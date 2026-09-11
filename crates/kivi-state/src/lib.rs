@@ -23,5 +23,5 @@ pub use envelope::{EnvelopeError, MUTATION_ENVELOPE_VERSION, MutationEnvelope};
 pub use hash::{PARTITION_DOMAIN_TAG, PartitionHashAlgorithmId, PartitionHasher};
 pub use mutation::{ApplyError, ApplyOutcome, Mutation};
 pub use object::{Key, LogicalValue, ObjectType, ObjectVersion, StoredObject, VersionExhausted};
-pub use ops::{OpError, Operation, OperationResult};
-pub use store::{ObjectStore, Prepared};
+pub use ops::{DurableOutcome, OpError, Operation, OperationResult, outcome_for};
+pub use store::{ObjectStore, Prepared, StorePrepared};

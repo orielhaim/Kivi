@@ -40,14 +40,17 @@ const MAX_ADMIN_BODY_BYTES: usize = 64 * 1024;
 /// Per-request ceiling: admin reads are local snapshots, never slow work.
 const ADMIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Shared admin state: node identity (operator-configured, same values the
-/// engine serves in native handshakes) plus the engine query handle.
+/// Shared admin state: node identity (operator-configured in ephemeral
+/// mode, data-directory-persisted in durable mode — always the same values
+/// the engine serves in native handshakes) plus the engine query handle.
 #[derive(Debug, Clone)]
 pub struct AdminState {
     /// This node's identity.
     pub node: NodeId,
     /// This cluster's identity.
     pub cluster: ClusterId,
+    /// This process's incarnation (durable: advanced at startup).
+    pub incarnation: NodeIncarnation,
     /// Read-only engine query handle (`Send + Sync`, Tokio-safe).
     pub engine: AdminHandle,
 }
@@ -78,6 +81,8 @@ struct NodeDto {
     workers: usize,
     tablets: usize,
     directory_version: u64,
+    durability_mode: &'static str,
+    data_dir: Option<String>,
 }
 
 /// One worker: endpoint, owned tablets, and arrival-path counters (`None`
@@ -100,6 +105,42 @@ struct TabletDto {
     guard: u64,
     range: String,
     owner: Option<u64>,
+}
+
+/// Durability posture: mode, identity, lanes, health, and what recovery did.
+#[derive(Debug, Clone, Serialize)]
+struct DurabilityDto {
+    mode: &'static str,
+    data_dir: Option<String>,
+    node: u64,
+    cluster: u128,
+    incarnation: u64,
+    lanes: Vec<LaneDto>,
+    recovery: Option<RecoveryDto>,
+}
+
+/// One WAL lane: position, health, and cumulative counters (`None` fields
+/// in ephemeral mode, which has no lanes).
+#[derive(Debug, Clone, Serialize)]
+struct LaneDto {
+    worker: u64,
+    lane: Option<u16>,
+    active_segment: Option<u64>,
+    segments: Option<u64>,
+    health: Option<String>,
+    batches: Option<u64>,
+    records: Option<u64>,
+    bytes: Option<u64>,
+    fsyncs: Option<u64>,
+}
+
+/// What startup recovery replayed.
+#[derive(Debug, Clone, Serialize)]
+struct RecoveryDto {
+    records_replayed: u64,
+    segments_scanned: u64,
+    tail_truncated_bytes: u64,
+    tablets_recovered: u64,
 }
 
 async fn health() -> Json<HealthDto> {
@@ -126,10 +167,11 @@ async fn ready(State(state): State<AdminState>) -> Json<ReadyDto> {
 
 async fn node(State(state): State<AdminState>) -> Json<NodeDto> {
     let routing = state.engine.routing();
+    let durability = state.engine.durability();
     Json(NodeDto {
         node: state.node.as_u64(),
         cluster: state.cluster.as_u128(),
-        incarnation: NodeIncarnation::INITIAL.as_u64(),
+        incarnation: state.incarnation.as_u64(),
         namespace: state.engine.namespace().as_u64(),
         workers: state.engine.worker_count(),
         tablets: routing
@@ -139,7 +181,72 @@ async fn node(State(state): State<AdminState>) -> Json<NodeDto> {
             .filter(|tablet| tablet.state().is_writable())
             .count(),
         directory_version: routing.version().as_u64(),
+        durability_mode: durability_mode(durability),
+        data_dir: durability.map(|info| info.data_dir.display().to_string()),
     })
+}
+
+fn durability_mode(durability: Option<&kivi_engine::EngineDurability>) -> &'static str {
+    if durability.is_some() {
+        "durable"
+    } else {
+        "ephemeral"
+    }
+}
+
+async fn durability(State(state): State<AdminState>) -> Result<Json<DurabilityDto>, StatusCode> {
+    let engine = state.engine.clone();
+    // Lane stats arrive over the blocking control channel.
+    let lanes = tokio::task::spawn_blocking(move || engine.lane_stats_snapshot())
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let by_worker: std::collections::HashMap<u64, kivi_durability::WorkerLaneStats> = lanes
+        .into_iter()
+        .filter_map(|(id, stats)| stats.map(|stats| (id.as_u64(), stats)))
+        .collect();
+    let mut out = Vec::new();
+    for index in 0..state.engine.worker_count() {
+        let id = u64::try_from(index).unwrap_or(u64::MAX);
+        match by_worker.get(&id) {
+            Some(lane) => out.push(LaneDto {
+                worker: id,
+                lane: Some(lane.lane),
+                active_segment: Some(lane.active_segment),
+                segments: Some(lane.segments),
+                health: Some(lane.health.to_string()),
+                batches: Some(lane.stats.batches),
+                records: Some(lane.stats.records),
+                bytes: Some(lane.stats.bytes),
+                fsyncs: Some(lane.stats.fsyncs),
+            }),
+            None => out.push(LaneDto {
+                worker: id,
+                lane: None,
+                active_segment: None,
+                segments: None,
+                health: None,
+                batches: None,
+                records: None,
+                bytes: None,
+                fsyncs: None,
+            }),
+        }
+    }
+    let info = state.engine.durability();
+    Ok(Json(DurabilityDto {
+        mode: durability_mode(info),
+        data_dir: info.map(|info| info.data_dir.display().to_string()),
+        node: state.node.as_u64(),
+        cluster: state.cluster.as_u128(),
+        incarnation: state.incarnation.as_u64(),
+        lanes: out,
+        recovery: info.map(|info| RecoveryDto {
+            records_replayed: info.recovery.records_replayed,
+            segments_scanned: info.recovery.segments_scanned,
+            tail_truncated_bytes: info.recovery.tail_truncated_bytes,
+            tablets_recovered: info.recovery.tablets_recovered,
+        }),
+    }))
 }
 
 async fn workers(State(state): State<AdminState>) -> Result<Json<Vec<WorkerDto>>, StatusCode> {
@@ -215,6 +322,7 @@ pub fn router(state: AdminState) -> axum::Router {
         .route("/v1/node", get(node))
         .route("/v1/workers", get(workers))
         .route("/v1/tablets", get(tablets))
+        .route("/v1/durability", get(durability))
         .layer(
             tower::ServiceBuilder::new()
                 .layer(TraceLayer::new_for_http())
@@ -247,7 +355,7 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kivi_engine::{EngineConfig, LocalEngine, Placement};
+    use kivi_engine::{DurabilityMode, EngineConfig, LocalEngine, Placement};
     use kivi_tablet::{DirectorySnapshot, HashPrefix, PartitionRange};
     use kivi_types::{NamespaceId, TabletEpoch, TabletId, WorkerId, WriteGuardGeneration};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -274,6 +382,7 @@ mod tests {
             worker_count: 2,
             request_capacity: 16,
             network: None,
+            durability: DurabilityMode::Ephemeral,
         })
         .expect("test engine starts")
     }
@@ -284,6 +393,7 @@ mod tests {
         AdminState {
             node: NodeId::from_u64(7),
             cluster: ClusterId::from_u128(0xC1),
+            incarnation: NodeIncarnation::INITIAL,
             engine: engine.admin_handle(),
         }
     }
@@ -375,6 +485,9 @@ mod tests {
         assert_eq!(node["cluster"], 0xC1);
         assert_eq!(node["namespace"], 1);
         assert_eq!(node["workers"], 2);
+        assert_eq!(node["incarnation"], 1);
+        assert_eq!(node["durability_mode"], "ephemeral");
+        assert_eq!(node["data_dir"], serde_json::Value::Null);
         let (status, workers) = get(port, "/v1/workers").await;
         assert_eq!(status, 200);
         let workers = workers.as_array().expect("worker list");
@@ -394,6 +507,22 @@ mod tests {
         assert_eq!(tablets[0]["state"], "active");
         assert_eq!(tablets[0]["range"], "hash:*");
         assert_eq!(tablets[0]["owner"], 0);
+    }
+
+    #[tokio::test]
+    async fn durability_endpoint_reports_ephemeral_shape() {
+        let (port, _shutdown, _engine) = spawn_admin().await;
+        let (status, durability) = get(port, "/v1/durability").await;
+        assert_eq!(status, 200);
+        assert_eq!(durability["mode"], "ephemeral");
+        assert_eq!(durability["data_dir"], serde_json::Value::Null);
+        assert_eq!(durability["node"], 7);
+        assert_eq!(durability["incarnation"], 1);
+        assert_eq!(durability["recovery"], serde_json::Value::Null);
+        let lanes = durability["lanes"].as_array().expect("lane list");
+        assert_eq!(lanes.len(), 2);
+        assert_eq!(lanes[0]["lane"], serde_json::Value::Null);
+        assert_eq!(lanes[0]["health"], serde_json::Value::Null);
     }
 
     #[tokio::test]

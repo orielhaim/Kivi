@@ -43,6 +43,31 @@ impl fmt::Display for RequestIdentity {
     }
 }
 
+/// One mutating request's full retry identity: who issued it, which sequence
+/// number it carries, and how far the client has acknowledged.
+///
+/// The server uses `client` for exactly-once lookup and `ack_floor` to
+/// advance the session's durable floor (dropping outcomes the client has
+/// explicitly acknowledged and will never retry). The floor only moves
+/// forward over consecutively completed sequences, so an in-flight sequence
+/// is never acknowledged beneath itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MutationIdentity {
+    /// Session + sequence uniquely naming this mutation attempt.
+    pub client: RequestIdentity,
+    /// Client acknowledgement watermark: every sequence `<= ack_floor` in
+    /// this session is complete from the client's perspective.
+    pub ack_floor: RequestSeq,
+}
+
+impl MutationIdentity {
+    /// Builds a retry identity from its parts.
+    #[must_use]
+    pub const fn new(client: RequestIdentity, ack_floor: RequestSeq) -> Self {
+        Self { client, ack_floor }
+    }
+}
+
 /// Durable idempotency key surviving client restarts (RFC §65).
 ///
 /// The canonical durable form is a fixed 128-bit value. Human-facing clients

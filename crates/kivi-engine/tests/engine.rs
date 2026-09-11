@@ -2,7 +2,7 @@
 //! shutdown, and failure surfacing over real worker threads.
 
 use bytes::Bytes;
-use kivi_engine::{EngineConfig, EngineError, LocalEngine, Placement};
+use kivi_engine::{DurabilityMode, EngineConfig, EngineError, LocalEngine, Placement};
 use kivi_state::Key;
 use kivi_tablet::{DirectorySnapshot, HashPrefix, PartitionRange, TabletState};
 use kivi_types::{NamespaceId, TabletEpoch, TabletId, WorkerId, WriteGuardGeneration};
@@ -68,6 +68,7 @@ fn start_root(workers: usize) -> LocalEngine {
         worker_count: workers,
         request_capacity: 64,
         network: None,
+        durability: DurabilityMode::Ephemeral,
     })
     .expect("root engine starts")
 }
@@ -85,6 +86,7 @@ fn invalid_configurations_fail_before_serving() {
             worker_count: 0,
             request_capacity: 64,
             network: None,
+            durability: DurabilityMode::Ephemeral,
         }),
         Err(EngineError::InvalidConfig { .. })
     ));
@@ -97,6 +99,7 @@ fn invalid_configurations_fail_before_serving() {
             worker_count: 1,
             request_capacity: 0,
             network: None,
+            durability: DurabilityMode::Ephemeral,
         }),
         Err(EngineError::InvalidConfig { .. })
     ));
@@ -109,6 +112,7 @@ fn invalid_configurations_fail_before_serving() {
             worker_count: 1,
             request_capacity: 64,
             network: None,
+            durability: DurabilityMode::Ephemeral,
         }),
         Err(EngineError::Routing(_))
     ));
@@ -121,6 +125,7 @@ fn invalid_configurations_fail_before_serving() {
             worker_count: 1,
             request_capacity: 64,
             network: None,
+            durability: DurabilityMode::Ephemeral,
         }),
         Err(EngineError::Routing(_))
     ));
@@ -177,6 +182,7 @@ fn multi_tablet_routing_reaches_both_owners() {
         worker_count: 2,
         request_capacity: 64,
         network: None,
+        durability: DurabilityMode::Ephemeral,
     })
     .expect("split engine starts");
     assert_eq!(engine.worker_of(TabletId::from_u64(2)), Some(worker(0)));

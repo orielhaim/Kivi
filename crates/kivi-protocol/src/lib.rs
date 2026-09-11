@@ -22,5 +22,5 @@ pub use frame::{
 };
 pub use message::{
     Capabilities, ClientHello, Opcode, RedirectInfo, Request, RequestId, Response, ResponseBody,
-    RouteHint, ServerHello, Status,
+    RouteHint, ServerHello, Status, operation_opcode,
 };

@@ -12,6 +12,7 @@ kivi-protocol.workspace = true
 bytes.workspace = true
 arc-swap.workspace = true
 crossbeam-channel.workspace = true
+getrandom.workspace = true
 thiserror.workspace = true
 
 [lints]

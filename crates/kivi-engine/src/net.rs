@@ -45,17 +45,20 @@ use compio::net::{TcpListener, TcpStream};
 use compio::runtime::Runtime;
 
 use kivi_protocol::{
-    ClientHello, DEFAULT_MAX_FRAME, FrameReader, RedirectInfo, Request, Response, ServerHello,
-    encode_frame,
+    Capabilities, ClientHello, DEFAULT_MAX_FRAME, FrameReader, RedirectInfo, Request, Response,
+    ServerHello, encode_frame,
 };
 use kivi_state::{Operation, PartitionHasher};
-use kivi_types::{ClusterId, NodeId, NodeIncarnation, TabletId, WorkerId};
+use kivi_types::{ClusterId, MutationIdentity, NodeId, NodeIncarnation, TabletId, WorkerId};
 
 use crate::affinity::{AffinityError, AffinityMode, pin_current_thread};
 use crate::clock::SystemClock;
 use crate::routing::RoutingSnapshot;
 use crate::tablet::LiveTablet;
-use crate::worker::{WorkerControl, WorkerMetrics, handle_control, handle_request};
+use crate::worker::{
+    DurableFailure, WorkerControl, WorkerDurability, WorkerMetrics, execute_durable,
+    handle_control, handle_request,
+};
 
 /// Per-connection input bound default (4 MiB of unparsed bytes).
 pub const DEFAULT_MAX_INPUT_BYTES: usize = 4 * 1024 * 1024;
@@ -142,6 +145,9 @@ pub struct EngineNetwork {
     pub node_id: NodeId,
     /// This cluster's identity.
     pub cluster_id: ClusterId,
+    /// This incarnation (advanced durably on every restart; `INITIAL` when
+    /// ephemeral). Advertised in handshakes and stamped into new segments.
+    pub incarnation: NodeIncarnation,
     /// Per-connection bounds.
     pub conn: ConnLimits,
     /// Per-turn fairness budgets.
@@ -165,6 +171,11 @@ pub struct NetConfig {
     pub node_id: NodeId,
     /// Cluster identity for handshakes.
     pub cluster_id: ClusterId,
+    /// This incarnation of the node (advanced durably on every restart).
+    pub incarnation: NodeIncarnation,
+    /// Capabilities advertised in `ServerHello` (`DURABLE_MUTATION_DEDUP`
+    /// exactly when the engine runs durable).
+    pub advertised_caps: Capabilities,
     /// Live worker endpoint directory (swapped once binds complete).
     pub endpoints: Arc<ArcSwap<EndpointMap>>,
     /// Live routing publication.
@@ -220,6 +231,11 @@ struct WorkerNet {
     shutdown: Rc<Cell<bool>>,
     active: Rc<Cell<usize>>,
     net: NetConfig,
+    /// Durable state (`None` in ephemeral mode). Shared across this
+    /// worker's connection tasks and bridge: single-threaded `Rc`, and
+    /// every use is synchronous (no `.await` while borrowed), so tasks
+    /// cannot interleave a persist-apply sequence.
+    durability: Option<Rc<RefCell<WorkerDurability>>>,
 }
 
 /// Launch bundle for one networked worker: everything `spawn_net` needs
@@ -246,6 +262,7 @@ pub(crate) fn run_net(
     tablets: Vec<LiveTablet>,
     requests: crossbeam_channel::Receiver<crate::worker::TabletRequest>,
     control: crossbeam_channel::Receiver<WorkerControl>,
+    durability: Option<WorkerDurability>,
     launch: NetLaunch,
     ready: std::sync::mpsc::Sender<Result<SocketAddr, NetStartError>>,
 ) {
@@ -268,6 +285,7 @@ pub(crate) fn run_net(
         shutdown: Rc::new(Cell::new(false)),
         active: Rc::new(Cell::new(0)),
         net: launch.net,
+        durability: durability.map(|durable| Rc::new(RefCell::new(durable))),
     });
     let runtime = match Runtime::new() {
         Ok(runtime) => runtime,
@@ -308,8 +326,9 @@ async fn serve(
         let tablets = Rc::clone(&shared.tablets);
         let metrics = Rc::clone(&shared.metrics);
         let shutdown = Rc::clone(&shared.shutdown);
+        let durability = shared.durability.clone();
         async move {
-            bridge_loop(requests, control, tablets, metrics, shutdown).await;
+            bridge_loop(requests, control, tablets, metrics, durability, shutdown).await;
         }
     };
     compio::runtime::spawn(bridge).detach();
@@ -353,6 +372,7 @@ async fn bridge_loop(
     control: crossbeam_channel::Receiver<WorkerControl>,
     tablets: Rc<RefCell<HashMap<TabletId, LiveTablet>>>,
     metrics: Rc<Cell<WorkerMetrics>>,
+    durability: Option<Rc<RefCell<WorkerDurability>>>,
     shutdown: Rc<Cell<bool>>,
 ) {
     use crossbeam_channel::TryRecvError;
@@ -362,7 +382,9 @@ async fn bridge_loop(
         loop {
             match control.try_recv() {
                 Ok(message) => {
-                    if !handle_control(message, &mut tablets.borrow_mut(), &metrics) {
+                    let durable = durability.as_ref().map(|cell| cell.borrow());
+                    let durable_ref = durable.as_deref();
+                    if !handle_control(message, &mut tablets.borrow_mut(), &metrics, durable_ref) {
                         shutdown.set(true);
                         return;
                     }
@@ -377,7 +399,9 @@ async fn bridge_loop(
         for _ in 0..64 {
             match requests.try_recv() {
                 Ok(request) => {
-                    handle_request(request, &mut tablets.borrow_mut(), &metrics);
+                    let mut durable = durability.as_ref().map(|cell| cell.borrow_mut());
+                    let durable_ref = durable.as_deref_mut();
+                    handle_request(request, &mut tablets.borrow_mut(), &metrics, durable_ref);
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -434,6 +458,9 @@ struct Conn {
     shutdown: Rc<Cell<bool>>,
     node_id: NodeId,
     cluster_id: ClusterId,
+    incarnation: NodeIncarnation,
+    advertised_caps: Capabilities,
+    durability: Option<Rc<RefCell<WorkerDurability>>>,
     reader: FrameReader,
     pending: std::collections::VecDeque<kivi_protocol::Frame>,
     max_input: usize,
@@ -550,10 +577,10 @@ impl Conn {
         let reply = ServerHello {
             major: kivi_protocol::PROTOCOL_MAJOR,
             minor: kivi_protocol::PROTOCOL_MINOR,
-            caps: kivi_protocol::Capabilities::BASE_V1,
+            caps: self.advertised_caps,
             cluster: self.cluster_id,
             node: self.node_id(),
-            incarnation: NodeIncarnation::INITIAL,
+            incarnation: self.incarnation,
             worker: self.worker,
             dir_version: routing.version(),
             max_frame,
@@ -661,8 +688,27 @@ impl Conn {
                 )
                 .await;
         }
+        self.handle_routed_request(request_id, request, tablet)
+            .await
+    }
+
+    /// Executes one routed request on this worker: durable pipeline when
+    /// the lane exists, direct in-memory execution otherwise.
+    async fn handle_routed_request(
+        &mut self,
+        request_id: u64,
+        request: Request,
+        tablet: TabletId,
+    ) -> Result<(), ConnExit> {
+        let identity = request.identity;
+        let ack_floor = request.ack_floor;
         let operation = request.into_operation();
-        let opcode = operation_opcode(&operation);
+        let opcode = kivi_protocol::operation_opcode(&operation);
+        if self.durability.is_some() {
+            return self
+                .handle_request_durable(request_id, identity, ack_floor, tablet, &operation, opcode)
+                .await;
+        }
         match self.execute_local(tablet, &operation) {
             None => {
                 self.respond(
@@ -683,6 +729,144 @@ impl Conn {
             }
             Some(Err(error)) => self.respond_op_error(request_id, opcode, &error).await,
         }
+    }
+
+    /// Durable write pipeline on the owning worker: dedup check, prepare,
+    /// exactly one WAL record, apply + verify (or install), reply. Never
+    /// replies success before the record is file-synced. Tablet and lane
+    /// borrows both end before any `.await`, so connection tasks on this
+    /// thread cannot interleave a persist-apply sequence.
+    async fn handle_request_durable(
+        &mut self,
+        request_id: u64,
+        identity: Option<kivi_types::RequestIdentity>,
+        ack_floor: kivi_types::RequestSeq,
+        tablet: TabletId,
+        operation: &Operation,
+        opcode: kivi_protocol::Opcode,
+    ) -> Result<(), ConnExit> {
+        use kivi_protocol::{Response, ResponseBody, Status};
+        // Identity rule: mutating requests must carry client identity on a
+        // durable server (the safe-retry contract); reads never need it and
+        // any identity they carry is ignored.
+        let identity = match (identity, opcode.is_mutating()) {
+            (Some(identity), true) => Some(MutationIdentity::new(identity, ack_floor)),
+            (None, true) => {
+                return self
+                    .respond(
+                        request_id,
+                        opcode,
+                        Response {
+                            status: Status::InvalidRequest,
+                            body: ResponseBody::Diagnostic(
+                                "mutating request lacks client identity".to_owned(),
+                            ),
+                        },
+                    )
+                    .await;
+            }
+            _ => None,
+        };
+        let now = SystemClock::wall_now();
+        // Resolve the tablet and run the whole pipeline synchronously:
+        // both borrows end before any `.await`, so connection tasks on
+        // this thread cannot interleave a persist-apply sequence. The
+        // double lookup is deliberate: holding any borrow across the
+        // response `.await` below would panic a sibling task that
+        // borrows while we wait on the socket (same thread, no
+        // preemption between the two borrows, so no race).
+        if !self.tablets.borrow().contains_key(&tablet) {
+            return self
+                .respond(
+                    request_id,
+                    opcode,
+                    Response {
+                        status: Status::NotLocal,
+                        body: ResponseBody::Diagnostic("tablet not live on owner".to_owned()),
+                    },
+                )
+                .await;
+        }
+        let outcome = {
+            let mut tablets = self.tablets.borrow_mut();
+            let live = tablets.get_mut(&tablet).expect("presence checked above");
+            let durability = self
+                .durability
+                .as_ref()
+                .expect("durable path always has a lane");
+            let mut durable = durability.borrow_mut();
+            execute_durable(
+                live,
+                &mut durable,
+                operation,
+                opcode.as_u8(),
+                identity.as_ref(),
+                now,
+            )
+        };
+        match outcome {
+            Ok(result) => {
+                bump_direct(&self.metrics);
+                self.respond_ok(request_id, opcode, &result).await
+            }
+            Err(DurableFailure::Op(error)) => {
+                self.respond_op_error(request_id, opcode, &error).await
+            }
+            Err(DurableFailure::Expired) => {
+                self.respond(
+                    request_id,
+                    opcode,
+                    Response {
+                        status: Status::DedupExpired,
+                        body: ResponseBody::Diagnostic(
+                            "mutation identity expired below the session floor".to_owned(),
+                        ),
+                    },
+                )
+                .await
+            }
+            Err(DurableFailure::Overloaded) => {
+                self.respond(
+                    request_id,
+                    opcode,
+                    Response {
+                        status: Status::SessionOverloaded,
+                        body: ResponseBody::Diagnostic(
+                            "session outcome window exhausted".to_owned(),
+                        ),
+                    },
+                )
+                .await
+            }
+            Err(DurableFailure::Storage(error)) => {
+                self.respond_storage_error(request_id, opcode, &error).await
+            }
+        }
+    }
+
+    /// Answers a WAL append failure: full disks read as resource
+    /// exhaustion (reads continue), anything else as internal. The lane
+    /// health already flipped inside the provider.
+    async fn respond_storage_error(
+        &mut self,
+        request_id: u64,
+        opcode: kivi_protocol::Opcode,
+        error: &kivi_durability::DurabilityError,
+    ) -> Result<(), ConnExit> {
+        use kivi_protocol::{Response, ResponseBody, Status};
+        let status = match error {
+            kivi_durability::DurabilityError::NoSpace { .. } => Status::ResourceExhausted,
+            _ => Status::Internal,
+        };
+        self.respond(
+            request_id,
+            opcode,
+            Response {
+                status,
+                body: ResponseBody::Diagnostic("durable write failed".to_owned()),
+            },
+        )
+        .await
     }
 
     /// Returns a refresh redirect when the client's hint disagrees with the
@@ -881,6 +1065,7 @@ impl Conn {
                 (Status::WrongType, "wrong type")
             }
             E::AuthorityMismatch { .. } => (Status::Internal, "authority mismatch"),
+            E::CommitExhausted { .. } => (Status::VersionExhausted, "commit space exhausted"),
         };
         self.respond(
             request_id,
@@ -920,20 +1105,6 @@ enum Route {
 }
 
 /// Maps an operation back to its opcode for response encoding.
-fn operation_opcode(operation: &Operation) -> kivi_protocol::Opcode {
-    match operation {
-        Operation::Get { .. } => kivi_protocol::Opcode::Get,
-        Operation::Set { .. } => kivi_protocol::Opcode::Set,
-        Operation::Delete { .. } => kivi_protocol::Opcode::Delete,
-        Operation::Exists { .. } => kivi_protocol::Opcode::Exists,
-        Operation::CounterGet { .. } => kivi_protocol::Opcode::CounterGet,
-        Operation::CounterAdd { .. } => kivi_protocol::Opcode::CounterAdd,
-        Operation::ExpireAt { .. } => kivi_protocol::Opcode::ExpireAt,
-        Operation::PersistExpiry { .. } => kivi_protocol::Opcode::PersistExpiry,
-        Operation::GetExpiry { .. } => kivi_protocol::Opcode::GetExpiry,
-    }
-}
-
 /// Bumps the direct-path execution counter.
 fn bump_direct(metrics: &Rc<Cell<WorkerMetrics>>) {
     let mut snapshot = metrics.get();
@@ -960,6 +1131,9 @@ async fn serve_conn(stream: TcpStream, peer: SocketAddr, shared: Rc<WorkerNet>) 
         shutdown: Rc::clone(&shared.shutdown),
         node_id: shared.net.node_id,
         cluster_id: shared.net.cluster_id,
+        incarnation: shared.net.incarnation,
+        advertised_caps: shared.net.advertised_caps,
+        durability: shared.durability.clone(),
         reader: FrameReader::new(shared.net.conn.max_frame),
         pending: std::collections::VecDeque::new(),
         max_input,

@@ -4,9 +4,14 @@
 //! TCP connections with a sparse route cache: the first request to a range
 //! goes to the seed, learns the authority from the redirect, and routes
 //! directly afterwards. One logical request identity is preserved across
-//! route retries — redirects are transport retries, never logical replays
-//! (the design already anticipates future `SessionId + RequestSeq`
-//! server-side dedup: identities stay stable across retries today).
+//! route retries — redirects are transport retries, never logical replays.
+//!
+//! Safe retry: every mutating call allocates one [`RequestIdentity`] (plus
+//! the acknowledgement floor) that is preserved across redirects, redials,
+//! and delivery retries. Servers advertising `DURABLE_MUTATION_DEDUP`
+//! persist each outcome under that identity, so a retried mutation returns
+//! its original outcome instead of executing twice. One typed call is one
+//! mutation identity; caller-level retries across calls are new mutations.
 //!
 //! Threading model: the client is cheaply clonable (`Arc` inside). Each
 //! connection has one background reader thread dispatching responses by
@@ -17,7 +22,7 @@ pub mod route;
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
@@ -30,7 +35,7 @@ use kivi_protocol::{
     RequestId, Response, ResponseBody, ServerHello, Status, encode_frame,
 };
 use kivi_state::{Key, PartitionHasher};
-use kivi_types::{NamespaceId, UnixMicros, WorkerId};
+use kivi_types::{NamespaceId, RequestIdentity, RequestSeq, SessionId, UnixMicros, WorkerId};
 
 pub use route::{RouteCache, RouteEntry};
 
@@ -44,6 +49,16 @@ pub const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_MAX_REDIRECTS: usize = 8;
 /// In-flight requests per connection default (fast `Overloaded` past this).
 pub const DEFAULT_MAX_PENDING: usize = 128;
+/// Dial attempts per connection (handshake validation failures fail fast;
+/// transport failures back off and retry).
+pub const DEFAULT_DIAL_ATTEMPTS: u32 = 3;
+/// Base dial backoff (doubled per attempt, capped at one second).
+pub const DEFAULT_DIAL_BACKOFF: Duration = Duration::from_millis(20);
+/// Ambiguous-delivery retries per mutating request (same identity, only
+/// against `DURABLE_MUTATION_DEDUP` servers).
+pub const DEFAULT_DELIVERY_RETRIES: u32 = 2;
+/// Backoff cap for every retry schedule.
+pub const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(1);
 
 /// Client configuration. All bounds explicit; everything has a default.
 #[derive(Debug, Clone)]
@@ -64,6 +79,12 @@ pub struct ClientConfig {
     pub request_timeout: Duration,
     /// Socket write timeout.
     pub write_timeout: Duration,
+    /// Dial attempts per connection establishment.
+    pub dial_attempts: u32,
+    /// Base backoff between dial attempts (exponential, capped).
+    pub dial_backoff: Duration,
+    /// Ambiguous-delivery retries per mutating request.
+    pub delivery_retries: u32,
 }
 
 impl Default for ClientConfig {
@@ -78,6 +99,9 @@ impl Default for ClientConfig {
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             write_timeout: DEFAULT_WRITE_TIMEOUT,
+            dial_attempts: DEFAULT_DIAL_ATTEMPTS,
+            dial_backoff: DEFAULT_DIAL_BACKOFF,
+            delivery_retries: DEFAULT_DELIVERY_RETRIES,
         }
     }
 }
@@ -129,6 +153,19 @@ pub enum ClientError {
     /// Unexpected server-side failure, with its diagnostic if any.
     #[error("server internal error: {0}")]
     Internal(String),
+    /// A mutating request may or may not have executed: delivery was
+    /// ambiguous (timeout or transport failure after possible transmission)
+    /// and the server does not advertise durable dedup, so retrying could
+    /// execute it twice. Returned instead of risking duplicate execution.
+    #[error("ambiguous outcome: request may or may not have executed")]
+    AmbiguousOutcome,
+    /// A retried identity fell below the session's durable floor: its
+    /// outcome is gone and it will never execute again.
+    #[error("mutation identity expired below the session floor")]
+    DedupExpired,
+    /// The session holds too many unacknowledged outcomes on the tablet.
+    #[error("session outcome window exhausted")]
+    SessionOverloaded,
 }
 
 /// Maps a response status onto a client error (Ok/NotFound handled by callers).
@@ -150,7 +187,15 @@ fn status_error(status: Status, body: &ResponseBody) -> ClientError {
         Status::ResourceExhausted => ClientError::ResourceExhausted,
         Status::ValueTooLarge => ClientError::ValueTooLarge,
         Status::Internal => ClientError::Internal(diagnostic),
+        Status::DedupExpired => ClientError::DedupExpired,
+        Status::SessionOverloaded => ClientError::SessionOverloaded,
     }
+}
+
+/// Sleeps the capped exponential backoff for retry `attempt` (from zero).
+fn backoff(base: Duration, attempt: u32) {
+    let shifted = base.checked_mul(1 << attempt.min(10)).unwrap_or(base);
+    std::thread::sleep(shifted.min(MAX_RETRY_BACKOFF));
 }
 
 /// One pooled connection: a mutex-serialized writer plus a background reader
@@ -159,6 +204,7 @@ fn status_error(status: Status, body: &ResponseBody) -> ClientError {
 struct Connection {
     worker: WorkerId,
     endpoint: String,
+    server_caps: Capabilities,
     writer: Mutex<TcpStream>,
     pending: Arc<Mutex<HashMap<u64, Sender<Response>>>>,
     max_pending: usize,
@@ -168,9 +214,41 @@ struct Connection {
 }
 
 impl Connection {
+    /// Whether this connection's server persists mutation outcomes under
+    /// client identity (safe to retry ambiguous mutating requests on).
+    fn durable_dedup(&self) -> bool {
+        self.server_caps
+            .contains(Capabilities::DURABLE_MUTATION_DEDUP)
+    }
+
     /// Dials, handshakes, and spawns the reader thread. Validates the hello
-    /// (worker identity when expected, base capability present).
+    /// (worker identity when expected, base capability present). Transport
+    /// (`Io`) failures retry with capped backoff; handshake validation
+    /// failures are deterministic and fail fast.
     fn dial(
+        endpoint: &str,
+        expect_worker: Option<WorkerId>,
+        config: &ClientConfig,
+    ) -> Result<Self, ClientError> {
+        let attempts = config.dial_attempts.max(1);
+        let mut last = ClientError::Io(format!("unresolvable endpoint {endpoint}"));
+        for attempt in 0..attempts {
+            match Self::dial_once(endpoint, expect_worker, config) {
+                Ok(conn) => return Ok(conn),
+                Err(ClientError::Io(detail)) => {
+                    last = ClientError::Io(detail);
+                    if attempt + 1 < attempts {
+                        backoff(config.dial_backoff, attempt);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last)
+    }
+
+    /// One dial plus handshake attempt, no retry.
+    fn dial_once(
         endpoint: &str,
         expect_worker: Option<WorkerId>,
         config: &ClientConfig,
@@ -243,6 +321,7 @@ impl Connection {
         Ok(Self {
             worker: hello.worker,
             endpoint: endpoint.to_owned(),
+            server_caps: hello.caps,
             writer: Mutex::new(stream),
             pending,
             max_pending: config.max_pending,
@@ -363,6 +442,20 @@ fn read_one_frame(stream: &mut TcpStream, max_frame: usize) -> Result<Frame, Pro
     }
 }
 
+/// Mutation sequence state for one client session. Sequences start at 1
+/// (0 is never issued); the acknowledgement floor only advances over
+/// consecutively completed sequences, so an in-flight sequence is never
+/// acknowledged beneath itself — even across tablets sharing the session.
+#[derive(Debug, Default)]
+struct SeqState {
+    /// Next sequence to issue.
+    next: u64,
+    /// Highest consecutively completed sequence (0 = nothing acked).
+    acked: u64,
+    /// Issued but not yet completed sequences.
+    in_flight: BTreeSet<u64>,
+}
+
 /// Shared client state behind every clone.
 #[derive(Debug)]
 struct Shared {
@@ -373,10 +466,15 @@ struct Shared {
     connect_timeout: Duration,
     request_timeout: Duration,
     write_timeout: Duration,
+    dial_attempts: u32,
+    dial_backoff: Duration,
+    delivery_retries: u32,
     seeds: Vec<String>,
     routes: route::RouteCache,
     pool: Mutex<HashMap<String, Arc<Connection>>>,
     id_counter: AtomicU64,
+    session: SessionId,
+    seq: Mutex<SeqState>,
     requests: AtomicU64,
     redirects: AtomicU64,
     errors: AtomicU64,
@@ -403,14 +501,20 @@ pub struct NativeClient {
 impl NativeClient {
     /// Builds a client from configuration (no connections yet — dialing is
     /// lazy on first use, so construction never fails on network state).
+    /// One client is one mutation session: every clone shares the session
+    /// identity and its sequence space.
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError::Io`] when no seed address is configured.
+    /// Returns [`ClientError::Io`] when no seed address is configured or the
+    /// OS random source is unavailable for the session identity.
     pub fn new(config: ClientConfig) -> Result<Self, ClientError> {
         if config.seeds.is_empty() {
             return Err(ClientError::Io("no seed addresses configured".to_owned()));
         }
+        let mut random = [0u8; 16];
+        getrandom::fill(&mut random)
+            .map_err(|error| ClientError::Io(format!("session identity: {error}")))?;
         Ok(Self {
             shared: Arc::new(Shared {
                 namespace: config.namespace,
@@ -420,10 +524,19 @@ impl NativeClient {
                 connect_timeout: config.connect_timeout,
                 request_timeout: config.request_timeout,
                 write_timeout: config.write_timeout,
+                dial_attempts: config.dial_attempts,
+                dial_backoff: config.dial_backoff,
+                delivery_retries: config.delivery_retries,
                 seeds: config.seeds,
                 routes: route::RouteCache::new(),
                 pool: Mutex::new(HashMap::new()),
                 id_counter: AtomicU64::new(1),
+                session: SessionId::from_u128(u128::from_le_bytes(random)),
+                seq: Mutex::new(SeqState {
+                    next: 1,
+                    acked: 0,
+                    in_flight: BTreeSet::new(),
+                }),
                 requests: AtomicU64::new(0),
                 redirects: AtomicU64::new(0),
                 errors: AtomicU64::new(0),
@@ -458,6 +571,52 @@ impl NativeClient {
         }
     }
 
+    /// Allocates one mutation identity plus the current acknowledgement
+    /// floor. The identity names this logical mutation across every
+    /// transport retry; the floor lets the server drop outcomes this
+    /// session already acknowledged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Internal`] when the sequence space is
+    /// exhausted (practically unreachable) or the state lock is poisoned.
+    fn alloc_seq(&self) -> Result<(RequestIdentity, RequestSeq), ClientError> {
+        let mut state = self
+            .shared
+            .seq
+            .lock()
+            .map_err(|_| ClientError::Internal("mutation sequence lock poisoned".to_owned()))?;
+        if state.next == u64::MAX {
+            return Err(ClientError::Internal(
+                "request sequence exhausted".to_owned(),
+            ));
+        }
+        let seq = state.next;
+        state.next += 1;
+        state.in_flight.insert(seq);
+        Ok((
+            RequestIdentity::new(self.shared.session, RequestSeq::from_u64(seq)),
+            RequestSeq::from_u64(state.acked),
+        ))
+    }
+
+    /// Marks one mutation complete (success, terminal failure, or
+    /// abandonment), advancing the acknowledgement floor over consecutively
+    /// completed sequences. Abandoned sequences complete too: the floor may
+    /// pass them because their identity will never be retried under this
+    /// call again, so no live retry can fall beneath it.
+    fn complete_seq(&self, seq: u64) {
+        if let Ok(mut state) = self.shared.seq.lock() {
+            state.in_flight.remove(&seq);
+            while let Some(candidate) = state.acked.checked_add(1) {
+                if candidate >= state.next || state.in_flight.contains(&candidate) {
+                    break;
+                }
+                state.acked = candidate;
+            }
+        }
+    }
+
     /// Returns the pooled connection for `endpoint` (dialing + handshake on
     /// miss), validating the expected worker when known.
     fn connection(
@@ -487,6 +646,9 @@ impl NativeClient {
             connect_timeout: self.shared.connect_timeout,
             request_timeout: self.shared.request_timeout,
             write_timeout: self.shared.write_timeout,
+            dial_attempts: self.shared.dial_attempts,
+            dial_backoff: self.shared.dial_backoff,
+            delivery_retries: self.shared.delivery_retries,
         };
         let conn = Arc::new(Connection::dial(endpoint, expect_worker, &config)?);
         self.shared
@@ -499,9 +661,12 @@ impl NativeClient {
 
     /// Executes one request payload against the authority for `key`,
     /// following redirects with the same request identity throughout.
+    /// Mutating opcodes carry one mutation identity (allocated here, never
+    /// reallocated across retries); reads carry none.
     fn execute(
         &self,
         key: &Key,
+        opcode: kivi_protocol::Opcode,
         build: impl Fn() -> kivi_protocol::Request,
     ) -> Result<Response, ClientError> {
         use kivi_protocol::Status;
@@ -511,13 +676,23 @@ impl NativeClient {
                 "partition hash unsupported".to_owned(),
             ))?;
         let id = self.next_id();
+        let mutating = opcode.is_mutating();
+        // One identity per typed call. The floor is snapshotted once;
+        // retries reuse it (a stale floor only evicts less, never wrongly).
+        let identity: Option<(RequestIdentity, RequestSeq, u64)> = if mutating {
+            let (identity, floor) = self.alloc_seq()?;
+            Some((identity, floor, identity.seq().as_u64()))
+        } else {
+            None
+        };
         let mut redirects = 0usize;
         let mut reconnects = 0usize;
+        let mut deliveries = 0u32;
         self.shared.requests.fetch_add(1, Ordering::Relaxed);
-        loop {
+        let outcome: Result<Response, ClientError> = loop {
             if redirects > self.shared.max_redirects {
                 self.shared.errors.fetch_add(1, Ordering::Relaxed);
-                return Err(ClientError::TooManyRedirects);
+                break Err(ClientError::TooManyRedirects);
             }
             // Route: cached authority, else the seed with no hint.
             let (endpoint, hint) = match self.shared.routes.lookup(hash) {
@@ -525,30 +700,65 @@ impl NativeClient {
                 None => (self.shared.seeds[0].clone(), None),
             };
             let expect = hint.map(|hint| hint.worker);
-            let conn = self.connection(&endpoint, expect)?;
+            let conn = match self.connection(&endpoint, expect) {
+                Ok(conn) => conn,
+                Err(error) => {
+                    self.shared.errors.fetch_add(1, Ordering::Relaxed);
+                    break Err(error);
+                }
+            };
             let mut request = build();
             request.hint = hint;
+            if let Some((identity, floor, _)) = &identity {
+                request.identity = Some(*identity);
+                request.ack_floor = *floor;
+            }
             let response = match conn.round_trip(id, &request.encode()) {
                 Ok(response) => response,
-                // Transport failure (including a wait that outlived its
-                // reader): drop the pooled connection and redial. The request
-                // identity is preserved; servers track no per-connection
-                // state that a redial could confuse. Retried writes may
-                // re-execute a request the dead server already ran — safe for
-                // idempotent ops; non-idempotent ops need the future
-                // `SessionId + RequestSeq` dedup before relying on this.
                 Err(ClientError::Io(_)) if reconnects < 2 => {
+                    // Delivery may or may not have happened. Reads have no
+                    // side effects; mutating requests are safe to redial
+                    // only against durable-dedup servers under the same
+                    // identity. Otherwise the outcome is ambiguous: surface
+                    // it instead of risking a duplicate execution.
+                    let safe = !mutating || conn.durable_dedup();
                     reconnects += 1;
                     self.drop_connection(&endpoint);
+                    if safe {
+                        backoff(
+                            self.shared.dial_backoff,
+                            u32::try_from(reconnects).unwrap_or(u32::MAX),
+                        );
+                        continue;
+                    }
+                    self.shared.errors.fetch_add(1, Ordering::Relaxed);
+                    break Err(ClientError::AmbiguousOutcome);
+                }
+                Err(ClientError::Timeout)
+                    if mutating
+                        && conn.durable_dedup()
+                        && deliveries < self.shared.delivery_retries =>
+                {
+                    // Possibly transmitted, possibly not — but the identity
+                    // makes redelivery safe: a completed first attempt is a
+                    // dedup hit, otherwise it executes exactly once. Drop
+                    // the connection (its waiter is gone) and redial.
+                    deliveries += 1;
+                    self.drop_connection(&endpoint);
+                    backoff(self.shared.dial_backoff, deliveries.min(10));
                     continue;
+                }
+                Err(ClientError::Timeout) if mutating => {
+                    self.shared.errors.fetch_add(1, Ordering::Relaxed);
+                    break Err(ClientError::AmbiguousOutcome);
                 }
                 Err(error) => {
                     self.shared.errors.fetch_add(1, Ordering::Relaxed);
-                    return Err(error);
+                    break Err(error);
                 }
             };
             match response.status {
-                Status::Ok | Status::NotFound => return Ok(response),
+                Status::Ok | Status::NotFound => break Ok(response),
                 Status::StaleRoute | Status::NotLocal => {
                     if let ResponseBody::Redirect(info) = &response.body {
                         self.shared.routes.insert(RouteEntry::from_redirect(info));
@@ -562,10 +772,19 @@ impl NativeClient {
                 }
                 other => {
                     self.shared.errors.fetch_add(1, Ordering::Relaxed);
-                    return Err(status_error(other, &response.body));
+                    break Err(status_error(other, &response.body));
                 }
             }
+        };
+        // Every terminal path completes the identity — including abandonment
+        // — so the acknowledgement floor can advance past it and the outcome
+        // (if any) becomes eligible for eviction. An identity is never
+        // retried after its call ends, so completing it cannot strand a
+        // live retry beneath the floor.
+        if let Some((_, _, raw)) = identity {
+            self.complete_seq(raw);
         }
+        outcome
     }
 
     /// Forgets one pooled connection so the next use redials. Used after
@@ -583,7 +802,7 @@ impl NativeClient {
     /// Returns [`ClientError`] on transport/routing failure or wrong-type access.
     pub fn get(&self, key: &Key) -> Result<Option<Bytes>, ClientError> {
         use kivi_protocol::{Opcode, ResponseBody};
-        let response = self.execute(key, || kivi_protocol::Request {
+        let response = self.execute(key, Opcode::Get, || kivi_protocol::Request {
             namespace: self.shared.namespace,
             opcode: Opcode::Get,
             hint: None,
@@ -591,6 +810,8 @@ impl NativeClient {
             value: None,
             delta: 0,
             expiry: 0,
+            identity: None,
+            ack_floor: RequestSeq::from_u64(0),
         })?;
         match response.body {
             ResponseBody::Value(value) => Ok(Some(Bytes::from(value))),
@@ -608,7 +829,7 @@ impl NativeClient {
     #[allow(clippy::needless_pass_by_value)]
     pub fn set(&self, key: &Key, value: Bytes) -> Result<(), ClientError> {
         use kivi_protocol::{Opcode, ResponseBody};
-        let response = self.execute(key, || kivi_protocol::Request {
+        let response = self.execute(key, Opcode::Set, || kivi_protocol::Request {
             namespace: self.shared.namespace,
             opcode: Opcode::Set,
             hint: None,
@@ -616,6 +837,8 @@ impl NativeClient {
             value: Some(value.to_vec()),
             delta: 0,
             expiry: 0,
+            identity: None,
+            ack_floor: RequestSeq::from_u64(0),
         })?;
         match response.body {
             ResponseBody::Stored { .. } => Ok(()),
@@ -630,7 +853,7 @@ impl NativeClient {
     /// Returns [`ClientError`] on transport/routing failure.
     pub fn delete(&self, key: &Key) -> Result<bool, ClientError> {
         use kivi_protocol::{Opcode, ResponseBody};
-        let response = self.execute(key, || kivi_protocol::Request {
+        let response = self.execute(key, Opcode::Delete, || kivi_protocol::Request {
             namespace: self.shared.namespace,
             opcode: Opcode::Delete,
             hint: None,
@@ -638,6 +861,8 @@ impl NativeClient {
             value: None,
             delta: 0,
             expiry: 0,
+            identity: None,
+            ack_floor: RequestSeq::from_u64(0),
         })?;
         match response.body {
             ResponseBody::Deleted { existed } => Ok(existed),
@@ -652,7 +877,7 @@ impl NativeClient {
     /// Returns [`ClientError`] on transport/routing failure.
     pub fn exists(&self, key: &Key) -> Result<bool, ClientError> {
         use kivi_protocol::{Opcode, ResponseBody};
-        let response = self.execute(key, || kivi_protocol::Request {
+        let response = self.execute(key, Opcode::Exists, || kivi_protocol::Request {
             namespace: self.shared.namespace,
             opcode: Opcode::Exists,
             hint: None,
@@ -660,6 +885,8 @@ impl NativeClient {
             value: None,
             delta: 0,
             expiry: 0,
+            identity: None,
+            ack_floor: RequestSeq::from_u64(0),
         })?;
         match response.body {
             ResponseBody::Exists(present) => Ok(present),
@@ -674,7 +901,7 @@ impl NativeClient {
     /// Returns [`ClientError`] on transport/routing failure or wrong-type access.
     pub fn counter_get(&self, key: &Key) -> Result<Option<i64>, ClientError> {
         use kivi_protocol::{Opcode, ResponseBody};
-        let response = self.execute(key, || kivi_protocol::Request {
+        let response = self.execute(key, Opcode::CounterGet, || kivi_protocol::Request {
             namespace: self.shared.namespace,
             opcode: Opcode::CounterGet,
             hint: None,
@@ -682,6 +909,8 @@ impl NativeClient {
             value: None,
             delta: 0,
             expiry: 0,
+            identity: None,
+            ack_floor: RequestSeq::from_u64(0),
         })?;
         match response.body {
             ResponseBody::Counter(value) => Ok(Some(value)),
@@ -700,7 +929,7 @@ impl NativeClient {
     /// access, or counter overflow.
     pub fn counter_add(&self, key: &Key, delta: i64) -> Result<i64, ClientError> {
         use kivi_protocol::{Opcode, ResponseBody};
-        let response = self.execute(key, || kivi_protocol::Request {
+        let response = self.execute(key, Opcode::CounterAdd, || kivi_protocol::Request {
             namespace: self.shared.namespace,
             opcode: Opcode::CounterAdd,
             hint: None,
@@ -708,6 +937,8 @@ impl NativeClient {
             value: None,
             delta,
             expiry: 0,
+            identity: None,
+            ack_floor: RequestSeq::from_u64(0),
         })?;
         match response.body {
             ResponseBody::CounterUpdated { value, .. } => Ok(value),
@@ -724,7 +955,7 @@ impl NativeClient {
     /// Returns [`ClientError`] on transport/routing failure.
     pub fn expire_at(&self, key: &Key, expires_at: UnixMicros) -> Result<bool, ClientError> {
         use kivi_protocol::{Opcode, ResponseBody};
-        let response = self.execute(key, || kivi_protocol::Request {
+        let response = self.execute(key, Opcode::ExpireAt, || kivi_protocol::Request {
             namespace: self.shared.namespace,
             opcode: Opcode::ExpireAt,
             hint: None,
@@ -732,6 +963,8 @@ impl NativeClient {
             value: None,
             delta: 0,
             expiry: expires_at.as_micros(),
+            identity: None,
+            ack_floor: RequestSeq::from_u64(0),
         })?;
         match response.body {
             ResponseBody::ExpirySet { applied } => Ok(applied),
@@ -748,7 +981,7 @@ impl NativeClient {
     /// Returns [`ClientError`] on transport/routing failure.
     pub fn persist_expiry(&self, key: &Key) -> Result<bool, ClientError> {
         use kivi_protocol::{Opcode, ResponseBody};
-        let response = self.execute(key, || kivi_protocol::Request {
+        let response = self.execute(key, Opcode::PersistExpiry, || kivi_protocol::Request {
             namespace: self.shared.namespace,
             opcode: Opcode::PersistExpiry,
             hint: None,
@@ -756,6 +989,8 @@ impl NativeClient {
             value: None,
             delta: 0,
             expiry: 0,
+            identity: None,
+            ack_floor: RequestSeq::from_u64(0),
         })?;
         match response.body {
             ResponseBody::ExpiryPersisted { removed } => Ok(removed),
@@ -770,7 +1005,7 @@ impl NativeClient {
     /// Returns [`ClientError`] on transport/routing failure.
     pub fn get_expiry(&self, key: &Key) -> Result<Option<kivi_types::Expiry>, ClientError> {
         use kivi_protocol::{Opcode, ResponseBody};
-        let response = self.execute(key, || kivi_protocol::Request {
+        let response = self.execute(key, Opcode::GetExpiry, || kivi_protocol::Request {
             namespace: self.shared.namespace,
             opcode: Opcode::GetExpiry,
             hint: None,
@@ -778,6 +1013,8 @@ impl NativeClient {
             value: None,
             delta: 0,
             expiry: 0,
+            identity: None,
+            ack_floor: RequestSeq::from_u64(0),
         })?;
         match response.body {
             ResponseBody::ExpiryAt(stamp) => Ok(Some(kivi_types::Expiry::at(
@@ -807,5 +1044,57 @@ impl NativeClient {
             .write_all(&bytes)
             .map_err(|error| ClientError::Io(error.to_string()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_client() -> NativeClient {
+        NativeClient::new(ClientConfig {
+            seeds: vec!["127.0.0.1:1".to_owned()],
+            ..ClientConfig::default()
+        })
+        .expect("client builds without dialing")
+    }
+
+    #[test]
+    fn sessions_carry_distinct_csprng_identities() {
+        let first = test_client();
+        let second = test_client();
+        assert_ne!(
+            first.shared.session, second.shared.session,
+            "sessions must differ (CSPRNG collision would break dedup isolation)"
+        );
+    }
+
+    #[test]
+    fn floor_advances_only_over_consecutive_completions() {
+        let client = test_client();
+        // Allocate 1, 2, 3; complete out of order: the floor must wait.
+        let (_, floor) = client.alloc_seq().expect("seq 1");
+        assert_eq!(floor.as_u64(), 0);
+        let (_, _) = client.alloc_seq().expect("seq 2");
+        let (_, _) = client.alloc_seq().expect("seq 3");
+        client.complete_seq(3);
+        client.complete_seq(1);
+        let (_, floor) = client.alloc_seq().expect("seq 4");
+        // 2 still in flight: floor stays at 1 even though 3 completed.
+        assert_eq!(floor.as_u64(), 1);
+        client.complete_seq(2);
+        let (_, floor) = client.alloc_seq().expect("seq 5");
+        // 2 completed, but 4 is still in flight: floor stops at 3.
+        assert_eq!(floor.as_u64(), 3);
+    }
+
+    #[test]
+    fn abandonment_completes_so_floors_never_stall() {
+        let client = test_client();
+        let _ = client.alloc_seq().expect("seq 1");
+        // Abandoned (timeout give-up): completing it lets the floor pass.
+        client.complete_seq(1);
+        let (_, floor) = client.alloc_seq().expect("seq 2");
+        assert_eq!(floor.as_u64(), 1);
     }
 }

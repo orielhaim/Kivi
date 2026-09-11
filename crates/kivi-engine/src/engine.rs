@@ -19,15 +19,17 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use crossbeam_channel::{TrySendError, bounded};
+use kivi_durability::{LaneIdentity, LocalWalLane, RecoverySummary};
+use kivi_protocol::Capabilities;
 use kivi_state::{Key, Operation, OperationResult, PartitionHasher};
 use kivi_tablet::DirectorySnapshot;
-use kivi_types::{NamespaceId, TabletId, UnixMicros, WorkerId};
+use kivi_types::{ClusterId, NamespaceId, NodeId, NodeIncarnation, TabletId, UnixMicros, WorkerId};
 
 use crate::clock::SystemClock;
 use crate::routing::{Placement, RoutingError, RoutingSnapshot};
 use crate::tablet::{LiveTablet, TabletError};
 use crate::worker::{
-    TabletRequest, WorkerControl, WorkerHandle, WorkerMetrics, WorkerRequestError,
+    TabletRequest, WorkerControl, WorkerDurability, WorkerHandle, WorkerMetrics, WorkerRequestError,
 };
 
 /// Networked spawn outcome: handles, channel senders, and bound addresses.
@@ -35,6 +37,14 @@ type NetworkSpawn = (
     Vec<WorkerHandle>,
     Vec<crossbeam_channel::Sender<TabletRequest>>,
     Vec<std::net::SocketAddr>,
+);
+
+/// Merged recovery scan: per-tablet commit-ordered records plus lane
+/// totals (segments scanned, torn-tail bytes truncated).
+type RecoveryScan = (
+    std::collections::HashMap<TabletId, Vec<(u64, kivi_durability::WalRecord)>>,
+    u64,
+    u64,
 );
 
 /// Capacity of each client response rendezvous: exactly one outcome travels
@@ -59,6 +69,55 @@ pub struct EngineConfig {
     /// Network serving. `None` keeps channel-only workers (embedded use,
     /// tests); `Some` binds one native endpoint per worker with CPU affinity.
     pub network: Option<crate::net::EngineNetwork>,
+    /// Durability mode. `Ephemeral` keeps the pure in-memory behavior;
+    /// `Durable` persists every mutating request through per-worker WAL
+    /// lanes and replays them at startup before any listener binds.
+    pub durability: DurabilityMode,
+}
+
+/// Durability mode: in-memory speed or crash-recoverable persistence.
+/// There is no silent default — callers choose explicitly so a supposed
+/// durable deployment can never run on the memory provider.
+#[derive(Debug, Clone)]
+pub enum DurabilityMode {
+    /// Pure in-memory behavior: no WAL, no dedup, no recovery.
+    Ephemeral,
+    /// Crash-recoverable: per-worker WAL lanes plus startup replay.
+    Durable(DurableConfig),
+}
+
+/// Durable-mode configuration (data directory already opened by the
+/// caller: lock held, identity established, incarnation advanced).
+#[derive(Debug, Clone)]
+pub struct DurableConfig {
+    /// Data-directory root (WAL lives in `<data-dir>/wal`).
+    pub data_dir: std::path::PathBuf,
+    /// Segment rotation target in bytes.
+    pub segment_target_bytes: u64,
+    /// This node's identity (from the data directory, never flags).
+    pub node: NodeId,
+    /// This cluster's identity (from the data directory).
+    pub cluster: ClusterId,
+    /// This process's incarnation (stamped into new segments).
+    pub incarnation: NodeIncarnation,
+    /// Share one WAL lane across all workers behind a mutex (the
+    /// group-commit experiment arm) instead of private per-worker lanes.
+    pub shared_wal: bool,
+}
+
+/// Durability facts a running engine exposes to the admin plane.
+#[derive(Debug, Clone)]
+pub struct EngineDurability {
+    /// Data-directory root.
+    pub data_dir: std::path::PathBuf,
+    /// This node's identity.
+    pub node: NodeId,
+    /// This cluster's identity.
+    pub cluster: ClusterId,
+    /// This process's incarnation.
+    pub incarnation: NodeIncarnation,
+    /// What recovery replayed at startup.
+    pub recovery: kivi_durability::RecoverySummary,
 }
 
 /// Renders the optional panic-payload suffix for
@@ -124,6 +183,19 @@ pub enum EngineError {
         /// What was wrong.
         reason: String,
     },
+    /// Durable setup or recovery failed; the engine never started serving.
+    #[error("durability failed: {0}")]
+    Durability(#[from] kivi_durability::DurabilityError),
+    /// WAL recovery refused to open the database (see the variant for why;
+    /// history is never silently truncated).
+    #[error("recovery failed: {0}")]
+    Recovery(#[from] kivi_durability::RecoveryError),
+    /// A retried identity fell below the session floor.
+    #[error("mutation identity expired below the session floor")]
+    DedupExpired,
+    /// The session holds too many unacknowledged outcomes on the tablet.
+    #[error("session outcome window exhausted")]
+    SessionOverloaded,
 }
 
 impl From<WorkerRequestError> for EngineError {
@@ -132,6 +204,9 @@ impl From<WorkerRequestError> for EngineError {
         match source {
             WorkerRequestError::UnknownTablet { tablet } => Self::UnknownTablet { tablet },
             WorkerRequestError::Tablet(error) => Self::Tablet(error),
+            WorkerRequestError::DedupExpired => Self::DedupExpired,
+            WorkerRequestError::SessionOverloaded => Self::SessionOverloaded,
+            WorkerRequestError::Storage(error) => Self::Durability(error),
         }
     }
 }
@@ -152,6 +227,7 @@ pub struct LocalEngine {
     shared: Arc<EngineShared>,
     workers: Vec<WorkerHandle>,
     bound: Vec<std::net::SocketAddr>,
+    durability: Option<EngineDurability>,
 }
 
 /// Read-only admin/query handle to a running engine.
@@ -166,6 +242,7 @@ pub struct AdminHandle {
     routing: Arc<ArcSwap<RoutingSnapshot>>,
     controls: Vec<(WorkerId, crossbeam_channel::Sender<WorkerControl>)>,
     endpoints: Vec<(WorkerId, std::net::SocketAddr)>,
+    durability: Option<EngineDurability>,
 }
 
 impl AdminHandle {
@@ -212,6 +289,33 @@ impl AdminHandle {
             }
             if let Ok(metrics) = receive.recv() {
                 out.push((*id, metrics));
+            }
+        }
+        out
+    }
+
+    /// Returns the durability facts established at startup (`None` in
+    /// ephemeral mode, which has no data directory).
+    #[must_use]
+    pub fn durability(&self) -> Option<&EngineDurability> {
+        self.durability.as_ref()
+    }
+
+    /// Snapshots every worker's WAL lane (`None` per worker in ephemeral
+    /// mode). Blocking control rendezvous: serve from `spawn_blocking`.
+    #[must_use]
+    pub fn lane_stats_snapshot(&self) -> Vec<(WorkerId, Option<kivi_durability::WorkerLaneStats>)> {
+        let mut out = Vec::new();
+        for (id, control) in &self.controls {
+            let (respond, receive) = crossbeam_channel::bounded(1);
+            if control
+                .try_send(WorkerControl::DurabilityStats { respond })
+                .is_err()
+            {
+                continue;
+            }
+            if let Ok(stats) = receive.recv() {
+                out.push((*id, stats));
             }
         }
         out
@@ -268,6 +372,30 @@ impl LocalEngine {
                 .map_err(|_| EngineError::UnknownWorker { worker })?;
             by_worker[index].push(live);
         }
+        // Durable mode recovers BEFORE any worker spawns (and therefore
+        // before any listener binds): a corrupt database never serves
+        // partial state, and replayed tablets are simply the workers'
+        // initial state.
+        let (lanes, durability) = match &config.durability {
+            DurabilityMode::Ephemeral => ((0..config.worker_count).map(|_| None).collect(), None),
+            DurabilityMode::Durable(cfg) => {
+                let (lanes, summary) = Self::recover_durable(
+                    cfg,
+                    &mut by_worker,
+                    &routing,
+                    config.namespace,
+                    config.worker_count,
+                )?;
+                let info = EngineDurability {
+                    data_dir: cfg.data_dir.clone(),
+                    node: cfg.node,
+                    cluster: cfg.cluster,
+                    incarnation: cfg.incarnation,
+                    recovery: summary,
+                };
+                (lanes, Some(info))
+            }
+        };
         let routing = Arc::new(ArcSwap::from_pointee(routing));
         let (workers, senders, bound) = match &config.network {
             None => {
@@ -275,6 +403,7 @@ impl LocalEngine {
                     config.request_capacity,
                     config.worker_count,
                     by_worker,
+                    lanes,
                 );
                 (workers, senders, Vec::new())
             }
@@ -285,6 +414,7 @@ impl LocalEngine {
                     config.worker_count,
                     by_worker,
                     &routing,
+                    lanes,
                 )?;
                 (workers, senders, bound)
             }
@@ -297,7 +427,216 @@ impl LocalEngine {
             }),
             workers,
             bound,
+            durability,
         })
+    }
+
+    /// Opens every WAL lane, repairs torn tails, and replays committed
+    /// history into the freshly built tablets. Returns per-worker lane
+    /// ownership plus the recovery summary for operators.
+    ///
+    /// Fails (refusing to serve) on corrupt history, structural gaps,
+    /// records for tablets the startup directory does not cover, fencing
+    /// mismatches, commit-chain breaks, or replay divergence.
+    fn recover_durable(
+        cfg: &DurableConfig,
+        by_worker: &mut [Vec<LiveTablet>],
+        routing: &RoutingSnapshot,
+        namespace: NamespaceId,
+        worker_count: usize,
+    ) -> Result<(Vec<Option<WorkerDurability>>, RecoverySummary), EngineError> {
+        let identity = LaneIdentity {
+            cluster: cfg.cluster,
+            node: cfg.node,
+            incarnation: cfg.incarnation,
+        };
+        let wal_dir = cfg.data_dir.join(kivi_durability::node::WAL_DIR_NAME);
+        // One lane per worker, or a single shared lane for the
+        // group-commit experiment arm.
+        let lane_indexes: Vec<u16> = if cfg.shared_wal {
+            vec![0; worker_count]
+        } else {
+            (0..worker_count)
+                .map(|index| {
+                    u16::try_from(index).map_err(|_| EngineError::InvalidConfig {
+                        reason: "worker count exceeds WAL lane space".to_owned(),
+                    })
+                })
+                .collect::<Result<_, _>>()?
+        };
+        let mut lanes =
+            Self::open_recovery_lanes(&wal_dir, &lane_indexes, identity, cfg.segment_target_bytes)?;
+        // Merge records per tablet across lanes (a future tablet may hold
+        // history in several lanes; never assume one lane per tablet).
+        let (per_tablet, segments_scanned, tail_truncated_bytes) =
+            Self::scan_recovery_lanes(&mut lanes)?;
+        // Validate against the startup directory, then replay in commit
+        // order. Records for forgotten tablets fail startup (spec O):
+        // discarding their history would be silent data loss.
+        let (records_replayed, tablets_recovered) =
+            Self::replay_records(by_worker, routing, namespace, per_tablet)?;
+        let summary = RecoverySummary {
+            records_replayed,
+            segments_scanned,
+            tail_truncated_bytes,
+            tablets_recovered,
+        };
+        tracing::info!(
+            records = summary.records_replayed,
+            segments = summary.segments_scanned,
+            truncated_bytes = summary.tail_truncated_bytes,
+            tablets = summary.tablets_recovered,
+            "durable recovery complete",
+        );
+        // Hand lanes to workers: exclusive per worker, or one shared lane.
+        let shared = if cfg.shared_wal {
+            let lane = lanes.remove(&0).expect("shared lane open");
+            Some(std::sync::Arc::new(std::sync::Mutex::new(lane)))
+        } else {
+            None
+        };
+        let mut out = Vec::with_capacity(worker_count);
+        for (index, lane_index) in lane_indexes.into_iter().enumerate() {
+            let worker = WorkerId::from_u64(index as u64);
+            let access = match &shared {
+                Some(shared) => crate::worker::LaneAccess::Shared(Arc::clone(shared)),
+                None => crate::worker::LaneAccess::Exclusive(
+                    lanes.remove(&lane_index).expect("lane open"),
+                ),
+            };
+            out.push(Some(WorkerDurability {
+                namespace,
+                worker,
+                lane: access,
+            }));
+        }
+        Ok((out, summary))
+    }
+
+    /// Opens every distinct WAL lane directory (no scanning yet).
+    fn open_recovery_lanes(
+        wal_dir: &std::path::Path,
+        lane_indexes: &[u16],
+        identity: LaneIdentity,
+        segment_target_bytes: u64,
+    ) -> Result<std::collections::HashMap<u16, LocalWalLane>, EngineError> {
+        use std::collections::HashMap;
+        let mut distinct: Vec<u16> = lane_indexes.to_vec();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let mut lanes = HashMap::new();
+        for lane in distinct {
+            let lane_state = LocalWalLane::open(wal_dir, lane, identity, segment_target_bytes)?;
+            lanes.insert(lane, lane_state);
+        }
+        Ok(lanes)
+    }
+
+    /// Scans every lane exactly once (validating, repairing torn tails)
+    /// and merges records per tablet. Lanes stay open for the handoff.
+    fn scan_recovery_lanes(
+        lanes: &mut std::collections::HashMap<u16, LocalWalLane>,
+    ) -> Result<RecoveryScan, EngineError> {
+        use kivi_durability::WalRecord;
+        use std::collections::HashMap;
+        let mut per_tablet: HashMap<TabletId, Vec<(u64, WalRecord)>> = HashMap::new();
+        let mut segments_scanned = 0u64;
+        let mut tail_truncated_bytes = 0u64;
+        let mut lane_order: Vec<u16> = lanes.keys().copied().collect();
+        lane_order.sort_unstable();
+        for lane in lane_order {
+            let recovery = lanes.get_mut(&lane).expect("lane present").recover()?;
+            segments_scanned += recovery.segments_scanned;
+            tail_truncated_bytes += recovery.truncated_bytes;
+            for entry in recovery.records {
+                per_tablet
+                    .entry(entry.record.tablet())
+                    .or_default()
+                    .push((entry.record.commit().as_u64(), entry.record));
+            }
+        }
+        Ok((per_tablet, segments_scanned, tail_truncated_bytes))
+    }
+
+    /// Validates merged records against the startup directory and replays
+    /// them into the freshly built tablets in commit order.
+    fn replay_records(
+        by_worker: &mut [Vec<LiveTablet>],
+        routing: &RoutingSnapshot,
+        namespace: NamespaceId,
+        per_tablet: std::collections::HashMap<TabletId, Vec<(u64, kivi_durability::WalRecord)>>,
+    ) -> Result<(u64, u64), EngineError> {
+        use kivi_durability::{RecoveryError, WalRecord};
+        let mut records_replayed = 0u64;
+        let mut tablets_recovered = 0u64;
+        for (tablet_id, mut entries) in per_tablet {
+            let descriptor =
+                routing
+                    .directory()
+                    .get(tablet_id)
+                    .ok_or(RecoveryError::UnknownTablet {
+                        tablet: tablet_id.as_u64(),
+                    })?;
+            if !descriptor.state().is_writable() {
+                return Err(RecoveryError::UnknownTablet {
+                    tablet: tablet_id.as_u64(),
+                }
+                .into());
+            }
+            entries.sort_by_key(|(commit, _)| *commit);
+            let live = by_worker
+                .iter_mut()
+                .flatten()
+                .find(|live| live.id() == tablet_id)
+                .ok_or(RecoveryError::UnknownTablet {
+                    tablet: tablet_id.as_u64(),
+                })?;
+            for (_, record) in &entries {
+                if record.namespace() != namespace {
+                    return Err(RecoveryError::NamespaceMismatch {
+                        tablet: tablet_id.as_u64(),
+                        expected: namespace.as_u64(),
+                        found: record.namespace().as_u64(),
+                    }
+                    .into());
+                }
+                if record.epoch() != descriptor.epoch() || record.guard() != descriptor.guard() {
+                    return Err(RecoveryError::FencingMismatch {
+                        tablet: tablet_id.as_u64(),
+                    }
+                    .into());
+                }
+            }
+            for (_, record) in entries {
+                match record {
+                    WalRecord::Mutation(entry) => {
+                        let is_persist = matches!(
+                            entry.mutation.as_operation(),
+                            kivi_state::Operation::PersistExpiry { .. }
+                        );
+                        live.apply_recovered_mutation(
+                            &entry.mutation,
+                            &entry.expected,
+                            is_persist,
+                            entry.commit,
+                            entry.identity.as_ref(),
+                            entry.now,
+                        )?;
+                    }
+                    WalRecord::Outcome(entry) => {
+                        live.install_recovered_outcome(
+                            &entry.outcome,
+                            entry.commit,
+                            entry.identity.as_ref(),
+                            entry.opcode,
+                        )?;
+                    }
+                }
+                records_replayed += 1;
+            }
+            tablets_recovered += 1;
+        }
+        Ok((records_replayed, tablets_recovered))
     }
 
     /// Spawns channel-only workers (embedded path, no networking).
@@ -305,15 +644,16 @@ impl LocalEngine {
         request_capacity: usize,
         worker_count: usize,
         by_worker: Vec<Vec<LiveTablet>>,
+        lanes: Vec<Option<WorkerDurability>>,
     ) -> (
         Vec<WorkerHandle>,
         Vec<crossbeam_channel::Sender<TabletRequest>>,
     ) {
         let mut workers = Vec::with_capacity(worker_count);
         let mut senders = Vec::with_capacity(worker_count);
-        for (index, tablets) in by_worker.into_iter().enumerate() {
+        for ((index, tablets), durability) in by_worker.into_iter().enumerate().zip(lanes) {
             let id = WorkerId::from_u64(index as u64);
-            let handle = WorkerHandle::spawn(id, tablets, request_capacity);
+            let handle = WorkerHandle::spawn(id, tablets, request_capacity, durability);
             senders.push(handle_sender(&handle));
             workers.push(handle);
         }
@@ -328,13 +668,23 @@ impl LocalEngine {
         worker_count: usize,
         by_worker: Vec<Vec<LiveTablet>>,
         routing: &Arc<ArcSwap<RoutingSnapshot>>,
+        lanes: Vec<Option<WorkerDurability>>,
     ) -> Result<NetworkSpawn, EngineError> {
         let endpoints = Arc::new(ArcSwap::new(Arc::new(crate::net::EndpointMap::new())));
+        // Lanes present means durable mode (start() builds all-or-none);
+        // the advertised capabilities follow the mode, never flags.
+        let durable = lanes.iter().any(Option::is_some);
+        debug_assert!(lanes.iter().all(|lane| lane.is_some() == durable));
+        let advertised_caps = if durable {
+            Capabilities::BASE_V1 | Capabilities::DURABLE_MUTATION_DEDUP
+        } else {
+            Capabilities::BASE_V1
+        };
         let mut workers = Vec::with_capacity(worker_count);
         let mut senders = Vec::with_capacity(worker_count);
         let mut bound: Vec<(WorkerId, String)> = Vec::with_capacity(worker_count);
         let mut addrs: Vec<std::net::SocketAddr> = Vec::with_capacity(worker_count);
-        for (index, tablets) in by_worker.into_iter().enumerate() {
+        for ((index, tablets), durability) in by_worker.into_iter().enumerate().zip(lanes) {
             let id = WorkerId::from_u64(index as u64);
             let port = if network.ports.is_empty() {
                 // Port 0 selects an ephemeral port per socket: every worker
@@ -376,6 +726,8 @@ impl LocalEngine {
                 turn: network.turn,
                 node_id: network.node_id,
                 cluster_id: network.cluster_id,
+                incarnation: network.incarnation,
+                advertised_caps,
                 endpoints: Arc::clone(&endpoints),
                 routing: Arc::clone(routing),
             };
@@ -383,6 +735,7 @@ impl LocalEngine {
                 id,
                 tablets,
                 request_capacity,
+                durability,
                 crate::net::NetLaunch {
                     routing: Arc::clone(routing),
                     net,
@@ -476,6 +829,7 @@ impl LocalEngine {
                 .zip(self.bound.iter())
                 .map(|(worker, addr)| (worker.id(), *addr))
                 .collect(),
+            durability: self.durability.clone(),
         }
     }
 
@@ -608,6 +962,9 @@ impl LocalClient {
             tablet,
             op,
             now: SystemClock::wall_now(),
+            // Embedded callers share fate with the process: no retry
+            // identity, so no dedup — durable mode still WALs the write.
+            identity: None,
             respond,
         };
         match sender.try_send(request) {
@@ -815,6 +1172,7 @@ mod tests {
                 key: Key::from("k"),
             },
             now: UnixMicros::from_micros(0),
+            identity: None,
             respond,
         }
     }

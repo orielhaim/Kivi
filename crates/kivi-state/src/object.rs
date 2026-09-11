@@ -9,6 +9,7 @@
 use core::fmt;
 
 use bytes::Bytes;
+use kivi_codec::{CodecError, Decode, Encode, decode_byte_vec, encode_bytes};
 use kivi_types::Expiry;
 
 /// Object key: an immutable shared byte string.
@@ -89,6 +90,23 @@ impl fmt::Display for Key {
     }
 }
 
+impl Encode for Key {
+    fn encoded_len(&self) -> usize {
+        4 + self.len()
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        encode_bytes(out, self.as_bytes());
+    }
+}
+
+impl Decode for Key {
+    fn decode(input: &[u8]) -> Result<(Self, usize), CodecError> {
+        let (bytes, consumed) = decode_byte_vec(input)?;
+        Ok((Self::from(bytes), consumed))
+    }
+}
+
 /// Logical version of one object: `1` at creation, `+1` per state-changing
 /// mutation, checked (never wrapping or saturating).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -144,6 +162,23 @@ impl fmt::Display for ObjectVersion {
     }
 }
 
+impl Encode for ObjectVersion {
+    fn encoded_len(&self) -> usize {
+        8
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.0.encode(out);
+    }
+}
+
+impl Decode for ObjectVersion {
+    fn decode(input: &[u8]) -> Result<(Self, usize), CodecError> {
+        let (raw, consumed) = u64::decode(input)?;
+        Ok((Self::from_u64(raw), consumed))
+    }
+}
+
 /// Reported when an object's version counter cannot advance past `u64::MAX`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
 #[error("object version space exhausted")]
@@ -165,6 +200,37 @@ impl fmt::Display for ObjectType {
         match self {
             Self::Bytes => write!(f, "bytes"),
             Self::StrictCounter => write!(f, "strict-counter"),
+        }
+    }
+}
+
+/// Canonical wire tags. Fixed forever within framing version 1.
+const TAG_OBJECT_BYTES: u8 = 1;
+const TAG_OBJECT_COUNTER: u8 = 2;
+
+impl Encode for ObjectType {
+    fn encoded_len(&self) -> usize {
+        1
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.push(match self {
+            Self::Bytes => TAG_OBJECT_BYTES,
+            Self::StrictCounter => TAG_OBJECT_COUNTER,
+        });
+    }
+}
+
+impl Decode for ObjectType {
+    fn decode(input: &[u8]) -> Result<(Self, usize), CodecError> {
+        let (tag, consumed) = u8::decode(input)?;
+        match tag {
+            TAG_OBJECT_BYTES => Ok((Self::Bytes, consumed)),
+            TAG_OBJECT_COUNTER => Ok((Self::StrictCounter, consumed)),
+            other => Err(CodecError::InvalidTag {
+                kind: "object-type",
+                tag: other,
+            }),
         }
     }
 }

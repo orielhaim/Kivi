@@ -11,6 +11,7 @@ members = [
     "crates/kivi-protocol",
     "crates/kivi-client",
     "crates/kivi-server",
+    "crates/kivi-durability",
 ]
 
 [workspace.package]
@@ -27,6 +28,7 @@ kivi-state = { path = "crates/kivi-state", version = "0.1.0" }
 kivi-protocol = { path = "crates/kivi-protocol", version = "0.1.0" }
 kivi-client = { path = "crates/kivi-client", version = "0.1.0" }
 kivi-engine = { path = "crates/kivi-engine", version = "0.1.0" }
+kivi-durability = { path = "crates/kivi-durability", version = "0.1.0" }
 
 # Mechanism crates borrowed per RFC §209 ("borrow mechanisms, own semantics").
 # The project owns all wire/durable formats; these crates never define them.
@@ -42,6 +44,7 @@ hashbrown = "0.17"
 bytes = "1.12"
 arc-swap = "1.9"
 crossbeam-channel = "0.5"
+getrandom = "0.4"
 compio = { version = "0.19", features = ["net", "time"] }
 core_affinity2 = "0.16"
 tracing = "0.1"
@@ -66,6 +69,7 @@ serde_json = "1.0"
 # Test/benchmark-only mechanisms.
 proptest = "1.11"
 divan = "0.1"
+tempfile = "3.27"
 
 [workspace.lints.rust]
 # `deny` (not `forbid`): zerocopy's derive macros generate sound `unsafe impl`

@@ -8,7 +8,7 @@
 use divan::{Bencher, black_box, counter::ItemsCount};
 
 use bytes::Bytes;
-use kivi_engine::{EngineConfig, LiveTablet, LocalEngine, Placement};
+use kivi_engine::{DurabilityMode, EngineConfig, LiveTablet, LocalEngine, Placement};
 use kivi_state::{Key, Operation};
 use kivi_tablet::{DirectorySnapshot, HashPrefix, PartitionRange};
 use kivi_types::{
@@ -55,6 +55,7 @@ fn root_engine() -> LocalEngine {
         worker_count: 1,
         request_capacity: 1024,
         network: None,
+        durability: DurabilityMode::Ephemeral,
     })
     .expect("engine starts")
 }

@@ -16,15 +16,20 @@
 use core::fmt;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, select};
+use kivi_durability::{
+    CommitProof, DurabilityError, DurabilityLevel, DurabilityProvider, LaneStats, LocalWalLane,
+    PersistIntent, StorageHealth, WalRecord, WorkerLaneStats,
+};
 use kivi_state::{Operation, OperationResult};
-use kivi_types::{TabletId, UnixMicros, WorkerId};
+use kivi_types::{MutationIdentity, NamespaceId, TabletId, UnixMicros, WorkerId};
 
 use crate::net::NetStartError;
 
-use crate::tablet::{LiveTablet, TabletError};
+use crate::tablet::{DurablePrepared, LiveTablet, TabletError};
 
 /// Capacity of each worker's control channel. Control traffic is rare
 /// (shutdown, sweeps); 16 slots cannot realistically fill, and every send
@@ -40,6 +45,10 @@ pub struct TabletRequest {
     pub op: Operation,
     /// Logical wall time captured at the client boundary.
     pub now: UnixMicros,
+    /// Retry identity with acknowledgement floor. Always `None` on the
+    /// embedded path (callers share fate with the process); the native
+    /// path fills it from the request.
+    pub identity: Option<MutationIdentity>,
     /// Where the outcome goes (bounded to one message).
     pub respond: Sender<WorkerResponse>,
 }
@@ -60,6 +69,221 @@ pub enum WorkerRequestError {
     /// Tablet logic rejected or failed the operation.
     #[error("{0}")]
     Tablet(#[source] TabletError),
+    /// A retried identity fell below the session floor: gone, never
+    /// re-executable.
+    #[error("mutation identity expired below the session floor")]
+    DedupExpired,
+    /// The session holds too many unacknowledged outcomes on this tablet.
+    #[error("session outcome window exhausted")]
+    SessionOverloaded,
+    /// The durable write under this request failed; logical state is
+    /// untouched and reads continue where safe.
+    #[error("durable write failed: {0}")]
+    Storage(#[source] DurabilityError),
+}
+
+/// One worker's durable state: namespace plus WAL lane access. `None`
+/// everywhere means ephemeral mode (no persistence, no dedup).
+#[derive(Debug)]
+pub struct WorkerDurability {
+    /// Namespace served (stamped into every record).
+    pub namespace: NamespaceId,
+    /// Owning worker (tracing and lane selection).
+    pub worker: WorkerId,
+    /// Lane access: exclusive per-worker lanes, or one shared lane behind
+    /// a mutex (the group-commit experiment arm).
+    pub lane: LaneAccess,
+}
+
+/// How a worker reaches its WAL lane.
+#[derive(Debug)]
+pub enum LaneAccess {
+    /// Private lane: no synchronization, the production default.
+    Exclusive(LocalWalLane),
+    /// One lane shared by all workers (experiment arm): appends serialize
+    /// on the mutex; recovery and ordering are unchanged.
+    Shared(Arc<Mutex<LocalWalLane>>),
+}
+
+impl WorkerDurability {
+    /// Appends one batch on this worker's lane, syncing before return.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurabilityError`] when the batch cannot be made durable;
+    /// the caller must not mutate logical state.
+    pub fn append(&mut self, records: &[WalRecord]) -> Result<CommitProof, DurabilityError> {
+        let intent = PersistIntent {
+            records,
+            level: DurabilityLevel::Sync,
+        };
+        match &mut self.lane {
+            LaneAccess::Exclusive(lane) => lane.append_batch(&intent),
+            LaneAccess::Shared(shared) => shared
+                .lock()
+                .map_err(|_| DurabilityError::Io {
+                    op: "lock shared WAL lane",
+                    message: "lane mutex poisoned".to_owned(),
+                    code: None,
+                })?
+                .append_batch(&intent),
+        }
+    }
+
+    /// Current coarse lane health.
+    #[must_use]
+    pub fn health(&self) -> StorageHealth {
+        match &self.lane {
+            LaneAccess::Exclusive(lane) => lane.health(),
+            LaneAccess::Shared(shared) => shared
+                .lock()
+                .map_or(StorageHealth::Failed, |lane| lane.health()),
+        }
+    }
+
+    /// Cumulative lane counters (a poisoned shared lane reports zeros;
+    /// poisoning cannot happen — see [`WorkerDurability::append`] — so
+    /// this is unreachable defensiveness, not a silent drop).
+    #[must_use]
+    pub fn stats(&self) -> LaneStats {
+        match &self.lane {
+            LaneAccess::Exclusive(lane) => lane.stats(),
+            LaneAccess::Shared(shared) => {
+                shared.lock().map(|lane| lane.stats()).unwrap_or_default()
+            }
+        }
+    }
+
+    /// Full lane snapshot for the admin plane.
+    #[must_use]
+    pub fn lane_stats(&self) -> WorkerLaneStats {
+        match &self.lane {
+            LaneAccess::Exclusive(lane) => lane.lane_stats(),
+            LaneAccess::Shared(shared) => shared.lock().map_or(
+                WorkerLaneStats {
+                    lane: u16::MAX,
+                    active_segment: 0,
+                    segments: 0,
+                    health: StorageHealth::Failed,
+                    stats: LaneStats::default(),
+                },
+                |lane| lane.lane_stats(),
+            ),
+        }
+    }
+}
+
+/// Durable execution failure: maps onto either channel errors or native
+/// statuses at the caller's boundary, never silently.
+#[derive(Debug)]
+pub(crate) enum DurableFailure {
+    /// Tablet logic failure (read-path rejections, commit exhaustion).
+    Op(TabletError),
+    /// Identity below the session floor.
+    Expired,
+    /// Session outcome window exhausted.
+    Overloaded,
+    /// WAL append failure (logical state untouched).
+    Storage(DurabilityError),
+}
+
+/// Executes one operation through the durable pipeline on an already-owned
+/// tablet: prepare (dedup + predict), persist exactly one record, apply +
+/// verify (mutations) or install (terminal outcomes), reply.
+pub(crate) fn execute_durable(
+    live: &mut LiveTablet,
+    durable: &mut WorkerDurability,
+    op: &Operation,
+    opcode: u8,
+    identity: Option<&MutationIdentity>,
+    now: UnixMicros,
+) -> Result<OperationResult, DurableFailure> {
+    let authority = live.authority();
+    let namespace = durable.namespace;
+    let tablet = live.id();
+    let epoch = authority.epoch();
+    let guard = authority.guard();
+    match live
+        .prepare_durable(op, identity, now)
+        .map_err(DurableFailure::Op)?
+    {
+        DurablePrepared::Read(result) => Ok(result),
+        DurablePrepared::Expired => Err(DurableFailure::Expired),
+        DurablePrepared::Overloaded => Err(DurableFailure::Overloaded),
+        DurablePrepared::DedupHit { outcome, .. } => complete_outcome(outcome),
+        DurablePrepared::Terminal { outcome, identity } => {
+            let commit = live.assign_commit().map_err(DurableFailure::Op)?;
+            let record = WalRecord::Outcome(kivi_durability::wal::OutcomeRecord {
+                namespace,
+                tablet,
+                epoch,
+                guard,
+                commit,
+                now,
+                opcode,
+                identity,
+                outcome: outcome.clone(),
+            });
+            durable
+                .append(std::slice::from_ref(&record))
+                .map_err(DurableFailure::Storage)?;
+            let committed = live.commit_terminal(&outcome, identity.as_ref(), commit, opcode);
+            complete_outcome(committed)
+        }
+        DurablePrepared::Persist {
+            mutation,
+            expected,
+            identity,
+        } => {
+            let commit = live.assign_commit().map_err(DurableFailure::Op)?;
+            let is_persist_expiry = matches!(op, Operation::PersistExpiry { .. });
+            let record = WalRecord::Mutation(kivi_durability::wal::MutationRecord {
+                namespace,
+                tablet,
+                epoch,
+                guard,
+                commit,
+                now,
+                opcode,
+                identity,
+                mutation: mutation.clone(),
+                expected: expected.clone(),
+            });
+            durable
+                .append(std::slice::from_ref(&record))
+                .map_err(DurableFailure::Storage)?;
+            live.commit_persisted(
+                &mutation,
+                &expected,
+                is_persist_expiry,
+                identity.as_ref(),
+                commit,
+                now,
+            )
+            .map_err(DurableFailure::Op)
+        }
+    }
+}
+
+/// Maps a stored terminal outcome onto a reply (shared by dedup hits and
+/// freshly committed terminal outcomes).
+fn complete_outcome(
+    outcome: kivi_state::DurableOutcome,
+) -> Result<OperationResult, DurableFailure> {
+    use kivi_state::DurableOutcome;
+    match outcome {
+        DurableOutcome::Completed(result) => Ok(result),
+        DurableOutcome::Rejected(error) => Err(DurableFailure::Op(TabletError::Op(error))),
+        DurableOutcome::VersionExhausted => Err(DurableFailure::Op(TabletError::Apply(
+            kivi_state::ApplyError::VersionExhausted,
+        ))),
+    }
+}
+
+/// Derives the originating opcode discriminant from a typed operation
+/// (channel path; the native path carries it on the request).
+pub(crate) fn operation_opcode(op: &Operation) -> u8 {
+    kivi_protocol::operation_opcode(op).as_u8()
 }
 
 /// Administrative control message. Handled ahead of queued requests.
@@ -82,6 +306,12 @@ pub enum WorkerControl {
     Metrics {
         /// Where the snapshot goes.
         respond: Sender<WorkerMetrics>,
+    },
+    /// Report the WAL lane snapshot (`None` in ephemeral mode, which has
+    /// no lane). Served from the control channel like metrics.
+    DurabilityStats {
+        /// Where the snapshot goes.
+        respond: Sender<Option<WorkerLaneStats>>,
     },
 }
 
@@ -110,19 +340,25 @@ pub struct WorkerHandle {
 
 impl WorkerHandle {
     /// Spawns the worker thread owning `tablets`, with a bounded request
-    /// queue of `request_capacity`.
+    /// queue of `request_capacity`. `durability` is `None` in ephemeral
+    /// mode; in durable mode the worker owns its WAL lane exclusively.
     ///
     /// # Panics
     ///
     /// Panics if the OS refuses to spawn the thread (resource exhaustion at
     /// startup is fatal — there is no worker to report through).
     #[must_use]
-    pub fn spawn(id: WorkerId, tablets: Vec<LiveTablet>, request_capacity: usize) -> Self {
+    pub fn spawn(
+        id: WorkerId,
+        tablets: Vec<LiveTablet>,
+        request_capacity: usize,
+        durability: Option<WorkerDurability>,
+    ) -> Self {
         let (request_tx, request_rx) = bounded::<TabletRequest>(request_capacity.max(1));
         let (control_tx, control_rx) = bounded::<WorkerControl>(CONTROL_CAPACITY);
         let thread = thread::Builder::new()
             .name(format!("kivi-worker-{}", id.as_u64()))
-            .spawn(move || run(id, tablets, request_rx, control_rx))
+            .spawn(move || run(id, tablets, request_rx, control_rx, durability))
             .expect("worker thread spawns");
         Self {
             id,
@@ -159,6 +395,14 @@ impl WorkerHandle {
     ///
     /// Returns the `TrySendError` (full queue or disconnected worker) for
     /// the caller to map onto engine errors.
+    ///
+    /// # Large error type
+    ///
+    /// The `Err` variant carries the whole request back (it must, so the
+    /// caller can observe what was refused). The single caller maps it to
+    /// the small [`crate::engine::EngineError`] immediately without storing it, so the
+    /// stack cost never materializes.
+    #[allow(clippy::result_large_err)]
     pub fn try_send(&self, request: TabletRequest) -> Result<(), TrySendError<TabletRequest>> {
         self.requests.try_send(request)
     }
@@ -202,6 +446,7 @@ impl WorkerHandle {
         id: WorkerId,
         tablets: Vec<LiveTablet>,
         request_capacity: usize,
+        durability: Option<WorkerDurability>,
         launch: crate::net::NetLaunch,
     ) -> Result<(Self, SocketAddr), NetStartError> {
         let (request_tx, request_rx) = bounded::<TabletRequest>(request_capacity.max(1));
@@ -210,7 +455,9 @@ impl WorkerHandle {
         let thread = thread::Builder::new()
             .name(format!("kivi-worker-{}", id.as_u64()))
             .spawn(move || {
-                crate::net::run_net(id, tablets, request_rx, control_rx, launch, ready_tx);
+                crate::net::run_net(
+                    id, tablets, request_rx, control_rx, durability, launch, ready_tx,
+                );
             })
             .map_err(|error| NetStartError::Startup(error.to_string()))?;
         match ready_rx.recv_timeout(crate::net::STARTUP_TIMEOUT) {
@@ -259,6 +506,7 @@ fn run(
     tablets: Vec<LiveTablet>,
     requests: Receiver<TabletRequest>,
     control: Receiver<WorkerControl>,
+    mut durability: Option<WorkerDurability>,
 ) {
     let _ = id;
     let metrics = core::cell::Cell::new(WorkerMetrics::default());
@@ -269,7 +517,7 @@ fn run(
     loop {
         // Control fast path: administration never waits behind requests.
         if let Ok(message) = control.try_recv() {
-            if !handle_control(message, &mut tablets, &metrics) {
+            if !handle_control(message, &mut tablets, &metrics, durability.as_ref()) {
                 break;
             }
             continue;
@@ -278,7 +526,7 @@ fn run(
             recv(control) -> message => {
                 match message {
                     Ok(message) => {
-                        if !handle_control(message, &mut tablets, &metrics) {
+                        if !handle_control(message, &mut tablets, &metrics, durability.as_ref()) {
                             break;
                         }
                     }
@@ -288,7 +536,7 @@ fn run(
             }
             recv(requests) -> message => {
                 match message {
-                    Ok(request) => handle_request(request, &mut tablets, &metrics),
+                    Ok(request) => handle_request(request, &mut tablets, &metrics, durability.as_mut()),
                     // All clients gone: exit cleanly.
                     Err(_) => break,
                 }
@@ -302,6 +550,7 @@ pub(crate) fn handle_control(
     message: WorkerControl,
     tablets: &mut HashMap<TabletId, LiveTablet>,
     metrics: &core::cell::Cell<WorkerMetrics>,
+    durability: Option<&WorkerDurability>,
 ) -> bool {
     match message {
         WorkerControl::Shutdown => false,
@@ -321,6 +570,10 @@ pub(crate) fn handle_control(
             let _ = respond.try_send(metrics.get());
             true
         }
+        WorkerControl::DurabilityStats { respond } => {
+            let _ = respond.try_send(durability.map(WorkerDurability::lane_stats));
+            true
+        }
     }
 }
 
@@ -330,16 +583,30 @@ pub(crate) fn handle_request(
     request: TabletRequest,
     tablets: &mut HashMap<TabletId, LiveTablet>,
     metrics: &core::cell::Cell<WorkerMetrics>,
+    durability: Option<&mut WorkerDurability>,
 ) {
     let TabletRequest {
         tablet,
         op,
         now,
+        identity,
         respond,
     } = request;
     let outcome = match tablets.get_mut(&tablet) {
         None => Err(WorkerRequestError::UnknownTablet { tablet }),
-        Some(live) => live.execute(&op, now).map_err(WorkerRequestError::Tablet),
+        Some(live) => match durability {
+            None => live.execute(&op, now).map_err(WorkerRequestError::Tablet),
+            Some(durable) => {
+                let opcode = operation_opcode(&op);
+                match execute_durable(live, durable, &op, opcode, identity.as_ref(), now) {
+                    Ok(result) => Ok(result),
+                    Err(DurableFailure::Op(error)) => Err(WorkerRequestError::Tablet(error)),
+                    Err(DurableFailure::Expired) => Err(WorkerRequestError::DedupExpired),
+                    Err(DurableFailure::Overloaded) => Err(WorkerRequestError::SessionOverloaded),
+                    Err(DurableFailure::Storage(error)) => Err(WorkerRequestError::Storage(error)),
+                }
+            }
+        },
     };
     let mut snapshot = metrics.get();
     snapshot.channel_ops += 1;
@@ -385,6 +652,7 @@ mod tests {
                 tablet,
                 op,
                 now: UnixMicros::from_micros(1_000_000),
+                identity: None,
                 respond,
             })
             .expect("admitted");
@@ -393,7 +661,7 @@ mod tests {
 
     #[test]
     fn worker_executes_requests_and_reports_unknown_tablets() {
-        let mut handle = WorkerHandle::spawn(WorkerId::from_u64(0), vec![live_tablet(1)], 16);
+        let mut handle = WorkerHandle::spawn(WorkerId::from_u64(0), vec![live_tablet(1)], 16, None);
         let set = round_trip(
             &handle,
             TabletId::from_u64(1),
@@ -423,7 +691,7 @@ mod tests {
 
     #[test]
     fn sweep_control_reclaims_without_request_queue() {
-        let mut handle = WorkerHandle::spawn(WorkerId::from_u64(0), vec![live_tablet(1)], 16);
+        let mut handle = WorkerHandle::spawn(WorkerId::from_u64(0), vec![live_tablet(1)], 16, None);
         round_trip(
             &handle,
             TabletId::from_u64(1),

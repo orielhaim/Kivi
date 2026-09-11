@@ -132,7 +132,7 @@ const _: () = assert!(core::mem::size_of::<WireHeader>() == FRAME_HEADER_LEN);
 
 /// The 24-byte frame header as validated domain values.
 ///
-/// Parsing goes through [`WireHeader`] (byte movement) plus explicit rule
+/// Parsing goes through `WireHeader` (byte movement) plus explicit rule
 /// checks (magic, version, kind, reserved bits); encoding is the reverse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FrameHeader {

@@ -22,9 +22,12 @@ pub mod worker;
 pub use affinity::{AffinityError, AffinityMode, available_cores, pin_current_thread};
 pub use clock::SystemClock;
 pub use engine::{
-    AdminHandle, EngineConfig, EngineError, LocalClient, LocalEngine, ShutdownReport,
+    AdminHandle, DurabilityMode, DurableConfig, EngineConfig, EngineDurability, EngineError,
+    LocalClient, LocalEngine, ShutdownReport,
 };
 pub use net::{ConnLimits, EngineNetwork, NetConfig, NetStartError, TurnBudget};
 pub use routing::{Placement, RoutingSnapshot};
-pub use tablet::{LiveTablet, TabletError, TabletMetrics};
-pub use worker::{WorkerControl, WorkerMetrics};
+pub use tablet::{
+    DedupEntry, DurablePrepared, LiveTablet, SessionDedup, TabletError, TabletMetrics,
+};
+pub use worker::{LaneAccess, WorkerControl, WorkerDurability, WorkerMetrics};

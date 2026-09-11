@@ -2,24 +2,30 @@
 //!
 //! Starts engine workers (each with its own native TCP endpoint), serves the
 //! read-only admin/control HTTP plane on Tokio, and shuts down orderly on
-//! Ctrl-C. Explicitly **in-memory / non-durable** in this stage:
-//! acknowledged writes survive process crashes only after the durability
-//! fabric lands.
+//! Ctrl-C. Two durability modes, chosen explicitly (never by default):
+//!
+//! * `--ephemeral`: pure in-memory (benchmarks, development).
+//! * `--data-dir <path>`: crash-recoverable local database. The directory
+//!   is locked, node identity loaded or minted, the incarnation advanced,
+//!   WAL lanes recovered and replayed — all before any listener binds.
 
 mod admin;
 
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 
 use admin::AdminState;
 use anyhow::Context;
 use clap::Parser;
 use kivi_engine::{
-    AffinityMode, ConnLimits, EngineConfig, EngineNetwork, LocalEngine, Placement, TurnBudget,
+    AffinityMode, ConnLimits, DurabilityMode, DurableConfig, EngineConfig, EngineNetwork,
+    LocalEngine, Placement, TurnBudget,
 };
 use kivi_state::PartitionHasher;
 use kivi_tablet::{DirectorySnapshot, HashPrefix, PartitionRange};
 use kivi_types::{
-    ClusterId, NamespaceId, NodeId, TabletEpoch, TabletId, WorkerId, WriteGuardGeneration,
+    ClusterId, NamespaceId, NodeId, NodeIncarnation, TabletEpoch, TabletId, WorkerId,
+    WriteGuardGeneration,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -28,7 +34,7 @@ const NS: NamespaceId = NamespaceId::from_u64(1);
 #[derive(Debug, Parser)]
 #[command(
     name = "kivi-server",
-    about = "Kivi single-node native server (in-memory)"
+    about = "Kivi single-node native server (ephemeral or durable)"
 )]
 struct Args {
     /// IP to bind worker listeners on.
@@ -52,12 +58,29 @@ struct Args {
     /// Maximum accepted frame in bytes (protocol ceiling 64 MiB).
     #[arg(long, default_value_t = 64 * 1024 * 1024, value_parser = parse_max_frame)]
     max_frame: usize,
-    /// Node identity for handshakes.
-    #[arg(long, default_value_t = 1)]
+    /// Run without persistence (in-memory; benchmarks and development).
+    /// Exactly one of `--ephemeral` and `--data-dir` is required.
+    #[arg(long, conflicts_with = "data_dir")]
+    ephemeral: bool,
+    /// Data directory for crash-recoverable durable mode. Created with
+    /// node identity and WAL lanes on first startup.
+    #[arg(long, conflicts_with = "ephemeral")]
+    data_dir: Option<PathBuf>,
+    /// Node identity for handshakes (ephemeral mode only; durable mode
+    /// always uses the data directory's persisted identity).
+    #[arg(long, default_value_t = 1, conflicts_with = "data_dir")]
     node: u64,
-    /// Cluster identity for handshakes.
-    #[arg(long, default_value_t = 1)]
+    /// Cluster identity for handshakes (ephemeral mode only).
+    #[arg(long, default_value_t = 1, conflicts_with = "data_dir")]
     cluster: u128,
+    /// WAL segment rotation target in bytes (durable mode only).
+    #[arg(long, default_value_t = kivi_durability::wal::DEFAULT_SEGMENT_TARGET_BYTES)]
+    wal_segment_target: u64,
+    /// Share one WAL lane across all workers behind a mutex instead of
+    /// private per-worker lanes (group-commit experiment arm; durable
+    /// mode only).
+    #[arg(long)]
+    shared_wal: bool,
     /// Admin/control HTTP listen address (loopback by default; `:0` selects
     /// an ephemeral port and prints it).
     #[arg(long, default_value = "127.0.0.1:19080")]
@@ -205,6 +228,69 @@ fn even_split(levels: u32, workers: usize) -> (DirectorySnapshot, Placement) {
     (directory, placement)
 }
 
+/// Opens the durability layer: explicit mode choice, data-directory lock,
+/// identity, and incarnation advance — all before any listener binds.
+/// Returns node/cluster/incarnation, the engine durability mode, and the
+/// lock guard (held for the whole process).
+fn open_durability(
+    args: &Args,
+) -> anyhow::Result<(
+    NodeId,
+    ClusterId,
+    NodeIncarnation,
+    DurabilityMode,
+    Option<kivi_durability::OpenDir>,
+)> {
+    match (&args.ephemeral, &args.data_dir) {
+        (true, None) => {
+            tracing::warn!(
+                "kivi-server: EPHEMERAL mode (no WAL; acknowledged writes die with the process)"
+            );
+            Ok((
+                NodeId::from_u64(args.node),
+                ClusterId::from_u128(args.cluster),
+                NodeIncarnation::INITIAL,
+                DurabilityMode::Ephemeral,
+                None,
+            ))
+        }
+        (false, Some(dir)) => {
+            // Lock, identity, incarnation advance, WAL root — all before
+            // any listener binds (see `open_data_dir`).
+            let opened = kivi_durability::open_data_dir(dir)
+                .with_context(|| format!("open data directory {}", dir.display()))?;
+            let (node, cluster, incarnation) = (
+                opened.meta.node,
+                opened.meta.cluster,
+                opened.meta.incarnation,
+            );
+            tracing::info!(
+                mode = "durable",
+                dir = %dir.display(),
+                node = node.as_u64(),
+                cluster = cluster.as_u128(),
+                incarnation = incarnation.as_u64(),
+                fresh = opened.fresh,
+                "durable mode: data directory open"
+            );
+            let durability = DurabilityMode::Durable(DurableConfig {
+                data_dir: dir.clone(),
+                segment_target_bytes: args.wal_segment_target,
+                node,
+                cluster,
+                incarnation,
+                shared_wal: args.shared_wal,
+            });
+            Ok((node, cluster, incarnation, durability, Some(opened)))
+        }
+        _ => {
+            anyhow::bail!(
+                "choose exactly one durability mode: --ephemeral (in-memory) or --data-dir <path> (crash-recoverable)"
+            );
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -227,8 +313,9 @@ fn main() -> anyhow::Result<()> {
             "fewer cores listed than workers; wrapping round-robin"
         );
     }
-    let node = NodeId::from_u64(args.node);
-    let cluster = ClusterId::from_u128(args.cluster);
+    // The lock guard lives for the whole process: dropping it would
+    // release the data directory to a second process mid-run.
+    let (node, cluster, incarnation, durability, _data_dir_guard) = open_durability(&args)?;
     let levels = args.tablets.trailing_zeros();
     let (directory, placement) = even_split(levels, args.workers);
     let tablet_count = directory
@@ -250,12 +337,13 @@ fn main() -> anyhow::Result<()> {
             affinity: args.pin.clone(),
             node_id: node,
             cluster_id: cluster,
+            incarnation,
             conn: ConnLimits::default(),
             turn: TurnBudget::default(),
         }),
+        durability,
     })
     .context("engine failed to start")?;
-    tracing::warn!("kivi-server: IN-MEMORY / NON-DURABLE build (no WAL yet)");
     tracing::info!(
         tablets = tablet_count,
         workers = args.workers,
@@ -269,6 +357,7 @@ fn main() -> anyhow::Result<()> {
     let state = AdminState {
         node,
         cluster,
+        incarnation,
         engine: engine.admin_handle(),
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()

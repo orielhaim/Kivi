@@ -29,7 +29,7 @@ pub mod time;
 
 pub use authority::{AuthorityMismatch, TabletAuthority};
 pub use hash::{ChunkId, PartitionHash};
-pub use identity::{IdempotencyKey, RequestIdentity};
+pub use identity::{IdempotencyKey, MutationIdentity, RequestIdentity};
 pub use ids::{
     ClusterId, CommitPosition, CpuId, GenerationExhausted, NamespaceId, NodeId, NodeIncarnation,
     NumaId, RequestSeq, SecurityDomainId, SequenceExhausted, SessionId, TabletEpoch, TabletId,

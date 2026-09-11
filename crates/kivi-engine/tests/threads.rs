@@ -11,7 +11,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 use bytes::Bytes;
-use kivi_engine::{EngineConfig, EngineError, LocalClient, LocalEngine, Placement};
+use kivi_engine::{DurabilityMode, EngineConfig, EngineError, LocalClient, LocalEngine, Placement};
 use kivi_state::{Key, ObjectStore, Operation};
 use kivi_tablet::{DirectorySnapshot, HashPrefix, PartitionRange};
 use kivi_types::{NamespaceId, TabletEpoch, TabletId, UnixMicros, WorkerId, WriteGuardGeneration};
@@ -111,6 +111,7 @@ fn concurrent_counter_is_exact() {
         worker_count: 1,
         request_capacity: 16,
         network: None,
+        durability: DurabilityMode::Ephemeral,
     })
     .expect("engine starts");
     let key = Key::from("counter");
@@ -148,6 +149,7 @@ fn multi_tablet_parallelism_makes_independent_progress() {
         worker_count: 2,
         request_capacity: 64,
         network: None,
+        durability: DurabilityMode::Ephemeral,
     })
     .expect("engine starts");
     assert_ne!(
@@ -235,6 +237,7 @@ fn mixed_workload_matches_sequential_reference() {
         worker_count: 2,
         request_capacity: 64,
         network: None,
+        durability: DurabilityMode::Ephemeral,
     })
     .expect("engine starts");
     // Reference: the same scripts applied sequentially per disjoint key set.

@@ -54,6 +54,41 @@ const TAG_DELETE: u8 = 2;
 const TAG_COUNTER_ADD: u8 = 3;
 const TAG_SET_EXPIRY: u8 = 4;
 
+impl Mutation {
+    /// Reconstructs the originating operation. Exact inverse of
+    /// `prepare`'s normalization: `SetExpiry{NEVER}` always came from
+    /// `PersistExpiry` (which is the only producer of `NEVER`), any other
+    /// expiry came from `ExpireAt`. WAL replay uses this to share the single
+    /// [`outcome_for`](crate::ops::outcome_for) mapping with the live path.
+    #[must_use]
+    pub fn as_operation(&self) -> crate::ops::Operation {
+        use crate::ops::Operation;
+        match self {
+            Self::PutBytes { key, value } => Operation::Set {
+                key: key.clone(),
+                value: value.clone(),
+            },
+            Self::Delete { key } => Operation::Delete { key: key.clone() },
+            Self::CounterAdd { key, delta } => Operation::CounterAdd {
+                key: key.clone(),
+                delta: *delta,
+            },
+            Self::SetExpiry { key, expiry } => {
+                if *expiry == kivi_types::Expiry::NEVER {
+                    Operation::PersistExpiry { key: key.clone() }
+                } else {
+                    Operation::ExpireAt {
+                        key: key.clone(),
+                        expires_at: expiry
+                            .as_stamp()
+                            .unwrap_or(kivi_types::UnixMicros::from_micros(0)),
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl Encode for Mutation {
     fn encoded_len(&self) -> usize {
         match self {

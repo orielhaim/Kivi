@@ -16,13 +16,16 @@
 //! consensus layer can propose the same mutations without changing tablet logic.
 
 use core::fmt;
+use std::collections::{BTreeMap, HashMap};
 
 use kivi_state::{
-    ApplyError, ApplyOutcome, Key, Mutation, ObjectStore, OpError, Operation, OperationResult,
-    Prepared,
+    ApplyError, ApplyOutcome, DurableOutcome, Key, Mutation, ObjectStore, OpError, Operation,
+    OperationResult, Prepared, StorePrepared,
 };
 use kivi_tablet::TabletDescriptor;
-use kivi_types::{TabletAuthority, TabletId, UnixMicros};
+use kivi_types::{
+    CommitPosition, MutationIdentity, RequestSeq, SessionId, TabletAuthority, TabletId, UnixMicros,
+};
 
 /// Local per-tablet counters. Plain integers behind the owner thread —
 /// aggregation across workers happens outside the hot path.
@@ -56,6 +59,148 @@ pub enum TabletError {
     /// Mutation application failed; see the variant for what held.
     #[error("mutation failed: {0}")]
     Apply(#[from] ApplyError),
+    /// This tablet's commit positions are exhausted; it can accept no
+    /// further durable mutations (practically unreachable: 2^64 slots).
+    #[error("tablet {tablet} commit position space exhausted")]
+    CommitExhausted {
+        /// The affected tablet.
+        tablet: TabletId,
+    },
+}
+
+/// Maximum retained unacknowledged outcomes per session on one tablet.
+/// Past this, new mutations for the session fail explicitly
+/// (`SessionOverloaded`) instead of silently evicting an outcome that a
+/// later retry might need. The client disciplines itself to 256
+/// outstanding; this is the backstop, not the target.
+pub const SESSION_OUTCOME_CAP: usize = 1024;
+
+/// One retained outcome: enough to answer a retried identity byte-for-byte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DedupEntry {
+    /// Commit position that installed this outcome.
+    pub commit: CommitPosition,
+    /// Originating opcode discriminant (response shaping).
+    pub opcode: u8,
+    /// The recorded outcome.
+    pub outcome: DurableOutcome,
+}
+
+/// One session's dedup state on one tablet: the durable floor plus the
+/// retained outcomes above it. The floor survives with an empty outcome
+/// map (a compact floor record); sessions are never garbage-collected in
+/// this stage — correctness over reclamation, and the eventual
+/// session-retention design must preserve the "never execute again" rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionDedup {
+    floor: RequestSeq,
+    outcomes: BTreeMap<RequestSeq, DedupEntry>,
+}
+
+impl SessionDedup {
+    /// Empty state: nothing acknowledged, nothing retained.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            floor: RequestSeq::from_u64(0),
+            outcomes: BTreeMap::new(),
+        }
+    }
+
+    /// Advances the floor over the client's watermark, dropping outcomes
+    /// the client explicitly acknowledged (and will never retry).
+    pub fn advance_floor(&mut self, ack: RequestSeq) {
+        if ack.as_u64() > self.floor.as_u64() {
+            self.floor = ack;
+            self.outcomes.retain(|seq, _| seq.as_u64() > ack.as_u64());
+        }
+    }
+
+    /// Returns the retained outcome for an in-window sequence, if any.
+    #[must_use]
+    pub fn get(&self, seq: RequestSeq) -> Option<&DedupEntry> {
+        self.outcomes.get(&seq)
+    }
+
+    /// Returns the current floor.
+    #[must_use]
+    pub const fn floor(&self) -> RequestSeq {
+        self.floor
+    }
+
+    /// Returns the retained outcome count (window accounting).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.outcomes.len()
+    }
+
+    /// Whether no outcomes are retained.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.outcomes.is_empty()
+    }
+}
+
+/// Durable preparation: what the worker must persist (if anything) before
+/// replying, plus the fast paths that skip persistence entirely.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DurablePrepared {
+    /// Read-only outcome: reply directly, no WAL, no dedup, no commit.
+    Read(OperationResult),
+    /// Mutation with its predicted outcome: persist a mutation record,
+    /// then apply and verify.
+    Persist {
+        /// Mutation to persist and apply.
+        mutation: Mutation,
+        /// Outcome `apply` must reproduce.
+        expected: OperationResult,
+        /// Retry identity with floor, if the request carried one.
+        identity: Option<MutationIdentity>,
+    },
+    /// Terminal outcome with no mutation: persist an outcome-only record,
+    /// install dedup, then reply.
+    Terminal {
+        /// Terminal outcome to persist and replay.
+        outcome: DurableOutcome,
+        /// Retry identity with floor, if the request carried one.
+        identity: Option<MutationIdentity>,
+    },
+    /// Identity already completed: reply with the stored outcome. No WAL,
+    /// no commit advance, no re-execution.
+    DedupHit {
+        /// The recorded outcome.
+        outcome: DurableOutcome,
+        /// Originating opcode discriminant.
+        opcode: u8,
+    },
+    /// The identity fell at or below the session floor: its outcome is
+    /// gone and it will never execute again. Reply `DedupExpired`
+    /// without touching the WAL or the commit sequence.
+    Expired,
+    /// The session holds too many unacknowledged outcomes: reject before
+    /// persisting anything (so no phantom execution can follow).
+    Overloaded,
+}
+
+/// Maps a persisted mutation back to its originating opcode discriminant
+/// (response shaping + replay mapping). The `is_persist_expiry` flag is the
+/// same one [`kivi_state::outcome_for`] takes: both derive from the single
+/// originating request, so they cannot disagree.
+fn opcode_for(mutation: &Mutation, is_persist_expiry: bool) -> u8 {
+    use kivi_protocol::Opcode;
+    match mutation {
+        Mutation::PutBytes { .. } => Opcode::Set,
+        Mutation::Delete { .. } => Opcode::Delete,
+        Mutation::CounterAdd { .. } => Opcode::CounterAdd,
+        Mutation::SetExpiry { .. } => {
+            if is_persist_expiry {
+                Opcode::PersistExpiry
+            } else {
+                Opcode::ExpireAt
+            }
+        }
+    }
+    .as_u8()
 }
 
 /// One mutable tablet replica. `Send` (it moves between threads only at
@@ -66,6 +211,8 @@ pub struct LiveTablet {
     authority: TabletAuthority,
     store: ObjectStore,
     metrics: TabletMetrics,
+    next_commit: CommitPosition,
+    dedup: HashMap<SessionId, SessionDedup>,
 }
 
 impl LiveTablet {
@@ -92,6 +239,8 @@ impl LiveTablet {
             authority,
             store: ObjectStore::new(),
             metrics: TabletMetrics::default(),
+            next_commit: CommitPosition::UNASSIGNED,
+            dedup: HashMap::new(),
         })
     }
 
@@ -176,28 +325,314 @@ impl LiveTablet {
                 let outcome = self.store.apply(&mutation, now)?;
                 self.metrics.writes += 1;
                 self.metrics.ops_total += 1;
-                Ok(match (op, outcome) {
-                    (Operation::Set { .. }, ApplyOutcome::Put { version }) => {
-                        OperationResult::Stored { version }
-                    }
-                    (Operation::Delete { .. }, ApplyOutcome::Deleted { existed }) => {
-                        OperationResult::Deleted { existed }
-                    }
-                    (Operation::CounterAdd { .. }, ApplyOutcome::Counter { value, version }) => {
-                        OperationResult::CounterUpdated { value, version }
-                    }
-                    (Operation::ExpireAt { .. }, ApplyOutcome::Expiry { applied, .. }) => {
-                        OperationResult::ExpirySet { applied }
-                    }
-                    (Operation::PersistExpiry { .. }, ApplyOutcome::Expiry { applied, .. }) => {
-                        OperationResult::ExpiryPersisted { removed: applied }
-                    }
-                    (op, outcome) => {
-                        panic!("prepare/apply contract violated: {op:?} -> {outcome:?}")
-                    }
-                })
+                Ok(kivi_state::outcome_for(
+                    &mutation,
+                    &outcome,
+                    matches!(op, Operation::PersistExpiry { .. }),
+                ))
             }
         }
+    }
+
+    /// Prepares one operation for the durable pipeline: dedup lookup and
+    /// floor advance first, then store preparation. Never persists, never
+    /// mutates logical state — the caller persists exactly what this
+    /// returns before replying.
+    ///
+    /// Identity `None` (embedded callers, which share fate with the
+    /// process) skips dedup but still goes through the WAL in durable
+    /// mode; the worker decides persistence from the returned shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TabletError::Op`] for read-only opcode failures only;
+    /// mutating failures arrive as [`DurablePrepared::Terminal`].
+    pub fn prepare_durable(
+        &mut self,
+        op: &Operation,
+        identity: Option<&MutationIdentity>,
+        now: UnixMicros,
+    ) -> Result<DurablePrepared, TabletError> {
+        if let Some(marker) = identity {
+            let session = self
+                .dedup
+                .entry(marker.client.session())
+                .or_insert_with(SessionDedup::empty);
+            session.advance_floor(marker.ack_floor);
+            let seq = marker.client.seq();
+            if seq.as_u64() <= session.floor().as_u64() {
+                // Unreachable for well-formed clients (the floor only
+                // passes consecutively completed sequences, and a live
+                // identity is never completed beneath itself), but a
+                // violated invariant must fail closed — never re-execute.
+                return Ok(DurablePrepared::Expired);
+            }
+            if let Some(entry) = session.get(seq) {
+                return Ok(DurablePrepared::DedupHit {
+                    outcome: entry.outcome.clone(),
+                    opcode: entry.opcode,
+                });
+            }
+            if session.len() >= SESSION_OUTCOME_CAP {
+                return Ok(DurablePrepared::Overloaded);
+            }
+        }
+        match self.store.prepare_durable(op, now)? {
+            StorePrepared::Read(result) => Ok(DurablePrepared::Read(result)),
+            StorePrepared::Terminal(outcome) => Ok(DurablePrepared::Terminal {
+                outcome,
+                identity: identity.copied(),
+            }),
+            StorePrepared::Write { mutation, expected } => Ok(DurablePrepared::Persist {
+                mutation,
+                expected,
+                identity: identity.copied(),
+            }),
+        }
+    }
+
+    /// Assigns this tablet's next commit position (exactly once per
+    /// accepted durable request). The caller persists the record under the
+    /// returned position before applying anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TabletError::CommitExhausted`] when the position space is
+    /// exhausted (practically unreachable: 2^64 slots per tablet).
+    pub fn assign_commit(&mut self) -> Result<CommitPosition, TabletError> {
+        let next = self
+            .next_commit
+            .next()
+            .map_err(|_| TabletError::CommitExhausted { tablet: self.id })?;
+        self.next_commit = next;
+        Ok(next)
+    }
+
+    /// Returns the last assigned commit position (`UNASSIGNED` before the
+    /// first durable request or replay).
+    #[must_use]
+    pub const fn next_commit(&self) -> CommitPosition {
+        self.next_commit
+    }
+
+    /// Commits a persisted mutation: applies it, verifies the outcome
+    /// against the persisted expectation, installs dedup, and returns the
+    /// reply outcome.
+    ///
+    /// A verification mismatch is process-fatal (panic): durable truth now
+    /// exists, so returning a normal recoverable error would be dishonest.
+    /// On restart, replay applies the same durable mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TabletError::Apply`] when application itself fails (only
+    /// reachable on divergent state — same log on same state never
+    /// produces it, which is exactly what the verification below guards).
+    ///
+    /// # Panics
+    ///
+    /// Panics when re-application diverges from the persisted expectation
+    /// (corruption, semantic incompatibility, or a deterministic-apply
+    /// bug).
+    ///
+    /// # Panics
+    ///
+    /// Panics when re-application diverges from the persisted expectation
+    /// (corruption, semantic incompatibility, or a deterministic-apply
+    /// bug).
+    pub fn commit_persisted(
+        &mut self,
+        mutation: &Mutation,
+        expected: &OperationResult,
+        is_persist_expiry: bool,
+        identity: Option<&MutationIdentity>,
+        commit: CommitPosition,
+        now: UnixMicros,
+    ) -> Result<OperationResult, TabletError> {
+        debug_assert_eq!(self.next_commit, commit);
+        let outcome = self.store.apply(mutation, now)?;
+        let result = kivi_state::outcome_for(mutation, &outcome, is_persist_expiry);
+        assert_eq!(
+            &result,
+            expected,
+            "durable apply diverged on tablet {} commit {}: persisted {expected:?}, recomputed {result:?}",
+            self.id.as_u64(),
+            commit.as_u64(),
+        );
+        if let Some(marker) = identity {
+            self.install_dedup(
+                marker.client.session(),
+                marker.client.seq(),
+                DedupEntry {
+                    commit,
+                    opcode: opcode_for(mutation, is_persist_expiry),
+                    outcome: DurableOutcome::Completed(result.clone()),
+                },
+            );
+        }
+        self.metrics.writes += 1;
+        self.metrics.ops_total += 1;
+        Ok(result)
+    }
+
+    /// Commits a persisted terminal outcome (no mutation to apply):
+    /// installs dedup and returns the outcome for reply.
+    pub fn commit_terminal(
+        &mut self,
+        outcome: &DurableOutcome,
+        identity: Option<&MutationIdentity>,
+        commit: CommitPosition,
+        opcode: u8,
+    ) -> DurableOutcome {
+        debug_assert_eq!(self.next_commit, commit);
+        if let Some(marker) = identity {
+            self.install_dedup(
+                marker.client.session(),
+                marker.client.seq(),
+                DedupEntry {
+                    commit,
+                    opcode,
+                    outcome: outcome.clone(),
+                },
+            );
+        }
+        self.metrics.ops_total += 1;
+        outcome.clone()
+    }
+
+    /// Replays one recovered mutation record: validates the commit chain,
+    /// re-applies deterministically at the recorded timestamp, verifies
+    /// against the recorded expectation, and installs dedup.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`kivi_durability::RecoveryError`] on chain breaks or
+    /// outcome divergence. Never panics on record contents.
+    pub fn apply_recovered_mutation(
+        &mut self,
+        mutation: &Mutation,
+        expected: &OperationResult,
+        is_persist_expiry: bool,
+        commit: CommitPosition,
+        identity: Option<&MutationIdentity>,
+        now: UnixMicros,
+    ) -> Result<(), kivi_durability::RecoveryError> {
+        use kivi_durability::RecoveryError;
+        let expected_pos = self
+            .next_commit
+            .next()
+            .map_err(|_| RecoveryError::ChainBreak {
+                tablet: self.id.as_u64(),
+                expected: u64::MAX,
+                found: commit.as_u64(),
+            })?;
+        if commit != expected_pos {
+            return Err(RecoveryError::ChainBreak {
+                tablet: self.id.as_u64(),
+                expected: expected_pos.as_u64(),
+                found: commit.as_u64(),
+            });
+        }
+        let outcome =
+            self.store
+                .apply(mutation, now)
+                .map_err(|_| RecoveryError::OutcomeMismatch {
+                    tablet: self.id.as_u64(),
+                    commit: commit.as_u64(),
+                })?;
+        let result = kivi_state::outcome_for(mutation, &outcome, is_persist_expiry);
+        if &result != expected {
+            return Err(RecoveryError::OutcomeMismatch {
+                tablet: self.id.as_u64(),
+                commit: commit.as_u64(),
+            });
+        }
+        self.next_commit = commit;
+        if let Some(marker) = identity {
+            self.install_dedup(
+                marker.client.session(),
+                marker.client.seq(),
+                DedupEntry {
+                    commit,
+                    opcode: opcode_for(mutation, is_persist_expiry),
+                    outcome: DurableOutcome::Completed(result),
+                },
+            );
+            self.advance_replay_floor(marker);
+        }
+        self.metrics.writes += 1;
+        self.metrics.ops_total += 1;
+        Ok(())
+    }
+
+    /// Replays one recovered outcome-only record: validates the commit
+    /// chain and installs dedup without executing anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`kivi_durability::RecoveryError`] on chain breaks.
+    pub fn install_recovered_outcome(
+        &mut self,
+        outcome: &DurableOutcome,
+        commit: CommitPosition,
+        identity: Option<&MutationIdentity>,
+        opcode: u8,
+    ) -> Result<(), kivi_durability::RecoveryError> {
+        use kivi_durability::RecoveryError;
+        let expected_pos = self
+            .next_commit
+            .next()
+            .map_err(|_| RecoveryError::ChainBreak {
+                tablet: self.id.as_u64(),
+                expected: u64::MAX,
+                found: commit.as_u64(),
+            })?;
+        if commit != expected_pos {
+            return Err(RecoveryError::ChainBreak {
+                tablet: self.id.as_u64(),
+                expected: expected_pos.as_u64(),
+                found: commit.as_u64(),
+            });
+        }
+        self.next_commit = commit;
+        if let Some(marker) = identity {
+            self.install_dedup(
+                marker.client.session(),
+                marker.client.seq(),
+                DedupEntry {
+                    commit,
+                    opcode,
+                    outcome: outcome.clone(),
+                },
+            );
+            self.advance_replay_floor(marker);
+        }
+        self.metrics.ops_total += 1;
+        Ok(())
+    }
+
+    /// Records one completed identity's outcome (durable paths only).
+    fn install_dedup(&mut self, session: SessionId, seq: RequestSeq, entry: DedupEntry) {
+        self.dedup
+            .entry(session)
+            .or_insert_with(SessionDedup::empty)
+            .outcomes
+            .insert(seq, entry);
+    }
+
+    /// Advances one session's floor during replay from a record's ack.
+    /// Identical to the live path's floor advance, so replay converges to
+    /// the same retained set the running tablet held.
+    fn advance_replay_floor(&mut self, marker: &MutationIdentity) {
+        if let Some(session) = self.dedup.get_mut(&marker.client.session()) {
+            session.advance_floor(marker.ack_floor);
+        }
+    }
+
+    /// Returns one session's dedup state, if the tablet has ever seen it.
+    #[must_use]
+    pub fn dedup_state(&self, session: SessionId) -> Option<&SessionDedup> {
+        self.dedup.get(&session)
     }
 
     /// Reclaims up to `limit` expired objects through explicit delete
@@ -231,6 +666,8 @@ impl fmt::Debug for LiveTablet {
             .field("authority", &self.authority)
             .field("store", &self.store)
             .field("metrics", &self.metrics)
+            .field("next_commit", &self.next_commit)
+            .field("dedup_sessions", &self.dedup.len())
             .finish()
     }
 }
@@ -240,6 +677,7 @@ mod tests {
     use super::*;
     use kivi_state::{Key, LogicalValue, ObjectVersion};
     use kivi_tablet::{DirectorySnapshot, PartitionRange};
+    use kivi_types::RequestIdentity;
     use kivi_types::{NamespaceId, TabletEpoch, WriteGuardGeneration};
 
     const NS: NamespaceId = NamespaceId::from_u64(1);
@@ -392,5 +830,230 @@ mod tests {
             tablet.store().get(&Key::from("keep"), later),
             Some(object) if matches!(object.value(), LogicalValue::Bytes(_))
         ));
+    }
+
+    fn session(n: u128) -> SessionId {
+        SessionId::from_u128(n)
+    }
+
+    fn identity(session_id: u128, seq: u64, ack: u64) -> MutationIdentity {
+        MutationIdentity::new(
+            RequestIdentity::new(session(session_id), RequestSeq::from_u64(seq)),
+            RequestSeq::from_u64(ack),
+        )
+    }
+
+    fn counter_add(key: &str, delta: i64) -> Operation {
+        Operation::CounterAdd {
+            key: Key::from(key),
+            delta,
+        }
+    }
+
+    /// Drives one full durable cycle in memory (prepare, assign, commit)
+    /// without any WAL: the tablet logic is identical, only persistence is
+    /// elided.
+    fn durable_cycle(
+        tablet: &mut LiveTablet,
+        op: &Operation,
+        marker: Option<&MutationIdentity>,
+    ) -> Result<OperationResult, TabletError> {
+        let prepared = tablet.prepare_durable(op, marker, NOW)?;
+        match prepared {
+            DurablePrepared::Read(result) => Ok(result),
+            DurablePrepared::DedupHit { outcome, .. } => match outcome {
+                DurableOutcome::Completed(result) => Ok(result),
+                DurableOutcome::Rejected(error) => Err(TabletError::Op(error)),
+                DurableOutcome::VersionExhausted => {
+                    Err(TabletError::Apply(kivi_state::ApplyError::VersionExhausted))
+                }
+            },
+            DurablePrepared::Expired | DurablePrepared::Overloaded => {
+                panic!("test never fills the window")
+            }
+            DurablePrepared::Terminal { outcome, identity } => {
+                let commit = tablet.assign_commit()?;
+                tablet.commit_terminal(&outcome, identity.as_ref(), commit, 6);
+                match outcome {
+                    DurableOutcome::Completed(result) => Ok(result),
+                    DurableOutcome::Rejected(error) => Err(TabletError::Op(error)),
+                    DurableOutcome::VersionExhausted => {
+                        Err(TabletError::Apply(kivi_state::ApplyError::VersionExhausted))
+                    }
+                }
+            }
+            DurablePrepared::Persist {
+                mutation,
+                expected,
+                identity,
+            } => {
+                let commit = tablet.assign_commit()?;
+                let is_persist = matches!(op, Operation::PersistExpiry { .. });
+                tablet.commit_persisted(
+                    &mutation,
+                    &expected,
+                    is_persist,
+                    identity.as_ref(),
+                    commit,
+                    NOW,
+                )
+            }
+        }
+    }
+
+    #[test]
+    fn durable_retry_returns_original_outcome() {
+        let mut tablet = live();
+        let marker = identity(0x51, 1, 0);
+        let first = durable_cycle(&mut tablet, &counter_add("n", 5), Some(&marker))
+            .expect("first executes");
+        assert_eq!(
+            first,
+            OperationResult::CounterUpdated {
+                value: 5,
+                version: ObjectVersion::FIRST,
+            }
+        );
+        assert_eq!(tablet.next_commit().as_u64(), 1);
+        // Same identity again: dedup hit, no re-execution, no new commit.
+        let retry =
+            durable_cycle(&mut tablet, &counter_add("n", 5), Some(&marker)).expect("retry hits");
+        assert_eq!(retry, first);
+        assert_eq!(tablet.next_commit().as_u64(), 1);
+        // Counter stayed at 5, not 10.
+        assert_eq!(
+            tablet
+                .execute(
+                    &Operation::CounterGet {
+                        key: Key::from("n")
+                    },
+                    NOW
+                )
+                .expect("read"),
+            OperationResult::Counter(Some(5))
+        );
+    }
+
+    #[test]
+    fn floor_expiry_never_reexecutes() {
+        let mut tablet = live();
+        durable_cycle(
+            &mut tablet,
+            &counter_add("n", 1),
+            Some(&identity(0x52, 1, 0)),
+        )
+        .expect("seq 1");
+        durable_cycle(
+            &mut tablet,
+            &counter_add("n", 1),
+            Some(&identity(0x52, 2, 1)),
+        )
+        .expect("seq 2");
+        // Floor is now 1: seq 1 is gone and stays gone.
+        let state = tablet.dedup_state(session(0x52)).expect("session tracked");
+        assert_eq!(state.floor(), RequestSeq::from_u64(1));
+        assert!(state.get(RequestSeq::from_u64(1)).is_none());
+        let expired = tablet
+            .prepare_durable(&counter_add("n", 1), Some(&identity(0x52, 1, 2)), NOW)
+            .expect("prepares");
+        assert!(
+            matches!(expired, DurablePrepared::Expired),
+            "stale identity fails closed, got {expired:?}"
+        );
+        // And the counter was incremented exactly twice.
+        assert_eq!(
+            tablet
+                .execute(
+                    &Operation::CounterGet {
+                        key: Key::from("n")
+                    },
+                    NOW
+                )
+                .expect("read"),
+            OperationResult::Counter(Some(2))
+        );
+    }
+
+    #[test]
+    fn outcome_only_terminal_is_replayable() {
+        let mut tablet = live();
+        // Bytes first, so the counter add is a terminal wrong-type.
+        tablet
+            .execute(
+                &Operation::Set {
+                    key: Key::from("k"),
+                    value: bytes::Bytes::from_static(b"v"),
+                },
+                NOW,
+            )
+            .expect("set");
+        let marker = identity(0x53, 1, 0);
+        let result = durable_cycle(&mut tablet, &counter_add("k", 1), Some(&marker));
+        assert!(matches!(
+            result,
+            Err(TabletError::Op(OpError::WrongType { .. }))
+        ));
+        // Retry replays the rejection without executing.
+        let retry = durable_cycle(&mut tablet, &counter_add("k", 1), Some(&marker));
+        assert!(matches!(
+            retry,
+            Err(TabletError::Op(OpError::WrongType { .. }))
+        ));
+        // Terminal completions also consume commit positions (uniform rule).
+        assert_eq!(tablet.next_commit().as_u64(), 1);
+    }
+
+    #[test]
+    fn replay_divergence_fails_instead_of_lying() {
+        use kivi_durability::RecoveryError;
+        // A failed replay leaves its application behind by design: in
+        // production the first divergence aborts startup and the tablet is
+        // never used, so rollback would be theater. Tests mirror that by
+        // replaying each scenario on the commit it belongs to.
+        let mut tablet = live();
+        let add = Mutation::CounterAdd {
+            key: Key::from("n"),
+            delta: 5,
+        };
+        // Honest expectation replays cleanly.
+        let honest = OperationResult::CounterUpdated {
+            value: 5,
+            version: ObjectVersion::FIRST,
+        };
+        tablet
+            .apply_recovered_mutation(&add, &honest, false, CommitPosition::from_u64(1), None, NOW)
+            .expect("honest replays");
+        // ...but only once: the chain rejects a repeated position.
+        let err = tablet
+            .apply_recovered_mutation(&add, &honest, false, CommitPosition::from_u64(1), None, NOW)
+            .expect_err("duplicate position fails");
+        assert!(
+            matches!(err, RecoveryError::ChainBreak { .. }),
+            "got {err:?}"
+        );
+        // A forged expectation for the next commit fails loudly instead of
+        // installing a lie: +1 onto 5 must yield 6, not 7.
+        let add_one = Mutation::CounterAdd {
+            key: Key::from("n"),
+            delta: 1,
+        };
+        let forged = OperationResult::CounterUpdated {
+            value: 7,
+            version: ObjectVersion::from_u64(2),
+        };
+        let err = tablet
+            .apply_recovered_mutation(
+                &add_one,
+                &forged,
+                false,
+                CommitPosition::from_u64(2),
+                None,
+                NOW,
+            )
+            .expect_err("divergence fails");
+        assert!(
+            matches!(err, RecoveryError::OutcomeMismatch { .. }),
+            "got {err:?}"
+        );
     }
 }

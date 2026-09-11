@@ -883,6 +883,7 @@ dependencies = [
  "arc-swap",
  "bytes",
  "crossbeam-channel",
+ "getrandom 0.4.3",
  "kivi-protocol",
  "kivi-state",
  "kivi-tablet",
@@ -910,6 +911,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "kivi-durability"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "getrandom 0.4.3",
+ "kivi-codec",
+ "kivi-state",
+ "kivi-types",
+ "proptest",
+ "rstest",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "zerocopy",
+]
+
+[[package]]
 name = "kivi-engine"
 version = "0.1.0"
 dependencies = [
@@ -919,10 +937,12 @@ dependencies = [
  "core_affinity2",
  "crossbeam-channel",
  "divan",
+ "kivi-durability",
  "kivi-protocol",
  "kivi-state",
  "kivi-tablet",
  "kivi-types",
+ "tempfile",
  "thiserror",
  "tracing",
 ]
@@ -952,6 +972,7 @@ dependencies = [
  "clap",
  "hdrhistogram",
  "kivi-client",
+ "kivi-durability",
  "kivi-engine",
  "kivi-protocol",
  "kivi-state",
@@ -959,6 +980,7 @@ dependencies = [
  "kivi-types",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tower",
  "tower-http",

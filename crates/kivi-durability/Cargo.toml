@@ -1,0 +1,23 @@
+[package]
+name = "kivi-durability"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+kivi-types.workspace = true
+kivi-codec.workspace = true
+kivi-state.workspace = true
+thiserror.workspace = true
+getrandom.workspace = true
+tracing.workspace = true
+zerocopy.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+proptest.workspace = true
+rstest.workspace = true
+bytes.workspace = true
+
+[lints]
+workspace = true

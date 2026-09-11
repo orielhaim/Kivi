@@ -26,7 +26,7 @@ use kivi_types::{Expiry, UnixMicros};
 
 use crate::mutation::{ApplyError, ApplyOutcome, Mutation};
 use crate::object::{Key, LogicalValue, ObjectType, ObjectVersion, StoredObject};
-use crate::ops::{OpError, Operation, OperationResult};
+use crate::ops::{DurableOutcome, OpError, Operation, OperationResult};
 
 /// A validated operation: either an immediately answered read or a mutation
 /// awaiting deterministic application.
@@ -36,6 +36,28 @@ pub enum Prepared {
     Read(OperationResult),
     /// Mutation to apply (locally now, or by replicas on replay).
     Write(Mutation),
+}
+
+/// A durability-aware preparation: everything `Prepared` carries, plus the
+/// terminal outcomes of mutating opcodes that produce no mutation
+/// (counter-type/overflow rejections, expiry no-ops). Read-only opcodes
+/// still answer inline and never touch the WAL; every other completion the
+/// caller persists exactly once before replying.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StorePrepared {
+    /// Read-only outcome: reply directly, no WAL, no dedup.
+    Read(OperationResult),
+    /// Terminal outcome of a mutating opcode with no mutation: persist an
+    /// outcome-only record, install dedup, then reply.
+    Terminal(DurableOutcome),
+    /// Mutating opcode with a mutation: persist a mutation record carrying
+    /// the predicted outcome, then apply and verify.
+    Write {
+        /// Mutation to persist and apply.
+        mutation: Mutation,
+        /// Outcome `apply` must produce (predicted from current state).
+        expected: OperationResult,
+    },
 }
 
 /// Worker-local logical object map. Single-threaded by construction: the
@@ -170,6 +192,155 @@ impl ObjectStore {
             Operation::GetExpiry { key } => Ok(Prepared::Read(OperationResult::Expiry(
                 self.get(key, now).map(StoredObject::expiry),
             ))),
+        }
+    }
+
+    /// Validates `op` for the durable pipeline, predicting the exact outcome
+    /// a subsequent [`apply`](Self::apply) must produce. Pure like
+    /// [`prepare`](Self::prepare): borrows state, touches nothing else.
+    ///
+    /// Read-only opcodes answer inline and never reach the WAL. Every
+    /// mutating opcode completion — a mutation with its predicted outcome,
+    /// or a terminal outcome with no mutation (counter rejections, expiry
+    /// no-ops, version exhaustion) — is returned for exactly-once
+    /// persistence before any reply.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OpError`] only for read-only opcode failures (wrong-type
+    /// `Get`/`CounterGet`), which the caller answers directly. Mutating
+    /// opcode failures arrive as [`StorePrepared::Terminal`] instead, so a
+    /// lost reply to them stays retry-safe.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a read-only opcode ever prepares a mutation (impossible by
+    /// construction of [`prepare`](Self::prepare); loud by design, mirroring
+    /// the prepare/apply contract panic in the live tablet path).
+    pub fn prepare_durable(
+        &self,
+        op: &Operation,
+        now: UnixMicros,
+    ) -> Result<StorePrepared, OpError> {
+        match op {
+            Operation::Get { .. }
+            | Operation::Exists { .. }
+            | Operation::CounterGet { .. }
+            | Operation::GetExpiry { .. } => match self.prepare(op, now)? {
+                Prepared::Read(result) => Ok(StorePrepared::Read(result)),
+                Prepared::Write(_) => {
+                    panic!("read-only opcode prepared a mutation: {op:?}")
+                }
+            },
+            Operation::Set { key, value } => Ok(match self.predict_version(key, now) {
+                Ok(version) => StorePrepared::Write {
+                    mutation: Mutation::PutBytes {
+                        key: key.clone(),
+                        value: value.clone(),
+                    },
+                    expected: OperationResult::Stored { version },
+                },
+                Err(outcome) => StorePrepared::Terminal(outcome),
+            }),
+            Operation::Delete { key } => Ok(StorePrepared::Write {
+                mutation: Mutation::Delete { key: key.clone() },
+                expected: OperationResult::Deleted {
+                    existed: self.live(key, now).is_some(),
+                },
+            }),
+            Operation::CounterAdd { key, delta } => Ok(self.predict_counter_add(key, *delta, now)),
+            Operation::ExpireAt { key, expires_at } => {
+                Ok(self.predict_expiry(key, Some(*expires_at), now))
+            }
+            Operation::PersistExpiry { key } => Ok(self.predict_expiry(key, None, now)),
+        }
+    }
+
+    /// Predicts the next version for a key gaining state, mapping
+    /// exhaustion to the terminal outcome the ephemeral apply path would
+    /// have produced (plus retry-safety).
+    fn predict_version(&self, key: &Key, now: UnixMicros) -> Result<ObjectVersion, DurableOutcome> {
+        self.next_version(key, now)
+            .map_err(|_| DurableOutcome::VersionExhausted)
+    }
+
+    /// Predicts a counter addition: fresh creation, validated increment,
+    /// or a terminal rejection (overflow, wrong type).
+    fn predict_counter_add(&self, key: &Key, delta: i64, now: UnixMicros) -> StorePrepared {
+        match self.get(key, now) {
+            None => StorePrepared::Write {
+                mutation: Mutation::CounterAdd {
+                    key: key.clone(),
+                    delta,
+                },
+                expected: OperationResult::CounterUpdated {
+                    value: delta,
+                    version: ObjectVersion::FIRST,
+                },
+            },
+            Some(object) => match object.value() {
+                LogicalValue::StrictCounter(value) => match value.checked_add(delta) {
+                    None => {
+                        StorePrepared::Terminal(DurableOutcome::Rejected(OpError::CounterOverflow))
+                    }
+                    Some(next) => match self.predict_version(key, now) {
+                        Ok(version) => StorePrepared::Write {
+                            mutation: Mutation::CounterAdd {
+                                key: key.clone(),
+                                delta,
+                            },
+                            expected: OperationResult::CounterUpdated {
+                                value: next,
+                                version,
+                            },
+                        },
+                        Err(outcome) => StorePrepared::Terminal(outcome),
+                    },
+                },
+                LogicalValue::Bytes(_) => {
+                    StorePrepared::Terminal(DurableOutcome::Rejected(OpError::WrongType {
+                        expected: ObjectType::StrictCounter,
+                        found: ObjectType::Bytes,
+                    }))
+                }
+            },
+        }
+    }
+
+    /// Predicts an expiry change: `Some` timestamp is `ExpireAt` semantics
+    /// (any live key takes it), `None` is `PersistExpiry` semantics (only a
+    /// live dated key takes `NEVER`); everything else is a terminal no-op.
+    fn predict_expiry(
+        &self,
+        key: &Key,
+        expires_at: Option<UnixMicros>,
+        now: UnixMicros,
+    ) -> StorePrepared {
+        let live_dated = match self.get(key, now) {
+            None => false,
+            Some(object) => expires_at.is_some() || object.expiry() != Expiry::NEVER,
+        };
+        if !live_dated {
+            let expected = match expires_at {
+                Some(_) => OperationResult::ExpirySet { applied: false },
+                None => OperationResult::ExpiryPersisted { removed: false },
+            };
+            return StorePrepared::Terminal(DurableOutcome::Completed(expected));
+        }
+        let expiry = expires_at.map_or(Expiry::NEVER, Expiry::at);
+        let expected = match expires_at {
+            Some(_) => OperationResult::ExpirySet { applied: true },
+            None => OperationResult::ExpiryPersisted { removed: true },
+        };
+        match self.predict_version(key, now) {
+            Ok(_) => StorePrepared::Write {
+                mutation: Mutation::SetExpiry {
+                    key: key.clone(),
+                    expiry,
+                },
+                expected,
+            },
+            Err(outcome) => StorePrepared::Terminal(outcome),
         }
     }
 
@@ -353,6 +524,89 @@ mod tests {
         Key::from(name)
     }
 
+    /// Durable preparation must predict exactly what the live path produces:
+    /// for every op, `prepare_durable`'s expectation equals `execute`'s
+    /// result (or its rejection), so replay verification can trust it.
+    #[test]
+    fn prepare_durable_predicts_execute_exactly() {
+        use bytes::Bytes;
+        let battery = [
+            Operation::Set {
+                key: key("a"),
+                value: Bytes::from_static(b"1"),
+            },
+            Operation::Set {
+                key: key("a"),
+                value: Bytes::from_static(b"2"),
+            },
+            Operation::Get { key: key("a") },
+            Operation::CounterAdd {
+                key: key("a"),
+                delta: 5,
+            },
+            Operation::CounterAdd {
+                key: key("c"),
+                delta: 5,
+            },
+            Operation::CounterAdd {
+                key: key("c"),
+                delta: -2,
+            },
+            Operation::CounterGet { key: key("c") },
+            Operation::Delete { key: key("a") },
+            Operation::Delete {
+                key: key("missing"),
+            },
+            Operation::ExpireAt {
+                key: key("c"),
+                expires_at: UnixMicros::from_micros(9_000_000),
+            },
+            Operation::PersistExpiry { key: key("c") },
+            Operation::PersistExpiry {
+                key: key("missing"),
+            },
+            Operation::ExpireAt {
+                key: key("missing"),
+                expires_at: UnixMicros::from_micros(9_000_000),
+            },
+            Operation::GetExpiry { key: key("c") },
+            Operation::Exists { key: key("c") },
+        ];
+        let mut store = ObjectStore::new();
+        for op in &battery {
+            let predicted = store.prepare_durable(op, NOW);
+            let actual = execute(&mut store, op, NOW);
+            match predicted {
+                Ok(StorePrepared::Read(expected)) => {
+                    assert_eq!(actual.expect("read succeeds"), expected);
+                }
+                Ok(StorePrepared::Terminal(outcome)) => match outcome {
+                    DurableOutcome::Completed(expected) => {
+                        assert_eq!(actual.expect("terminal ok succeeds"), expected);
+                    }
+                    DurableOutcome::Rejected(expected_error) => {
+                        assert_eq!(
+                            actual.expect_err("terminal rejection fails"),
+                            format!("{expected_error:?}")
+                        );
+                    }
+                    DurableOutcome::VersionExhausted => {
+                        panic!("version space must not exhaust in this battery");
+                    }
+                },
+                Ok(StorePrepared::Write { expected, .. }) => {
+                    assert_eq!(actual.expect("predicted write succeeds"), expected);
+                }
+                Err(error) => {
+                    assert_eq!(
+                        actual.expect_err("read failure matches"),
+                        format!("{error:?}")
+                    );
+                }
+            }
+        }
+    }
+
     /// Runs one operation end to end (prepare, then apply when required),
     /// propagating any failure as a debug string for test assertions.
     fn execute(
@@ -367,24 +621,11 @@ mod tests {
             Prepared::Read(result) => Ok(result),
             Prepared::Write(mutation) => {
                 let outcome = store.apply(&mutation, now).expect("apply must not fail");
-                Ok(match (op, outcome) {
-                    (Operation::Set { .. }, ApplyOutcome::Put { version }) => {
-                        OperationResult::Stored { version }
-                    }
-                    (Operation::Delete { .. }, ApplyOutcome::Deleted { existed }) => {
-                        OperationResult::Deleted { existed }
-                    }
-                    (Operation::CounterAdd { .. }, ApplyOutcome::Counter { value, version }) => {
-                        OperationResult::CounterUpdated { value, version }
-                    }
-                    (Operation::ExpireAt { .. }, ApplyOutcome::Expiry { applied, .. }) => {
-                        OperationResult::ExpirySet { applied }
-                    }
-                    (Operation::PersistExpiry { .. }, ApplyOutcome::Expiry { applied, .. }) => {
-                        OperationResult::ExpiryPersisted { removed: applied }
-                    }
-                    (op, outcome) => panic!("unexpected {op:?} -> {outcome:?}"),
-                })
+                Ok(crate::ops::outcome_for(
+                    &mutation,
+                    &outcome,
+                    matches!(op, Operation::PersistExpiry { .. }),
+                ))
             }
         }
     }

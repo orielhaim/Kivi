@@ -12,12 +12,14 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use kivi_client::{ClientConfig, NativeClient};
-use kivi_engine::{ConnLimits, EngineConfig, EngineNetwork, LocalEngine, Placement, TurnBudget};
+use kivi_engine::{
+    ConnLimits, DurabilityMode, EngineConfig, EngineNetwork, LocalEngine, Placement, TurnBudget,
+};
 use kivi_state::Key;
 use kivi_tablet::{DirectorySnapshot, HashPrefix, PartitionRange};
 use kivi_types::{
-    ClusterId, NamespaceId, NodeId, TabletEpoch, TabletId, UnixMicros, WorkerId,
-    WriteGuardGeneration,
+    ClusterId, NamespaceId, NodeId, NodeIncarnation, RequestSeq, TabletEpoch, TabletId, UnixMicros,
+    WorkerId, WriteGuardGeneration,
 };
 
 const NS: NamespaceId = NamespaceId::from_u64(1);
@@ -65,6 +67,7 @@ fn network() -> EngineNetwork {
         affinity: kivi_engine::AffinityMode::Disabled,
         node_id: NodeId::from_u64(1),
         cluster_id: ClusterId::from_u128(1),
+        incarnation: NodeIncarnation::INITIAL,
         conn: ConnLimits::default(),
         turn: TurnBudget::default(),
     }
@@ -83,6 +86,7 @@ fn restart_on_ports(ports: &[u16], placement: Placement) -> LocalEngine {
             ports: ports.to_vec(),
             ..network()
         }),
+        durability: DurabilityMode::Ephemeral,
     })
     .expect("restart binds same ports")
 }
@@ -98,6 +102,7 @@ fn start_split() -> LocalEngine {
         worker_count: 2,
         request_capacity: 128,
         network: Some(network()),
+        durability: DurabilityMode::Ephemeral,
     })
     .expect("networked engine starts")
 }
@@ -326,6 +331,8 @@ fn pipelined_raw_socket_round_trips_in_order() {
             value: Some(b"x".to_vec()),
             delta: 0,
             expiry: 0,
+            identity: None,
+            ack_floor: RequestSeq::from_u64(0),
         };
         socket
             .write_all(&encode_frame(FrameKind::Request, id, &request.encode()))

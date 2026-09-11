@@ -23,6 +23,7 @@ kivi-tablet.workspace = true
 kivi-engine.workspace = true
 kivi-client.workspace = true
 kivi-protocol.workspace = true
+kivi-durability.workspace = true
 bytes.workspace = true
 clap.workspace = true
 tracing.workspace = true
@@ -35,6 +36,9 @@ tower.workspace = true
 tower-http.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

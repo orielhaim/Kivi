@@ -13,7 +13,8 @@
 use kivi_state::{Key, Operation};
 use kivi_tablet::{DirectoryVersion, HashPrefix, OrderedRange, PartitionRange};
 use kivi_types::{
-    ClusterId, NamespaceId, NodeId, NodeIncarnation, TabletEpoch, TabletId, UnixMicros, WorkerId,
+    ClusterId, NamespaceId, NodeId, NodeIncarnation, RequestIdentity, RequestSeq, TabletEpoch,
+    TabletId, UnixMicros, WorkerId,
 };
 
 use crate::frame::ProtocolError;
@@ -30,12 +31,18 @@ bitflags::bitflags! {
     pub struct Capabilities: u64 {
         /// Base v1 protocol every peer must speak (required bit).
         const BASE_V1 = 1 << 0;
+        /// Durable mutation dedup: the server persists every mutating
+        /// request's outcome keyed by client identity before replying, so a
+        /// retried identity returns its original outcome instead of
+        /// re-executing. Servers advertise it only in durable mode; clients
+        /// retry ambiguous mutating requests only when they saw it.
+        const DURABLE_MUTATION_DEDUP = 1 << 1;
     }
 }
 
 impl Capabilities {
     /// Capability bits this build understands.
-    pub const KNOWN: Self = Self::BASE_V1;
+    pub const KNOWN: Self = Self::BASE_V1.union(Self::DURABLE_MUTATION_DEDUP);
 
     /// Bits in a required mask that this build does not understand (`empty`
     /// means negotiation can proceed). Unknown bits fail even in the
@@ -93,6 +100,16 @@ impl Opcode {
     pub const fn as_u8(self) -> u8 {
         self as u8
     }
+
+    /// Whether this opcode can change logical state (and therefore enters
+    /// the WAL in durable mode). Reads never do, whatever their outcome.
+    #[must_use]
+    pub const fn is_mutating(self) -> bool {
+        matches!(
+            self,
+            Self::Set | Self::Delete | Self::CounterAdd | Self::ExpireAt | Self::PersistExpiry
+        )
+    }
 }
 
 impl core::fmt::Display for Opcode {
@@ -141,6 +158,14 @@ pub enum Status {
     ValueTooLarge = 11,
     /// Unexpected server-side failure; safe to retry, likely pointless.
     Internal = 12,
+    /// A retried mutation identity fell below the session's durable floor:
+    /// its outcome is gone and it will never execute again. Not retriable
+    /// under the same identity; start a new mutation instead.
+    DedupExpired = 13,
+    /// The session holds too many unacknowledged outcomes on this tablet;
+    /// acknowledge older mutations before sending new ones. Deterministic
+    /// for the same state, so retrying is harmless but pointless.
+    SessionOverloaded = 14,
 }
 
 impl Status {
@@ -161,6 +186,8 @@ impl Status {
             10 => Some(Self::ResourceExhausted),
             11 => Some(Self::ValueTooLarge),
             12 => Some(Self::Internal),
+            13 => Some(Self::DedupExpired),
+            14 => Some(Self::SessionOverloaded),
             _ => None,
         }
     }
@@ -196,6 +223,8 @@ impl core::fmt::Display for Status {
             Self::ResourceExhausted => write!(f, "resource-exhausted"),
             Self::ValueTooLarge => write!(f, "value-too-large"),
             Self::Internal => write!(f, "internal"),
+            Self::DedupExpired => write!(f, "dedup-expired"),
+            Self::SessionOverloaded => write!(f, "session-overloaded"),
         }
     }
 }
@@ -347,6 +376,13 @@ pub struct Request {
     pub delta: i64,
     /// Absolute expiry micros (meaningful for `ExpireAt` only).
     pub expiry: u64,
+    /// Retry identity for mutating opcodes (`None` for reads and for
+    /// clients that predate durable dedup). Durable servers require it on
+    /// every mutating request; ephemeral servers ignore it.
+    pub identity: Option<RequestIdentity>,
+    /// Client acknowledgement watermark for the identity's session
+    /// (meaningful only alongside `identity`; zero otherwise).
+    pub ack_floor: RequestSeq,
 }
 
 impl Request {
@@ -375,6 +411,24 @@ impl Request {
             Opcode::PersistExpiry => Operation::PersistExpiry { key },
             Opcode::GetExpiry => Operation::GetExpiry { key },
         }
+    }
+}
+
+/// Maps a typed operation back to its opcode. Total inverse of the
+/// operation half of [`Request::into_operation`]: exactly one opcode per
+/// operation, so response shaping and WAL records never guess.
+#[must_use]
+pub fn operation_opcode(operation: &Operation) -> Opcode {
+    match operation {
+        Operation::Get { .. } => Opcode::Get,
+        Operation::Set { .. } => Opcode::Set,
+        Operation::Delete { .. } => Opcode::Delete,
+        Operation::Exists { .. } => Opcode::Exists,
+        Operation::CounterGet { .. } => Opcode::CounterGet,
+        Operation::CounterAdd { .. } => Opcode::CounterAdd,
+        Operation::ExpireAt { .. } => Opcode::ExpireAt,
+        Operation::PersistExpiry { .. } => Opcode::PersistExpiry,
+        Operation::GetExpiry { .. } => Opcode::GetExpiry,
     }
 }
 
@@ -787,6 +841,17 @@ impl Request {
             | Opcode::PersistExpiry
             | Opcode::GetExpiry => {}
         }
+        // Retry identity rides last so pre-identity decoders fail cleanly on
+        // length: flag 0 means "no identity, end of request".
+        match self.identity {
+            None => push_u8(&mut out, 0),
+            Some(identity) => {
+                push_u8(&mut out, 1);
+                push_u128(&mut out, identity.session().as_u128());
+                push_u64(&mut out, identity.seq().as_u64());
+                push_u64(&mut out, self.ack_floor.as_u64());
+            }
+        }
         out
     }
 
@@ -823,6 +888,8 @@ impl Request {
             value: None,
             delta: 0,
             expiry: 0,
+            identity: None,
+            ack_floor: RequestSeq::from_u64(0),
         };
         match opcode {
             Opcode::Set => {
@@ -840,6 +907,21 @@ impl Request {
             | Opcode::CounterGet
             | Opcode::PersistExpiry
             | Opcode::GetExpiry => {}
+        }
+        // Identity suffix: absent on pre-identity encodings (exact end),
+        // otherwise flag 1 plus session/seq/ack. Anything else is malformed.
+        if cursor.remaining() > 0 {
+            match cursor.u8(CONTEXT)? {
+                0 => {}
+                1 => {
+                    let session = kivi_types::SessionId::from_u128(cursor.u128(CONTEXT)?);
+                    let seq = RequestSeq::from_u64(cursor.u64(CONTEXT)?);
+                    let ack_floor = RequestSeq::from_u64(cursor.u64(CONTEXT)?);
+                    request.identity = Some(RequestIdentity::new(session, seq));
+                    request.ack_floor = ack_floor;
+                }
+                _ => return Err(ProtocolError::Malformed { context: CONTEXT }),
+            }
         }
         cursor.end(CONTEXT)?;
         Ok(request)
@@ -989,6 +1071,11 @@ mod tests {
             value: Some(b"value".to_vec()),
             delta: -12,
             expiry: 123_456,
+            identity: Some(RequestIdentity::new(
+                kivi_types::SessionId::from_u128(0x00C0_FFEE),
+                RequestSeq::from_u64(41),
+            )),
+            ack_floor: RequestSeq::from_u64(40),
         }
     }
 
@@ -1009,6 +1096,11 @@ mod tests {
         assert_eq!(decoded.namespace, NS);
         assert_eq!(decoded.key, b"user:1");
         assert_eq!(decoded.hint.expect("hint").tablet, TabletId::from_u64(3));
+        assert_eq!(
+            decoded.identity.expect("identity").seq(),
+            RequestSeq::from_u64(41)
+        );
+        assert_eq!(decoded.ack_floor, RequestSeq::from_u64(40));
         // Operation translation is total and typed.
         let op = decoded.into_operation();
         match opcode {
@@ -1068,6 +1160,8 @@ mod tests {
     #[case(Status::ResourceExhausted)]
     #[case(Status::ValueTooLarge)]
     #[case(Status::Internal)]
+    #[case(Status::DedupExpired)]
+    #[case(Status::SessionOverloaded)]
     fn every_status_round_trips(#[case] status: Status) {
         assert_eq!(Status::from_u16(status.as_u16()), Some(status));
         assert_eq!(
@@ -1077,6 +1171,90 @@ mod tests {
                 Status::StaleRoute | Status::NotLocal | Status::Overloaded
             )
         );
+    }
+
+    #[test]
+    fn dedup_statuses_are_terminal() {
+        // Dedup outcomes are deterministic for the same state: retrying is
+        // harmless but pointless, so they are not marked retriable.
+        assert!(!Status::DedupExpired.is_retriable());
+        assert!(!Status::SessionOverloaded.is_retriable());
+        assert_eq!(Status::from_u16(13), Some(Status::DedupExpired));
+        assert_eq!(Status::from_u16(14), Some(Status::SessionOverloaded));
+        assert_eq!(Status::DedupExpired.to_string(), "dedup-expired");
+        assert_eq!(Status::SessionOverloaded.to_string(), "session-overloaded");
+    }
+
+    #[test]
+    fn identity_wire_layout_is_stable() {
+        // Golden suffix: flag 1, session LE, seq LE, ack LE. The base layout
+        // is pinned by the pre-identity tests; this pins the suffix.
+        let mut bare = request(Opcode::Get);
+        bare.identity = None;
+        let mut identified = bare.clone();
+        identified.identity = Some(RequestIdentity::new(
+            kivi_types::SessionId::from_u128(0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10),
+            RequestSeq::from_u64(0x1112_1314_1516_1718),
+        ));
+        identified.ack_floor = RequestSeq::from_u64(0x2122_2324_2526_2728);
+        let bare_bytes = bare.encode();
+        let full_bytes = identified.encode();
+        // Bare ends with flag 0 (1 byte); identified ends with flag 1 plus
+        // session/seq/ack (33 bytes): the difference is exactly 32.
+        assert_eq!(full_bytes.len(), bare_bytes.len() + 32);
+        assert_eq!(
+            &full_bytes[..bare_bytes.len() - 1],
+            &bare_bytes[..bare_bytes.len() - 1]
+        );
+        assert_eq!(bare_bytes[bare_bytes.len() - 1], 0);
+        let suffix = &full_bytes[bare_bytes.len() - 1..];
+        assert_eq!(suffix.len(), 33);
+        assert_eq!(suffix[0], 1);
+        assert_eq!(
+            &suffix[1..17],
+            &0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10u128.to_le_bytes()
+        );
+        assert_eq!(&suffix[17..25], &0x1112_1314_1516_1718u64.to_le_bytes());
+        assert_eq!(&suffix[25..33], &0x2122_2324_2526_2728u64.to_le_bytes());
+        let back = Request::decode(&full_bytes).expect("identity round trip");
+        // Opcode tails are not preserved for Get (same as pre-identity
+        // behavior); the identity suffix is what this pins.
+        assert_eq!(back.identity, identified.identity);
+        assert_eq!(back.ack_floor, identified.ack_floor);
+        assert_eq!(back.key, identified.key);
+        assert_eq!(back.hint, identified.hint);
+    }
+
+    #[test]
+    fn pre_identity_requests_still_decode() {
+        // A request encoded by a pre-identity client (no suffix at all, not
+        // even the flag) decodes with no identity rather than failing: the
+        // server decides policy, not the parser.
+        let mut bare = request(Opcode::Set);
+        bare.identity = None;
+        let bytes = bare.encode();
+        assert_eq!(bytes[bytes.len() - 1], 0, "flag 0 terminates");
+        let old_style = &bytes[..bytes.len() - 1];
+        let back = Request::decode(old_style).expect("suffix-less decodes");
+        assert_eq!(back.identity, None);
+        assert_eq!(back.ack_floor, RequestSeq::from_u64(0));
+        // A garbage flag is malformed, not silently skipped.
+        let mut bad = bytes.clone();
+        let last = bad.len() - 1;
+        bad[last] = 0x7F;
+        assert!(matches!(
+            Request::decode(&bad),
+            Err(ProtocolError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn durable_dedup_capability_negotiates() {
+        assert!(Capabilities::BASE_V1.unknown_required().is_empty());
+        let both = Capabilities::BASE_V1 | Capabilities::DURABLE_MUTATION_DEDUP;
+        assert!(both.unknown_required().is_empty());
+        assert!(both.contains(Capabilities::DURABLE_MUTATION_DEDUP));
+        assert_eq!(Capabilities::KNOWN, both);
     }
 
     #[test]

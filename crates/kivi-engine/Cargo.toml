@@ -9,6 +9,7 @@ kivi-types.workspace = true
 kivi-tablet.workspace = true
 kivi-state.workspace = true
 kivi-protocol.workspace = true
+kivi-durability.workspace = true
 bytes.workspace = true
 arc-swap.workspace = true
 crossbeam-channel.workspace = true
@@ -19,6 +20,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 divan.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

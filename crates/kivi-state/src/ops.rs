@@ -6,9 +6,11 @@
 //! objects behave as absent (a read never deletes).
 
 use bytes::Bytes;
+use kivi_codec::{CodecError, Decode, Encode, decode_byte_vec, encode_bytes};
 use kivi_types::{Expiry, UnixMicros};
 
-use crate::object::{Key, ObjectType};
+use crate::mutation::{ApplyOutcome, Mutation};
+use crate::object::{Key, ObjectType, ObjectVersion};
 
 /// One typed native operation against a single key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,4 +131,434 @@ pub enum OpError {
     /// A counter addition overflowed `i64`; nothing was mutated.
     #[error("counter addition overflows i64")]
     CounterOverflow,
+}
+
+/// Canonical wire tags. Fixed forever within framing version 1.
+const TAG_OP_WRONG_TYPE: u8 = 1;
+const TAG_OP_OVERFLOW: u8 = 2;
+
+impl Encode for OpError {
+    fn encoded_len(&self) -> usize {
+        match self {
+            Self::WrongType { .. } => 1 + 1 + 1,
+            Self::CounterOverflow => 1,
+        }
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::WrongType { expected, found } => {
+                out.push(TAG_OP_WRONG_TYPE);
+                expected.encode(out);
+                found.encode(out);
+            }
+            Self::CounterOverflow => out.push(TAG_OP_OVERFLOW),
+        }
+    }
+}
+
+impl Decode for OpError {
+    fn decode(input: &[u8]) -> Result<(Self, usize), CodecError> {
+        let (tag, first) = u8::decode(input)?;
+        match tag {
+            TAG_OP_WRONG_TYPE => {
+                let (expected, second) = ObjectType::decode(&input[first..])?;
+                let (found, third) = ObjectType::decode(&input[first + second..])?;
+                Ok((Self::WrongType { expected, found }, first + second + third))
+            }
+            TAG_OP_OVERFLOW => Ok((Self::CounterOverflow, first)),
+            other => Err(CodecError::InvalidTag {
+                kind: "op-error",
+                tag: other,
+            }),
+        }
+    }
+}
+
+/// Canonical wire tags for [`OperationResult`]. Fixed forever within
+/// framing version 1.
+const TAG_RES_VALUE: u8 = 1;
+const TAG_RES_STORED: u8 = 2;
+const TAG_RES_DELETED: u8 = 3;
+const TAG_RES_EXISTS: u8 = 4;
+const TAG_RES_COUNTER: u8 = 5;
+const TAG_RES_COUNTER_UPDATED: u8 = 6;
+const TAG_RES_EXPIRY_SET: u8 = 7;
+const TAG_RES_EXPIRY_PERSISTED: u8 = 8;
+const TAG_RES_EXPIRY: u8 = 9;
+
+impl Encode for OperationResult {
+    fn encoded_len(&self) -> usize {
+        match self {
+            Self::Value(value) => 1 + 1 + value.as_ref().map_or(0, |bytes| 4 + bytes.len()),
+            Self::Stored { .. } => 1 + 8,
+            Self::Deleted { .. }
+            | Self::Exists(_)
+            | Self::ExpirySet { .. }
+            | Self::ExpiryPersisted { .. } => 1 + 1,
+            Self::Counter(value) => 1 + 1 + usize::from(value.is_some()) * 8,
+            Self::CounterUpdated { .. } => 1 + 8 + 8,
+            Self::Expiry(value) => 1 + 1 + value.as_ref().map_or(0, Expiry::encoded_len),
+        }
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::Value(value) => {
+                out.push(TAG_RES_VALUE);
+                match value {
+                    None => out.push(0),
+                    Some(bytes) => {
+                        out.push(1);
+                        encode_bytes(out, bytes);
+                    }
+                }
+            }
+            Self::Stored { version } => {
+                out.push(TAG_RES_STORED);
+                version.encode(out);
+            }
+            Self::Deleted { existed } => {
+                out.push(TAG_RES_DELETED);
+                existed.encode(out);
+            }
+            Self::Exists(present) => {
+                out.push(TAG_RES_EXISTS);
+                present.encode(out);
+            }
+            Self::Counter(value) => {
+                out.push(TAG_RES_COUNTER);
+                match value {
+                    None => out.push(0),
+                    Some(counter) => {
+                        out.push(1);
+                        out.extend_from_slice(&counter.to_le_bytes());
+                    }
+                }
+            }
+            Self::CounterUpdated { value, version } => {
+                out.push(TAG_RES_COUNTER_UPDATED);
+                out.extend_from_slice(&value.to_le_bytes());
+                version.encode(out);
+            }
+            Self::ExpirySet { applied } => {
+                out.push(TAG_RES_EXPIRY_SET);
+                applied.encode(out);
+            }
+            Self::ExpiryPersisted { removed } => {
+                out.push(TAG_RES_EXPIRY_PERSISTED);
+                removed.encode(out);
+            }
+            Self::Expiry(value) => {
+                out.push(TAG_RES_EXPIRY);
+                match value {
+                    None => out.push(0),
+                    Some(expiry) => {
+                        out.push(1);
+                        expiry.encode(out);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Decode for OperationResult {
+    fn decode(input: &[u8]) -> Result<(Self, usize), CodecError> {
+        let (tag, first) = u8::decode(input)?;
+        match tag {
+            TAG_RES_VALUE => {
+                let (present, second) = bool::decode(&input[first..])?;
+                if !present {
+                    return Ok((Self::Value(None), first + second));
+                }
+                let (bytes, third) = decode_byte_vec(&input[first + second..])?;
+                Ok((
+                    Self::Value(Some(Bytes::from(bytes))),
+                    first + second + third,
+                ))
+            }
+            TAG_RES_STORED => {
+                let (version, second) = ObjectVersion::decode(&input[first..])?;
+                Ok((Self::Stored { version }, first + second))
+            }
+            TAG_RES_DELETED => {
+                let (existed, second) = bool::decode(&input[first..])?;
+                Ok((Self::Deleted { existed }, first + second))
+            }
+            TAG_RES_EXISTS => {
+                let (present, second) = bool::decode(&input[first..])?;
+                Ok((Self::Exists(present), first + second))
+            }
+            TAG_RES_COUNTER => {
+                let (present, second) = bool::decode(&input[first..])?;
+                if !present {
+                    return Ok((Self::Counter(None), first + second));
+                }
+                let (raw, third) = <[u8; 8]>::decode(&input[first + second..])?;
+                Ok((
+                    Self::Counter(Some(i64::from_le_bytes(raw))),
+                    first + second + third,
+                ))
+            }
+            TAG_RES_COUNTER_UPDATED => {
+                let (raw_value, second) = <[u8; 8]>::decode(&input[first..])?;
+                let (version, third) = ObjectVersion::decode(&input[first + second..])?;
+                Ok((
+                    Self::CounterUpdated {
+                        value: i64::from_le_bytes(raw_value),
+                        version,
+                    },
+                    first + second + third,
+                ))
+            }
+            TAG_RES_EXPIRY_SET => {
+                let (applied, second) = bool::decode(&input[first..])?;
+                Ok((Self::ExpirySet { applied }, first + second))
+            }
+            TAG_RES_EXPIRY_PERSISTED => {
+                let (removed, second) = bool::decode(&input[first..])?;
+                Ok((Self::ExpiryPersisted { removed }, first + second))
+            }
+            TAG_RES_EXPIRY => {
+                let (present, second) = bool::decode(&input[first..])?;
+                if !present {
+                    return Ok((Self::Expiry(None), first + second));
+                }
+                let (expiry, third) = Expiry::decode(&input[first + second..])?;
+                Ok((Self::Expiry(Some(expiry)), first + second + third))
+            }
+            other => Err(CodecError::InvalidTag {
+                kind: "operation-result",
+                tag: other,
+            }),
+        }
+    }
+}
+
+/// Terminal outcome of one durable mutating request: either the completed
+/// result or the terminal rejection that must be replayed to a retrying
+/// client instead of re-executing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DurableOutcome {
+    /// The request completed with this result.
+    Completed(OperationResult),
+    /// The request was terminally rejected without mutating.
+    Rejected(OpError),
+    /// An object version could not advance; nothing mutated.
+    VersionExhausted,
+}
+
+/// Canonical wire tags. Fixed forever within framing version 1.
+const TAG_OUTCOME_COMPLETED: u8 = 1;
+const TAG_OUTCOME_REJECTED: u8 = 2;
+const TAG_OUTCOME_VERSION_EXHAUSTED: u8 = 3;
+
+impl Encode for DurableOutcome {
+    fn encoded_len(&self) -> usize {
+        match self {
+            Self::Completed(result) => 1 + result.encoded_len(),
+            Self::Rejected(error) => 1 + error.encoded_len(),
+            Self::VersionExhausted => 1,
+        }
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::Completed(result) => {
+                out.push(TAG_OUTCOME_COMPLETED);
+                result.encode(out);
+            }
+            Self::Rejected(error) => {
+                out.push(TAG_OUTCOME_REJECTED);
+                error.encode(out);
+            }
+            Self::VersionExhausted => out.push(TAG_OUTCOME_VERSION_EXHAUSTED),
+        }
+    }
+}
+
+impl Decode for DurableOutcome {
+    fn decode(input: &[u8]) -> Result<(Self, usize), CodecError> {
+        let (tag, first) = u8::decode(input)?;
+        match tag {
+            TAG_OUTCOME_COMPLETED => {
+                let (result, second) = OperationResult::decode(&input[first..])?;
+                Ok((Self::Completed(result), first + second))
+            }
+            TAG_OUTCOME_REJECTED => {
+                let (error, second) = OpError::decode(&input[first..])?;
+                Ok((Self::Rejected(error), first + second))
+            }
+            TAG_OUTCOME_VERSION_EXHAUSTED => Ok((Self::VersionExhausted, first)),
+            other => Err(CodecError::InvalidTag {
+                kind: "durable-outcome",
+                tag: other,
+            }),
+        }
+    }
+}
+
+/// Maps one applied mutation to its operation result. This is the single
+/// canonical `(Mutation, ApplyOutcome)` mapping: the live path and WAL
+/// replay verification share it, so any divergence fails loudly instead of
+/// forking semantics.
+///
+/// `is_persist_expiry` disambiguates `SetExpiry` outcomes (`ExpirySet` for
+/// `ExpireAt`, `ExpiryPersisted` for `PersistExpiry`); the WAL record and
+/// dedup entry always know the originating opcode.
+///
+/// # Panics
+///
+/// Panics on impossible mutation/outcome pairings (e.g. a `Set` yielding a
+/// counter outcome): preparation and application run back-to-back on the
+/// same state, so disagreement is an internal logic bug, never a runtime
+/// condition.
+#[must_use]
+pub fn outcome_for(
+    mutation: &Mutation,
+    outcome: &ApplyOutcome,
+    is_persist_expiry: bool,
+) -> OperationResult {
+    match (mutation, outcome) {
+        (Mutation::PutBytes { .. }, ApplyOutcome::Put { version }) => {
+            OperationResult::Stored { version: *version }
+        }
+        (Mutation::Delete { .. }, ApplyOutcome::Deleted { existed }) => {
+            OperationResult::Deleted { existed: *existed }
+        }
+        (Mutation::CounterAdd { .. }, ApplyOutcome::Counter { value, version }) => {
+            OperationResult::CounterUpdated {
+                value: *value,
+                version: *version,
+            }
+        }
+        (Mutation::SetExpiry { .. }, ApplyOutcome::Expiry { applied, .. }) => {
+            if is_persist_expiry {
+                OperationResult::ExpiryPersisted { removed: *applied }
+            } else {
+                OperationResult::ExpirySet { applied: *applied }
+            }
+        }
+        (mutation, outcome) => {
+            panic!("prepare/apply contract violated: {mutation:?} -> {outcome:?}")
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kivi_codec::{Decode, Encode};
+    use kivi_types::UnixMicros;
+
+    fn round_trip<T>(value: &T) -> T
+    where
+        T: Encode + Decode + PartialEq + core::fmt::Debug,
+    {
+        let mut bytes = Vec::new();
+        value.encode(&mut bytes);
+        assert_eq!(bytes.len(), value.encoded_len(), "length prefix honest");
+        let (back, consumed) = T::decode(&bytes).expect("decode");
+        assert_eq!(consumed, bytes.len(), "exact consumption");
+        assert_eq!(&back, value);
+        back
+    }
+
+    #[test]
+    fn operation_results_round_trip_every_variant() {
+        let version = ObjectVersion::from_u64(7);
+        round_trip(&OperationResult::Value(None));
+        round_trip(&OperationResult::Value(Some(Bytes::from_static(b"v"))));
+        round_trip(&OperationResult::Stored { version });
+        round_trip(&OperationResult::Deleted { existed: true });
+        round_trip(&OperationResult::Exists(false));
+        round_trip(&OperationResult::Counter(None));
+        round_trip(&OperationResult::Counter(Some(-41)));
+        round_trip(&OperationResult::CounterUpdated { value: 9, version });
+        round_trip(&OperationResult::ExpirySet { applied: true });
+        round_trip(&OperationResult::ExpiryPersisted { removed: false });
+        round_trip(&OperationResult::Expiry(None));
+        round_trip(&OperationResult::Expiry(Some(Expiry::at(
+            UnixMicros::from_micros(99),
+        ))));
+        round_trip(&OperationResult::Expiry(Some(Expiry::NEVER)));
+    }
+
+    #[test]
+    fn op_errors_and_durable_outcomes_round_trip() {
+        round_trip(&OpError::WrongType {
+            expected: ObjectType::Bytes,
+            found: ObjectType::StrictCounter,
+        });
+        round_trip(&OpError::CounterOverflow);
+        round_trip(&DurableOutcome::Completed(OperationResult::Stored {
+            version: ObjectVersion::FIRST,
+        }));
+        round_trip(&DurableOutcome::Rejected(OpError::CounterOverflow));
+        round_trip(&DurableOutcome::VersionExhausted);
+    }
+
+    #[test]
+    fn stored_wire_bytes_are_stable() {
+        // Golden bytes: tag 2 then version 7 LE. Pin the layout deliberately.
+        let mut bytes = Vec::new();
+        OperationResult::Stored {
+            version: ObjectVersion::from_u64(7),
+        }
+        .encode(&mut bytes);
+        assert_eq!(bytes, vec![2, 7, 0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn unknown_result_tags_rejected() {
+        assert!(OperationResult::decode(&[0xFF]).is_err());
+        assert!(OpError::decode(&[0xFF]).is_err());
+        assert!(DurableOutcome::decode(&[0xFF]).is_err());
+    }
+
+    #[test]
+    fn outcome_for_covers_the_matrix() {
+        let version = ObjectVersion::from_u64(3);
+        let key = Key::from("k");
+        assert_eq!(
+            outcome_for(
+                &Mutation::PutBytes {
+                    key: key.clone(),
+                    value: Bytes::from_static(b"v"),
+                },
+                &ApplyOutcome::Put { version },
+                false,
+            ),
+            OperationResult::Stored { version }
+        );
+        assert_eq!(
+            outcome_for(
+                &Mutation::SetExpiry {
+                    key: key.clone(),
+                    expiry: Expiry::NEVER,
+                },
+                &ApplyOutcome::Expiry {
+                    applied: true,
+                    version: Some(version),
+                },
+                true,
+            ),
+            OperationResult::ExpiryPersisted { removed: true }
+        );
+        assert_eq!(
+            outcome_for(
+                &Mutation::SetExpiry {
+                    key,
+                    expiry: Expiry::at(UnixMicros::from_micros(5)),
+                },
+                &ApplyOutcome::Expiry {
+                    applied: true,
+                    version: Some(version),
+                },
+                false,
+            ),
+            OperationResult::ExpirySet { applied: true }
+        );
+    }
 }
