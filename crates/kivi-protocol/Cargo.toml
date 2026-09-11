@@ -1,0 +1,21 @@
+[package]
+name = "kivi-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+kivi-types.workspace = true
+kivi-state.workspace = true
+kivi-tablet.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+zerocopy.workspace = true
+bitflags.workspace = true
+
+[dev-dependencies]
+rstest.workspace = true
+proptest.workspace = true
+
+[lints]
+workspace = true

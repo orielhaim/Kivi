@@ -1,6 +1,81 @@
-[package]
-name = "kivi"
+[workspace]
+resolver = "2"
+members = [
+    "crates/kivi-types",
+    "crates/kivi-codec",
+    "crates/kivi-core",
+    "crates/kivi-tablet",
+    "crates/kivi-sim",
+    "crates/kivi-state",
+    "crates/kivi-engine",
+    "crates/kivi-protocol",
+    "crates/kivi-client",
+    "crates/kivi-server",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.98"
 
-[dependencies]
+[workspace.dependencies]
+kivi-types = { path = "crates/kivi-types", version = "0.1.0" }
+kivi-codec = { path = "crates/kivi-codec", version = "0.1.0" }
+kivi-core = { path = "crates/kivi-core", version = "0.1.0" }
+kivi-tablet = { path = "crates/kivi-tablet", version = "0.1.0" }
+kivi-state = { path = "crates/kivi-state", version = "0.1.0" }
+kivi-protocol = { path = "crates/kivi-protocol", version = "0.1.0" }
+kivi-client = { path = "crates/kivi-client", version = "0.1.0" }
+kivi-engine = { path = "crates/kivi-engine", version = "0.1.0" }
+
+# Mechanism crates borrowed per RFC §209 ("borrow mechanisms, own semantics").
+# The project owns all wire/durable formats; these crates never define them.
+blake3 = "1.8"
+crc32c = "0.6"
+
+# Test-only framework for table-driven tests and fixtures. Never ships in
+# library code or durable formats.
+rstest = "0.27"
+
+# Production mechanisms (each justified at its use site).
+hashbrown = "0.17"
+bytes = "1.12"
+arc-swap = "1.9"
+crossbeam-channel = "0.5"
+compio = { version = "0.19", features = ["net", "time"] }
+core_affinity2 = "0.16"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+clap = { version = "4", features = ["derive"] }
+hdrhistogram = "7.6"
+thiserror = "2.0"
+anyhow = "1.0"
+# zerocopy 0.9 is pre-release (alpha); the stable track is 0.8.
+zerocopy = { version = "0.8", features = ["derive"] }
+bitflags = "2.13"
+
+# Admin/control plane only (Tokio/Axum live in kivi-server, never in the
+# Compio data plane or the state/tablet/codec libraries).
+tokio = { version = "1.53", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.7", features = ["limit", "timeout", "trace"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Test/benchmark-only mechanisms.
+proptest = "1.11"
+divan = "0.1"
+
+[workspace.lints.rust]
+# `deny` (not `forbid`): zerocopy's derive macros generate sound `unsafe impl`
+# blocks for the fixed wire headers, which needs a scoped `#[allow]` on those
+# two structs. Hand-written `unsafe` anywhere else still fails this lint; the
+# only allows in the tree must sit on derive sites (grep-able, documented).
+unsafe_code = "deny"
+missing_docs = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = "deny"
+pedantic = "deny"

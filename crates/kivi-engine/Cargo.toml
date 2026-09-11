@@ -1,0 +1,28 @@
+[package]
+name = "kivi-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+kivi-types.workspace = true
+kivi-tablet.workspace = true
+kivi-state.workspace = true
+kivi-protocol.workspace = true
+bytes.workspace = true
+arc-swap.workspace = true
+crossbeam-channel.workspace = true
+compio.workspace = true
+core_affinity2.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+divan.workspace = true
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "engine"
+harness = false

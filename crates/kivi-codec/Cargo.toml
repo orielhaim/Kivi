@@ -1,0 +1,15 @@
+[package]
+name = "kivi-codec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+kivi-types.workspace = true
+blake3.workspace = true
+crc32c.workspace = true
+thiserror.workspace = true
+zerocopy.workspace = true
+
+[lints]
+workspace = true
