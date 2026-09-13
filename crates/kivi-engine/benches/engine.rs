@@ -54,6 +54,7 @@ fn root_engine() -> LocalEngine {
         placement: Placement::new([(tablet, WorkerId::from_u64(0))]),
         worker_count: 1,
         request_capacity: 1024,
+        chunks: kivi_engine::ChunkFabricConfig::default(),
         network: None,
         durability: DurabilityMode::Ephemeral,
     })
@@ -129,4 +130,52 @@ fn client_counter_add(bencher: Bencher) {
     bencher
         .counter(ItemsCount::new(1u64))
         .bench_local(|| black_box(client.counter_add(&key, 1).expect("add")));
+}
+
+/// Large-value benchmarks: a 300 KiB value stages one chunk on set and
+/// resolves it on get; the range patch exercises the inline splice path.
+/// These pin the chunk-fabric overhead against the point-op baselines
+/// above (staging cost, lane round trip, splice cost).
+const BIG_LEN: usize = 300_000;
+
+fn big_value() -> Bytes {
+    Bytes::from(vec![0xABu8; BIG_LEN])
+}
+
+#[divan::bench]
+fn client_set_chunked(bencher: Bencher) {
+    let engine = root_engine();
+    let client = engine.client();
+    let key = Key::from(KEY);
+    let value = big_value();
+    bencher.counter(ItemsCount::new(1u64)).bench_local(|| {
+        client.set(&key, value.clone()).expect("set");
+        black_box(());
+    });
+}
+
+#[divan::bench]
+fn client_get_chunked(bencher: Bencher) {
+    let engine = root_engine();
+    let client = engine.client();
+    let key = Key::from(KEY);
+    client.set(&key, big_value()).expect("seed");
+    bencher
+        .counter(ItemsCount::new(1u64))
+        .bench_local(|| black_box(client.get(&key).expect("get")));
+}
+
+#[divan::bench]
+fn client_set_range_inline(bencher: Bencher) {
+    let engine = root_engine();
+    let client = engine.client();
+    let key = Key::from(KEY);
+    client
+        .set(&key, Bytes::from_static(VALUE_16))
+        .expect("seed");
+    let patch = Bytes::from_static(b"XY");
+    bencher.counter(ItemsCount::new(1u64)).bench_local(|| {
+        client.set_range(&key, 4, patch.clone()).expect("patch");
+        black_box(());
+    });
 }

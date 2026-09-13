@@ -82,6 +82,7 @@ fn restart_on_ports(ports: &[u16], placement: Placement) -> LocalEngine {
         placement,
         worker_count: 2,
         request_capacity: 128,
+        chunks: kivi_engine::ChunkFabricConfig::default(),
         network: Some(EngineNetwork {
             ports: ports.to_vec(),
             ..network()
@@ -101,6 +102,7 @@ fn start_split() -> LocalEngine {
         ]),
         worker_count: 2,
         request_capacity: 128,
+        chunks: kivi_engine::ChunkFabricConfig::default(),
         network: Some(network()),
         durability: DurabilityMode::Ephemeral,
     })
@@ -331,6 +333,7 @@ fn pipelined_raw_socket_round_trips_in_order() {
             value: Some(b"x".to_vec()),
             delta: 0,
             expiry: 0,
+            offset: 0,
             identity: None,
             ack_floor: RequestSeq::from_u64(0),
         };

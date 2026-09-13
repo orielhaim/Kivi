@@ -11,6 +11,7 @@
 
 mod admin;
 
+use std::io::Write as _;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
@@ -81,6 +82,51 @@ struct Args {
     /// mode only).
     #[arg(long)]
     shared_wal: bool,
+    /// Maximum mutations per WAL batch (durable mode only). `1` reproduces
+    /// immediate per-mutation durability on the same pipeline — the
+    /// baseline group commit measures against.
+    #[arg(long, default_value_t = kivi_engine::BatchPolicy::DEFAULT_MAX_OPS)]
+    batch_max_ops: usize,
+    /// Maximum encoded record bytes per WAL batch (durable mode only).
+    #[arg(long, default_value_t = kivi_engine::BatchPolicy::DEFAULT_MAX_BYTES)]
+    batch_max_bytes: u64,
+    /// Maximum age of the oldest unsealed batch entry in microseconds
+    /// before forced seal (durable mode only).
+    #[arg(long, default_value_t = 500)]
+    batch_max_wait_us: u64,
+    /// Drained-batch linger in microseconds: how long a non-full batch
+    /// waits for concurrent arrivals before sealing (durable mode only).
+    #[arg(long, default_value_t = kivi_engine::BatchPolicy::DEFAULT_LINGER.as_micros() as u64)]
+    batch_linger_us: u64,
+    /// WAL bytes per worker since its last checkpoint that trigger an
+    /// automatic checkpoint (durable mode only).
+    #[arg(long, default_value_t = kivi_engine::CheckpointConfig::DEFAULT_WAL_BYTES)]
+    checkpoint_wal_bytes: u64,
+    /// Applied commits per tablet since its last cut that trigger an
+    /// automatic checkpoint (durable mode only).
+    #[arg(long, default_value_t = kivi_engine::CheckpointConfig::DEFAULT_MUTATIONS)]
+    checkpoint_mutations: u64,
+    /// Minimum checkpoint age in seconds before the elapsed-time trigger
+    /// may fire, and only with dirty state (durable mode only).
+    #[arg(long, default_value_t = 300)]
+    checkpoint_interval_secs: u64,
+    /// Disable automatic checkpoints (manual triggers still work).
+    /// Benchmarks use this to isolate commit-pipeline variables.
+    #[arg(long)]
+    no_checkpoint: bool,
+    /// Values strictly larger stage as chunked roots through per-worker
+    /// chunk lanes; the rest stay inline. Physical only: logical `Bytes`
+    /// semantics never change. Both durability modes.
+    #[arg(long, default_value_t = kivi_engine::ChunkFabricConfig::DEFAULT_INLINE_THRESHOLD)]
+    inline_threshold: u64,
+    /// Chunk pack rotation target in bytes per lane (tests use small
+    /// targets to exercise rotation; production stays large).
+    #[arg(long, default_value_t = kivi_engine::ChunkFabricConfig::DEFAULT_PACK_TARGET_BYTES)]
+    chunk_pack_target: u64,
+    /// Chunk-cache bound in bytes per lane (immutable entries, safe
+    /// eviction at any time).
+    #[arg(long, default_value_t = kivi_engine::ChunkFabricConfig::DEFAULT_CACHE_BYTES)]
+    chunk_cache_bytes: u64,
     /// Admin/control HTTP listen address (loopback by default; `:0` selects
     /// an ephemeral port and prints it).
     #[arg(long, default_value = "127.0.0.1:19080")]
@@ -273,6 +319,22 @@ fn open_durability(
                 fresh = opened.fresh,
                 "durable mode: data directory open"
             );
+            let batch = kivi_engine::BatchPolicy {
+                max_ops: args.batch_max_ops,
+                max_bytes: args.batch_max_bytes,
+                max_wait: std::time::Duration::from_micros(args.batch_max_wait_us),
+                linger: std::time::Duration::from_micros(args.batch_linger_us),
+            };
+            batch
+                .validate()
+                .map_err(|reason| anyhow::anyhow!("invalid batch policy: {reason}"))?;
+            let checkpoint = kivi_engine::CheckpointConfig {
+                wal_bytes_threshold: args.checkpoint_wal_bytes,
+                mutations_threshold: args.checkpoint_mutations,
+                min_interval: std::time::Duration::from_secs(args.checkpoint_interval_secs),
+                policy: kivi_checkpoint::CheckpointPolicy::DEFAULT,
+                disabled: args.no_checkpoint,
+            };
             let durability = DurabilityMode::Durable(DurableConfig {
                 data_dir: dir.clone(),
                 segment_target_bytes: args.wal_segment_target,
@@ -280,6 +342,8 @@ fn open_durability(
                 cluster,
                 incarnation,
                 shared_wal: args.shared_wal,
+                batch,
+                checkpoint,
             });
             Ok((node, cluster, incarnation, durability, Some(opened)))
         }
@@ -329,6 +393,11 @@ fn main() -> anyhow::Result<()> {
         placement,
         worker_count: args.workers,
         request_capacity: args.queue,
+        chunks: kivi_engine::ChunkFabricConfig {
+            inline_threshold: args.inline_threshold,
+            pack_target_bytes: args.chunk_pack_target,
+            cache_bytes: args.chunk_cache_bytes,
+        },
         network: Some(EngineNetwork {
             base_port: args.port,
             ports: Vec::new(),
@@ -370,6 +439,23 @@ fn main() -> anyhow::Result<()> {
         .with_context(|| format!("admin bind failed on {}", args.admin))?;
     let admin_addr = listener.local_addr().context("admin listener address")?;
     tracing::info!(endpoint = %admin_addr, "admin plane listening");
+    // Machine-readable startup report for process supervisors and the
+    // integration-test harness: the actual bound endpoints (authoritative
+    // when `--port 0` / `--admin 127.0.0.1:0` select ephemeral ports).
+    // One line, fixed shape, printed once. Workers are listed in worker
+    // index order, so the first entry is the seed endpoint.
+    //
+    // ```text
+    // KIVI_READY workers=127.0.0.1:9000,127.0.0.1:9001 admin=127.0.0.1:19080
+    // ```
+    let workers = engine
+        .worker_addrs()
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    println!("KIVI_READY workers={workers} admin={admin_addr}");
+    let _ = std::io::stdout().flush();
     runtime.block_on(admin::serve(listener, state, async {
         if let Err(error) = tokio::signal::ctrl_c().await {
             tracing::warn!(%error, "shutdown signal watch failed; exiting");

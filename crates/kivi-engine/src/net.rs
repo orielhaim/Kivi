@@ -34,30 +34,33 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use core::time::Duration;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::rc::Rc;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
+use bytes::Bytes;
 use compio::io::{AsyncRead, AsyncWriteExt};
 use compio::net::{TcpListener, TcpStream};
 use compio::runtime::Runtime;
 
 use kivi_protocol::{
-    Capabilities, ClientHello, DEFAULT_MAX_FRAME, FrameReader, RedirectInfo, Request, Response,
-    ServerHello, encode_frame,
+    Capabilities, ClientHello, DEFAULT_MAX_FRAME, FRAME_HEADER_LEN, FrameReader, RedirectInfo,
+    Request, Response, ServerHello, StreamAbort, StreamBegin, StreamReady, ValueStreamBegin,
+    encode_frame,
 };
-use kivi_state::{Operation, PartitionHasher};
+use kivi_state::{Key, Operation, OperationResult, PartitionHasher};
 use kivi_types::{ClusterId, MutationIdentity, NodeId, NodeIncarnation, TabletId, WorkerId};
 
 use crate::affinity::{AffinityError, AffinityMode, pin_current_thread};
 use crate::clock::SystemClock;
+use crate::commit::PendingEntry;
 use crate::routing::RoutingSnapshot;
 use crate::tablet::LiveTablet;
 use crate::worker::{
-    DurableFailure, WorkerControl, WorkerDurability, WorkerMetrics, execute_durable,
-    handle_control, handle_request,
+    WorkerChunks, WorkerControl, WorkerDurability, WorkerMetrics, WorkerRequestError,
+    WorkerResponse, handle_control, handle_request,
 };
 
 /// Per-connection input bound default (4 MiB of unparsed bytes).
@@ -75,6 +78,11 @@ pub const DEFAULT_TURN_BYTES: usize = 256 * 1024;
 /// park is the honest trade: guaranteed reactor progress with no busy spin.
 /// Channel-only workers keep their blocking `select!` loop with zero added
 /// latency; benchmarks of the embedded path use those.
+///
+/// While the commit coordinator holds admitted work, the bridge parks on
+/// the shorter completion quantum instead so embedded replies track batch
+/// proofs rather than this interval. The quantum only bounds completion
+/// detection, never batching.
 const BRIDGE_PARK_INTERVAL: Duration = Duration::from_millis(10);
 /// Accept-loop shutdown poll interval.
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -174,7 +182,9 @@ pub struct NetConfig {
     /// This incarnation of the node (advanced durably on every restart).
     pub incarnation: NodeIncarnation,
     /// Capabilities advertised in `ServerHello` (`DURABLE_MUTATION_DEDUP`
-    /// exactly when the engine runs durable).
+    /// exactly when the engine runs durable, plus `STREAMING` in both
+    /// modes: every networked worker serves chunk-fabric uploads and
+    /// streamed reads).
     pub advertised_caps: Capabilities,
     /// Live worker endpoint directory (swapped once binds complete).
     pub endpoints: Arc<ArcSwap<EndpointMap>>,
@@ -236,6 +246,10 @@ struct WorkerNet {
     /// every use is synchronous (no `.await` while borrowed), so tasks
     /// cannot interleave a persist-apply sequence.
     durability: Option<Rc<RefCell<WorkerDurability>>>,
+    /// Chunk lane access plus the representation policy. Shared across
+    /// connection tasks and bridge like durability above. Staging and
+    /// resolution suspend the awaiting task only — never the reactor.
+    chunks: crate::worker::WorkerChunks,
 }
 
 /// Launch bundle for one networked worker: everything `spawn_net` needs
@@ -257,12 +271,17 @@ pub struct NetLaunch {
 
 /// Thread body for a networked `DataWorker`: affinity, runtime, listener,
 /// accept loop, and the crossbeam bridge for the embedded path.
+// Eight parameters: identity, tablets, channels, durability, chunks,
+// launch, readiness. Grouping further would hide the startup order the
+// surrounding code documents; the engine builds this call once.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_net(
     id: WorkerId,
     tablets: Vec<LiveTablet>,
     requests: crossbeam_channel::Receiver<crate::worker::TabletRequest>,
     control: crossbeam_channel::Receiver<WorkerControl>,
     durability: Option<WorkerDurability>,
+    chunks: crate::worker::WorkerChunks,
     launch: NetLaunch,
     ready: std::sync::mpsc::Sender<Result<SocketAddr, NetStartError>>,
 ) {
@@ -286,6 +305,7 @@ pub(crate) fn run_net(
         active: Rc::new(Cell::new(0)),
         net: launch.net,
         durability: durability.map(|durable| Rc::new(RefCell::new(durable))),
+        chunks,
     });
     let runtime = match Runtime::new() {
         Ok(runtime) => runtime,
@@ -321,46 +341,82 @@ async fn serve(
     tracing::info!(worker = %shared.id.as_u64(), addr = %bound, "worker listening");
     let _ = ready.send(Ok(bound));
     // The embedded channel bridge runs beside the accept loop so LocalClient
-    // keeps working on networked workers through the same tablets.
+    // keeps working on networked workers through the same tablets. Joined
+    // explicitly at shutdown (never detached): deterministic teardown with
+    // no tasks outliving the runtime they were spawned on.
     let bridge = {
         let tablets = Rc::clone(&shared.tablets);
         let metrics = Rc::clone(&shared.metrics);
         let shutdown = Rc::clone(&shared.shutdown);
         let durability = shared.durability.clone();
-        async move {
-            bridge_loop(requests, control, tablets, metrics, durability, shutdown).await;
-        }
+        let chunks = shared.chunks.clone();
+        compio::runtime::spawn(async move {
+            bridge_loop(
+                requests, control, tablets, metrics, durability, chunks, shutdown,
+            )
+            .await;
+        })
     };
-    compio::runtime::spawn(bridge).detach();
-    // Accept loop with shutdown polling: a blocked accept would otherwise
-    // delay shutdown indefinitely.
+    // Accept loop WITHOUT a timeout: cancelling a pending AcceptEx leaks
+    // the listener on this compio version (proven by test — a single
+    // cancelled accept keeps the FD bound past runtime drop, breaking
+    // same-port restart). The loop parks in `accept()` uncancellable and
+    // wakes only on real connections; shutdown wakes it with a dummy
+    // connection (see `LocalEngine::shutdown`), which it answers by
+    // observing the flag at the top of the next turn.
     loop {
         if shared.shutdown.get() {
             break;
         }
-        match compio::time::timeout(ACCEPT_POLL_INTERVAL, listener.accept()).await {
-            Ok(Ok((stream, peer))) => {
+        match listener.accept().await {
+            Ok((stream, peer)) => {
                 tracing::debug!(worker = %shared.id.as_u64(), %peer, "accepted connection");
                 spawn_conn(stream, peer, Rc::clone(&shared));
             }
-            Ok(Err(error)) => {
+            Err(error) => {
                 tracing::warn!(worker = %shared.id.as_u64(), %error, "accept failed");
                 compio::time::sleep(Duration::from_millis(10)).await;
             }
-            Err(_) => {}
         }
     }
-    // Bounded drain: connections observe shutdown through their read poll
-    // (≤ one accept interval) and exit on their own, so the runtime never
-    // drops under live sockets. Whatever lingers past the grace period is
-    // force-closed by the runtime drop that follows.
+    // Bounded drain: connections observe shutdown through their own read
+    // polls and exit on their own, so the runtime never drops under live
+    // sockets. Whatever lingers past the grace period is force-closed by
+    // the runtime drop that follows.
     for _ in 0..100 {
         if shared.active.get() == 0 {
             break;
         }
         compio::time::sleep(Duration::from_millis(10)).await;
     }
+    // Flush admitted durable work: proofs already on the lane still need
+    // ordered apply so committed state (not just the WAL) reflects every
+    // acknowledged write at shutdown. Replies go nowhere — connection
+    // tasks already exited — but the state advance is what matters, and
+    // recovery would replay it anyway.
+    if let Some(cell) = shared.durability.as_ref() {
+        let namespace = shared.routing.load().namespace();
+        for _ in 0..300 {
+            let pending = {
+                let mut durable = cell.borrow_mut();
+                durable
+                    .commit
+                    .poll(&mut shared.tablets.borrow_mut(), namespace);
+                durable.commit.has_pending()
+            };
+            if !pending {
+                break;
+            }
+            compio::time::sleep(crate::commit::COMPLETION_PARK).await;
+        }
+    }
     tracing::info!(worker = %shared.id.as_u64(), "worker listener stopped");
+    // Join the bridge explicitly: no detached task may outlive this
+    // runtime (a lingering task keeps driver state — and potentially
+    // sockets — alive past thread join, breaking same-port restart).
+    // The bridge exits on the Shutdown control already sent, so this
+    // join is prompt, never a hang.
+    let _ = bridge.await;
 }
 
 /// Embedded-path bridge: serves the crossbeam request/control channels from
@@ -373,11 +429,16 @@ async fn bridge_loop(
     tablets: Rc<RefCell<HashMap<TabletId, LiveTablet>>>,
     metrics: Rc<Cell<WorkerMetrics>>,
     durability: Option<Rc<RefCell<WorkerDurability>>>,
+    chunks: crate::worker::WorkerChunks,
     shutdown: Rc<Cell<bool>>,
 ) {
     use crossbeam_channel::TryRecvError;
     let mut requests_dead = false;
     let mut control_dead = false;
+    // Large embedded `Set`s parked while the chunk lane stages them (the
+    // bridge shares the reactor thread, so it polls completions per turn
+    // instead of blocking like plain worker threads do).
+    let mut frontier: VecDeque<BridgeStage> = VecDeque::new();
     loop {
         loop {
             match control.try_recv() {
@@ -399,9 +460,14 @@ async fn bridge_loop(
         for _ in 0..64 {
             match requests.try_recv() {
                 Ok(request) => {
-                    let mut durable = durability.as_ref().map(|cell| cell.borrow_mut());
-                    let durable_ref = durable.as_deref_mut();
-                    handle_request(request, &mut tablets.borrow_mut(), &metrics, durable_ref);
+                    bridge_intake(
+                        request,
+                        &tablets,
+                        &metrics,
+                        durability.as_ref(),
+                        &chunks,
+                        &mut frontier,
+                    );
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -414,11 +480,292 @@ async fn bridge_loop(
             shutdown.set(true);
             return;
         }
-        // Always park: an executor-agnostic wake-loop here would spin the
-        // thread and can starve every other task on a single-threaded
-        // reactor. Parking bounds idle CPU and guarantees connection tasks,
-        // timers, and completions all progress.
-        compio::time::sleep(BRIDGE_PARK_INTERVAL).await;
+        // Complete staged large Sets whose lane proofs arrived, then pump
+        // the commit coordinator so embedded durable requests keep
+        // flowing, then park: short quantum while batches are admitted or
+        // in flight (reply latency tracks proofs), idle interval
+        // otherwise (bounded CPU, guaranteed progress).
+        poll_bridge_stages(&mut frontier, &tablets, &metrics, durability.as_ref());
+        let pending = !frontier.is_empty()
+            || durability.as_ref().is_some_and(|cell| {
+                // Synchronous borrow: ends before any `.await` below.
+                cell.borrow().commit.has_pending()
+            });
+        {
+            if let Some(cell) = durability.as_ref() {
+                let mut durable = cell.borrow_mut();
+                let namespace = durable.namespace;
+                durable.commit.poll(&mut tablets.borrow_mut(), namespace);
+            }
+        }
+        if pending {
+            compio::time::sleep(crate::commit::COMPLETION_PARK).await;
+        } else {
+            // Always park: an executor-agnostic wake-loop here would spin the
+            // thread and can starve every other task on a single-threaded
+            // reactor. Parking bounds idle CPU and guarantees connection tasks,
+            // timers, and completions all progress.
+            compio::time::sleep(BRIDGE_PARK_INTERVAL).await;
+        }
+    }
+}
+
+/// One embedded large-`Set` parked on the bridge while its lane staging
+/// proves durable. Completion admits the resulting small `SetChunked`
+/// into the commit pipeline (durable) or executes it inline (ephemeral)
+/// with the original identity and responder, so exactly-once and version
+/// semantics match the plain-thread path exactly.
+struct BridgeStage {
+    /// Owning tablet (routed before parking; placement is static).
+    tablet: TabletId,
+    /// Target key for the chunked root.
+    key: Key,
+    /// Client retry identity, preserved across the park.
+    identity: Option<MutationIdentity>,
+    /// Where the outcome goes.
+    respond: crossbeam_channel::Sender<WorkerResponse>,
+    /// Lane proof being polled.
+    reply: crate::chunk_lane::ChunkReply<
+        Result<crate::chunk_lane::StagedValue, kivi_chunk::ChunkError>,
+    >,
+    /// Staging pins, moved into the coordinator entry on completion.
+    pinned: Option<crate::chunk_lane::PinnedUpload>,
+    /// Pin set for post-stage pinning (splice jobs only: their addresses
+    /// are unknown until the lane replies, so pinning happens at
+    /// completion instead of intake).
+    pins: Option<Arc<crate::chunk_lane::StagingPins>>,
+}
+
+/// Embedded intake on the reactor bridge: inline ops serve synchronously
+/// (no lane traffic, no block); large `Set`s park on the frontier and
+/// complete on later turns. Lane saturation answers `Overloaded` at once.
+#[allow(clippy::needless_pass_by_value)]
+fn bridge_intake(
+    request: crate::worker::TabletRequest,
+    tablets: &Rc<RefCell<HashMap<TabletId, LiveTablet>>>,
+    metrics: &Rc<Cell<WorkerMetrics>>,
+    durability: Option<&Rc<RefCell<WorkerDurability>>>,
+    chunks: &WorkerChunks,
+    frontier: &mut VecDeque<BridgeStage>,
+) {
+    let crate::worker::TabletRequest {
+        tablet,
+        op,
+        now,
+        identity,
+        respond,
+    } = request;
+    // Range patches plan against the peeked base before the
+    // representation split: small inline results serve synchronously
+    // below, restaged results re-enter as ordinary large `Set`s, chunked
+    // bases park a lane splice on the frontier, and absurd ranges reject
+    // with state untouched. A parked or rejected patch returns here (its
+    // responder is consumed by the frontier or the answer).
+    let (planned, respond) = bridge_plan_range(
+        tablet, op, now, identity, respond, tablets, metrics, chunks, frontier,
+    );
+    let (Some(op), Some(respond)) = (planned, respond) else {
+        return;
+    };
+    match crate::chunk_lane::split_large_set(op, chunks.inline_threshold) {
+        crate::chunk_lane::LargeSetSplit::Inline(op) => {
+            let mut durable = durability.map(|cell| cell.borrow_mut());
+            let durable_ref = durable.as_deref_mut();
+            handle_request(
+                crate::worker::TabletRequest {
+                    tablet,
+                    op,
+                    now,
+                    identity,
+                    respond,
+                },
+                &mut tablets.borrow_mut(),
+                metrics,
+                durable_ref,
+                chunks,
+            );
+        }
+        crate::chunk_lane::LargeSetSplit::Stage { key, value } => {
+            let pinned =
+                match crate::chunk_lane::PinnedUpload::begin(&chunks.pins, chunks.domain, &value) {
+                    Ok(pinned) => Some(pinned),
+                    Err(error) => {
+                        let mut snapshot = metrics.get();
+                        snapshot.channel_ops += 1;
+                        metrics.set(snapshot);
+                        let _ = respond.try_send(Err(WorkerRequestError::ChunkStore(error)));
+                        return;
+                    }
+                };
+            match chunks.lane.submit_stage(value) {
+                Ok(reply) => frontier.push_back(BridgeStage {
+                    tablet,
+                    key,
+                    identity,
+                    respond,
+                    reply,
+                    pinned,
+                    pins: None,
+                }),
+                Err(error) => {
+                    let mut snapshot = metrics.get();
+                    snapshot.channel_ops += 1;
+                    metrics.set(snapshot);
+                    let _ = respond.try_send(Err(WorkerRequestError::ChunkStore(error)));
+                }
+            }
+        }
+    }
+}
+
+/// Plans one range patch on the bridge: inline results and restaged
+/// `Set`s return for synchronous serving below; splices park on the
+/// frontier; rejections answer at once. The responder travels in and
+/// back out: parked requests consume it into the frontier (`None`), all
+/// other outcomes hand it back for the synchronous path below.
+// Nine parameters: the routed request envelope plus the bridge state the
+// plan consults (tablets, metrics, lane policy, frontier). Grouping
+// would hide the intake order the surrounding code documents; the sole
+// caller builds it explicitly.
+#[allow(clippy::too_many_arguments)]
+fn bridge_plan_range(
+    tablet: TabletId,
+    op: Operation,
+    now: kivi_types::UnixMicros,
+    identity: Option<MutationIdentity>,
+    respond: crossbeam_channel::Sender<crate::worker::WorkerResponse>,
+    tablets: &Rc<RefCell<HashMap<TabletId, LiveTablet>>>,
+    metrics: &Rc<Cell<WorkerMetrics>>,
+    chunks: &WorkerChunks,
+    frontier: &mut VecDeque<BridgeStage>,
+) -> (
+    Option<Operation>,
+    Option<crossbeam_channel::Sender<crate::worker::WorkerResponse>>,
+) {
+    let Operation::SetRange { key, offset, patch } = op else {
+        return (Some(op), Some(respond));
+    };
+    let base = crate::worker::peek_range_base(&tablets.borrow(), tablet, &key, now);
+    match crate::chunk_lane::plan_set_range(key, offset, patch, base, chunks.inline_threshold) {
+        crate::chunk_lane::SetRangePlan::Inline(op) => (Some(op), Some(respond)),
+        crate::chunk_lane::SetRangePlan::Reject { detail } => {
+            let mut snapshot = metrics.get();
+            snapshot.channel_ops += 1;
+            metrics.set(snapshot);
+            let _ = respond.try_send(Err(WorkerRequestError::InvalidRequest { detail }));
+            (None, Some(respond))
+        }
+        crate::chunk_lane::SetRangePlan::RestageSet { key, value } => {
+            (Some(Operation::Set { key, value }), Some(respond))
+        }
+        crate::chunk_lane::SetRangePlan::Splice {
+            key,
+            manifest,
+            logical_len,
+            offset,
+            patch,
+        } => match chunks
+            .lane
+            .submit_splice(manifest, logical_len, offset, patch)
+        {
+            Ok(reply) => {
+                frontier.push_back(BridgeStage {
+                    tablet,
+                    key,
+                    identity,
+                    respond,
+                    reply,
+                    pinned: None,
+                    pins: Some(Arc::clone(&chunks.pins)),
+                });
+                (None, None)
+            }
+            Err(error) => {
+                let mut snapshot = metrics.get();
+                snapshot.channel_ops += 1;
+                metrics.set(snapshot);
+                let _ = respond.try_send(Err(WorkerRequestError::ChunkStore(error)));
+                (None, Some(respond))
+            }
+        },
+    }
+}
+
+/// Polls parked stagings: completions admit (durable) or execute
+/// (ephemeral) with the commit timestamp taken at completion — the
+/// logical commit happens at admission, not at the original arrival.
+fn poll_bridge_stages(
+    frontier: &mut VecDeque<BridgeStage>,
+    tablets: &Rc<RefCell<HashMap<TabletId, LiveTablet>>>,
+    metrics: &Rc<Cell<WorkerMetrics>>,
+    durability: Option<&Rc<RefCell<WorkerDurability>>>,
+) {
+    use async_channel::TryRecvError;
+    let mut cursor = 0;
+    while cursor < frontier.len() {
+        let outcome = match frontier[cursor].reply.try_recv() {
+            Err(TryRecvError::Empty) => {
+                cursor += 1;
+                continue;
+            }
+            // Lane gone: the worker is exiting. Dropping the responder
+            // surfaces disconnect downstream; nothing was admitted.
+            Err(TryRecvError::Closed) => {
+                frontier.remove(cursor);
+                continue;
+            }
+            Ok(outcome) => outcome,
+        };
+        let staged = frontier.remove(cursor).expect("cursor valid");
+        let mut snapshot = metrics.get();
+        snapshot.channel_ops += 1;
+        metrics.set(snapshot);
+        let (op, pinned) = match outcome {
+            Err(error) => {
+                let _ = staged
+                    .respond
+                    .try_send(Err(WorkerRequestError::ChunkStore(error)));
+                continue;
+            }
+            Ok(proof) => {
+                // Splice jobs pin here (addresses were unknowable at
+                // intake); ordinary stages already carry their guard.
+                let pinned = staged
+                    .pins
+                    .as_ref()
+                    .map(|pins| crate::chunk_lane::PinnedUpload::staged(pins, &proof))
+                    .or(staged.pinned);
+                (
+                    Operation::SetChunked {
+                        key: staged.key,
+                        manifest: proof.manifest,
+                        logical_len: proof.logical_len,
+                    },
+                    pinned,
+                )
+            }
+        };
+        let now = SystemClock::wall_now();
+        match durability {
+            None => {
+                let outcome = match tablets.borrow_mut().get_mut(&staged.tablet) {
+                    None => Err(WorkerRequestError::UnknownTablet {
+                        tablet: staged.tablet,
+                    }),
+                    Some(live) => live.execute(&op, now).map_err(WorkerRequestError::Tablet),
+                };
+                let _ = staged.respond.try_send(outcome);
+            }
+            Some(cell) => {
+                let mut durable = cell.borrow_mut();
+                let namespace = durable.namespace;
+                durable.commit.admit(
+                    PendingEntry::new(staged.tablet, op, now, staged.identity, staged.respond)
+                        .with_pinned(pinned),
+                );
+                durable.commit.poll(&mut tablets.borrow_mut(), namespace);
+            }
+        }
     }
 }
 
@@ -448,8 +795,16 @@ impl Drop for ActiveGuard {
 }
 
 /// Per-connection serving state.
+///
+/// The socket is split after the handshake: a detached reader task owns
+/// the read half (framing is never cancelled, so pipelined bytes can
+/// never be lost to a raced timeout), while this task owns the write
+/// half plus the reply outbox. Frames cross by a bounded channel; channel
+/// timeouts cancel nothing, so wakeups are free of the swallow hazard
+/// that socket-read timeouts carry.
 struct Conn {
-    stream: TcpStream,
+    /// Write half (post-handshake; `None` only while splitting).
+    stream: Option<TcpStream>,
     worker: WorkerId,
     tablets: Rc<RefCell<HashMap<TabletId, LiveTablet>>>,
     metrics: Rc<Cell<WorkerMetrics>>,
@@ -461,18 +816,89 @@ struct Conn {
     incarnation: NodeIncarnation,
     advertised_caps: Capabilities,
     durability: Option<Rc<RefCell<WorkerDurability>>>,
-    reader: FrameReader,
-    pending: std::collections::VecDeque<kivi_protocol::Frame>,
+    /// Chunk lane access plus the representation policy (large-`Set`
+    /// conversion and chunked-read resolution, always off-reactor).
+    chunks: WorkerChunks,
+    /// Parser state (post-handshake; moved to the reader task on split).
+    reader: Option<FrameReader>,
+    /// Inbound frames from the reader task (bounded by `max_pipelined`).
+    frames: async_channel::Receiver<kivi_protocol::Frame>,
     max_input: usize,
     max_pipelined: usize,
     turn: TurnBudget,
     shook_hands: bool,
     frames_this_turn: usize,
     bytes_this_turn: usize,
+    /// Admitted durable mutations awaiting their batch proof, in
+    /// admission order. Intake never waits on these: each loop turn pumps
+    /// the coordinator, replies to whatever proved, then takes more.
+    /// Responses match by request id, so barrier completions may answer
+    /// out of admission order — the client dispatches by id.
+    outbox: std::collections::VecDeque<OutboxEntry>,
+    /// Open streaming uploads by client-chosen stream id. Connection-local
+    /// by construction: ids never leave this connection, and connection
+    /// death drops every half-staged upload with it (staged-but-uncommitted
+    /// chunks age out through GC; nothing references them).
+    uploads: HashMap<u64, UploadState>,
+    /// Maximum `StreamData` payload bytes per frame, negotiated at
+    /// handshake from `max_frame` and capped at one chunk: uploads and
+    /// downloads chunk to this, so no stream frame ever exceeds framing.
+    stream_data_cap: u32,
 }
+
+/// One open streaming upload: staged chunk addresses in logical order
+/// plus the sub-chunk tail still buffering. Chunks stage incrementally
+/// (no per-chunk sync); one barrier at commit proves them together.
+struct UploadState {
+    /// Target key (its namespace was checked at begin; routing after
+    /// that keys off the tablet, exactly like ordinary requests).
+    key: Key,
+    /// Owning tablet (routed at begin; placement is static).
+    tablet: TabletId,
+    /// Retry identity for the commit, mirroring requests.
+    identity: Option<kivi_types::RequestIdentity>,
+    /// Acknowledgement floor for the commit, mirroring requests.
+    ack_floor: kivi_types::RequestSeq,
+    /// Declared total bytes (`None` = unknown upfront).
+    declared: Option<u64>,
+    /// Payload bytes accepted so far (staged plus buffered).
+    received: u64,
+    /// Sub-chunk tail buffering toward the next full piece.
+    buf: Vec<u8>,
+    /// Staged chunk addresses in logical order with their lengths.
+    entries: Vec<(kivi_types::ChunkId, u64)>,
+    /// Negotiated per-frame cap echoed for error paths.
+    max_data: u32,
+}
+
+/// One admitted durable mutation: who to answer once its batch proves.
+/// No pin guard rides here: the coordinator entry owns the upload's pins
+/// until after its apply journals the commit (which then covers the
+/// response window), so dropping this entry unpins nothing.
+struct OutboxEntry {
+    request_id: u64,
+    opcode: kivi_protocol::Opcode,
+    /// Whether this was a `GetStream` read: completions answer with
+    /// `ValueStream*` frames instead of a single `Response`.
+    streamed: bool,
+    receive: crossbeam_channel::Receiver<crate::worker::WorkerResponse>,
+}
+
+/// How long one loop turn waits for the next frame before re-pumping the
+/// coordinator (straggler detection for barrier completions while idle).
+/// Fast paths answer in the admit turn itself, so this never paces them.
+/// Channel timeouts cancel no socket reads (framing lives on the reader
+/// task), so this wait is free of the swallow hazard: wakeups cost a
+/// timer, never bytes.
+const OUTBOX_IDLE_POLL: Duration = Duration::from_millis(50);
+/// Frame wait while this connection (or its worker) holds outstanding
+/// work: completions and linger expiries resolve promptly instead of
+/// waiting out the idle interval.
+const OUTBOX_ACTIVE_POLL: Duration = Duration::from_micros(250);
 
 /// Why a connection task ended. `Clean` (EOF) is silent; violations
 /// and I/O failures trace at warn/debug respectively.
+#[derive(Debug, Clone, Copy)]
 enum ConnExit {
     Clean,
     Violation(&'static str),
@@ -481,17 +907,46 @@ enum ConnExit {
 
 impl Conn {
     /// Serves one connection from handshake to close.
+    ///
+    /// Intake and replies are decoupled: frames arrive pre-decoded from
+    /// the reader task (bounded channel), are admitted eagerly (bounded
+    /// by `max_pipelined` across channel plus outbox), and every turn
+    /// pumps the coordinator and answers whatever proved. A pipelined
+    /// client thus keeps many mutations in flight through one
+    /// connection, and concurrent connections genuinely overlap in the
+    /// commit pipeline instead of serializing behind one wait at a time.
+    /// (The handshake runs first, on the unified stream — see
+    /// `serve_conn`.)
     async fn run(&mut self) -> ConnExit {
-        if let Err(exit) = self.handshake().await {
-            return exit;
-        }
         loop {
             if self.shutdown.get() {
+                // Unanswered outbox entries die with the connection: the
+                // client's retry carries the same identity, so exactly-once
+                // holds across the shutdown.
                 return ConnExit::Clean;
             }
-            let frame = match self.next_frame().await {
-                Ok(frame) => frame,
-                Err(exit) => return exit,
+            // Pump first so barrier completions (and fast paths from the
+            // last admission) progress even when no new frame arrives.
+            self.pump_coordinator();
+            if let Err(exit) = self.flush_outbox().await {
+                return exit;
+            }
+            // Active connections (outbox or worker work outstanding)
+            // poll frames promptly so linger expiries and completions
+            // resolve in hundreds of microseconds; idle connections park
+            // longer. Either way this timeout cancels only a channel
+            // wait — never a socket read — so no frame is ever at risk.
+            let active = !self.outbox.is_empty() || self.coordinator_has_pending();
+            let wait = if active {
+                OUTBOX_ACTIVE_POLL
+            } else {
+                OUTBOX_IDLE_POLL
+            };
+            let frame = match compio::time::timeout(wait, self.next_frame()).await {
+                Ok(Ok(frame)) => frame,
+                Ok(Err(exit)) => return exit,
+                // No frame yet: loop back through pump and flush.
+                Err(_) => continue,
             };
             self.frames_this_turn += 1;
             self.bytes_this_turn += frame.payload.len();
@@ -508,55 +963,31 @@ impl Conn {
         }
     }
 
-    /// Reads the next frame, enforcing the input and backlog bounds. EOF is
-    /// clean; violations and I/O errors end the connection.
+    /// Whether the shared coordinator holds admitted or in-flight work
+    /// (frame wait stays short while it does).
+    fn coordinator_has_pending(&self) -> bool {
+        self.durability.as_ref().is_some_and(|cell| {
+            // Synchronous borrow: ends before any `.await` below.
+            cell.borrow().commit.has_pending()
+        })
+    }
+
+    /// Takes the next pre-decoded frame from the reader task. Reader death
+    /// (EOF, violation, I/O) ends the connection the same way a local
+    /// read failure would. Channel timeouts cancel nothing.
     async fn next_frame(&mut self) -> Result<kivi_protocol::Frame, ConnExit> {
-        loop {
-            if let Some(frame) = self.pending.pop_front() {
-                return Ok(frame);
-            }
-            // Pull more bytes only while the backlog has room: a client
-            // pipelining deeper than max_pipelined gets closed, never an
-            // unbounded queue. The read carries the accept-loop poll
-            // interval so an idle pooled connection still observes shutdown:
-            // without it, graceful close would drop the runtime under live
-            // sockets and leak the listener binding.
-            if self.reader.buffered() >= self.max_input {
-                return Err(ConnExit::Violation("input buffer bound"));
-            }
-            let chunk = Vec::with_capacity(8192);
-            let outcome =
-                compio::time::timeout(ACCEPT_POLL_INTERVAL, self.stream.read(chunk)).await;
-            let (result, chunk) = match outcome {
-                Err(_) => {
-                    if self.shutdown.get() {
-                        return Err(ConnExit::Clean);
-                    }
-                    continue;
-                }
-                Ok(outcome) => (outcome.0, outcome.1),
-            };
-            match result {
-                Ok(0) => return Err(ConnExit::Clean),
-                Ok(_) => {
-                    let frames = self
-                        .reader
-                        .push(&chunk)
-                        .map_err(|_| ConnExit::Violation("frame parse"))?;
-                    if self.pending.len() + frames.len() > self.max_pipelined {
-                        return Err(ConnExit::Violation("pipelined backlog bound"));
-                    }
-                    self.pending.extend(frames);
-                }
-                Err(_) => return Err(ConnExit::Io),
-            }
-        }
+        self.frames.recv().await.map_err(|_| ConnExit::Clean)
     }
 
     /// Performs the handshake: exactly one `ClientHello` first, then our
-    /// `ServerHello`. Any deviation closes the connection.
-    async fn handshake(&mut self) -> Result<(), ConnExit> {
-        let frame = self.next_frame().await?;
+    /// `ServerHello`. Any deviation closes the connection. Runs pre-split
+    /// on the unified stream (the only frames ever read synchronously
+    /// here); any pipelined frames arriving with the hello are returned
+    /// for the reader task's channel so nothing is lost in the handoff.
+    /// The handshake carries no outer timeout (one racing hello cannot
+    /// lose bytes — nothing else is in flight yet).
+    async fn handshake(&mut self) -> Result<Vec<kivi_protocol::Frame>, ConnExit> {
+        let (frame, extras) = self.read_handshake_frames().await?;
         if frame.kind != kivi_protocol::FrameKind::ClientHello {
             return Err(ConnExit::Violation("first frame must be ClientHello"));
         }
@@ -570,9 +1001,17 @@ impl Conn {
         if hello.max_frame == 0 {
             return Err(ConnExit::Violation("zero max frame"));
         }
-        let server_max = u32::try_from(self.reader.max_frame()).unwrap_or(u32::MAX);
+        let server_max = u32::try_from(self.reader.as_ref().expect("parser pre-split").max_frame())
+            .unwrap_or(u32::MAX);
         let max_frame = hello.max_frame.min(server_max);
-        self.reader = FrameReader::new(max_frame as usize);
+        self.reader = Some(FrameReader::new(max_frame as usize));
+        // Stream frames share the framing bound: payloads stay under the
+        // header, and one chunk per frame at most keeps upload staging
+        // incremental on both sides.
+        self.stream_data_cap = max_frame
+            .saturating_sub(u32::try_from(FRAME_HEADER_LEN).unwrap_or(u32::MAX))
+            .max(1)
+            .min(u32::try_from(kivi_chunk::DEFAULT_CHUNK_SIZE).unwrap_or(u32::MAX));
         let routing = self.routing.load();
         let reply = ServerHello {
             major: kivi_protocol::PROTOCOL_MAJOR,
@@ -595,7 +1034,51 @@ impl Conn {
         self.write_frame(kivi_protocol::FrameKind::ServerHello, 0, &reply.encode())
             .await?;
         self.shook_hands = true;
-        Ok(())
+        Ok(extras)
+    }
+
+    /// Reads handshake frames straight from the socket (pre-split only):
+    /// loops until at least one full frame decodes, returning any further
+    /// frames that arrived in the same bytes alongside. EOF, violations,
+    /// and I/O errors end the connection before it starts.
+    async fn read_handshake_frames(
+        &mut self,
+    ) -> Result<(kivi_protocol::Frame, Vec<kivi_protocol::Frame>), ConnExit> {
+        let stream = self.stream.as_mut().expect("unified stream pre-split");
+        let reader = self.reader.as_mut().expect("parser pre-split");
+        loop {
+            if reader.buffered() >= self.max_input {
+                return Err(ConnExit::Violation("input buffer bound"));
+            }
+            let chunk = Vec::with_capacity(8192);
+            let outcome = compio::time::timeout(ACCEPT_POLL_INTERVAL, stream.read(chunk)).await;
+            let (result, chunk) = match outcome {
+                Err(_) => {
+                    if self.shutdown.get() {
+                        return Err(ConnExit::Clean);
+                    }
+                    continue;
+                }
+                Ok(outcome) => (outcome.0, outcome.1),
+            };
+            match result {
+                Ok(0) => return Err(ConnExit::Clean),
+                Ok(_) => {
+                    let mut frames: std::collections::VecDeque<kivi_protocol::Frame> = reader
+                        .push(&chunk)
+                        .map_err(|_| ConnExit::Violation("frame parse"))?
+                        .into_iter()
+                        .collect();
+                    if frames.len() > self.max_pipelined {
+                        return Err(ConnExit::Violation("pipelined backlog bound"));
+                    }
+                    if let Some(first) = frames.pop_front() {
+                        return Ok((first, frames.into_iter().collect()));
+                    }
+                }
+                Err(_) => return Err(ConnExit::Io),
+            }
+        }
     }
 
     /// Handles one post-handshake frame.
@@ -608,7 +1091,287 @@ impl Conn {
                 Ok(())
             }
             FrameKind::Request => self.handle_request(frame.request_id, &frame.payload).await,
+            FrameKind::StreamBegin => {
+                self.handle_stream_begin(frame.request_id, &frame.payload)
+                    .await
+            }
+            FrameKind::StreamData => {
+                self.handle_stream_data(frame.request_id, &frame.payload)
+                    .await
+            }
+            FrameKind::StreamCommit => {
+                self.handle_stream_commit(frame.request_id, &frame.payload)
+                    .await
+            }
+            FrameKind::StreamAbort => {
+                // Best-effort by design: the sender already dropped its
+                // side, so a garbled reason still ends in a dropped
+                // stream. Never a violation, never a reply.
+                if let Ok(abort) = StreamAbort::decode(&frame.payload) {
+                    tracing::debug!(stream = frame.request_id, reason = %abort.reason, "peer aborted upload");
+                }
+                self.uploads.remove(&frame.request_id);
+                Ok(())
+            }
             _ => Err(ConnExit::Violation("unexpected frame kind")),
+        }
+    }
+
+    /// Aborts one upload in-band: drops all stream state and tells the
+    /// client why. Commits never follow an abort on the same id.
+    async fn abort_upload(&mut self, stream: u64, reason: &str) -> Result<(), ConnExit> {
+        self.uploads.remove(&stream);
+        tracing::debug!(stream, reason, "upload aborted");
+        self.write_frame(
+            kivi_protocol::FrameKind::StreamAbort,
+            stream,
+            &StreamAbort {
+                reason: reason.to_owned(),
+            }
+            .encode(),
+        )
+        .await
+    }
+
+    /// Opens one streaming upload: validates, routes, and parks the
+    /// assembler, answering `StreamReady` with the per-frame cap.
+    async fn handle_stream_begin(&mut self, stream: u64, payload: &[u8]) -> Result<(), ConnExit> {
+        let begin = StreamBegin::decode(payload)
+            .map_err(|_| ConnExit::Violation("malformed stream-begin"))?;
+        if begin.namespace != self.routing.load().namespace() {
+            return self.abort_upload(stream, "unknown namespace").await;
+        }
+        if begin
+            .total_len
+            .is_some_and(|total| total > kivi_protocol::MAX_STREAM_UPLOAD_BYTES)
+        {
+            return self
+                .abort_upload(stream, "upload exceeds the 1 GiB stream bound")
+                .await;
+        }
+        if self.uploads.contains_key(&stream) {
+            return self.abort_upload(stream, "stream id already in use").await;
+        }
+        let hash = PartitionHasher::V1
+            .hash(begin.namespace, &begin.key)
+            .ok_or(ConnExit::Io)?;
+        let tablet = match self.route(hash) {
+            Route::Execute(tablet) => tablet,
+            Route::Redirect(info) => {
+                let endpoint = self
+                    .endpoints
+                    .load()
+                    .get(&info.worker)
+                    .cloned()
+                    .unwrap_or_default();
+                return self
+                    .abort_upload(
+                        stream,
+                        &format!("key lives on worker {} ({endpoint})", info.worker.as_u64()),
+                    )
+                    .await;
+            }
+            Route::Nowhere => {
+                return self.abort_upload(stream, "no tablet covers key").await;
+            }
+        };
+        self.uploads.insert(
+            stream,
+            UploadState {
+                key: Key::from(begin.key),
+                tablet,
+                identity: begin.identity,
+                ack_floor: begin.ack_floor,
+                declared: begin.total_len,
+                received: 0,
+                buf: Vec::new(),
+                entries: Vec::new(),
+                max_data: self.stream_data_cap,
+            },
+        );
+        self.write_frame(
+            kivi_protocol::FrameKind::StreamReady,
+            stream,
+            &StreamReady {
+                max_data: self.stream_data_cap,
+            }
+            .encode(),
+        )
+        .await
+    }
+
+    /// Appends one upload frame: stages full chunks incrementally so
+    /// server residency stays near one chunk however large the upload.
+    async fn handle_stream_data(&mut self, stream: u64, payload: &[u8]) -> Result<(), ConnExit> {
+        // Unknown ids echo an abort instead of violating: data already in
+        // flight when the server aborts (over-cap, over-declared) is a
+        // benign race, not a peer bug.
+        if !self.uploads.contains_key(&stream) {
+            return self.abort_upload(stream, "unknown stream").await;
+        }
+        let max_data = self.uploads.get(&stream).expect("checked").max_data;
+        if payload.len() as u64 > u64::from(max_data) {
+            return self
+                .abort_upload(stream, "stream frame exceeds negotiated cap")
+                .await;
+        }
+        // `received` already covers the buffered tail: only the new
+        // payload extends the accepted total.
+        let accepted = self.uploads.get(&stream).expect("checked").received;
+        let total = accepted + payload.len() as u64;
+        if total > kivi_protocol::MAX_STREAM_UPLOAD_BYTES {
+            return self
+                .abort_upload(stream, "upload exceeds the 1 GiB stream bound")
+                .await;
+        }
+        if self
+            .uploads
+            .get(&stream)
+            .expect("checked")
+            .declared
+            .is_some_and(|declared| total > declared)
+        {
+            return self
+                .abort_upload(stream, "upload exceeds its declared total")
+                .await;
+        }
+        // Queue the bytes, then drain full pieces without holding the
+        // state borrow across lane awaits (disjoint field borrows would
+        // still tangle with the abort path's `&mut self`).
+        let drain = {
+            let state = self.uploads.get_mut(&stream).expect("checked");
+            state.buf.extend_from_slice(payload);
+            state.received += payload.len() as u64;
+            state.buf.len() >= kivi_chunk::DEFAULT_CHUNK_SIZE
+        };
+        if drain {
+            self.drain_upload_pieces(stream).await?;
+        }
+        Ok(())
+    }
+
+    /// Stages every full buffered piece for one upload. Split-then-stage:
+    /// pieces divide under the state borrow, stage over lane awaits, and
+    /// land back under a fresh borrow — the borrow never crosses an await.
+    async fn drain_upload_pieces(&mut self, stream: u64) -> Result<(), ConnExit> {
+        loop {
+            let piece = match self.uploads.get_mut(&stream) {
+                None => return self.abort_upload(stream, "unknown stream").await,
+                Some(state) => {
+                    if state.buf.len() < kivi_chunk::DEFAULT_CHUNK_SIZE {
+                        return Ok(());
+                    }
+                    let piece: Vec<u8> =
+                        state.buf.drain(..kivi_chunk::DEFAULT_CHUNK_SIZE).collect();
+                    Bytes::from(piece)
+                }
+            };
+            let id = kivi_codec::integrity::chunk_id(self.chunks.domain, &piece);
+            if let Err(error) = self.chunks.lane.stage_chunk_async(id, piece).await {
+                tracing::warn!(stream, %error, "upload chunk staging failed");
+                return self.abort_upload(stream, "chunk staging failed").await;
+            }
+            match self.uploads.get_mut(&stream) {
+                None => return self.abort_upload(stream, "unknown stream").await,
+                Some(state) => state
+                    .entries
+                    .push((id, kivi_chunk::DEFAULT_CHUNK_SIZE as u64)),
+            }
+        }
+    }
+
+    /// Commits one upload: flushes the tail piece, proves the manifest
+    /// durable with one sync barrier, and admits the small root — the
+    /// same chunks-first ordering as every other write path, with the
+    /// stored version answered under the stream id.
+    async fn handle_stream_commit(&mut self, stream: u64, payload: &[u8]) -> Result<(), ConnExit> {
+        if !payload.is_empty() {
+            return Err(ConnExit::Violation("stream-commit carries no payload"));
+        }
+        let Some(state) = self.uploads.remove(&stream) else {
+            return self.abort_upload(stream, "unknown stream").await;
+        };
+        // `received` counts every accepted payload byte, buffered or
+        // staged alike — the commit total needs no adjustment.
+        let total = state.received;
+        if state.declared.is_some_and(|declared| declared != total) {
+            return self
+                .abort_upload(stream, "upload length mismatches its declared total")
+                .await;
+        }
+        // Take the owned parts out of the removed state; the state is
+        // already gone, so a failure below answers abort with nothing to
+        // roll back — the client re-uploads under a fresh id.
+        let UploadState {
+            key,
+            tablet,
+            identity,
+            ack_floor,
+            mut buf,
+            mut entries,
+            ..
+        } = state;
+        if !buf.is_empty() {
+            let tail = Bytes::from(std::mem::take(&mut buf));
+            let id = kivi_codec::integrity::chunk_id(self.chunks.domain, &tail);
+            let len = tail.len() as u64;
+            if let Err(error) = self.chunks.lane.stage_chunk_async(id, tail).await {
+                tracing::warn!(stream, %error, "upload tail staging failed");
+                return self.abort_upload(stream, "chunk staging failed").await;
+            }
+            entries.push((id, len));
+        }
+        let staged = match self.chunks.lane.finalize_stream_async(entries, total).await {
+            Ok(staged) => staged,
+            Err(error) => {
+                tracing::warn!(stream, %error, "upload finalization failed");
+                return self
+                    .abort_upload(stream, "upload finalization failed")
+                    .await;
+            }
+        };
+        let guard = crate::chunk_lane::PinnedUpload::staged(&self.chunks.pins, &staged);
+        let operation = Operation::SetChunked {
+            key,
+            manifest: staged.manifest,
+            logical_len: staged.logical_len,
+        };
+        if self.durability.is_some() {
+            return self
+                .handle_request_durable(
+                    stream,
+                    identity,
+                    ack_floor,
+                    tablet,
+                    &operation,
+                    kivi_protocol::Opcode::Set,
+                    Some(guard),
+                    false,
+                )
+                .await;
+        }
+        match self.execute_local(tablet, &operation) {
+            None => {
+                self.respond(
+                    stream,
+                    kivi_protocol::Opcode::Set,
+                    kivi_protocol::Response {
+                        status: kivi_protocol::Status::NotLocal,
+                        body: kivi_protocol::ResponseBody::Diagnostic(
+                            "tablet not live on owner".to_owned(),
+                        ),
+                    },
+                )
+                .await
+            }
+            Some(Ok(result)) => {
+                self.respond_result(stream, kivi_protocol::Opcode::Set, &result, false)
+                    .await
+            }
+            Some(Err(error)) => {
+                self.respond_op_error(stream, kivi_protocol::Opcode::Set, &error)
+                    .await
+            }
         }
     }
 
@@ -693,7 +1456,10 @@ impl Conn {
     }
 
     /// Executes one routed request on this worker: durable pipeline when
-    /// the lane exists, direct in-memory execution otherwise.
+    /// the lane exists, direct in-memory execution otherwise. Large legacy
+    /// `Set`s stage through the chunk lane first (suspending only this
+    /// task) and re-enter as small `SetChunked` roots; chunked reads
+    /// resolve through [`respond_result`](Self::respond_result).
     async fn handle_routed_request(
         &mut self,
         request_id: u64,
@@ -702,18 +1468,75 @@ impl Conn {
     ) -> Result<(), ConnExit> {
         let identity = request.identity;
         let ack_floor = request.ack_floor;
+        // The response envelope keeps the requested opcode — never the
+        // post-split one — so `GetStream` answers stream-shaped even
+        // though it executes the same read as `Get`.
+        let requested = request.opcode;
+        let streamed = requested == kivi_protocol::Opcode::GetStream;
         let operation = request.into_operation();
-        let opcode = kivi_protocol::operation_opcode(&operation);
+        // Representation split on the owner: values over the threshold
+        // stage (chunks, manifest, one sync barrier) before admission, so
+        // the WAL only ever carries the small root. Range patches plan
+        // against the peeked base first (the peek is synchronous; the
+        // staging below suspends only this task, and the split passes the
+        // resulting `SetChunked` straight through). Staging precedes
+        // admission, so a lane failure or a rejected range answers here
+        // with state untouched. A handled patch (`None`) already answered.
+        let Some((operation, pinned)) = self
+            .plan_routed_range(request_id, tablet, operation)
+            .await?
+        else {
+            return Ok(());
+        };
+        let (operation, pinned) =
+            match crate::chunk_lane::split_large_set(operation, self.chunks.inline_threshold) {
+                crate::chunk_lane::LargeSetSplit::Inline(op) => (op, pinned),
+                crate::chunk_lane::LargeSetSplit::Stage { key, value } => {
+                    let mut guard = match crate::chunk_lane::PinnedUpload::begin(
+                        &self.chunks.pins,
+                        self.chunks.domain,
+                        &value,
+                    ) {
+                        Ok(guard) => guard,
+                        Err(error) => {
+                            return self
+                                .respond_chunk_error(request_id, kivi_protocol::Opcode::Set, &error)
+                                .await;
+                        }
+                    };
+                    match self.chunks.lane.stage_value_async(value).await {
+                        Ok(staged) => {
+                            guard.set_manifest(staged.manifest);
+                            (
+                                Operation::SetChunked {
+                                    key,
+                                    manifest: staged.manifest,
+                                    logical_len: staged.logical_len,
+                                },
+                                Some(guard),
+                            )
+                        }
+                        Err(error) => {
+                            return self
+                                .respond_chunk_error(request_id, kivi_protocol::Opcode::Set, &error)
+                                .await;
+                        }
+                    }
+                }
+            };
         if self.durability.is_some() {
             return self
-                .handle_request_durable(request_id, identity, ack_floor, tablet, &operation, opcode)
+                .handle_request_durable(
+                    request_id, identity, ack_floor, tablet, &operation, requested, pinned,
+                    streamed,
+                )
                 .await;
         }
         match self.execute_local(tablet, &operation) {
             None => {
                 self.respond(
                     request_id,
-                    opcode,
+                    requested,
                     kivi_protocol::Response {
                         status: kivi_protocol::Status::NotLocal,
                         body: kivi_protocol::ResponseBody::Diagnostic(
@@ -724,18 +1547,456 @@ impl Conn {
                 .await
             }
             Some(Ok(result)) => {
-                bump_direct(&self.metrics);
-                self.respond_ok(request_id, opcode, &result).await
+                self.respond_result(request_id, requested, &result, streamed)
+                    .await
             }
-            Some(Err(error)) => self.respond_op_error(request_id, opcode, &error).await,
+            Some(Err(error)) => self.respond_op_error(request_id, requested, &error).await,
         }
     }
 
-    /// Durable write pipeline on the owning worker: dedup check, prepare,
-    /// exactly one WAL record, apply + verify (or install), reply. Never
-    /// replies success before the record is file-synced. Tablet and lane
-    /// borrows both end before any `.await`, so connection tasks on this
-    /// thread cannot interleave a persist-apply sequence.
+    /// Plans one routed range patch against its peeked base: inline
+    /// results and restaged `Set`s return for the split below, splices
+    /// stage through the lane and return the `SetChunked` pair, and
+    /// rejections answer at once. Returns `None` when the request is
+    /// already answered (rejected or staging-failed); connection exits
+    /// propagate like every other responder.
+    async fn plan_routed_range(
+        &mut self,
+        request_id: u64,
+        tablet: TabletId,
+        operation: Operation,
+    ) -> Result<Option<(Operation, Option<crate::chunk_lane::PinnedUpload>)>, ConnExit> {
+        let Operation::SetRange { key, offset, patch } = operation else {
+            return Ok(Some((operation, None)));
+        };
+        let base = crate::worker::peek_range_base(
+            &self.tablets.borrow(),
+            tablet,
+            &key,
+            SystemClock::wall_now(),
+        );
+        match crate::chunk_lane::plan_set_range(
+            key,
+            offset,
+            patch,
+            base,
+            self.chunks.inline_threshold,
+        ) {
+            crate::chunk_lane::SetRangePlan::Inline(op) => Ok(Some((op, None))),
+            crate::chunk_lane::SetRangePlan::Reject { detail } => {
+                self.respond(
+                    request_id,
+                    kivi_protocol::Opcode::SetRange,
+                    kivi_protocol::Response {
+                        status: kivi_protocol::Status::InvalidRequest,
+                        body: kivi_protocol::ResponseBody::Diagnostic(detail),
+                    },
+                )
+                .await?;
+                Ok(None)
+            }
+            crate::chunk_lane::SetRangePlan::RestageSet { key, value } => {
+                Ok(Some((Operation::Set { key, value }, None)))
+            }
+            crate::chunk_lane::SetRangePlan::Splice {
+                key,
+                manifest,
+                logical_len,
+                offset,
+                patch,
+            } => match self
+                .chunks
+                .lane
+                .splice_range_async(manifest, logical_len, offset, patch)
+                .await
+            {
+                Ok(staged) => {
+                    let guard = crate::chunk_lane::PinnedUpload::staged(&self.chunks.pins, &staged);
+                    Ok(Some((
+                        Operation::SetChunked {
+                            key,
+                            manifest: staged.manifest,
+                            logical_len: staged.logical_len,
+                        },
+                        Some(guard),
+                    )))
+                }
+                Err(error) => {
+                    self.respond_chunk_error(request_id, kivi_protocol::Opcode::SetRange, &error)
+                        .await?;
+                    Ok(None)
+                }
+            },
+        }
+    }
+
+    /// Answers one executed result, resolving chunked reads through the
+    /// chunk lane first. The tablet borrow is long gone by the time the
+    /// lane is awaited: resolution suspends only this connection task,
+    /// never the reactor, and the tablet stays the sole mutation owner
+    /// throughout (§16, §17). `GetStream` completions fan out into
+    /// `ValueStream*` frames instead of one response frame.
+    async fn respond_result(
+        &mut self,
+        request_id: u64,
+        opcode: kivi_protocol::Opcode,
+        result: &OperationResult,
+        streamed: bool,
+    ) -> Result<(), ConnExit> {
+        if streamed {
+            return self.respond_stream(request_id, result).await;
+        }
+        bump_direct(&self.metrics);
+        match result {
+            OperationResult::ChunkedValue {
+                manifest,
+                logical_len,
+            } => match self
+                .chunks
+                .lane
+                .read_value_async(*manifest, *logical_len)
+                .await
+            {
+                Ok(bytes) => {
+                    self.respond_ok(request_id, opcode, &OperationResult::Value(Some(bytes)))
+                        .await
+                }
+                Err(error) => self.respond_chunk_error(request_id, opcode, &error).await,
+            },
+            other => self.respond_ok(request_id, opcode, other).await,
+        }
+    }
+
+    /// Answers one `GetStream` read as `ValueStream*` frames under the
+    /// originating request id: `Begin{total}` first, `Data` payloads cut
+    /// to the negotiated cap, then one empty `End`. Inline values stream
+    /// from memory; chunked values stream entry by entry straight from
+    /// packs, so downloads stay flat however large the value. Pre-begin
+    /// failures answer as ordinary error responses (the client never saw
+    /// a begin); once the begin is out, failures can only abort mid-stream.
+    async fn respond_stream(
+        &mut self,
+        request_id: u64,
+        result: &OperationResult,
+    ) -> Result<(), ConnExit> {
+        use kivi_protocol::{Response, ResponseBody, Status};
+        bump_direct(&self.metrics);
+        match result {
+            OperationResult::Value(Some(bytes)) => self.write_value_stream(request_id, bytes).await,
+            OperationResult::Value(None) => {
+                self.respond(
+                    request_id,
+                    kivi_protocol::Opcode::GetStream,
+                    Response {
+                        status: Status::NotFound,
+                        body: ResponseBody::Diagnostic(String::new()),
+                    },
+                )
+                .await
+            }
+            OperationResult::ChunkedValue {
+                manifest,
+                logical_len,
+            } => {
+                let loaded = match self.chunks.lane.fetch_manifest_async(*manifest).await {
+                    Ok(loaded) => loaded,
+                    Err(error) => {
+                        return self
+                            .respond_chunk_error(
+                                request_id,
+                                kivi_protocol::Opcode::GetStream,
+                                &error,
+                            )
+                            .await;
+                    }
+                };
+                if loaded.total_len != *logical_len {
+                    tracing::error!(%request_id, manifest = %manifest, claimed = logical_len, actual = loaded.total_len, "streamed root disagrees with its manifest");
+                    return self
+                        .respond(
+                            request_id,
+                            kivi_protocol::Opcode::GetStream,
+                            Response {
+                                status: Status::Internal,
+                                body: ResponseBody::Diagnostic(
+                                    "chunked value unavailable".to_owned(),
+                                ),
+                            },
+                        )
+                        .await;
+                }
+                self.write_frame(
+                    kivi_protocol::FrameKind::ValueStreamBegin,
+                    request_id,
+                    &ValueStreamBegin {
+                        total_len: *logical_len,
+                    }
+                    .encode(),
+                )
+                .await?;
+                for entry in loaded.entries {
+                    let bytes = match self.chunks.lane.read_chunk_async(entry.id).await {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            tracing::error!(%request_id, %error, "streamed chunk read failed");
+                            return self
+                                .abort_value_stream(request_id, "chunked value unavailable")
+                                .await;
+                        }
+                    };
+                    if bytes.len() as u64 != entry.len {
+                        tracing::error!(%request_id, chunk = %entry.id, "streamed chunk disagrees with its manifest entry");
+                        return self
+                            .abort_value_stream(request_id, "chunked value unavailable")
+                            .await;
+                    }
+                    self.write_stream_data(request_id, &bytes).await?;
+                }
+                self.write_frame(kivi_protocol::FrameKind::ValueStreamEnd, request_id, &[])
+                    .await
+            }
+            // Unreachable: `Get` executes to values or chunked values (or
+            // errors, which never reach here). Fail closed, never guess.
+            other => {
+                tracing::error!(%request_id, result = ?other, "streamed read executed to a non-value");
+                self.respond(
+                    request_id,
+                    kivi_protocol::Opcode::GetStream,
+                    Response {
+                        status: Status::Internal,
+                        body: ResponseBody::Diagnostic("chunked value unavailable".to_owned()),
+                    },
+                )
+                .await
+            }
+        }
+    }
+
+    /// Writes one in-memory value as a value stream (begin, capped data
+    /// frames, end).
+    async fn write_value_stream(
+        &mut self,
+        request_id: u64,
+        bytes: &bytes::Bytes,
+    ) -> Result<(), ConnExit> {
+        self.write_frame(
+            kivi_protocol::FrameKind::ValueStreamBegin,
+            request_id,
+            &ValueStreamBegin {
+                total_len: bytes.len() as u64,
+            }
+            .encode(),
+        )
+        .await?;
+        self.write_stream_data(request_id, bytes).await?;
+        self.write_frame(kivi_protocol::FrameKind::ValueStreamEnd, request_id, &[])
+            .await
+    }
+
+    /// Writes verbatim bytes as capped `ValueStreamData` frames. Awaiting
+    /// each write is the backpressure: a slow client parks this task, not
+    /// the reactor, and no frame ever exceeds the negotiated cap.
+    async fn write_stream_data(&mut self, request_id: u64, bytes: &[u8]) -> Result<(), ConnExit> {
+        let cap = self.stream_data_cap.max(1) as usize;
+        for piece in bytes.chunks(cap) {
+            self.write_frame(kivi_protocol::FrameKind::ValueStreamData, request_id, piece)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Ends a broken value stream: the client saw a begin but the packs
+    /// stopped verifying, so only an abort (never a forged end) follows.
+    async fn abort_value_stream(&mut self, request_id: u64, reason: &str) -> Result<(), ConnExit> {
+        self.write_frame(
+            kivi_protocol::FrameKind::StreamAbort,
+            request_id,
+            &StreamAbort {
+                reason: reason.to_owned(),
+            }
+            .encode(),
+        )
+        .await
+    }
+
+    /// Answers a chunk fabric failure with its stable status. Overload and
+    /// oversize are retriable signals; missing or corrupt immutable data
+    /// is `Internal` (loud, never wrong bytes — later multi-source
+    /// recovery will repair what local verification condemns).
+    async fn respond_chunk_error(
+        &mut self,
+        request_id: u64,
+        opcode: kivi_protocol::Opcode,
+        error: &kivi_chunk::ChunkError,
+    ) -> Result<(), ConnExit> {
+        use kivi_protocol::{Response, ResponseBody, Status};
+        bump_direct(&self.metrics);
+        let (status, diagnostic) = match error {
+            kivi_chunk::ChunkError::Overloaded => (Status::Overloaded, "chunk lane saturated"),
+            kivi_chunk::ChunkError::TooLarge { .. } => (Status::ValueTooLarge, "value too large"),
+            kivi_chunk::ChunkError::MissingChunk { .. }
+            | kivi_chunk::ChunkError::MissingManifest { .. }
+            | kivi_chunk::ChunkError::CorruptChunk { .. }
+            | kivi_chunk::ChunkError::CorruptManifest { .. } => {
+                tracing::error!(%request_id, %error, "chunked read failed verification");
+                (Status::Internal, "chunked value unavailable")
+            }
+            kivi_chunk::ChunkError::Unsupported { .. }
+            | kivi_chunk::ChunkError::Invalid { .. }
+            | kivi_chunk::ChunkError::Io { .. } => {
+                tracing::warn!(%request_id, %error, "chunk fabric failure");
+                (Status::Internal, "chunk fabric failure")
+            }
+            // `ChunkError` is non-exhaustive across crates: future
+            // variants fail loudly retriable-agnostic here by
+            // construction (never wrong bytes, never a crash).
+            _ => (Status::Internal, "chunk fabric failure"),
+        };
+        self.respond(
+            request_id,
+            opcode,
+            Response {
+                status,
+                body: ResponseBody::Diagnostic(diagnostic.to_owned()),
+            },
+        )
+        .await
+    }
+
+    /// Pumps the shared commit coordinator (no-op in ephemeral mode).
+    /// Synchronous borrows only; never held across an `.await`.
+    fn pump_coordinator(&mut self) {
+        if let Some(cell) = self.durability.as_ref() {
+            let mut durable = cell.borrow_mut();
+            let namespace = durable.namespace;
+            durable
+                .commit
+                .poll(&mut self.tablets.borrow_mut(), namespace);
+        }
+    }
+
+    /// Answers every outbox entry whose batch proved (or failed), in
+    /// completion order. Entries answered here leave the outbox; the rest
+    /// keep waiting for later turns.
+    async fn flush_outbox(&mut self) -> Result<(), ConnExit> {
+        let mut ready = Vec::new();
+        let mut cursor = 0usize;
+        while cursor < self.outbox.len() {
+            match self.outbox[cursor].receive.try_recv() {
+                Ok(outcome) => {
+                    let entry = self.outbox.remove(cursor).expect("cursor valid");
+                    ready.push((entry.request_id, entry.opcode, entry.streamed, outcome));
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => {
+                    cursor += 1;
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    // Coordinator gone without answering: the worker is
+                    // exiting. Sealed work still proves on the lane and
+                    // replays on restart; retries reuse identities.
+                    return Err(ConnExit::Io);
+                }
+            }
+        }
+        for (request_id, opcode, streamed, outcome) in ready {
+            match outcome {
+                // `respond_result` resolves chunked reads (bumping itself)
+                // and fans `GetStream` completions into value streams;
+                // every other outcome answers inline as before.
+                Ok(result) => {
+                    self.respond_result(request_id, opcode, &result, streamed)
+                        .await?;
+                }
+                Err(error) => {
+                    self.respond_worker_error(request_id, opcode, &error)
+                        .await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Maps a worker-side request failure onto the wire (shared by inline
+    /// and outbox replies so both paths speak identically).
+    async fn respond_worker_error(
+        &mut self,
+        request_id: u64,
+        opcode: kivi_protocol::Opcode,
+        error: &WorkerRequestError,
+    ) -> Result<(), ConnExit> {
+        use kivi_protocol::{Response, ResponseBody, Status};
+        match error {
+            WorkerRequestError::Tablet(error) => {
+                self.respond_op_error(request_id, opcode, error).await
+            }
+            WorkerRequestError::UnknownTablet { .. } => {
+                self.respond(
+                    request_id,
+                    opcode,
+                    Response {
+                        status: Status::NotLocal,
+                        body: ResponseBody::Diagnostic("tablet not live on owner".to_owned()),
+                    },
+                )
+                .await
+            }
+            WorkerRequestError::DedupExpired => {
+                self.respond(
+                    request_id,
+                    opcode,
+                    Response {
+                        status: Status::DedupExpired,
+                        body: ResponseBody::Diagnostic(
+                            "mutation identity expired below the session floor".to_owned(),
+                        ),
+                    },
+                )
+                .await
+            }
+            WorkerRequestError::SessionOverloaded => {
+                self.respond(
+                    request_id,
+                    opcode,
+                    Response {
+                        status: Status::SessionOverloaded,
+                        body: ResponseBody::Diagnostic(
+                            "session outcome window exhausted".to_owned(),
+                        ),
+                    },
+                )
+                .await
+            }
+            WorkerRequestError::ChunkStore(error) => {
+                self.respond_chunk_error(request_id, opcode, error).await
+            }
+            WorkerRequestError::InvalidRequest { detail } => {
+                self.respond(
+                    request_id,
+                    opcode,
+                    Response {
+                        status: Status::InvalidRequest,
+                        body: ResponseBody::Diagnostic(detail.clone()),
+                    },
+                )
+                .await
+            }
+            WorkerRequestError::Storage(error) => {
+                self.respond_storage_error(request_id, opcode, error).await
+            }
+        }
+    }
+
+    /// Durable write intake on the owning worker: validates, admits to the
+    /// commit coordinator, and queues the reply slot — never waits.
+    /// Never replies success before the record is file-synced: the reply
+    /// leaves through [`flush_outbox`](Self::flush_outbox) once the batch
+    /// proves. All borrows end before any `.await`, so connection tasks on
+    /// this thread cannot interleave a persist-apply sequence.
+    // Nine parameters: routing, identity, payload, opcode, the pin guard
+    // this stage adds, plus the stream flag completions answer with.
+    // Grouping would hide the intake order the surrounding code
+    // documents; the callers build it explicitly.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_request_durable(
         &mut self,
         request_id: u64,
@@ -744,6 +2005,8 @@ impl Conn {
         tablet: TabletId,
         operation: &Operation,
         opcode: kivi_protocol::Opcode,
+        pinned: Option<crate::chunk_lane::PinnedUpload>,
+        streamed: bool,
     ) -> Result<(), ConnExit> {
         use kivi_protocol::{Response, ResponseBody, Status};
         // Identity rule: mutating requests must carry client identity on a
@@ -787,61 +2050,37 @@ impl Conn {
                 )
                 .await;
         }
-        let outcome = {
-            let mut tablets = self.tablets.borrow_mut();
-            let live = tablets.get_mut(&tablet).expect("presence checked above");
-            let durability = self
-                .durability
-                .as_ref()
-                .expect("durable path always has a lane");
-            let mut durable = durability.borrow_mut();
-            execute_durable(
-                live,
-                &mut durable,
-                operation,
-                opcode.as_u8(),
-                identity.as_ref(),
-                now,
-            )
-        };
-        match outcome {
-            Ok(result) => {
-                bump_direct(&self.metrics);
-                self.respond_ok(request_id, opcode, &result).await
-            }
-            Err(DurableFailure::Op(error)) => {
-                self.respond_op_error(request_id, opcode, &error).await
-            }
-            Err(DurableFailure::Expired) => {
-                self.respond(
-                    request_id,
-                    opcode,
-                    Response {
-                        status: Status::DedupExpired,
-                        body: ResponseBody::Diagnostic(
-                            "mutation identity expired below the session floor".to_owned(),
-                        ),
-                    },
-                )
-                .await
-            }
-            Err(DurableFailure::Overloaded) => {
-                self.respond(
-                    request_id,
-                    opcode,
-                    Response {
-                        status: Status::SessionOverloaded,
-                        body: ResponseBody::Diagnostic(
-                            "session outcome window exhausted".to_owned(),
-                        ),
-                    },
-                )
-                .await
-            }
-            Err(DurableFailure::Storage(error)) => {
-                self.respond_storage_error(request_id, opcode, &error).await
-            }
+        let durability = self
+            .durability
+            .as_ref()
+            .expect("durable path always has a lane");
+        // Pipelining bound across decode backlog plus outbox: deeper gets
+        // closed, never an unbounded queue.
+        if self.outbox.len() >= self.max_pipelined {
+            return Err(ConnExit::Violation("pipelined backlog bound"));
         }
+        let (respond, receive) = crossbeam_channel::bounded::<crate::worker::WorkerResponse>(1);
+        {
+            let mut durable = durability.borrow_mut();
+            let namespace = durable.namespace;
+            // The coordinator entry owns the upload's pins until after
+            // its apply journals the commit; the journal then covers the
+            // response window, so the outbox needs no guard of its own.
+            durable.commit.admit(
+                crate::commit::PendingEntry::new(tablet, operation.clone(), now, identity, respond)
+                    .with_pinned(pinned),
+            );
+            durable
+                .commit
+                .poll(&mut self.tablets.borrow_mut(), namespace);
+        }
+        self.outbox.push_back(OutboxEntry {
+            request_id,
+            opcode,
+            streamed,
+            receive,
+        });
+        Ok(())
     }
 
     /// Answers a WAL append failure: full disks read as resource
@@ -976,7 +2215,8 @@ impl Conn {
         payload: &[u8],
     ) -> Result<(), ConnExit> {
         let bytes = encode_frame(kind, request_id, payload);
-        let outcome = self.stream.write_all(bytes).await;
+        let stream = self.stream.as_mut().expect("write half held");
+        let outcome = stream.write_all(bytes).await;
         outcome.0.map_err(|_| ConnExit::Io)?;
         Ok(())
     }
@@ -1039,6 +2279,17 @@ impl Conn {
                     Some(stamp) => ResponseBody::ExpiryAt(stamp.as_micros()),
                 },
             },
+            // Unreachable by construction: the engine resolves chunked
+            // reads through the chunk lane before responding, so a
+            // `ChunkedValue` here is a missed resolution path. Answer
+            // loudly retriable `Internal` (never wrong bytes, never a
+            // crash) — and the resolution tests below pin the real paths.
+            R::ChunkedValue { .. } => Response {
+                status: Status::Internal,
+                body: ResponseBody::Diagnostic(
+                    "chunked value reached the wire unresolved".to_owned(),
+                ),
+            },
         };
         self.respond(request_id, opcode, response).await
     }
@@ -1055,6 +2306,12 @@ impl Conn {
         let (status, message) = match error {
             E::Op(kivi_state::OpError::WrongType { .. }) => (Status::WrongType, "wrong type"),
             E::Op(kivi_state::OpError::CounterOverflow) => (Status::CounterOverflow, "overflow"),
+            // Transient admission race: the range base changed
+            // representation under the request. Safe to retry at once —
+            // the retry re-plans against the new root.
+            E::Op(kivi_state::OpError::StaleRangeBase) => {
+                (Status::InvalidRequest, "range base changed; retry")
+            }
             E::Apply(kivi_state::ApplyError::VersionExhausted) => {
                 (Status::VersionExhausted, "version exhausted")
             }
@@ -1063,6 +2320,11 @@ impl Conn {
             }
             E::Apply(kivi_state::ApplyError::TypeMismatch { .. }) => {
                 (Status::WrongType, "wrong type")
+            }
+            // Divergent-state splice: a corrupt or forked record met a
+            // chunked base. Never a client retry — surface as internal.
+            E::Apply(kivi_state::ApplyError::UnresolvableSplice) => {
+                (Status::Internal, "splice cannot apply")
             }
             E::AuthorityMismatch { .. } => (Status::Internal, "authority mismatch"),
             E::CommitExhausted { .. } => (Status::VersionExhausted, "commit space exhausted"),
@@ -1121,8 +2383,10 @@ async fn serve_conn(stream: TcpStream, peer: SocketAddr, shared: Rc<WorkerNet>) 
     let _ = stream.set_nodelay(true);
     let max_input = shared.net.conn.max_input_bytes;
     let max_pipelined = shared.net.conn.max_pipelined;
+    let (frames_tx, frames_rx) =
+        async_channel::bounded::<kivi_protocol::Frame>(max_pipelined.max(1));
     let mut conn = Conn {
-        stream,
+        stream: Some(stream),
         worker: shared.id,
         tablets: Rc::clone(&shared.tablets),
         metrics: Rc::clone(&shared.metrics),
@@ -1134,16 +2398,70 @@ async fn serve_conn(stream: TcpStream, peer: SocketAddr, shared: Rc<WorkerNet>) 
         incarnation: shared.net.incarnation,
         advertised_caps: shared.net.advertised_caps,
         durability: shared.durability.clone(),
-        reader: FrameReader::new(shared.net.conn.max_frame),
-        pending: std::collections::VecDeque::new(),
+        chunks: shared.chunks.clone(),
+        reader: Some(FrameReader::new(shared.net.conn.max_frame)),
+        frames: frames_rx,
         max_input,
         max_pipelined,
         turn: shared.net.turn,
         shook_hands: false,
         frames_this_turn: 0,
         bytes_this_turn: 0,
+        outbox: std::collections::VecDeque::new(),
+        uploads: HashMap::new(),
+        // Negotiated below in the handshake; this default only covers
+        // the pre-handshake window, where stream frames are violations.
+        stream_data_cap: 1,
     };
+    // Handshake first on the unified stream, then split: the reader task
+    // owns framing from here on (never cancelled), the serving task owns
+    // the write half plus the reply outbox.
+    let extras = match conn.handshake().await {
+        Ok(extras) => extras,
+        Err(exit) => {
+            log_conn_exit(peer, exit);
+            return;
+        }
+    };
+    let stream = conn.stream.take().expect("handshake keeps the stream");
+    let parser = conn.reader.take().expect("handshake keeps the parser");
+    let (read_stream, write_stream) = stream.into_split();
+    conn.stream = Some(write_stream);
+    for frame in extras {
+        if frames_tx.try_send(frame).is_err() {
+            log_conn_exit(peer, ConnExit::Violation("pipelined backlog bound"));
+            return;
+        }
+    }
+    let reader_shutdown = Rc::clone(&shared.shutdown);
+    // Handshake first on the unified stream, then split: the reader task
+    // owns framing from here on (never cancelled), the serving task owns
+    // the write half plus the reply outbox. Both halves count live: the
+    // shutdown drain waits for the serving task AND the reader, so the
+    // runtime never drops under a live socket (a dropped runtime with
+    // live tasks leaks their FDs past thread join, breaking same-port
+    // restart with ghost listeners).
+    let reader_guard = ActiveGuard::hold(&shared.active);
+    compio::runtime::spawn(async move {
+        let _guard = reader_guard;
+        conn_read_loop(
+            read_stream,
+            parser,
+            max_input,
+            max_pipelined,
+            reader_shutdown,
+            frames_tx,
+            peer,
+        )
+        .await;
+    })
+    .detach();
     let exit = conn.run().await;
+    log_conn_exit(peer, exit);
+}
+
+/// Logs one connection outcome at its level.
+fn log_conn_exit(peer: SocketAddr, exit: ConnExit) {
     match exit {
         ConnExit::Clean => tracing::debug!(%peer, "connection closed"),
         ConnExit::Violation(reason) => {
@@ -1151,4 +2469,62 @@ async fn serve_conn(stream: TcpStream, peer: SocketAddr, shared: Rc<WorkerNet>) 
         }
         ConnExit::Io => tracing::debug!(%peer, "connection I/O ended"),
     }
+}
+
+/// Per-connection reader task: owns the read half and framing, forwards
+/// decoded frames over a bounded channel. Reads are never wrapped in an
+/// outer timeout, so a racing wakeup can never cancel an in-flight read
+/// and lose pipelined bytes. Backpressure is explicit: a full channel
+/// (server task behind) closes the connection instead of queueing
+/// without limit. Exits on EOF, violation, I/O failure, shutdown, or a
+/// dead server task.
+async fn conn_read_loop(
+    mut stream: TcpStream,
+    mut reader: FrameReader,
+    max_input: usize,
+    max_pipelined: usize,
+    shutdown: Rc<Cell<bool>>,
+    tx: async_channel::Sender<kivi_protocol::Frame>,
+    peer: SocketAddr,
+) {
+    let mut pending = std::collections::VecDeque::new();
+    let exit = loop {
+        if shutdown.get() {
+            break ConnExit::Clean;
+        }
+        if let Some(frame) = pending.pop_front() {
+            if tx.try_send(frame).is_err() {
+                break ConnExit::Violation("pipelined backlog bound");
+            }
+            continue;
+        }
+        if reader.buffered() >= max_input {
+            break ConnExit::Violation("input buffer bound");
+        }
+        let chunk = Vec::with_capacity(8192);
+        let outcome = compio::time::timeout(ACCEPT_POLL_INTERVAL, stream.read(chunk)).await;
+        let (result, chunk) = match outcome {
+            Err(_) => {
+                if shutdown.get() {
+                    break ConnExit::Clean;
+                }
+                continue;
+            }
+            Ok(outcome) => (outcome.0, outcome.1),
+        };
+        match result {
+            Ok(0) => break ConnExit::Clean,
+            Ok(_) => match reader.push(&chunk) {
+                Ok(frames) => {
+                    if pending.len() + frames.len() > max_pipelined {
+                        break ConnExit::Violation("pipelined backlog bound");
+                    }
+                    pending.extend(frames);
+                }
+                Err(_) => break ConnExit::Violation("frame parse"),
+            },
+            Err(_) => break ConnExit::Io,
+        }
+    };
+    log_conn_exit(peer, exit);
 }

@@ -24,9 +24,9 @@ bitflags::bitflags! {
     ///
     /// Bits 0..32 are the required space (unknown bits fail negotiation);
     /// bits 32..64 are the optional space (unknown bits are silently ignored).
-    /// No bits are minted beyond v1 yet. Future candidates with no assigned
-    /// bits and no implementation: TLS/auth, compression, streaming,
-    /// changefeeds, strong caches, QUIC.
+    /// No bits are minted beyond v1 yet, except streaming below. Future
+    /// candidates with no assigned bits and no implementation: TLS/auth,
+    /// compression, changefeeds, strong caches, QUIC.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct Capabilities: u64 {
         /// Base v1 protocol every peer must speak (required bit).
@@ -37,12 +37,20 @@ bitflags::bitflags! {
         /// re-executing. Servers advertise it only in durable mode; clients
         /// retry ambiguous mutating requests only when they saw it.
         const DURABLE_MUTATION_DEDUP = 1 << 1;
+        /// Chunk-fabric streaming: upload (`Stream*`) and download
+        /// (`ValueStream*`) frames plus the `SetRange`/`GetStream`
+        /// opcodes. Servers advertise it when they serve streams; clients
+        /// gate every streaming API on having seen it and answer
+        /// `Unsupported` without sending a frame otherwise.
+        const STREAMING = 1 << 2;
     }
 }
 
 impl Capabilities {
     /// Capability bits this build understands.
-    pub const KNOWN: Self = Self::BASE_V1.union(Self::DURABLE_MUTATION_DEDUP);
+    pub const KNOWN: Self = Self::BASE_V1
+        .union(Self::DURABLE_MUTATION_DEDUP)
+        .union(Self::STREAMING);
 
     /// Bits in a required mask that this build does not understand (`empty`
     /// means negotiation can proceed). Unknown bits fail even in the
@@ -75,6 +83,12 @@ pub enum Opcode {
     PersistExpiry = 8,
     /// Read a key's expiry.
     GetExpiry = 9,
+    /// Patch a byte range of a value (partial update; Redis SETRANGE
+    /// semantics with zero-padding past the end).
+    SetRange = 10,
+    /// Fetch a value as a stream (`ValueStream*` frames) instead of one
+    /// response frame. Large reads never build giant frames either side.
+    GetStream = 11,
 }
 
 impl Opcode {
@@ -91,6 +105,8 @@ impl Opcode {
             7 => Some(Self::ExpireAt),
             8 => Some(Self::PersistExpiry),
             9 => Some(Self::GetExpiry),
+            10 => Some(Self::SetRange),
+            11 => Some(Self::GetStream),
             _ => None,
         }
     }
@@ -107,7 +123,12 @@ impl Opcode {
     pub const fn is_mutating(self) -> bool {
         matches!(
             self,
-            Self::Set | Self::Delete | Self::CounterAdd | Self::ExpireAt | Self::PersistExpiry
+            Self::Set
+                | Self::Delete
+                | Self::CounterAdd
+                | Self::ExpireAt
+                | Self::PersistExpiry
+                | Self::SetRange
         )
     }
 }
@@ -124,6 +145,8 @@ impl core::fmt::Display for Opcode {
             Self::ExpireAt => write!(f, "expire-at"),
             Self::PersistExpiry => write!(f, "persist-expiry"),
             Self::GetExpiry => write!(f, "get-expiry"),
+            Self::SetRange => write!(f, "set-range"),
+            Self::GetStream => write!(f, "get-stream"),
         }
     }
 }
@@ -376,6 +399,9 @@ pub struct Request {
     pub delta: i64,
     /// Absolute expiry micros (meaningful for `ExpireAt` only).
     pub expiry: u64,
+    /// Patch offset (meaningful for `SetRange` only): the logical byte
+    /// index the patch overwrites from, zero-padding past the end.
+    pub offset: u64,
     /// Retry identity for mutating opcodes (`None` for reads and for
     /// clients that predate durable dedup). Durable servers require it on
     /// every mutating request; ephemeral servers ignore it.
@@ -392,7 +418,11 @@ impl Request {
     pub fn into_operation(self) -> Operation {
         let key = Key::from(self.key);
         match self.opcode {
-            Opcode::Get => Operation::Get { key },
+            // A stream read executes the same read as `Get`; the opcode
+            // only changes the delivery shape (`ValueStream*` frames
+            // instead of one response frame), so translation stays total
+            // here and the server picks the encoder after executing.
+            Opcode::Get | Opcode::GetStream => Operation::Get { key },
             Opcode::Set => Operation::Set {
                 key,
                 value: bytes::Bytes::from(self.value.unwrap_or_default()),
@@ -410,18 +440,27 @@ impl Request {
             },
             Opcode::PersistExpiry => Operation::PersistExpiry { key },
             Opcode::GetExpiry => Operation::GetExpiry { key },
+            Opcode::SetRange => Operation::SetRange {
+                key,
+                offset: self.offset,
+                patch: bytes::Bytes::from(self.value.unwrap_or_default()),
+            },
         }
     }
 }
 
-/// Maps a typed operation back to its opcode. Total inverse of the
-/// operation half of [`Request::into_operation`]: exactly one opcode per
-/// operation, so response shaping and WAL records never guess.
+/// Maps a typed operation back to its opcode. Inverse of the operation
+/// half of [`Request::into_operation`] with one deliberate many-to-one:
+/// [`SetChunked`](Operation::SetChunked) shares [`Set`](Opcode::Set)'s
+/// shape. Both store bytes and both answer `Stored{version}`; the response
+/// carries no representation, and chunked commits arrive over the
+/// streaming COMMIT frame (never as legacy `Set` frames), so no decoder
+/// can confuse the two. Response shaping and WAL records never guess.
 #[must_use]
 pub fn operation_opcode(operation: &Operation) -> Opcode {
     match operation {
         Operation::Get { .. } => Opcode::Get,
-        Operation::Set { .. } => Opcode::Set,
+        Operation::Set { .. } | Operation::SetChunked { .. } => Opcode::Set,
         Operation::Delete { .. } => Opcode::Delete,
         Operation::Exists { .. } => Opcode::Exists,
         Operation::CounterGet { .. } => Opcode::CounterGet,
@@ -429,6 +468,7 @@ pub fn operation_opcode(operation: &Operation) -> Opcode {
         Operation::ExpireAt { .. } => Opcode::ExpireAt,
         Operation::PersistExpiry { .. } => Opcode::PersistExpiry,
         Operation::GetExpiry { .. } => Opcode::GetExpiry,
+        Operation::SetRange { .. } => Opcode::SetRange,
     }
 }
 
@@ -834,12 +874,17 @@ impl Request {
             Opcode::Set => push_blob(&mut out, self.value.as_deref().unwrap_or_default()),
             Opcode::CounterAdd => push_i64(&mut out, self.delta),
             Opcode::ExpireAt => push_u64(&mut out, self.expiry),
+            Opcode::SetRange => {
+                push_u64(&mut out, self.offset);
+                push_blob(&mut out, self.value.as_deref().unwrap_or_default());
+            }
             Opcode::Get
             | Opcode::Delete
             | Opcode::Exists
             | Opcode::CounterGet
             | Opcode::PersistExpiry
-            | Opcode::GetExpiry => {}
+            | Opcode::GetExpiry
+            | Opcode::GetStream => {}
         }
         // Retry identity rides last so pre-identity decoders fail cleanly on
         // length: flag 0 means "no identity, end of request".
@@ -888,6 +933,7 @@ impl Request {
             value: None,
             delta: 0,
             expiry: 0,
+            offset: 0,
             identity: None,
             ack_floor: RequestSeq::from_u64(0),
         };
@@ -901,12 +947,17 @@ impl Request {
             Opcode::ExpireAt => {
                 request.expiry = cursor.u64(CONTEXT)?;
             }
+            Opcode::SetRange => {
+                request.offset = cursor.u64(CONTEXT)?;
+                request.value = Some(cursor.blob(CONTEXT)?.to_vec());
+            }
             Opcode::Get
             | Opcode::Delete
             | Opcode::Exists
             | Opcode::CounterGet
             | Opcode::PersistExpiry
-            | Opcode::GetExpiry => {}
+            | Opcode::GetExpiry
+            | Opcode::GetStream => {}
         }
         // Identity suffix: absent on pre-identity encodings (exact end),
         // otherwise flag 1 plus session/seq/ack. Anything else is malformed.
@@ -980,9 +1031,16 @@ impl Response {
         let body = match status {
             Status::Ok => match opcode {
                 Opcode::Get => ResponseBody::Value(cursor.blob(CONTEXT)?.to_vec()),
-                Opcode::Set => ResponseBody::Stored {
+                Opcode::Set | Opcode::SetRange => ResponseBody::Stored {
                     version: cursor.u64(CONTEXT)?,
                 },
+                // A stream read never completes as a single `Response`
+                // frame: bytes arrive as `ValueStream*` frames under the
+                // request id. An `Ok` shaped like a response is a peer
+                // bug — fail closed, never guess a shape.
+                Opcode::GetStream => {
+                    return Err(ProtocolError::Malformed { context: CONTEXT });
+                }
                 Opcode::Delete => ResponseBody::Deleted {
                     existed: flag(&mut cursor)?,
                 },
@@ -1005,7 +1063,7 @@ impl Response {
                 },
             },
             Status::NotFound => match opcode {
-                Opcode::Get | Opcode::CounterGet | Opcode::GetExpiry => {
+                Opcode::Get | Opcode::CounterGet | Opcode::GetExpiry | Opcode::GetStream => {
                     let len = cursor.u16(CONTEXT)? as usize;
                     let bytes = cursor.take(len, CONTEXT)?;
                     ResponseBody::Diagnostic(String::from_utf8_lossy(bytes).into_owned())
@@ -1034,6 +1092,212 @@ fn flag(cursor: &mut Cursor<'_>) -> Result<bool, ProtocolError> {
         0 => Ok(false),
         1 => Ok(true),
         _ => Err(ProtocolError::Malformed { context: "flag" }),
+    }
+}
+
+/// V1 streaming-upload bound: 1 GiB per stream (1024 chunks at the
+/// default 1 MiB grid). Peers agree here so both sides enforce the same
+/// ceiling — the server aborts past it, the client never opens past it.
+/// Bulk beyond this is a future multi-stream or resumption story, never
+/// silent truncation today.
+pub const MAX_STREAM_UPLOAD_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Opens a value upload: client → server `StreamBegin` frame payload.
+/// The frame `request_id` is the client-chosen stream id, echoed on
+/// every stream frame for this upload and on the final `Response`
+/// (`Stored{version}`), so uploads multiplex freely with ordinary
+/// requests on one connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamBegin {
+    /// Target namespace.
+    pub namespace: NamespaceId,
+    /// Target key.
+    pub key: Vec<u8>,
+    /// Declared total bytes (`None` = unknown upfront; the upload bound
+    /// still applies, and a declared total mismatching delivery aborts
+    /// the stream instead of committing short).
+    pub total_len: Option<u64>,
+    /// Retry identity, mirroring [`Request`]: a retried upload commits at
+    /// most once per identity, dedup-hitting when the first attempt
+    /// already committed.
+    pub identity: Option<RequestIdentity>,
+    /// Acknowledgement floor, mirroring [`Request`].
+    pub ack_floor: RequestSeq,
+}
+
+impl StreamBegin {
+    /// Encodes one begin payload (framing header added by the caller).
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(32 + self.key.len());
+        push_u64(&mut out, self.namespace.as_u64());
+        push_blob(&mut out, &self.key);
+        match self.total_len {
+            None => push_u8(&mut out, 0),
+            Some(total) => {
+                push_u8(&mut out, 1);
+                push_u64(&mut out, total);
+            }
+        }
+        match self.identity {
+            None => push_u8(&mut out, 0),
+            Some(identity) => {
+                push_u8(&mut out, 1);
+                push_u128(&mut out, identity.session().as_u128());
+                push_u64(&mut out, identity.seq().as_u64());
+                push_u64(&mut out, self.ack_floor.as_u64());
+            }
+        }
+        out
+    }
+
+    /// Decodes one begin payload, requiring exact consumption.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError`] on truncation, trailing bytes, or a bad
+    /// discriminator.
+    pub fn decode(input: &[u8]) -> Result<Self, ProtocolError> {
+        const CONTEXT: &str = "stream-begin";
+        let mut cursor = Cursor::new(input);
+        let namespace = NamespaceId::from_u64(cursor.u64(CONTEXT)?);
+        let key = cursor.blob(CONTEXT)?.to_vec();
+        let total_len = match cursor.u8(CONTEXT)? {
+            0 => None,
+            1 => Some(cursor.u64(CONTEXT)?),
+            _ => return Err(ProtocolError::Malformed { context: CONTEXT }),
+        };
+        let mut begin = Self {
+            namespace,
+            key,
+            total_len,
+            identity: None,
+            ack_floor: RequestSeq::from_u64(0),
+        };
+        match cursor.u8(CONTEXT)? {
+            0 => {}
+            1 => {
+                let session = kivi_types::SessionId::from_u128(cursor.u128(CONTEXT)?);
+                let seq = RequestSeq::from_u64(cursor.u64(CONTEXT)?);
+                begin.ack_floor = RequestSeq::from_u64(cursor.u64(CONTEXT)?);
+                begin.identity = Some(RequestIdentity::new(session, seq));
+            }
+            _ => return Err(ProtocolError::Malformed { context: CONTEXT }),
+        }
+        cursor.end(CONTEXT)?;
+        Ok(begin)
+    }
+}
+
+/// Server accepts an upload: `StreamReady` frame payload. The client
+/// must keep every `StreamData` payload at or under `max_data` bytes;
+/// larger frames abort the stream (framing bounds still apply on top).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamReady {
+    /// Maximum `StreamData` payload bytes per frame on this stream.
+    pub max_data: u32,
+}
+
+impl StreamReady {
+    /// Encodes one ready payload.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4);
+        push_u32(&mut out, self.max_data);
+        out
+    }
+
+    /// Decodes one ready payload, requiring exact consumption.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError`] on truncation or trailing bytes.
+    pub fn decode(input: &[u8]) -> Result<Self, ProtocolError> {
+        const CONTEXT: &str = "stream-ready";
+        let mut cursor = Cursor::new(input);
+        let ready = Self {
+            max_data: cursor.u32(CONTEXT)?,
+        };
+        cursor.end(CONTEXT)?;
+        Ok(ready)
+    }
+}
+
+/// Either side aborts a stream: `StreamAbort` frame payload. The sender
+/// drops all stream state; the receiver answers nothing. Commits never
+/// follow an abort on the same id, and servers never commit a stream
+/// they aborted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamAbort {
+    /// Human-readable reason (diagnostic only, never a contract).
+    pub reason: String,
+}
+
+impl StreamAbort {
+    /// Encodes one abort payload (u16-prefixed UTF-8, like diagnostics).
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(2 + self.reason.len());
+        push_u16(
+            &mut out,
+            u16::try_from(self.reason.len()).unwrap_or(u16::MAX),
+        );
+        out.extend_from_slice(self.reason.as_bytes());
+        out
+    }
+
+    /// Decodes one abort payload, requiring exact consumption.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError`] on truncation or trailing bytes.
+    pub fn decode(input: &[u8]) -> Result<Self, ProtocolError> {
+        const CONTEXT: &str = "stream-abort";
+        let mut cursor = Cursor::new(input);
+        let len = cursor.u16(CONTEXT)? as usize;
+        let bytes = cursor.take(len, CONTEXT)?;
+        let abort = Self {
+            reason: String::from_utf8_lossy(bytes).into_owned(),
+        };
+        cursor.end(CONTEXT)?;
+        Ok(abort)
+    }
+}
+
+/// A streamed read starts: server → client `ValueStreamBegin` frame
+/// payload under the originating request id. `total_len` data bytes
+/// follow across `ValueStreamData` frames, then one empty
+/// `ValueStreamEnd`. Raw `Data` payloads are verbatim bytes (no
+/// envelope); `Commit`-side framing does not exist for reads — the
+/// stream simply ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValueStreamBegin {
+    /// Total data bytes to follow across `ValueStreamData` frames.
+    pub total_len: u64,
+}
+
+impl ValueStreamBegin {
+    /// Encodes one begin payload.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8);
+        push_u64(&mut out, self.total_len);
+        out
+    }
+
+    /// Decodes one begin payload, requiring exact consumption.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError`] on truncation or trailing bytes.
+    pub fn decode(input: &[u8]) -> Result<Self, ProtocolError> {
+        const CONTEXT: &str = "value-stream-begin";
+        let mut cursor = Cursor::new(input);
+        let begin = Self {
+            total_len: cursor.u64(CONTEXT)?,
+        };
+        cursor.end(CONTEXT)?;
+        Ok(begin)
     }
 }
 
@@ -1071,6 +1335,7 @@ mod tests {
             value: Some(b"value".to_vec()),
             delta: -12,
             expiry: 123_456,
+            offset: 77,
             identity: Some(RequestIdentity::new(
                 kivi_types::SessionId::from_u128(0x00C0_FFEE),
                 RequestSeq::from_u64(41),
@@ -1089,6 +1354,8 @@ mod tests {
     #[case(Opcode::ExpireAt)]
     #[case(Opcode::PersistExpiry)]
     #[case(Opcode::GetExpiry)]
+    #[case(Opcode::SetRange)]
+    #[case(Opcode::GetStream)]
     fn every_operation_round_trips(#[case] opcode: Opcode) {
         let encoded = request(opcode).encode();
         let decoded = Request::decode(&encoded).expect("round trip");
@@ -1113,6 +1380,14 @@ mod tests {
             Opcode::ExpireAt => assert!(matches!(op, Operation::ExpireAt { .. })),
             Opcode::PersistExpiry => assert!(matches!(op, Operation::PersistExpiry { .. })),
             Opcode::GetExpiry => assert!(matches!(op, Operation::GetExpiry { .. })),
+            Opcode::SetRange => {
+                let Operation::SetRange { offset, .. } = op else {
+                    panic!("SetRange mistranslated")
+                };
+                assert_eq!(offset, 77);
+            }
+            // GetStream executes the same read as Get; only delivery differs.
+            Opcode::GetStream => assert!(matches!(op, Operation::Get { .. })),
         }
     }
 
@@ -1254,7 +1529,9 @@ mod tests {
         let both = Capabilities::BASE_V1 | Capabilities::DURABLE_MUTATION_DEDUP;
         assert!(both.unknown_required().is_empty());
         assert!(both.contains(Capabilities::DURABLE_MUTATION_DEDUP));
-        assert_eq!(Capabilities::KNOWN, both);
+        // The known set additionally carries streaming (chunk-fabric
+        // upload/download frames plus SetRange/GetStream opcodes).
+        assert_eq!(Capabilities::KNOWN, both | Capabilities::STREAMING);
     }
 
     #[test]
@@ -1384,6 +1661,72 @@ mod tests {
         let decoded = ServerHello::decode(&reply.encode()).expect("round trip");
         assert_eq!(decoded, reply);
         assert_eq!(decoded.endpoints.len(), 2);
+    }
+
+    #[test]
+    fn stream_control_messages_round_trip() {
+        // Begin with a declared total and an identity.
+        let begin = StreamBegin {
+            namespace: NS,
+            key: b"big:1".to_vec(),
+            total_len: Some(1 << 20),
+            identity: Some(RequestIdentity::new(
+                kivi_types::SessionId::from_u128(0x5EED),
+                RequestSeq::from_u64(9),
+            )),
+            ack_floor: RequestSeq::from_u64(8),
+        };
+        let decoded = StreamBegin::decode(&begin.encode()).expect("round trip");
+        assert_eq!(decoded, begin);
+        // Begin without total or identity (unknown length, at-most-once).
+        let bare = StreamBegin {
+            namespace: NS,
+            key: Vec::new(),
+            total_len: None,
+            identity: None,
+            ack_floor: RequestSeq::from_u64(0),
+        };
+        assert_eq!(
+            StreamBegin::decode(&bare.encode()).expect("round trip"),
+            bare
+        );
+        // Ready, abort, and value-begin are fixed small shapes.
+        let ready = StreamReady { max_data: 1 << 20 };
+        assert_eq!(
+            StreamReady::decode(&ready.encode()).expect("round trip"),
+            ready
+        );
+        let abort = StreamAbort {
+            reason: "over the upload bound".to_owned(),
+        };
+        assert_eq!(
+            StreamAbort::decode(&abort.encode()).expect("round trip"),
+            abort
+        );
+        let value = ValueStreamBegin {
+            total_len: 3_000_000,
+        };
+        assert_eq!(
+            ValueStreamBegin::decode(&value.encode()).expect("round trip"),
+            value
+        );
+        // Truncation and trailing bytes fail closed on every shape.
+        let begin_bytes = begin.encode();
+        assert!(StreamBegin::decode(&begin_bytes[..begin_bytes.len() - 1]).is_err());
+        let ready_bytes = ready.encode();
+        assert!(StreamReady::decode(&ready_bytes[..3]).is_err());
+        let abort_bytes = abort.encode();
+        assert!(StreamAbort::decode(&abort_bytes[..1]).is_err());
+        let value_bytes = value.encode();
+        assert!(ValueStreamBegin::decode(&value_bytes[..7]).is_err());
+        let mut trailing = value_bytes;
+        trailing.push(0);
+        assert!(ValueStreamBegin::decode(&trailing).is_err());
+        // Bad discriminators fail, never default.
+        let mut bad = bare.encode();
+        let total_flag = 8 + 4 + bare.key.len();
+        bad[total_flag] = 7;
+        assert!(StreamBegin::decode(&bad).is_err());
     }
 
     #[test]

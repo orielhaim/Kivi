@@ -21,6 +21,7 @@ pub use frame::{
     PROTOCOL_MAGIC, PROTOCOL_MAJOR, PROTOCOL_MINOR, ProtocolError, encode_frame,
 };
 pub use message::{
-    Capabilities, ClientHello, Opcode, RedirectInfo, Request, RequestId, Response, ResponseBody,
-    RouteHint, ServerHello, Status, operation_opcode,
+    Capabilities, ClientHello, MAX_STREAM_UPLOAD_BYTES, Opcode, RedirectInfo, Request, RequestId,
+    Response, ResponseBody, RouteHint, ServerHello, Status, StreamAbort, StreamBegin, StreamReady,
+    ValueStreamBegin, operation_opcode,
 };

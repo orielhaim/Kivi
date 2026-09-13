@@ -39,7 +39,7 @@ pub use provider::{
     StorageHealth,
 };
 pub use wal::{
-    DEFAULT_SEGMENT_TARGET_BYTES, LaneIdentity, LaneRecovery, LocalWalLane, MutationRecord,
-    OutcomeRecord, RecoveredRecord, RecoverySummary, WAL_MAJOR, WAL_MAX_BODY_BYTES, WalRecord,
-    WorkerLaneStats,
+    DEFAULT_SEGMENT_TARGET_BYTES, LaneFloor, LaneIdentity, LaneRecovery, LocalWalLane,
+    MutationRecord, OutcomeRecord, RecoveredRecord, RecoverySummary, SealedSegmentSummary,
+    WAL_MAJOR, WAL_MAX_BODY_BYTES, WalRecord, WorkerLaneStats,
 };

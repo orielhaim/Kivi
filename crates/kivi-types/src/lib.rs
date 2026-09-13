@@ -28,7 +28,7 @@ pub mod reads;
 pub mod time;
 
 pub use authority::{AuthorityMismatch, TabletAuthority};
-pub use hash::{ChunkId, PartitionHash};
+pub use hash::{ChunkId, ManifestId, PartitionHash};
 pub use identity::{IdempotencyKey, MutationIdentity, RequestIdentity};
 pub use ids::{
     ClusterId, CommitPosition, CpuId, GenerationExhausted, NamespaceId, NodeId, NodeIncarnation,

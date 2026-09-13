@@ -47,6 +47,65 @@ type RecoveryScan = (
     u64,
 );
 
+/// Everything durable startup establishes before workers spawn.
+struct DurableBootstrap {
+    /// Per-worker durability (coordinator + lane thread).
+    lanes: Vec<WorkerDurability>,
+    /// Direct lane maintenance access per worker (checkpoint path).
+    maintenance: Vec<(WorkerId, crate::commit::LaneMaintenance)>,
+    /// WAL-tail recovery summary.
+    wal_summary: RecoverySummary,
+    /// Checkpoint-restore summary.
+    checkpoint_summary: CheckpointRecovery,
+    /// Installed CURRENT per checkpointed tablet.
+    installed: std::collections::HashMap<TabletId, kivi_checkpoint::CurrentRecord>,
+}
+
+/// Checkpoint-thread spawn bundle, assembled after workers start (it
+/// needs their control senders).
+struct CheckpointSpawn {
+    /// Lane maintenance access per worker.
+    maintenance: Vec<(WorkerId, crate::commit::LaneMaintenance)>,
+    /// Installed CURRENT per checkpointed tablet.
+    installed: std::collections::HashMap<TabletId, kivi_checkpoint::CurrentRecord>,
+    /// Trigger configuration.
+    config: crate::checkpoint::CheckpointConfig,
+    /// Data-directory root.
+    data_dir: std::path::PathBuf,
+    /// Namespace served.
+    namespace: NamespaceId,
+    /// Publisher identity base.
+    cluster: ClusterId,
+    /// Publisher identity base.
+    node: NodeId,
+    /// This process's incarnation.
+    incarnation: NodeIncarnation,
+    /// Writable tablets to checkpoint.
+    tablets: Vec<TabletId>,
+    /// Owner worker per tablet (authoritative placement for WAL attribution).
+    placement: std::collections::HashMap<TabletId, WorkerId>,
+    /// Whether all workers share WAL lane 0.
+    shared_wal: bool,
+    /// Engine-global in-flight staging pins for chunk GC roots.
+    pins: Arc<crate::chunk_lane::StagingPins>,
+    /// Chunk lane per worker for GC planning and reclamation.
+    chunk_lanes: Vec<(WorkerId, crate::chunk_lane::ChunkLaneHandle)>,
+}
+
+/// Checkpoint-restored state staged before WAL-tail replay: cuts (tail
+/// records at or below these are obsolete), durable lane floors,
+/// installed currents, and the restore summary.
+struct RestoredCheckpoints {
+    /// Checkpoint cut per restored tablet.
+    cuts: std::collections::HashMap<TabletId, u64>,
+    /// Durable WAL floor per lane.
+    floors: std::collections::HashMap<u16, kivi_durability::LaneFloor>,
+    /// Installed CURRENT per restored tablet.
+    currents: std::collections::HashMap<TabletId, kivi_checkpoint::CurrentRecord>,
+    /// Restore accounting.
+    summary: CheckpointRecovery,
+}
+
 /// Capacity of each client response rendezvous: exactly one outcome travels
 /// per request, so one slot is both necessary and sufficient.
 const RESPONSE_CAPACITY: usize = 1;
@@ -66,6 +125,9 @@ pub struct EngineConfig {
     pub worker_count: usize,
     /// Per-worker bounded request queue depth; must be nonzero.
     pub request_capacity: usize,
+    /// Chunk fabric policy and lane resources (both modes stage large
+    /// values through per-worker chunk lanes).
+    pub chunks: ChunkFabricConfig,
     /// Network serving. `None` keeps channel-only workers (embedded use,
     /// tests); `Some` binds one native endpoint per worker with CPU affinity.
     pub network: Option<crate::net::EngineNetwork>,
@@ -86,6 +148,42 @@ pub enum DurabilityMode {
     Durable(DurableConfig),
 }
 
+/// Chunk fabric configuration: representation policy plus lane resources.
+/// One value shared by every worker; per-worker lanes open beneath it.
+#[derive(Debug, Clone)]
+pub struct ChunkFabricConfig {
+    /// Values strictly larger stage as chunked roots; the rest stay
+    /// inline. Physical only — logical `Bytes` semantics never change.
+    pub inline_threshold: u64,
+    /// Chunk pack rotation target in bytes per lane.
+    pub pack_target_bytes: u64,
+    /// Chunk-cache bound in bytes per lane (immutable entries, safe
+    /// eviction at any time).
+    pub cache_bytes: u64,
+}
+
+impl ChunkFabricConfig {
+    /// Production default pack target: 256 MiB per lane, matching WAL
+    /// segment scale so rotation stays rare outside tests.
+    pub const DEFAULT_PACK_TARGET_BYTES: u64 = 256 * 1024 * 1024;
+    /// Default representation threshold (see
+    /// [`kivi_chunk::DEFAULT_INLINE_THRESHOLD`]).
+    pub const DEFAULT_INLINE_THRESHOLD: u64 = kivi_chunk::DEFAULT_INLINE_THRESHOLD;
+    /// Default per-lane chunk-cache bound (see
+    /// [`crate::chunk_lane::DEFAULT_CHUNK_CACHE_BYTES`]).
+    pub const DEFAULT_CACHE_BYTES: u64 = crate::chunk_lane::DEFAULT_CHUNK_CACHE_BYTES;
+}
+
+impl Default for ChunkFabricConfig {
+    fn default() -> Self {
+        Self {
+            inline_threshold: kivi_chunk::DEFAULT_INLINE_THRESHOLD,
+            pack_target_bytes: Self::DEFAULT_PACK_TARGET_BYTES,
+            cache_bytes: crate::chunk_lane::DEFAULT_CHUNK_CACHE_BYTES,
+        }
+    }
+}
+
 /// Durable-mode configuration (data directory already opened by the
 /// caller: lock held, identity established, incarnation advanced).
 #[derive(Debug, Clone)]
@@ -103,6 +201,11 @@ pub struct DurableConfig {
     /// Share one WAL lane across all workers behind a mutex (the
     /// group-commit experiment arm) instead of private per-worker lanes.
     pub shared_wal: bool,
+    /// Batch-closing policy for the commit pipeline (`max_ops: 1`
+    /// reproduces immediate per-mutation durability on the same code path).
+    pub batch: crate::commit::BatchPolicy,
+    /// Automatic checkpoint triggers and build policy.
+    pub checkpoint: crate::checkpoint::CheckpointConfig,
 }
 
 /// Durability facts a running engine exposes to the admin plane.
@@ -118,6 +221,24 @@ pub struct EngineDurability {
     pub incarnation: NodeIncarnation,
     /// What recovery replayed at startup.
     pub recovery: kivi_durability::RecoverySummary,
+    /// What checkpoint recovery restored at startup.
+    pub checkpoint_recovery: CheckpointRecovery,
+}
+
+/// What checkpoint recovery restored at startup (spec AK, first half:
+/// the WAL-tail half stays in [`kivi_durability::RecoverySummary`]).
+#[derive(Debug, Clone, Default)]
+pub struct CheckpointRecovery {
+    /// Tablets restored from installed checkpoints.
+    pub tablets_loaded: u64,
+    /// Bands verified (identity, CRCs, ordering).
+    pub bands_verified: u64,
+    /// Checkpoint bytes restored (bands + dedup).
+    pub bytes_restored: u64,
+    /// WAL records skipped as checkpoint-covered (obsolete, not replayed).
+    pub obsolete_skipped: u64,
+    /// Tablets that fell back to the retained previous checkpoint.
+    pub fell_back: u64,
 }
 
 /// Renders the optional panic-payload suffix for
@@ -190,12 +311,29 @@ pub enum EngineError {
     /// history is never silently truncated).
     #[error("recovery failed: {0}")]
     Recovery(#[from] kivi_durability::RecoveryError),
+    /// Checkpoint recovery refused to open the database (corrupt catalog
+    /// or unloadable chains; history is never silently truncated).
+    #[error("checkpoint recovery failed: {0}")]
+    Checkpoint(#[from] kivi_checkpoint::CheckpointError),
+    /// Chunk fabric failure: missing or corrupt immutable data a
+    /// committed root needs, or a lane I/O failure. Missing/corrupt
+    /// chunk data fails loudly here so later multi-source recovery can
+    /// repair it, instead of serving wrong bytes.
+    #[error("chunk fabric failed: {0}")]
+    Chunk(#[from] kivi_chunk::ChunkError),
     /// A retried identity fell below the session floor.
     #[error("mutation identity expired below the session floor")]
     DedupExpired,
     /// The session holds too many unacknowledged outcomes on the tablet.
     #[error("session outcome window exhausted")]
     SessionOverloaded,
+    /// The request is not admittable (absurd range, oversize patch):
+    /// caller bug, state untouched — fix and retry.
+    #[error("invalid request: {detail}")]
+    InvalidRequest {
+        /// Human-readable reason (returned verbatim).
+        detail: String,
+    },
 }
 
 impl From<WorkerRequestError> for EngineError {
@@ -207,6 +345,8 @@ impl From<WorkerRequestError> for EngineError {
             WorkerRequestError::DedupExpired => Self::DedupExpired,
             WorkerRequestError::SessionOverloaded => Self::SessionOverloaded,
             WorkerRequestError::Storage(error) => Self::Durability(error),
+            WorkerRequestError::ChunkStore(error) => Self::Chunk(error),
+            WorkerRequestError::InvalidRequest { detail } => Self::InvalidRequest { detail },
         }
     }
 }
@@ -220,6 +360,9 @@ struct EngineShared {
     namespace: NamespaceId,
     routing: Arc<arc_swap::ArcSwap<RoutingSnapshot>>,
     senders: Vec<crossbeam_channel::Sender<TabletRequest>>,
+    /// Chunk lane per worker index, for caller-side chunked-read
+    /// resolution on the embedded path (blocking, caller thread).
+    chunk_lanes: Vec<crate::chunk_lane::ChunkLaneHandle>,
 }
 
 /// The running engine: worker threads, routing, placement, lifecycle.
@@ -228,6 +371,16 @@ pub struct LocalEngine {
     workers: Vec<WorkerHandle>,
     bound: Vec<std::net::SocketAddr>,
     durability: Option<EngineDurability>,
+    checkpoint: Option<crate::checkpoint::CheckpointWorkerHandle>,
+    checkpoint_admin: Arc<std::sync::Mutex<crate::checkpoint::CheckpointAdminState>>,
+    /// Chunk lane handles (stats, shutdown signaling) plus join guards
+    /// (shutdown after workers join: no worker submits once it exits).
+    chunk_lanes: Vec<crate::chunk_lane::ChunkLaneHandle>,
+    chunk_guards: Vec<crate::chunk_lane::ChunkLaneGuard>,
+    /// Ephemeral-mode chunk root: per-process `TempDir` auto-removed on
+    /// clean shutdown (`None` in durable mode, which stages under the
+    /// data directory). Held for its `Drop`, never otherwise touched.
+    _ephemeral_chunks: Option<tempfile::TempDir>,
 }
 
 /// Read-only admin/query handle to a running engine.
@@ -243,6 +396,9 @@ pub struct AdminHandle {
     controls: Vec<(WorkerId, crossbeam_channel::Sender<WorkerControl>)>,
     endpoints: Vec<(WorkerId, std::net::SocketAddr)>,
     durability: Option<EngineDurability>,
+    checkpoint: Arc<std::sync::Mutex<crate::checkpoint::CheckpointAdminState>>,
+    /// Chunk lane per worker id, for read-only lane stats snapshots.
+    chunk_lanes: Vec<(WorkerId, crate::chunk_lane::ChunkLaneHandle)>,
 }
 
 impl AdminHandle {
@@ -320,6 +476,55 @@ impl AdminHandle {
         }
         out
     }
+
+    /// Snapshots every worker's commit-pipeline metrics (`None` per worker
+    /// in ephemeral mode, which has no pipeline). Blocking control
+    /// rendezvous: serve from `spawn_blocking`.
+    #[must_use]
+    pub fn commit_metrics_snapshot(
+        &self,
+    ) -> Vec<(WorkerId, Option<crate::commit::CommitMetricsSnapshot>)> {
+        let mut out = Vec::new();
+        for (id, control) in &self.controls {
+            let (respond, receive) = crossbeam_channel::bounded(1);
+            if control
+                .try_send(WorkerControl::CommitMetrics { respond })
+                .is_err()
+            {
+                continue;
+            }
+            if let Ok(metrics) = receive.recv() {
+                out.push((*id, metrics));
+            }
+        }
+        out
+    }
+
+    /// Clones the live checkpoint state for the admin plane (brief status
+    /// lock; empty in ephemeral mode, which never checkpoints).
+    #[must_use]
+    pub fn checkpoint_state(&self) -> crate::checkpoint::CheckpointAdminState {
+        self.checkpoint
+            .lock()
+            .map(|state| state.clone())
+            .unwrap_or_default()
+    }
+
+    /// Snapshots every worker's chunk lane (blocking lane round-trip per
+    /// worker; serve from `spawn_blocking` like every other lane query).
+    /// Exited lanes are absent from the result.
+    #[must_use]
+    pub fn chunk_stats_snapshot(
+        &self,
+    ) -> Vec<(
+        WorkerId,
+        Result<crate::chunk_lane::ChunkLaneStats, kivi_chunk::ChunkError>,
+    )> {
+        self.chunk_lanes
+            .iter()
+            .map(|(id, lane)| (*id, lane.stats_blocking()))
+            .collect()
+    }
 }
 
 impl LocalEngine {
@@ -335,6 +540,10 @@ impl LocalEngine {
     ///
     /// Returns [`EngineError`] for invalid configuration, incoherent
     /// routing, or tablet construction failures — always before serving.
+    // One linear bring-up (validate → tablets → durability → workers →
+    // listeners → checkpoint); the order is the correctness argument and
+    // splitting it would scatter the startup sequence.
+    #[allow(clippy::too_many_lines)]
     pub fn start(config: EngineConfig) -> Result<Self, EngineError> {
         if config.worker_count == 0 {
             return Err(EngineError::InvalidConfig {
@@ -372,14 +581,100 @@ impl LocalEngine {
                 .map_err(|_| EngineError::UnknownWorker { worker })?;
             by_worker[index].push(live);
         }
+        // Chunk lanes open before any recovery: pack recovery rebuilds
+        // each lane's derived index, and checkpoint/WAL validation below
+        // proves every restored or replayed chunked root against those
+        // indexes before serving. Ephemeral mode stages under a
+        // per-process TempDir (removed on clean shutdown); durable mode
+        // stages under the data directory. One lane per worker either way.
+        // Lane threads spawn here too (stores are recovered first):
+        // workers submit from their first request, and the checkpoint
+        // bundle below needs lane handles for GC planning.
+        let chunk_pins = Arc::new(crate::chunk_lane::StagingPins::default());
+        let chunk_domain = kivi_types::SecurityDomainId::from_u64(config.namespace.as_u64());
+        let chunk_wall_micros = SystemClock::wall_now().as_micros();
+        let mut ephemeral_chunks: Option<tempfile::TempDir> = None;
+        let chunk_root: std::path::PathBuf = match &config.durability {
+            DurabilityMode::Ephemeral => {
+                let dir = tempfile::TempDir::new().map_err(|error| {
+                    EngineError::Chunk(kivi_chunk::ChunkError::io(
+                        "create ephemeral chunk dir",
+                        &std::env::temp_dir(),
+                        &error,
+                    ))
+                })?;
+                let path = dir.path().to_owned();
+                ephemeral_chunks = Some(dir);
+                path
+            }
+            DurabilityMode::Durable(cfg) => cfg.data_dir.clone(),
+        };
+        let mut chunk_stores = Vec::with_capacity(config.worker_count);
+        for index in 0..config.worker_count {
+            let lane = u16::try_from(index).map_err(|_| EngineError::InvalidConfig {
+                reason: "worker count exceeds chunk lane space".to_owned(),
+            })?;
+            let (store, summary) = kivi_chunk::ChunkStore::open(
+                &chunk_root,
+                lane,
+                chunk_domain,
+                config.chunks.pack_target_bytes,
+                chunk_wall_micros,
+            )?;
+            tracing::info!(
+                worker = index,
+                packs = summary.packs_scanned,
+                chunks = summary.chunks_indexed,
+                manifests = summary.manifests_indexed,
+                truncated_bytes = summary.truncated_bytes,
+                "chunk lane recovered"
+            );
+            chunk_stores.push(store);
+        }
+        // Each lane moves into its thread before WAL recovery: recovery
+        // only borrows the stores for validation, while workers (spawned
+        // below) and the checkpoint bundle (assembled in the match) need
+        // live handles. Handles clone cheaply into workers, shared
+        // state, the admin plane, and GC planning.
+        let mut chunk_guards = Vec::with_capacity(config.worker_count);
+        let mut chunk_access = Vec::with_capacity(config.worker_count);
+        let mut chunk_lanes = Vec::with_capacity(config.worker_count);
+        for (index, store) in chunk_stores.into_iter().enumerate() {
+            let worker = WorkerId::from_u64(index as u64);
+            let (handle, guard) =
+                crate::chunk_lane::spawn_lane(worker, store, config.chunks.cache_bytes);
+            chunk_access.push(crate::worker::WorkerChunks {
+                lane: handle.clone(),
+                inline_threshold: config.chunks.inline_threshold,
+                domain: chunk_domain,
+                pins: Arc::clone(&chunk_pins),
+            });
+            chunk_lanes.push(handle);
+            chunk_guards.push(guard);
+        }
         // Durable mode recovers BEFORE any worker spawns (and therefore
-        // before any listener binds): a corrupt database never serves
+        // before any listener binds): checkpoints restore first, then the
+        // WAL tail replays after the cuts. A corrupt database never serves
         // partial state, and replayed tablets are simply the workers'
-        // initial state.
-        let (lanes, durability) = match &config.durability {
-            DurabilityMode::Ephemeral => ((0..config.worker_count).map(|_| None).collect(), None),
+        // initial state. (Chunked-root dependency validation runs after
+        // this match over final live state — see the dependency gate
+        // below — covering restore and replay uniformly.)
+        let (lanes, durability, checkpoint_spawn): (
+            Vec<Option<WorkerDurability>>,
+            Option<EngineDurability>,
+            Option<CheckpointSpawn>,
+        ) = match &config.durability {
+            DurabilityMode::Ephemeral => {
+                ((0..config.worker_count).map(|_| None).collect(), None, None)
+            }
             DurabilityMode::Durable(cfg) => {
-                let (lanes, summary) = Self::recover_durable(
+                let DurableBootstrap {
+                    lanes,
+                    maintenance,
+                    wal_summary,
+                    checkpoint_summary,
+                    installed,
+                } = Self::recover_durable(
                     cfg,
                     &mut by_worker,
                     &routing,
@@ -391,11 +686,68 @@ impl LocalEngine {
                     node: cfg.node,
                     cluster: cfg.cluster,
                     incarnation: cfg.incarnation,
-                    recovery: summary,
+                    recovery: wal_summary,
+                    checkpoint_recovery: checkpoint_summary,
                 };
-                (lanes, Some(info))
+                let tablets = by_worker
+                    .iter()
+                    .flatten()
+                    .map(super::tablet::LiveTablet::id)
+                    .collect::<Vec<_>>();
+                let placement = tablets
+                    .iter()
+                    .filter_map(|tablet| {
+                        routing
+                            .placement()
+                            .worker_of(*tablet)
+                            .map(|worker| (*tablet, worker))
+                    })
+                    .collect::<std::collections::HashMap<_, _>>();
+                let spawn = CheckpointSpawn {
+                    maintenance,
+                    installed,
+                    config: cfg.checkpoint.clone(),
+                    data_dir: cfg.data_dir.clone(),
+                    namespace: config.namespace,
+                    cluster: cfg.cluster,
+                    node: cfg.node,
+                    incarnation: cfg.incarnation,
+                    tablets,
+                    placement,
+                    shared_wal: cfg.shared_wal,
+                    pins: Arc::clone(&chunk_pins),
+                    chunk_lanes: chunk_access
+                        .iter()
+                        .enumerate()
+                        .map(|(index, access)| {
+                            (WorkerId::from_u64(index as u64), access.lane.clone())
+                        })
+                        .collect(),
+                };
+                (
+                    lanes.into_iter().map(Some).collect(),
+                    Some(info),
+                    Some(spawn),
+                )
             }
         };
+        // Dependency gate (§30, §31): every live chunked root — restored
+        // from checkpoints, replayed from the WAL tail, or fresh — proves
+        // its manifest and chunks in its owner's lane before serving. A
+        // committed root without its immutable data fails startup loudly,
+        // never serves absence. Obsolete WAL records (at or below a cut)
+        // need no proof: they never replay.
+        for (index, lives) in by_worker.iter().enumerate() {
+            for live in lives {
+                for (_, object) in live.store().snapshot_entries() {
+                    if let Some(chunked) = object.chunk_ref() {
+                        chunk_access[index]
+                            .lane
+                            .check_root_blocking(chunked.manifest, chunked.logical_len)?;
+                    }
+                }
+            }
+        }
         let routing = Arc::new(ArcSwap::from_pointee(routing));
         let (workers, senders, bound) = match &config.network {
             None => {
@@ -404,6 +756,7 @@ impl LocalEngine {
                     config.worker_count,
                     by_worker,
                     lanes,
+                    chunk_access,
                 );
                 (workers, senders, Vec::new())
             }
@@ -415,36 +768,94 @@ impl LocalEngine {
                     by_worker,
                     &routing,
                     lanes,
+                    chunk_access,
                 )?;
                 (workers, senders, bound)
             }
         };
+        // The checkpoint worker starts last (it needs worker control
+        // senders) and stops first (before workers flush). `disabled`
+        // only stills the automatic triggers (benchmarks isolate the
+        // commit pipeline); the thread itself always runs in durable
+        // mode because manual triggers need a running worker to serve
+        // (and `due_tablets` has an explicit disabled branch for this).
+        let checkpoint_admin = Arc::new(std::sync::Mutex::new(
+            crate::checkpoint::CheckpointAdminState::default(),
+        ));
+        let checkpoint = checkpoint_spawn.map(|spawn| {
+            let context = crate::checkpoint::CheckpointContext {
+                data_dir: spawn.data_dir,
+                namespace: spawn.namespace,
+                cluster: spawn.cluster,
+                node: spawn.node,
+                incarnation: spawn.incarnation,
+                tablets: spawn.tablets,
+                placement: spawn.placement,
+                controls: workers
+                    .iter()
+                    .map(|worker| (worker.id(), worker.control_sender()))
+                    .collect(),
+                lanes: spawn
+                    .maintenance
+                    .into_iter()
+                    .map(|(worker, maintenance)| {
+                        // Exclusive mode numbers lanes by worker; the
+                        // shared arm funnels every worker into lane 0
+                        // (mirrors recover_durable's lane assignment).
+                        let lane = if spawn.shared_wal {
+                            0
+                        } else {
+                            u16::try_from(worker.as_u64()).unwrap_or(u16::MAX)
+                        };
+                        crate::checkpoint::LaneMaintenanceAccess {
+                            worker,
+                            lane,
+                            maintenance,
+                        }
+                    })
+                    .collect(),
+                config: spawn.config,
+                installed: spawn.installed,
+                pins: spawn.pins,
+                chunk_lanes: spawn.chunk_lanes,
+                admin: Arc::clone(&checkpoint_admin),
+            };
+            crate::checkpoint::CheckpointWorkerHandle::spawn(context)
+        });
         Ok(Self {
             shared: Arc::new(EngineShared {
                 namespace: config.namespace,
                 routing,
                 senders,
+                chunk_lanes: chunk_lanes.clone(),
             }),
             workers,
             bound,
             durability,
+            checkpoint,
+            checkpoint_admin,
+            chunk_lanes,
+            chunk_guards,
+            _ephemeral_chunks: ephemeral_chunks,
         })
     }
 
-    /// Opens every WAL lane, repairs torn tails, and replays committed
-    /// history into the freshly built tablets. Returns per-worker lane
-    /// ownership plus the recovery summary for operators.
+    /// Opens every WAL lane, restores installed checkpoints, repairs torn
+    /// tails from the durable floor, and replays only the WAL tail after
+    /// each tablet's checkpoint cut. Returns lane ownership, both recovery
+    /// summaries, installed currents, and lane maintenance access.
     ///
     /// Fails (refusing to serve) on corrupt history, structural gaps,
     /// records for tablets the startup directory does not cover, fencing
-    /// mismatches, commit-chain breaks, or replay divergence.
+    /// mismatches, commit-chain breaks, replay divergence, or unloadable
+    /// checkpoint chains.
     fn recover_durable(
         cfg: &DurableConfig,
         by_worker: &mut [Vec<LiveTablet>],
         routing: &RoutingSnapshot,
         namespace: NamespaceId,
         worker_count: usize,
-    ) -> Result<(Vec<Option<WorkerDurability>>, RecoverySummary), EngineError> {
+    ) -> Result<DurableBootstrap, EngineError> {
         let identity = LaneIdentity {
             cluster: cfg.cluster,
             node: cfg.node,
@@ -464,53 +875,204 @@ impl LocalEngine {
                 })
                 .collect::<Result<_, _>>()?
         };
+        // Checkpoints restore first: installed state plus per-tablet cuts
+        // plus the durable WAL floors. The WAL tail replays after the cuts.
+        let restored = Self::restore_checkpoints(cfg, by_worker, routing, namespace)?;
         let mut lanes =
             Self::open_recovery_lanes(&wal_dir, &lane_indexes, identity, cfg.segment_target_bytes)?;
         // Merge records per tablet across lanes (a future tablet may hold
-        // history in several lanes; never assume one lane per tablet).
+        // history in several lanes; never assume one lane per tablet),
+        // resuming each lane at its durable floor.
         let (per_tablet, segments_scanned, tail_truncated_bytes) =
-            Self::scan_recovery_lanes(&mut lanes)?;
-        // Validate against the startup directory, then replay in commit
-        // order. Records for forgotten tablets fail startup (spec O):
-        // discarding their history would be silent data loss.
-        let (records_replayed, tablets_recovered) =
-            Self::replay_records(by_worker, routing, namespace, per_tablet)?;
-        let summary = RecoverySummary {
+            Self::scan_recovery_lanes(&mut lanes, &restored.floors)?;
+        // Validate against the startup directory, skip checkpoint-covered
+        // records, then replay the tail in commit order. Records for
+        // forgotten tablets fail startup: discarding their history would
+        // be silent data loss.
+        let (records_replayed, tablets_recovered, obsolete_skipped) =
+            Self::replay_records(by_worker, routing, namespace, per_tablet, &restored.cuts)?;
+        let wal_summary = RecoverySummary {
             records_replayed,
             segments_scanned,
             tail_truncated_bytes,
             tablets_recovered,
         };
         tracing::info!(
-            records = summary.records_replayed,
-            segments = summary.segments_scanned,
-            truncated_bytes = summary.tail_truncated_bytes,
-            tablets = summary.tablets_recovered,
+            records = wal_summary.records_replayed,
+            segments = wal_summary.segments_scanned,
+            truncated_bytes = wal_summary.tail_truncated_bytes,
+            tablets = wal_summary.tablets_recovered,
+            skipped = obsolete_skipped,
+            checkpoints = restored.summary.tablets_loaded,
             "durable recovery complete",
         );
         // Hand lanes to workers: exclusive per worker, or one shared lane.
+        // Each lane moves into its worker's coordinator lane thread here;
+        // the initial stats snapshot seeds the admin plane before the
+        // first seal reports back.
         let shared = if cfg.shared_wal {
             let lane = lanes.remove(&0).expect("shared lane open");
-            Some(std::sync::Arc::new(std::sync::Mutex::new(lane)))
+            let stats = lane.lane_stats();
+            Some((std::sync::Arc::new(std::sync::Mutex::new(lane)), stats))
         } else {
             None
         };
         let mut out = Vec::with_capacity(worker_count);
+        let mut maintenance = Vec::with_capacity(worker_count);
         for (index, lane_index) in lane_indexes.into_iter().enumerate() {
             let worker = WorkerId::from_u64(index as u64);
-            let access = match &shared {
-                Some(shared) => crate::worker::LaneAccess::Shared(Arc::clone(shared)),
-                None => crate::worker::LaneAccess::Exclusive(
-                    lanes.remove(&lane_index).expect("lane open"),
-                ),
+            let (access, initial) = if let Some((shared, stats)) = &shared {
+                (
+                    crate::worker::LaneAccess::Shared(Arc::clone(shared)),
+                    *stats,
+                )
+            } else {
+                let lane = lanes.remove(&lane_index).expect("lane open");
+                let stats = lane.lane_stats();
+                (crate::worker::LaneAccess::Exclusive(lane), stats)
             };
-            out.push(Some(WorkerDurability {
-                namespace,
-                worker,
-                lane: access,
-            }));
+            // Fresh, replayed, and restored tablets alike start dirty
+            // tracking from a clean slate: restore and replay ran before
+            // tracking existed, and the next checkpoint's cut covers
+            // everything restored, so no retroactive dirt is owed.
+            for live in &mut by_worker[index] {
+                live.enable_band_tracking(namespace);
+            }
+            let durable = WorkerDurability::spawn(namespace, worker, cfg.batch, access, initial)?;
+            maintenance.push((worker, durable.maintenance()));
+            out.push(durable);
         }
-        Ok((out, summary))
+        Ok(DurableBootstrap {
+            lanes: out,
+            maintenance,
+            wal_summary,
+            checkpoint_summary: CheckpointRecovery {
+                obsolete_skipped,
+                ..restored.summary
+            },
+            installed: restored.currents,
+        })
+    }
+
+    /// Restores installed checkpoints into the freshly built tablets:
+    /// loads each tablet's CURRENT chain, validates fencing against the
+    /// startup directory, installs objects/dedup/cuts, and reads the
+    /// durable WAL floors. Returns cuts, floors, currents, and the
+    /// restore summary.
+    fn restore_checkpoints(
+        cfg: &DurableConfig,
+        by_worker: &mut [Vec<LiveTablet>],
+        routing: &RoutingSnapshot,
+        namespace: NamespaceId,
+    ) -> Result<RestoredCheckpoints, EngineError> {
+        use std::collections::HashMap;
+        let mut cuts: HashMap<TabletId, u64> = HashMap::new();
+        let mut currents: HashMap<TabletId, kivi_checkpoint::CurrentRecord> = HashMap::new();
+        let mut summary = CheckpointRecovery::default();
+        for live in by_worker.iter_mut().flatten() {
+            let tablet = live.id();
+            let Some(installed) = kivi_checkpoint::load_installed(&cfg.data_dir, tablet)? else {
+                continue;
+            };
+            // Fencing: the checkpoint's authority must match the startup
+            // directory. A stale checkpoint (old epoch/guard) is skipped
+            // here — the WAL tail then fails loudly on the same fencing
+            // mismatch instead of serving cross-authority state.
+            let descriptor = routing.directory().get(tablet).ok_or_else(|| {
+                kivi_durability::RecoveryError::UnknownTablet {
+                    tablet: tablet.as_u64(),
+                }
+            })?;
+            if installed.manifest.epoch != descriptor.epoch()
+                || installed.manifest.guard != descriptor.guard()
+            {
+                tracing::warn!(
+                    tablet = tablet.as_u64(),
+                    "installed checkpoint names a stale authority; skipping to WAL replay"
+                );
+                continue;
+            }
+            if installed.manifest.namespace != namespace {
+                return Err(kivi_durability::RecoveryError::NamespaceMismatch {
+                    tablet: tablet.as_u64(),
+                    expected: namespace.as_u64(),
+                    found: installed.manifest.namespace.as_u64(),
+                }
+                .into());
+            }
+            let restored = crate::tablet::RestoredTablet {
+                objects: installed
+                    .bands
+                    .iter()
+                    .flat_map(|band| {
+                        band.records
+                            .iter()
+                            .map(|record| (record.key.clone(), record.object.clone()))
+                    })
+                    .collect(),
+                sessions: installed
+                    .dedup
+                    .sessions
+                    .iter()
+                    .map(|session| {
+                        (
+                            session.session,
+                            session.floor,
+                            session
+                                .outcomes
+                                .iter()
+                                .map(|outcome| {
+                                    (
+                                        outcome.seq,
+                                        crate::tablet::DedupEntry {
+                                            commit: outcome.commit,
+                                            opcode: outcome.opcode,
+                                            outcome: outcome.outcome.clone(),
+                                        },
+                                    )
+                                })
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+                cut: kivi_types::CommitPosition::from_u64(installed.manifest.cut),
+            };
+            let bytes_restored: u64 = installed
+                .manifest
+                .bands
+                .iter()
+                .map(|descriptor| descriptor.len)
+                .sum::<u64>()
+                + installed.manifest.dedup.len;
+            live.restore_checkpoint(restored);
+            cuts.insert(tablet, installed.manifest.cut);
+            currents.insert(tablet, installed.current.clone());
+            summary.tablets_loaded += 1;
+            summary.bands_verified += installed.manifest.bands.len() as u64;
+            summary.bytes_restored += bytes_restored;
+            if installed.fell_back {
+                summary.fell_back += 1;
+            }
+        }
+        let floors = Self::read_wal_floors(cfg)?;
+        Ok(RestoredCheckpoints {
+            cuts,
+            floors,
+            currents,
+            summary,
+        })
+    }
+
+    /// Reads the durable WAL floors (absent file means genesis everywhere
+    /// — pre-checkpoint databases replay fully).
+    fn read_wal_floors(
+        cfg: &DurableConfig,
+    ) -> Result<std::collections::HashMap<u16, kivi_durability::LaneFloor>, EngineError> {
+        let floors = kivi_checkpoint::read_wal_floor(&cfg.data_dir)?.unwrap_or_default();
+        Ok(floors
+            .into_iter()
+            .map(|floor| (floor.lane, floor))
+            .collect())
     }
 
     /// Opens every distinct WAL lane directory (no scanning yet).
@@ -532,10 +1094,13 @@ impl LocalEngine {
         Ok(lanes)
     }
 
-    /// Scans every lane exactly once (validating, repairing torn tails)
-    /// and merges records per tablet. Lanes stay open for the handoff.
+    /// Scans every lane exactly once from its durable floor (validating,
+    /// repairing torn tails on retained tails) and merges records per
+    /// tablet. Lanes stay open for the handoff. Lanes without a recorded
+    /// floor replay from genesis.
     fn scan_recovery_lanes(
         lanes: &mut std::collections::HashMap<u16, LocalWalLane>,
+        floors: &std::collections::HashMap<u16, kivi_durability::LaneFloor>,
     ) -> Result<RecoveryScan, EngineError> {
         use kivi_durability::WalRecord;
         use std::collections::HashMap;
@@ -545,7 +1110,12 @@ impl LocalEngine {
         let mut lane_order: Vec<u16> = lanes.keys().copied().collect();
         lane_order.sort_unstable();
         for lane in lane_order {
-            let recovery = lanes.get_mut(&lane).expect("lane present").recover()?;
+            let lane_state = lanes.get_mut(&lane).expect("lane present");
+            let floor = floors
+                .get(&lane)
+                .copied()
+                .unwrap_or_else(|| kivi_durability::LaneFloor::for_lane(lane));
+            let recovery = lane_state.recover_from(floor)?;
             segments_scanned += recovery.segments_scanned;
             tail_truncated_bytes += recovery.truncated_bytes;
             for entry in recovery.records {
@@ -558,17 +1128,21 @@ impl LocalEngine {
         Ok((per_tablet, segments_scanned, tail_truncated_bytes))
     }
 
-    /// Validates merged records against the startup directory and replays
-    /// them into the freshly built tablets in commit order.
+    /// Validates merged records against the startup directory, skips
+    /// checkpoint-covered records (commit at or below the tablet's cut —
+    /// counted as obsolete, never replayed), and replays the tail in
+    /// commit order.
     fn replay_records(
         by_worker: &mut [Vec<LiveTablet>],
         routing: &RoutingSnapshot,
         namespace: NamespaceId,
         per_tablet: std::collections::HashMap<TabletId, Vec<(u64, kivi_durability::WalRecord)>>,
-    ) -> Result<(u64, u64), EngineError> {
+        cuts: &std::collections::HashMap<TabletId, u64>,
+    ) -> Result<(u64, u64, u64), EngineError> {
         use kivi_durability::{RecoveryError, WalRecord};
         let mut records_replayed = 0u64;
         let mut tablets_recovered = 0u64;
+        let mut obsolete_skipped = 0u64;
         for (tablet_id, mut entries) in per_tablet {
             let descriptor =
                 routing
@@ -584,6 +1158,7 @@ impl LocalEngine {
                 .into());
             }
             entries.sort_by_key(|(commit, _)| *commit);
+            let cut = cuts.get(&tablet_id).copied().unwrap_or(0);
             let live = by_worker
                 .iter_mut()
                 .flatten()
@@ -608,6 +1183,15 @@ impl LocalEngine {
                 }
             }
             for (_, record) in entries {
+                // Checkpoint-covered records are obsolete by cut
+                // semantics: the checkpoint already restores their
+                // effects (and their dedup outcomes), so replaying them
+                // would duplicate logical application. Reappearing
+                // deleted segments are harmless for exactly this reason.
+                if record.commit().as_u64() <= cut {
+                    obsolete_skipped += 1;
+                    continue;
+                }
                 match record {
                     WalRecord::Mutation(entry) => {
                         let is_persist = matches!(
@@ -636,24 +1220,28 @@ impl LocalEngine {
             }
             tablets_recovered += 1;
         }
-        Ok((records_replayed, tablets_recovered))
+        Ok((records_replayed, tablets_recovered, obsolete_skipped))
     }
 
     /// Spawns channel-only workers (embedded path, no networking).
+    #[allow(clippy::too_many_arguments)]
     fn spawn_channel_workers(
         request_capacity: usize,
         worker_count: usize,
         by_worker: Vec<Vec<LiveTablet>>,
         lanes: Vec<Option<WorkerDurability>>,
+        chunks: Vec<crate::worker::WorkerChunks>,
     ) -> (
         Vec<WorkerHandle>,
         Vec<crossbeam_channel::Sender<TabletRequest>>,
     ) {
         let mut workers = Vec::with_capacity(worker_count);
         let mut senders = Vec::with_capacity(worker_count);
-        for ((index, tablets), durability) in by_worker.into_iter().enumerate().zip(lanes) {
+        for (((index, tablets), durability), chunks) in
+            by_worker.into_iter().enumerate().zip(lanes).zip(chunks)
+        {
             let id = WorkerId::from_u64(index as u64);
-            let handle = WorkerHandle::spawn(id, tablets, request_capacity, durability);
+            let handle = WorkerHandle::spawn(id, tablets, request_capacity, durability, chunks);
             senders.push(handle_sender(&handle));
             workers.push(handle);
         }
@@ -662,6 +1250,7 @@ impl LocalEngine {
 
     /// Spawns networked workers, collecting bound addresses into the shared
     /// endpoint registry once every worker reports ready.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_network_workers(
         network: &crate::net::EngineNetwork,
         request_capacity: usize,
@@ -669,6 +1258,7 @@ impl LocalEngine {
         by_worker: Vec<Vec<LiveTablet>>,
         routing: &Arc<ArcSwap<RoutingSnapshot>>,
         lanes: Vec<Option<WorkerDurability>>,
+        chunks: Vec<crate::worker::WorkerChunks>,
     ) -> Result<NetworkSpawn, EngineError> {
         let endpoints = Arc::new(ArcSwap::new(Arc::new(crate::net::EndpointMap::new())));
         // Lanes present means durable mode (start() builds all-or-none);
@@ -676,15 +1266,17 @@ impl LocalEngine {
         let durable = lanes.iter().any(Option::is_some);
         debug_assert!(lanes.iter().all(|lane| lane.is_some() == durable));
         let advertised_caps = if durable {
-            Capabilities::BASE_V1 | Capabilities::DURABLE_MUTATION_DEDUP
+            Capabilities::BASE_V1 | Capabilities::DURABLE_MUTATION_DEDUP | Capabilities::STREAMING
         } else {
-            Capabilities::BASE_V1
+            Capabilities::BASE_V1 | Capabilities::STREAMING
         };
         let mut workers = Vec::with_capacity(worker_count);
         let mut senders = Vec::with_capacity(worker_count);
         let mut bound: Vec<(WorkerId, String)> = Vec::with_capacity(worker_count);
         let mut addrs: Vec<std::net::SocketAddr> = Vec::with_capacity(worker_count);
-        for ((index, tablets), durability) in by_worker.into_iter().enumerate().zip(lanes) {
+        for (((index, tablets), durability), chunks) in
+            by_worker.into_iter().enumerate().zip(lanes).zip(chunks)
+        {
             let id = WorkerId::from_u64(index as u64);
             let port = if network.ports.is_empty() {
                 // Port 0 selects an ephemeral port per socket: every worker
@@ -736,6 +1328,7 @@ impl LocalEngine {
                 tablets,
                 request_capacity,
                 durability,
+                chunks,
                 crate::net::NetLaunch {
                     routing: Arc::clone(routing),
                     net,
@@ -818,6 +1411,12 @@ impl LocalEngine {
         AdminHandle {
             namespace: self.shared.namespace,
             routing: Arc::clone(&self.shared.routing),
+            chunk_lanes: self
+                .workers
+                .iter()
+                .zip(self.chunk_lanes.iter())
+                .map(|(worker, lane)| (worker.id(), lane.clone()))
+                .collect(),
             controls: self
                 .workers
                 .iter()
@@ -830,6 +1429,16 @@ impl LocalEngine {
                 .map(|(worker, addr)| (worker.id(), *addr))
                 .collect(),
             durability: self.durability.clone(),
+            checkpoint: Arc::clone(&self.checkpoint_admin),
+        }
+    }
+
+    /// Requests checkpoints now (`None` = every dirty tablet). No-op in
+    /// ephemeral mode. Returns immediately; the background worker builds
+    /// asynchronously.
+    pub fn request_checkpoint(&self, tablet: Option<TabletId>) {
+        if let Some(checkpoint) = self.checkpoint.as_ref() {
+            checkpoint.trigger(tablet);
         }
     }
 
@@ -863,8 +1472,29 @@ impl LocalEngine {
     /// Returns [`EngineError::WorkerPanicked`] when a worker thread panicked;
     /// joined workers stay joined either way.
     pub fn shutdown(mut self) -> Result<ShutdownReport, EngineError> {
+        // The checkpoint worker stops first (finishing its in-flight
+        // build, if any): no new captures or lane maintenance once
+        // workers begin draining.
+        if let Some(checkpoint) = self.checkpoint.as_mut() {
+            checkpoint.shutdown();
+        }
         for worker in &self.workers {
             let _ = worker.try_control(crate::worker::WorkerControl::Shutdown);
+        }
+        // Wakeup for accept loops: they park in `accept()` uncancellable
+        // (cancelling AcceptEx leaks the listener), so each bound worker
+        // gets a dummy connection that wakes its accept turn, where it
+        // observes the shutdown flag and breaks. The dummy sends nothing
+        // and closes at once: the server reads EOF and closes it cleanly
+        // with no log noise. A short settle precedes the dummies so the
+        // flag is set before any dummy is accepted (bridge cycle ≤10ms).
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        for addr in &self.bound {
+            if let Ok(socket) =
+                std::net::TcpStream::connect_timeout(addr, std::time::Duration::from_secs(2))
+            {
+                drop(socket);
+            }
         }
         let mut joined = 0usize;
         let mut panic = None;
@@ -880,6 +1510,12 @@ impl LocalEngine {
                     }
                 }
             }
+        }
+        // Chunk lanes stop after every worker joined: no worker submits
+        // once it exits, so no chunk work is abandoned mid-flight (queued
+        // lane jobs fail their severed replies instead of hanging).
+        for (guard, lane) in self.chunk_guards.iter_mut().zip(self.chunk_lanes.iter()) {
+            guard.shutdown(lane);
         }
         match panic {
             Some(error) => Err(error),
@@ -943,7 +1579,11 @@ pub struct LocalClient {
 }
 
 impl LocalClient {
-    /// Executes one typed operation against its owning tablet.
+    /// Executes one typed operation against its owning tablet. Chunked
+    /// reads resolve here on the caller thread (blocking lane call — this
+    /// is application-thread context, never the reactor), so every typed
+    /// method below keeps its plain-bytes contract whatever the physical
+    /// representation is.
     fn execute(&self, key: &Key, op: Operation) -> Result<OperationResult, EngineError> {
         let routing = self.shared.routing.load();
         let hash = PartitionHasher::V1
@@ -955,6 +1595,11 @@ impl LocalClient {
         let sender = self
             .shared
             .senders
+            .get(index)
+            .ok_or(EngineError::UnknownWorker { worker })?;
+        let lane = self
+            .shared
+            .chunk_lanes
             .get(index)
             .ok_or(EngineError::UnknownWorker { worker })?;
         let (respond, receive) = bounded(RESPONSE_CAPACITY);
@@ -971,10 +1616,20 @@ impl LocalClient {
             Ok(()) => {}
             Err(error) => return Err(map_send_error(&error, worker)),
         }
-        receive
+        match receive
             .recv()
             .map_err(|_| EngineError::WorkerDown { worker })?
-            .map_err(EngineError::from)
+            .map_err(EngineError::from)?
+        {
+            OperationResult::ChunkedValue {
+                manifest,
+                logical_len,
+            } => {
+                let bytes = lane.read_value_blocking(manifest, logical_len)?;
+                Ok(OperationResult::Value(Some(bytes)))
+            }
+            other => Ok(other),
+        }
     }
 
     /// Fetches bytes (`None` when absent, expired, or never written).
@@ -1016,6 +1671,38 @@ impl LocalClient {
         )? {
             OperationResult::Stored { .. } => Ok(()),
             unexpected => panic!("set contract violated: {unexpected:?}"),
+        }
+    }
+
+    /// Patches a byte range of a value (partial update), overwriting any
+    /// type and clearing expiry on the stored result exactly like
+    /// [`set`](Self::set). Against absent state the base reads as empty;
+    /// past-the-end gaps zero-pad; counters fail with wrong-type. Large
+    /// results and chunked bases restage through the chunk lane, so the
+    /// patch itself stays small — bulk rewrites belong on the streaming
+    /// upload path instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError`] on routing/transport failure, wrong-type
+    /// access, or an inadmittable range (overflow, past the range bound).
+    ///
+    /// # Panics
+    ///
+    /// Panics if tablet execution returns an outcome shape that cannot result
+    /// from the issued operation (an internal contract violation, never a
+    /// runtime condition).
+    pub fn set_range(&self, key: &Key, offset: u64, patch: Bytes) -> Result<(), EngineError> {
+        match self.execute(
+            key,
+            Operation::SetRange {
+                key: key.clone(),
+                offset,
+                patch,
+            },
+        )? {
+            OperationResult::Stored { .. } => Ok(()),
+            unexpected => panic!("set-range contract violated: {unexpected:?}"),
         }
     }
 

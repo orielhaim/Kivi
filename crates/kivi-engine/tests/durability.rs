@@ -43,6 +43,8 @@ fn durable_config(dir: &std::path::Path) -> (DurabilityMode, NodeId, ClusterId, 
         cluster: opened.meta.cluster,
         incarnation: opened.meta.incarnation,
         shared_wal: false,
+        batch: kivi_engine::BatchPolicy::default_policy(),
+        checkpoint: kivi_engine::CheckpointConfig::default_config(),
     });
     (
         mode,
@@ -60,6 +62,7 @@ fn start(dir: &std::path::Path) -> (LocalEngine, NodeIncarnation) {
         placement: placement(),
         worker_count: 2,
         request_capacity: 64,
+        chunks: kivi_engine::ChunkFabricConfig::default(),
         network: None,
         durability,
     })
@@ -117,6 +120,7 @@ fn recovery_rejects_forgotten_tablet() {
         placement: placement(),
         worker_count: 2,
         request_capacity: 64,
+        chunks: kivi_engine::ChunkFabricConfig::default(),
         network: None,
         durability,
     })

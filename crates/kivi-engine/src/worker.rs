@@ -20,21 +20,47 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, select};
-use kivi_durability::{
-    CommitProof, DurabilityError, DurabilityLevel, DurabilityProvider, LaneStats, LocalWalLane,
-    PersistIntent, StorageHealth, WalRecord, WorkerLaneStats,
-};
+use kivi_durability::{DurabilityError, LaneStats, StorageHealth, WorkerLaneStats};
 use kivi_state::{Operation, OperationResult};
-use kivi_types::{MutationIdentity, NamespaceId, TabletId, UnixMicros, WorkerId};
+use kivi_types::{ManifestId, MutationIdentity, NamespaceId, TabletId, UnixMicros, WorkerId};
 
+use crate::chunk_lane::{
+    ChunkLaneHandle, LargeSetSplit, RangeBase, SetRangePlan, StagingPins, plan_set_range,
+    split_large_set,
+};
+use crate::commit::{BatchPolicy, CommitCoordinator, PendingEntry};
 use crate::net::NetStartError;
 
-use crate::tablet::{DurablePrepared, LiveTablet, TabletError};
+use crate::tablet::{LiveTablet, TabletError};
 
 /// Capacity of each worker's control channel. Control traffic is rare
 /// (shutdown, sweeps); 16 slots cannot realistically fill, and every send
 /// site handles `Full` explicitly anyway.
 pub const CONTROL_CAPACITY: usize = 16;
+
+/// Requests admitted per worker wake beyond the first (bounded drain so
+/// concurrent arrivals share batch windows without starving control).
+const REQUEST_DRAIN_PER_WAKE: usize = 63;
+
+/// Admits one request plus whatever else is already queued (bounded):
+/// concurrent arrivals join the same batch window instead of sealing
+/// alone one wake at a time.
+fn admit_drained(
+    first: TabletRequest,
+    tablets: &mut HashMap<TabletId, LiveTablet>,
+    metrics: &core::cell::Cell<WorkerMetrics>,
+    durability: &mut Option<WorkerDurability>,
+    chunks: &WorkerChunks,
+    requests: &Receiver<TabletRequest>,
+) {
+    handle_request(first, tablets, metrics, durability.as_mut(), chunks);
+    for _ in 0..REQUEST_DRAIN_PER_WAKE {
+        match requests.try_recv() {
+            Ok(request) => handle_request(request, tablets, metrics, durability.as_mut(), chunks),
+            Err(_) => break,
+        }
+    }
+}
 
 /// Work delivered to a worker thread.
 #[derive(Debug)]
@@ -80,210 +106,92 @@ pub enum WorkerRequestError {
     /// untouched and reads continue where safe.
     #[error("durable write failed: {0}")]
     Storage(#[source] DurabilityError),
+    /// Chunk staging or resolution failed; logical state is untouched
+    /// (staging precedes admission, so nothing was admitted) or reads
+    /// continue where safe.
+    #[error("chunk fabric failed: {0}")]
+    ChunkStore(#[source] kivi_chunk::ChunkError),
+    /// The request is not admittable (absurd range, oversize patch):
+    /// caller bug, state untouched, never persisted — fix and retry.
+    #[error("invalid request: {detail}")]
+    InvalidRequest {
+        /// Human-readable reason (returned verbatim).
+        detail: String,
+    },
 }
 
-/// One worker's durable state: namespace plus WAL lane access. `None`
-/// everywhere means ephemeral mode (no persistence, no dedup).
+/// One worker's durable state: namespace plus the commit coordinator
+/// (which owns the admission queue, batch formation, lane thread, and
+/// metrics). `None` everywhere means ephemeral mode (no persistence, no
+/// dedup, no coordinator).
 #[derive(Debug)]
 pub struct WorkerDurability {
     /// Namespace served (stamped into every record).
     pub namespace: NamespaceId,
     /// Owning worker (tracing and lane selection).
     pub worker: WorkerId,
-    /// Lane access: exclusive per-worker lanes, or one shared lane behind
-    /// a mutex (the group-commit experiment arm).
-    pub lane: LaneAccess,
+    /// Batched commit pipeline with its dedicated durability lane.
+    pub commit: CommitCoordinator,
 }
 
-/// How a worker reaches its WAL lane.
+/// How a worker reaches its WAL lane. The lane moves into the
+/// coordinator's dedicated durability thread at startup; the `DataWorker`
+/// never touches it again.
 #[derive(Debug)]
 pub enum LaneAccess {
     /// Private lane: no synchronization, the production default.
-    Exclusive(LocalWalLane),
+    Exclusive(kivi_durability::LocalWalLane),
     /// One lane shared by all workers (experiment arm): appends serialize
     /// on the mutex; recovery and ordering are unchanged.
-    Shared(Arc<Mutex<LocalWalLane>>),
+    Shared(Arc<Mutex<kivi_durability::LocalWalLane>>),
 }
 
 impl WorkerDurability {
-    /// Appends one batch on this worker's lane, syncing before return.
+    /// Builds the durable state and spawns the lane thread.
     ///
     /// # Errors
     ///
-    /// Returns [`DurabilityError`] when the batch cannot be made durable;
-    /// the caller must not mutate logical state.
-    pub fn append(&mut self, records: &[WalRecord]) -> Result<CommitProof, DurabilityError> {
-        let intent = PersistIntent {
-            records,
-            level: DurabilityLevel::Sync,
-        };
-        match &mut self.lane {
-            LaneAccess::Exclusive(lane) => lane.append_batch(&intent),
-            LaneAccess::Shared(shared) => shared
-                .lock()
-                .map_err(|_| DurabilityError::Io {
-                    op: "lock shared WAL lane",
-                    message: "lane mutex poisoned".to_owned(),
-                    code: None,
-                })?
-                .append_batch(&intent),
-        }
+    /// Returns [`DurabilityError`] when the batch policy is invalid or the
+    /// lane thread cannot spawn.
+    pub fn spawn(
+        namespace: NamespaceId,
+        worker: WorkerId,
+        policy: BatchPolicy,
+        lane: LaneAccess,
+        initial_stats: WorkerLaneStats,
+    ) -> Result<Self, DurabilityError> {
+        Ok(Self {
+            namespace,
+            worker,
+            commit: CommitCoordinator::spawn(policy, lane, initial_stats)?,
+        })
     }
 
-    /// Current coarse lane health.
+    /// Current coarse lane health (cached from the last seal outcome).
     #[must_use]
     pub fn health(&self) -> StorageHealth {
-        match &self.lane {
-            LaneAccess::Exclusive(lane) => lane.health(),
-            LaneAccess::Shared(shared) => shared
-                .lock()
-                .map_or(StorageHealth::Failed, |lane| lane.health()),
-        }
+        self.commit.health()
     }
 
-    /// Cumulative lane counters (a poisoned shared lane reports zeros;
-    /// poisoning cannot happen — see [`WorkerDurability::append`] — so
-    /// this is unreachable defensiveness, not a silent drop).
+    /// Cumulative lane counters (authoritative snapshots ride home on
+    /// every seal; see [`WorkerDurability::lane_stats`]).
     #[must_use]
     pub fn stats(&self) -> LaneStats {
-        match &self.lane {
-            LaneAccess::Exclusive(lane) => lane.stats(),
-            LaneAccess::Shared(shared) => {
-                shared.lock().map(|lane| lane.stats()).unwrap_or_default()
-            }
-        }
+        self.commit.lane_stats().stats
     }
 
     /// Full lane snapshot for the admin plane.
     #[must_use]
     pub fn lane_stats(&self) -> WorkerLaneStats {
-        match &self.lane {
-            LaneAccess::Exclusive(lane) => lane.lane_stats(),
-            LaneAccess::Shared(shared) => shared.lock().map_or(
-                WorkerLaneStats {
-                    lane: u16::MAX,
-                    active_segment: 0,
-                    segments: 0,
-                    health: StorageHealth::Failed,
-                    stats: LaneStats::default(),
-                },
-                |lane| lane.lane_stats(),
-            ),
-        }
+        self.commit.lane_stats()
     }
-}
 
-/// Durable execution failure: maps onto either channel errors or native
-/// statuses at the caller's boundary, never silently.
-#[derive(Debug)]
-pub(crate) enum DurableFailure {
-    /// Tablet logic failure (read-path rejections, commit exhaustion).
-    Op(TabletError),
-    /// Identity below the session floor.
-    Expired,
-    /// Session outcome window exhausted.
-    Overloaded,
-    /// WAL append failure (logical state untouched).
-    Storage(DurabilityError),
-}
-
-/// Executes one operation through the durable pipeline on an already-owned
-/// tablet: prepare (dedup + predict), persist exactly one record, apply +
-/// verify (mutations) or install (terminal outcomes), reply.
-pub(crate) fn execute_durable(
-    live: &mut LiveTablet,
-    durable: &mut WorkerDurability,
-    op: &Operation,
-    opcode: u8,
-    identity: Option<&MutationIdentity>,
-    now: UnixMicros,
-) -> Result<OperationResult, DurableFailure> {
-    let authority = live.authority();
-    let namespace = durable.namespace;
-    let tablet = live.id();
-    let epoch = authority.epoch();
-    let guard = authority.guard();
-    match live
-        .prepare_durable(op, identity, now)
-        .map_err(DurableFailure::Op)?
-    {
-        DurablePrepared::Read(result) => Ok(result),
-        DurablePrepared::Expired => Err(DurableFailure::Expired),
-        DurablePrepared::Overloaded => Err(DurableFailure::Overloaded),
-        DurablePrepared::DedupHit { outcome, .. } => complete_outcome(outcome),
-        DurablePrepared::Terminal { outcome, identity } => {
-            let commit = live.assign_commit().map_err(DurableFailure::Op)?;
-            let record = WalRecord::Outcome(kivi_durability::wal::OutcomeRecord {
-                namespace,
-                tablet,
-                epoch,
-                guard,
-                commit,
-                now,
-                opcode,
-                identity,
-                outcome: outcome.clone(),
-            });
-            durable
-                .append(std::slice::from_ref(&record))
-                .map_err(DurableFailure::Storage)?;
-            let committed = live.commit_terminal(&outcome, identity.as_ref(), commit, opcode);
-            complete_outcome(committed)
-        }
-        DurablePrepared::Persist {
-            mutation,
-            expected,
-            identity,
-        } => {
-            let commit = live.assign_commit().map_err(DurableFailure::Op)?;
-            let is_persist_expiry = matches!(op, Operation::PersistExpiry { .. });
-            let record = WalRecord::Mutation(kivi_durability::wal::MutationRecord {
-                namespace,
-                tablet,
-                epoch,
-                guard,
-                commit,
-                now,
-                opcode,
-                identity,
-                mutation: mutation.clone(),
-                expected: expected.clone(),
-            });
-            durable
-                .append(std::slice::from_ref(&record))
-                .map_err(DurableFailure::Storage)?;
-            live.commit_persisted(
-                &mutation,
-                &expected,
-                is_persist_expiry,
-                identity.as_ref(),
-                commit,
-                now,
-            )
-            .map_err(DurableFailure::Op)
-        }
+    /// Direct maintenance access to the durability lane (checkpoint worker
+    /// path; seals keep flowing through the coordinator).
+    #[must_use]
+    pub fn maintenance(&self) -> crate::commit::LaneMaintenance {
+        self.commit.maintenance()
     }
-}
-
-/// Maps a stored terminal outcome onto a reply (shared by dedup hits and
-/// freshly committed terminal outcomes).
-fn complete_outcome(
-    outcome: kivi_state::DurableOutcome,
-) -> Result<OperationResult, DurableFailure> {
-    use kivi_state::DurableOutcome;
-    match outcome {
-        DurableOutcome::Completed(result) => Ok(result),
-        DurableOutcome::Rejected(error) => Err(DurableFailure::Op(TabletError::Op(error))),
-        DurableOutcome::VersionExhausted => Err(DurableFailure::Op(TabletError::Apply(
-            kivi_state::ApplyError::VersionExhausted,
-        ))),
-    }
-}
-
-/// Derives the originating opcode discriminant from a typed operation
-/// (channel path; the native path carries it on the request).
-pub(crate) fn operation_opcode(op: &Operation) -> u8 {
-    kivi_protocol::operation_opcode(op).as_u8()
 }
 
 /// Administrative control message. Handled ahead of queued requests.
@@ -313,6 +221,72 @@ pub enum WorkerControl {
         /// Where the snapshot goes.
         respond: Sender<Option<WorkerLaneStats>>,
     },
+    /// Report the commit-pipeline metrics (`None` in ephemeral mode).
+    /// Served from the control channel like metrics.
+    CommitMetrics {
+        /// Where the snapshot goes.
+        respond: Sender<Option<crate::commit::CommitMetricsSnapshot>>,
+    },
+    /// Capture one tablet's checkpoint view (commit boundary, committed
+    /// state only). Served from the control channel; the clone cost is
+    /// the measured capture pause, never unbounded work.
+    CaptureTablet {
+        /// Tablet to capture.
+        tablet: TabletId,
+        /// Where the view goes (`None` when this worker owns no such tablet).
+        respond: Sender<Option<kivi_checkpoint::TabletSnapshot>>,
+    },
+    /// Report per-tablet applied cuts and dirty-band counts for
+    /// checkpoint trigger evaluation. Cheap metadata only.
+    TabletCheckpointStatus {
+        /// Where the statuses go.
+        respond: Sender<Vec<TabletCheckpointStatus>>,
+    },
+    /// Collect owned tablets' chunked-commit journals, pruning entries at
+    /// or below each tablet's bound (its older retained cut). The
+    /// checkpoint worker calls this after each publish; the returned
+    /// remainder feeds chunk GC roots. Journal entries are `(commit,
+    /// manifest)` pairs in commit order per tablet.
+    ChunkedJournal {
+        /// Per-tablet prune bounds `(tablet, prune_through)`. Tablets
+        /// absent from the bounds reply unpruned (the worker cannot know
+        /// their retention promise).
+        bounds: Vec<(TabletId, u64)>,
+        /// Where `(tablet, journal)` pairs go.
+        respond: Sender<ChunkJournals>,
+    },
+}
+
+/// Chunk lane access for one worker: the lane handle, the representation
+/// policy, and the engine-global staging pins. Every worker holds one in
+/// both modes (the ephemeral lane is TempDir-backed); large legacy `Set`s
+/// convert here, on the tablet owner, before admission.
+#[derive(Debug, Clone)]
+pub struct WorkerChunks {
+    /// This worker's chunk lane (staging, proofs, reads, stats).
+    pub lane: ChunkLaneHandle,
+    /// Values strictly larger stage as chunked roots; the rest stay inline.
+    pub inline_threshold: u64,
+    /// Security domain staged ids bind (from the namespace).
+    pub domain: kivi_types::SecurityDomainId,
+    /// Engine-global in-flight staging pins (GC roots while uncommitted).
+    pub pins: Arc<StagingPins>,
+}
+
+/// Collected chunked-commit journals: `(tablet, [(commit, manifest)])` in
+/// commit order per tablet. Shared by the worker control plane and the
+/// checkpoint worker's GC roots so the shape never drifts between them.
+pub type ChunkJournals = Vec<(TabletId, Vec<(u64, ManifestId)>)>;
+
+/// Per-tablet checkpoint trigger metadata: applied cut plus dirt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TabletCheckpointStatus {
+    /// Tablet.
+    pub tablet: TabletId,
+    /// Last applied commit position.
+    pub applied: u64,
+    /// Dirty bands since the last capture.
+    pub dirty: usize,
 }
 
 /// Worker-local execution counters, split by arrival path.
@@ -342,6 +316,8 @@ impl WorkerHandle {
     /// Spawns the worker thread owning `tablets`, with a bounded request
     /// queue of `request_capacity`. `durability` is `None` in ephemeral
     /// mode; in durable mode the worker owns its WAL lane exclusively.
+    /// `chunks` is this worker's chunk lane access plus the representation
+    /// policy (both modes stage large values through it).
     ///
     /// # Panics
     ///
@@ -353,12 +329,13 @@ impl WorkerHandle {
         tablets: Vec<LiveTablet>,
         request_capacity: usize,
         durability: Option<WorkerDurability>,
+        chunks: WorkerChunks,
     ) -> Self {
         let (request_tx, request_rx) = bounded::<TabletRequest>(request_capacity.max(1));
         let (control_tx, control_rx) = bounded::<WorkerControl>(CONTROL_CAPACITY);
         let thread = thread::Builder::new()
             .name(format!("kivi-worker-{}", id.as_u64()))
-            .spawn(move || run(id, tablets, request_rx, control_rx, durability))
+            .spawn(move || run(id, tablets, request_rx, control_rx, durability, chunks))
             .expect("worker thread spawns");
         Self {
             id,
@@ -447,6 +424,7 @@ impl WorkerHandle {
         tablets: Vec<LiveTablet>,
         request_capacity: usize,
         durability: Option<WorkerDurability>,
+        chunks: WorkerChunks,
         launch: crate::net::NetLaunch,
     ) -> Result<(Self, SocketAddr), NetStartError> {
         let (request_tx, request_rx) = bounded::<TabletRequest>(request_capacity.max(1));
@@ -456,7 +434,7 @@ impl WorkerHandle {
             .name(format!("kivi-worker-{}", id.as_u64()))
             .spawn(move || {
                 crate::net::run_net(
-                    id, tablets, request_rx, control_rx, durability, launch, ready_tx,
+                    id, tablets, request_rx, control_rx, durability, chunks, launch, ready_tx,
                 );
             })
             .map_err(|error| NetStartError::Startup(error.to_string()))?;
@@ -500,6 +478,17 @@ impl fmt::Debug for WorkerHandle {
 ///
 /// Channels arrive by value (not reference) because ownership must transfer
 /// into the thread: the worker exits when the engine drops every sender.
+///
+/// In durable mode the loop also pumps the commit coordinator after every
+/// wake, and parks boundedly (not indefinitely) while a batch is admitted
+/// or in flight — the embedded client waits blocked in its rendezvous, so
+/// an indefinite park would deadlock its reply. The park quantum only
+/// bounds completion detection, never batching: batches seal on
+/// drain/full/deadline/linger regardless.
+///
+/// Requests drain boundedly per wake (not one per wake) so concurrent
+/// embedded clients accumulate into shared batches instead of sealing
+/// alone one wake at a time.
 #[allow(clippy::needless_pass_by_value)]
 fn run(
     id: WorkerId,
@@ -507,6 +496,7 @@ fn run(
     requests: Receiver<TabletRequest>,
     control: Receiver<WorkerControl>,
     mut durability: Option<WorkerDurability>,
+    chunks: WorkerChunks,
 ) {
     let _ = id;
     let metrics = core::cell::Cell::new(WorkerMetrics::default());
@@ -514,34 +504,87 @@ fn run(
         .into_iter()
         .map(|tablet| (tablet.id(), tablet))
         .collect();
+    // Pumps the coordinator once (no-op in ephemeral mode).
+    let pump = |tablets: &mut HashMap<TabletId, LiveTablet>,
+                durability: Option<&mut WorkerDurability>| {
+        if let Some(durable) = durability {
+            let namespace = durable.namespace;
+            durable.commit.poll(tablets, namespace);
+        }
+    };
     loop {
         // Control fast path: administration never waits behind requests.
         if let Ok(message) = control.try_recv() {
             if !handle_control(message, &mut tablets, &metrics, durability.as_ref()) {
+                flush_for_shutdown(&mut tablets, durability.as_mut());
                 break;
             }
+            pump(&mut tablets, durability.as_mut());
             continue;
         }
-        select! {
-            recv(control) -> message => {
-                match message {
-                    Ok(message) => {
-                        if !handle_control(message, &mut tablets, &metrics, durability.as_ref()) {
-                            break;
+        if durability
+            .as_ref()
+            .is_some_and(|durable| durable.commit.has_pending())
+        {
+            select! {
+                recv(control) -> message => {
+                    match message {
+                        Ok(message) => {
+                            if !handle_control(message, &mut tablets, &metrics, durability.as_ref()) {
+                                flush_for_shutdown(&mut tablets, durability.as_mut());
+                                break;
+                            }
                         }
+                        // Engine gone: exit rather than serve a headless worker.
+                        Err(_) => break,
                     }
-                    // Engine gone: exit rather than serve a headless worker.
-                    Err(_) => break,
                 }
+                recv(requests) -> message => {
+                    match message {
+                        Ok(request) => admit_drained(request, &mut tablets, &metrics, &mut durability, &chunks, &requests),
+                        // All clients gone: exit cleanly.
+                        Err(_) => break,
+                    }
+                }
+                default(crate::commit::COMPLETION_PARK) => {}
             }
-            recv(requests) -> message => {
-                match message {
-                    Ok(request) => handle_request(request, &mut tablets, &metrics, durability.as_mut()),
-                    // All clients gone: exit cleanly.
-                    Err(_) => break,
+        } else {
+            select! {
+                recv(control) -> message => {
+                    match message {
+                        Ok(message) => {
+                            if !handle_control(message, &mut tablets, &metrics, durability.as_ref()) {
+                                flush_for_shutdown(&mut tablets, durability.as_mut());
+                                break;
+                            }
+                        }
+                        // Engine gone: exit rather than serve a headless worker.
+                        Err(_) => break,
+                    }
+                }
+                recv(requests) -> message => {
+                    match message {
+                        Ok(request) => admit_drained(request, &mut tablets, &metrics, &mut durability, &chunks, &requests),
+                        // All clients gone: exit cleanly.
+                        Err(_) => break,
+                    }
                 }
             }
         }
+        pump(&mut tablets, durability.as_mut());
+    }
+}
+
+/// Flushes admitted work synchronously for shutdown: every admitted
+/// request is answered (committed or explicitly failed) before the worker
+/// exits, so shutdown never strands a blocked client.
+fn flush_for_shutdown(
+    tablets: &mut HashMap<TabletId, LiveTablet>,
+    durability: Option<&mut WorkerDurability>,
+) {
+    if let Some(durable) = durability {
+        let namespace = durable.namespace;
+        durable.commit.flush_blocking(tablets, namespace);
     }
 }
 
@@ -559,9 +602,17 @@ pub(crate) fn handle_control(
             limit,
             respond,
         } => {
+            // A sweep physically deletes expired keys outside the commit
+            // pipeline, so it must skip every key with a staged prediction
+            // (queued, open, or in flight): deleting one would diverge the
+            // post-durability verification. Skipped keys wait for the next
+            // sweep; deletion is reclamation, never correctness.
+            let touched = durability.map(|durable| durable.commit.touched_keys());
             let mut reclaimed = 0usize;
             for tablet in tablets.values_mut() {
-                reclaimed += tablet.sweep_expired(now, limit).len();
+                reclaimed += tablet
+                    .sweep_expired_except(now, limit, touched.as_ref())
+                    .len();
             }
             let _ = respond.try_send(reclaimed);
             true
@@ -574,16 +625,186 @@ pub(crate) fn handle_control(
             let _ = respond.try_send(durability.map(WorkerDurability::lane_stats));
             true
         }
+        WorkerControl::CommitMetrics { respond } => {
+            let _ = respond.try_send(durability.map(|durable| durable.commit.metrics_snapshot()));
+            true
+        }
+        WorkerControl::CaptureTablet { tablet, respond } => {
+            let view = tablets
+                .get_mut(&tablet)
+                .map(|live| live.capture_view(capture_namespace(durability)));
+            let _ = respond.try_send(view);
+            true
+        }
+        WorkerControl::TabletCheckpointStatus { respond } => {
+            let statuses = tablets
+                .values()
+                .map(|live| TabletCheckpointStatus {
+                    tablet: live.id(),
+                    applied: live.applied_commit().as_u64(),
+                    dirty: live
+                        .dirty_bands()
+                        .map_or(0, kivi_checkpoint::BandDirty::dirty_count),
+                })
+                .collect();
+            let _ = respond.try_send(statuses);
+            true
+        }
+        WorkerControl::ChunkedJournal { bounds, respond } => {
+            let bounds: std::collections::HashMap<TabletId, u64> = bounds.into_iter().collect();
+            let journals = tablets
+                .values_mut()
+                .filter(|live| bounds.contains_key(&live.id()))
+                .map(|live| {
+                    let bound = bounds.get(&live.id()).copied().unwrap_or(0);
+                    (live.id(), live.collect_chunked_journal(bound))
+                })
+                .collect();
+            let _ = respond.try_send(journals);
+            true
+        }
     }
 }
 
-/// Executes one request against the owned tablet and responds. A dropped
-/// responder (client gone) only drops the outcome.
+/// Peeks the tablet-visible base a range patch applies against: one
+/// synchronous store read, no mutation. Unknown tablets read as absent —
+/// the plan outcome is then unused because downstream answers
+/// `UnknownTablet` before preparing anything.
+pub(crate) fn peek_range_base(
+    tablets: &HashMap<TabletId, LiveTablet>,
+    tablet: TabletId,
+    key: &kivi_state::Key,
+    now: UnixMicros,
+) -> RangeBase {
+    let Some(live) = tablets.get(&tablet) else {
+        return RangeBase::Absent;
+    };
+    match live.store().get(key, now) {
+        None => RangeBase::Absent,
+        Some(object) => match object.value() {
+            kivi_state::LogicalValue::Bytes(bytes) => RangeBase::Inline(bytes.clone()),
+            kivi_state::LogicalValue::StrictCounter(_) => RangeBase::Counter,
+            kivi_state::LogicalValue::Chunked(chunked) => RangeBase::Chunked {
+                manifest: chunked.manifest,
+                logical_len: chunked.logical_len,
+            },
+        },
+    }
+}
+
+/// One staging job's input: a full value to chunk, or a chunked base plus
+/// a patch for the lane's prefix-reuse splice.
+#[derive(Debug)]
+enum StageWork {
+    /// Chunk a full value (large `Set`, or a restaged range result).
+    Value(bytes::Bytes),
+    /// Splice a patch into a chunked base without materializing it.
+    Splice {
+        /// Manifest addressing the base value.
+        manifest: ManifestId,
+        /// Total logical bytes the root claims.
+        logical_len: u64,
+        /// Logical byte index the patch overwrites from.
+        offset: u64,
+        /// Bytes written starting at `offset`.
+        patch: bytes::Bytes,
+    },
+}
+
+/// Stages one value-or-splice on the owner's lane (blocking lane call —
+/// plain worker threads only) and rewrites it as a small `SetChunked`
+/// with its pin guard. Answers the failure and reports `Err(())` with
+/// state untouched when staging fails.
+fn stage_value_work(
+    key: &kivi_state::Key,
+    work: StageWork,
+    chunks: &WorkerChunks,
+    metrics: &core::cell::Cell<WorkerMetrics>,
+    respond: &Sender<WorkerResponse>,
+) -> Result<(Operation, Option<crate::chunk_lane::PinnedUpload>), ()> {
+    fn failed(
+        metrics: &core::cell::Cell<WorkerMetrics>,
+        respond: &Sender<WorkerResponse>,
+        error: WorkerRequestError,
+    ) -> Result<(Operation, Option<crate::chunk_lane::PinnedUpload>), ()> {
+        let mut snapshot = metrics.get();
+        snapshot.channel_ops += 1;
+        metrics.set(snapshot);
+        let _ = respond.try_send(Err(error));
+        Err(())
+    }
+    match work {
+        StageWork::Value(value) => {
+            // Pins open before the first append and close after commit
+            // (the guard rides the coordinator entry below): GC always
+            // sees staged data as pinned or journaled, never neither.
+            let mut guard =
+                match crate::chunk_lane::PinnedUpload::begin(&chunks.pins, chunks.domain, &value) {
+                    Ok(guard) => guard,
+                    Err(error) => {
+                        return failed(metrics, respond, WorkerRequestError::ChunkStore(error));
+                    }
+                };
+            match chunks.lane.stage_value_blocking(value) {
+                Ok(staged) => {
+                    guard.set_manifest(staged.manifest);
+                    Ok((
+                        Operation::SetChunked {
+                            key: key.clone(),
+                            manifest: staged.manifest,
+                            logical_len: staged.logical_len,
+                        },
+                        Some(guard),
+                    ))
+                }
+                Err(error) => failed(metrics, respond, WorkerRequestError::ChunkStore(error)),
+            }
+        }
+        StageWork::Splice {
+            manifest,
+            logical_len,
+            offset,
+            patch,
+        } => match chunks
+            .lane
+            .splice_range_blocking(manifest, logical_len, offset, patch)
+        {
+            Ok(staged) => {
+                let guard = crate::chunk_lane::PinnedUpload::staged(&chunks.pins, &staged);
+                Ok((
+                    Operation::SetChunked {
+                        key: key.clone(),
+                        manifest: staged.manifest,
+                        logical_len: staged.logical_len,
+                    },
+                    Some(guard),
+                ))
+            }
+            Err(error) => failed(metrics, respond, WorkerRequestError::ChunkStore(error)),
+        },
+    }
+}
+
+/// Namespace for checkpoint captures (durable workers serve exactly one).
+fn capture_namespace(durability: Option<&WorkerDurability>) -> NamespaceId {
+    durability.map_or(NamespaceId::from_u64(0), |durable| durable.namespace)
+}
+
+/// Executes one request: ephemeral tablets run inline; durable requests
+/// join the commit coordinator's admission queue and complete when their
+/// batch proves durable. Large legacy `Set`s convert to staged chunked
+/// roots first (blocking lane call — plain worker threads only; the
+/// reactor bridge defers through its continuation queue instead). Reads
+/// may complete as [`ChunkedValue`](OperationResult::ChunkedValue): the
+/// caller resolves those through the lane (async on the reactor, blocking
+/// on caller threads). A dropped responder (client gone) only drops the
+/// outcome.
 pub(crate) fn handle_request(
     request: TabletRequest,
     tablets: &mut HashMap<TabletId, LiveTablet>,
     metrics: &core::cell::Cell<WorkerMetrics>,
     durability: Option<&mut WorkerDurability>,
+    chunks: &WorkerChunks,
 ) {
     let TabletRequest {
         tablet,
@@ -592,21 +813,83 @@ pub(crate) fn handle_request(
         identity,
         respond,
     } = request;
-    let outcome = match tablets.get_mut(&tablet) {
-        None => Err(WorkerRequestError::UnknownTablet { tablet }),
-        Some(live) => match durability {
-            None => live.execute(&op, now).map_err(WorkerRequestError::Tablet),
-            Some(durable) => {
-                let opcode = operation_opcode(&op);
-                match execute_durable(live, durable, &op, opcode, identity.as_ref(), now) {
-                    Ok(result) => Ok(result),
-                    Err(DurableFailure::Op(error)) => Err(WorkerRequestError::Tablet(error)),
-                    Err(DurableFailure::Expired) => Err(WorkerRequestError::DedupExpired),
-                    Err(DurableFailure::Overloaded) => Err(WorkerRequestError::SessionOverloaded),
-                    Err(DurableFailure::Storage(error)) => Err(WorkerRequestError::Storage(error)),
+    // Representation split before anything else: values over the threshold
+    // stage (chunks, manifest, one sync barrier) and re-enter as a small
+    // `SetChunked`. Range patches plan against the peeked base first
+    // (small inline results WAL as splices, chunked bases restage through
+    // the lane splice). Staging precedes admission, so a lane failure or
+    // a rejected range answers here with state untouched.
+    let (op, pinned) = match op {
+        Operation::SetRange { key, offset, patch } => {
+            let base = peek_range_base(tablets, tablet, &key, now);
+            match plan_set_range(key, offset, patch, base, chunks.inline_threshold) {
+                SetRangePlan::Inline(op) => (op, None),
+                SetRangePlan::Reject { detail } => {
+                    let mut snapshot = metrics.get();
+                    snapshot.channel_ops += 1;
+                    metrics.set(snapshot);
+                    let _ = respond.try_send(Err(WorkerRequestError::InvalidRequest { detail }));
+                    return;
+                }
+                SetRangePlan::RestageSet { key, value } => {
+                    match stage_value_work(&key, StageWork::Value(value), chunks, metrics, &respond)
+                    {
+                        Ok(staged) => staged,
+                        Err(()) => return,
+                    }
+                }
+                SetRangePlan::Splice {
+                    key,
+                    manifest,
+                    logical_len,
+                    offset,
+                    patch,
+                } => {
+                    match stage_value_work(
+                        &key,
+                        StageWork::Splice {
+                            manifest,
+                            logical_len,
+                            offset,
+                            patch,
+                        },
+                        chunks,
+                        metrics,
+                        &respond,
+                    ) {
+                        Ok(staged) => staged,
+                        Err(()) => return,
+                    }
+                }
+            }
+        }
+        other => match split_large_set(other, chunks.inline_threshold) {
+            LargeSetSplit::Inline(op) => (op, None),
+            LargeSetSplit::Stage { key, value } => {
+                match stage_value_work(&key, StageWork::Value(value), chunks, metrics, &respond) {
+                    Ok(staged) => staged,
+                    Err(()) => return,
                 }
             }
         },
+    };
+    let outcome = match durability {
+        None => match tablets.get_mut(&tablet) {
+            None => Err(WorkerRequestError::UnknownTablet { tablet }),
+            Some(live) => live.execute(&op, now).map_err(WorkerRequestError::Tablet),
+        },
+        Some(durable) => {
+            durable
+                .commit
+                .admit(PendingEntry::new(tablet, op, now, identity, respond).with_pinned(pinned));
+            durable.commit.poll(tablets, durable.namespace);
+            // Admission itself is the outcome; the reply arrives through
+            // the responder once the batch completes.
+            let mut snapshot = metrics.get();
+            snapshot.channel_ops += 1;
+            metrics.set(snapshot);
+            return;
+        }
     };
     let mut snapshot = metrics.get();
     snapshot.channel_ops += 1;
@@ -628,6 +911,45 @@ mod tests {
     use kivi_types::{NamespaceId, TabletAuthority, TabletEpoch, WriteGuardGeneration};
 
     const NS: NamespaceId = NamespaceId::from_u64(1);
+
+    /// Test chunk access: TempDir-backed lane, shut down explicitly at
+    /// the test's end (lane thread joins before the directory drops, so
+    /// no open file handles wedge Windows cleanup). Mirrors the engine's
+    /// shutdown ordering on a small scale.
+    struct TestChunks {
+        chunks: WorkerChunks,
+        lane: crate::chunk_lane::ChunkLaneHandle,
+        guard: crate::chunk_lane::ChunkLaneGuard,
+        #[allow(dead_code)]
+        dir: tempfile::TempDir,
+    }
+
+    impl TestChunks {
+        fn open() -> Self {
+            use crate::chunk_lane::{DEFAULT_CHUNK_CACHE_BYTES, spawn_lane};
+            use kivi_chunk::{ChunkStore, DEFAULT_INLINE_THRESHOLD};
+            let dir = tempfile::tempdir().expect("scratch");
+            let domain = kivi_types::SecurityDomainId::from_u64(NS.as_u64());
+            let (store, _) = ChunkStore::open(dir.path(), 0, domain, 1024 * 1024, 1_000_000)
+                .expect("test lane opens");
+            let (lane, guard) = spawn_lane(WorkerId::from_u64(0), store, DEFAULT_CHUNK_CACHE_BYTES);
+            Self {
+                chunks: WorkerChunks {
+                    lane: lane.clone(),
+                    inline_threshold: DEFAULT_INLINE_THRESHOLD,
+                    domain,
+                    pins: std::sync::Arc::new(crate::chunk_lane::StagingPins::default()),
+                },
+                lane,
+                guard,
+                dir,
+            }
+        }
+
+        fn shutdown(mut self) {
+            self.guard.shutdown(&self.lane);
+        }
+    }
 
     fn live_tablet(id: u64) -> LiveTablet {
         let tablet = TabletId::from_u64(id);
@@ -661,7 +983,14 @@ mod tests {
 
     #[test]
     fn worker_executes_requests_and_reports_unknown_tablets() {
-        let mut handle = WorkerHandle::spawn(WorkerId::from_u64(0), vec![live_tablet(1)], 16, None);
+        let chunks = TestChunks::open();
+        let mut handle = WorkerHandle::spawn(
+            WorkerId::from_u64(0),
+            vec![live_tablet(1)],
+            16,
+            None,
+            chunks.chunks.clone(),
+        );
         let set = round_trip(
             &handle,
             TabletId::from_u64(1),
@@ -687,11 +1016,206 @@ mod tests {
             .expect("control");
         handle.join().expect("clean exit");
         assert!(handle.is_joined());
+        chunks.shutdown();
+    }
+
+    #[test]
+    fn splice_plan_routes_every_base() {
+        use crate::chunk_lane::{RangeBase, SetRangePlan, plan_set_range};
+        use kivi_chunk::policy::MAX_LEGACY_VALUE_BYTES;
+        let key = || Key::from("k");
+        // Absent bases: small results splice inline, large restage.
+        assert!(matches!(
+            plan_set_range(
+                key(),
+                0,
+                bytes::Bytes::from_static(b"v"),
+                RangeBase::Absent,
+                1024
+            ),
+            SetRangePlan::Inline(_)
+        ));
+        assert!(matches!(
+            plan_set_range(
+                key(),
+                0,
+                bytes::Bytes::from(vec![0u8; 2048]),
+                RangeBase::Absent,
+                1024
+            ),
+            SetRangePlan::RestageSet { .. }
+        ));
+        // Counters pass through: preparation rejects them, not the plan.
+        assert!(matches!(
+            plan_set_range(
+                key(),
+                0,
+                bytes::Bytes::from_static(b"v"),
+                RangeBase::Counter,
+                1024
+            ),
+            SetRangePlan::Inline(_)
+        ));
+        // Chunked bases splice lane-side with no size bound (streaming).
+        assert!(matches!(
+            plan_set_range(
+                key(),
+                0,
+                bytes::Bytes::from_static(b"v"),
+                RangeBase::Chunked {
+                    manifest: kivi_types::ManifestId::from_bytes([0x11; 32]),
+                    logical_len: MAX_LEGACY_VALUE_BYTES + 1,
+                },
+                1024
+            ),
+            SetRangePlan::Splice { .. }
+        ));
+        // Overflowing arithmetic and past-bound results reject with state
+        // untouched (the caller answers `InvalidRequest`).
+        assert!(matches!(
+            plan_set_range(
+                key(),
+                u64::MAX,
+                bytes::Bytes::from_static(b"v"),
+                RangeBase::Absent,
+                1024
+            ),
+            SetRangePlan::Reject { .. }
+        ));
+        assert!(matches!(
+            plan_set_range(
+                key(),
+                MAX_LEGACY_VALUE_BYTES + 1,
+                bytes::Bytes::new(),
+                RangeBase::Absent,
+                1024
+            ),
+            SetRangePlan::Reject { .. }
+        ));
+        // A result one byte past the bound rejects (at the bound it
+        // still restages: the cap is enforced, not the boundary).
+        assert!(matches!(
+            plan_set_range(
+                key(),
+                MAX_LEGACY_VALUE_BYTES,
+                bytes::Bytes::from_static(b"v"),
+                RangeBase::Inline(bytes::Bytes::from_static(b"v")),
+                1024
+            ),
+            SetRangePlan::Reject { .. }
+        ));
+    }
+
+    #[test]
+    fn splice_missing_manifest_fails_loudly_without_touching_state() {
+        let chunks = TestChunks::open();
+        let missing = kivi_types::ManifestId::from_bytes([0xAB; 32]);
+        let error = chunks
+            .lane
+            .splice_range_blocking(missing, 100, 0, bytes::Bytes::from_static(b"x"))
+            .expect_err("missing manifest fails");
+        assert!(
+            matches!(error, kivi_chunk::ChunkError::MissingManifest { .. }),
+            "loud missing-manifest, got {error:?}"
+        );
+        chunks.shutdown();
+    }
+
+    #[test]
+    fn finalize_empty_upload_stores_an_empty_manifest() {
+        let chunks = TestChunks::open();
+        let staged = chunks
+            .lane
+            .finalize_stream_blocking(Vec::new(), 0)
+            .expect("empty upload finalizes");
+        assert_eq!(staged.logical_len, 0);
+        assert!(staged.chunks.is_empty());
+        let bytes = chunks
+            .lane
+            .read_value_blocking(staged.manifest, 0)
+            .expect("empty value reads");
+        assert!(bytes.is_empty());
+        let loaded = chunks
+            .lane
+            .fetch_manifest_blocking(staged.manifest)
+            .expect("manifest fetches");
+        assert!(loaded.entries.is_empty());
+        chunks.shutdown();
+    }
+
+    #[test]
+    fn stage_chunks_then_finalize_round_trips() {
+        use kivi_codec::integrity::chunk_id;
+        let chunks = TestChunks::open();
+        let domain = chunks.chunks.domain;
+        // Grid-aligned pieces (a full chunk plus a short final), exactly
+        // what the upload drain stages: anything else is an invalid
+        // manifest and must stay rejected (see below).
+        let first = bytes::Bytes::from(vec![0x11u8; kivi_chunk::DEFAULT_CHUNK_SIZE]);
+        let second = bytes::Bytes::from(vec![0x22u8; 50]);
+        let first_id = chunk_id(domain, &first);
+        let second_id = chunk_id(domain, &second);
+        chunks
+            .lane
+            .stage_chunk_blocking(first_id, first.clone())
+            .expect("stage");
+        // Dedup: re-staging identical bytes is free, never a second record.
+        chunks
+            .lane
+            .stage_chunk_blocking(first_id, first)
+            .expect("restage");
+        chunks
+            .lane
+            .stage_chunk_blocking(second_id, second)
+            .expect("stage");
+        let total = kivi_chunk::DEFAULT_CHUNK_SIZE as u64 + 50;
+        let staged = chunks
+            .lane
+            .finalize_stream_blocking(
+                vec![
+                    (first_id, kivi_chunk::DEFAULT_CHUNK_SIZE as u64),
+                    (second_id, 50),
+                ],
+                total,
+            )
+            .expect("finalize");
+        assert_eq!(staged.logical_len, total);
+        let bytes = chunks
+            .lane
+            .read_value_blocking(staged.manifest, total)
+            .expect("read back");
+        assert_eq!(bytes.len() as u64, total);
+        assert!(
+            bytes[..kivi_chunk::DEFAULT_CHUNK_SIZE]
+                .iter()
+                .all(|byte| *byte == 0x11)
+        );
+        assert!(
+            bytes[kivi_chunk::DEFAULT_CHUNK_SIZE..]
+                .iter()
+                .all(|byte| *byte == 0x22)
+        );
+        // Off-grid entries stay invalid: finalize validates, never stores.
+        assert!(
+            chunks
+                .lane
+                .finalize_stream_blocking(vec![(first_id, 100), (second_id, 50)], 150)
+                .is_err(),
+            "short non-final entry rejected"
+        );
+        chunks.shutdown();
     }
 
     #[test]
     fn sweep_control_reclaims_without_request_queue() {
-        let mut handle = WorkerHandle::spawn(WorkerId::from_u64(0), vec![live_tablet(1)], 16, None);
+        let chunks = TestChunks::open();
+        let mut handle = WorkerHandle::spawn(
+            WorkerId::from_u64(0),
+            vec![live_tablet(1)],
+            16,
+            None,
+            chunks.chunks.clone(),
+        );
         round_trip(
             &handle,
             TabletId::from_u64(1),
@@ -723,5 +1247,6 @@ mod tests {
             .try_control(WorkerControl::Shutdown)
             .expect("control");
         handle.join().expect("clean exit");
+        chunks.shutdown();
     }
 }

@@ -9,7 +9,11 @@ kivi-types.workspace = true
 kivi-tablet.workspace = true
 kivi-state.workspace = true
 kivi-protocol.workspace = true
+kivi-codec.workspace = true
 kivi-durability.workspace = true
+kivi-checkpoint.workspace = true
+kivi-chunk.workspace = true
+async-channel.workspace = true
 bytes.workspace = true
 arc-swap.workspace = true
 crossbeam-channel.workspace = true
@@ -17,6 +21,10 @@ compio.workspace = true
 core_affinity2.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
+# Ephemeral-mode chunk lane root: a per-process TempDir (auto-removed on
+# clean shutdown) so small and large values share one staging path in both
+# modes. Durable mode stages under the data directory instead.
+tempfile.workspace = true
 
 [dev-dependencies]
 divan.workspace = true

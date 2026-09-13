@@ -9,9 +9,10 @@
 //! deterministically — the same mutation on the same state always yields the
 //! same outcome, with no clock reads or randomness inside.
 //!
-//! Physical representation is deliberately private: values live inline today,
-//! and arena/chunked/compressed/cold forms can arrive later without changing
-//! any of these semantics.
+//! Physical representation is deliberately private: small values live inline
+//! while large byte strings live as chunk references (manifest id plus
+//! logical length, resolved by the engine), without changing any of these
+//! semantics.
 
 pub mod envelope;
 pub mod hash;
@@ -22,6 +23,8 @@ pub mod store;
 pub use envelope::{EnvelopeError, MUTATION_ENVELOPE_VERSION, MutationEnvelope};
 pub use hash::{PARTITION_DOMAIN_TAG, PartitionHashAlgorithmId, PartitionHasher};
 pub use mutation::{ApplyError, ApplyOutcome, Mutation};
-pub use object::{Key, LogicalValue, ObjectType, ObjectVersion, StoredObject, VersionExhausted};
+pub use object::{
+    ChunkedRef, Key, LogicalValue, ObjectType, ObjectVersion, StoredObject, VersionExhausted,
+};
 pub use ops::{DurableOutcome, OpError, Operation, OperationResult, outcome_for};
-pub use store::{ObjectStore, Prepared, StorePrepared};
+pub use store::{ObjectStore, Prepared, StorePrepared, splice_inline};

@@ -5,7 +5,9 @@
 //! identity. The project owns the constructions built on top — in particular
 //! [`chunk_id`], whose exact byte layout is part of the durable contract.
 
-use kivi_types::{ChunkId, SecurityDomainId, hash::CHUNK_DOMAIN_TAG};
+use kivi_types::{
+    ChunkId, ManifestId, SecurityDomainId, hash::CHUNK_DOMAIN_TAG, hash::MANIFEST_DOMAIN_TAG,
+};
 
 /// CRC32C (Castagnoli) checksum of `data`, hardware-accelerated when
 /// available with a software fallback.
@@ -38,6 +40,26 @@ pub fn chunk_id(domain: SecurityDomainId, canonical_bytes: &[u8]) -> ChunkId {
     hasher.update(&domain.as_u64().to_le_bytes());
     hasher.update(canonical_bytes);
     ChunkId::from_bytes(hasher.finalize().into())
+}
+
+/// Derives the content address of an immutable chunk manifest.
+///
+/// Byte-exact construction (durable — must never change for `V1`):
+///
+/// ```text
+/// ManifestId = BLAKE3(MANIFEST_DOMAIN_TAG || le64(security_domain) || canonical_manifest_bytes)
+/// ```
+///
+/// The disjoint tag is what keeps manifest addresses from ever aliasing
+/// chunk addresses: [`chunk_id`] and [`manifest_id`] agree on neither
+/// inputs nor outputs for the same payload.
+#[must_use]
+pub fn manifest_id(domain: SecurityDomainId, canonical_bytes: &[u8]) -> ManifestId {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(MANIFEST_DOMAIN_TAG);
+    hasher.update(&domain.as_u64().to_le_bytes());
+    hasher.update(canonical_bytes);
+    ManifestId::from_bytes(hasher.finalize().into())
 }
 
 #[cfg(test)]
@@ -81,5 +103,18 @@ mod tests {
         let empty_chunk = chunk_id(SecurityDomainId::from_u64(9), &[]);
         assert!(empty_chunk.is_valid());
         assert_eq!(crc32c_checksum(&[]), crc32c_checksum(&[]));
+    }
+
+    #[test]
+    fn manifest_ids_are_domain_separated_from_chunks() {
+        let bytes = b"same canonical bytes";
+        let manifest = manifest_id(SecurityDomainId::from_u64(1), bytes);
+        let chunk = chunk_id(SecurityDomainId::from_u64(1), bytes);
+        assert!(manifest.is_valid());
+        // Disjoint tags: identical payloads never alias across the two
+        // address spaces (compared as raw digests).
+        assert_ne!(manifest.as_bytes(), chunk.as_bytes());
+        assert_eq!(manifest, manifest_id(SecurityDomainId::from_u64(1), bytes));
+        assert_ne!(manifest, manifest_id(SecurityDomainId::from_u64(2), bytes));
     }
 }

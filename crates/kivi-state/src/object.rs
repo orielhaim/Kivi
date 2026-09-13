@@ -10,7 +10,7 @@ use core::fmt;
 
 use bytes::Bytes;
 use kivi_codec::{CodecError, Decode, Encode, decode_byte_vec, encode_bytes};
-use kivi_types::Expiry;
+use kivi_types::{Expiry, ManifestId};
 
 /// Object key: an immutable shared byte string.
 ///
@@ -238,29 +238,72 @@ impl Decode for ObjectType {
 /// Logical value of a stored object.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LogicalValue {
-    /// Opaque byte string.
+    /// Opaque byte string, resident.
     Bytes(Bytes),
+    /// Opaque byte string addressed by immutable chunks. Logically identical
+    /// to [`Bytes`](Self::Bytes) of the same content: same type, same reads,
+    /// same overwrites. Only the physical representation differs, and only
+    /// the engine (never this layer) resolves it into bytes.
+    Chunked(ChunkedRef),
     /// Exact counter value.
     StrictCounter(i64),
 }
 
 impl LogicalValue {
-    /// Returns the value's logical type.
+    /// Returns the value's logical type. Chunked bytes are bytes: type
+    /// checks never distinguish representation.
     #[must_use]
     pub const fn object_type(&self) -> ObjectType {
         match self {
-            Self::Bytes(_) => ObjectType::Bytes,
+            Self::Bytes(_) | Self::Chunked(_) => ObjectType::Bytes,
             Self::StrictCounter(_) => ObjectType::StrictCounter,
         }
     }
 }
 
-/// Physical representation tag. Private and currently always inline; future
-/// arena/chunked/compressed/cold representations extend this enum without
-/// touching logical semantics or any public API.
+/// Reference to a chunked byte string: the manifest addressing its immutable
+/// chunks plus the total logical length. Small (`Copy`): tablet roots,
+/// checkpoints, and WAL records carry this instead of bulk bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ChunkedRef {
+    /// Manifest addressing the immutable chunk sequence.
+    pub manifest: ManifestId,
+    /// Total logical bytes across the manifest's entries.
+    pub logical_len: u64,
+}
+
+impl Encode for ChunkedRef {
+    fn encoded_len(&self) -> usize {
+        32 + 8
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(self.manifest.as_bytes());
+        self.logical_len.encode(out);
+    }
+}
+
+impl Decode for ChunkedRef {
+    fn decode(input: &[u8]) -> Result<(Self, usize), CodecError> {
+        let (raw, first) = <[u8; 32]>::decode(input)?;
+        let (logical_len, second) = u64::decode(&input[first..])?;
+        Ok((
+            Self {
+                manifest: ManifestId::from_bytes(raw),
+                logical_len,
+            },
+            first + second,
+        ))
+    }
+}
+
+/// Physical representation tag. Private: logical semantics never branch on
+/// it (matches go through [`LogicalValue`]); it exists so debugging,
+/// checkpoints, and future tiering can name what a root physically is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Representation {
     Inline,
+    Chunked,
 }
 
 /// A stored logical object: value, version, expiry, and representation.
@@ -274,14 +317,29 @@ pub struct StoredObject {
 
 impl StoredObject {
     /// Builds an object. Only the store constructs these; callers go through
-    /// typed operations and mutations.
+    /// typed operations and mutations. The representation derives from the
+    /// value, so a chunked root can never masquerade as inline or reverse.
     pub(crate) fn new(value: LogicalValue, version: ObjectVersion, expiry: Expiry) -> Self {
+        let representation = match &value {
+            LogicalValue::Bytes(_) | LogicalValue::StrictCounter(_) => Representation::Inline,
+            LogicalValue::Chunked(_) => Representation::Chunked,
+        };
         Self {
             value,
             version,
             expiry,
-            representation: Representation::Inline,
+            representation,
         }
+    }
+
+    /// Rebuilds an object from checkpointed components. Checkpoint
+    /// recovery is the only production caller: versions are logical
+    /// history and must be restored exactly, never recomputed. Chunked
+    /// roots restore as chunk references (bulk bytes stay in chunk packs);
+    /// dependency validation proves them before serving.
+    #[must_use]
+    pub fn restore(value: LogicalValue, version: ObjectVersion, expiry: Expiry) -> Self {
+        Self::new(value, version, expiry)
     }
 
     /// Returns the logical value.
@@ -306,6 +364,33 @@ impl StoredObject {
     #[must_use]
     pub const fn object_type(&self) -> ObjectType {
         self.value.object_type()
+    }
+
+    /// Whether this root addresses immutable chunks instead of resident
+    /// bytes. Diagnostics, checkpoints, and GC use this; reads resolve
+    /// through the engine either way.
+    #[must_use]
+    pub const fn is_chunked(&self) -> bool {
+        matches!(self.value, LogicalValue::Chunked(_))
+    }
+
+    /// Returns the chunk reference of a chunked root, if chunked.
+    #[must_use]
+    pub const fn chunk_ref(&self) -> Option<ChunkedRef> {
+        match &self.value {
+            LogicalValue::Chunked(chunked) => Some(*chunked),
+            _ => None,
+        }
+    }
+
+    /// Returns the physical representation name for `EXPLAIN`-style
+    /// diagnostics (`"inline"` or `"chunked"`). Informational only.
+    #[must_use]
+    pub const fn representation_name(&self) -> &'static str {
+        match self.representation {
+            Representation::Inline => "inline",
+            Representation::Chunked => "chunked",
+        }
     }
 
     /// Whether the object is logically absent at `now` (`now >= expires_at`).

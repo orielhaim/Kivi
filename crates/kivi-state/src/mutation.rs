@@ -12,7 +12,7 @@
 //! bincode, or rkyv type defines it.
 
 use kivi_codec::{CodecError, Decode, Encode, decode_byte_vec, encode_bytes};
-use kivi_types::Expiry;
+use kivi_types::{Expiry, ManifestId};
 
 use crate::object::{Key, ObjectType, ObjectVersion};
 
@@ -45,6 +45,36 @@ pub enum Mutation {
         /// New expiry (`NEVER` clears).
         expiry: Expiry,
     },
+    /// Point `key` at a chunked value: the manifest addressing its
+    /// immutable chunks plus the total logical length. The WAL carries
+    /// this small root transition only — bulk bytes live in chunk packs
+    /// whose durability precedes this record (§11, §12). Overwrites any
+    /// type and clears expiry, exactly like [`PutBytes`](Self::PutBytes).
+    ReplaceChunkedRoot {
+        /// Target key.
+        key: Key,
+        /// Manifest addressing the immutable chunk sequence.
+        manifest: ManifestId,
+        /// Total logical bytes across the manifest.
+        logical_len: u64,
+    },
+    /// Patch a byte range of `key`'s value at `offset` with `patch`,
+    /// zero-padding past-the-end gaps (Redis `SETRANGE` semantics) and
+    /// clearing expiry, exactly like [`PutBytes`](Self::PutBytes). The
+    /// tablet layer only admits this against absent, expired, or inline
+    /// bases whose patched result stays within the legacy inline bound;
+    /// chunked bases are resolved and restaged by the engine first, so
+    /// apply meets no chunk reference it cannot read. Replay is
+    /// deterministic: the same ordered state yields the same base, hence
+    /// the same splice.
+    SpliceBytes {
+        /// Target key.
+        key: Key,
+        /// Logical byte index the patch overwrites from.
+        offset: u64,
+        /// Bytes written starting at `offset`.
+        patch: bytes::Bytes,
+    },
 }
 
 /// Canonical wire tags. Fixed forever within framing version 1; new
@@ -53,8 +83,28 @@ const TAG_PUT_BYTES: u8 = 1;
 const TAG_DELETE: u8 = 2;
 const TAG_COUNTER_ADD: u8 = 3;
 const TAG_SET_EXPIRY: u8 = 4;
+/// Chunked-root mutation tag. New tags never reuse old ones.
+const TAG_REPLACE_CHUNKED_ROOT: u8 = 5;
+/// Byte-range splice mutation tag. New tags never reuse old ones.
+const TAG_SPLICE_BYTES: u8 = 6;
 
 impl Mutation {
+    /// Returns the single key this mutation touches. Every mutation in
+    /// this stage is single-key; dirty-band tracking and overlays rely on
+    /// that (a future multi-key mutation must extend this contract, not
+    /// silently bypass it).
+    #[must_use]
+    pub fn key(&self) -> &Key {
+        match self {
+            Self::PutBytes { key, .. }
+            | Self::Delete { key }
+            | Self::CounterAdd { key, .. }
+            | Self::SetExpiry { key, .. }
+            | Self::ReplaceChunkedRoot { key, .. }
+            | Self::SpliceBytes { key, .. } => key,
+        }
+    }
+
     /// Reconstructs the originating operation. Exact inverse of
     /// `prepare`'s normalization: `SetExpiry{NEVER}` always came from
     /// `PersistExpiry` (which is the only producer of `NEVER`), any other
@@ -85,6 +135,20 @@ impl Mutation {
                     }
                 }
             }
+            Self::ReplaceChunkedRoot {
+                key,
+                manifest,
+                logical_len,
+            } => Operation::SetChunked {
+                key: key.clone(),
+                manifest: *manifest,
+                logical_len: *logical_len,
+            },
+            Self::SpliceBytes { key, offset, patch } => Operation::SetRange {
+                key: key.clone(),
+                offset: *offset,
+                patch: patch.clone(),
+            },
         }
     }
 }
@@ -96,6 +160,8 @@ impl Encode for Mutation {
             Self::Delete { key } => 1 + (4 + key.len()),
             Self::CounterAdd { key, .. } => 1 + (4 + key.len()) + 8,
             Self::SetExpiry { key, expiry } => 1 + (4 + key.len()) + expiry.encoded_len(),
+            Self::ReplaceChunkedRoot { key, .. } => 1 + (4 + key.len()) + 32 + 8,
+            Self::SpliceBytes { key, patch, .. } => 1 + (4 + key.len()) + 8 + (4 + patch.len()),
         }
     }
 
@@ -119,6 +185,22 @@ impl Encode for Mutation {
                 out.push(TAG_SET_EXPIRY);
                 encode_bytes(out, key.as_bytes());
                 expiry.encode(out);
+            }
+            Self::ReplaceChunkedRoot {
+                key,
+                manifest,
+                logical_len,
+            } => {
+                out.push(TAG_REPLACE_CHUNKED_ROOT);
+                encode_bytes(out, key.as_bytes());
+                out.extend_from_slice(manifest.as_bytes());
+                logical_len.encode(out);
+            }
+            Self::SpliceBytes { key, offset, patch } => {
+                out.push(TAG_SPLICE_BYTES);
+                encode_bytes(out, key.as_bytes());
+                offset.encode(out);
+                encode_bytes(out, patch);
             }
         }
     }
@@ -168,6 +250,32 @@ impl Decode for Mutation {
                         expiry,
                     },
                     first + second + third,
+                ))
+            }
+            TAG_REPLACE_CHUNKED_ROOT => {
+                let (key, second) = decode_byte_vec(&input[first..])?;
+                let (raw, third) = <[u8; 32]>::decode(&input[first + second..])?;
+                let (logical_len, fourth) = u64::decode(&input[first + second + third..])?;
+                Ok((
+                    Self::ReplaceChunkedRoot {
+                        key: Key::from(key),
+                        manifest: ManifestId::from_bytes(raw),
+                        logical_len,
+                    },
+                    first + second + third + fourth,
+                ))
+            }
+            TAG_SPLICE_BYTES => {
+                let (key, second) = decode_byte_vec(&input[first..])?;
+                let (offset, third) = u64::decode(&input[first + second..])?;
+                let (patch, fourth) = decode_byte_vec(&input[first + second + third..])?;
+                Ok((
+                    Self::SpliceBytes {
+                        key: Key::from(key),
+                        offset,
+                        patch: bytes::Bytes::from(patch),
+                    },
+                    first + second + third + fourth,
                 ))
             }
             other => Err(CodecError::InvalidTag {
@@ -231,6 +339,12 @@ pub enum ApplyError {
         /// Type actually stored.
         found: ObjectType,
     },
+    /// A splice met a chunked base the engine must have restaged first,
+    /// or an offset that overflows `u64`. Only reachable by applying
+    /// mutations against divergent state: admission resolves chunked
+    /// bases through the lane and validates arithmetic before the WAL.
+    #[error("byte-range splice cannot apply to stored state")]
+    UnresolvableSplice,
 }
 
 #[cfg(test)]
@@ -258,6 +372,21 @@ mod tests {
             Mutation::SetExpiry {
                 key: key.clone(),
                 expiry: Expiry::NEVER,
+            },
+            Mutation::ReplaceChunkedRoot {
+                key: key.clone(),
+                manifest: ManifestId::from_bytes([0x11; 32]),
+                logical_len: 3_000_000,
+            },
+            Mutation::SpliceBytes {
+                key: key.clone(),
+                offset: 7,
+                patch: bytes::Bytes::from_static(b"patch"),
+            },
+            Mutation::SpliceBytes {
+                key: key.clone(),
+                offset: u64::MAX,
+                patch: bytes::Bytes::new(),
             },
         ];
         for mutation in cases {

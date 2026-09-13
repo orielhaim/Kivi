@@ -1,0 +1,19 @@
+[package]
+name = "kivi-chunk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+kivi-types.workspace = true
+kivi-codec.workspace = true
+kivi-durability.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

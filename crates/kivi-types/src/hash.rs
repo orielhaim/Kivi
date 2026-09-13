@@ -15,6 +15,13 @@ use core::fmt;
 /// instead of colliding with existing content addresses.
 pub const CHUNK_DOMAIN_TAG: &[u8] = b"KIVI-CHUNK-V1";
 
+/// Domain-separation tag mixed into every chunk-manifest hash.
+///
+/// A manifest names an ordered list of chunks, not bytes, so it hashes in a
+/// disjoint domain from chunks: a chunk can never alias a manifest address
+/// even if their canonical bytes happened to coincide.
+pub const MANIFEST_DOMAIN_TAG: &[u8] = b"KIVI-MANIFEST-V1";
+
 /// 256-bit content address of an immutable chunk (RFC §28, §29).
 ///
 /// Construction (pinned — this formula is the durable contract):
@@ -64,6 +71,65 @@ impl From<ChunkId> for [u8; 32] {
 }
 
 impl fmt::Display for ChunkId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// 256-bit content address of an immutable chunk manifest (ordered chunk
+/// list plus chunking parameters).
+///
+/// Construction (pinned — this formula is the durable contract):
+///
+/// ```text
+/// ManifestId = BLAKE3("KIVI-MANIFEST-V1" || le64(security_domain) || canonical_manifest_bytes)
+/// ```
+///
+/// Same sentinel rule as [`ChunkId`]: all-zero is never a real address.
+/// Manifests and chunks live in disjoint domains, so identical bytes hash
+/// to different addresses across the two types by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ManifestId([u8; 32]);
+
+impl ManifestId {
+    /// All-zero sentinel. Never a real content address.
+    pub const ZERO: Self = Self([0; 32]);
+
+    /// Wraps 32 digest bytes.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the raw digest bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// Whether this could be a real content address (i.e. is non-zero).
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.0 != [0; 32]
+    }
+}
+
+impl From<[u8; 32]> for ManifestId {
+    fn from(bytes: [u8; 32]) -> Self {
+        Self::from_bytes(bytes)
+    }
+}
+
+impl From<ManifestId> for [u8; 32] {
+    fn from(id: ManifestId) -> Self {
+        id.0
+    }
+}
+
+impl fmt::Display for ManifestId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for byte in self.0 {
             write!(f, "{byte:02x}")?;
@@ -125,6 +191,15 @@ mod tests {
     fn zero_is_invalid_and_nonzero_is_valid() {
         assert!(!ChunkId::ZERO.is_valid());
         assert!(ChunkId::from_bytes([1; 32]).is_valid());
+        assert!(!ManifestId::ZERO.is_valid());
+        assert!(ManifestId::from_bytes([1; 32]).is_valid());
+    }
+
+    #[test]
+    fn manifest_ids_display_as_64_hex_chars() {
+        let id = ManifestId::from_bytes([0xCDu8; 32]);
+        assert_eq!(id.to_string(), "cd".repeat(32));
+        assert!(ManifestId::ZERO < id);
     }
 
     #[test]

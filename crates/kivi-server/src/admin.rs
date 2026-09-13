@@ -107,7 +107,8 @@ struct TabletDto {
     owner: Option<u64>,
 }
 
-/// Durability posture: mode, identity, lanes, health, and what recovery did.
+/// Durability posture: mode, identity, lanes, commit batching, health,
+/// and what recovery did.
 #[derive(Debug, Clone, Serialize)]
 struct DurabilityDto {
     mode: &'static str,
@@ -116,6 +117,7 @@ struct DurabilityDto {
     cluster: u128,
     incarnation: u64,
     lanes: Vec<LaneDto>,
+    commit: Vec<CommitDto>,
     recovery: Option<RecoveryDto>,
 }
 
@@ -141,6 +143,60 @@ struct RecoveryDto {
     segments_scanned: u64,
     tail_truncated_bytes: u64,
     tablets_recovered: u64,
+    checkpoint_tablets_loaded: u64,
+    checkpoint_bands_verified: u64,
+    checkpoint_bytes_restored: u64,
+    checkpoint_obsolete_skipped: u64,
+    checkpoint_fell_back: u64,
+}
+
+/// One worker's commit pipeline: the logical-writes-per-fsync story
+/// (`None` fields in ephemeral mode, which has no pipeline).
+#[derive(Debug, Clone, Serialize)]
+struct CommitDto {
+    worker: u64,
+    logical_mutations: Option<u64>,
+    physical_batches: Option<u64>,
+    barriers: Option<u64>,
+    bytes_durable: Option<u64>,
+    failed_batches: Option<u64>,
+    batch_size_avg: Option<f64>,
+    batch_size_max: Option<u64>,
+    batch_size_p50: Option<u64>,
+    batch_size_p95: Option<u64>,
+    batch_size_p99: Option<u64>,
+    oldest_wait_avg_us: Option<u64>,
+    oldest_wait_max_us: Option<u64>,
+    barrier_latency_avg_us: Option<u64>,
+    barrier_latency_max_us: Option<u64>,
+    queue_depth: Option<usize>,
+    queue_depth_max: Option<usize>,
+    in_flight: Option<bool>,
+}
+
+/// Checkpoints: installed current/previous per tablet plus WAL retention.
+#[derive(Debug, Clone, Serialize)]
+struct CheckpointsDto {
+    tablets: Vec<CheckpointTabletDto>,
+    wal_retained_bytes: u64,
+    wal_reclaimable_bytes: u64,
+    checkpoints_completed: u64,
+    last_error: Option<String>,
+}
+
+/// One retained checkpoint (current or previous) of one tablet.
+#[derive(Debug, Clone, Serialize)]
+struct CheckpointTabletDto {
+    tablet: u64,
+    which: &'static str,
+    cut: u64,
+    manifest: Option<String>,
+    created_wall_micros: u64,
+    bands: usize,
+    bands_reused: usize,
+    stored_bytes: u64,
+    duration_ms: u64,
+    fell_back: bool,
 }
 
 async fn health() -> Json<HealthDto> {
@@ -194,17 +250,30 @@ fn durability_mode(durability: Option<&kivi_engine::EngineDurability>) -> &'stat
     }
 }
 
+// One linear DTO assembly (lanes → commit → checkpoints): the fields
+// read top to bottom in response order; splitting would scatter the shape
+// of the admin contract.
+#[allow(clippy::too_many_lines)]
 async fn durability(State(state): State<AdminState>) -> Result<Json<DurabilityDto>, StatusCode> {
     let engine = state.engine.clone();
     // Lane stats arrive over the blocking control channel.
     let lanes = tokio::task::spawn_blocking(move || engine.lane_stats_snapshot())
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let engine = state.engine.clone();
+    let commit = tokio::task::spawn_blocking(move || engine.commit_metrics_snapshot())
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let by_worker: std::collections::HashMap<u64, kivi_durability::WorkerLaneStats> = lanes
         .into_iter()
         .filter_map(|(id, stats)| stats.map(|stats| (id.as_u64(), stats)))
         .collect();
+    let by_commit: std::collections::HashMap<u64, kivi_engine::CommitMetricsSnapshot> = commit
+        .into_iter()
+        .filter_map(|(id, stats)| stats.map(|stats| (id.as_u64(), stats)))
+        .collect();
     let mut out = Vec::new();
+    let mut commit_out = Vec::new();
     for index in 0..state.engine.worker_count() {
         let id = u64::try_from(index).unwrap_or(u64::MAX);
         match by_worker.get(&id) {
@@ -231,6 +300,72 @@ async fn durability(State(state): State<AdminState>) -> Result<Json<DurabilityDt
                 fsyncs: None,
             }),
         }
+        match by_commit.get(&id) {
+            Some(metrics) => commit_out.push(CommitDto {
+                worker: id,
+                logical_mutations: Some(metrics.logical_mutations),
+                physical_batches: Some(metrics.physical_batches),
+                barriers: Some(metrics.barriers),
+                bytes_durable: Some(metrics.bytes_durable),
+                failed_batches: Some(metrics.failed_batches),
+                batch_size_avg: Some(metrics.batch_size_avg),
+                batch_size_max: Some(metrics.batch_size_max),
+                batch_size_p50: Some(metrics.batch_size_p50),
+                batch_size_p95: Some(metrics.batch_size_p95),
+                batch_size_p99: Some(metrics.batch_size_p99),
+                oldest_wait_avg_us: Some(
+                    metrics
+                        .oldest_wait_avg
+                        .as_micros()
+                        .try_into()
+                        .unwrap_or(u64::MAX),
+                ),
+                oldest_wait_max_us: Some(
+                    metrics
+                        .oldest_wait_max
+                        .as_micros()
+                        .try_into()
+                        .unwrap_or(u64::MAX),
+                ),
+                barrier_latency_avg_us: Some(
+                    metrics
+                        .barrier_latency_avg
+                        .as_micros()
+                        .try_into()
+                        .unwrap_or(u64::MAX),
+                ),
+                barrier_latency_max_us: Some(
+                    metrics
+                        .barrier_latency_max
+                        .as_micros()
+                        .try_into()
+                        .unwrap_or(u64::MAX),
+                ),
+                queue_depth: Some(metrics.queue_depth),
+                queue_depth_max: Some(metrics.queue_depth_max),
+                in_flight: Some(metrics.in_flight),
+            }),
+            None => commit_out.push(CommitDto {
+                worker: id,
+                logical_mutations: None,
+                physical_batches: None,
+                barriers: None,
+                bytes_durable: None,
+                failed_batches: None,
+                batch_size_avg: None,
+                batch_size_max: None,
+                batch_size_p50: None,
+                batch_size_p95: None,
+                batch_size_p99: None,
+                oldest_wait_avg_us: None,
+                oldest_wait_max_us: None,
+                barrier_latency_avg_us: None,
+                barrier_latency_max_us: None,
+                queue_depth: None,
+                queue_depth_max: None,
+                in_flight: None,
+            }),
+        }
     }
     let info = state.engine.durability();
     Ok(Json(DurabilityDto {
@@ -240,11 +375,17 @@ async fn durability(State(state): State<AdminState>) -> Result<Json<DurabilityDt
         cluster: state.cluster.as_u128(),
         incarnation: state.incarnation.as_u64(),
         lanes: out,
+        commit: commit_out,
         recovery: info.map(|info| RecoveryDto {
             records_replayed: info.recovery.records_replayed,
             segments_scanned: info.recovery.segments_scanned,
             tail_truncated_bytes: info.recovery.tail_truncated_bytes,
             tablets_recovered: info.recovery.tablets_recovered,
+            checkpoint_tablets_loaded: info.checkpoint_recovery.tablets_loaded,
+            checkpoint_bands_verified: info.checkpoint_recovery.bands_verified,
+            checkpoint_bytes_restored: info.checkpoint_recovery.bytes_restored,
+            checkpoint_obsolete_skipped: info.checkpoint_recovery.obsolete_skipped,
+            checkpoint_fell_back: info.checkpoint_recovery.fell_back,
         }),
     }))
 }
@@ -291,6 +432,68 @@ async fn workers(State(state): State<AdminState>) -> Result<Json<Vec<WorkerDto>>
     Ok(Json(out))
 }
 
+/// Checkpoints: installed current/previous per tablet plus WAL retention.
+/// Pure status reads (locks a brief status mutex, never the data path).
+async fn checkpoints(State(state): State<AdminState>) -> Json<CheckpointsDto> {
+    let engine = state.engine.clone();
+    let snapshot = tokio::task::spawn_blocking(move || engine.checkpoint_state())
+        .await
+        .unwrap_or_default();
+    let mut tablets: Vec<CheckpointTabletDto> = Vec::new();
+    let mut ids: Vec<u64> = snapshot
+        .latest
+        .keys()
+        .chain(snapshot.previous.keys())
+        .map(|tablet| tablet.as_u64())
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    for id in ids {
+        let tablet = kivi_types::TabletId::from_u64(id);
+        if let Some(info) = snapshot.latest.get(&tablet) {
+            tablets.push(CheckpointTabletDto {
+                tablet: id,
+                which: "current",
+                cut: info.cut,
+                manifest: info
+                    .manifest
+                    .as_ref()
+                    .map(kivi_checkpoint::ArtifactHash::hex),
+                created_wall_micros: info.created_wall_micros,
+                bands: info.bands,
+                bands_reused: info.bands_reused,
+                stored_bytes: info.stored_bytes,
+                duration_ms: info.duration.as_millis().try_into().unwrap_or(u64::MAX),
+                fell_back: info.fell_back,
+            });
+        }
+        if let Some(info) = snapshot.previous.get(&tablet) {
+            tablets.push(CheckpointTabletDto {
+                tablet: id,
+                which: "previous",
+                cut: info.cut,
+                manifest: info
+                    .manifest
+                    .as_ref()
+                    .map(kivi_checkpoint::ArtifactHash::hex),
+                created_wall_micros: info.created_wall_micros,
+                bands: info.bands,
+                bands_reused: info.bands_reused,
+                stored_bytes: info.stored_bytes,
+                duration_ms: info.duration.as_millis().try_into().unwrap_or(u64::MAX),
+                fell_back: info.fell_back,
+            });
+        }
+    }
+    Json(CheckpointsDto {
+        tablets,
+        wal_retained_bytes: snapshot.wal_retained_bytes,
+        wal_reclaimable_bytes: snapshot.wal_reclaimable_bytes,
+        checkpoints_completed: snapshot.checkpoints_completed,
+        last_error: snapshot.last_error,
+    })
+}
+
 async fn tablets(State(state): State<AdminState>) -> Json<Vec<TabletDto>> {
     let routing = state.engine.routing();
     Json(
@@ -323,6 +526,7 @@ pub fn router(state: AdminState) -> axum::Router {
         .route("/v1/workers", get(workers))
         .route("/v1/tablets", get(tablets))
         .route("/v1/durability", get(durability))
+        .route("/v1/checkpoints", get(checkpoints))
         .layer(
             tower::ServiceBuilder::new()
                 .layer(TraceLayer::new_for_http())
@@ -381,6 +585,7 @@ mod tests {
             placement: Placement::new([(TabletId::from_u64(1), WorkerId::from_u64(0))]),
             worker_count: 2,
             request_capacity: 16,
+            chunks: kivi_engine::ChunkFabricConfig::default(),
             network: None,
             durability: DurabilityMode::Ephemeral,
         })

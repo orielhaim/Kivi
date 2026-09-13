@@ -43,6 +43,11 @@ pub const FRAME_HEADER_LEN: usize = 24;
 pub const DEFAULT_MAX_FRAME: usize = 64 * 1024 * 1024;
 
 /// Frame kinds. Fixed discriminants on the wire, never Rust layout.
+/// Kinds 7–14 are the chunk-fabric streaming flows: uploads move in
+/// `Stream*` frames keyed by a client-chosen stream id (the frame
+/// `request_id`), downloads in `ValueStream*` frames keyed by the
+/// originating request id. Both multiplex freely with ordinary requests
+/// on one connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FrameKind {
     /// Client handshake opener.
@@ -57,6 +62,23 @@ pub enum FrameKind {
     Ping = 5,
     /// Keepalive answer (empty payload).
     Pong = 6,
+    /// Open an upload: `StreamBegin` payload, `request_id` is the stream id.
+    StreamBegin = 7,
+    /// Upload accepted: `StreamReady` payload (`request_id` = stream id).
+    StreamReady = 8,
+    /// Upload bytes: raw payload (`request_id` = stream id).
+    StreamData = 9,
+    /// Commit an upload: `StreamCommit` payload (`request_id` = stream id).
+    /// Answered by an ordinary `Response` frame.
+    StreamCommit = 10,
+    /// Abort an upload, either direction (`StreamAbort` payload).
+    StreamAbort = 11,
+    /// A streamed read starts: `ValueStreamBegin` payload.
+    ValueStreamBegin = 12,
+    /// Streamed read bytes: raw payload, same `request_id` throughout.
+    ValueStreamData = 13,
+    /// Streamed read done: empty payload, same `request_id`.
+    ValueStreamEnd = 14,
 }
 
 impl FrameKind {
@@ -70,6 +92,14 @@ impl FrameKind {
             4 => Some(Self::Response),
             5 => Some(Self::Ping),
             6 => Some(Self::Pong),
+            7 => Some(Self::StreamBegin),
+            8 => Some(Self::StreamReady),
+            9 => Some(Self::StreamData),
+            10 => Some(Self::StreamCommit),
+            11 => Some(Self::StreamAbort),
+            12 => Some(Self::ValueStreamBegin),
+            13 => Some(Self::ValueStreamData),
+            14 => Some(Self::ValueStreamEnd),
             _ => None,
         }
     }
@@ -90,6 +120,14 @@ impl core::fmt::Display for FrameKind {
             Self::Response => write!(f, "response"),
             Self::Ping => write!(f, "ping"),
             Self::Pong => write!(f, "pong"),
+            Self::StreamBegin => write!(f, "stream-begin"),
+            Self::StreamReady => write!(f, "stream-ready"),
+            Self::StreamData => write!(f, "stream-data"),
+            Self::StreamCommit => write!(f, "stream-commit"),
+            Self::StreamAbort => write!(f, "stream-abort"),
+            Self::ValueStreamBegin => write!(f, "value-stream-begin"),
+            Self::ValueStreamData => write!(f, "value-stream-data"),
+            Self::ValueStreamEnd => write!(f, "value-stream-end"),
         }
     }
 }

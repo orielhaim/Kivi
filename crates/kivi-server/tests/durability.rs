@@ -1,16 +1,21 @@
 //! Crash-recoverable durability through real server processes.
 //!
 //! These spawn the actual `kivi-server` binary, `kill` it without any
-//! graceful shutdown (the honest crash), restart it on the same address
-//! with the same `--data-dir`, and prove acknowledged writes come back.
+//! graceful shutdown (the honest crash), restart it on the same `--data-dir`
+//! with fresh ports, and prove acknowledged writes come back.
 //! The lost-response half of exactly-once is covered deterministically:
 //! the same `(session, seq)` identity replayed — even after a kill and
 //! restart, even on a fresh connection — returns the original outcome
 //! without re-executing.
 
+use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use kivi_client::{ClientConfig, NativeClient};
@@ -20,22 +25,131 @@ use kivi_types::{NamespaceId, RequestIdentity, RequestSeq, SessionId};
 const NS: NamespaceId = NamespaceId::from_u64(1);
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Reserves a worker pair (`base`, `base+1`) plus an admin port, holding
-/// every probe until all three are known-free simultaneously. A lone
-/// `free_port` is not enough: worker 1 binds `base+1`, which a random
-/// free `base` says nothing about.
-fn reserve_ports() -> (u16, u16) {
-    for _ in 0..50 {
-        let base_probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe bind");
-        let base = base_probe.local_addr().expect("probe addr").port();
-        let second = std::net::TcpListener::bind(format!("127.0.0.1:{}", base.wrapping_add(1)));
-        let admin_probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe bind");
-        let admin = admin_probe.local_addr().expect("probe addr").port();
-        if second.is_ok() && admin != base && admin != base.wrapping_add(1) {
-            return (base, admin);
+/// Race-free process spawn: the server binds ephemeral ports (`--port 0`,
+/// `--admin 127.0.0.1:0`) and reports its actual endpoints on stdout
+/// (`KIVI_READY ...`). Tests connect to the reported addresses, so the old
+/// probe-then-bind window — where a parallel test could steal a "reserved"
+/// port between our probe and the server's bind — no longer exists.
+/// Restarts likewise take fresh ports: crash recovery never depends on
+/// socket addresses, only on the data directory.
+fn spawn_process(data_dir: &std::path::Path, extra: &[&str]) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_kivi-server"))
+        .arg("--data-dir")
+        .arg(data_dir)
+        .arg("--port")
+        .arg("0")
+        .arg("--admin")
+        .arg("127.0.0.1:0")
+        .arg("--workers")
+        .arg("2")
+        .arg("--tablets")
+        .arg("1")
+        .args(extra)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("server binary spawns")
+}
+
+/// What a spawned server did inside its startup window.
+enum SpawnOutcome {
+    /// `KIVI_READY` parsed: worker-0 port, then admin port.
+    Ready(u16, u16),
+    /// The process exited before reporting readiness.
+    Exited(std::process::ExitStatus),
+    /// Neither readiness nor exit inside the window (caller kills first).
+    TimedOut,
+}
+
+/// Parses `KIVI_READY workers=<a>,<b> admin=<c>`; returns worker-0 and
+/// admin ports. Anything else (tracing noise on the shared stdout) is
+/// skipped by the caller, never an error.
+fn parse_ready(line: &str) -> Option<(u16, u16)> {
+    let rest = line.strip_prefix("KIVI_READY")?.trim();
+    let mut workers: Option<&str> = None;
+    let mut admin: Option<&str> = None;
+    for token in rest.split_whitespace() {
+        if let Some(value) = token.strip_prefix("workers=") {
+            workers = Some(value);
+        }
+        if let Some(value) = token.strip_prefix("admin=") {
+            admin = Some(value);
         }
     }
-    panic!("could not reserve a free worker pair plus admin port");
+    let first = workers?.split(',').next()?;
+    let base = first.rsplit(':').next()?.parse::<u16>().ok()?;
+    let admin = admin?.rsplit(':').next()?.parse::<u16>().ok()?;
+    (base != 0 && admin != 0).then_some((base, admin))
+}
+
+/// Last lines of a dead child's stderr for failure diagnostics.
+fn stderr_tail(child: &mut Child) -> String {
+    let mut log = String::new();
+    if let Some(stderr) = child.stderr.as_mut() {
+        let _ = stderr.read_to_string(&mut log);
+    }
+    log.lines()
+        .rev()
+        .take(8)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Waits for `KIVI_READY` on the child's stdout, watching for early exit
+/// on a reader thread so a silent stall can never hang the harness past
+/// the deadline: the reader only produces lines, the loop owns the clock.
+fn wait_ready_or_exit(child: &mut Child, timeout: Duration) -> SpawnOutcome {
+    let stdout = child.stdout.take().expect("server stdout piped");
+    let (tx, rx) = std::sync::mpsc::channel::<Option<(u16, u16)>>();
+    std::thread::spawn(move || {
+        use std::io::BufRead as _;
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => {
+                    let _ = tx.send(None);
+                    break;
+                }
+                Ok(_) => {
+                    if let Some(ports) = parse_ready(&line) {
+                        let _ = tx.send(Some(ports));
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            return SpawnOutcome::Exited(status);
+        }
+        match rx.recv_timeout(Duration::from_millis(25)) {
+            Ok(found) => {
+                if let Some(ports) = found {
+                    return SpawnOutcome::Ready(ports.0, ports.1);
+                }
+                // EOF before readiness: the child is dying; loop once more
+                // to collect its exit status below.
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                if let Ok(Some(status)) = child.try_wait() {
+                    return SpawnOutcome::Exited(status);
+                }
+            }
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            return SpawnOutcome::TimedOut;
+        }
+    }
 }
 
 struct Server {
@@ -45,59 +159,35 @@ struct Server {
 }
 
 impl Server {
-    fn spawn(data_dir: &std::path::Path, base: u16, admin: u16) -> Self {
-        Self::spawn_with(data_dir, base, admin, &[])
-    }
-
-    fn spawn_with(data_dir: &std::path::Path, base: u16, admin: u16, extra: &[&str]) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_kivi-server"))
-            .arg("--data-dir")
-            .arg(data_dir)
-            .arg("--port")
-            .arg(base.to_string())
-            .arg("--admin")
-            .arg(format!("127.0.0.1:{admin}"))
-            .arg("--workers")
-            .arg("2")
-            .arg("--tablets")
-            .arg("1")
-            .args(extra)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("server binary spawns");
-        // Readiness = the worker listener accepts TCP. Recovery runs
-        // before any listener binds, so an accepted connection means the
-        // WAL was already replayed (or the startup failed loudly).
-        let deadline = Instant::now() + READY_TIMEOUT;
-        loop {
-            if TcpStream::connect(format!("127.0.0.1:{base}")).is_ok() {
-                break;
+    /// Spawns on ephemeral ports and returns once `KIVI_READY` arrives
+    /// (which the server prints after every listener binds, so recovery
+    /// already ran). An early exit panics with the stderr tail — startup
+    /// failure stays loud, never a silent hang.
+    fn spawn_auto(data_dir: &std::path::Path, extra: &[&str]) -> Self {
+        let mut child = spawn_process(data_dir, extra);
+        match wait_ready_or_exit(&mut child, READY_TIMEOUT) {
+            SpawnOutcome::Ready(base, admin) => {
+                // Belt-and-braces: a successful connect proves the worker
+                // listener serves, not just binds.
+                assert!(
+                    TcpStream::connect(format!("127.0.0.1:{base}")).is_ok(),
+                    "worker {base} accepts after ready"
+                );
+                Self { child, base, admin }
             }
-            if let Ok(Some(status)) = child.try_wait() {
-                let mut log = String::new();
-                if let Some(stderr) = child.stderr.as_mut() {
-                    let _ = stderr.read_to_string(&mut log);
-                }
-                let tail: String = log
-                    .lines()
-                    .rev()
-                    .take(8)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                panic!("server exited during startup: {status}\nstderr tail:\n{tail}");
+            SpawnOutcome::Exited(status) => {
+                panic!(
+                    "server exited during startup: {status}\nstderr tail:\n{}",
+                    stderr_tail(&mut child)
+                );
             }
-            if Instant::now() > deadline {
-                let _ = child.kill();
-                panic!("server not ready after {READY_TIMEOUT:?}");
+            SpawnOutcome::TimedOut => {
+                panic!(
+                    "server not ready after {READY_TIMEOUT:?}\nstderr tail:\n{}",
+                    stderr_tail(&mut child)
+                );
             }
-            std::thread::sleep(Duration::from_millis(25));
         }
-        Self { child, base, admin }
     }
 
     fn endpoint(&self) -> String {
@@ -151,6 +241,24 @@ impl Server {
     fn kill(mut self) {
         self.child.kill().expect("kill succeeds");
         let _ = self.child.wait();
+    }
+
+    /// Extracts the first JSON number following `"key":` (admin DTOs are
+    /// tiny and machine-shaped; a full JSON parser is not warranted).
+    fn admin_number(&self, path: &str, key: &str) -> u64 {
+        let (status, body) = self.admin_get(path);
+        assert_eq!(status, 200, "GET {path}");
+        let needle = format!("\"{key}\":");
+        let start = body
+            .find(&needle)
+            .unwrap_or_else(|| panic!("{key} present in {path}: {body}"))
+            + needle.len();
+        body[start..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse()
+            .unwrap_or_else(|_| panic!("{key} numeric in {path}: {body}"))
     }
 }
 
@@ -238,6 +346,7 @@ impl RawDurable {
             value: None,
             delta: 1,
             expiry: 0,
+            offset: 0,
             identity: Some(RequestIdentity::new(session, RequestSeq::from_u64(seq))),
             ack_floor: RequestSeq::from_u64(ack),
         };
@@ -257,6 +366,79 @@ impl RawDurable {
     }
 }
 
+/// Raw streaming-upload driver: begin → data frames → commit. Mirrors
+/// exactly what `NativeClient::put_stream` sends, with a caller-chosen
+/// identity for replay tests.
+fn raw_upload_begin(
+    raw: &mut RawDurable,
+    stream: u64,
+    session: SessionId,
+    seq: u64,
+    key: &str,
+    total: Option<u64>,
+) -> u32 {
+    use kivi_protocol::{FrameKind, StreamBegin, StreamReady};
+    let begin = StreamBegin {
+        namespace: NS,
+        key: key.as_bytes().to_vec(),
+        total_len: total,
+        identity: Some(RequestIdentity::new(session, RequestSeq::from_u64(seq))),
+        ack_floor: RequestSeq::from_u64(0),
+    };
+    raw.socket
+        .write_all(&kivi_protocol::encode_frame(
+            FrameKind::StreamBegin,
+            stream,
+            &begin.encode(),
+        ))
+        .expect("begin");
+    let frame = read_frame(&mut raw.socket, &mut raw.reader).expect("ready");
+    assert_eq!(frame.kind, FrameKind::StreamReady);
+    assert_eq!(frame.request_id, stream);
+    StreamReady::decode(&frame.payload)
+        .expect("ready decodes")
+        .max_data
+}
+
+fn raw_upload_data(raw: &mut RawDurable, stream: u64, bytes: &[u8]) {
+    raw.socket
+        .write_all(&kivi_protocol::encode_frame(
+            kivi_protocol::FrameKind::StreamData,
+            stream,
+            bytes,
+        ))
+        .expect("data");
+}
+
+fn raw_upload_commit(raw: &mut RawDurable, stream: u64) -> kivi_protocol::Response {
+    raw.socket
+        .write_all(&kivi_protocol::encode_frame(
+            kivi_protocol::FrameKind::StreamCommit,
+            stream,
+            &[],
+        ))
+        .expect("commit");
+    let frame = read_frame(&mut raw.socket, &mut raw.reader).expect("commit response");
+    assert_eq!(frame.kind, kivi_protocol::FrameKind::Response);
+    assert_eq!(frame.request_id, stream);
+    kivi_protocol::Response::decode(&frame.payload)
+        .expect("response decodes")
+        .0
+}
+
+fn stored_version(response: &kivi_protocol::Response) -> u64 {
+    assert_eq!(
+        response.status,
+        kivi_protocol::Status::Ok,
+        "expected Ok, got {:?}",
+        response.status
+    );
+    match &response.body {
+        kivi_protocol::ResponseBody::Stored { version } => *version,
+        other => panic!("expected stored outcome, got {other:?}"),
+    }
+}
+
 fn counter_value(response: &kivi_protocol::Response) -> i64 {
     assert_eq!(
         response.status,
@@ -270,11 +452,185 @@ fn counter_value(response: &kivi_protocol::Response) -> i64 {
     }
 }
 
+/// Deterministic pseudo-random bytes for stream bodies (small helper;
+/// the engine-side pattern generator is not reachable from this crate).
+fn stream_bytes(len: usize, seed: u64) -> Vec<u8> {
+    let mut state = seed;
+    let mut out = Vec::with_capacity(len);
+    while out.len() < len {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        out.extend_from_slice(&z.to_le_bytes());
+    }
+    out.truncate(len);
+    out
+}
+
+#[test]
+fn streamed_upload_replay_after_kill_returns_original_without_reexecuting() {
+    let scratch = tempfile::tempdir().expect("scratch");
+    let server = Server::spawn_auto(scratch.path(), &[]);
+    let endpoint = server.endpoint();
+    // Fixed identity across three commits of the same bytes: the "lost
+    // responses". Every replay must dedup-hit the first commit's version,
+    // never store twice.
+    let session = SessionId::from_u128(0x0057_EA11);
+    let body = stream_bytes(1_500_000, 0xCAFE);
+    let commit_once = |raw: &mut RawDurable, stream: u64| {
+        let max_data = raw_upload_begin(raw, stream, session, 1, "money", Some(body.len() as u64));
+        for piece in body.chunks(max_data as usize) {
+            raw_upload_data(raw, stream, piece);
+        }
+        raw_upload_commit(raw, stream)
+    };
+    let mut raw = RawDurable::connect(&endpoint);
+    let first = commit_once(&mut raw, 100);
+    let version = stored_version(&first);
+    // Same identity on the live server: dedup hit, same version.
+    let replay = commit_once(&mut raw, 101);
+    assert_eq!(stored_version(&replay), version, "live replay dedups");
+    drop(raw);
+    server.kill();
+    // After the crash the dedup memory is gone — but the WAL remembers
+    // the small root, so the replay still dedups instead of storing anew.
+    let server = Server::spawn_auto(scratch.path(), &[]);
+    let mut raw = RawDurable::connect(&server.endpoint());
+    let after_crash = commit_once(&mut raw, 102);
+    assert_eq!(
+        stored_version(&after_crash),
+        version,
+        "replayed stream identity must not re-execute after recovery"
+    );
+    drop(raw);
+    // And the bytes are the committed ones, exactly once.
+    let client = server.client();
+    assert_eq!(
+        client.get(&Key::from("money")).expect("get"),
+        Some(bytes::Bytes::from(body))
+    );
+}
+
+#[test]
+fn kill_mid_upload_leaves_no_root_and_recovers_cleanly() {
+    let scratch = tempfile::tempdir().expect("scratch");
+    let server = Server::spawn_auto(scratch.path(), &[]);
+    let endpoint = server.endpoint();
+    let session = SessionId::from_u128(0x00DE_C0DE);
+    let mut raw = RawDurable::connect(&endpoint);
+    // Begin plus two data frames, then the honest crash — no commit, so
+    // nothing may become visible, and staged-but-uncommitted packs must
+    // not wedge recovery.
+    let max_data = raw_upload_begin(&mut raw, 50, session, 1, "half", Some(1_500_000));
+    let body = stream_bytes(1_500_000, 0x8A1F);
+    for piece in body.chunks(max_data as usize).take(2) {
+        raw_upload_data(&mut raw, 50, piece);
+    }
+    drop(raw);
+    server.kill();
+    let server = Server::spawn_auto(scratch.path(), &[]);
+    let client = server.client();
+    assert_eq!(client.get(&Key::from("half")).expect("get"), None);
+    // The log continues past the orphaned stage: new writes land fine.
+    client
+        .set(&Key::from("after"), bytes::Bytes::from_static(b"yes"))
+        .expect("set");
+    assert_eq!(
+        client.get(&Key::from("after")).expect("get"),
+        Some(bytes::Bytes::from_static(b"yes"))
+    );
+}
+
+/// Uploads one body, retrying load-induced stalls (timeout/overload)
+/// with a fresh source. Retries are commit-safe: a stalled first attempt
+/// either never committed (plain retry) or did (same bytes → identical
+/// root either way, so the retry converges rather than corrupts). Only
+/// terminal errors fail the test — the point here is atomicity under
+/// concurrency, not liveness under parallel-suite fsync storms.
+fn put_stream_sturdy(
+    client: &NativeClient,
+    key: &Key,
+    body: &[u8],
+    attempts: u32,
+) -> Result<(), kivi_client::ClientError> {
+    use kivi_client::ClientError;
+    let mut last = ClientError::Timeout;
+    for _ in 0..attempts.max(1) {
+        let mut source = std::io::Cursor::new(body.to_vec());
+        match client.put_stream(key, Some(body.len() as u64), &mut source) {
+            Ok(()) => return Ok(()),
+            Err(ClientError::Timeout | ClientError::Overloaded) => {
+                last = ClientError::Timeout;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last)
+}
+
+#[test]
+fn concurrent_same_key_uploads_never_tear() {
+    use std::sync::Barrier;
+    let scratch = tempfile::tempdir().expect("scratch");
+    let server = Server::spawn_auto(scratch.path(), &[]);
+    let endpoint = server.endpoint();
+    let bodies = [
+        stream_bytes(1_200_000, 0xA11CE),
+        stream_bytes(2_300_000, 0xB0B),
+    ];
+    let start = Arc::new(Barrier::new(3));
+    let errors = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut handles = Vec::new();
+    for body in bodies.clone() {
+        let start = Arc::clone(&start);
+        let errors = Arc::clone(&errors);
+        let endpoint = endpoint.clone();
+        handles.push(std::thread::spawn(move || {
+            let client = NativeClient::new(ClientConfig {
+                seeds: vec![endpoint],
+                namespace: NS,
+                ..ClientConfig::default()
+            })
+            .expect("client builds");
+            start.wait();
+            if let Err(error) = put_stream_sturdy(&client, &Key::from("race"), &body, 3) {
+                errors
+                    .lock()
+                    .expect("errors lock")
+                    .push(format!("{error:?}"));
+            }
+        }));
+    }
+    start.wait();
+    for handle in handles {
+        handle.join().expect("uploader joins");
+    }
+    assert!(
+        errors.lock().expect("errors lock").is_empty(),
+        "both uploads commit cleanly: {:?}",
+        errors.lock().expect("errors lock")
+    );
+    // Last-writer-wins, never torn: the stored value is exactly one of
+    // the two uploads — full length, full bytes, no interleave.
+    let client = server.client();
+    let stored = client
+        .get(&Key::from("race"))
+        .expect("get")
+        .expect("present");
+    let options: Vec<bytes::Bytes> = bodies.into_iter().map(bytes::Bytes::from).collect();
+    assert!(
+        options.contains(&stored),
+        "stored value is atomic: {} bytes, matching neither upload",
+        stored.len()
+    );
+}
+
 #[test]
 fn kill_restart_recovers_acknowledged_writes() {
     let scratch = tempfile::tempdir().expect("scratch");
-    let (base, admin) = reserve_ports();
-    let server = Server::spawn(scratch.path(), base, admin);
+    let server = Server::spawn_auto(scratch.path(), &[]);
     let client = server.client();
     client
         .set(&Key::from("hello"), bytes::Bytes::from_static(b"world"))
@@ -287,9 +643,9 @@ fn kill_restart_recovers_acknowledged_writes() {
     );
     drop(client);
     server.kill();
-    // Same address, same data directory, fresh admin port.
-    let (_, admin) = reserve_ports();
-    let server = Server::spawn(scratch.path(), base, admin);
+    // Same data directory, fresh ports: recovery keys off the directory,
+    // never the socket addresses.
+    let server = Server::spawn_auto(scratch.path(), &[]);
     let client = server.client();
     assert_eq!(
         client.get(&Key::from("hello")).expect("get"),
@@ -304,8 +660,7 @@ fn kill_restart_recovers_acknowledged_writes() {
 fn replay_after_kill_returns_original_without_reexecuting() {
     use kivi_protocol::Status;
     let scratch = tempfile::tempdir().expect("scratch");
-    let (base, admin) = reserve_ports();
-    let server = Server::spawn(scratch.path(), base, admin);
+    let server = Server::spawn_auto(scratch.path(), &[]);
     let endpoint = server.endpoint();
     // Fixed identity: this is the "lost response" — the client sent
     // (session, seq=1), the reply never arrived, and the retry carries
@@ -321,8 +676,7 @@ fn replay_after_kill_returns_original_without_reexecuting() {
     drop(raw);
     server.kill();
     // After the crash the dedup memory is gone — but the WAL remembers.
-    let (_, admin) = reserve_ports();
-    let server = Server::spawn(scratch.path(), base, admin);
+    let server = Server::spawn_auto(scratch.path(), &[]);
     let mut raw = RawDurable::connect(&server.endpoint());
     let after_crash = raw.counter_add(3, session, 1, 0, "exact");
     assert_eq!(after_crash.status, Status::Ok);
@@ -339,30 +693,15 @@ fn replay_after_kill_returns_original_without_reexecuting() {
 #[test]
 fn second_process_is_refused_while_first_holds_the_lock() {
     let scratch = tempfile::tempdir().expect("scratch");
-    let (live_base, live_admin) = reserve_ports();
-    let server = Server::spawn(scratch.path(), live_base, live_admin);
+    let server = Server::spawn_auto(scratch.path(), &[]);
     // A second process on the same directory must fail fast, never
-    // interleave WAL writes with the live owner.
-    let (probe_base, probe_admin) = reserve_ports();
-    let probe = Command::new(env!("CARGO_BIN_EXE_kivi-server"))
-        .arg("--data-dir")
-        .arg(scratch.path())
-        .arg("--port")
-        .arg(probe_base.to_string())
-        .arg("--admin")
-        .arg(format!("127.0.0.1:{probe_admin}"))
-        .arg("--workers")
-        .arg("2")
-        .arg("--tablets")
-        .arg("1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("second process spawns");
-    let output = probe.wait_with_output().expect("probe exits");
+    // interleave WAL writes with the live owner. It takes ephemeral ports
+    // too: only the data-directory lock is under test, so no address can
+    // collide with anything.
+    let mut probe = spawn_process(scratch.path(), &[]);
+    let status = probe.wait().expect("probe exits");
     assert!(
-        !output.status.success(),
+        !status.success(),
         "second owner of a live data directory must fail"
     );
     drop(server);
@@ -371,8 +710,7 @@ fn second_process_is_refused_while_first_holds_the_lock() {
 #[test]
 fn admin_durability_reports_mode_identity_and_recovery() {
     let scratch = tempfile::tempdir().expect("scratch");
-    let (base, admin) = reserve_ports();
-    let server = Server::spawn(scratch.path(), base, admin);
+    let server = Server::spawn_auto(scratch.path(), &[]);
     let client = server.client();
     for index in 0..3u32 {
         client
@@ -394,8 +732,7 @@ fn admin_durability_reports_mode_identity_and_recovery() {
     );
     drop(client);
     server.kill();
-    let (_, admin) = reserve_ports();
-    let server = Server::spawn(scratch.path(), base, admin);
+    let server = Server::spawn_auto(scratch.path(), &[]);
     let (status, second) = server.admin_get("/v1/durability");
     assert_eq!(status, 200);
     assert!(
@@ -417,14 +754,8 @@ fn admin_durability_reports_mode_identity_and_recovery() {
 #[test]
 fn segment_rotation_recovers_across_many_segments() {
     let scratch = tempfile::tempdir().expect("scratch");
-    let (base, admin) = reserve_ports();
     // 4 KiB segments: a few hundred small writes must rotate repeatedly.
-    let server = Server::spawn_with(
-        scratch.path(),
-        base,
-        admin,
-        &["--wal-segment-target", "4096"],
-    );
+    let server = Server::spawn_auto(scratch.path(), &["--wal-segment-target", "4096"]);
     let client = server.client();
     let value = bytes::Bytes::from(vec![b'x'; 97]);
     for index in 0..300u32 {
@@ -440,8 +771,7 @@ fn segment_rotation_recovers_across_many_segments() {
         segments.len()
     );
     server.kill();
-    let (_, admin) = reserve_ports();
-    let server = Server::spawn(scratch.path(), base, admin);
+    let server = Server::spawn_auto(scratch.path(), &[]);
     let client = server.client();
     for index in [0u32, 1, 149, 150, 298, 299] {
         assert_eq!(
@@ -471,4 +801,858 @@ fn walkdir_wal(dir: &std::path::Path) -> impl Iterator<Item = std::path::PathBuf
         }
     }
     found.into_iter()
+}
+
+/// Waits until the server reports at least `count` completed checkpoints.
+fn await_checkpoints(server: &Server, count: u64) {
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let completed = server.admin_number("/v1/checkpoints", "checkpoints_completed");
+        if completed >= count {
+            return;
+        }
+        assert!(
+            Instant::now() <= deadline,
+            "only {completed} checkpoints after 90s, wanted {count}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Lists WAL segment files across all lanes of a data directory.
+fn wal_segments(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    walkdir_wal(dir).collect()
+}
+
+#[test]
+fn group_commit_batches_hot_writes_with_one_barrier() {
+    let scratch = tempfile::tempdir().expect("scratch");
+    // No automatic checkpoints: this measures the commit pipeline alone.
+    let server = Server::spawn_auto(scratch.path(), &["--no-checkpoint"]);
+    let endpoint = server.endpoint();
+    // Eight clients hammer one hot counter: every add is ordered behind
+    // the last on its tablet, so sustained load must batch them.
+    let threads: Vec<_> = (0..8u32)
+        .map(|_| {
+            let endpoint = endpoint.clone();
+            std::thread::spawn(move || {
+                let client = NativeClient::new(ClientConfig {
+                    seeds: vec![endpoint],
+                    namespace: NS,
+                    ..ClientConfig::default()
+                })
+                .expect("client builds");
+                for _ in 0..200 {
+                    client
+                        .counter_add(&Key::from("hot"), 1)
+                        .expect("counter add");
+                }
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().expect("client thread");
+    }
+    // Exact under batching: 8 × 200 ordered adds, none lost, none doubled.
+    let client = server.client();
+    assert_eq!(
+        client.counter_get(&Key::from("hot")).expect("read"),
+        Some(1600)
+    );
+    // ...while one barrier acknowledges many mutations.
+    let logical = server.admin_number("/v1/durability", "logical_mutations");
+    let batches = server.admin_number("/v1/durability", "physical_batches");
+    let barriers = server.admin_number("/v1/durability", "barriers");
+    let (_, durability_body) = server.admin_get("/v1/durability");
+    assert_eq!(logical, 1600, "every add committed");
+    assert!(batches < logical, "batches {batches} < mutations {logical}");
+    assert_eq!(barriers, batches, "one barrier per batch today");
+    // Admin counters are exact u64; the ratio is a human-readable test
+    // assertion (values here are in the thousands — nowhere near 2^53).
+    #[allow(clippy::cast_precision_loss)]
+    let per_fsync = logical as f64 / barriers as f64;
+    // Immediate mode pins this at exactly 1.0 (one barrier per mutation
+    // by construction); group commit under overlap measures ~4+. The
+    // threshold sits between at 1.5: a starved scheduler still overlaps
+    // pairs (worst observed: 2.0), while anything at 1.0 proves batching
+    // regressed to immediate behavior. Exactness rides on the structural
+    // asserts above, not this ratio.
+    assert!(
+        per_fsync > 1.5,
+        "mutations/fsync above immediate's 1.0, got {per_fsync:.1} ({logical}/{barriers}): {durability_body}"
+    );
+}
+
+#[test]
+fn checkpoint_dedup_money_test_retry_after_reclaim_returns_original() {
+    use kivi_protocol::Status;
+    let scratch = tempfile::tempdir().expect("scratch");
+    // Tiny segments (rotation) plus eager checkpoints (mutations): two
+    // checkpoints install current + previous, and reclamation runs.
+    let server = Server::spawn_auto(
+        scratch.path(),
+        &[
+            "--wal-segment-target",
+            "4096",
+            "--checkpoint-mutations",
+            "5",
+        ],
+    );
+    let endpoint = server.endpoint();
+    // The lost reply: (session S, seq 1) applies; the client never sees
+    // the response and will retry the same bytes after the crash.
+    let session = SessionId::from_u128(0xD0_DED);
+    let mut raw = RawDurable::connect(&endpoint);
+    let first = raw.counter_add(1, session, 1, 0, "exact");
+    assert_eq!(counter_value(&first), 1);
+    drop(raw);
+    // Advance the log in two phases with a checkpoint between them, so
+    // two checkpoints install (current + previous) and reclamation has a
+    // verified floor. Big pads force several segments so the earliest
+    // one must actually go away.
+    let client = server.client();
+    for index in 0..10u32 {
+        client
+            .set(
+                &Key::from(format!("pad:{index}")),
+                bytes::Bytes::from(vec![b'p'; 512]),
+            )
+            .expect("set");
+    }
+    await_checkpoints(&server, 1);
+    for index in 10..30u32 {
+        client
+            .set(
+                &Key::from(format!("pad:{index}")),
+                bytes::Bytes::from(vec![b'p'; 512]),
+            )
+            .expect("set");
+    }
+    await_checkpoints(&server, 2);
+    let floor_deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if scratch
+            .path()
+            .join("checkpoints")
+            .join("WAL_FLOOR")
+            .exists()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() <= floor_deadline,
+            "reclaim never published a WAL floor"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // The segment that held seq 1 is sealed history far below the floor:
+    // it must be reclaimed (deleted), proving the retry below is answered
+    // from checkpointed dedup state rather than the original WAL.
+    let first_segment = scratch
+        .path()
+        .join("wal")
+        .join("lane-0000")
+        .join("00000000000000000001.wal");
+    assert!(
+        !first_segment.exists(),
+        "seq 1's original segment must be reclaimed before the kill"
+    );
+    drop(client);
+    drop(endpoint);
+    server.kill();
+    // Restart, then retry the SAME identity on a fresh connection: the
+    // checkpointed dedup state must answer without re-executing, even
+    // though the original WAL is long reclaimed.
+    let server = Server::spawn_auto(scratch.path(), &[]);
+    let mut raw = RawDurable::connect(&server.endpoint());
+    let replay = raw.counter_add(10, session, 1, 0, "exact");
+    assert_eq!(replay.status, Status::Ok);
+    assert_eq!(
+        counter_value(&replay),
+        1,
+        "replayed identity must not re-execute after WAL reclamation"
+    );
+    let next = raw.counter_add(11, session, 2, 1, "exact");
+    assert_eq!(counter_value(&next), 2, "window continues past the replay");
+}
+
+#[test]
+fn wal_reclamation_removes_old_segments_and_survives_kill() {
+    let scratch = tempfile::tempdir().expect("scratch");
+    let server = Server::spawn_auto(
+        scratch.path(),
+        &[
+            "--wal-segment-target",
+            "4096",
+            "--checkpoint-mutations",
+            "60",
+        ],
+    );
+    let client = server.client();
+    // Phase sizes vs ~190B records and 4KiB segments (~21 records each):
+    // phase 1 fills ~3 segments, checkpoint 1 covers the first two fully.
+    for index in 0..60u32 {
+        client
+            .set(
+                &Key::from(format!("reclaim:{index:03}")),
+                bytes::Bytes::from(vec![b'x'; 64]),
+            )
+            .expect("set");
+    }
+    await_checkpoints(&server, 1);
+    // Snapshot the pre-reclaim layout now: the second checkpoint installs
+    // a previous, which lets reclamation delete fully covered sealed
+    // segments (it cannot run before two checkpoints exist).
+    let before: Vec<_> = wal_segments(scratch.path());
+    assert!(
+        before.len() >= 3,
+        "phase 1 should span segments, found {before:?}"
+    );
+    for index in 60..120u32 {
+        client
+            .set(
+                &Key::from(format!("reclaim:{index:03}")),
+                bytes::Bytes::from(vec![b'x'; 64]),
+            )
+            .expect("set");
+    }
+    await_checkpoints(&server, 2);
+    // The floor promise (previous cut) covers the early sealed segments:
+    // some pre-checkpoint file must be gone (counts can stay level as
+    // deletions and new segments offset), while the active tail remains.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let now = wal_segments(scratch.path());
+        if before.iter().any(|old| !now.contains(old)) {
+            break;
+        }
+        if Instant::now() > deadline {
+            let (_, checkpoints) = server.admin_get("/v1/checkpoints");
+            let floor = scratch.path().join("checkpoints").join("WAL_FLOOR");
+            panic!(
+                "reclaim deleted nothing:\nbefore: {before:?}\nafter: {now:?}\ncheckpoints: {checkpoints}\nWAL_FLOOR present: {}",
+                floor.exists(),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        !wal_segments(scratch.path()).is_empty(),
+        "the active tail always remains"
+    );
+    drop(client);
+    // Kill mid-steady-state (possibly mid-reclaim: deletes are
+    // idempotent) and restart: everything acknowledged comes back.
+    server.kill();
+    let server = Server::spawn_auto(scratch.path(), &[]);
+    let client = server.client();
+    for index in 0..120u32 {
+        assert_eq!(
+            client
+                .get(&Key::from(format!("reclaim:{index:03}")))
+                .expect("get"),
+            Some(bytes::Bytes::from(vec![b'x'; 64])),
+            "key survives reclaim plus kill"
+        );
+    }
+}
+
+#[test]
+fn incremental_checkpoint_reuses_clean_bands() {
+    let scratch = tempfile::tempdir().expect("scratch");
+    // Phase 1 with checkpoints off: 200 writes, then kill. Restart with
+    // an eager threshold so exactly one checkpoint covers all of them.
+    let server = Server::spawn_auto(scratch.path(), &["--no-checkpoint"]);
+    let client = server.client();
+    for index in 0..200u32 {
+        client
+            .set(
+                &Key::from(format!("inc:{index:03}")),
+                bytes::Bytes::from_static(b"v"),
+            )
+            .expect("set");
+    }
+    drop(client);
+    server.kill();
+    let server = Server::spawn_auto(scratch.path(), &["--checkpoint-mutations", "5"]);
+    await_checkpoints(&server, 1);
+    let reused_first = server.admin_number("/v1/checkpoints", "bands_reused");
+    assert_eq!(reused_first, 0, "first checkpoint builds everything");
+    // Phase 2: overwrite 60 keys that all live in one band.
+    let band = band_of_key(&Key::from("reband:000000"));
+    let fresh = keys_in_band(band, 60, "reband2");
+    let client = server.client();
+    for key in &fresh {
+        client
+            .set(key, bytes::Bytes::from_static(b"v2"))
+            .expect("set");
+    }
+    drop(client);
+    await_checkpoints(&server, 2);
+    let (status, body) = server.admin_get("/v1/checkpoints");
+    assert_eq!(status, 200);
+    let reused = server.admin_number("/v1/checkpoints", "bands_reused");
+    assert_eq!(reused, 255, "exactly one band changed, got body: {body}");
+    // Phase 3: delete every phase-1 key in the smallest-occupied band
+    // (plus same-band pad writes to trip the threshold), then prove the
+    // deleted keys do not resurrect after restart.
+    let occupancy = band_occupancy(&server);
+    let (victim_band, victim_keys) = occupancy
+        .into_iter()
+        .min_by_key(|(_, keys)| keys.len())
+        .expect("occupied bands exist");
+    let mut phase3 = victim_keys;
+    let mut pad = keys_in_band(victim_band, 8, "reband3");
+    phase3.append(&mut pad);
+    let client = server.client();
+    for key in &phase3[..phase3.len().min(8)] {
+        if key.as_bytes().starts_with(b"inc:") {
+            client.delete(key).expect("delete");
+        } else {
+            client
+                .set(key, bytes::Bytes::from_static(b"v3"))
+                .expect("set");
+        }
+    }
+    // Ensure at least 5 mutations tripped the threshold even if the
+    // victim band held fewer keys.
+    for key in keys_in_band(victim_band, 5, "reband4") {
+        client
+            .set(&key, bytes::Bytes::from_static(b"v3"))
+            .expect("set");
+    }
+    drop(client);
+    await_checkpoints(&server, 3);
+    server.kill();
+    let server = Server::spawn_auto(scratch.path(), &[]);
+    let client = server.client();
+    for key in &phase3 {
+        if key.as_bytes().starts_with(b"inc:") {
+            assert_eq!(
+                client.get(key).expect("get"),
+                None,
+                "deleted key {key:?} must not resurrect"
+            );
+        }
+    }
+    // A survivor outside the victim band is intact.
+    let survivor = (0..200u32)
+        .map(|index| Key::from(format!("inc:{index:03}")))
+        .find(|key| band_of_key(key) != victim_band)
+        .expect("a survivor exists");
+    assert_eq!(
+        client.get(&survivor).expect("get"),
+        Some(bytes::Bytes::from_static(b"v")),
+        "untouched keys survive"
+    );
+}
+
+/// Band of one key under the server's namespace and layout.
+fn band_of_key(key: &Key) -> u16 {
+    kivi_checkpoint::BandLayout::V1
+        .band_of(NS, key.as_bytes())
+        .expect("mappable")
+}
+
+/// Finds `count` fresh keys that all map to `band`.
+fn keys_in_band(band: u16, count: usize, prefix: &str) -> Vec<Key> {
+    let mut keys = Vec::new();
+    for index in 0..1_000_000u32 {
+        let key = Key::from(format!("{prefix}:{index:06}"));
+        if band_of_key(&key) == band {
+            keys.push(key);
+            if keys.len() >= count {
+                return keys;
+            }
+        }
+    }
+    panic!("could not find {count} keys in band {band}");
+}
+
+/// Groups phase-1 keys (`inc:*`) by band (read back through the client).
+fn band_occupancy(server: &Server) -> Vec<(u16, Vec<Key>)> {
+    use std::collections::HashMap;
+    let client = server.client();
+    let mut groups: HashMap<u16, Vec<Key>> = HashMap::new();
+    for index in 0..200u32 {
+        let key = Key::from(format!("inc:{index:03}"));
+        // All phase-1 keys exist (written before the kill, checkpointed).
+        assert!(
+            client.get(&key).expect("get").is_some(),
+            "phase-1 key present"
+        );
+        groups.entry(band_of_key(&key)).or_default().push(key);
+    }
+    groups.into_iter().collect()
+}
+
+/// One pre-kill mutation attempt with its explicit identity: everything
+/// needed to retry it verbatim after a crash. Each attempt owns a
+/// single-use session (one client per mutation below), so no session
+/// floor can advance past it before the kill — a retry is always a
+/// dedup hit (applied before the kill) or a first execution (never
+/// sent), never an expiry.
+enum Ambiguous {
+    Set {
+        session: SessionId,
+        key: Key,
+        value: bytes::Bytes,
+    },
+    Add {
+        session: SessionId,
+        key: Key,
+        delta: i64,
+    },
+}
+
+/// A client resuming a pre-kill session: retries speak as the original
+/// session, so the server answers from the retained outcome instead of
+/// executing twice.
+fn resume_client(endpoint: &str, session: SessionId) -> NativeClient {
+    NativeClient::new(ClientConfig {
+        seeds: vec![endpoint.to_owned()],
+        namespace: NS,
+        session: Some(session),
+        ..ClientConfig::default()
+    })
+    .expect("resume client builds")
+}
+
+/// Retries every ambiguous identity verbatim (fresh resume client per
+/// attempt: completing an attempt advances that client's floor, so a
+/// second attempt on the same object would self-expire). Each identity
+/// applies exactly once across kill + resume — hit when the first
+/// attempt applied, first execution otherwise — and a repeat retry must
+/// return the identical outcome, proving the record is stable rather
+/// than re-executed.
+fn retry_ambiguous(endpoint: &str, ambiguous: &[Ambiguous]) {
+    for op in ambiguous {
+        match op {
+            Ambiguous::Set {
+                session,
+                key,
+                value,
+            } => {
+                resume_client(endpoint, *session)
+                    .set_with_seq(key, value.clone(), RequestSeq::from_u64(1))
+                    .expect("ambiguous set resolves");
+                resume_client(endpoint, *session)
+                    .set_with_seq(key, value.clone(), RequestSeq::from_u64(1))
+                    .expect("ambiguous set stable on re-retry");
+            }
+            Ambiguous::Add {
+                session,
+                key,
+                delta,
+            } => {
+                let first = resume_client(endpoint, *session)
+                    .counter_add_with_seq(key, *delta, RequestSeq::from_u64(1))
+                    .expect("ambiguous add resolves");
+                let second = resume_client(endpoint, *session)
+                    .counter_add_with_seq(key, *delta, RequestSeq::from_u64(1))
+                    .expect("ambiguous add stable on re-retry");
+                assert_eq!(
+                    second, first,
+                    "re-retry is a stable dedup hit ({first}), not a re-execution"
+                );
+            }
+        }
+    }
+}
+
+/// One hammer thread's outcome: acknowledged sets/adds plus every
+/// unacknowledged attempt with its retryable identity.
+struct HammerOutcome {
+    sets: Vec<(Key, bytes::Bytes)>,
+    adds: u64,
+    ambiguous: Vec<Ambiguous>,
+    acked_sessions: HashSet<SessionId>,
+    ambiguous_sessions: HashSet<SessionId>,
+}
+
+/// Hammers one key range with per-attempt sessions: a set plus a shared
+/// hot-counter add per index, each on its own client (own session) with
+/// explicit sequence 1. Stops promptly once `stop` is set.
+fn hammer(endpoint: &str, stop: &AtomicBool, thread: u32) -> HammerOutcome {
+    let one = || {
+        NativeClient::new(ClientConfig {
+            seeds: vec![endpoint.to_owned()],
+            namespace: NS,
+            connect_timeout: Duration::from_millis(300),
+            dial_attempts: 1,
+            ..ClientConfig::default()
+        })
+        .expect("client builds")
+    };
+    let mut outcome = HammerOutcome {
+        sets: Vec::new(),
+        adds: 0,
+        ambiguous: Vec::new(),
+        acked_sessions: HashSet::new(),
+        ambiguous_sessions: HashSet::new(),
+    };
+    for index in 0..250u32 {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let key = Key::from(format!("am:{thread}:{index:03}"));
+        let value = bytes::Bytes::from(format!("{thread}-{index}"));
+        let set_client = one();
+        let set_session = set_client.session();
+        if set_client
+            .set_with_seq(&key, value.clone(), RequestSeq::from_u64(1))
+            .is_ok()
+        {
+            outcome.sets.push((key, value));
+            assert!(
+                outcome.acked_sessions.insert(set_session),
+                "one session per attempt"
+            );
+        } else {
+            outcome.ambiguous.push(Ambiguous::Set {
+                session: set_session,
+                key,
+                value,
+            });
+            assert!(
+                outcome.ambiguous_sessions.insert(set_session),
+                "one session per attempt"
+            );
+        }
+        let add_client = one();
+        let add_session = add_client.session();
+        if add_client
+            .counter_add_with_seq(&Key::from("am-hot"), 1, RequestSeq::from_u64(1))
+            .is_ok()
+        {
+            outcome.adds += 1;
+            assert!(
+                outcome.acked_sessions.insert(add_session),
+                "one session per attempt"
+            );
+        } else {
+            outcome.ambiguous.push(Ambiguous::Add {
+                session: add_session,
+                key: Key::from("am-hot"),
+                delta: 1,
+            });
+            assert!(
+                outcome.ambiguous_sessions.insert(add_session),
+                "one session per attempt"
+            );
+        }
+    }
+    outcome
+}
+
+#[test]
+fn concurrent_checkpoint_workload_survives_kill_exactly() {
+    let scratch = tempfile::tempdir().expect("scratch");
+    let server = Server::spawn_auto(scratch.path(), &["--checkpoint-mutations", "200"]);
+    let endpoint = server.endpoint();
+    // Four threads hammering: distinct SET keys plus one shared hot
+    // counter. Every mutation carries its own session and explicit
+    // sequence 1, so every unacknowledged attempt is retryable verbatim
+    // after the kill — no identity is ever inferred or reused across
+    // attempts. Workload dials fail fast (short connect budget): once
+    // the server is dead there is nothing to learn from redialing it.
+    eprintln!("AM: spawning clients");
+    let stop = Arc::new(AtomicBool::new(false));
+    let threads: Vec<_> = (0..4u32)
+        .map(|thread| {
+            let endpoint = endpoint.clone();
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || hammer(&endpoint, &stop, thread))
+        })
+        .collect();
+    // Let the workload (and checkpoints) run briefly, then crash mid-run.
+    // Threads stop issuing once the server is dead, keeping the
+    // ambiguous set to the true kill-window attempts instead of hundreds
+    // of never-sent post-kill dials (which would still be correct to
+    // retry, only slow).
+    std::thread::sleep(Duration::from_secs(2));
+    eprintln!("AM: killing server");
+    drop(endpoint);
+    server.kill();
+    stop.store(true, Ordering::Relaxed);
+    eprintln!("AM: joining clients");
+    let mut acked_sets = Vec::new();
+    let mut acked_adds = 0u64;
+    let mut ambiguous = Vec::new();
+    let mut acked_sessions = HashSet::new();
+    let mut ambiguous_sessions = HashSet::new();
+    for thread in threads {
+        let outcome = thread.join().expect("client thread");
+        acked_sets.extend(outcome.sets);
+        acked_adds += outcome.adds;
+        ambiguous.extend(outcome.ambiguous);
+        acked_sessions.extend(outcome.acked_sessions);
+        ambiguous_sessions.extend(outcome.ambiguous_sessions);
+    }
+    for session in &ambiguous_sessions {
+        assert!(
+            !acked_sessions.contains(session),
+            "an identity is acknowledged or ambiguous, never both"
+        );
+    }
+    let ambiguous_adds = ambiguous
+        .iter()
+        .filter(|op| matches!(op, Ambiguous::Add { .. }))
+        .count() as u64;
+    eprintln!(
+        "AM: acked {} sets, {} adds, {} ambiguous; respawning",
+        acked_sets.len(),
+        acked_adds,
+        ambiguous.len(),
+    );
+    // Restart: every acknowledged write is present, exactly.
+    let server = Server::spawn_auto(scratch.path(), &[]);
+    eprintln!("AM: respawned; verifying");
+    let client = server.client();
+    for (key, value) in &acked_sets {
+        assert_eq!(
+            client.get(key).expect("get"),
+            Some(value.clone()),
+            "acknowledged set survives"
+        );
+    }
+    // The kill window is honest ambiguity, not loss or duplication: an
+    // ambiguous attempt may have applied (durable, reply lost in the
+    // kill) or never been sent. The recovered counter must lie within
+    // exactly that window — anything outside is loss or double-apply.
+    let recovered = u64::try_from(
+        client
+            .counter_get(&Key::from("am-hot"))
+            .expect("read")
+            .unwrap_or(0),
+    )
+    .expect("counter nonnegative");
+    assert!(
+        recovered >= acked_adds && recovered <= acked_adds + ambiguous_adds,
+        "recovered {recovered} within [acked {acked_adds}, acked + ambiguous {}]",
+        acked_adds + ambiguous_adds,
+    );
+    // Retry every ambiguous identity verbatim through the shared
+    // helper (fresh resume client per attempt, stability re-retry
+    // inside).
+    let endpoint = server.endpoint();
+    retry_ambiguous(&endpoint, &ambiguous);
+    // Exactness, now provable: every ambiguous identity contributed
+    // exactly one application in total, and every acknowledged one
+    // survived. A loss would fall short; a double-apply would exceed.
+    let final_counter = client
+        .counter_get(&Key::from("am-hot"))
+        .expect("read")
+        .unwrap_or(0);
+    assert_eq!(
+        final_counter,
+        acked_adds.cast_signed() + ambiguous_adds.cast_signed(),
+        "counter equals acked adds plus one application per ambiguous identity"
+    );
+    for op in &ambiguous {
+        if let Ambiguous::Set { key, value, .. } = op {
+            assert_eq!(
+                client.get(key).expect("get"),
+                Some(value.clone()),
+                "retried set is present with its exact value"
+            );
+        }
+    }
+}
+
+#[test]
+fn deleted_current_recovers_from_wal_replay() {
+    // Interrupted publication is invisible: with CURRENT gone, recovery
+    // replays the WAL from genesis and restores everything acknowledged.
+    let scratch = tempfile::tempdir().expect("scratch");
+    let server = Server::spawn_auto(scratch.path(), &["--checkpoint-mutations", "5"]);
+    let client = server.client();
+    for index in 0..10u32 {
+        client
+            .set(
+                &Key::from(format!("inv:{index}")),
+                bytes::Bytes::from_static(b"v"),
+            )
+            .expect("set");
+    }
+    await_checkpoints(&server, 1);
+    drop(client);
+    server.kill();
+    std::fs::remove_file(
+        scratch
+            .path()
+            .join("checkpoints")
+            .join("tablet-1")
+            .join("CURRENT"),
+    )
+    .expect("delete CURRENT");
+    let server = Server::spawn_auto(scratch.path(), &[]);
+    let client = server.client();
+    for index in 0..10u32 {
+        assert_eq!(
+            client.get(&Key::from(format!("inv:{index}"))).expect("get"),
+            Some(bytes::Bytes::from_static(b"v")),
+            "WAL replay restores everything without a catalog"
+        );
+    }
+}
+
+#[test]
+fn missing_current_manifest_falls_back_to_previous() {
+    // Two checkpoints install current + previous. Destroying the current
+    // manifest must fall back loudly to the retained previous (WAL tail
+    // covers the gap) — never partial state, never silent loss.
+    let scratch = tempfile::tempdir().expect("scratch");
+    let server = Server::spawn_auto(scratch.path(), &["--checkpoint-mutations", "5"]);
+    let client = server.client();
+    for index in 0..5u32 {
+        client
+            .set(
+                &Key::from(format!("fb:{index}")),
+                bytes::Bytes::from_static(b"v"),
+            )
+            .expect("set");
+    }
+    await_checkpoints(&server, 1);
+    for index in 5..10u32 {
+        client
+            .set(
+                &Key::from(format!("fb:{index}")),
+                bytes::Bytes::from_static(b"v"),
+            )
+            .expect("set");
+    }
+    await_checkpoints(&server, 2);
+    let (status, body) = server.admin_get("/v1/checkpoints");
+    assert_eq!(status, 200);
+    let current_manifest = extract_manifest(&body, "current");
+    drop(client);
+    server.kill();
+    std::fs::remove_file(
+        scratch
+            .path()
+            .join("checkpoints")
+            .join("tablet-1")
+            .join("manifests")
+            .join(format!("{current_manifest}.manifest")),
+    )
+    .expect("delete current manifest");
+    let server = Server::spawn_auto(scratch.path(), &[]);
+    let client = server.client();
+    for index in 0..10u32 {
+        assert_eq!(
+            client.get(&Key::from(format!("fb:{index}"))).expect("get"),
+            Some(bytes::Bytes::from_static(b"v")),
+            "previous checkpoint plus WAL tail restores everything"
+        );
+    }
+    let fell_back = server.admin_number("/v1/durability", "checkpoint_fell_back");
+    assert_eq!(fell_back, 1, "fallback is loud in recovery stats");
+}
+
+/// Extracts the manifest hash of the first `"which":"current"` entry.
+fn extract_manifest(body: &str, which: &str) -> String {
+    let marker = format!("\"which\":\"{which}\"");
+    let at = body.find(&marker).expect("entry present");
+    let hash_key = "\"manifest\":\"";
+    let from = body[at..].find(hash_key).expect("manifest present") + at + hash_key.len();
+    body[from..from + 64].to_owned()
+}
+
+#[test]
+fn corrupt_band_is_detected_loudly() {
+    // Corrupting a current-only band (rewritten by the second checkpoint,
+    // so the previous chain references different files) must fail loudly
+    // or fall back — never serve partial state.
+    let scratch = tempfile::tempdir().expect("scratch");
+    let server = Server::spawn_auto(scratch.path(), &["--checkpoint-mutations", "5"]);
+    let client = server.client();
+    for index in 0..5u32 {
+        client
+            .set(
+                &Key::from(format!("cb:{index}")),
+                bytes::Bytes::from_static(b"v"),
+            )
+            .expect("set");
+    }
+    await_checkpoints(&server, 1);
+    for index in 5..10u32 {
+        client
+            .set(
+                &Key::from(format!("cb:{index}")),
+                bytes::Bytes::from_static(b"v"),
+            )
+            .expect("set");
+    }
+    await_checkpoints(&server, 2);
+    let (status, body) = server.admin_get("/v1/checkpoints");
+    assert_eq!(status, 200);
+    let current_manifest = extract_manifest(&body, "current");
+    drop(client);
+    server.kill();
+    // Find a band file referenced ONLY by the current manifest (a dirty
+    // band the second checkpoint rebuilt) and flip one byte.
+    let bands_dir = scratch.path().join("checkpoints").join("bands");
+    let manifest_path = scratch
+        .path()
+        .join("checkpoints")
+        .join("tablet-1")
+        .join("manifests")
+        .join(format!("{current_manifest}.manifest"));
+    let manifest_bytes = std::fs::read(&manifest_path).expect("manifest readable");
+    let manifest = kivi_checkpoint::load_manifest(parse_hash(&current_manifest), &manifest_bytes)
+        .expect("manifest loads");
+    let band_hash = manifest.bands.first().expect("bands").hash.hex();
+    let band_path = bands_dir.join(format!("{band_hash}.band"));
+    let mut bytes = std::fs::read(&band_path).expect("band readable");
+    let flip = bytes.len() / 2;
+    bytes[flip] ^= 0xFF;
+    std::fs::write(&band_path, &bytes).expect("band corrupted");
+    // Restart: either loud failure or previous-fallback with full state.
+    // A corrupt FIRST band (likely an empty reused band — identical file
+    // in both chains) breaks both chains and must fail loudly.
+    // Fresh ephemeral ports: recovery reads the data directory, so the
+    // probe address is irrelevant and cannot collide with anything.
+    let mut probe = spawn_process(scratch.path(), &[]);
+    // Give it a bounded window: success (fallback) or loud exit both end
+    // the ambiguity. A hanging or partial server fails the test below.
+    let ready = match wait_ready_or_exit(&mut probe, Duration::from_secs(20)) {
+        SpawnOutcome::Ready(base, admin) => {
+            assert!(
+                std::net::TcpStream::connect(format!("127.0.0.1:{base}")).is_ok(),
+                "ready worker accepts"
+            );
+            Some((base, admin))
+        }
+        SpawnOutcome::Exited(status) => {
+            assert!(
+                !status.success(),
+                "corrupt band must fail loudly, not exit 0"
+            );
+            None
+        }
+        SpawnOutcome::TimedOut => {
+            panic!("corrupt band: server neither failed loudly nor served");
+        }
+    };
+    if let Some((base, admin)) = ready {
+        // Served: fallback must have restored everything.
+        let server = Server {
+            child: probe,
+            base,
+            admin,
+        };
+        let client = server.client();
+        for index in 0..10u32 {
+            assert_eq!(
+                client.get(&Key::from(format!("cb:{index}"))).expect("get"),
+                Some(bytes::Bytes::from_static(b"v")),
+                "fallback restores everything or the server must not serve"
+            );
+        }
+    }
+}
+
+fn parse_hash(hex: &str) -> kivi_checkpoint::ArtifactHash {
+    kivi_checkpoint::ArtifactHash::parse_hex(hex).expect("hash parses")
 }

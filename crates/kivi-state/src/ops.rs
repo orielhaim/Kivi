@@ -7,7 +7,7 @@
 
 use bytes::Bytes;
 use kivi_codec::{CodecError, Decode, Encode, decode_byte_vec, encode_bytes};
-use kivi_types::{Expiry, UnixMicros};
+use kivi_types::{Expiry, ManifestId, UnixMicros};
 
 use crate::mutation::{ApplyOutcome, Mutation};
 use crate::object::{Key, ObjectType, ObjectVersion};
@@ -26,6 +26,38 @@ pub enum Operation {
         key: Key,
         /// Value to store.
         value: Bytes,
+    },
+    /// Store a large byte string by chunk reference, overwriting any type
+    /// and clearing any expiry — the chunked spelling of [`Set`](Self::Set).
+    /// The engine stages every referenced chunk and proves pack durability
+    /// *before* admitting this; the store trusts the reference exactly as
+    /// it trusts an inline value. Produced by the streaming commit path and
+    /// by large legacy `Set`s the engine converts at admission, never by
+    /// end users directly.
+    SetChunked {
+        /// Key to write.
+        key: Key,
+        /// Manifest addressing the immutable chunk sequence.
+        manifest: ManifestId,
+        /// Total logical bytes across the manifest.
+        logical_len: u64,
+    },
+    /// Patch a byte range of a value (partial update), overwriting any type
+    /// and clearing any expiry on the stored result exactly like
+    /// [`Set`](Self::Set). Against absent or expired state the base is the
+    /// empty string; past-the-end gaps zero-pad (Redis `SETRANGE`
+    /// semantics). Against byte strings the untouched prefix and suffix
+    /// survive; against counters this fails with
+    /// [`WrongType`](OpError::WrongType) without mutation. Large results
+    /// the engine converts to chunked roots at admission, so the store
+    /// spells the outcome as whatever representation fits.
+    SetRange {
+        /// Key to patch.
+        key: Key,
+        /// Logical byte index the patch overwrites from.
+        offset: u64,
+        /// Bytes written starting at `offset`.
+        patch: Bytes,
     },
     /// Remove the key (including expired-but-unreclaimed state).
     Delete {
@@ -69,6 +101,28 @@ pub enum Operation {
     },
 }
 
+impl Operation {
+    /// Returns the single key this operation touches. Every operation in
+    /// this stage is single-key, which is what makes batch-local overlays
+    /// sound: preparation reads no state beyond this key.
+    #[must_use]
+    pub fn key(&self) -> &Key {
+        match self {
+            Self::Get { key }
+            | Self::Set { key, .. }
+            | Self::SetChunked { key, .. }
+            | Self::SetRange { key, .. }
+            | Self::Delete { key }
+            | Self::Exists { key }
+            | Self::CounterGet { key }
+            | Self::CounterAdd { key, .. }
+            | Self::ExpireAt { key, .. }
+            | Self::PersistExpiry { key }
+            | Self::GetExpiry { key } => key,
+        }
+    }
+}
+
 /// Outcome of one prepared operation.
 ///
 /// Exhaustive by design: every consumer in the workspace must handle every
@@ -78,6 +132,18 @@ pub enum Operation {
 pub enum OperationResult {
     /// `Get` payload (`None` when absent, expired, or — via error — mistyped).
     Value(Option<Bytes>),
+    /// `Get` hit a chunked root: the engine must resolve these bytes
+    /// through the chunk lane before replying. Never crosses the wire and
+    /// never persists: reads answer inline, so no WAL record, dedup entry,
+    /// or checkpoint band ever names this variant. It exists so the
+    /// deterministic store can name "bytes live elsewhere" without
+    /// performing I/O itself.
+    ChunkedValue {
+        /// Manifest addressing the immutable chunk sequence.
+        manifest: ManifestId,
+        /// Total logical bytes across the manifest.
+        logical_len: u64,
+    },
     /// `Set` completed with the new version.
     Stored {
         /// Version after the store.
@@ -131,17 +197,27 @@ pub enum OpError {
     /// A counter addition overflowed `i64`; nothing was mutated.
     #[error("counter addition overflows i64")]
     CounterOverflow,
+    /// A `SetRange` met a chunked root its admission plan did not expect:
+    /// the root changed representation between the engine's peek and
+    /// preparation. Nothing was mutated; the client retries and the retry
+    /// re-plans against the new root. Unreachable on the current
+    /// single-owner paths (peek and prepare share one synchronous tablet
+    /// turn), kept total for future replica proposals.
+    #[error("range base changed representation during admission; retry")]
+    StaleRangeBase,
 }
 
 /// Canonical wire tags. Fixed forever within framing version 1.
 const TAG_OP_WRONG_TYPE: u8 = 1;
 const TAG_OP_OVERFLOW: u8 = 2;
+/// Stale range-base tag. New tags never reuse old ones.
+const TAG_OP_STALE_RANGE_BASE: u8 = 3;
 
 impl Encode for OpError {
     fn encoded_len(&self) -> usize {
         match self {
             Self::WrongType { .. } => 1 + 1 + 1,
-            Self::CounterOverflow => 1,
+            Self::CounterOverflow | Self::StaleRangeBase => 1,
         }
     }
 
@@ -153,6 +229,7 @@ impl Encode for OpError {
                 found.encode(out);
             }
             Self::CounterOverflow => out.push(TAG_OP_OVERFLOW),
+            Self::StaleRangeBase => out.push(TAG_OP_STALE_RANGE_BASE),
         }
     }
 }
@@ -167,6 +244,7 @@ impl Decode for OpError {
                 Ok((Self::WrongType { expected, found }, first + second + third))
             }
             TAG_OP_OVERFLOW => Ok((Self::CounterOverflow, first)),
+            TAG_OP_STALE_RANGE_BASE => Ok((Self::StaleRangeBase, first)),
             other => Err(CodecError::InvalidTag {
                 kind: "op-error",
                 tag: other,
@@ -186,11 +264,15 @@ const TAG_RES_COUNTER_UPDATED: u8 = 6;
 const TAG_RES_EXPIRY_SET: u8 = 7;
 const TAG_RES_EXPIRY_PERSISTED: u8 = 8;
 const TAG_RES_EXPIRY: u8 = 9;
+/// Engine-internal chunked-read marker. New tag, never reused; see the
+/// variant docs for why it never persists.
+const TAG_RES_CHUNKED: u8 = 10;
 
 impl Encode for OperationResult {
     fn encoded_len(&self) -> usize {
         match self {
             Self::Value(value) => 1 + 1 + value.as_ref().map_or(0, |bytes| 4 + bytes.len()),
+            Self::ChunkedValue { .. } => 1 + 32 + 8,
             Self::Stored { .. } => 1 + 8,
             Self::Deleted { .. }
             | Self::Exists(_)
@@ -258,6 +340,14 @@ impl Encode for OperationResult {
                         expiry.encode(out);
                     }
                 }
+            }
+            Self::ChunkedValue {
+                manifest,
+                logical_len,
+            } => {
+                out.push(TAG_RES_CHUNKED);
+                out.extend_from_slice(manifest.as_bytes());
+                logical_len.encode(out);
             }
         }
     }
@@ -327,6 +417,17 @@ impl Decode for OperationResult {
                 }
                 let (expiry, third) = Expiry::decode(&input[first + second..])?;
                 Ok((Self::Expiry(Some(expiry)), first + second + third))
+            }
+            TAG_RES_CHUNKED => {
+                let (raw, second) = <[u8; 32]>::decode(&input[first..])?;
+                let (logical_len, third) = u64::decode(&input[first + second..])?;
+                Ok((
+                    Self::ChunkedValue {
+                        manifest: ManifestId::from_bytes(raw),
+                        logical_len,
+                    },
+                    first + second + third,
+                ))
             }
             other => Err(CodecError::InvalidTag {
                 kind: "operation-result",
@@ -421,9 +522,14 @@ pub fn outcome_for(
     is_persist_expiry: bool,
 ) -> OperationResult {
     match (mutation, outcome) {
-        (Mutation::PutBytes { .. }, ApplyOutcome::Put { version }) => {
-            OperationResult::Stored { version: *version }
-        }
+        // Inline, chunked, and spliced stores answer identically: the
+        // result names the new version either way, never the representation.
+        (
+            Mutation::PutBytes { .. }
+            | Mutation::ReplaceChunkedRoot { .. }
+            | Mutation::SpliceBytes { .. },
+            ApplyOutcome::Put { version },
+        ) => OperationResult::Stored { version: *version },
         (Mutation::Delete { .. }, ApplyOutcome::Deleted { existed }) => {
             OperationResult::Deleted { existed: *existed }
         }
@@ -470,6 +576,10 @@ mod tests {
         let version = ObjectVersion::from_u64(7);
         round_trip(&OperationResult::Value(None));
         round_trip(&OperationResult::Value(Some(Bytes::from_static(b"v"))));
+        round_trip(&OperationResult::ChunkedValue {
+            manifest: ManifestId::from_bytes([0x22; 32]),
+            logical_len: 3_000_000,
+        });
         round_trip(&OperationResult::Stored { version });
         round_trip(&OperationResult::Deleted { existed: true });
         round_trip(&OperationResult::Exists(false));

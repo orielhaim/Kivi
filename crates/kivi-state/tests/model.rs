@@ -60,7 +60,9 @@ impl RefStore {
         let key = op.key().to_vec();
         match op {
             GenOp::Get(_) => self.read(&key, now),
-            GenOp::Set(_, value) => {
+            // Inline and chunked stores are logically identical: the
+            // reference never learns representations.
+            GenOp::Set(_, value) | GenOp::SetChunked(_, value) => {
                 let version = self.live(&key, now).map_or(1, |obj| obj.version + 1);
                 self.map.insert(
                     key,
@@ -74,6 +76,7 @@ impl RefStore {
                 );
                 Ok(Out::Stored(version))
             }
+            GenOp::SetRange(_, offset, patch) => self.splice(&key, *offset, patch, now),
             GenOp::Delete(_) => {
                 let existed = self.live(&key, now).is_some();
                 self.map.remove(&key);
@@ -152,6 +155,40 @@ impl RefStore {
         }
     }
 
+    /// Independent spelling of the splice: absent state reads as empty,
+    /// counters reject, past-the-end gaps zero-pad, and the stored result
+    /// clears expiry like `Set`.
+    fn splice(&mut self, key: &[u8], offset: u64, patch: &[u8], now: u64) -> Result<Out, RefErr> {
+        let base = match self.live(key, now) {
+            None => Vec::new(),
+            Some(obj) => match obj.kind {
+                RefKind::Bytes => obj.bytes.clone(),
+                RefKind::Counter => return Err(RefErr::WrongType),
+            },
+        };
+        let offset = usize::try_from(offset).expect("model offsets fit the address space");
+        let end = offset.checked_add(patch.len()).expect("model splices fit");
+        let mut spliced = Vec::new();
+        spliced.extend_from_slice(&base[..offset.min(base.len())]);
+        spliced.resize(offset, 0);
+        spliced.extend_from_slice(patch);
+        if base.len() > end {
+            spliced.extend_from_slice(&base[end..]);
+        }
+        let version = self.live(key, now).map_or(1, |obj| obj.version + 1);
+        self.map.insert(
+            key.to_vec(),
+            RefObj {
+                kind: RefKind::Bytes,
+                bytes: spliced,
+                int: 0,
+                version,
+                expiry: None,
+            },
+        );
+        Ok(Out::Stored(version))
+    }
+
     fn dump(&self) -> BTreeMap<Vec<u8>, Row> {
         self.map
             .iter()
@@ -211,6 +248,13 @@ const KEYS: [&[u8]; 6] = [b"k0", b"k1", b"k2", b"k3", b"k4", b"k5"];
 enum GenOp {
     Get(usize),
     Set(usize, Vec<u8>),
+    /// Chunked spelling of `Set`: overwrites any type with a chunk
+    /// reference naming `Vec<u8>` bytes. The reference model treats it
+    /// exactly like `Set` — representation must never leak into logical
+    /// semantics — while the Kivi side stores a chunked root the driver
+    /// resolves through the manifest registry below.
+    SetChunked(usize, Vec<u8>),
+    SetRange(usize, u64, Vec<u8>),
     Delete(usize),
     Exists(usize),
     CounterGet(usize),
@@ -225,6 +269,8 @@ impl GenOp {
         let index = match self {
             Self::Get(i)
             | Self::Set(i, _)
+            | Self::SetChunked(i, _)
+            | Self::SetRange(i, _, _)
             | Self::Delete(i)
             | Self::Exists(i)
             | Self::CounterGet(i)
@@ -237,6 +283,20 @@ impl GenOp {
     }
 }
 
+/// Deterministic synthetic manifest id for model bytes: stands in for the
+/// real chunking the engine performs (which this layer never sees). The
+/// registry below maps these back to bytes, mirroring engine resolution.
+fn fake_manifest_id(key: &[u8], value: &[u8]) -> kivi_types::ManifestId {
+    let mut input = Vec::with_capacity(11 + key.len() + value.len());
+    input.extend_from_slice(b"model-chunk");
+    input.extend_from_slice(key);
+    input.extend_from_slice(value);
+    let digest = blake3::hash(&input);
+    let id = kivi_types::ManifestId::from_bytes(*digest.as_bytes());
+    debug_assert!(id.is_valid(), "test ids must be nonzero");
+    id
+}
+
 fn arb_delta() -> impl Strategy<Value = i64> {
     prop_oneof![-10i64..10i64, Just(i64::MAX), Just(i64::MIN), Just(0i64),]
 }
@@ -245,6 +305,16 @@ fn arb_step() -> impl Strategy<Value = (GenOp, u64)> {
     let op = prop_oneof![
         (0usize..6).prop_map(GenOp::Get),
         (0usize..6, prop::collection::vec(any::<u8>(), 0..8)).prop_map(|(k, v)| GenOp::Set(k, v)),
+        (0usize..6, prop::collection::vec(any::<u8>(), 0..8))
+            .prop_map(|(k, v)| GenOp::SetChunked(k, v)),
+        // Small offsets and patches: covers in-place patches, truncation
+        // past the end, and zero-padded gaps past the end.
+        (
+            0usize..6,
+            0u64..16,
+            prop::collection::vec(any::<u8>(), 0..8),
+        )
+            .prop_map(|(k, off, p)| GenOp::SetRange(k, off, p)),
         (0usize..6).prop_map(GenOp::Delete),
         (0usize..6).prop_map(GenOp::Exists),
         (0usize..6).prop_map(GenOp::CounterGet),
@@ -264,9 +334,25 @@ fn kivi_key(index: usize) -> Key {
     Key::from(KEYS[index])
 }
 
-fn norm_result(result: &OperationResult) -> Out {
+fn norm_result(result: &OperationResult, registry: &BTreeMap<[u8; 32], Vec<u8>>) -> Out {
     match result {
         OperationResult::Value(value) => Out::Val(value.clone().map(|b| b.to_vec())),
+        // Engine resolution, mirrored: the test registry stands in for
+        // the chunk lane (which this layer never touches).
+        OperationResult::ChunkedValue {
+            manifest,
+            logical_len,
+        } => {
+            let bytes = registry
+                .get(manifest.as_bytes())
+                .expect("chunked reads name planted manifests");
+            assert_eq!(
+                u64::try_from(bytes.len()).expect("model values fit u64"),
+                *logical_len,
+                "logical length matches resolved bytes"
+            );
+            Out::Val(Some(bytes.clone()))
+        }
         OperationResult::Stored { version } => Out::Stored(version.as_u64()),
         OperationResult::Deleted { existed } => Out::Deleted(*existed),
         OperationResult::Exists(present) => Out::Exists(*present),
@@ -288,16 +374,31 @@ fn norm_error(error: &OpError) -> RefErr {
     match error {
         OpError::WrongType { .. } => RefErr::WrongType,
         OpError::CounterOverflow => RefErr::Overflow,
+        // Unreachable: the driver resolves chunked bases before a
+        // `SetRange` ever reaches `prepare` (mirroring the engine's lane
+        // restage), so a stale base here is a model bug, not a case.
+        OpError::StaleRangeBase => panic!("model driver leaked a chunked base into SetRange"),
     }
 }
 
-fn kivi_dump(store: &ObjectStore) -> BTreeMap<Vec<u8>, Row> {
+fn kivi_dump(
+    store: &ObjectStore,
+    registry: &BTreeMap<[u8; 32], Vec<u8>>,
+) -> BTreeMap<Vec<u8>, Row> {
     store
         .snapshot_sorted()
         .into_iter()
         .map(|(key, object)| {
             let (kind, bytes, int) = match object.value() {
                 LogicalValue::Bytes(value) => (0, value.to_vec(), 0),
+                LogicalValue::Chunked(chunked) => (
+                    0,
+                    registry
+                        .get(chunked.manifest.as_bytes())
+                        .expect("dump resolves planted manifests")
+                        .clone(),
+                    0,
+                ),
                 LogicalValue::StrictCounter(value) => (1, Vec::new(), *value),
             };
             (
@@ -324,6 +425,20 @@ fn kivi_op(step: &GenOp) -> Operation {
             key: kivi_key(*i),
             value: Bytes::from(value.clone()),
         },
+        GenOp::SetChunked(i, value) => {
+            let key = KEYS[*i];
+            let manifest = fake_manifest_id(key, value);
+            Operation::SetChunked {
+                key: kivi_key(*i),
+                manifest,
+                logical_len: u64::try_from(value.len()).expect("model values fit u64"),
+            }
+        }
+        GenOp::SetRange(i, offset, patch) => Operation::SetRange {
+            key: kivi_key(*i),
+            offset: *offset,
+            patch: Bytes::from(patch.clone()),
+        },
         GenOp::Delete(i) => Operation::Delete { key: kivi_key(*i) },
         GenOp::Exists(i) => Operation::Exists { key: kivi_key(*i) },
         GenOp::CounterGet(i) => Operation::CounterGet { key: kivi_key(*i) },
@@ -348,6 +463,10 @@ proptest! {
     fn operations_match_reference_model(steps in prop::collection::vec(arb_step(), 1..64)) {
         let mut store = ObjectStore::new();
         let mut reference = RefStore::default();
+        // Manifest registry: stands in for the chunk lane when the Kivi
+        // side names chunked bytes. Planted before each chunked store so
+        // reads and dumps resolve exactly like engine resolution would.
+        let mut registry: BTreeMap<[u8; 32], Vec<u8>> = BTreeMap::new();
         let mut now: u64 = 1_000_000;
         for (step, advance) in &steps {
             now = now.checked_add(*advance).expect("test clock fits");
@@ -357,10 +476,50 @@ proptest! {
                 GenOp::ExpireAt(i, rel) => GenOp::ExpireAt(*i, now.saturating_add(*rel)),
                 other => other.clone(),
             };
+            if let GenOp::SetChunked(i, value) = &step {
+                let key = KEYS[*i];
+                registry.insert(*fake_manifest_id(key, value).as_bytes(), value.clone());
+            }
+            // Engine mirror: a `SetRange` against a chunked root never
+            // reaches `prepare` as a splice — the engine restages through
+            // the lane and stores the patched bytes. Resolve here through
+            // the registry and run a plain `Set` on both sides instead.
+            let step = match &step {
+                GenOp::SetRange(i, offset, patch)
+                    if matches!(
+                        store.get(&kivi_key(*i), stamp).map(kivi_state::StoredObject::value),
+                        Some(LogicalValue::Chunked(_))
+                    ) =>
+                {
+                    let base = match store.get(&kivi_key(*i), stamp) {
+                        Some(object) => match object.value() {
+                            LogicalValue::Bytes(value) => value.to_vec(),
+                            LogicalValue::StrictCounter(_) => Vec::new(),
+                            LogicalValue::Chunked(chunked) => registry
+                                .get(chunked.manifest.as_bytes())
+                                .expect("driver resolves planted manifests")
+                                .clone(),
+                        },
+                        None => Vec::new(),
+                    };
+                    let offset =
+                        usize::try_from(*offset).expect("model offsets fit the address space");
+                    let end = offset.checked_add(patch.len()).expect("model splices fit");
+                    let mut spliced = Vec::new();
+                    spliced.extend_from_slice(&base[..offset.min(base.len())]);
+                    spliced.resize(offset, 0);
+                    spliced.extend_from_slice(patch);
+                    if base.len() > end {
+                        spliced.extend_from_slice(&base[end..]);
+                    }
+                    GenOp::Set(*i, spliced)
+                }
+                _ => step,
+            };
             let expected = reference.run(&step, now);
             let actual = match store.prepare(&kivi_op(&step), stamp) {
                 Err(error) => Err(norm_error(&error)),
-                Ok(Prepared::Read(result)) => Ok(norm_result(&result)),
+                Ok(Prepared::Read(result)) => Ok(norm_result(&result, &registry)),
                 Ok(Prepared::Write(mutation)) => {
                     let outcome = store.apply(&mutation, stamp).expect("valid writes apply");
                     Ok(norm_apply(&step, &outcome))
@@ -368,7 +527,7 @@ proptest! {
             };
             prop_assert_eq!(actual, expected, "divergence on {:?} at t={}", step, now);
         }
-        prop_assert_eq!(kivi_dump(&store), reference.dump());
+        prop_assert_eq!(kivi_dump(&store, &registry), reference.dump());
     }
 }
 

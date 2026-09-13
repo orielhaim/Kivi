@@ -24,6 +24,7 @@ kivi-engine.workspace = true
 kivi-client.workspace = true
 kivi-protocol.workspace = true
 kivi-durability.workspace = true
+kivi-checkpoint.workspace = true
 bytes.workspace = true
 clap.workspace = true
 tracing.workspace = true

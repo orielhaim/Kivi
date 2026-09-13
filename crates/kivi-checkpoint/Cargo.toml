@@ -1,0 +1,27 @@
+[package]
+name = "kivi-checkpoint"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+kivi-types.workspace = true
+kivi-codec.workspace = true
+kivi-state.workspace = true
+kivi-durability.workspace = true
+blake3.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# Checkpoint band compression experiment (RFC §217: lz4_flex for hot/warm).
+# Owns only the block codec mechanism; Kivi owns the band format, header,
+# manifest codec record, and content identity.
+lz4_flex.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+rstest.workspace = true
+bytes.workspace = true
+
+[lints]
+workspace = true

@@ -25,8 +25,29 @@ use std::collections::hash_map::RandomState;
 use kivi_types::{Expiry, UnixMicros};
 
 use crate::mutation::{ApplyError, ApplyOutcome, Mutation};
-use crate::object::{Key, LogicalValue, ObjectType, ObjectVersion, StoredObject};
+use crate::object::{ChunkedRef, Key, LogicalValue, ObjectType, ObjectVersion, StoredObject};
 use crate::ops::{DurableOutcome, OpError, Operation, OperationResult};
+
+/// Splices `patch` over `base` at `offset`, zero-padding past-the-end
+/// gaps (Redis `SETRANGE` semantics). Pure: the single implementation
+/// shared by apply and the engine's admission planner, so the two can
+/// never disagree. Returns `None` when `offset` does not fit the address
+/// space or `offset + patch.len()` overflows `u64`; every other input is
+/// total (including offsets far past the end — the gap zero-pads,
+/// bounded by the caller's admission cap, never here).
+#[must_use]
+pub fn splice_inline(base: &[u8], offset: u64, patch: &[u8]) -> Option<bytes::Bytes> {
+    let offset = usize::try_from(offset).ok()?;
+    let end = offset.checked_add(patch.len())?;
+    let mut out = Vec::new();
+    out.extend_from_slice(base.get(..offset.min(base.len())).unwrap_or(base));
+    out.resize(offset, 0);
+    out.extend_from_slice(patch);
+    if base.len() > end {
+        out.extend_from_slice(&base[end..]);
+    }
+    Some(bytes::Bytes::from(out))
+}
 
 /// A validated operation: either an immediately answered read or a mutation
 /// awaiting deterministic application.
@@ -107,6 +128,44 @@ impl ObjectStore {
             .filter(|object| !object.is_expired(now))
     }
 
+    /// Returns the physically stored object for `key`, including
+    /// logically expired entries. This bypasses the liveness filter for
+    /// batch-overlay materialization and checkpoint capture, which must
+    /// mirror committed state exactly (an expired-but-present object and
+    /// an absent key predict identically today, but the overlay stores
+    /// the truth so future semantics cannot silently diverge).
+    #[must_use]
+    pub fn get_stored(&self, key: &Key) -> Option<&StoredObject> {
+        self.objects.get(key)
+    }
+
+    /// Stores `object` under `key` verbatim, bypassing prepare/apply.
+    /// Batch-overlay materialization and tests use this to stage exact
+    /// state; production mutation still flows through [`apply`](Self::apply)
+    /// only.
+    pub fn put_stored(&mut self, key: Key, object: StoredObject) {
+        self.objects.insert(key, object);
+    }
+
+    /// Removes whatever is physically stored under `key`, if anything.
+    /// Batch-overlay counterpart to [`put_stored`](Self::put_stored).
+    pub fn remove_stored(&mut self, key: &Key) {
+        self.objects.remove(key);
+    }
+
+    /// Snapshots all entries without sorting. The hot worker captures
+    /// checkpoints with this (no `O(n log n)` pause on the data path);
+    /// deterministic ordering is the serializer's job, never the capture's.
+    /// See [`snapshot_sorted`](Self::snapshot_sorted) for the sorted form
+    /// used by tests and verification.
+    #[must_use]
+    pub fn snapshot_entries(&self) -> Vec<(Key, StoredObject)> {
+        self.objects
+            .iter()
+            .map(|(key, object)| (key.clone(), object.clone()))
+            .collect()
+    }
+
     /// Validates `op` against current state, answering reads immediately and
     /// translating writes into typed mutations. Pure: borrows state, reads
     /// the supplied `now`, touches nothing else.
@@ -124,6 +183,15 @@ impl ObjectStore {
                     LogicalValue::Bytes(value) => {
                         Ok(Prepared::Read(OperationResult::Value(Some(value.clone()))))
                     }
+                    // Chunked bytes read identically; the engine resolves
+                    // the reference through the chunk lane — this layer
+                    // never touches the filesystem.
+                    LogicalValue::Chunked(chunked) => {
+                        Ok(Prepared::Read(OperationResult::ChunkedValue {
+                            manifest: chunked.manifest,
+                            logical_len: chunked.logical_len,
+                        }))
+                    }
                     LogicalValue::StrictCounter(_) => Err(OpError::WrongType {
                         expected: ObjectType::Bytes,
                         found: ObjectType::StrictCounter,
@@ -134,6 +202,18 @@ impl ObjectStore {
                 key: key.clone(),
                 value: value.clone(),
             })),
+            Operation::SetChunked {
+                key,
+                manifest,
+                logical_len,
+            } => Ok(Prepared::Write(Mutation::ReplaceChunkedRoot {
+                key: key.clone(),
+                manifest: *manifest,
+                logical_len: *logical_len,
+            })),
+            Operation::SetRange { key, offset, patch } => {
+                self.prepare_set_range(key, *offset, patch, now)
+            }
             Operation::Delete { key } => Ok(Prepared::Write(Mutation::Delete { key: key.clone() })),
             Operation::Exists { key } => Ok(Prepared::Read(OperationResult::Exists(
                 self.get(key, now).is_some(),
@@ -144,7 +224,8 @@ impl ObjectStore {
                     LogicalValue::StrictCounter(value) => {
                         Ok(Prepared::Read(OperationResult::Counter(Some(*value))))
                     }
-                    LogicalValue::Bytes(_) => Err(OpError::WrongType {
+                    // Chunked values are bytes: same rejection as inline.
+                    LogicalValue::Bytes(_) | LogicalValue::Chunked(_) => Err(OpError::WrongType {
                         expected: ObjectType::StrictCounter,
                         found: ObjectType::Bytes,
                     }),
@@ -163,7 +244,7 @@ impl ObjectStore {
                             delta: *delta,
                         }))
                     }
-                    LogicalValue::Bytes(_) => Err(OpError::WrongType {
+                    LogicalValue::Bytes(_) | LogicalValue::Chunked(_) => Err(OpError::WrongType {
                         expected: ObjectType::StrictCounter,
                         found: ObjectType::Bytes,
                     }),
@@ -192,6 +273,39 @@ impl ObjectStore {
             Operation::GetExpiry { key } => Ok(Prepared::Read(OperationResult::Expiry(
                 self.get(key, now).map(StoredObject::expiry),
             ))),
+        }
+    }
+
+    /// Validates a range patch against current state: absent, expired, and
+    /// inline bases become [`SpliceBytes`](Mutation::SpliceBytes) writes;
+    /// counters reject without mutation; chunked bases report
+    /// [`StaleRangeBase`](OpError::StaleRangeBase) (the engine restages
+    /// those through the lane before preparing, so meeting one means the
+    /// root changed representation under admission).
+    fn prepare_set_range(
+        &self,
+        key: &Key,
+        offset: u64,
+        patch: &bytes::Bytes,
+        now: UnixMicros,
+    ) -> Result<Prepared, OpError> {
+        let write = || {
+            Prepared::Write(Mutation::SpliceBytes {
+                key: key.clone(),
+                offset,
+                patch: patch.clone(),
+            })
+        };
+        match self.get(key, now) {
+            None => Ok(write()),
+            Some(object) => match object.value() {
+                LogicalValue::Bytes(_) => Ok(write()),
+                LogicalValue::StrictCounter(_) => Err(OpError::WrongType {
+                    expected: ObjectType::Bytes,
+                    found: ObjectType::StrictCounter,
+                }),
+                LogicalValue::Chunked(_) => Err(OpError::StaleRangeBase),
+            },
         }
     }
 
@@ -242,6 +356,52 @@ impl ObjectStore {
                 },
                 Err(outcome) => StorePrepared::Terminal(outcome),
             }),
+            Operation::SetChunked {
+                key,
+                manifest,
+                logical_len,
+            } => Ok(match self.predict_version(key, now) {
+                Ok(version) => StorePrepared::Write {
+                    mutation: Mutation::ReplaceChunkedRoot {
+                        key: key.clone(),
+                        manifest: *manifest,
+                        logical_len: *logical_len,
+                    },
+                    expected: OperationResult::Stored { version },
+                },
+                Err(outcome) => StorePrepared::Terminal(outcome),
+            }),
+            Operation::SetRange { key, offset, patch } => {
+                // Type gate first: counters reject without mutation (a
+                // terminal client error, retry-safe to persist), chunked
+                // bases answer directly (transient: never persisted, the
+                // retry re-plans against the new root).
+                match self.get(key, now) {
+                    Some(object) if matches!(object.value(), LogicalValue::StrictCounter(_)) => {
+                        return Ok(StorePrepared::Terminal(DurableOutcome::Rejected(
+                            OpError::WrongType {
+                                expected: ObjectType::Bytes,
+                                found: ObjectType::StrictCounter,
+                            },
+                        )));
+                    }
+                    Some(object) if matches!(object.value(), LogicalValue::Chunked(_)) => {
+                        return Err(OpError::StaleRangeBase);
+                    }
+                    _ => {}
+                }
+                Ok(match self.predict_version(key, now) {
+                    Ok(version) => StorePrepared::Write {
+                        mutation: Mutation::SpliceBytes {
+                            key: key.clone(),
+                            offset: *offset,
+                            patch: patch.clone(),
+                        },
+                        expected: OperationResult::Stored { version },
+                    },
+                    Err(outcome) => StorePrepared::Terminal(outcome),
+                })
+            }
             Operation::Delete { key } => Ok(StorePrepared::Write {
                 mutation: Mutation::Delete { key: key.clone() },
                 expected: OperationResult::Deleted {
@@ -297,7 +457,7 @@ impl ObjectStore {
                         Err(outcome) => StorePrepared::Terminal(outcome),
                     },
                 },
-                LogicalValue::Bytes(_) => {
+                LogicalValue::Bytes(_) | LogicalValue::Chunked(_) => {
                     StorePrepared::Terminal(DurableOutcome::Rejected(OpError::WrongType {
                         expected: ObjectType::StrictCounter,
                         found: ObjectType::Bytes,
@@ -354,6 +514,9 @@ impl ObjectStore {
     /// addition overflows, or a counter mutation meets a byte string (only
     /// reachable by applying mutations against divergent state — same log
     /// on same state never produces it).
+    // One arm per mutation variant (five today); splitting would scatter
+    // the single total function the model test verifies.
+    #[allow(clippy::too_many_lines)]
     pub fn apply(
         &mut self,
         mutation: &Mutation,
@@ -367,6 +530,56 @@ impl ObjectStore {
                 self.objects.insert(
                     key.clone(),
                     StoredObject::new(LogicalValue::Bytes(value.clone()), version, Expiry::NEVER),
+                );
+                Ok(ApplyOutcome::Put { version })
+            }
+            Mutation::ReplaceChunkedRoot {
+                key,
+                manifest,
+                logical_len,
+            } => {
+                let version = self
+                    .next_version(key, now)
+                    .map_err(|_| ApplyError::VersionExhausted)?;
+                self.objects.insert(
+                    key.clone(),
+                    StoredObject::new(
+                        LogicalValue::Chunked(ChunkedRef {
+                            manifest: *manifest,
+                            logical_len: *logical_len,
+                        }),
+                        version,
+                        Expiry::NEVER,
+                    ),
+                );
+                Ok(ApplyOutcome::Put { version })
+            }
+            Mutation::SpliceBytes { key, offset, patch } => {
+                // Admission guarantees an absent, expired, or inline base
+                // with validated arithmetic; anything else is divergent
+                // state (or a corrupt record) and fails loudly, never
+                // wrong bytes. Expiry clears exactly like `PutBytes`.
+                let base: &[u8] = match self.live(key, now) {
+                    None => &[],
+                    Some(current) => match current.value() {
+                        LogicalValue::Bytes(value) => value,
+                        LogicalValue::StrictCounter(_) => {
+                            return Err(ApplyError::TypeMismatch {
+                                expected: ObjectType::Bytes,
+                                found: ObjectType::StrictCounter,
+                            });
+                        }
+                        LogicalValue::Chunked(_) => return Err(ApplyError::UnresolvableSplice),
+                    },
+                };
+                let spliced =
+                    splice_inline(base, *offset, patch).ok_or(ApplyError::UnresolvableSplice)?;
+                let version = self
+                    .next_version(key, now)
+                    .map_err(|_| ApplyError::VersionExhausted)?;
+                self.objects.insert(
+                    key.clone(),
+                    StoredObject::new(LogicalValue::Bytes(spliced), version, Expiry::NEVER),
                 );
                 Ok(ApplyOutcome::Put { version })
             }
@@ -412,10 +625,12 @@ impl ObjectStore {
                             value: next,
                         })
                     }
-                    LogicalValue::Bytes(_) => Err(ApplyError::TypeMismatch {
-                        expected: ObjectType::StrictCounter,
-                        found: ObjectType::Bytes,
-                    }),
+                    LogicalValue::Bytes(_) | LogicalValue::Chunked(_) => {
+                        Err(ApplyError::TypeMismatch {
+                            expected: ObjectType::StrictCounter,
+                            found: ObjectType::Bytes,
+                        })
+                    }
                 },
             },
             Mutation::SetExpiry { key, expiry } => match self.live(key, now) {
@@ -571,6 +786,28 @@ mod tests {
             },
             Operation::GetExpiry { key: key("c") },
             Operation::Exists { key: key("c") },
+            // Chunked roots predict exactly like inline bytes: stores
+            // carry versions, reads name the reference, counters reject.
+            Operation::SetChunked {
+                key: key("big"),
+                manifest: kivi_types::ManifestId::from_bytes([0xC4; 32]),
+                logical_len: 3_000_000,
+            },
+            Operation::Get { key: key("big") },
+            Operation::CounterAdd {
+                key: key("big"),
+                delta: 1,
+            },
+            Operation::Set {
+                key: key("big"),
+                value: bytes::Bytes::from_static(b"small again"),
+            },
+            Operation::SetChunked {
+                key: key("big"),
+                manifest: kivi_types::ManifestId::from_bytes([0xC5; 32]),
+                logical_len: 4_000_000,
+            },
+            Operation::Delete { key: key("big") },
         ];
         let mut store = ObjectStore::new();
         for op in &battery {
@@ -1031,6 +1268,199 @@ mod tests {
         assert_eq!(store.len(), 1);
         assert_eq!(store.live_count(now), 1);
         assert!(store.collect_expired(now, 1_000).is_empty());
+    }
+
+    #[test]
+    fn set_range_splices_inline_bases() {
+        use bytes::Bytes;
+        let mut store = ObjectStore::new();
+        let patch = |offset: u64, patch: &[u8]| Operation::SetRange {
+            key: key("k"),
+            offset,
+            patch: Bytes::copy_from_slice(patch),
+        };
+        // Absent state reads as empty: a patch at zero creates the value.
+        let stored = execute(&mut store, &patch(0, b"hello"), NOW).expect("create");
+        assert!(matches!(stored, OperationResult::Stored { .. }));
+        // In-place overwrite keeps prefix and suffix.
+        execute(&mut store, &patch(1, b"ELL"), NOW).expect("overwrite");
+        assert_eq!(read(&store, "k"), b"hELLo");
+        // Patch past the end truncates nothing; the gap zero-pads.
+        execute(&mut store, &patch(8, b"!"), NOW).expect("gap");
+        assert_eq!(read(&store, "k"), b"hELLo\0\0\0!");
+        // Empty patch at the end is a version-bumping no-op write.
+        let before = read(&store, "k");
+        execute(&mut store, &patch(9, b""), NOW).expect("empty patch");
+        assert_eq!(read(&store, "k"), before);
+        // Expiry clears exactly like `Set`: expire into the past so the
+        // old bytes are logically gone, and the patch starts from empty.
+        execute(
+            &mut store,
+            &Operation::ExpireAt {
+                key: key("k"),
+                expires_at: UnixMicros::from_micros(500),
+            },
+            NOW,
+        )
+        .expect("expire");
+        execute(&mut store, &patch(0, b"new"), NOW).expect("overwrite clears expiry");
+        assert_eq!(read(&store, "k"), b"new");
+        assert_eq!(
+            store.get(&key("k"), NOW).expect("live").expiry(),
+            Expiry::NEVER
+        );
+    }
+
+    #[test]
+    fn set_range_rejects_counters() {
+        use bytes::Bytes;
+        let mut store = ObjectStore::new();
+        execute(
+            &mut store,
+            &Operation::CounterAdd {
+                key: key("n"),
+                delta: 4,
+            },
+            NOW,
+        )
+        .expect("counter");
+        let error = store
+            .prepare(
+                &Operation::SetRange {
+                    key: key("n"),
+                    offset: 0,
+                    patch: Bytes::from_static(b"x"),
+                },
+                NOW,
+            )
+            .expect_err("counter rejects range patches");
+        assert_eq!(
+            error,
+            OpError::WrongType {
+                expected: ObjectType::Bytes,
+                found: ObjectType::StrictCounter,
+            }
+        );
+        // The durable pipeline reports the same rejection as terminal
+        // (retry-safe to persist: the type will still mismatch).
+        assert!(matches!(
+            store.prepare_durable(
+                &Operation::SetRange {
+                    key: key("n"),
+                    offset: 0,
+                    patch: Bytes::from_static(b"x"),
+                },
+                NOW,
+            ),
+            Ok(StorePrepared::Terminal(DurableOutcome::Rejected(
+                OpError::WrongType { .. }
+            )))
+        ));
+    }
+
+    #[test]
+    fn set_range_reports_stale_chunked_bases() {
+        use bytes::Bytes;
+        let mut store = ObjectStore::new();
+        // A chunked base answers directly (transient: never persisted,
+        // the retry re-plans against the new root).
+        store
+            .apply(
+                &Mutation::ReplaceChunkedRoot {
+                    key: key("c"),
+                    manifest: kivi_types::ManifestId::from_bytes([0x22; 32]),
+                    logical_len: 10,
+                },
+                NOW,
+            )
+            .expect("chunked root");
+        assert_eq!(
+            store
+                .prepare(
+                    &Operation::SetRange {
+                        key: key("c"),
+                        offset: 0,
+                        patch: Bytes::from_static(b"x"),
+                    },
+                    NOW,
+                )
+                .expect_err("chunked base is stale"),
+            OpError::StaleRangeBase
+        );
+        assert_eq!(
+            store
+                .prepare_durable(
+                    &Operation::SetRange {
+                        key: key("c"),
+                        offset: 0,
+                        patch: Bytes::from_static(b"x"),
+                    },
+                    NOW,
+                )
+                .expect_err("durable answers stale directly"),
+            OpError::StaleRangeBase
+        );
+        // ... and a splice reaching apply against one fails loudly.
+        assert_eq!(
+            store
+                .apply(
+                    &Mutation::SpliceBytes {
+                        key: key("c"),
+                        offset: 0,
+                        patch: Bytes::from_static(b"x"),
+                    },
+                    NOW,
+                )
+                .expect_err("chunked apply fails"),
+            ApplyError::UnresolvableSplice
+        );
+        // Overflowing arithmetic fails loudly too, never wrong bytes.
+        assert_eq!(
+            store
+                .apply(
+                    &Mutation::SpliceBytes {
+                        key: key("k"),
+                        offset: u64::MAX,
+                        patch: Bytes::from_static(b"x"),
+                    },
+                    NOW,
+                )
+                .expect_err("overflow fails"),
+            ApplyError::UnresolvableSplice
+        );
+    }
+
+    #[test]
+    fn set_range_durable_prediction_matches_live_apply() {
+        use bytes::Bytes;
+        let mut store = ObjectStore::new();
+        let op = Operation::SetRange {
+            key: key("k"),
+            offset: 3,
+            patch: Bytes::from_static(b"XYZ"),
+        };
+        let StorePrepared::Write { mutation, expected } =
+            store.prepare_durable(&op, NOW).expect("prepares")
+        else {
+            panic!("set-range prepares a write");
+        };
+        assert!(matches!(mutation, Mutation::SpliceBytes { .. }));
+        let outcome = store.apply(&mutation, NOW).expect("applies");
+        assert_eq!(
+            crate::ops::outcome_for(&mutation, &outcome, false),
+            expected
+        );
+        assert_eq!(read(&store, "k"), b"\0\0\0XYZ");
+    }
+
+    /// Reads one inline value for assertions (test values stay inline).
+    fn read(store: &ObjectStore, name: &str) -> Vec<u8> {
+        match store.get(&key(name), NOW).expect("present").value() {
+            LogicalValue::Bytes(value) => value.to_vec(),
+            LogicalValue::StrictCounter(_) | LogicalValue::Chunked(_) => {
+                panic!("test value stays inline")
+            }
+        }
     }
 
     #[test]

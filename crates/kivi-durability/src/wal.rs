@@ -658,6 +658,56 @@ pub fn lane_dir_name(lane: u16) -> String {
     format!("lane-{lane:04}")
 }
 
+/// First-retained position of one lane: where recovery resumes after
+/// checkpoint reclamation. Durably recorded in the checkpoint catalog's
+/// `WAL_FLOOR` file; absent floors mean genesis (full replay).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LaneFloor {
+    /// The lane this floor applies to.
+    pub lane: u16,
+    /// First segment sequence that must exist (below: reclaimed/ignored).
+    pub first_segment: u64,
+    /// First batch sequence inside that segment.
+    pub first_batch: u64,
+    /// One past the highest batch sequence ever issued on the lane
+    /// (numbering watermark so post-restart appends never collide).
+    pub next_batch: u64,
+}
+
+impl LaneFloor {
+    /// Genesis floor: replay everything from the first segment/batch.
+    pub const GENESIS: Self = Self {
+        lane: 0,
+        first_segment: 1,
+        first_batch: 1,
+        next_batch: 1,
+    };
+
+    /// Genesis floor for one lane.
+    #[must_use]
+    pub const fn for_lane(lane: u16) -> Self {
+        Self {
+            lane,
+            first_segment: 1,
+            first_batch: 1,
+            next_batch: 1,
+        }
+    }
+}
+
+/// Strict summary of one sealed segment for the reclamation planner: its
+/// first batch sequence plus every record's tablet and commit, in file
+/// order. Sealed segments are immutable, so this summary is stable.
+#[derive(Debug, Clone)]
+pub struct SealedSegmentSummary {
+    /// Segment scanned.
+    pub segment: u64,
+    /// First batch sequence (`None` for header-only segments).
+    pub first_batch_seq: Option<u64>,
+    /// Every record's tablet and commit position, in file order.
+    pub records: Vec<(TabletId, kivi_types::CommitPosition)>,
+}
+
 /// Formats a segment file name (`00000000000000000007.wal`).
 #[must_use]
 pub fn segment_file_name(segment_seq: u64) -> String {
@@ -701,6 +751,11 @@ pub struct LocalWalLane {
     file: Option<File>,
     segment_seq: u64,
     segment_bytes: u64,
+    /// First batch sequence of the active segment (unknown until the
+    /// segment's first append, then fixed: the upcoming `next_batch_seq`
+    /// at rotation time). Checkpoint floors point here when every sealed
+    /// segment has been reclaimed.
+    active_first_batch: u64,
     segments: u64,
     next_batch_seq: u64,
     stats: LaneStats,
@@ -739,6 +794,7 @@ impl LocalWalLane {
             file: None,
             segment_seq: 0,
             segment_bytes: 0,
+            active_first_batch: 1,
             segments: 0,
             next_batch_seq: 1,
             stats: LaneStats::default(),
@@ -785,6 +841,14 @@ impl LocalWalLane {
         self.next_batch_seq
     }
 
+    /// Returns the first batch sequence of the active segment (the
+    /// upcoming sequence when the active segment holds no batches yet).
+    /// Checkpoint floors resume here once every sealed segment is gone.
+    #[must_use]
+    pub fn active_first_batch(&self) -> u64 {
+        self.active_first_batch
+    }
+
     /// Discovers existing segments: counts them for rotation and admin.
     /// Full validation happens in [`recover`](Self::recover), which also
     /// re-derives the exact batch sequence.
@@ -804,6 +868,28 @@ impl LocalWalLane {
     /// Returns [`RecoveryError`] on any corruption outside a torn final
     /// tail (see the module docs for the exact rules).
     pub fn recover(&mut self) -> Result<LaneRecovery, RecoveryError> {
+        self.recover_from(LaneFloor::for_lane(self.lane))
+    }
+
+    /// Recovers starting at a reclamation floor: segments below
+    /// `floor.first_segment` are ignored entirely (reclaim leftovers or
+    /// reappeared deletions — harmless by checkpoint-cut semantics),
+    /// retained segments must be contiguous from the floor, and the first
+    /// batch must carry `floor.first_batch` (validating the floor record
+    /// itself). Post-restart numbering continues past every sequence ever
+    /// observed, so names are never reused.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecoveryError`] when a retained segment is missing or any
+    /// retained content fails validation — same loud rules as [`recover`](Self::recover).
+    #[allow(clippy::too_many_lines)]
+    pub fn recover_from(&mut self, floor: LaneFloor) -> Result<LaneRecovery, RecoveryError> {
+        if floor.lane != self.lane {
+            return Err(RecoveryError::Misdirected {
+                reason: "WAL floor names a different lane",
+            });
+        }
         let mut seqs =
             segment_seqs(&self.dir, self.lane).map_err(|_| RecoveryError::CorruptSegment {
                 lane: self.lane,
@@ -811,21 +897,41 @@ impl LocalWalLane {
                 reason: "unreadable lane directory",
             })?;
         seqs.sort_unstable();
-        for (offset, found) in (1u64..).zip(seqs.iter()) {
-            if *found != offset {
+        let retained: Vec<u64> = seqs
+            .iter()
+            .copied()
+            .filter(|seq| *seq >= floor.first_segment)
+            .collect();
+        if let Some(first) = retained.first() {
+            if *first != floor.first_segment {
                 return Err(RecoveryError::SegmentGap {
                     lane: self.lane,
-                    expected: offset,
-                    found: *found,
+                    expected: floor.first_segment,
+                    found: *first,
                 });
+            }
+            for (offset, found) in (floor.first_segment..).zip(retained.iter()) {
+                if *found != offset {
+                    return Err(RecoveryError::SegmentGap {
+                        lane: self.lane,
+                        expected: offset,
+                        found: *found,
+                    });
+                }
             }
         }
         let mut records = Vec::new();
         let mut truncated_bytes = 0u64;
-        let mut expected_batch = 1u64;
-        let last = seqs.last().copied();
-        for seq in &seqs {
+        let mut expected_batch = floor.first_batch.max(1);
+        let last = retained.last().copied();
+        for seq in &retained {
             let is_last = Some(*seq) == last;
+            if is_last {
+                // The active tail resumes here: its first batch is
+                // whatever sequence stands next (or the upcoming one for
+                // a header-only tail).
+                self.active_first_batch = expected_batch;
+            }
             let path = self.dir.join(segment_file_name(*seq));
             let bytes = read_segment_capped(&path, self.target_bytes).map_err(|_| {
                 RecoveryError::CorruptSegment {
@@ -859,11 +965,25 @@ impl LocalWalLane {
             }
         }
         self.segments = seqs.len() as u64;
-        self.segment_seq = last.unwrap_or(0);
-        self.next_batch_seq = expected_batch;
+        // Numbering never reuses: continue past the highest sequence ever
+        // observed (including ignored reclaim leftovers), or resume exactly
+        // at the floor when nothing is on disk.
+        self.segment_seq = retained.last().copied().unwrap_or_else(|| {
+            seqs.last()
+                .copied()
+                .unwrap_or(0)
+                .max(floor.first_segment.saturating_sub(1))
+        });
+        self.next_batch_seq = expected_batch.max(floor.next_batch.max(1));
+        if retained.is_empty() {
+            // Nothing retained: the next segment starts fresh, so its
+            // first batch is the watermark itself.
+            self.active_first_batch = self.next_batch_seq;
+        }
         tracing::info!(
             lane = self.lane,
-            segments = seqs.len(),
+            segments = retained.len(),
+            ignored = seqs.len().saturating_sub(retained.len()),
             batches = expected_batch.saturating_sub(1),
             records = records.len(),
             truncated_bytes,
@@ -872,9 +992,117 @@ impl LocalWalLane {
         Ok(LaneRecovery {
             lane: self.lane,
             records,
-            segments_scanned: seqs.len() as u64,
+            segments_scanned: retained.len() as u64,
             truncated_bytes,
         })
+    }
+
+    /// Lists sealed segment sequences (every present segment except the
+    /// active tail), oldest first. The reclamation planner decides from
+    /// these; rotation and recovery own the active tail.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurabilityError`] when the lane directory is unreadable.
+    pub fn sealed_segments(&self) -> Result<Vec<u64>, DurabilityError> {
+        let mut seqs = segment_seqs(&self.dir, self.lane)?;
+        seqs.sort_unstable();
+        seqs.retain(|seq| *seq != self.segment_seq);
+        Ok(seqs)
+    }
+
+    /// Seals the active segment now by rotating (checkpoint-time rotation
+    /// simplifies reclamation: everything sealed becomes a candidate).
+    /// No-op when no segment is open or the active segment holds only its
+    /// header.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurabilityError`] when the new segment cannot be published.
+    pub fn seal_active_segment(&mut self) -> Result<(), DurabilityError> {
+        if self.file.is_none() || self.segment_bytes <= SEGMENT_HEADER_LEN as u64 {
+            return Ok(());
+        }
+        self.rotate()
+    }
+
+    /// Scans one sealed segment strictly and summarizes it for the
+    /// reclamation planner. No torn-tail repair happens here: sealed files
+    /// end at batch boundaries, so any truncation is corruption — the
+    /// planner keeps the segment (and everything after it) on any error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecoveryError`] when the segment fails strict validation.
+    pub fn scan_sealed(&self, segment: u64) -> Result<SealedSegmentSummary, RecoveryError> {
+        let fail = |reason: &'static str| RecoveryError::CorruptSegment {
+            lane: self.lane,
+            segment,
+            reason,
+        };
+        let path = self.dir.join(segment_file_name(segment));
+        let bytes = read_segment_capped(&path, self.target_bytes)
+            .map_err(|_| fail("unreadable segment file"))?;
+        if bytes.len() == SEGMENT_HEADER_LEN {
+            // Header-only: validate the header, report no records.
+            let mut expected_batch = 1u64;
+            let mut records = Vec::new();
+            self.scan_segment(segment, &bytes, false, &mut expected_batch, &mut records)?;
+            return Ok(SealedSegmentSummary {
+                segment,
+                first_batch_seq: None,
+                records: Vec::new(),
+            });
+        }
+        if bytes.len() < SEGMENT_HEADER_LEN + BATCH_HEADER_LEN {
+            return Err(fail("sealed segment ends mid-header"));
+        }
+        let first = BatchHeaderWire::read_from_bytes(
+            &bytes[SEGMENT_HEADER_LEN..SEGMENT_HEADER_LEN + BATCH_HEADER_LEN],
+        )
+        .map_err(|_| fail("unreadable first batch header"))?;
+        let mut expected_batch = first.batch_seq.get();
+        let mut records = Vec::new();
+        self.scan_segment(segment, &bytes, false, &mut expected_batch, &mut records)?;
+        Ok(SealedSegmentSummary {
+            segment,
+            first_batch_seq: Some(first.batch_seq.get()),
+            records: records
+                .iter()
+                .map(|entry| (entry.record.tablet(), entry.record.commit()))
+                .collect(),
+        })
+    }
+
+    /// Deletes one sealed segment file and syncs the directory. Refuses
+    /// the active tail (never reclaim what is still written). Missing
+    /// files are already-gone (idempotent success); other I/O failures
+    /// propagate so the planner keeps the segment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurabilityError`] on refusal or undeletable files.
+    pub fn delete_segment(&mut self, segment: u64) -> Result<(), DurabilityError> {
+        if segment == self.segment_seq {
+            return Err(DurabilityError::InvalidConfig {
+                reason: "WAL reclamation must never remove the active segment",
+            });
+        }
+        let path = self.dir.join(segment_file_name(segment));
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(DurabilityError::io(
+                    "delete reclaimed WAL segment",
+                    &path,
+                    &error,
+                ));
+            }
+        }
+        let _ = crate::fs::sync_dir(&self.dir);
+        self.segments = self.segments.saturating_sub(1);
+        Ok(())
     }
 
     /// Appends one batch and syncs it before returning: the caller may ack
@@ -1011,6 +1239,9 @@ impl LocalWalLane {
         self.file = Some(file);
         self.segment_seq = seq;
         self.segment_bytes = SEGMENT_HEADER_LEN as u64;
+        // The new segment's first batch is whatever sequence issues next —
+        // fixed now, whatever appends first.
+        self.active_first_batch = self.next_batch_seq;
         self.segments += 1;
         tracing::debug!(lane = self.lane, segment = seq, "WAL segment rotated");
         Ok(())

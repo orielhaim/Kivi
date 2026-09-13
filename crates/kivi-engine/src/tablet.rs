@@ -18,13 +18,15 @@
 use core::fmt;
 use std::collections::{BTreeMap, HashMap};
 
+use kivi_checkpoint::layout::BandDirty;
 use kivi_state::{
     ApplyError, ApplyOutcome, DurableOutcome, Key, Mutation, ObjectStore, OpError, Operation,
     OperationResult, Prepared, StorePrepared,
 };
 use kivi_tablet::TabletDescriptor;
 use kivi_types::{
-    CommitPosition, MutationIdentity, RequestSeq, SessionId, TabletAuthority, TabletId, UnixMicros,
+    CommitPosition, MutationIdentity, NamespaceId, RequestSeq, SessionId, TabletAuthority,
+    TabletId, UnixMicros,
 };
 
 /// Local per-tablet counters. Plain integers behind the owner thread —
@@ -122,6 +124,11 @@ impl SessionDedup {
         self.outcomes.get(&seq)
     }
 
+    /// Iterates retained outcomes in sequence order (checkpoint capture).
+    pub fn outcomes(&self) -> impl Iterator<Item = (&RequestSeq, &DedupEntry)> {
+        self.outcomes.iter()
+    }
+
     /// Returns the current floor.
     #[must_use]
     pub const fn floor(&self) -> RequestSeq {
@@ -139,6 +146,27 @@ impl SessionDedup {
     pub fn is_empty(&self) -> bool {
         self.outcomes.is_empty()
     }
+}
+
+/// Read-only identity gate: the dedup decision without any state change.
+/// The commit pipeline checks this before preparing into an open batch;
+/// floor advances and outcome installs happen exactly once at apply time,
+/// in batch order, so a failed batch leaves session state untouched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IdentityGate {
+    /// Fresh identity: prepare and persist normally.
+    Admit,
+    /// Identity already completed: reply with the stored outcome.
+    Hit {
+        /// The recorded outcome.
+        outcome: DurableOutcome,
+        /// Originating opcode discriminant.
+        opcode: u8,
+    },
+    /// Identity at or below the floor: gone, never re-executable.
+    Expired,
+    /// Session window exhausted: reject before persisting anything.
+    Overloaded,
 }
 
 /// Durable preparation: what the worker must persist (if anything) before
@@ -189,7 +217,11 @@ pub enum DurablePrepared {
 fn opcode_for(mutation: &Mutation, is_persist_expiry: bool) -> u8 {
     use kivi_protocol::Opcode;
     match mutation {
-        Mutation::PutBytes { .. } => Opcode::Set,
+        // Chunked roots answer exactly like inline stores: the response
+        // shapes `Stored{version}` either way (see `operation_opcode`).
+        // Range patches answer the same `Stored{version}` shape.
+        Mutation::PutBytes { .. } | Mutation::ReplaceChunkedRoot { .. } => Opcode::Set,
+        Mutation::SpliceBytes { .. } => Opcode::SetRange,
         Mutation::Delete { .. } => Opcode::Delete,
         Mutation::CounterAdd { .. } => Opcode::CounterAdd,
         Mutation::SetExpiry { .. } => {
@@ -203,6 +235,21 @@ fn opcode_for(mutation: &Mutation, is_persist_expiry: bool) -> u8 {
     .as_u8()
 }
 
+/// Checkpoint-restored tablet state: plain data the recovery loader
+/// hands to [`LiveTablet::restore_checkpoint`].
+#[derive(Debug, Clone)]
+pub(crate) struct RestoredTablet {
+    /// Restored objects (exact versions, expiries, values).
+    pub objects: Vec<(Key, kivi_state::StoredObject)>,
+    /// Restored sessions: floor plus retained outcomes in sequence order.
+    pub sessions: Vec<RestoredSession>,
+    /// Checkpoint cut both cursors resume from.
+    pub cut: CommitPosition,
+}
+
+/// One restored session: floor plus retained outcomes in sequence order.
+pub(crate) type RestoredSession = (SessionId, RequestSeq, Vec<(RequestSeq, DedupEntry)>);
+
 /// One mutable tablet replica. `Send` (it moves between threads only at
 /// construction/migration boundaries) but used from exactly one thread at a
 /// time — the owner enforces that, not the type system.
@@ -212,7 +259,31 @@ pub struct LiveTablet {
     store: ObjectStore,
     metrics: TabletMetrics,
     next_commit: CommitPosition,
+    /// Last applied commit position (`UNASSIGNED` before the first apply).
+    /// Assign (prepare time) and apply (post-durability) are separate
+    /// steps in the batched pipeline, so two cursors are needed: assignment
+    /// reserves order, application advances truth. Recovery assigns and
+    /// applies in lockstep, keeping both identical there.
+    applied_commit: CommitPosition,
     dedup: HashMap<SessionId, SessionDedup>,
+    /// Checkpoint dirty-band tracking (`None` in ephemeral mode, which
+    /// never checkpoints: zero hot-path cost there).
+    bands: Option<BandTracker>,
+    /// Chunked-root commit journal: `(commit, manifest)` for every
+    /// `ReplaceChunkedRoot` applied here, in commit order. Append-only
+    /// history for chunk GC: the checkpoint worker prunes entries at or
+    /// below the older retained cut (then checkpoint bands plus the WAL
+    /// tail cover them), keeping everything newer as GC roots. One push
+    /// per chunked commit only — inline traffic never touches it.
+    chunked_commits: std::collections::VecDeque<(u64, kivi_types::ManifestId)>,
+}
+
+/// Dirty-band tracking for one tablet: the namespace needed to map keys
+/// to physical bands plus the bitset apply paths mark.
+#[derive(Debug, Clone)]
+struct BandTracker {
+    namespace: NamespaceId,
+    dirty: BandDirty,
 }
 
 impl LiveTablet {
@@ -240,8 +311,45 @@ impl LiveTablet {
             store: ObjectStore::new(),
             metrics: TabletMetrics::default(),
             next_commit: CommitPosition::UNASSIGNED,
+            applied_commit: CommitPosition::UNASSIGNED,
             dedup: HashMap::new(),
+            bands: None,
+            chunked_commits: std::collections::VecDeque::new(),
         })
+    }
+
+    /// Enables checkpoint dirty-band tracking for `namespace`. Durable
+    /// workers call this once at startup; ephemeral tablets never do, so
+    /// their apply paths pay no hashing cost.
+    pub fn enable_band_tracking(&mut self, namespace: NamespaceId) {
+        self.bands = Some(BandTracker {
+            namespace,
+            dirty: kivi_checkpoint::layout::BandDirty::clean(),
+        });
+    }
+
+    /// Returns the dirty-band bitset, if tracking is enabled.
+    #[must_use]
+    pub fn dirty_bands(&self) -> Option<&BandDirty> {
+        self.bands.as_ref().map(|tracker| &tracker.dirty)
+    }
+
+    /// Marks the physical checkpoint band holding `key` dirty. No-op when
+    /// tracking is disabled. An unmappable key (unsupported layout — only
+    /// reachable if formats evolve past this build) fails closed: callers
+    /// surface it rather than silently losing dirt.
+    fn note_key_dirty(&mut self, key: &Key) {
+        if let Some(tracker) = self.bands.as_mut() {
+            match kivi_checkpoint::BandLayout::V1.band_of(tracker.namespace, key.as_bytes()) {
+                Some(band) => tracker.dirty.mark(band),
+                None => {
+                    // Layout evolution past this build must be loud, not
+                    // silently untracked. Every apply path funnels through
+                    // here, so one panic site covers all mutations.
+                    panic!("band layout cannot map keys: checkpoint tracking is stale");
+                }
+            }
+        }
     }
 
     /// Returns the tablet identity.
@@ -334,6 +442,47 @@ impl LiveTablet {
         }
     }
 
+    /// Checks one retry identity against session state without changing
+    /// anything: the read-only half of the dedup decision. The commit
+    /// pipeline calls this before preparing into an open batch; floor
+    /// advances and outcome installs happen at apply time instead.
+    pub(crate) fn check_identity(&self, marker: &MutationIdentity) -> IdentityGate {
+        let Some(session) = self.dedup.get(&marker.client.session()) else {
+            return IdentityGate::Admit;
+        };
+        // The check runs against the floor this identity would install:
+        // preparation advances the floor before deciding, so an
+        // adversarial (or replayed) ack at or above the sequence fails
+        // closed here exactly as it would on the immediate path.
+        let floor = session.floor().as_u64().max(marker.ack_floor.as_u64());
+        let seq = marker.client.seq();
+        if seq.as_u64() <= floor {
+            // Unreachable for well-formed clients (the floor only
+            // passes consecutively completed sequences, and a live
+            // identity is never completed beneath itself), but a
+            // violated invariant must fail closed — never re-execute.
+            return IdentityGate::Expired;
+        }
+        if let Some(entry) = session.get(seq) {
+            return IdentityGate::Hit {
+                outcome: entry.outcome.clone(),
+                opcode: entry.opcode,
+            };
+        }
+        if session.len() >= SESSION_OUTCOME_CAP {
+            return IdentityGate::Overloaded;
+        }
+        IdentityGate::Admit
+    }
+
+    /// Advances one session's floor (durable apply path only). Floor moves
+    /// only forward and only over client-acknowledged sequences.
+    pub(crate) fn advance_session_floor(&mut self, session: SessionId, ack: RequestSeq) {
+        if let Some(state) = self.dedup.get_mut(&session) {
+            state.advance_floor(ack);
+        }
+    }
+
     /// Prepares one operation for the durable pipeline: dedup lookup and
     /// floor advance first, then store preparation. Never persists, never
     /// mutates logical state — the caller persists exactly what this
@@ -354,28 +503,19 @@ impl LiveTablet {
         now: UnixMicros,
     ) -> Result<DurablePrepared, TabletError> {
         if let Some(marker) = identity {
+            match self.check_identity(marker) {
+                IdentityGate::Expired => return Ok(DurablePrepared::Expired),
+                IdentityGate::Hit { outcome, opcode } => {
+                    return Ok(DurablePrepared::DedupHit { outcome, opcode });
+                }
+                IdentityGate::Overloaded => return Ok(DurablePrepared::Overloaded),
+                IdentityGate::Admit => {}
+            }
             let session = self
                 .dedup
                 .entry(marker.client.session())
                 .or_insert_with(SessionDedup::empty);
             session.advance_floor(marker.ack_floor);
-            let seq = marker.client.seq();
-            if seq.as_u64() <= session.floor().as_u64() {
-                // Unreachable for well-formed clients (the floor only
-                // passes consecutively completed sequences, and a live
-                // identity is never completed beneath itself), but a
-                // violated invariant must fail closed — never re-execute.
-                return Ok(DurablePrepared::Expired);
-            }
-            if let Some(entry) = session.get(seq) {
-                return Ok(DurablePrepared::DedupHit {
-                    outcome: entry.outcome.clone(),
-                    opcode: entry.opcode,
-                });
-            }
-            if session.len() >= SESSION_OUTCOME_CAP {
-                return Ok(DurablePrepared::Overloaded);
-            }
         }
         match self.store.prepare_durable(op, now)? {
             StorePrepared::Read(result) => Ok(DurablePrepared::Read(result)),
@@ -415,6 +555,34 @@ impl LiveTablet {
         self.next_commit
     }
 
+    /// Returns the last applied commit position (`UNASSIGNED` before the
+    /// first apply). Checkpoint cuts and recovery floors read this, never
+    /// the assignment cursor: only applied positions are durable truth.
+    #[must_use]
+    pub const fn applied_commit(&self) -> CommitPosition {
+        self.applied_commit
+    }
+
+    /// Advances the applied cursor after a verified apply. The caller must
+    /// have applied exactly `applied.next()` — contiguity is checked by
+    /// the commit paths, not here.
+    fn set_applied(&mut self, commit: CommitPosition) {
+        self.applied_commit = commit;
+    }
+
+    /// Rewinds the commit sequence to a pre-batch position. The commit
+    /// pipeline calls this only when a sealed batch fails persistence:
+    /// nothing was written, so the burned positions are safely reusable
+    /// and recovery chains stay contiguous. Never called after any
+    /// persistence of the rewound positions (that would fork history).
+    pub(crate) fn rewind_commit(&mut self, base: CommitPosition) {
+        debug_assert!(
+            base.as_u64() <= self.next_commit.as_u64(),
+            "commit rewind must move backwards"
+        );
+        self.next_commit = base;
+    }
+
     /// Commits a persisted mutation: applies it, verifies the outcome
     /// against the persisted expectation, installs dedup, and returns the
     /// reply outcome.
@@ -422,6 +590,11 @@ impl LiveTablet {
     /// A verification mismatch is process-fatal (panic): durable truth now
     /// exists, so returning a normal recoverable error would be dishonest.
     /// On restart, replay applies the same durable mutation.
+    ///
+    /// Application must arrive in assignment order: the applied cursor
+    /// advances contiguously, so a batch applies 1,2,3 — never 1,3,2.
+    /// Out-of-order or repeated application is process-fatal for the same
+    /// reason as a value mismatch.
     ///
     /// # Errors
     ///
@@ -433,7 +606,7 @@ impl LiveTablet {
     ///
     /// Panics when re-application diverges from the persisted expectation
     /// (corruption, semantic incompatibility, or a deterministic-apply
-    /// bug).
+    /// bug), or when commits apply out of order.
     ///
     /// # Panics
     ///
@@ -449,7 +622,14 @@ impl LiveTablet {
         commit: CommitPosition,
         now: UnixMicros,
     ) -> Result<OperationResult, TabletError> {
-        debug_assert_eq!(self.next_commit, commit);
+        assert_eq!(
+            self.applied_commit
+                .next()
+                .expect("applied cursor cannot exhaust before assignment does"),
+            commit,
+            "durable commits must apply in assignment order on tablet {}",
+            self.id.as_u64(),
+        );
         let outcome = self.store.apply(mutation, now)?;
         let result = kivi_state::outcome_for(mutation, &outcome, is_persist_expiry);
         assert_eq!(
@@ -459,6 +639,9 @@ impl LiveTablet {
             self.id.as_u64(),
             commit.as_u64(),
         );
+        self.set_applied(commit);
+        self.note_key_dirty(mutation.key());
+        self.note_chunked_commit(commit, mutation);
         if let Some(marker) = identity {
             self.install_dedup(
                 marker.client.session(),
@@ -475,8 +658,24 @@ impl LiveTablet {
         Ok(result)
     }
 
+    /// Records a chunked root's commit in the GC journal. Called on every
+    /// path that installs a `ReplaceChunkedRoot`: live apply, WAL replay,
+    /// and checkpoint restore (which conservatively files restored roots
+    /// under the restore cut — retention-longer, never shorter).
+    fn note_chunked_commit(&mut self, commit: CommitPosition, mutation: &Mutation) {
+        if let Mutation::ReplaceChunkedRoot { manifest, .. } = mutation {
+            self.chunked_commits.push_back((commit.as_u64(), *manifest));
+        }
+    }
+
     /// Commits a persisted terminal outcome (no mutation to apply):
     /// installs dedup and returns the outcome for reply.
+    ///
+    /// # Panics
+    ///
+    /// Panics on out-of-order commits or an exhausted commit cursor: both
+    /// are coordinator bugs that must fail closed, never silently reorder
+    /// durable history.
     pub fn commit_terminal(
         &mut self,
         outcome: &DurableOutcome,
@@ -484,7 +683,15 @@ impl LiveTablet {
         commit: CommitPosition,
         opcode: u8,
     ) -> DurableOutcome {
-        debug_assert_eq!(self.next_commit, commit);
+        assert_eq!(
+            self.applied_commit
+                .next()
+                .expect("applied cursor cannot exhaust before assignment does"),
+            commit,
+            "durable commits must apply in assignment order on tablet {}",
+            self.id.as_u64(),
+        );
+        self.set_applied(commit);
         if let Some(marker) = identity {
             self.install_dedup(
                 marker.client.session(),
@@ -518,8 +725,11 @@ impl LiveTablet {
         now: UnixMicros,
     ) -> Result<(), kivi_durability::RecoveryError> {
         use kivi_durability::RecoveryError;
+        // Recovery assigns and applies in lockstep, so the check runs
+        // against the applied cursor (identical to the assignment cursor
+        // here) and both advance together.
         let expected_pos = self
-            .next_commit
+            .applied_commit
             .next()
             .map_err(|_| RecoveryError::ChainBreak {
                 tablet: self.id.as_u64(),
@@ -548,6 +758,9 @@ impl LiveTablet {
             });
         }
         self.next_commit = commit;
+        self.set_applied(commit);
+        self.note_key_dirty(mutation.key());
+        self.note_chunked_commit(commit, mutation);
         if let Some(marker) = identity {
             self.install_dedup(
                 marker.client.session(),
@@ -579,8 +792,9 @@ impl LiveTablet {
         opcode: u8,
     ) -> Result<(), kivi_durability::RecoveryError> {
         use kivi_durability::RecoveryError;
+        // Lockstep like the mutation path above: check applied, advance both.
         let expected_pos = self
-            .next_commit
+            .applied_commit
             .next()
             .map_err(|_| RecoveryError::ChainBreak {
                 tablet: self.id.as_u64(),
@@ -595,6 +809,7 @@ impl LiveTablet {
             });
         }
         self.next_commit = commit;
+        self.set_applied(commit);
         if let Some(marker) = identity {
             self.install_dedup(
                 marker.client.session(),
@@ -635,13 +850,130 @@ impl LiveTablet {
         self.dedup.get(&session)
     }
 
+    /// Collects the chunked-commit journal, pruning entries at or below
+    /// `prune_through` (the older retained cut: checkpoint bands plus the
+    /// WAL floor cover them from here on). Returns the retained remainder
+    /// in commit order for the checkpoint worker's GC roots.
+    pub(crate) fn collect_chunked_journal(
+        &mut self,
+        prune_through: u64,
+    ) -> Vec<(u64, kivi_types::ManifestId)> {
+        while self
+            .chunked_commits
+            .front()
+            .is_some_and(|(commit, _)| *commit <= prune_through)
+        {
+            self.chunked_commits.pop_front();
+        }
+        self.chunked_commits.iter().copied().collect()
+    }
+
+    /// Captures a logically immutable checkpoint view at the current
+    /// committed cut. The view shares value bytes with committed state
+    /// (cheap clones) and takes the dirty bands (clearing the live set).
+    /// Open batches are definitionally excluded: only applied positions
+    /// are durable truth, so capture never waits and never sees
+    /// speculation. Serialization happens off the hot worker from this
+    /// view — the first step of the future COW/MVCC checkpoint model.
+    pub fn capture_view(&mut self, namespace: NamespaceId) -> kivi_checkpoint::TabletSnapshot {
+        use kivi_checkpoint::{OutcomeCheckpoint, SessionCheckpoint};
+        let mut sessions: Vec<SessionCheckpoint> = self
+            .dedup
+            .iter()
+            .map(|(session, state)| SessionCheckpoint {
+                session: *session,
+                floor: state.floor(),
+                outcomes: state
+                    .outcomes()
+                    .map(|(seq, entry)| OutcomeCheckpoint {
+                        seq: *seq,
+                        commit: entry.commit,
+                        opcode: entry.opcode,
+                        outcome: entry.outcome.clone(),
+                    })
+                    .collect(),
+            })
+            .collect();
+        sessions.sort_by_key(|session| session.session.as_u128());
+        let dirty = self
+            .bands
+            .as_mut()
+            .map_or_else(BandDirty::clean, |tracker| {
+                std::mem::replace(&mut tracker.dirty, BandDirty::clean())
+            });
+        kivi_checkpoint::TabletSnapshot {
+            namespace,
+            tablet: self.id,
+            epoch: self.authority.epoch(),
+            guard: self.authority.guard(),
+            cut: self.applied_commit,
+            objects: self.store.snapshot_entries(),
+            sessions,
+            dirty,
+        }
+    }
+
+    /// Installs checkpoint-restored state: objects, dedup sessions, and
+    /// both commit cursors at the cut. Recovery calls this before
+    /// replaying the WAL tail; the tail's chain validation resumes from
+    /// the cut exactly as if the tablet had applied it live.
+    pub(crate) fn restore_checkpoint(&mut self, restored: RestoredTablet) {
+        debug_assert!(
+            restored.cut.as_u64() >= self.applied_commit.as_u64(),
+            "checkpoint restore must not move the cut backwards"
+        );
+        for (key, object) in restored.objects {
+            if let Some(chunked) = object.chunk_ref() {
+                // Conservative filing under the restore cut (see
+                // `note_chunked_commit`): retention-longer, never shorter.
+                self.chunked_commits
+                    .push_back((restored.cut.as_u64(), chunked.manifest));
+            }
+            self.store.put_stored(key, object);
+        }
+        for (session, floor, outcomes) in restored.sessions {
+            let mut state = SessionDedup::empty();
+            state.advance_floor(floor);
+            for (seq, entry) in outcomes {
+                state.outcomes.insert(seq, entry);
+            }
+            self.dedup.insert(session, state);
+        }
+        self.next_commit = restored.cut;
+        self.applied_commit = restored.cut;
+    }
+
     /// Reclaims up to `limit` expired objects through explicit delete
     /// mutations, returning each reclaimed key with its outcome. Bounded by
     /// `limit` so reclamation never starves foreground work; the driver
     /// repeats sweeps until `collect_expired` comes back empty.
     pub fn sweep_expired(&mut self, now: UnixMicros, limit: usize) -> Vec<(Key, ApplyOutcome)> {
+        self.sweep_expired_except(now, limit, None)
+    }
+
+    /// Reclaims expired objects like [`sweep_expired`](Self::sweep_expired)
+    /// but never touches keys in `skip`. The commit pipeline passes its
+    /// staged keys so a sweep cannot delete a key whose prediction is
+    /// already batched (which would diverge post-durability verification).
+    /// Skipped keys simply wait for the next sweep.
+    pub fn sweep_expired_except(
+        &mut self,
+        now: UnixMicros,
+        limit: usize,
+        skip: Option<&std::collections::HashSet<Key>>,
+    ) -> Vec<(Key, ApplyOutcome)> {
+        // Over-fetch past skipped keys so a batch-staged prefix cannot
+        // starve reclamation behind it; the reclaim bound below still
+        // holds exactly.
+        let extra = skip.map_or(0, std::collections::HashSet::len);
         let mut reclaimed = Vec::new();
-        for key in self.store.collect_expired(now, limit) {
+        for key in self.store.collect_expired(now, limit + extra) {
+            if reclaimed.len() >= limit {
+                break;
+            }
+            if skip.is_some_and(|touched| touched.contains(&key)) {
+                continue;
+            }
             // Delete of a swept key cannot fail (no error paths exist for it);
             // a hypothetical failure would simply leave the key for the next
             // sweep, so skipping is the safe direction.
@@ -652,6 +984,7 @@ impl LiveTablet {
                 self.metrics.writes += 1;
                 self.metrics.ops_total += 1;
                 self.metrics.expired_reclaimed += 1;
+                self.note_key_dirty(&key);
                 reclaimed.push((key, outcome));
             }
         }
@@ -667,7 +1000,16 @@ impl fmt::Debug for LiveTablet {
             .field("store", &self.store)
             .field("metrics", &self.metrics)
             .field("next_commit", &self.next_commit)
-            .field("dedup_sessions", &self.dedup.len())
+            .field("applied_commit", &self.applied_commit)
+            .field("dedup", &self.dedup.len())
+            .field("chunked_commits", &self.chunked_commits.len())
+            .field(
+                "bands",
+                &self
+                    .bands
+                    .as_ref()
+                    .map(|tracker| tracker.dirty.dirty_count()),
+            )
             .finish()
     }
 }

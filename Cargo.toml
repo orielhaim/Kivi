@@ -12,6 +12,8 @@ members = [
     "crates/kivi-client",
     "crates/kivi-server",
     "crates/kivi-durability",
+    "crates/kivi-checkpoint",
+    "crates/kivi-chunk",
 ]
 
 [workspace.package]
@@ -29,21 +31,28 @@ kivi-protocol = { path = "crates/kivi-protocol", version = "0.1.0" }
 kivi-client = { path = "crates/kivi-client", version = "0.1.0" }
 kivi-engine = { path = "crates/kivi-engine", version = "0.1.0" }
 kivi-durability = { path = "crates/kivi-durability", version = "0.1.0" }
+kivi-checkpoint = { path = "crates/kivi-checkpoint", version = "0.1.0" }
+kivi-chunk = { path = "crates/kivi-chunk", version = "0.1.0" }
 
 # Mechanism crates borrowed per RFC §209 ("borrow mechanisms, own semantics").
 # The project owns all wire/durable formats; these crates never define them.
 blake3 = "1.8"
 crc32c = "0.6"
+# Checkpoint band compression experiment (RFC §217: lz4_flex for hot/warm).
+lz4_flex = "0.14"
 
 # Test-only framework for table-driven tests and fixtures. Never ships in
 # library code or durable formats.
 rstest = "0.27"
 
-# Production mechanisms (each justified at its use site).
 hashbrown = "0.17"
 bytes = "1.12"
 arc-swap = "1.9"
 crossbeam-channel = "0.5"
+# Runtime-agnostic async frame handoff (conn reader task to serving task):
+# channel timeouts cancel no socket reads, so wakeups can never swallow
+# pipelined bytes. No runtime, no I/O of its own.
+async-channel = "2.5"
 getrandom = "0.4"
 compio = { version = "0.19", features = ["net", "time"] }
 core_affinity2 = "0.16"
@@ -53,7 +62,6 @@ clap = { version = "4", features = ["derive"] }
 hdrhistogram = "7.6"
 thiserror = "2.0"
 anyhow = "1.0"
-# zerocopy 0.9 is pre-release (alpha); the stable track is 0.8.
 zerocopy = { version = "0.8", features = ["derive"] }
 bitflags = "2.13"
 

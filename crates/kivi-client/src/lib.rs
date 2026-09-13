@@ -29,10 +29,11 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use bytes::Bytes;
-use crossbeam_channel::{Sender, bounded};
+use crossbeam_channel::{Sender, bounded, unbounded};
 use kivi_protocol::{
-    Capabilities, ClientHello, DEFAULT_MAX_FRAME, Frame, FrameKind, FrameReader, ProtocolError,
-    RequestId, Response, ResponseBody, ServerHello, Status, encode_frame,
+    Capabilities, ClientHello, DEFAULT_MAX_FRAME, Frame, FrameKind, FrameReader,
+    MAX_STREAM_UPLOAD_BYTES, ProtocolError, RequestId, Response, ResponseBody, ServerHello, Status,
+    StreamAbort, StreamBegin, encode_frame,
 };
 use kivi_state::{Key, PartitionHasher};
 use kivi_types::{NamespaceId, RequestIdentity, RequestSeq, SessionId, UnixMicros, WorkerId};
@@ -85,6 +86,14 @@ pub struct ClientConfig {
     pub dial_backoff: Duration,
     /// Ambiguous-delivery retries per mutating request.
     pub delivery_retries: u32,
+    /// Adopt an existing mutation session instead of minting a fresh
+    /// random one. `None` (the default) mints; `Some` resumes: the client
+    /// speaks as that session, so retries of its uncompleted sequences
+    /// dedup-hit server-side instead of executing twice. Resuming is the
+    /// application-level exactly-once primitive — pair it with explicit
+    /// sequences (`set_with_seq`, `counter_add_with_seq`) naming the
+    /// sequences to resume.
+    pub session: Option<SessionId>,
 }
 
 impl Default for ClientConfig {
@@ -102,6 +111,7 @@ impl Default for ClientConfig {
             dial_attempts: DEFAULT_DIAL_ATTEMPTS,
             dial_backoff: DEFAULT_DIAL_BACKOFF,
             delivery_retries: DEFAULT_DELIVERY_RETRIES,
+            session: None,
         }
     }
 }
@@ -198,8 +208,28 @@ fn backoff(base: Duration, attempt: u32) {
     std::thread::sleep(shifted.min(MAX_RETRY_BACKOFF));
 }
 
+/// One stream event arriving on the background reader: upload control
+/// (`Ready`, the final `Response`, `Abort`) or download frames
+/// (`ValueBegin`, `ValueData`, `ValueEnd`).
+#[derive(Debug)]
+enum StreamEvent {
+    /// Server accepted the upload; client must cap data frames here.
+    Ready(u32),
+    /// Upload committed: the ordinary stored response under the stream id.
+    Committed(Response),
+    /// Either side aborted: the stream is over, nothing was committed.
+    Aborted(String),
+    /// A streamed read starts; this many data bytes follow.
+    ValueBegin(u64),
+    /// Verbatim value bytes (already capped per frame by the server).
+    ValueData(Vec<u8>),
+    /// The streamed read completed exactly (byte count already checked).
+    ValueEnd,
+}
+
 /// One pooled connection: a mutex-serialized writer plus a background reader
-/// dispatching responses to per-request rendezvous channels by id.
+/// dispatching responses to per-request rendezvous channels by id, and
+/// stream frames to per-stream rendezvous by stream id.
 #[derive(Debug)]
 struct Connection {
     worker: WorkerId,
@@ -207,6 +237,7 @@ struct Connection {
     server_caps: Capabilities,
     writer: Mutex<TcpStream>,
     pending: Arc<Mutex<HashMap<u64, Sender<Response>>>>,
+    streams: Arc<Mutex<HashMap<u64, crossbeam_channel::Sender<StreamEvent>>>>,
     max_pending: usize,
     request_timeout: Duration,
     reader_alive: Arc<AtomicBool>,
@@ -219,6 +250,14 @@ impl Connection {
     fn durable_dedup(&self) -> bool {
         self.server_caps
             .contains(Capabilities::DURABLE_MUTATION_DEDUP)
+    }
+
+    /// Whether this connection's server speaks chunk-fabric streaming
+    /// (upload and streamed-read frames). Streaming calls check this
+    /// before sending anything, so a legacy server fails fast with
+    /// `Unsupported` instead of a violation.
+    fn streaming(&self) -> bool {
+        self.server_caps.contains(Capabilities::STREAMING)
     }
 
     /// Dials, handshakes, and spawns the reader thread. Validates the hello
@@ -309,13 +348,19 @@ impl Connection {
         let pending: Arc<Mutex<HashMap<u64, Sender<Response>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let dispatch = Arc::clone(&pending);
+        // Stream ids live in the high-bit space (request ids ascend from
+        // 1), so the two tables never share an id and the reader routes
+        // response frames by table membership without ambiguity.
+        let streams: Arc<Mutex<HashMap<u64, crossbeam_channel::Sender<StreamEvent>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let stream_dispatch = Arc::clone(&streams);
         let reader_alive = Arc::new(AtomicBool::new(true));
         let alive = Arc::clone(&reader_alive);
         let max_frame = config.max_frame.min(hello.max_frame as usize);
         let reader = std::thread::Builder::new()
             .name(format!("kivi-client-reader-{endpoint}"))
             .spawn(move || {
-                reader_loop(reader_stream, max_frame, dispatch, alive);
+                reader_loop(reader_stream, max_frame, dispatch, stream_dispatch, alive);
             })
             .map_err(|error| ClientError::Io(error.to_string()))?;
         Ok(Self {
@@ -324,6 +369,7 @@ impl Connection {
             server_caps: hello.caps,
             writer: Mutex::new(stream),
             pending,
+            streams,
             max_pending: config.max_pending,
             request_timeout: config.request_timeout,
             reader_alive,
@@ -332,9 +378,11 @@ impl Connection {
     }
 
     /// Sends one request frame and waits for its response (matched by id). A
-    /// wait that outlives its reader thread surfaces as `Io` (connection
-    /// lost, never a slow server): the reader only exits on EOF or fatal
-    /// framing failure, after which no response can arrive.
+    /// wait that outlives its reader thread surfaces as `Io` promptly
+    /// (connection lost, never a slow server): the reader drains the
+    /// rendezvous table on exit, so the stranded wait wakes at once instead
+    /// of burning the full request timeout. The reader only exits on EOF or
+    /// fatal framing failure, after which no response can arrive.
     fn round_trip(&self, id: RequestId, payload: &[u8]) -> Result<Response, ClientError> {
         let (tx, rx) = bounded::<Response>(1);
         {
@@ -379,20 +427,116 @@ impl Connection {
             pending.remove(&id);
         }
     }
+
+    /// Writes one frame on a connection. Each frame holds the writer
+    /// mutex only for its own write: stream frames multiplex with
+    /// ordinary requests by id, so uploads never pin the connection.
+    fn send_frame(
+        conn: &Arc<Connection>,
+        kind: FrameKind,
+        id: u64,
+        payload: &[u8],
+    ) -> Result<(), ClientError> {
+        let bytes = encode_frame(kind, id, payload);
+        conn.writer
+            .lock()
+            .map_err(|_| ClientError::Io(format!("connection {} lock poisoned", conn.endpoint)))
+            .and_then(|mut stream| {
+                use std::io::Write as _;
+                stream
+                    .write_all(&bytes)
+                    .map_err(|error| ClientError::Io(error.to_string()))
+            })
+    }
+
+    /// Registers one stream rendezvous, bounding open streams like
+    /// in-flight requests (every registration pins server-side state).
+    fn register_stream(
+        conn: &Arc<Connection>,
+        id: u64,
+    ) -> Result<crossbeam_channel::Receiver<StreamEvent>, ClientError> {
+        let (tx, rx) = unbounded();
+        conn.streams
+            .lock()
+            .map_err(|_| ClientError::Io(format!("connection {} lock poisoned", conn.endpoint)))
+            .and_then(|mut table| {
+                if table.len() >= conn.max_pending {
+                    return Err(ClientError::Overloaded);
+                }
+                table.insert(id, tx);
+                Ok(rx)
+            })
+    }
+
+    /// Forgets one stream rendezvous (after completion, timeout, or abort).
+    fn unregister_stream(conn: &Arc<Connection>, id: u64) {
+        if let Ok(mut table) = conn.streams.lock() {
+            table.remove(&id);
+        }
+    }
+
+    /// Best-effort stream abort (timeout hygiene: frees server-side
+    /// assembler state). Delivery failure is ignored — the connection
+    /// itself is already suspect when this runs.
+    fn abort_stream(conn: &Arc<Connection>, id: u64, reason: &str) {
+        let _ = Connection::send_frame(
+            conn,
+            FrameKind::StreamAbort,
+            id,
+            &StreamAbort {
+                reason: reason.to_owned(),
+            }
+            .encode(),
+        );
+    }
+
+    /// Waits for one stream event. Timeouts and dead readers surface like
+    /// `round_trip` (`Timeout` vs `Io` via the reader liveness check), so
+    /// stalled streams never hang past the request timeout.
+    fn await_stream_event(
+        conn: &Arc<Connection>,
+        rx: &crossbeam_channel::Receiver<StreamEvent>,
+    ) -> Result<StreamEvent, ClientError> {
+        match rx.recv_timeout(conn.request_timeout) {
+            Ok(event) => Ok(event),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                if conn.reader_alive.load(Ordering::SeqCst) {
+                    Err(ClientError::Timeout)
+                } else {
+                    Err(ClientError::Io(format!(
+                        "connection {} reader ended mid-stream",
+                        conn.endpoint
+                    )))
+                }
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                if conn.reader_alive.load(Ordering::SeqCst) {
+                    Err(ClientError::Internal("stream rendezvous lost".to_owned()))
+                } else {
+                    Err(ClientError::Io(format!(
+                        "connection {} reader ended mid-stream",
+                        conn.endpoint
+                    )))
+                }
+            }
+        }
+    }
 }
 
-/// Background reader: frames → responses → per-id rendezvous. Ends on EOF,
-/// timeout-free; pending waiters fail via their own timeouts or the next
-/// connection teardown. Malformed frames end the connection (pending
-/// responses fail when their waiters time out or the pool drops the conn).
-/// Takes the table by value: the reader thread owns its dispatch handle.
-/// Clears `alive` on exit so waits can distinguish a dead connection
-/// (redial) from a slow server (timeout).
+/// Background reader: frames → responses → per-id rendezvous, plus stream
+/// frames → per-stream rendezvous. Ends on EOF, timeout-free. On exit both
+/// tables drain: dropping every waiter wakes blocked calls at once with a
+/// channel disconnect (surfaced as `Io` by the `reader_alive` check),
+/// instead of stranding each one until its full timeout. Malformed frames
+/// end the connection the same way. Takes the tables by value: the reader
+/// thread owns its dispatch handles. Clears `alive` on exit so waits can
+/// distinguish a dead connection (redial) from a slow server (timeout).
 #[allow(clippy::needless_pass_by_value)]
 fn reader_loop(
     mut stream: TcpStream,
     max_frame: usize,
     pending: Arc<Mutex<HashMap<u64, Sender<Response>>>>,
+    streams: Arc<Mutex<HashMap<u64, crossbeam_channel::Sender<StreamEvent>>>>,
     alive: Arc<AtomicBool>,
 ) {
     let mut reader = FrameReader::new(max_frame);
@@ -406,22 +550,146 @@ fn reader_loop(
             break;
         };
         for frame in frames {
-            if frame.kind != FrameKind::Response {
-                continue;
-            }
-            let Ok((response, _)) = Response::decode(&frame.payload) else {
-                continue;
-            };
-            let waiter = pending
-                .lock()
-                .ok()
-                .and_then(|mut table| table.remove(&frame.request_id));
-            if let Some(tx) = waiter {
-                let _ = tx.try_send(response);
-            }
+            dispatch_frame(&frame, &pending, &streams);
         }
     }
     alive.store(false, Ordering::SeqCst);
+    // Fail-fast stranded waiters: dropping every rendezvous sender wakes
+    // each blocked `round_trip` at once (its `recv` errors immediately and
+    // the `reader_alive` check below reports `Io`, i.e. redial). Without
+    // this, every in-flight request on a dead connection burns its full
+    // request timeout before noticing — a ~30s stall per dead connection
+    // under load, exactly the tail this fixes. Off the hot path: runs once
+    // per connection death.
+    if let Ok(mut table) = pending.lock() {
+        let stranded = table.len();
+        if stranded > 0 {
+            tracing::warn!(
+                stranded,
+                "client connection reader exited with in-flight requests; failing them fast"
+            );
+        }
+        table.clear();
+    }
+    // Stream waiters strand the same way: dropping their senders wakes
+    // every in-flight upload and download at once.
+    if let Ok(mut table) = streams.lock() {
+        if !table.is_empty() {
+            tracing::warn!(
+                stranded = table.len(),
+                "client connection reader exited with in-flight streams; failing them fast"
+            );
+        }
+        table.clear();
+    }
+}
+
+/// Routes one frame to its rendezvous. Undecodable frames are skipped
+/// (the waiter stays and times out, exactly like before streaming):
+/// framing violations already end the connection inside `reader.push`,
+/// so nothing here re-litigates the connection over one bad payload.
+/// Per-stream control decode failures degrade to that stream's abort
+/// instead: one garbled control frame must not kill healthy multiplexed
+/// streams.
+fn dispatch_frame(
+    frame: &Frame,
+    pending: &Arc<Mutex<HashMap<u64, Sender<Response>>>>,
+    streams: &Arc<Mutex<HashMap<u64, crossbeam_channel::Sender<StreamEvent>>>>,
+) {
+    use kivi_protocol::ValueStreamBegin;
+    match frame.kind {
+        FrameKind::Response => {
+            // A committed upload's final response arrives under its
+            // stream id — check the request table first (hot path),
+            // then the stream table (id spaces never overlap).
+            let Ok((response, _)) = Response::decode(&frame.payload) else {
+                return;
+            };
+            if let Some(tx) = pending
+                .lock()
+                .ok()
+                .and_then(|mut table| table.remove(&frame.request_id))
+            {
+                let _ = tx.try_send(response);
+                return;
+            }
+            if let Some(tx) = streams
+                .lock()
+                .ok()
+                .and_then(|mut table| table.remove(&frame.request_id))
+            {
+                let _ = tx.send(StreamEvent::Committed(response));
+            }
+        }
+        FrameKind::StreamReady => {
+            if let Some(tx) = streams
+                .lock()
+                .ok()
+                .and_then(|table| table.get(&frame.request_id).cloned())
+            {
+                match kivi_protocol::StreamReady::decode(&frame.payload) {
+                    Ok(ready) => {
+                        let _ = tx.send(StreamEvent::Ready(ready.max_data));
+                    }
+                    Err(_) => {
+                        let _ = tx.send(StreamEvent::Aborted("malformed stream-ready".to_owned()));
+                    }
+                }
+            }
+        }
+        FrameKind::StreamAbort => {
+            if let Some(tx) = streams
+                .lock()
+                .ok()
+                .and_then(|mut table| table.remove(&frame.request_id))
+            {
+                let reason = StreamAbort::decode(&frame.payload)
+                    .map_or_else(|_| "stream aborted".to_owned(), |abort| abort.reason);
+                let _ = tx.send(StreamEvent::Aborted(reason));
+            }
+        }
+        FrameKind::ValueStreamBegin => {
+            if let Some(tx) = streams
+                .lock()
+                .ok()
+                .and_then(|table| table.get(&frame.request_id).cloned())
+            {
+                match ValueStreamBegin::decode(&frame.payload) {
+                    Ok(begin) => {
+                        let _ = tx.send(StreamEvent::ValueBegin(begin.total_len));
+                    }
+                    Err(_) => {
+                        let _ = tx.send(StreamEvent::Aborted(
+                            "malformed value-stream-begin".to_owned(),
+                        ));
+                    }
+                }
+            }
+        }
+        FrameKind::ValueStreamData => {
+            if let Some(tx) = streams
+                .lock()
+                .ok()
+                .and_then(|table| table.get(&frame.request_id).cloned())
+            {
+                let _ = tx.send(StreamEvent::ValueData(frame.payload.to_vec()));
+            }
+        }
+        FrameKind::ValueStreamEnd => {
+            if let Some(tx) = streams
+                .lock()
+                .ok()
+                .and_then(|mut table| table.remove(&frame.request_id))
+            {
+                let _ = tx.send(StreamEvent::ValueEnd);
+            }
+        }
+        // The server never sends these on a client connection; anything
+        // else arriving here is a peer bug. Ignoring (like before) keeps
+        // one stray frame from killing healthy requests — framing
+        // violations still end the connection in `reader.push`.
+        _ => {}
+    }
 }
 
 /// Reads exactly one frame (handshake path, no pipelining yet).
@@ -440,6 +708,21 @@ fn read_one_frame(stream: &mut TcpStream, max_frame: usize) -> Result<Frame, Pro
             return Ok(frame);
         }
     }
+}
+
+/// One download attempt's outcome: finished, retry on a new route,
+/// back off and retry, redial and retry, or surface.
+enum GetOutcome {
+    /// Terminal: the value (`None` when absent).
+    Done(Option<Bytes>),
+    /// The route moved: re-resolve and re-request (reads are side-effect free).
+    Reroute,
+    /// The server is saturated: back off and re-request.
+    Overloaded,
+    /// The transport died: drop the connection, redial, re-request.
+    Reconnect,
+    /// Terminal failure.
+    Fail(ClientError),
 }
 
 /// Mutation sequence state for one client session. Sequences start at 1
@@ -473,6 +756,7 @@ struct Shared {
     routes: route::RouteCache,
     pool: Mutex<HashMap<String, Arc<Connection>>>,
     id_counter: AtomicU64,
+    stream_counter: AtomicU64,
     session: SessionId,
     seq: Mutex<SeqState>,
     requests: AtomicU64,
@@ -502,7 +786,8 @@ impl NativeClient {
     /// Builds a client from configuration (no connections yet — dialing is
     /// lazy on first use, so construction never fails on network state).
     /// One client is one mutation session: every clone shares the session
-    /// identity and its sequence space.
+    /// identity and its sequence space. Set `config.session` to resume a
+    /// session this process (or a previous one) owned before.
     ///
     /// # Errors
     ///
@@ -512,9 +797,14 @@ impl NativeClient {
         if config.seeds.is_empty() {
             return Err(ClientError::Io("no seed addresses configured".to_owned()));
         }
-        let mut random = [0u8; 16];
-        getrandom::fill(&mut random)
-            .map_err(|error| ClientError::Io(format!("session identity: {error}")))?;
+        let session = if let Some(session) = config.session {
+            session
+        } else {
+            let mut random = [0u8; 16];
+            getrandom::fill(&mut random)
+                .map_err(|error| ClientError::Io(format!("session identity: {error}")))?;
+            SessionId::from_u128(u128::from_le_bytes(random))
+        };
         Ok(Self {
             shared: Arc::new(Shared {
                 namespace: config.namespace,
@@ -531,7 +821,8 @@ impl NativeClient {
                 routes: route::RouteCache::new(),
                 pool: Mutex::new(HashMap::new()),
                 id_counter: AtomicU64::new(1),
-                session: SessionId::from_u128(u128::from_le_bytes(random)),
+                stream_counter: AtomicU64::new(1),
+                session,
                 seq: Mutex::new(SeqState {
                     next: 1,
                     acked: 0,
@@ -542,6 +833,14 @@ impl NativeClient {
                 errors: AtomicU64::new(0),
             }),
         })
+    }
+
+    /// This client's mutation session: the identity every mutation it
+    /// sends (or resumes) speaks as. Record it to resume the session
+    /// after a restart with `ClientConfig::session`.
+    #[must_use]
+    pub fn session(&self) -> SessionId {
+        self.shared.session
     }
 
     /// Returns cumulative client counters.
@@ -558,6 +857,14 @@ impl NativeClient {
     #[must_use]
     pub fn cached_routes(&self) -> usize {
         self.shared.routes.len()
+    }
+
+    /// Allocates the next stream id: the high-bit space request ids never
+    /// reach (they ascend from 1), so stream and request rendezvous never
+    /// share an id and the reader routes by table membership.
+    fn next_stream_id(&self) -> u64 {
+        let low = self.shared.stream_counter.fetch_add(1, Ordering::SeqCst);
+        (1u64 << 63) | low.max(1)
     }
 
     /// Allocates the next request identity (starts at 1, skips 0 on the
@@ -596,6 +903,40 @@ impl NativeClient {
         state.in_flight.insert(seq);
         Ok((
             RequestIdentity::new(self.shared.session, RequestSeq::from_u64(seq)),
+            RequestSeq::from_u64(state.acked),
+        ))
+    }
+
+    /// Marks one explicit sequence issued under this session: same
+    /// bookkeeping as allocation, but the caller names the sequence (a
+    /// resumed identity, never a fresh one). The sequence space advances
+    /// past it so later automatic allocation cannot collide; skipped
+    /// sequences complete past silently, so resuming out of order is safe
+    /// but reusing a completed sequence fails closed server-side
+    /// (`DedupExpired`) once the floor passes it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Internal`] when `seq` is 0 or exhausted, or
+    /// the state lock is poisoned.
+    fn adopt_seq(&self, seq: RequestSeq) -> Result<(RequestIdentity, RequestSeq), ClientError> {
+        let mut state = self
+            .shared
+            .seq
+            .lock()
+            .map_err(|_| ClientError::Internal("mutation sequence lock poisoned".to_owned()))?;
+        let raw = seq.as_u64();
+        if raw == 0 || raw == u64::MAX {
+            return Err(ClientError::Internal(
+                "explicit request sequence out of range".to_owned(),
+            ));
+        }
+        state.in_flight.insert(raw);
+        if raw >= state.next {
+            state.next = raw + 1;
+        }
+        Ok((
+            RequestIdentity::new(self.shared.session, seq),
             RequestSeq::from_u64(state.acked),
         ))
     }
@@ -649,6 +990,9 @@ impl NativeClient {
             dial_attempts: self.shared.dial_attempts,
             dial_backoff: self.shared.dial_backoff,
             delivery_retries: self.shared.delivery_retries,
+            // Transport-only redial config: the session lives in `Shared`,
+            // not the connection, so there is nothing to adopt here.
+            session: None,
         };
         let conn = Arc::new(Connection::dial(endpoint, expect_worker, &config)?);
         self.shared
@@ -657,6 +1001,29 @@ impl NativeClient {
             .map_err(|_| ClientError::Io("connection pool lock poisoned".to_owned()))?
             .insert(endpoint.to_owned(), Arc::clone(&conn));
         Ok(conn)
+    }
+
+    /// Issues one call identity: allocates fresh, or adopts the named
+    /// sequence for resumption. Returns the identity, the floor snapshot,
+    /// and the raw sequence for completion bookkeeping (`None` for reads).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Internal`] when the sequence space is
+    /// exhausted or an explicit sequence is out of range.
+    fn issue_identity(
+        &self,
+        mutating: bool,
+        seq: Option<RequestSeq>,
+    ) -> Result<Option<(RequestIdentity, RequestSeq, u64)>, ClientError> {
+        if !mutating {
+            return Ok(None);
+        }
+        let (identity, floor) = match seq {
+            Some(explicit) => self.adopt_seq(explicit)?,
+            None => self.alloc_seq()?,
+        };
+        Ok(Some((identity, floor, identity.seq().as_u64())))
     }
 
     /// Executes one request payload against the authority for `key`,
@@ -669,6 +1036,21 @@ impl NativeClient {
         opcode: kivi_protocol::Opcode,
         build: impl Fn() -> kivi_protocol::Request,
     ) -> Result<Response, ClientError> {
+        self.execute_with_seq(key, opcode, build, None)
+    }
+
+    /// Executes one request, naming the mutation sequence explicitly when
+    /// `seq` is `Some` (session resumption: the identity must have been
+    /// issued under this session before — e.g., sent but unacknowledged
+    /// across a crash — so the server dedups it instead of executing
+    /// twice). `None` allocates a fresh sequence. Reads ignore `seq`.
+    fn execute_with_seq(
+        &self,
+        key: &Key,
+        opcode: kivi_protocol::Opcode,
+        build: impl Fn() -> kivi_protocol::Request,
+        seq: Option<RequestSeq>,
+    ) -> Result<Response, ClientError> {
         use kivi_protocol::Status;
         let hash = PartitionHasher::V1
             .hash(self.shared.namespace, key.as_bytes())
@@ -679,12 +1061,9 @@ impl NativeClient {
         let mutating = opcode.is_mutating();
         // One identity per typed call. The floor is snapshotted once;
         // retries reuse it (a stale floor only evicts less, never wrongly).
-        let identity: Option<(RequestIdentity, RequestSeq, u64)> = if mutating {
-            let (identity, floor) = self.alloc_seq()?;
-            Some((identity, floor, identity.seq().as_u64()))
-        } else {
-            None
-        };
+        // Explicit sequences resume a previously issued identity; fresh
+        // sequences allocate.
+        let identity = self.issue_identity(mutating, seq)?;
         let mut redirects = 0usize;
         let mut reconnects = 0usize;
         let mut deliveries = 0u32;
@@ -810,6 +1189,7 @@ impl NativeClient {
             value: None,
             delta: 0,
             expiry: 0,
+            offset: 0,
             identity: None,
             ack_floor: RequestSeq::from_u64(0),
         })?;
@@ -837,6 +1217,7 @@ impl NativeClient {
             value: Some(value.to_vec()),
             delta: 0,
             expiry: 0,
+            offset: 0,
             identity: None,
             ack_floor: RequestSeq::from_u64(0),
         })?;
@@ -846,6 +1227,577 @@ impl NativeClient {
         }
     }
 
+    /// Patches a byte range of a value (partial update): `patch` overwrites
+    /// the value starting at `offset`, zero-padding past-the-end gaps and
+    /// clearing expiry exactly like [`set`](Self::set). Counters fail with
+    /// wrong-type; absurd ranges fail inadmittable. The patch travels in
+    /// one request frame — bulk rewrites belong on the streaming upload
+    /// path instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport/routing failure, wrong-type
+    /// access, or an inadmittable range.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn set_range(&self, key: &Key, offset: u64, patch: Bytes) -> Result<(), ClientError> {
+        use kivi_protocol::{Opcode, ResponseBody};
+        let response = self.execute(key, Opcode::SetRange, || kivi_protocol::Request {
+            namespace: self.shared.namespace,
+            opcode: Opcode::SetRange,
+            hint: None,
+            key: key.as_bytes().to_vec(),
+            value: Some(patch.to_vec()),
+            delta: 0,
+            expiry: 0,
+            offset,
+            identity: None,
+            ack_floor: RequestSeq::from_u64(0),
+        })?;
+        match response.body {
+            ResponseBody::Stored { .. } => Ok(()),
+            _ => Err(ClientError::Internal(
+                "unexpected set-range body".to_owned(),
+            )),
+        }
+    }
+
+    /// Streams a value upload of any size up to the 1 GiB stream bound:
+    /// frames carry slices while the server stages chunk by chunk, and one
+    /// commit barrier proves the manifest — neither side materializes the
+    /// value outside chunking. Values over the inline threshold land as
+    /// chunked roots and read back identically through [`get`](Self::get).
+    /// Pass `total_len` when known (the server aborts on mismatch instead
+    /// of committing short); `None` streams until `source` ends.
+    ///
+    /// Routing warms from the cache (probing when cold); a mid-upload
+    /// range move surfaces as an error and the caller retries with a
+    /// fresh source — pass an explicit sequence (see
+    /// [`put_stream_with_seq`](Self::put_stream_with_seq)) when the retry
+    /// must dedup against a possibly-committed first attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport/routing failure, a legacy
+    /// server (`Unsupported`, checked before sending anything), an
+    /// over-bound or inconsistent upload, or a lost commit response
+    /// (`AmbiguousOutcome`: the commit may have applied).
+    pub fn put_stream(
+        &self,
+        key: &Key,
+        total_len: Option<u64>,
+        source: &mut impl Read,
+    ) -> Result<(), ClientError> {
+        self.put_stream_with_seq(key, total_len, source, None)
+    }
+
+    /// Streams an upload under an explicitly named sequence of this
+    /// session (resumption: same contract as `set_with_seq` — a retried
+    /// upload with the same identity commits at most once, dedup-hitting
+    /// when the first attempt already applied). Pair with
+    /// `ClientConfig::session` to resume across restarts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport/routing failure, an
+    /// out-of-range sequence, over-bound uploads, or a lost commit
+    /// response (`AmbiguousOutcome`).
+    pub fn put_stream_with_seq(
+        &self,
+        key: &Key,
+        total_len: Option<u64>,
+        source: &mut impl Read,
+        seq: Option<RequestSeq>,
+    ) -> Result<(), ClientError> {
+        // One identity per typed call, mirroring `execute_with_seq`: fresh
+        // sequences allocate, explicit ones resume. Completed here on
+        // every terminal path so the floor can advance past it.
+        let identity = self.issue_identity(true, seq)?;
+        let outcome = self.put_stream_inner(key, total_len, source, identity.as_ref());
+        if let Some((_, _, raw)) = identity {
+            self.complete_seq(raw);
+        }
+        outcome
+    }
+
+    /// Streams a value download of any size: the server fans the value
+    /// into `ValueStream*` frames (entry by entry for chunked values, so
+    /// server memory stays flat) and the client reassembles. Returns
+    /// `None` when absent. Downloads materialize client-side, bounded by
+    /// the 1 GiB stream bound — bulk processing without materializing is
+    /// a future reader API, not this call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport/routing failure, a legacy
+    /// server (`Unsupported`, checked before sending anything),
+    /// wrong-type access, or a truncated stream (`Protocol`: the byte
+    /// count, not just the end marker, must agree).
+    pub fn get_stream(&self, key: &Key) -> Result<Option<Bytes>, ClientError> {
+        let hash = PartitionHasher::V1
+            .hash(self.shared.namespace, key.as_bytes())
+            .ok_or(ClientError::Internal(
+                "partition hash unsupported".to_owned(),
+            ))?;
+        let mut redirects = 0usize;
+        let mut reconnects = 0usize;
+        self.shared.requests.fetch_add(1, Ordering::Relaxed);
+        loop {
+            if redirects > self.shared.max_redirects {
+                self.shared.errors.fetch_add(1, Ordering::Relaxed);
+                return Err(ClientError::TooManyRedirects);
+            }
+            let (endpoint, hint) = match self.shared.routes.lookup(hash) {
+                Some(route) => (route.endpoint.clone(), Some(route.hint())),
+                None => (self.shared.seeds[0].clone(), None),
+            };
+            let expect = hint.map(|hint| hint.worker);
+            let conn = match self.connection(&endpoint, expect) {
+                Ok(conn) => conn,
+                Err(error) => {
+                    self.shared.errors.fetch_add(1, Ordering::Relaxed);
+                    return Err(error);
+                }
+            };
+            if !conn.streaming() {
+                self.shared.errors.fetch_add(1, Ordering::Relaxed);
+                return Err(ClientError::Unsupported);
+            }
+            match self.get_stream_attempt(&conn, key, hint) {
+                GetOutcome::Done(value) => return Ok(value),
+                GetOutcome::Reroute => {
+                    redirects += 1;
+                    self.shared.redirects.fetch_add(1, Ordering::Relaxed);
+                }
+                GetOutcome::Overloaded => {
+                    redirects += 1;
+                    self.shared.redirects.fetch_add(1, Ordering::Relaxed);
+                    backoff(
+                        self.shared.dial_backoff,
+                        u32::try_from(redirects).unwrap_or(u32::MAX).min(10),
+                    );
+                }
+                GetOutcome::Reconnect => {
+                    // Reads have no side effects: redial and retry, like
+                    // `execute_with_seq`, bounded the same way.
+                    reconnects += 1;
+                    if reconnects > 2 {
+                        self.shared.errors.fetch_add(1, Ordering::Relaxed);
+                        return Err(ClientError::AmbiguousOutcome);
+                    }
+                    self.drop_connection(&endpoint);
+                    backoff(
+                        self.shared.dial_backoff,
+                        u32::try_from(reconnects).unwrap_or(u32::MAX),
+                    );
+                }
+                GetOutcome::Fail(error) => {
+                    self.shared.errors.fetch_add(1, Ordering::Relaxed);
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    /// One upload attempt against the routed endpoint: begin, data, commit.
+    /// Pre-commit failures are definitely uncommitted (the commit is the
+    /// single atomic point, and this call never retries past it with a
+    /// consumed source); only a lost commit response is ambiguous.
+    #[allow(clippy::too_many_arguments)]
+    fn put_stream_inner(
+        &self,
+        key: &Key,
+        total_len: Option<u64>,
+        source: &mut impl Read,
+        identity: Option<&(RequestIdentity, RequestSeq, u64)>,
+    ) -> Result<(), ClientError> {
+        let hash = PartitionHasher::V1
+            .hash(self.shared.namespace, key.as_bytes())
+            .ok_or(ClientError::Internal(
+                "partition hash unsupported".to_owned(),
+            ))?;
+        // Cold routes probe first: one cheap `Exists` warms the cache
+        // through the ordinary redirect machinery, so the begin below
+        // lands on the owner the first time (a move between probe and
+        // begin still aborts cleanly and surfaces — never miscommits).
+        if self.shared.routes.lookup(hash).is_none() {
+            let _ = self.exists(key);
+        }
+        self.shared.requests.fetch_add(1, Ordering::Relaxed);
+        let (endpoint, hint) = match self.shared.routes.lookup(hash) {
+            Some(route) => (route.endpoint.clone(), Some(route.hint())),
+            None => (self.shared.seeds[0].clone(), None),
+        };
+        let expect = hint.map(|hint| hint.worker);
+        let conn = match self.connection(&endpoint, expect) {
+            Ok(conn) => conn,
+            Err(error) => {
+                self.shared.errors.fetch_add(1, Ordering::Relaxed);
+                return Err(error);
+            }
+        };
+        if !conn.streaming() {
+            self.shared.errors.fetch_add(1, Ordering::Relaxed);
+            return Err(ClientError::Unsupported);
+        }
+        let outcome = self.upload_attempt(&conn, &endpoint, key, total_len, source, identity);
+        if outcome.is_err() {
+            self.shared.errors.fetch_add(1, Ordering::Relaxed);
+        }
+        outcome
+    }
+
+    /// Runs begin → data → commit on one connection. Returns the terminal
+    /// error with server state already accounted for (aborts sent where
+    /// the server may hold an assembler).
+    fn upload_attempt(
+        &self,
+        conn: &Arc<Connection>,
+        endpoint: &str,
+        key: &Key,
+        total_len: Option<u64>,
+        source: &mut impl Read,
+        identity: Option<&(RequestIdentity, RequestSeq, u64)>,
+    ) -> Result<(), ClientError> {
+        if total_len.is_some_and(|total| total > MAX_STREAM_UPLOAD_BYTES) {
+            return Err(ClientError::ValueTooLarge);
+        }
+        let stream = self.next_stream_id();
+        let rx = Connection::register_stream(conn, stream)?;
+        let (id, floor) = match identity {
+            Some((identity, floor, _)) => (Some(*identity), *floor),
+            None => (None, RequestSeq::from_u64(0)),
+        };
+        let begin = StreamBegin {
+            namespace: self.shared.namespace,
+            key: key.as_bytes().to_vec(),
+            total_len,
+            identity: id,
+            ack_floor: floor,
+        };
+        if let Err(error) =
+            Connection::send_frame(conn, FrameKind::StreamBegin, stream, &begin.encode())
+        {
+            Connection::unregister_stream(conn, stream);
+            return Err(match error {
+                ClientError::Io(_) => {
+                    self.drop_connection(endpoint);
+                    ClientError::AmbiguousOutcome
+                }
+                other => other,
+            });
+        }
+        // Ready (or an immediate abort: unknown namespace, over bound,
+        // misrouted key — all pre-commit, so all definitely uncommitted).
+        let max_data = match Connection::await_stream_event(conn, &rx) {
+            Ok(StreamEvent::Ready(max_data)) => max_data.max(1) as usize,
+            Ok(StreamEvent::Aborted(reason)) => {
+                Connection::unregister_stream(conn, stream);
+                return Err(ClientError::Internal(reason));
+            }
+            Ok(_) => {
+                Connection::unregister_stream(conn, stream);
+                Connection::abort_stream(conn, stream, "client closing malformed stream");
+                return Err(ClientError::Protocol(ProtocolError::Malformed {
+                    context: "stream-ready",
+                }));
+            }
+            Err(error) => {
+                Connection::unregister_stream(conn, stream);
+                return Err(match error {
+                    ClientError::Timeout => ClientError::Timeout,
+                    ClientError::Io(_) => {
+                        self.drop_connection(endpoint);
+                        ClientError::AmbiguousOutcome
+                    }
+                    other => other,
+                });
+            }
+        };
+        self.upload_data(conn, endpoint, stream, source, total_len, max_data)?;
+        // Commit: the atomic point. A lost response from here on is
+        // ambiguous (the root may have committed) — same contract as
+        // `execute_with_seq` past delivery.
+        if let Err(error) = Connection::send_frame(conn, FrameKind::StreamCommit, stream, &[]) {
+            Connection::unregister_stream(conn, stream);
+            self.drop_connection(endpoint);
+            return Err(match error {
+                ClientError::Io(_) => ClientError::AmbiguousOutcome,
+                other => other,
+            });
+        }
+        match Connection::await_stream_event(conn, &rx) {
+            // The commit response arrives under the stream id and
+            // unregisters the rendezvous on arrival.
+            Ok(StreamEvent::Committed(response)) => match response.status {
+                Status::Ok => Ok(()),
+                other => Err(status_error(other, &response.body)),
+            },
+            Ok(StreamEvent::Aborted(reason)) => Err(ClientError::Internal(reason)),
+            Ok(_) => {
+                Connection::abort_stream(conn, stream, "client closing malformed stream");
+                Err(ClientError::Protocol(ProtocolError::Malformed {
+                    context: "stream-commit",
+                }))
+            }
+            Err(ClientError::Timeout | ClientError::Io(_)) => {
+                Connection::unregister_stream(conn, stream);
+                self.drop_connection(endpoint);
+                Err(ClientError::AmbiguousOutcome)
+            }
+            Err(other) => {
+                Connection::unregister_stream(conn, stream);
+                Err(other)
+            }
+        }
+    }
+
+    /// Streams source bytes as data frames capped at the negotiated size.
+    /// Anything failing here is pre-commit, hence definitely uncommitted —
+    /// plain errors, never ambiguous. Short writer holds per frame, reads
+    /// chunked to the cap.
+    fn upload_data(
+        &self,
+        conn: &Arc<Connection>,
+        endpoint: &str,
+        stream: u64,
+        source: &mut impl Read,
+        total_len: Option<u64>,
+        max_data: usize,
+    ) -> Result<(), ClientError> {
+        let mut delivered = 0u64;
+        let mut buf = vec![0u8; max_data];
+        loop {
+            let count = match source.read(&mut buf) {
+                Ok(0) => break,
+                Ok(count) => count,
+                Err(error) => {
+                    Connection::unregister_stream(conn, stream);
+                    Connection::abort_stream(conn, stream, "client source failed");
+                    return Err(ClientError::Io(format!("stream source: {error}")));
+                }
+            };
+            delivered += count as u64;
+            if delivered > MAX_STREAM_UPLOAD_BYTES {
+                Connection::unregister_stream(conn, stream);
+                Connection::abort_stream(conn, stream, "upload exceeds the stream bound");
+                return Err(ClientError::ValueTooLarge);
+            }
+            if total_len.is_some_and(|total| delivered > total) {
+                Connection::unregister_stream(conn, stream);
+                Connection::abort_stream(conn, stream, "upload exceeds its declared total");
+                return Err(ClientError::InvalidRequest);
+            }
+            if let Err(error) =
+                Connection::send_frame(conn, FrameKind::StreamData, stream, &buf[..count])
+            {
+                Connection::unregister_stream(conn, stream);
+                self.drop_connection(endpoint);
+                return Err(match error {
+                    ClientError::Io(detail) => ClientError::Io(detail),
+                    other => other,
+                });
+            }
+        }
+        if total_len.is_some_and(|total| delivered != total) {
+            Connection::unregister_stream(conn, stream);
+            Connection::abort_stream(conn, stream, "upload length mismatches its declared total");
+            return Err(ClientError::InvalidRequest);
+        }
+        Ok(())
+    }
+
+    /// One download attempt: request, then collect frames to the declared
+    /// total. Reads never mutate, so every failure mode either retries
+    /// (redirects, redials) or surfaces plainly — nothing is ambiguous.
+    fn get_stream_attempt(
+        &self,
+        conn: &Arc<Connection>,
+        key: &Key,
+        hint: Option<kivi_protocol::RouteHint>,
+    ) -> GetOutcome {
+        use kivi_protocol::{Opcode, ResponseBody};
+        let stream = self.next_stream_id();
+        let rx = match Connection::register_stream(conn, stream) {
+            Ok(rx) => rx,
+            Err(ClientError::Overloaded) => return GetOutcome::Overloaded,
+            Err(error) => return GetOutcome::Fail(error),
+        };
+        let request = kivi_protocol::Request {
+            namespace: self.shared.namespace,
+            opcode: Opcode::GetStream,
+            hint,
+            key: key.as_bytes().to_vec(),
+            value: None,
+            delta: 0,
+            expiry: 0,
+            offset: 0,
+            identity: None,
+            ack_floor: RequestSeq::from_u64(0),
+        };
+        if let Err(error) =
+            Connection::send_frame(conn, FrameKind::Request, stream, &request.encode())
+        {
+            Connection::unregister_stream(conn, stream);
+            return match error {
+                ClientError::Io(_) => GetOutcome::Reconnect,
+                other => GetOutcome::Fail(other),
+            };
+        }
+        // Head: begin (stream the body), a terminal response (absent,
+        // redirect, error), or an abort.
+        let total = match Connection::await_stream_event(conn, &rx) {
+            Ok(StreamEvent::ValueBegin(total)) => total,
+            Ok(StreamEvent::Committed(response)) => {
+                return match response.status {
+                    Status::NotFound => GetOutcome::Done(None),
+                    Status::StaleRoute | Status::NotLocal => {
+                        if let ResponseBody::Redirect(info) = &response.body {
+                            self.shared.routes.insert(RouteEntry::from_redirect(info));
+                        }
+                        GetOutcome::Reroute
+                    }
+                    Status::Overloaded => GetOutcome::Overloaded,
+                    other => GetOutcome::Fail(status_error(other, &response.body)),
+                };
+            }
+            Ok(StreamEvent::Aborted(reason)) => {
+                return GetOutcome::Fail(ClientError::Internal(reason));
+            }
+            Ok(_) => {
+                Connection::unregister_stream(conn, stream);
+                Connection::abort_stream(conn, stream, "client closing malformed stream");
+                return GetOutcome::Fail(ClientError::Protocol(ProtocolError::Malformed {
+                    context: "value-stream-begin",
+                }));
+            }
+            Err(ClientError::Timeout) => {
+                Connection::unregister_stream(conn, stream);
+                return GetOutcome::Fail(ClientError::Timeout);
+            }
+            Err(ClientError::Io(_)) => {
+                Connection::unregister_stream(conn, stream);
+                return GetOutcome::Reconnect;
+            }
+            Err(other) => {
+                Connection::unregister_stream(conn, stream);
+                return GetOutcome::Fail(other);
+            }
+        };
+        if total > MAX_STREAM_UPLOAD_BYTES {
+            Connection::unregister_stream(conn, stream);
+            Connection::abort_stream(conn, stream, "download exceeds the stream bound");
+            return GetOutcome::Fail(ClientError::ValueTooLarge);
+        }
+        Self::collect_stream_body(conn, stream, &rx, total)
+    }
+
+    /// Collects download frames to the declared total, then the end
+    /// marker. The count — not just the marker — must agree, or the
+    /// download is truncated and fails instead of returning short bytes.
+    fn collect_stream_body(
+        conn: &Arc<Connection>,
+        stream: u64,
+        rx: &crossbeam_channel::Receiver<StreamEvent>,
+        total: u64,
+    ) -> GetOutcome {
+        let mut out = Vec::new();
+        if total > 0
+            && let Ok(capacity) = usize::try_from(total)
+        {
+            out.try_reserve_exact(capacity).ok();
+        }
+        loop {
+            match Connection::await_stream_event(conn, rx) {
+                Ok(StreamEvent::ValueData(bytes)) => {
+                    if out.len() as u64 + bytes.len() as u64 > total {
+                        Connection::unregister_stream(conn, stream);
+                        Connection::abort_stream(
+                            conn,
+                            stream,
+                            "download overran its declared total",
+                        );
+                        return GetOutcome::Fail(ClientError::Protocol(ProtocolError::Malformed {
+                            context: "value-stream-data",
+                        }));
+                    }
+                    out.extend_from_slice(&bytes);
+                }
+                Ok(StreamEvent::ValueEnd) => {
+                    Connection::unregister_stream(conn, stream);
+                    if out.len() as u64 != total {
+                        return GetOutcome::Fail(ClientError::Protocol(ProtocolError::Malformed {
+                            context: "value-stream-end",
+                        }));
+                    }
+                    return GetOutcome::Done(Some(Bytes::from(out)));
+                }
+                Ok(StreamEvent::Aborted(reason)) => {
+                    return GetOutcome::Fail(ClientError::Internal(reason));
+                }
+                Ok(_) => {
+                    Connection::unregister_stream(conn, stream);
+                    Connection::abort_stream(conn, stream, "client closing malformed stream");
+                    return GetOutcome::Fail(ClientError::Protocol(ProtocolError::Malformed {
+                        context: "value-stream",
+                    }));
+                }
+                Err(ClientError::Timeout) => {
+                    Connection::unregister_stream(conn, stream);
+                    return GetOutcome::Fail(ClientError::Timeout);
+                }
+                Err(ClientError::Io(_)) => {
+                    Connection::unregister_stream(conn, stream);
+                    return GetOutcome::Reconnect;
+                }
+                Err(other) => {
+                    Connection::unregister_stream(conn, stream);
+                    return GetOutcome::Fail(other);
+                }
+            }
+        }
+    }
+
+    /// Stores bytes under an explicitly named sequence of this session
+    /// (resumption: the identity was issued before — sent but never
+    /// acknowledged — so this either executes it for the first time or
+    /// dedup-hits the stored outcome; it never executes twice). Pair with
+    /// `ClientConfig::session` to resume across restarts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport/routing failure, an out-of-range
+    /// sequence, or a server-side rejection (including `DedupExpired` when
+    /// the session floor already passed the sequence).
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn set_with_seq(
+        &self,
+        key: &Key,
+        value: Bytes,
+        seq: RequestSeq,
+    ) -> Result<(), ClientError> {
+        use kivi_protocol::{Opcode, ResponseBody};
+        let response = self.execute_with_seq(
+            key,
+            Opcode::Set,
+            || kivi_protocol::Request {
+                namespace: self.shared.namespace,
+                opcode: Opcode::Set,
+                hint: None,
+                key: key.as_bytes().to_vec(),
+                value: Some(value.to_vec()),
+                delta: 0,
+                expiry: 0,
+                offset: 0,
+                identity: None,
+                ack_floor: RequestSeq::from_u64(0),
+            },
+            Some(seq),
+        )?;
+        match response.body {
+            ResponseBody::Stored { .. } => Ok(()),
+            _ => Err(ClientError::Internal("unexpected set body".to_owned())),
+        }
+    }
     /// Removes a key, reporting whether a live object existed.
     ///
     /// # Errors
@@ -861,6 +1813,7 @@ impl NativeClient {
             value: None,
             delta: 0,
             expiry: 0,
+            offset: 0,
             identity: None,
             ack_floor: RequestSeq::from_u64(0),
         })?;
@@ -885,6 +1838,7 @@ impl NativeClient {
             value: None,
             delta: 0,
             expiry: 0,
+            offset: 0,
             identity: None,
             ack_floor: RequestSeq::from_u64(0),
         })?;
@@ -909,6 +1863,7 @@ impl NativeClient {
             value: None,
             delta: 0,
             expiry: 0,
+            offset: 0,
             identity: None,
             ack_floor: RequestSeq::from_u64(0),
         })?;
@@ -937,9 +1892,53 @@ impl NativeClient {
             value: None,
             delta,
             expiry: 0,
+            offset: 0,
             identity: None,
             ack_floor: RequestSeq::from_u64(0),
         })?;
+        match response.body {
+            ResponseBody::CounterUpdated { value, .. } => Ok(value),
+            _ => Err(ClientError::Internal(
+                "unexpected counter-add body".to_owned(),
+            )),
+        }
+    }
+
+    /// Adds `delta` under an explicitly named sequence of this session
+    /// (resumption: same contract as `set_with_seq` — executes at most
+    /// once per identity, dedup-hitting when the first attempt already
+    /// applied). A dedup hit returns the originally recorded post-add
+    /// value, not a re-execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport/routing failure, wrong-type
+    /// access, counter overflow, an out-of-range sequence, or a
+    /// server-side rejection (including `DedupExpired`).
+    pub fn counter_add_with_seq(
+        &self,
+        key: &Key,
+        delta: i64,
+        seq: RequestSeq,
+    ) -> Result<i64, ClientError> {
+        use kivi_protocol::{Opcode, ResponseBody};
+        let response = self.execute_with_seq(
+            key,
+            Opcode::CounterAdd,
+            || kivi_protocol::Request {
+                namespace: self.shared.namespace,
+                opcode: Opcode::CounterAdd,
+                hint: None,
+                key: key.as_bytes().to_vec(),
+                value: None,
+                delta,
+                expiry: 0,
+                offset: 0,
+                identity: None,
+                ack_floor: RequestSeq::from_u64(0),
+            },
+            Some(seq),
+        )?;
         match response.body {
             ResponseBody::CounterUpdated { value, .. } => Ok(value),
             _ => Err(ClientError::Internal(
@@ -963,6 +1962,7 @@ impl NativeClient {
             value: None,
             delta: 0,
             expiry: expires_at.as_micros(),
+            offset: 0,
             identity: None,
             ack_floor: RequestSeq::from_u64(0),
         })?;
@@ -989,6 +1989,7 @@ impl NativeClient {
             value: None,
             delta: 0,
             expiry: 0,
+            offset: 0,
             identity: None,
             ack_floor: RequestSeq::from_u64(0),
         })?;
@@ -1013,6 +2014,7 @@ impl NativeClient {
             value: None,
             delta: 0,
             expiry: 0,
+            offset: 0,
             identity: None,
             ack_floor: RequestSeq::from_u64(0),
         })?;
@@ -1096,5 +2098,123 @@ mod tests {
         client.complete_seq(1);
         let (_, floor) = client.alloc_seq().expect("seq 2");
         assert_eq!(floor.as_u64(), 1);
+    }
+
+    #[test]
+    fn adopted_sequences_reserve_space_without_colliding() {
+        let client = test_client();
+        let (identity, _) = client
+            .adopt_seq(RequestSeq::from_u64(41))
+            .expect("adopt 41");
+        assert_eq!(identity.seq().as_u64(), 41);
+        // Automatic allocation continues past the adopted sequence.
+        let (next, _) = client.alloc_seq().expect("next");
+        assert_eq!(next.seq().as_u64(), 42);
+    }
+
+    #[test]
+    fn adopted_sequences_reject_the_reserved_endpoints() {
+        let client = test_client();
+        assert!(client.adopt_seq(RequestSeq::from_u64(0)).is_err());
+        assert!(client.adopt_seq(RequestSeq::from_u64(u64::MAX)).is_err());
+    }
+
+    #[test]
+    fn resumed_sessions_keep_their_identity() {
+        let first = test_client();
+        let resumed = NativeClient::new(ClientConfig {
+            seeds: vec!["127.0.0.1:1".to_owned()],
+            session: Some(first.session()),
+            ..ClientConfig::default()
+        })
+        .expect("resume builds without dialing");
+        assert_eq!(resumed.session(), first.session());
+    }
+
+    /// Regression for the ~30s durable tail: when the server side of a
+    /// connection dies mid-request (close, violation kill, crash), the
+    /// in-flight waiter must fail at once and redial — never burn the full
+    /// request timeout first. Deterministic stub: completes the handshake,
+    /// reads exactly one request frame, then closes silently with no
+    /// response. With `request_timeout` at 10s, stranded code surfaces
+    /// only after ~10s; fixed code surfaces `Io` (reader ended) in
+    /// milliseconds and the redial then fails fast on the closed listener.
+    #[test]
+    fn dead_connection_fails_inflight_fast() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("stub binds");
+        let addr = listener.local_addr().expect("stub addr");
+        let stub = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+            // No further accepts: the client's redial must fail fast with
+            // connection-refused instead of hanging in a second handshake.
+            drop(listener);
+            socket.set_read_timeout(Some(Duration::from_secs(10))).ok();
+            let mut reader = FrameReader::new(DEFAULT_MAX_FRAME);
+            let mut chunk = vec![0u8; 4096];
+            let hello = loop {
+                let count = socket.read(&mut chunk).expect("hello bytes");
+                assert!(count > 0, "client must send a hello");
+                let frames = reader.push(&chunk[..count]).expect("hello parses");
+                if let Some(frame) = frames.into_iter().next() {
+                    break frame;
+                }
+            };
+            assert_eq!(hello.kind, FrameKind::ClientHello);
+            let reply = ServerHello {
+                major: kivi_protocol::PROTOCOL_MAJOR,
+                minor: kivi_protocol::PROTOCOL_MINOR,
+                caps: Capabilities::BASE_V1 | Capabilities::DURABLE_MUTATION_DEDUP,
+                cluster: kivi_types::ClusterId::from_u128(1),
+                node: kivi_types::NodeId::from_u64(1),
+                incarnation: kivi_types::NodeIncarnation::from_u64(1),
+                worker: WorkerId::from_u64(0),
+                dir_version: kivi_tablet::DirectoryVersion::from_u64(1),
+                max_frame: u32::try_from(DEFAULT_MAX_FRAME).expect("frame bound fits u32"),
+                endpoints: Vec::new(),
+            };
+            socket
+                .write_all(&encode_frame(FrameKind::ServerHello, 0, &reply.encode()))
+                .expect("hello reply");
+            loop {
+                let count = socket.read(&mut chunk).expect("request bytes");
+                assert!(count > 0, "client must send its request");
+                let frames = reader.push(&chunk[..count]).expect("request parses");
+                if frames
+                    .into_iter()
+                    .any(|frame| frame.kind == FrameKind::Request)
+                {
+                    break;
+                }
+            }
+            // Die silently: close with the request unanswered.
+        });
+        let client = NativeClient::new(ClientConfig {
+            seeds: vec![addr.to_string()],
+            request_timeout: Duration::from_secs(10),
+            connect_timeout: Duration::from_secs(2),
+            dial_attempts: 1,
+            ..ClientConfig::default()
+        })
+        .expect("client builds");
+        let started = Instant::now();
+        let outcome = client.set(&Key::from("k"), bytes::Bytes::from_static(b"v"));
+        let elapsed = started.elapsed();
+        stub.join().expect("stub exits");
+        // The waiter must notice the dead connection promptly: well under
+        // the 10s timeout it would otherwise burn. The redial then fails
+        // fast (refused), so the surfaced error is transport `Io` — never
+        // a `Timeout` that pretends the server is merely slow.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "in-flight waiter stranded {elapsed:?} on a dead connection"
+        );
+        assert!(
+            matches!(outcome, Err(ClientError::Io(_))),
+            "expected fast transport Io, got {outcome:?}"
+        );
     }
 }
