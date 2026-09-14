@@ -10,6 +10,7 @@
 //!   WAL lanes recovered and replayed — all before any listener binds.
 
 mod admin;
+mod cluster;
 #[cfg(feature = "redis-compat")]
 mod resp;
 #[cfg(feature = "redis-compat")]
@@ -36,6 +37,9 @@ use tracing_subscriber::EnvFilter;
 
 const NS: NamespaceId = NamespaceId::from_u64(1);
 
+/// CLI flags are inherently boolean-heavy (one per toggle); the struct
+/// groups them instead of scattering subcommands.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Parser)]
 #[command(
     name = "kivi-server",
@@ -62,7 +66,7 @@ struct Args {
     queue: usize,
     /// Maximum accepted frame in bytes (protocol ceiling 64 MiB).
     #[arg(long, default_value_t = 64 * 1024 * 1024, value_parser = parse_max_frame)]
-    max_frame: usize,
+    pub(crate) max_frame: usize,
     /// Run without persistence (in-memory; benchmarks and development).
     /// Exactly one of `--ephemeral` and `--data-dir` is required.
     #[arg(long, conflicts_with = "data_dir")]
@@ -70,7 +74,7 @@ struct Args {
     /// Data directory for crash-recoverable durable mode. Created with
     /// node identity and WAL lanes on first startup.
     #[arg(long, conflicts_with = "ephemeral")]
-    data_dir: Option<PathBuf>,
+    pub(crate) data_dir: Option<PathBuf>,
     /// Node identity for handshakes (ephemeral mode only; durable mode
     /// always uses the data directory's persisted identity).
     #[arg(long, default_value_t = 1, conflicts_with = "data_dir")]
@@ -80,7 +84,7 @@ struct Args {
     cluster: u128,
     /// WAL segment rotation target in bytes (durable mode only).
     #[arg(long, default_value_t = kivi_durability::wal::DEFAULT_SEGMENT_TARGET_BYTES)]
-    wal_segment_target: u64,
+    pub(crate) wal_segment_target: u64,
     /// Share one WAL lane across all workers behind a mutex instead of
     /// private per-worker lanes (group-commit experiment arm; durable
     /// mode only).
@@ -134,18 +138,61 @@ struct Args {
     /// Admin/control HTTP listen address (loopback by default; `:0` selects
     /// an ephemeral port and prints it).
     #[arg(long, default_value = "127.0.0.1:19080")]
-    admin: SocketAddr,
+    pub(crate) admin: SocketAddr,
     /// Optional Redis/RESP compatibility listen address (feature
     /// `redis-compat` only). Absent means native-only: no RESP service
     /// starts even when compiled in. `:0` selects an ephemeral port.
     #[cfg(feature = "redis-compat")]
     #[arg(long)]
-    redis_listen: Option<SocketAddr>,
+    pub(crate) redis_listen: Option<SocketAddr>,
     /// Namespace id the RESP frontend serves (Redis DB 0 maps here).
     /// Single-namespace stage: must equal the engine namespace (1).
     #[cfg(feature = "redis-compat")]
     #[arg(long, default_value_t = 1)]
     redis_namespace: u64,
+    /// Enable replicated cluster mode: one statically configured tablet
+    /// group instead of single-node workers. Requires `--data-dir`.
+    #[arg(long = "cluster-mode")]
+    cluster_mode: bool,
+    /// Cluster identity for cluster mode.
+    #[arg(long)]
+    pub(crate) cluster_id: Option<u128>,
+    /// This process's node identity for cluster mode.
+    #[arg(long)]
+    pub(crate) node_id: Option<u64>,
+    /// Tablet replicated in cluster mode.
+    #[arg(long, default_value_t = 1)]
+    pub(crate) cluster_tablet: u64,
+    /// Static peer endpoints `node=host:port,...` for cluster mode.
+    #[arg(long, value_delimiter = ',', value_parser = parse_node_endpoint)]
+    pub(crate) cluster_peers: Vec<(u64, SocketAddr)>,
+    /// Static native endpoints `node=host:port,...` for cluster mode
+    /// (client redirect targets; required, and distinct from the peer
+    /// endpoints).
+    #[arg(long, value_delimiter = ',', value_parser = parse_node_endpoint)]
+    pub(crate) cluster_natives: Vec<(u64, SocketAddr)>,
+    /// Native client listen address in cluster mode (`:0` ephemeral).
+    #[arg(long, default_value = "127.0.0.1:9000")]
+    pub(crate) cluster_native: SocketAddr,
+}
+
+/// Parses one `node=host:port` endpoint mapping.
+fn parse_node_endpoint(spec: &str) -> Result<(u64, SocketAddr), String> {
+    let (node, addr) = spec
+        .split_once('=')
+        .ok_or_else(|| format!("endpoint mapping must be node=host:port, got {spec:?}"))?;
+    let node: u64 = node
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid node id in {spec:?}"))?;
+    if node == 0 {
+        return Err(format!("node id 0 is reserved, got {spec:?}"));
+    }
+    let addr: SocketAddr = addr
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid socket address in {spec:?}"))?;
+    Ok((node, addr))
 }
 
 /// Parses CPU pinning without panicking: `auto`, `none`, or explicit cores
@@ -378,6 +425,11 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
     let args = Args::parse();
+    // Replicated cluster mode bypasses the single-node engine entirely:
+    // one tablet group, peer mesh, native/admin/RESP edges on Tokio.
+    if args.cluster_mode {
+        return cluster::run_from_args(&args);
+    }
     if args.workers == 0 {
         anyhow::bail!("workers must be nonzero");
     }

@@ -33,7 +33,7 @@ use kivi_checkpoint::{
 use kivi_durability::LaneFloor;
 use kivi_types::{ClusterId, NamespaceId, NodeId, NodeIncarnation, TabletId};
 
-use crate::worker::{TabletCheckpointStatus, WorkerControl};
+use crate::worker::{ControlIngress, TabletCheckpointStatus, WorkerControl};
 
 /// Automatic checkpoint triggers. All thresholds are conservative:
 /// checkpoints are rare, bounded background work — never a fixed cadence
@@ -158,8 +158,10 @@ pub(crate) struct CheckpointContext {
     /// Owner worker per tablet (authoritative placement from engine start;
     /// used only to attribute per-worker WAL bytes to the WAL trigger).
     pub placement: HashMap<TabletId, kivi_types::WorkerId>,
-    /// Control senders per worker (captures, metrics, status).
-    pub controls: Vec<(kivi_types::WorkerId, Sender<WorkerControl>)>,
+    /// Control ingress bundles per worker (captures, metrics, status).
+    /// Every send through a bundle pings the networked bridge, so
+    /// checkpoint queries never stall behind an idle bridge.
+    pub controls: Vec<(kivi_types::WorkerId, ControlIngress)>,
     /// Lane maintenance access per worker.
     pub lanes: Vec<LaneMaintenanceAccess>,
     /// Trigger configuration.

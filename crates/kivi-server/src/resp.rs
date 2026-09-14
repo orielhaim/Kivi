@@ -273,8 +273,22 @@ pub async fn serve(
     listener: tokio::net::TcpListener,
     client: LocalClient,
     stats: Arc<RespStats>,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
+    serve_with(listener, LocalExecutor { client }, stats, shutdown).await;
+}
+
+/// Serves one RESP listener over any [`Executor`] (single-node embedded
+/// clients and replicated cluster nodes share the entire frontend; only
+/// the executor differs).
+pub async fn serve_with<E>(
+    listener: tokio::net::TcpListener,
+    executor: E,
+    stats: Arc<RespStats>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) where
+    E: Executor + Clone + Send + 'static,
+{
     let mut next_id: u64 = 1;
     loop {
         tokio::select! {
@@ -293,7 +307,7 @@ pub async fn serve(
                 stats.connections_current.fetch_add(1, Ordering::Relaxed);
                 stats.connections_total.fetch_add(1, Ordering::Relaxed);
                 stats.resp2_current.fetch_add(1, Ordering::Relaxed);
-                let executor = LocalExecutor { client: client.clone() };
+                let executor = executor.clone();
                 let stats = Arc::clone(&stats);
                 tokio::spawn(async move {
                     serve_conn(socket, id, executor, stats).await;
@@ -306,12 +320,10 @@ pub async fn serve(
 /// Serves one connection: read, decode bounded pipelines in order, execute
 /// via blocking offload (the embedded client blocks on its rendezvous),
 /// and write replies in the same order.
-async fn serve_conn(
-    socket: tokio::net::TcpStream,
-    id: u64,
-    executor: LocalExecutor,
-    stats: Arc<RespStats>,
-) {
+async fn serve_conn<E>(socket: tokio::net::TcpStream, id: u64, executor: E, stats: Arc<RespStats>)
+where
+    E: Executor + Send + 'static,
+{
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let (mut reader, mut writer) = socket.into_split();
     let mut slot = Some(RespConnection::new(executor, ConnConfig::default(), id));
@@ -394,9 +406,10 @@ async fn serve_conn(
 /// Loops while complete frames remain so one read batch answers fully, but
 /// caps the batch so a single read can never produce an unbounded reply
 /// vector even if budgets shift.
-fn drain_owned(
-    mut connection: RespConnection<LocalExecutor>,
-) -> (Vec<Vec<u8>>, bool, RespConnection<LocalExecutor>) {
+fn drain_owned<E>(mut connection: RespConnection<E>) -> (Vec<Vec<u8>>, bool, RespConnection<E>)
+where
+    E: Executor,
+{
     const MAX_BATCH_REPLIES: usize = 1024;
     let mut all = Vec::new();
     let mut quit = false;

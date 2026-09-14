@@ -405,7 +405,7 @@ pub fn probe_server(
 }
 
 /// Internal ready-wait outcome (child ownership stays with the caller).
-enum WaitOutcome {
+pub(crate) enum WaitOutcome {
     /// `KIVI_READY` parsed: native endpoints, admin endpoint, optional RESP.
     Ready(Vec<String>, String, Option<String>),
     /// The process exited before reporting readiness.
@@ -430,7 +430,7 @@ fn binary_supports_resp(binary: &Path) -> Result<bool, SpawnError> {
 }
 
 /// Last lines of a dead child's stderr for failure diagnostics.
-fn stderr_tail(child: &mut Child) -> String {
+pub(crate) fn stderr_tail(child: &mut Child) -> String {
     let mut log = String::new();
     if let Some(stderr) = child.stderr.as_mut() {
         let _ = stderr.read_to_string(&mut log);
@@ -448,7 +448,7 @@ fn stderr_tail(child: &mut Child) -> String {
 /// Waits for `KIVI_READY` on the child's stdout, watching for early exit
 /// on a reader thread so a silent stall can never hang the harness past
 /// the deadline: the reader only produces lines, the loop owns the clock.
-fn wait_ready_or_exit(child: &mut Child, timeout: Duration) -> WaitOutcome {
+pub(crate) fn wait_ready_or_exit(child: &mut Child, timeout: Duration) -> WaitOutcome {
     let Some(stdout) = child.stdout.take() else {
         // Internal contract: the harness always pipes stdout before this
         // call, so a missing pipe is a harness bug, never runtime noise.
@@ -499,16 +499,31 @@ fn wait_ready_or_exit(child: &mut Child, timeout: Duration) -> WaitOutcome {
     }
 }
 
-/// Parses `KIVI_READY workers=<a>,<b> admin=<c> [redis=<d>]`; tracing noise
-/// on the shared stdout is skipped by the caller, never an error.
-fn parse_ready(line: &str) -> Option<(Vec<String>, String, Option<String>)> {
+/// Parses readiness lines; tracing noise on the shared stdout is skipped
+/// by the caller, never an error. Two shapes (both carry `admin=`, plus
+/// an optional `redis=`):
+///
+/// ```text
+/// KIVI_READY workers=<a>,<b> admin=<c> [redis=<d>]   (single-node)
+/// KIVI_READY native=<a> peer=<b> admin=<c> [redis=<d>] ... (cluster)
+/// ```
+///
+/// The returned native list is the worker list (single-node) or the
+/// single native endpoint (cluster); extra cluster tokens (`peer=`,
+/// `node=`, ...) are ignored here (the cluster harness reads what it
+/// needs separately).
+pub(crate) fn parse_ready(line: &str) -> Option<(Vec<String>, String, Option<String>)> {
     let rest = line.strip_prefix("KIVI_READY")?.trim();
     let mut workers: Option<&str> = None;
+    let mut native: Option<&str> = None;
     let mut admin: Option<&str> = None;
     let mut redis: Option<&str> = None;
     for token in rest.split_whitespace() {
         if let Some(value) = token.strip_prefix("workers=") {
             workers = Some(value);
+        }
+        if let Some(value) = token.strip_prefix("native=") {
+            native = Some(value);
         }
         if let Some(value) = token.strip_prefix("admin=") {
             admin = Some(value);
@@ -517,7 +532,11 @@ fn parse_ready(line: &str) -> Option<(Vec<String>, String, Option<String>)> {
             redis = Some(value);
         }
     }
-    let native: Vec<String> = workers?.split(',').map(str::to_owned).collect();
+    let native: Vec<String> = match (workers, native) {
+        (Some(list), _) => list.split(',').map(str::to_owned).collect(),
+        (None, Some(addr)) => vec![addr.to_owned()],
+        (None, None) => return None,
+    };
     let admin = admin?.to_owned();
     if native.is_empty() || admin.is_empty() {
         return None;

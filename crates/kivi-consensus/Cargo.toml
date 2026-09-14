@@ -1,0 +1,48 @@
+[package]
+name = "kivi-consensus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+kivi-types.workspace = true
+kivi-state.workspace = true
+kivi-codec.workspace = true
+kivi-durability.workspace = true
+kivi-protocol.workspace = true
+bytes.workspace = true
+crc32c.workspace = true
+# Pinned OpenRaft 0.10 pre-release (see crate docs for the selection record).
+# Exact `=` pin: pre-1.0 alpha APIs shift between releases, so caret drift
+# is unacceptable. `default-features = false` drops the Tokio runtime and
+# clap; `single-threaded` removes the `Send` bounds so Raft tasks park on
+# Kivi's Compio reactors (thread-per-core ownership, enforced by types).
+openraft = { version = "=0.10.0-alpha.34", default-features = false, features = ["single-threaded"] }
+# Official Compio `AsyncRuntime` for OpenRaft (the `KiviTypeConfig` runtime).
+openraft-rt-compio = "=0.10.0-alpha.34"
+# Official Multi-Raft routing adapters (`GroupRouter` and friends).
+openraft-multi = "=0.10.0-alpha.34"
+# Compio execution architecture: consensus tasks run on Compio reactors
+# (the owner thread today, `DataWorker` reactors in the future). No Tokio
+# anywhere in this crate: `cargo tree -p kivi-consensus` must show none.
+compio.workspace = true
+# Runtime-agnostic channels for the owner-thread front (`propose` futures
+# stay `Send` while the `!Send` Raft handle stays pinned to its reactor).
+futures.workspace = true
+async-channel.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# Density-experiment measurement only (examples/density.rs). Never ships in
+# the library or the production binary.
+sysinfo = "0.39"
+tempfile.workspace = true
+
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = "deny"
+pedantic = "deny"

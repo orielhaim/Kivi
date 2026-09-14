@@ -83,9 +83,23 @@ impl KiviNativeTarget {
     ///
     /// Returns the client setup error when the seed is unreachable.
     pub fn connect(server: &str, namespace: u64, pending: usize) -> anyhow::Result<Self> {
+        Self::connect_multi(std::slice::from_ref(&server.to_owned()), namespace, pending)
+    }
+
+    /// Connects with several seed endpoints (task AG: the replicated
+    /// cluster target). The workload definitions stay untouched: this
+    /// target handles leader discovery (`StaleRoute` redirects),
+    /// bounded retries, and stable mutation identities internally, so
+    /// shared benchmark code remains target-neutral. One instance per
+    /// benchmark thread (one retry session each).
+    ///
+    /// # Errors
+    ///
+    /// Returns the client setup error when no seed is reachable.
+    pub fn connect_multi(seeds: &[String], namespace: u64, pending: usize) -> anyhow::Result<Self> {
         use anyhow::Context;
         let client = NativeClient::new(ClientConfig {
-            seeds: vec![server.to_owned()],
+            seeds: seeds.to_owned(),
             namespace: NamespaceId::from_u64(namespace),
             max_pending: pending,
             ..ClientConfig::default()

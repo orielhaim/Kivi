@@ -15,6 +15,7 @@ members = [
     "crates/kivi-checkpoint",
     "crates/kivi-chunk",
     "crates/kivi-resp",
+    "crates/kivi-consensus",
     "crates/kivi-lab",
 ]
 
@@ -33,6 +34,7 @@ kivi-tablet = { path = "crates/kivi-tablet", version = "0.1.0" }
 kivi-state = { path = "crates/kivi-state", version = "0.1.0" }
 kivi-protocol = { path = "crates/kivi-protocol", version = "0.1.0" }
 kivi-client = { path = "crates/kivi-client", version = "0.1.0" }
+kivi-consensus = { path = "crates/kivi-consensus", version = "0.1.0" }
 kivi-engine = { path = "crates/kivi-engine", version = "0.1.0" }
 kivi-durability = { path = "crates/kivi-durability", version = "0.1.0" }
 kivi-checkpoint = { path = "crates/kivi-checkpoint", version = "0.1.0" }
@@ -51,6 +53,7 @@ rstest = "0.27"
 
 hashbrown = "0.17"
 bytes = "1.12"
+futures = "0.3"
 arc-swap = "1.9"
 crossbeam-channel = "0.5"
 # Runtime-agnostic async frame handoff (conn reader task to serving task):

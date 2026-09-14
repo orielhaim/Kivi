@@ -358,11 +358,23 @@ pub fn encode_frame(kind: FrameKind, request_id: u64, payload: &[u8]) -> Vec<u8>
 ///
 /// Codec state only — no I/O, no timers, no allocation beyond the output
 /// frames and the pending tail buffer (whose growth the connection bounds).
+/// The tail buffer grows on demand up to a declared in-progress frame —
+/// never pre-allocated — and releases one-shot bulk capacity back once the
+/// frame completes (see [`FrameReader::buffer_ceiling`]).
 #[derive(Debug)]
 pub struct FrameReader {
     buf: Vec<u8>,
     max_frame: usize,
 }
+
+/// Tail capacity above which a completed frame releases its one-shot bulk
+/// allocation back instead of retaining it for the connection lifetime.
+/// Ordinary small-op connections never reach this; a connection that once
+/// carried a multi-megabyte frame does not keep megabytes parked forever.
+const BULK_CAPACITY_RELEASE: usize = 1024 * 1024;
+/// Tail length below which the release above applies: releasing only when
+/// the parser is nearly drained avoids realloc churn on pipelined bulk.
+const BULK_TAIL_QUIET: usize = 64 * 1024;
 
 impl FrameReader {
     /// Creates a parser rejecting payloads above `max_frame` bytes.
@@ -384,6 +396,33 @@ impl FrameReader {
     #[must_use]
     pub fn buffered(&self) -> usize {
         self.buf.len()
+    }
+
+    /// Coherent buffering ceiling for a connection whose unparsed-junk
+    /// bound is `input_cap`.
+    ///
+    /// The input bound caps bytes that have no validated meaning yet —
+    /// junk, trickles, and unparseable prefixes — never a legal frame in
+    /// flight. Once the buffered head parses as a header declaring a
+    /// payload within this parser's `max_frame`, the ceiling rises to
+    /// cover exactly that declared frame (`header + payload`), so a
+    /// 64 MiB-legal frame is never killed by a smaller connection input
+    /// bound. Declarations above `max_frame` gain nothing: [`push`](Self::push)
+    /// rejects them on arrival without waiting for the payload.
+    /// Unparseable heads keep the plain `input_cap` ceiling.
+    #[must_use]
+    pub fn buffer_ceiling(&self, input_cap: usize) -> usize {
+        if self.buf.len() < FRAME_HEADER_LEN {
+            return input_cap;
+        }
+        let Ok(header) = FrameHeader::decode(&self.buf[..FRAME_HEADER_LEN]) else {
+            return input_cap;
+        };
+        let payload = header.payload_len as usize;
+        if payload > self.max_frame {
+            return input_cap;
+        }
+        input_cap.max(FRAME_HEADER_LEN.saturating_add(payload))
     }
 
     /// Feeds newly read bytes, returning every frame completed by them
@@ -408,6 +447,13 @@ impl FrameReader {
             self.buf.drain(..FRAME_HEADER_LEN);
             let payload = Bytes::copy_from_slice(&self.buf[..payload_len]);
             self.buf.drain(..payload_len);
+            // One-shot bulk frames must not park megabytes on the
+            // connection forever: the tail buffer grew on demand to hold
+            // the declared payload, and releases it once drained quiet.
+            // This never pre-sizes anything — growth stays demand-driven.
+            if self.buf.capacity() > BULK_CAPACITY_RELEASE && self.buf.len() < BULK_TAIL_QUIET {
+                self.buf.shrink_to_fit();
+            }
             frames.push(Frame {
                 kind,
                 request_id,
@@ -527,6 +573,55 @@ mod tests {
         assert_eq!(frames[0].request_id, 1);
         assert_eq!(frames[1].payload.as_ref(), b"xy");
         assert_eq!(frames[2].request_id, 3);
+    }
+
+    #[test]
+    fn buffer_ceiling_covers_declared_frames_not_junk() {
+        const INPUT: usize = 4 * 1024 * 1024;
+        // Empty or sub-header tails: the plain input cap applies.
+        let reader = FrameReader::new(DEFAULT_MAX_FRAME);
+        assert_eq!(reader.buffer_ceiling(INPUT), INPUT);
+        // A declared 4 MiB frame is legal (protocol ceiling 64 MiB), so
+        // the ceiling rises to cover exactly header + payload.
+        let big = encode_frame(FrameKind::Request, 7, &vec![0xA5u8; 4 * 1024 * 1024]);
+        let mut reader = FrameReader::new(DEFAULT_MAX_FRAME);
+        reader.push(&big[..40]).expect("partial buffers");
+        assert_eq!(
+            reader.buffer_ceiling(INPUT),
+            FRAME_HEADER_LEN + 4 * 1024 * 1024
+        );
+        // A declaration above max_frame gains no cover: it is rejected
+        // on arrival, never buffered toward.
+        let mut huge = encode_frame(FrameKind::Request, 9, b"tiny");
+        huge[10..14].copy_from_slice(
+            &u32::try_from(DEFAULT_MAX_FRAME + 1)
+                .expect("protocol ceiling fits u32")
+                .to_le_bytes(),
+        );
+        let mut reader = FrameReader::new(DEFAULT_MAX_FRAME);
+        reader.push(&huge).expect_err("oversized must fail");
+        // Sub-header junk (no parseable header yet) keeps the plain cap.
+        let mut reader = FrameReader::new(DEFAULT_MAX_FRAME);
+        reader.push(b"\x00\x01garbage").expect("buffered");
+        assert_eq!(reader.buffer_ceiling(INPUT), INPUT);
+        // A smaller negotiated max_frame narrows the cover accordingly:
+        // the 4 MiB declaration is rejected on arrival, never buffered.
+        let mut reader = FrameReader::new(1024);
+        reader.push(&big[..40]).expect_err("narrowed bound rejects");
+        assert_eq!(reader.buffer_ceiling(INPUT), INPUT);
+    }
+
+    #[test]
+    fn bulk_capacity_releases_after_completion() {
+        let big = encode_frame(FrameKind::Request, 7, &vec![0xA5u8; 2 * 1024 * 1024]);
+        let mut reader = FrameReader::new(DEFAULT_MAX_FRAME);
+        let frames = reader.push(&big).expect("parse");
+        assert_eq!(frames.len(), 1);
+        assert!(
+            reader.buf.capacity() <= BULK_CAPACITY_RELEASE,
+            "one-shot bulk capacity released, cap={}",
+            reader.buf.capacity()
+        );
     }
 
     #[test]

@@ -179,6 +179,19 @@ fn random_node_id() -> Result<NodeId, DurabilityError> {
     }
 }
 
+/// Operator-supplied identity for first cluster formation. Single-node
+/// deployments pass `None` (random stable identities); cluster members
+/// pass their static topology identity so a fresh directory adopts the
+/// configured cluster/node instead of minting unrelated ones (which
+/// restart verification would then loudly reject).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeSeed {
+    /// Cluster to adopt on first startup.
+    pub cluster: ClusterId,
+    /// Node to adopt on first startup (nonzero: zero stays reserved).
+    pub node: NodeId,
+}
+
 /// Opens (creating if needed) a Kivi data directory: lock, identity,
 /// incarnation advance, WAL root — in that order, before any listener.
 ///
@@ -189,6 +202,20 @@ fn random_node_id() -> Result<NodeId, DurabilityError> {
 /// incarnation cannot advance, or filesystem/validation failures.
 /// Nothing is published until every step succeeds.
 pub fn open_data_dir(path: &Path) -> Result<OpenDir, DurabilityError> {
+    open_data_dir_with(path, None)
+}
+
+/// Opens a data directory like [`open_data_dir`], adopting `seed` on
+/// first startup when present. Existing directories ignore the seed
+/// entirely (their identity is authoritative; callers verify it matches
+/// separately and fail loudly on conflict).
+///
+/// # Errors
+///
+/// Returns the same failures as [`open_data_dir`], plus
+/// [`DurabilityError::InvalidConfig`] when the seed names the reserved
+/// zero node id.
+pub fn open_data_dir_with(path: &Path, seed: Option<NodeSeed>) -> Result<OpenDir, DurabilityError> {
     let dir_sync = create_dir_all_sync(path)
         .map_err(|error| DurabilityError::io("create data directory", path, &error))?;
     tracing::debug!(dir = %path.display(), ?dir_sync, "data directory ready");
@@ -205,11 +232,26 @@ pub fn open_data_dir(path: &Path) -> Result<OpenDir, DurabilityError> {
     remove_stale_tmp(&meta_path);
     let (meta, fresh) = match fs::read(&meta_path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            // First startup: mint stable identities from the OS CSPRNG.
-            let fresh = NodeMeta {
-                cluster: ClusterId::from_u128(random_u128()?),
-                node: random_node_id()?,
-                incarnation: NodeIncarnation::INITIAL,
+            // First startup: adopt the operator seed when present,
+            // else mint stable identities from the OS CSPRNG.
+            let fresh = match seed {
+                Some(seed) => {
+                    if seed.node.as_u64() == 0 {
+                        return Err(DurabilityError::InvalidConfig {
+                            reason: "cluster seed names the reserved zero node id",
+                        });
+                    }
+                    NodeMeta {
+                        cluster: seed.cluster,
+                        node: seed.node,
+                        incarnation: NodeIncarnation::INITIAL,
+                    }
+                }
+                None => NodeMeta {
+                    cluster: ClusterId::from_u128(random_u128()?),
+                    node: random_node_id()?,
+                    incarnation: NodeIncarnation::INITIAL,
+                },
             };
             publish_meta(&meta_path, &fresh)?;
             (fresh, true)

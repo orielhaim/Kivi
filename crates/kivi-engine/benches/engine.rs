@@ -12,7 +12,8 @@ use kivi_engine::{DurabilityMode, EngineConfig, LiveTablet, LocalEngine, Placeme
 use kivi_state::{Key, Operation};
 use kivi_tablet::{DirectorySnapshot, HashPrefix, PartitionRange};
 use kivi_types::{
-    NamespaceId, TabletAuthority, TabletEpoch, TabletId, UnixMicros, WorkerId, WriteGuardGeneration,
+    ClusterId, NamespaceId, NodeId, NodeIncarnation, TabletAuthority, TabletEpoch, TabletId,
+    UnixMicros, WorkerId, WriteGuardGeneration,
 };
 
 const NS: NamespaceId = NamespaceId::from_u64(1);
@@ -160,6 +161,71 @@ fn client_get_chunked(bencher: Bencher) {
     let client = engine.client();
     let key = Key::from(KEY);
     client.set(&key, big_value()).expect("seed");
+    bencher
+        .counter(ItemsCount::new(1u64))
+        .bench_local(|| black_box(client.get(&key).expect("get")));
+}
+
+/// Networked engine: one worker serving loopback TCP plus the embedded
+/// channel bridge. `LocalClient` calls below traverse the bridge — the
+/// event-driven wakeup path — so these benches pin the A1 latency floor
+/// fix (the old 100 µs bridge poll quantum showed up here directly).
+fn net_engine() -> LocalEngine {
+    let tablet = TabletId::from_u64(1);
+    let directory = DirectorySnapshot::bootstrap(
+        NS,
+        tablet,
+        PartitionRange::Hash(HashPrefix::new(0, 0).expect("root")),
+        TabletEpoch::INITIAL,
+        WriteGuardGeneration::INITIAL,
+    )
+    .and_then(|s| s.stage(tablet))
+    .and_then(|s| s.activate(tablet))
+    .expect("active root");
+    LocalEngine::start(EngineConfig {
+        namespace: NS,
+        directory,
+        placement: Placement::new([(tablet, WorkerId::from_u64(0))]),
+        worker_count: 1,
+        request_capacity: 1024,
+        chunks: kivi_engine::ChunkFabricConfig::default(),
+        network: Some(kivi_engine::EngineNetwork {
+            base_port: 0,
+            ports: Vec::new(),
+            bind_ip: [127, 0, 0, 1].into(),
+            max_frame: kivi_protocol::DEFAULT_MAX_FRAME,
+            affinity: kivi_engine::AffinityMode::Disabled,
+            node_id: NodeId::from_u64(1),
+            cluster_id: ClusterId::from_u128(1),
+            incarnation: NodeIncarnation::INITIAL,
+            conn: kivi_engine::ConnLimits::default(),
+            turn: kivi_engine::TurnBudget::default(),
+        }),
+        durability: DurabilityMode::Ephemeral,
+    })
+    .expect("networked engine starts")
+}
+
+#[divan::bench]
+fn bridge_set(bencher: Bencher) {
+    let engine = net_engine();
+    let client = engine.client();
+    let key = Key::from(KEY);
+    let value = Bytes::from_static(VALUE_16);
+    bencher.counter(ItemsCount::new(1u64)).bench_local(|| {
+        client.set(&key, value.clone()).expect("set");
+        black_box(());
+    });
+}
+
+#[divan::bench]
+fn bridge_get(bencher: Bencher) {
+    let engine = net_engine();
+    let client = engine.client();
+    let key = Key::from(KEY);
+    client
+        .set(&key, Bytes::from_static(VALUE_16))
+        .expect("seed");
     bencher
         .counter(ItemsCount::new(1u64))
         .bench_local(|| black_box(client.get(&key).expect("get")));

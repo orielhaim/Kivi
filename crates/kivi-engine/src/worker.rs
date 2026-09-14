@@ -38,6 +38,99 @@ use crate::tablet::{LiveTablet, TabletError};
 /// site handles `Full` explicitly anyway.
 pub const CONTROL_CAPACITY: usize = 16;
 
+/// Event-driven wakeup for the networked-worker embedded bridge.
+///
+/// The bridge lives on the Compio reactor thread, which cannot block on
+/// the crossbeam ingress channels — so it used to poll them every 100 µs,
+/// taxing every embedded wake (admin, tests, the RESP edge) with a fixed
+/// latency floor and idle wakeups. Every ingress send now carries a
+/// coalesced ping on this side channel: the bridge parks in
+/// `recv().await` instead of a timer. The ping is a hint, never a
+/// count — one ping per send attempt, collapsed to a single slot — and
+/// the bridge drains the real channels on every wake, so a collapsed
+/// ping loses nothing. Sends that find the bridge already awake (or a
+/// channel-only worker with no bridge) have nowhere to notify and that
+/// is fine. `async_channel` is runtime-agnostic (waker-based parking, no
+/// runtime of its own), so this adds no async runtime to the engine.
+#[derive(Debug, Clone)]
+pub struct BridgeWaker {
+    wake: async_channel::Sender<()>,
+}
+
+impl BridgeWaker {
+    /// Creates a waker pair: the sender travels with every ingress
+    /// handle, the receiver parks the networked bridge. Channel-only
+    /// workers drop the receiver immediately (their blocking `select!`
+    /// loop needs no wakeup); pings then fail closed and cost nothing.
+    #[must_use]
+    pub fn channel() -> (Self, async_channel::Receiver<()>) {
+        let (wake, woken) = async_channel::bounded::<()>(1);
+        (Self { wake }, woken)
+    }
+
+    /// Pings the bridge. Best-effort by construction: a full slot means
+    /// a wake is already pending, a closed channel means no bridge is
+    /// listening — both are correct without the ping.
+    pub fn ping(&self) {
+        let _ = self.wake.try_send(());
+    }
+}
+
+/// Bundled ingress to one worker's request queue: the bounded crossbeam
+/// sender (admission, backpressure) plus the bridge wakeup (promptness on
+/// networked workers). Every send pings; the ping never blocks, fails, or
+/// changes admission — ingress stays bounded by the channel capacity.
+#[derive(Debug, Clone)]
+pub struct RequestIngress {
+    sender: Sender<TabletRequest>,
+    bridge: BridgeWaker,
+}
+
+impl RequestIngress {
+    /// Admits one request without blocking, then pings the bridge.
+    ///
+    /// # Errors
+    ///
+    /// Returns the `TrySendError` (full queue or disconnected worker) for
+    /// the caller to map onto engine errors. The bridge ping fires
+    /// regardless: a full queue still wants prompt draining.
+    ///
+    /// # Large error type
+    ///
+    /// The `Err` variant carries the whole request back (it must, so the
+    /// caller can observe what was refused). The single caller maps it to
+    /// the small [`crate::engine::EngineError`] immediately without storing it, so the
+    /// stack cost never materializes.
+    #[allow(clippy::result_large_err)]
+    pub fn try_send(&self, request: TabletRequest) -> Result<(), TrySendError<TabletRequest>> {
+        let outcome = self.sender.try_send(request);
+        self.bridge.ping();
+        outcome
+    }
+}
+
+/// Bundled ingress to one worker's control queue: same wakeup contract as
+/// [`RequestIngress`], guarding the maintenance/shutdown path.
+#[derive(Debug, Clone)]
+pub struct ControlIngress {
+    sender: Sender<WorkerControl>,
+    bridge: BridgeWaker,
+}
+
+impl ControlIngress {
+    /// Sends one control message without blocking, then pings the bridge.
+    ///
+    /// # Errors
+    ///
+    /// Returns the `TrySendError` (full control queue or disconnected
+    /// worker) for the caller to handle.
+    pub fn try_send(&self, control: WorkerControl) -> Result<(), TrySendError<WorkerControl>> {
+        let outcome = self.sender.try_send(control);
+        self.bridge.ping();
+        outcome
+    }
+}
+
 /// Requests admitted per worker wake beyond the first (bounded drain so
 /// concurrent arrivals share batch windows without starving control).
 const REQUEST_DRAIN_PER_WAKE: usize = 63;
@@ -309,6 +402,7 @@ pub struct WorkerHandle {
     id: WorkerId,
     requests: Sender<TabletRequest>,
     control: Sender<WorkerControl>,
+    bridge: BridgeWaker,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -333,6 +427,10 @@ impl WorkerHandle {
     ) -> Self {
         let (request_tx, request_rx) = bounded::<TabletRequest>(request_capacity.max(1));
         let (control_tx, control_rx) = bounded::<WorkerControl>(CONTROL_CAPACITY);
+        // Channel-only workers block in `select!` on the real channels, so
+        // no bridge ever parks on this waker: the receiver drops here and
+        // every ping fails closed.
+        let (bridge, _unbridged) = BridgeWaker::channel();
         let thread = thread::Builder::new()
             .name(format!("kivi-worker-{}", id.as_u64()))
             .spawn(move || run(id, tablets, request_rx, control_rx, durability, chunks))
@@ -341,6 +439,7 @@ impl WorkerHandle {
             id,
             requests: request_tx,
             control: control_tx,
+            bridge,
             thread: Some(thread),
         }
     }
@@ -351,17 +450,25 @@ impl WorkerHandle {
         self.id
     }
 
-    /// Clones the bounded request sender (engine keeps one per worker and
+    /// Clones the bundled request ingress (engine keeps one per worker and
     /// hands clones to clients; the worker exits once all senders drop).
+    /// Every send through the bundle pings the networked bridge.
     #[must_use]
-    pub fn sender(&self) -> Sender<TabletRequest> {
-        self.requests.clone()
+    pub fn sender(&self) -> RequestIngress {
+        RequestIngress {
+            sender: self.requests.clone(),
+            bridge: self.bridge.clone(),
+        }
     }
 
-    /// Clones the bounded control sender (metrics queries, sweeps).
+    /// Clones the bundled control ingress (metrics queries, sweeps,
+    /// shutdown). Every send through the bundle pings the bridge.
     #[must_use]
-    pub fn control_sender(&self) -> Sender<WorkerControl> {
-        self.control.clone()
+    pub fn control_sender(&self) -> ControlIngress {
+        ControlIngress {
+            sender: self.control.clone(),
+            bridge: self.bridge.clone(),
+        }
     }
 
     /// Admits one request without blocking: `Ok` when queued, `Err` when the
@@ -384,14 +491,17 @@ impl WorkerHandle {
         self.requests.try_send(request)
     }
 
-    /// Sends one control message without blocking.
+    /// Sends one control message without blocking, then pings the bridge
+    /// (covers engine shutdown and test-harness control sends).
     ///
     /// # Errors
     ///
     /// Returns the `TrySendError` (full control queue or disconnected
     /// worker) for the caller to handle.
     pub fn try_control(&self, control: WorkerControl) -> Result<(), TrySendError<WorkerControl>> {
-        self.control.try_send(control)
+        let outcome = self.control.try_send(control);
+        self.bridge.ping();
+        outcome
     }
 
     /// Joins the worker thread. Returns the thread's outcome: `Ok(())` on
@@ -429,12 +539,17 @@ impl WorkerHandle {
     ) -> Result<(Self, SocketAddr), NetStartError> {
         let (request_tx, request_rx) = bounded::<TabletRequest>(request_capacity.max(1));
         let (control_tx, control_rx) = bounded::<WorkerControl>(CONTROL_CAPACITY);
+        // The bridge parks on this receiver (event-driven, no poll
+        // quantum); every ingress send through the handle's bundles pings
+        // the matching sender.
+        let (bridge, woken) = BridgeWaker::channel();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let thread = thread::Builder::new()
             .name(format!("kivi-worker-{}", id.as_u64()))
             .spawn(move || {
                 crate::net::run_net(
-                    id, tablets, request_rx, control_rx, durability, chunks, launch, ready_tx,
+                    id, tablets, request_rx, control_rx, durability, chunks, launch, woken,
+                    ready_tx,
                 );
             })
             .map_err(|error| NetStartError::Startup(error.to_string()))?;
@@ -444,6 +559,7 @@ impl WorkerHandle {
                     id,
                     requests: request_tx,
                     control: control_tx,
+                    bridge,
                     thread: Some(thread),
                 },
                 addr,

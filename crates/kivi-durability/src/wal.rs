@@ -61,6 +61,10 @@
 //!   opcode u8, has_identity u8, [session u128, seq u64, ack u64],
 //!   outcome_len u32, outcome[..]
 //!   (outcome is the DurableOutcome to replay to retries)
+//! kinds 10–15 v1 RAFT_* (consensus metadata; see the `raft` module):
+//!   votes, log entries, logical truncate/purge markers, commit pointer,
+//!   installed-snapshot metadata. Tablet and consensus families share
+//!   segments, batches, and framing but never mix inside one batch.
 //! ```
 //!
 //! ## Recovery rules
@@ -251,6 +255,20 @@ pub enum WalRecord {
     Outcome(OutcomeRecord),
 }
 
+/// One physical WAL entry: tablet-committed data or consensus metadata.
+///
+/// Both families share segments, batches, framing, and checksums on one
+/// lane; families never mix inside one batch (tablet batches seal tablet
+/// commits, consensus batches seal one group's Raft progress). Tablet
+/// code paths match `Tablet` first and never interpret consensus bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WalEntry {
+    /// Tablet-committed mutation or outcome (single-node history).
+    Tablet(WalRecord),
+    /// Consensus metadata (replicated-mode history; see [`crate::raft`]).
+    Consensus(crate::raft::RaftRecord),
+}
+
 impl WalRecord {
     /// The tablet this record belongs to.
     #[must_use]
@@ -316,13 +334,13 @@ impl WalRecord {
     }
 }
 
-/// One recovered record with its physical position.
+/// One recovered entry with its physical position.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveredRecord {
-    /// Per-lane batch sequence the record arrived in.
+    /// Per-lane batch sequence the entry arrived in.
     pub batch_seq: u64,
-    /// The logical record.
-    pub record: WalRecord,
+    /// The logical entry (tablet or consensus family).
+    pub entry: WalEntry,
 }
 
 /// Recovery result for one lane: validated records plus repair accounting.
@@ -443,43 +461,89 @@ fn encode_record_body(record: &WalRecord, out: &mut Vec<u8>) -> Result<(), Durab
     Ok(())
 }
 
-/// Encodes one batch body: framed records with backpatched lengths.
-/// Validates count and total size before the caller allocates the frame.
-fn encode_batch_body(records: &[WalRecord]) -> Result<Vec<u8>, DurabilityError> {
-    if records.is_empty() || records.len() > WAL_MAX_RECORDS_PER_BATCH {
+/// Frames one record with a backpatched length: `kind u16, version u16,
+/// length u32, body`. Shared by tablet and consensus batches so framing
+/// can never drift between families.
+fn frame_record(
+    body: &mut Vec<u8>,
+    kind: u16,
+    encode: impl FnOnce(&mut Vec<u8>) -> Result<(), DurabilityError>,
+) -> Result<(), DurabilityError> {
+    let start = body.len();
+    body.extend_from_slice(&kind.to_le_bytes());
+    body.extend_from_slice(&RECORD_VERSION_1.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes()); // length backpatch
+    encode(body)?;
+    let len =
+        u32::try_from(body.len() - start - 8).map_err(|_| DurabilityError::InvalidConfig {
+            reason: "WAL record exceeds u32 length",
+        })?;
+    body[start + 4..start + 8].copy_from_slice(&len.to_le_bytes());
+    Ok(())
+}
+
+/// Validates batch count and total size before the caller seals the frame.
+fn check_batch_body(count: usize, body: &[u8], what: &'static str) -> Result<(), DurabilityError> {
+    if count == 0 || count > WAL_MAX_RECORDS_PER_BATCH {
         return Err(DurabilityError::InvalidConfig {
             reason: "WAL batch must hold 1..=4096 records",
         });
     }
+    if body.len() > WAL_MAX_BODY_BYTES {
+        return Err(DurabilityError::InvalidConfig { reason: what });
+    }
+    Ok(())
+}
+
+/// Encodes one batch body: framed records with backpatched lengths.
+/// Validates count and total size before the caller allocates the frame.
+fn encode_batch_body(records: &[WalRecord]) -> Result<Vec<u8>, DurabilityError> {
     let mut body = Vec::new();
     for record in records {
         let kind = match record {
             WalRecord::Mutation(_) => RECORD_KIND_MUTATION,
             WalRecord::Outcome(_) => RECORD_KIND_OUTCOME,
         };
-        let start = body.len();
-        body.extend_from_slice(&kind.to_le_bytes());
-        body.extend_from_slice(&RECORD_VERSION_1.to_le_bytes());
-        body.extend_from_slice(&0u32.to_le_bytes()); // length backpatch
-        encode_record_body(record, &mut body)?;
-        let len =
-            u32::try_from(body.len() - start - 8).map_err(|_| DurabilityError::InvalidConfig {
-                reason: "WAL record exceeds u32 length",
-            })?;
-        body[start + 4..start + 8].copy_from_slice(&len.to_le_bytes());
+        frame_record(&mut body, kind, |out| encode_record_body(record, out))?;
     }
-    if body.len() > WAL_MAX_BODY_BYTES {
-        return Err(DurabilityError::InvalidConfig {
-            reason: "WAL batch body exceeds allocation guard",
-        });
+    check_batch_body(
+        records.len(),
+        &body,
+        "WAL batch body exceeds allocation guard",
+    )?;
+    Ok(body)
+}
+
+/// Encodes one consensus batch body: one group's Raft records under the
+/// same framing, checksums, and allocation guards as tablet batches.
+/// Families never mix inside one batch.
+///
+/// # Errors
+///
+/// Returns [`DurabilityError`] when the batch is empty, oversized, or a
+/// blob exceeds the `u32` length bound.
+pub fn encode_raft_batch(records: &[crate::raft::RaftRecord]) -> Result<Vec<u8>, DurabilityError> {
+    let mut body = Vec::new();
+    for record in records {
+        let kind = record.kind();
+        frame_record(&mut body, kind, |out| {
+            crate::raft::encode_raft_body(record, out)
+        })?;
     }
+    check_batch_body(
+        records.len(),
+        &body,
+        "raft batch body exceeds allocation guard",
+    )?;
     Ok(body)
 }
 
 /// Structural record-decode failure without file position: the segment
-/// scanner attaches lane and segment before surfacing it.
+/// scanner attaches lane and segment before surfacing it. Shared with the
+/// consensus record decoder ([`crate::raft`]), whose faults get the same
+/// positions at the same call site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RecordFault {
+pub(crate) enum RecordFault {
     /// Complete bytes that fail validation.
     Corrupt(&'static str),
     /// Unknown state-changing kind or version (never skipped).
@@ -574,7 +638,12 @@ fn decode_blob_prefix(input: &[u8]) -> Result<(&[u8], usize), RecordFault> {
     Ok((&input[4..4 + len], 4 + len))
 }
 
-fn decode_record_body(kind: u16, version: u16, body: &[u8]) -> Result<WalRecord, RecordFault> {
+fn decode_record_body(kind: u16, version: u16, body: &[u8]) -> Result<WalEntry, RecordFault> {
+    // Consensus kinds decode through the Raft formats (shared framing,
+    // same fault contract, positions attached by the scanner).
+    if crate::raft::is_raft_kind(kind) {
+        return crate::raft::decode_raft_body(kind, version, body).map(WalEntry::Consensus);
+    }
     if version != RECORD_VERSION_1 {
         return Err(RecordFault::UnsupportedVersion);
     }
@@ -606,7 +675,7 @@ fn decode_record_body(kind: u16, version: u16, body: &[u8]) -> Result<WalRecord,
             if consumed != expected_bytes.len() {
                 return Err(RecordFault::Corrupt("trailing bytes in expected outcome"));
             }
-            Ok(WalRecord::Mutation(MutationRecord {
+            Ok(WalEntry::Tablet(WalRecord::Mutation(MutationRecord {
                 namespace: NamespaceId::from_u64(prefix.namespace),
                 tablet: TabletId::from_u64(prefix.tablet),
                 epoch: TabletEpoch::from_u64(prefix.epoch),
@@ -617,7 +686,7 @@ fn decode_record_body(kind: u16, version: u16, body: &[u8]) -> Result<WalRecord,
                 identity,
                 mutation,
                 expected,
-            }))
+            })))
         }
         RECORD_KIND_OUTCOME => {
             let (prefix, mut at) = decode_fixed_prefix(body)?;
@@ -633,7 +702,7 @@ fn decode_record_body(kind: u16, version: u16, body: &[u8]) -> Result<WalRecord,
             if consumed != outcome_bytes.len() {
                 return Err(RecordFault::Corrupt("trailing bytes in outcome"));
             }
-            Ok(WalRecord::Outcome(OutcomeRecord {
+            Ok(WalEntry::Tablet(WalRecord::Outcome(OutcomeRecord {
                 namespace: NamespaceId::from_u64(prefix.namespace),
                 tablet: TabletId::from_u64(prefix.tablet),
                 epoch: TabletEpoch::from_u64(prefix.epoch),
@@ -643,7 +712,7 @@ fn decode_record_body(kind: u16, version: u16, body: &[u8]) -> Result<WalRecord,
                 opcode: prefix.opcode,
                 identity,
                 outcome,
-            }))
+            })))
         }
         other => Err(RecordFault::Unknown {
             kind: other,
@@ -1069,7 +1138,15 @@ impl LocalWalLane {
             first_batch_seq: Some(first.batch_seq.get()),
             records: records
                 .iter()
-                .map(|entry| (entry.record.tablet(), entry.record.commit()))
+                .filter_map(|entry| match &entry.entry {
+                    // Tablet commits drive reclamation coverage. Consensus
+                    // entries carry no commit position and contribute no
+                    // coverage here; their retention is tracked separately
+                    // through purge markers (stage H), and physical
+                    // reclamation stays conservative until then.
+                    WalEntry::Tablet(record) => Some((record.tablet(), record.commit())),
+                    WalEntry::Consensus(_) => None,
+                })
                 .collect(),
         })
     }
@@ -1117,6 +1194,39 @@ impl LocalWalLane {
             });
         }
         let body = encode_batch_body(records)?;
+        self.seal_encoded_body(&body, records.len())
+    }
+
+    /// Appends one consensus batch (a group's Raft records) with exactly
+    /// the tablet path's rotation, barrier, health, and stats semantics:
+    /// one durability contract for both families on a shared lane.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurabilityError`] on encode failure, a failed lane, or a
+    /// failed barrier — same contract as `append_records`.
+    pub fn append_raft_records(
+        &mut self,
+        records: &[crate::raft::RaftRecord],
+    ) -> Result<CommitProof, DurabilityError> {
+        if self.health == StorageHealth::Failed {
+            return Err(DurabilityError::Io {
+                op: "append to failed WAL lane",
+                message: "lane is terminally failed; restart to recover".to_owned(),
+                code: None,
+            });
+        }
+        let body = encode_raft_batch(records)?;
+        self.seal_encoded_body(&body, records.len())
+    }
+
+    /// Seals a pre-encoded batch body: rotation, header/footer, write,
+    /// barrier, and stats. Shared by tablet and consensus appends.
+    fn seal_encoded_body(
+        &mut self,
+        body: &[u8],
+        count: usize,
+    ) -> Result<CommitProof, DurabilityError> {
         let batch_len = (BATCH_HEADER_LEN + body.len() + BATCH_FOOTER_LEN) as u64;
         if self.file.is_none()
             || (self.segment_bytes > 0 && self.segment_bytes + batch_len > self.target_bytes)
@@ -1127,10 +1237,9 @@ impl LocalWalLane {
         let body_len = u32::try_from(body.len()).map_err(|_| DurabilityError::InvalidConfig {
             reason: "WAL batch body exceeds u32 length",
         })?;
-        let record_count =
-            u16::try_from(records.len()).map_err(|_| DurabilityError::InvalidConfig {
-                reason: "WAL batch exceeds u16 record count",
-            })?;
+        let record_count = u16::try_from(count).map_err(|_| DurabilityError::InvalidConfig {
+            reason: "WAL batch exceeds u16 record count",
+        })?;
         let header = BatchHeaderWire {
             magic: U32::new(WAL_MAGIC_BATCH),
             major: U16::new(WAL_MAJOR),
@@ -1151,7 +1260,7 @@ impl LocalWalLane {
         let footer = BatchFooterWire {
             magic: U32::new(WAL_MAGIC_FOOTER),
             batch_seq: U64::new(batch_seq),
-            body_crc: U32::new(crc32c_checksum(&body)),
+            body_crc: U32::new(crc32c_checksum(body)),
             footer_crc: U32::new(0),
         };
         let mut footer_bytes = [0u8; BATCH_FOOTER_LEN];
@@ -1162,7 +1271,7 @@ impl LocalWalLane {
         let path = self.dir.join(segment_file_name(self.segment_seq));
         let write_outcome = (|| -> io::Result<()> {
             file.write_all(&header_bytes)?;
-            file.write_all(&body)?;
+            file.write_all(body)?;
             file.write_all(&footer_bytes)?;
             crate::fs::sync_file(file)?;
             Ok(())
@@ -1184,7 +1293,7 @@ impl LocalWalLane {
         self.segment_bytes += batch_len;
         self.next_batch_seq += 1;
         self.stats.batches += 1;
-        self.stats.records += records.len() as u64;
+        self.stats.records += count as u64;
         self.stats.bytes += batch_len;
         self.stats.fsyncs += 1;
         if self.health == StorageHealth::ReadOnly {
@@ -1429,11 +1538,11 @@ impl LocalWalLane {
                         max: WAL_MAX_BODY_BYTES,
                     });
                 }
-                let record = decode_record_body(kind, version, &body[at + 8..at + 8 + len])
+                let entry = decode_record_body(kind, version, &body[at + 8..at + 8 + len])
                     .map_err(|fault| fault.at(self.lane, seq))?;
                 records.push(RecoveredRecord {
                     batch_seq: batch.batch_seq.get(),
-                    record,
+                    entry,
                 });
                 at += 8 + len;
             }
@@ -1605,11 +1714,70 @@ mod tests {
         let replayed: Vec<WalRecord> = recovery
             .records
             .into_iter()
-            .map(|entry| entry.record)
+            .map(|entry| match entry.entry {
+                WalEntry::Tablet(record) => record,
+                WalEntry::Consensus(_) => panic!("tablet-only lane holds no consensus entries"),
+            })
             .collect();
         assert_eq!(replayed, records);
         // Batch sequences are contiguous from 1 across the lane.
         assert_eq!(lane.next_batch_seq(), 4);
+    }
+
+    #[test]
+    fn mixed_tablet_and_consensus_batches_share_one_lane() {
+        use crate::raft::{RaftRecord, RaftTruncate, RaftVote};
+        let scratch = tempfile::tempdir().expect("scratch");
+        let mut lane = open_lane(scratch.path(), 1024 * 1024);
+        let mutation = test_mutation(9, 1, "a");
+        lane.append_batch(&PersistIntent {
+            records: std::slice::from_ref(&mutation),
+            level: DurabilityLevel::Sync,
+        })
+        .expect("tablet batch appends");
+        let vote = RaftRecord::Vote(RaftVote {
+            namespace: NamespaceId::from_u64(1),
+            group: TabletId::from_u64(9),
+            term: 7,
+            candidate: NodeId::from_u64(2),
+            committed: true,
+        });
+        let truncate = RaftRecord::Truncate(RaftTruncate {
+            namespace: NamespaceId::from_u64(1),
+            group: TabletId::from_u64(9),
+            from_index: 44,
+        });
+        lane.append_raft_records(&[vote.clone(), truncate.clone()])
+            .expect("consensus batch appends");
+        lane.append_batch(&PersistIntent {
+            records: std::slice::from_ref(&mutation),
+            level: DurabilityLevel::Sync,
+        })
+        .expect("second tablet batch appends");
+        assert_eq!(lane.stats().batches, 3);
+        assert_eq!(lane.stats().records, 4);
+        let recovery = lane.recover().expect("mixed lane recovers");
+        assert_eq!(recovery.records.len(), 4);
+        assert!(matches!(
+            &recovery.records[0].entry,
+            WalEntry::Tablet(WalRecord::Mutation(_))
+        ));
+        assert_eq!(recovery.records[0].batch_seq, 1);
+        assert!(matches!(
+            &recovery.records[1].entry,
+            WalEntry::Consensus(record) if *record == vote
+        ));
+        assert!(matches!(
+            &recovery.records[2].entry,
+            WalEntry::Consensus(record) if *record == truncate
+        ));
+        assert_eq!(recovery.records[1].batch_seq, 2);
+        assert_eq!(recovery.records[2].batch_seq, 2);
+        assert!(matches!(
+            &recovery.records[3].entry,
+            WalEntry::Tablet(WalRecord::Mutation(_))
+        ));
+        assert_eq!(recovery.records[3].batch_seq, 3);
     }
 
     #[test]
@@ -1635,7 +1803,12 @@ mod tests {
         assert_eq!(recovery.truncated_bytes, 0);
         for (position, entry) in recovery.records.iter().enumerate() {
             assert_eq!(entry.batch_seq, position as u64 + 1);
-            assert_eq!(entry.record.commit().as_u64(), position as u64 + 1);
+            match &entry.entry {
+                WalEntry::Tablet(record) => {
+                    assert_eq!(record.commit().as_u64(), position as u64 + 1);
+                }
+                WalEntry::Consensus(_) => panic!("tablet-only lane holds no consensus entries"),
+            }
         }
         // Old segments are never deleted in this stage.
         assert!(lane.segment_count() >= 3);

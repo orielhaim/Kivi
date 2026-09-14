@@ -406,6 +406,58 @@ fn direct_path_bypasses_the_channel() {
     engine.shutdown().expect("clean shutdown");
 }
 
+/// A legal frame near the 4 MiB connection input bound must round-trip:
+/// the input bound caps unparsed junk, never a declared in-progress frame
+/// (protocol ceiling is 64 MiB). Regression test for the frame/input-bound
+/// mismatch that killed every non-stream frame at or above 4 MiB.
+#[test]
+fn large_single_frame_round_trips() {
+    let engine = start_split();
+    let client = client_for(&engine);
+    // 4 MiB value: the request frame is strictly larger than the 4 MiB
+    // connection input bound, so the old buffered-bytes check closed this.
+    let big = Bytes::from(vec![0xA5u8; 4 * 1024 * 1024]);
+    let key = Key::from("bulk:4mib");
+    client.set(&key, big.clone()).expect("4 MiB set");
+    assert_eq!(client.get(&key).expect("get"), Some(big));
+    engine.shutdown().expect("clean shutdown");
+}
+
+/// Concurrent 4 MiB bulk sets from independent connections all succeed —
+/// one connection's in-progress frame never trips another's bound, and
+/// pipelined small frames alongside bulk traffic stay healthy.
+#[test]
+fn concurrent_bulk_frames_all_succeed() {
+    let engine = start_split();
+    let barrier = Arc::new(Barrier::new(5));
+    let mut threads = Vec::new();
+    for worker in 0u8..4 {
+        let client = client_for(&engine);
+        let gate = Arc::clone(&barrier);
+        threads.push(thread::spawn(move || {
+            gate.wait();
+            for round in 0u8..2 {
+                let key = Key::from(format!("bulk:{worker}:{round}"));
+                let value = Bytes::from(vec![worker * 16 + round; 4 * 1024 * 1024]);
+                client.set(&key, value.clone()).expect("bulk set");
+                assert_eq!(client.get(&key).expect("get"), Some(value));
+                // Small frames on the same client stay healthy next to bulk.
+                client
+                    .set(
+                        &Key::from(format!("small:{worker}:{round}")),
+                        Bytes::from_static(b"s"),
+                    )
+                    .expect("small set");
+            }
+        }));
+    }
+    barrier.wait();
+    for thread in threads {
+        thread.join().expect("client thread joins");
+    }
+    engine.shutdown().expect("clean shutdown");
+}
+
 #[test]
 fn concurrent_native_counter_is_exact() {
     let engine = start_split();

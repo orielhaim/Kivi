@@ -31,6 +31,7 @@
 //! * [`conformance`] — differential-testing helpers: key-prefix isolation,
 //!   normalization, and reference-Redis configuration inspection.
 
+pub mod cluster;
 pub mod conformance;
 pub mod metrics;
 pub mod process;

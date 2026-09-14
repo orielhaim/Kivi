@@ -29,20 +29,24 @@ use crate::clock::SystemClock;
 use crate::routing::{Placement, RoutingError, RoutingSnapshot};
 use crate::tablet::{LiveTablet, TabletError};
 use crate::worker::{
-    TabletRequest, WorkerControl, WorkerDurability, WorkerHandle, WorkerMetrics, WorkerRequestError,
+    ControlIngress, RequestIngress, TabletRequest, WorkerControl, WorkerDurability, WorkerHandle,
+    WorkerMetrics, WorkerRequestError,
 };
 
-/// Networked spawn outcome: handles, channel senders, and bound addresses.
+/// Networked spawn outcome: handles, bundled ingress handles (bounded
+/// sender plus bridge wakeup), and bound addresses.
 type NetworkSpawn = (
     Vec<WorkerHandle>,
-    Vec<crossbeam_channel::Sender<TabletRequest>>,
+    Vec<RequestIngress>,
     Vec<std::net::SocketAddr>,
 );
 
-/// Merged recovery scan: per-tablet commit-ordered records plus lane
-/// totals (segments scanned, torn-tail bytes truncated).
+/// Merged recovery scan: per-tablet commit-ordered records, per-group
+/// file-ordered consensus records, plus lane totals (segments scanned,
+/// torn-tail bytes truncated).
 type RecoveryScan = (
     std::collections::HashMap<TabletId, Vec<(u64, kivi_durability::WalRecord)>>,
+    std::collections::HashMap<TabletId, Vec<(u64, kivi_durability::RaftRecord)>>,
     u64,
     u64,
 );
@@ -359,7 +363,7 @@ impl From<WorkerRequestError> for EngineError {
 struct EngineShared {
     namespace: NamespaceId,
     routing: Arc<arc_swap::ArcSwap<RoutingSnapshot>>,
-    senders: Vec<crossbeam_channel::Sender<TabletRequest>>,
+    senders: Vec<RequestIngress>,
     /// Chunk lane per worker index, for caller-side chunked-read
     /// resolution on the embedded path (blocking, caller thread).
     chunk_lanes: Vec<crate::chunk_lane::ChunkLaneHandle>,
@@ -393,7 +397,7 @@ pub struct LocalEngine {
 pub struct AdminHandle {
     namespace: NamespaceId,
     routing: Arc<ArcSwap<RoutingSnapshot>>,
-    controls: Vec<(WorkerId, crossbeam_channel::Sender<WorkerControl>)>,
+    controls: Vec<(WorkerId, ControlIngress)>,
     endpoints: Vec<(WorkerId, std::net::SocketAddr)>,
     durability: Option<EngineDurability>,
     checkpoint: Arc<std::sync::Mutex<crate::checkpoint::CheckpointAdminState>>,
@@ -883,14 +887,20 @@ impl LocalEngine {
         // Merge records per tablet across lanes (a future tablet may hold
         // history in several lanes; never assume one lane per tablet),
         // resuming each lane at its durable floor.
-        let (per_tablet, segments_scanned, tail_truncated_bytes) =
+        let (per_tablet, consensus, segments_scanned, tail_truncated_bytes) =
             Self::scan_recovery_lanes(&mut lanes, &restored.floors)?;
         // Validate against the startup directory, skip checkpoint-covered
         // records, then replay the tail in commit order. Records for
         // forgotten tablets fail startup: discarding their history would
         // be silent data loss.
-        let (records_replayed, tablets_recovered, obsolete_skipped) =
-            Self::replay_records(by_worker, routing, namespace, per_tablet, &restored.cuts)?;
+        let (records_replayed, tablets_recovered, obsolete_skipped) = Self::replay_records(
+            by_worker,
+            routing,
+            namespace,
+            per_tablet,
+            &consensus,
+            &restored.cuts,
+        )?;
         let wal_summary = RecoverySummary {
             records_replayed,
             segments_scanned,
@@ -1102,9 +1112,11 @@ impl LocalEngine {
         lanes: &mut std::collections::HashMap<u16, LocalWalLane>,
         floors: &std::collections::HashMap<u16, kivi_durability::LaneFloor>,
     ) -> Result<RecoveryScan, EngineError> {
-        use kivi_durability::WalRecord;
+        use kivi_durability::{WalEntry, WalRecord};
         use std::collections::HashMap;
         let mut per_tablet: HashMap<TabletId, Vec<(u64, WalRecord)>> = HashMap::new();
+        let mut consensus: HashMap<TabletId, Vec<(u64, kivi_durability::RaftRecord)>> =
+            HashMap::new();
         let mut segments_scanned = 0u64;
         let mut tail_truncated_bytes = 0u64;
         let mut lane_order: Vec<u16> = lanes.keys().copied().collect();
@@ -1118,14 +1130,32 @@ impl LocalEngine {
             let recovery = lane_state.recover_from(floor)?;
             segments_scanned += recovery.segments_scanned;
             tail_truncated_bytes += recovery.truncated_bytes;
+            // Lanes recover in file order, so both families stay ordered
+            // without re-sorting: tablet records sort by commit below,
+            // consensus records keep arrival order per group.
             for entry in recovery.records {
-                per_tablet
-                    .entry(entry.record.tablet())
-                    .or_default()
-                    .push((entry.record.commit().as_u64(), entry.record));
+                match entry.entry {
+                    WalEntry::Tablet(record) => {
+                        per_tablet
+                            .entry(record.tablet())
+                            .or_default()
+                            .push((record.commit().as_u64(), record));
+                    }
+                    WalEntry::Consensus(record) => {
+                        consensus
+                            .entry(record.group())
+                            .or_default()
+                            .push((entry.batch_seq, record));
+                    }
+                }
             }
         }
-        Ok((per_tablet, segments_scanned, tail_truncated_bytes))
+        Ok((
+            per_tablet,
+            consensus,
+            segments_scanned,
+            tail_truncated_bytes,
+        ))
     }
 
     /// Validates merged records against the startup directory, skips
@@ -1137,9 +1167,20 @@ impl LocalEngine {
         routing: &RoutingSnapshot,
         namespace: NamespaceId,
         per_tablet: std::collections::HashMap<TabletId, Vec<(u64, kivi_durability::WalRecord)>>,
+        consensus: &std::collections::HashMap<TabletId, Vec<(u64, kivi_durability::RaftRecord)>>,
         cuts: &std::collections::HashMap<TabletId, u64>,
     ) -> Result<(u64, u64, u64), EngineError> {
         use kivi_durability::{RecoveryError, WalRecord};
+        // Single-node mode owns no consensus history: any consensus record
+        // means this data directory was written by replicated mode, and
+        // serving it as single-node would fork history. The replicated
+        // replayer (consensus stage) consumes these instead.
+        if let Some(group) = consensus.keys().next() {
+            return Err(RecoveryError::UnexpectedConsensusRecord {
+                group: group.as_u64(),
+            }
+            .into());
+        }
         let mut records_replayed = 0u64;
         let mut tablets_recovered = 0u64;
         let mut obsolete_skipped = 0u64;
@@ -1231,10 +1272,7 @@ impl LocalEngine {
         by_worker: Vec<Vec<LiveTablet>>,
         lanes: Vec<Option<WorkerDurability>>,
         chunks: Vec<crate::worker::WorkerChunks>,
-    ) -> (
-        Vec<WorkerHandle>,
-        Vec<crossbeam_channel::Sender<TabletRequest>>,
-    ) {
+    ) -> (Vec<WorkerHandle>, Vec<RequestIngress>) {
         let mut workers = Vec::with_capacity(worker_count);
         let mut senders = Vec::with_capacity(worker_count);
         for (((index, tablets), durability), chunks) in
@@ -1487,7 +1525,9 @@ impl LocalEngine {
         // observes the shutdown flag and breaks. The dummy sends nothing
         // and closes at once: the server reads EOF and closes it cleanly
         // with no log noise. A short settle precedes the dummies so the
-        // flag is set before any dummy is accepted (bridge cycle ≤10ms).
+        // flag is set before any dummy is accepted (the Shutdown control
+        // above already pinged every bridge awake, so bridges exit
+        // promptly; the settle is for the accept loops only).
         std::thread::sleep(std::time::Duration::from_millis(50));
         for addr in &self.bound {
             if let Ok(socket) =
@@ -1541,9 +1581,10 @@ pub struct ShutdownReport {
     pub workers_joined: usize,
 }
 
-/// Extracts the current request sender out of a fresh handle. Handle senders
-/// are not otherwise exposed; the engine keeps exactly one per worker.
-fn handle_sender(handle: &WorkerHandle) -> crossbeam_channel::Sender<TabletRequest> {
+/// Extracts the current request ingress out of a fresh handle. Handle
+/// ingress bundles are not otherwise exposed; the engine keeps exactly one
+/// per worker.
+fn handle_sender(handle: &WorkerHandle) -> RequestIngress {
     handle.sender()
 }
 

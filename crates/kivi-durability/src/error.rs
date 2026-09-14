@@ -135,6 +135,16 @@ pub enum RecoveryError {
         /// Observed record version.
         version: u16,
     },
+    /// A consensus (Raft) record reached a replayer that only understands
+    /// single-node tablet history. The data directory was written by
+    /// replicated mode; serving it as single-node would fork history, so
+    /// recovery refuses loudly. The replicated replayer (consensus stage)
+    /// consumes these records instead.
+    #[error("consensus record for group {group} in single-node recovery")]
+    UnexpectedConsensusRecord {
+        /// The consensus group (tablet) the record belongs to.
+        group: u64,
+    },
     /// A record names a tablet absent from (or retired in) the startup
     /// directory. The configuration forgot a tablet; discarding its history
     /// would be silent data loss.

@@ -65,6 +65,13 @@ struct BenchArgs {
     /// Endpoint: native seed endpoint or RESP address.
     #[arg(long, default_value = "127.0.0.1:9000")]
     server: String,
+    /// Extra native seed endpoints (comma-separated; the first seed
+    /// stays `--server`). A multi-seed native target is how existing
+    /// workload definitions run against the replicated cluster: leader
+    /// discovery, `NotLeader` retries, and stable mutation identities
+    /// are handled inside the target (task AG).
+    #[arg(long, value_delimiter = ',')]
+    seeds: Vec<String>,
     /// Target namespace id (native only; RESP always uses DB 0).
     #[arg(long, default_value_t = 1)]
     namespace: u64,
@@ -184,7 +191,9 @@ fn bench(args: BenchArgs) -> anyhow::Result<()> {
     let (report, endpoint, kind) = match args.target {
         Target::Native => {
             let server = args.server.clone();
-            let mut seeder = KiviNativeTarget::connect(&server, args.namespace, args.pending)?;
+            let mut seeds = vec![server.clone()];
+            seeds.extend(args.seeds.iter().cloned());
+            let mut seeder = KiviNativeTarget::connect_multi(&seeds, args.namespace, args.pending)?;
             runner::seed(
                 &mut seeder,
                 args.keys,
@@ -196,7 +205,7 @@ fn bench(args: BenchArgs) -> anyhow::Result<()> {
             .context("keyspace seeding failed")?;
             let redirects = seeder.redirects();
             let stats = runner::run(config, || {
-                KiviNativeTarget::connect(&server, args.namespace, args.pending)
+                KiviNativeTarget::connect_multi(&seeds, args.namespace, args.pending)
             })?;
             let mut extra = BTreeMap::new();
             extra.insert("redirects".to_owned(), redirects.to_string());

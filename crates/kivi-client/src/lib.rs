@@ -2440,4 +2440,147 @@ mod tests {
             "expected fast transport Io, got {outcome:?}"
         );
     }
+
+    /// Reads frames until the handshake completes, then until one
+    /// request arrives. Returns the request id, the decoded request,
+    /// and the now-established socket for the reply.
+    fn stub_request(socket: &mut std::net::TcpStream, node: u64) -> (u64, kivi_protocol::Request) {
+        use std::io::{Read, Write};
+
+        let mut reader = FrameReader::new(DEFAULT_MAX_FRAME);
+        let mut chunk = vec![0u8; 4096];
+        let hello = loop {
+            let count = socket.read(&mut chunk).expect("hello bytes");
+            assert!(count > 0, "client must send a hello");
+            let frames = reader.push(&chunk[..count]).expect("hello parses");
+            if let Some(frame) = frames.into_iter().next() {
+                break frame;
+            }
+        };
+        assert_eq!(hello.kind, FrameKind::ClientHello);
+        let reply = ServerHello {
+            major: kivi_protocol::PROTOCOL_MAJOR,
+            minor: kivi_protocol::PROTOCOL_MINOR,
+            caps: Capabilities::BASE_V1 | Capabilities::DURABLE_MUTATION_DEDUP,
+            cluster: kivi_types::ClusterId::from_u128(1),
+            node: kivi_types::NodeId::from_u64(node),
+            incarnation: kivi_types::NodeIncarnation::from_u64(1),
+            worker: WorkerId::from_u64(0),
+            dir_version: kivi_tablet::DirectoryVersion::from_u64(1),
+            max_frame: u32::try_from(DEFAULT_MAX_FRAME).expect("frame bound fits u32"),
+            endpoints: Vec::new(),
+        };
+        socket
+            .write_all(&encode_frame(FrameKind::ServerHello, 0, &reply.encode()))
+            .expect("hello reply");
+        loop {
+            let count = socket.read(&mut chunk).expect("request bytes");
+            assert!(count > 0, "client must send its request");
+            let frames = reader.push(&chunk[..count]).expect("request parses");
+            for frame in frames {
+                if frame.kind == FrameKind::Request {
+                    let request =
+                        kivi_protocol::Request::decode(&frame.payload).expect("request decodes");
+                    return (frame.request_id, request);
+                }
+            }
+        }
+    }
+
+    /// Leader redirect preserves the mutation identity (task O): a
+    /// follower answers `StaleRoute` with the leader's endpoint, and the
+    /// retry at the leader carries the identical session, sequence, and
+    /// ack floor — bounded by the redirect budget, never an infinite
+    /// loop, never a reallocated identity.
+    #[test]
+    fn redirect_retry_preserves_mutation_identity() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+
+        use kivi_protocol::RedirectInfo;
+
+        // Completer stub (the "leader"): answers `Stored` and reports the
+        // identity it served.
+        let leader_listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let leader_addr = leader_listener.local_addr().expect("addr");
+        let (leader_seen_tx, leader_seen_rx) = mpsc::channel();
+        let leader = std::thread::spawn(move || {
+            let (mut socket, _) = leader_listener.accept().expect("accept");
+            let (id, request) = stub_request(&mut socket, 1);
+            let identity = request.identity.expect("mutations carry identity");
+            leader_seen_tx
+                .send((identity, request.ack_floor))
+                .expect("report");
+            let response = Response {
+                status: Status::Ok,
+                body: ResponseBody::Stored { version: 7 },
+            };
+            socket
+                .write_all(&encode_frame(
+                    FrameKind::Response,
+                    id,
+                    &response.encode(request.opcode),
+                ))
+                .expect("reply");
+        });
+        // Redirector stub (the "follower"): answers `StaleRoute` at the
+        // leader and reports the identity it saw.
+        let follower_listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let follower_addr = follower_listener.local_addr().expect("addr");
+        let (follower_seen_tx, follower_seen_rx) = mpsc::channel();
+        let follower = std::thread::spawn(move || {
+            let (mut socket, _) = follower_listener.accept().expect("accept");
+            let (id, request) = stub_request(&mut socket, 2);
+            let identity = request.identity.expect("mutations carry identity");
+            follower_seen_tx
+                .send((identity, request.ack_floor))
+                .expect("report");
+            let info = RedirectInfo::new(
+                kivi_tablet::DirectoryVersion::from_u64(1),
+                kivi_types::TabletId::from_u64(9),
+                kivi_types::TabletEpoch::INITIAL,
+                WorkerId::from_u64(0),
+                leader_addr.to_string(),
+                kivi_tablet::PartitionRange::Hash(
+                    kivi_tablet::HashPrefix::new(0, 0).expect("root range valid"),
+                ),
+            )
+            .expect("redirect builds");
+            let response = Response {
+                status: Status::StaleRoute,
+                body: ResponseBody::Redirect(info),
+            };
+            socket
+                .write_all(&encode_frame(
+                    FrameKind::Response,
+                    id,
+                    &response.encode(request.opcode),
+                ))
+                .expect("reply");
+        });
+        // Seeded at the follower: the write transparently follows the
+        // redirect with the same identity, inside the redirect budget.
+        let client = NativeClient::new(ClientConfig {
+            seeds: vec![follower_addr.to_string()],
+            ..ClientConfig::default()
+        })
+        .expect("client builds");
+        client
+            .set(&Key::from("k"), bytes::Bytes::from_static(b"v"))
+            .expect("redirected write succeeds");
+        let (first, first_floor) = follower_seen_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("follower saw the attempt");
+        let (second, second_floor) = leader_seen_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("leader saw the retry");
+        assert_eq!(
+            (first, first_floor),
+            (second, second_floor),
+            "redirect retries must preserve session, sequence, and ack floor"
+        );
+        follower.join().expect("follower exits");
+        leader.join().expect("leader exits");
+    }
 }

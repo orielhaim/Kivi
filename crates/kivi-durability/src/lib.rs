@@ -30,16 +30,23 @@ pub mod error;
 pub mod fs;
 pub mod node;
 pub mod provider;
+pub mod raft;
 pub mod wal;
 
 pub use error::{DurabilityError, RecoveryError};
-pub use node::{NodeMeta, OpenDir, open_data_dir};
+pub use node::{NodeMeta, NodeSeed, OpenDir, open_data_dir, open_data_dir_with};
 pub use provider::{
     CommitProof, DurabilityLevel, DurabilityProvider, LaneStats, PersistIntent, RecoveryRecord,
     StorageHealth,
 };
+pub use raft::{
+    RAFT_PAYLOAD_BLANK, RAFT_PAYLOAD_MEMBERSHIP, RAFT_PAYLOAD_NORMAL, RECORD_KIND_RAFT_COMMITTED,
+    RECORD_KIND_RAFT_ENTRY, RECORD_KIND_RAFT_PURGE, RECORD_KIND_RAFT_SNAPSHOT_INSTALLED,
+    RECORD_KIND_RAFT_TRUNCATE, RECORD_KIND_RAFT_VOTE, RaftCommitted, RaftEntry, RaftEntryPayload,
+    RaftMembership, RaftPurge, RaftRecord, RaftSnapshotInstalled, RaftTruncate, RaftVote,
+};
 pub use wal::{
     DEFAULT_SEGMENT_TARGET_BYTES, LaneFloor, LaneIdentity, LaneRecovery, LocalWalLane,
     MutationRecord, OutcomeRecord, RecoveredRecord, RecoverySummary, SealedSegmentSummary,
-    WAL_MAJOR, WAL_MAX_BODY_BYTES, WalRecord, WorkerLaneStats,
+    WAL_MAJOR, WAL_MAX_BODY_BYTES, WalEntry, WalRecord, WorkerLaneStats,
 };

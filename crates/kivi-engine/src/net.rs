@@ -63,7 +63,10 @@ use crate::worker::{
     WorkerResponse, handle_control, handle_request,
 };
 
-/// Per-connection input bound default (4 MiB of unparsed bytes).
+/// Per-connection unparsed-junk bound default (4 MiB). This caps bytes
+/// with no validated meaning yet — never a declared in-progress frame,
+/// which [`kivi_protocol::FrameReader::buffer_ceiling`] covers exactly up
+/// to `max_frame`. A legal frame therefore always fits.
 pub const DEFAULT_MAX_INPUT_BYTES: usize = 4 * 1024 * 1024;
 /// Decoded-but-not-executed backlog bound default. Pipelining deeper than
 /// this closes the connection instead of queueing without limit.
@@ -72,23 +75,22 @@ pub const DEFAULT_MAX_PIPELINED: usize = 1024;
 pub const DEFAULT_TURN_FRAMES: usize = 32;
 /// Per-turn byte budget default (256 KiB of request payload).
 pub const DEFAULT_TURN_BYTES: usize = 256 * 1024;
-/// Embedded-path park interval: bounds idle CPU and caps pickup latency
-/// for channel messages on networked workers. `LocalClient` traffic against a
-/// networked worker carries admin calls, tests, and the RESP compatibility
-/// edge (which deliberately reuses local ingress instead of proxying through
-/// the native wire protocol) — never the native fast path, which lives on
-/// the connection tasks and never waits on this timer. 100 µs keeps embedded
-/// pickup latency in the noise while each wake only polls two channels and
-/// a pending flag; the long-term fix is an event-driven wakeup so idle
-/// workers sleep until traffic arrives.
-/// Channel-only workers keep their blocking `select!` loop with zero added
-/// latency; benchmarks of the embedded path use those.
+/// Embedded-bridge idle backstop: the bridge parks event-driven on its
+/// wakeup channel (every ingress send pings it), so idle workers sleep
+/// until traffic arrives with no poll quantum and no latency floor.
+/// `LocalClient` traffic against a networked worker carries admin calls,
+/// tests, and the RESP compatibility edge (which deliberately reuses local
+/// ingress instead of proxying through the native wire protocol) — never
+/// the native fast path, which lives on the connection tasks and never
+/// waits on this timer. This backstop only bounds a lost-ping bug (every
+/// send site pings through its ingress bundle, so it never fires in
+/// practice); normal wakes are immediate.
 ///
 /// While the commit coordinator holds admitted work, the bridge parks on
 /// the shorter completion quantum instead so embedded replies track batch
 /// proofs rather than this interval. The quantum only bounds completion
 /// detection, never batching.
-const BRIDGE_PARK_INTERVAL: Duration = Duration::from_micros(100);
+const BRIDGE_IDLE_BACKSTOP: Duration = Duration::from_millis(20);
 /// Accept-loop shutdown poll interval.
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Startup handshake timeout (bind + runtime creation must report fast).
@@ -97,7 +99,10 @@ pub(crate) const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Connection-level bounds, all explicit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConnLimits {
-    /// Maximum unparsed input bytes buffered per connection.
+    /// Maximum unparsed input bytes with no validated frame meaning
+    /// buffered per connection. A declared in-progress frame (header
+    /// parsed, length within `max_frame`) may buffer exactly its
+    /// declared length — see `FrameReader::buffer_ceiling`.
     pub max_input_bytes: usize,
     /// Maximum accepted frame payload (≤ 64 MiB protocol ceiling).
     pub max_frame: usize,
@@ -288,6 +293,7 @@ pub(crate) fn run_net(
     durability: Option<WorkerDurability>,
     chunks: crate::worker::WorkerChunks,
     launch: NetLaunch,
+    bridge_wake: async_channel::Receiver<()>,
     ready: std::sync::mpsc::Sender<Result<SocketAddr, NetStartError>>,
 ) {
     if let Err(error) =
@@ -319,7 +325,7 @@ pub(crate) fn run_net(
             return;
         }
     };
-    runtime.block_on(serve(shared, requests, control, ready));
+    runtime.block_on(serve(shared, requests, control, bridge_wake, ready));
 }
 
 /// Top-level serving future: bind, report, accept until shutdown, drain.
@@ -327,6 +333,7 @@ async fn serve(
     shared: Rc<WorkerNet>,
     requests: crossbeam_channel::Receiver<crate::worker::TabletRequest>,
     control: crossbeam_channel::Receiver<WorkerControl>,
+    bridge_wake: async_channel::Receiver<()>,
     ready: std::sync::mpsc::Sender<Result<SocketAddr, NetStartError>>,
 ) {
     let listener = match TcpListener::bind(shared.net.listen).await {
@@ -356,9 +363,16 @@ async fn serve(
         let durability = shared.durability.clone();
         let chunks = shared.chunks.clone();
         compio::runtime::spawn(async move {
-            bridge_loop(
-                requests, control, tablets, metrics, durability, chunks, shutdown,
-            )
+            bridge_loop(BridgeContext {
+                requests,
+                control,
+                bridge_wake,
+                tablets,
+                metrics,
+                durability,
+                chunks,
+                shutdown,
+            })
             .await;
         })
     };
@@ -424,20 +438,43 @@ async fn serve(
     let _ = bridge.await;
 }
 
-/// Embedded-path bridge: serves the crossbeam request/control channels from
-/// inside the runtime thread, sharing its tablets. Bounded per turn like
-/// connection I/O; exits on Shutdown or when the engine drops every sender
-/// (which also flips the listener shutdown so the thread can join).
-async fn bridge_loop(
+/// Embedded-bridge context: everything the bridge task borrows from the
+/// worker. Bundled so the bridge entry point takes one argument.
+struct BridgeContext {
     requests: crossbeam_channel::Receiver<crate::worker::TabletRequest>,
     control: crossbeam_channel::Receiver<WorkerControl>,
+    bridge_wake: async_channel::Receiver<()>,
     tablets: Rc<RefCell<HashMap<TabletId, LiveTablet>>>,
     metrics: Rc<Cell<WorkerMetrics>>,
     durability: Option<Rc<RefCell<WorkerDurability>>>,
     chunks: crate::worker::WorkerChunks,
     shutdown: Rc<Cell<bool>>,
-) {
+}
+
+/// Embedded-path bridge: serves the crossbeam request/control channels from
+/// inside the runtime thread, sharing its tablets. Ingress drains yield to
+/// the reactor like connection I/O; exits on Shutdown or when the engine
+/// drops every sender (which also flips the listener shutdown so the
+/// thread can join).
+///
+/// Wakeups are event-driven: every ingress send pings `bridge_wake`, so an
+/// idle bridge parks in `recv()` with no poll quantum, no latency floor,
+/// and no idle CPU. A short backstop bounds a lost ping (which cannot
+/// happen through the ingress bundles — this is defense in depth, not a
+/// pacing interval). While admitted work is outstanding the bridge parks
+/// on the completion quantum so replies track batch proofs.
+async fn bridge_loop(context: BridgeContext) {
     use crossbeam_channel::TryRecvError;
+    let BridgeContext {
+        requests,
+        control,
+        bridge_wake,
+        tablets,
+        metrics,
+        durability,
+        chunks,
+        shutdown,
+    } = context;
     let mut requests_dead = false;
     let mut control_dead = false;
     // Large embedded `Set`s parked while the chunk lane stages them (the
@@ -462,7 +499,11 @@ async fn bridge_loop(
                 }
             }
         }
-        for _ in 0..64 {
+        // Full drain (the channel capacity bounds the work): intake is
+        // admit-only with no I/O, and a yield every slice keeps connection
+        // tasks sharing this single-threaded reactor fairly.
+        let mut drained = 0usize;
+        loop {
             match requests.try_recv() {
                 Ok(request) => {
                     bridge_intake(
@@ -473,6 +514,10 @@ async fn bridge_loop(
                         &chunks,
                         &mut frontier,
                     );
+                    drained += 1;
+                    if drained.is_multiple_of(64) {
+                        YieldNow::default().await;
+                    }
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -488,8 +533,8 @@ async fn bridge_loop(
         // Complete staged large Sets whose lane proofs arrived, then pump
         // the commit coordinator so embedded durable requests keep
         // flowing, then park: short quantum while batches are admitted or
-        // in flight (reply latency tracks proofs), idle interval
-        // otherwise (bounded CPU, guaranteed progress).
+        // in flight (reply latency tracks proofs), event-driven sleep
+        // otherwise (bounded CPU, immediate wake on traffic).
         poll_bridge_stages(&mut frontier, &tablets, &metrics, durability.as_ref());
         let pending = !frontier.is_empty()
             || durability.as_ref().is_some_and(|cell| {
@@ -506,11 +551,11 @@ async fn bridge_loop(
         if pending {
             compio::time::sleep(crate::commit::COMPLETION_PARK).await;
         } else {
-            // Always park: an executor-agnostic wake-loop here would spin the
-            // thread and can starve every other task on a single-threaded
-            // reactor. Parking bounds idle CPU and guarantees connection tasks,
-            // timers, and completions all progress.
-            compio::time::sleep(BRIDGE_PARK_INTERVAL).await;
+            // Event-driven idle: every ingress send pings this channel, so
+            // the bridge sleeps until traffic arrives. The backstop only
+            // bounds a lost ping (defense in depth — send sites always
+            // ping, and a closed channel here just re-checks the queues).
+            let _ = compio::time::timeout(BRIDGE_IDLE_BACKSTOP, bridge_wake.recv()).await;
         }
     }
 }
@@ -1117,7 +1162,10 @@ impl Conn {
         let stream = self.stream.as_mut().expect("unified stream pre-split");
         let reader = self.reader.as_mut().expect("parser pre-split");
         loop {
-            if reader.buffered() >= self.max_input {
+            // Coherent bound: the input cap applies to unparsed junk, not
+            // to a declared in-progress frame (which the ceiling covers
+            // exactly). A legal frame up to max_frame always fits.
+            if reader.buffered() >= reader.buffer_ceiling(self.max_input) {
                 return Err(ConnExit::Violation("input buffer bound"));
             }
             let chunk = Vec::with_capacity(8192);
@@ -2688,7 +2736,10 @@ async fn conn_read_loop(
             }
             continue;
         }
-        if reader.buffered() >= max_input {
+        // Coherent bound (see the handshake loop): unparsed junk is
+        // capped at max_input while a declared in-progress frame may
+        // buffer exactly its declared length up to max_frame.
+        if reader.buffered() >= reader.buffer_ceiling(max_input) {
             break ConnExit::Violation("input buffer bound");
         }
         let chunk = Vec::with_capacity(8192);
