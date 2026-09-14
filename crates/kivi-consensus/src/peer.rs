@@ -1,26 +1,23 @@
-//! Dedicated Kivi peer protocol.
+//! Kivi peer message vocabulary over QUIC/H3.
 //!
-//! Consensus traffic runs on its own TCP mesh with project-owned,
-//! versioned framing — never the native client protocol, RESP, or admin
-//! HTTP. Every connection opens with a handshake carrying the peer
-//! protocol version, [`ClusterId`], [`NodeId`], [`NodeIncarnation`], and
-//! capability bits; the receiver rejects wrong clusters, stale
-//! incarnations, and missing required capabilities loudly.
+//! Peer traffic runs on the QUIC/H3 mesh ([`crate::transport`]) — never the
+//! native client protocol, RESP, or admin HTTP. HTTP/3 provides
+//! multiplexing, framing, flow control, and stream lifecycle; this module
+//! owns only Kivi semantics:
 //!
-//! ```text
-//! frame := magic u32, version u16, len u32, body[len], crc u32
-//! body  := kind u16, id u64, group u64, payload…
-//! ```
+//! * peer identity ([`PeerIdentity`]: cluster, node, incarnation) carried
+//!   in authenticated H3 headers and validated per request (wrong cluster,
+//!   stale incarnation, and missing capabilities refuse loudly);
+//! * Raft RPC payloads as Kivi-owned binary structs (never `OpenRaft`
+//!   memory layout — [`crate::router`] owns translation both ways, so
+//!   `OpenRaft` upgrades cannot change these bytes);
+//! * immutable sidecar identities (`ChunkId`/`ManifestId` over content,
+//!   never pack offsets).
 //!
-//! Every consensus body carries the addressed consensus group
+//! Every RPC addresses its consensus group
 //! ([`ConsensusGroupId`](crate::types::ConsensusGroupId), as its tablet
-//! id): one physical mesh multiplexes many Raft groups (Multi-Raft
+//! id) in the H3 path: one mesh multiplexes many Raft groups (Multi-Raft
 //! direction), and the group id routes each RPC to the right instance.
-//!
-//! Kinds `1–3` are handshake (`Hello`, `Accept`, `Reject`); kinds
-//! `10–17` carry consensus RPCs as Kivi-owned structs (never `OpenRaft`
-//! memory layout — [`crate::router`] owns translation both ways, so
-//! `OpenRaft` upgrades cannot change these bytes).
 //!
 //! ## Snapshot identity discipline
 //!
@@ -48,42 +45,15 @@ use std::collections::HashMap;
 
 use kivi_types::{ClusterId, NodeId, NodeIncarnation};
 
-/// Peer-frame magic (`KVSP`: Kivi peer), little-endian.
-pub const PEER_MAGIC: u32 = 0x5053_564B;
-/// Peer protocol version spoken here (v2: group-multiplexed bodies,
-/// pre-vote, checkpoint/transfer snapshot identity split).
-pub const PEER_PROTOCOL_VERSION: u16 = 2;
-/// Required capability: consensus RPCs v2 (election/append/snapshot).
+/// Required capability: consensus RPCs (election/append/snapshot).
 pub const CAP_CONSENSUS_V2: u64 = 1 << 0;
+/// Required capability: immutable sidecar bulk transfer (manifest/chunk).
+pub const CAP_SIDECAR_V1: u64 = 1 << 1;
 /// All capabilities this binary requires of its peers.
-pub const REQUIRED_CAPABILITIES: u64 = CAP_CONSENSUS_V2;
-
-/// Maximum peer frame in bytes (matches the canonical frame ceiling; a
-/// larger declaration fails the connection, never allocates).
-pub const PEER_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
-
-/// Frame kinds: handshake.
-pub const KIND_HELLO: u16 = 1;
-/// Frame kinds: handshake accept.
-pub const KIND_ACCEPT: u16 = 2;
-/// Frame kinds: handshake reject.
-pub const KIND_REJECT: u16 = 3;
-/// Frame kinds: vote request.
-pub const KIND_VOTE_REQUEST: u16 = 10;
-/// Frame kinds: vote response.
-pub const KIND_VOTE_RESPONSE: u16 = 11;
-/// Frame kinds: append-entries request.
-pub const KIND_APPEND_REQUEST: u16 = 12;
-/// Frame kinds: append-entries response.
-pub const KIND_APPEND_RESPONSE: u16 = 13;
-/// Frame kinds: install-snapshot request fragment.
-pub const KIND_SNAPSHOT_REQUEST: u16 = 14;
-/// Frame kinds: install-snapshot response.
-pub const KIND_SNAPSHOT_RESPONSE: u16 = 15;
-/// Frame kinds: pre-vote request (same shape as a vote request).
-pub const KIND_PRE_VOTE_REQUEST: u16 = 16;
-/// Frame kinds: pre-vote response (same shape as a vote response).
-pub const KIND_PRE_VOTE_RESPONSE: u16 = 17;
+pub const REQUIRED_CAPABILITIES: u64 = CAP_CONSENSUS_V2 | CAP_SIDECAR_V1;
+/// Maximum bulk payload bytes per frame (chunk + framing, well under the
+/// 16 MiB peer ceiling; chunk bodies never exceed 8 MiB by construction).
+pub const MAX_BULK_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 /// Stable peer identity: who is speaking, in which cluster, in which
 /// process generation.
@@ -97,48 +67,13 @@ pub struct PeerIdentity {
     pub incarnation: NodeIncarnation,
 }
 
-/// Opening handshake of every peer connection, both directions (each side
-/// validates the other's hello).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HandshakeHello {
-    /// Protocol version offered.
-    pub version: u16,
-    /// Claimed cluster.
-    pub cluster: u128,
-    /// Claimed node.
-    pub node: u64,
-    /// Claimed incarnation.
-    pub incarnation: u64,
-    /// Offered capability bits.
-    pub capabilities: u64,
-}
-
-/// Successful handshake reply: the acceptor's own identity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HandshakeAccept {
-    /// Protocol version accepted.
-    pub version: u16,
-    /// Acceptor cluster.
-    pub cluster: u128,
-    /// Acceptor node.
-    pub node: u64,
-    /// Acceptor incarnation.
-    pub incarnation: u64,
-    /// Acceptor capability bits.
-    pub capabilities: u64,
-}
-
-/// Why a handshake was refused. Every variant fails the connection —
-/// never a downgrade, never a silent retry on the same socket.
+/// Why a peer request was refused at the authentication layer (wrong
+/// cluster, stale incarnation, missing capability, suspended link).
+/// Refusals fail only the request (mapped to retry-safe transport
+/// errors), never the connection — H3 streams are cheap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
-pub enum HandshakeReject {
-    /// The peer speaks a version this binary cannot serve.
-    #[error("unsupported peer protocol version {found}")]
-    UnsupportedVersion {
-        /// Offered version.
-        found: u16,
-    },
+pub enum AuthReject {
     /// The peer belongs to a different cluster.
     #[error("wrong cluster: peer serves {found}, local serves {expected}")]
     WrongCluster {
@@ -163,6 +98,16 @@ pub enum HandshakeReject {
         /// Required bits absent from the offer.
         missing: u64,
     },
+}
+
+/// Validated Kivi peer identity for one request: the claimed headers, with
+/// the TLS certificate already bound to a configured peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValidatedPeer {
+    /// Claimed node.
+    pub node: NodeId,
+    /// Claimed incarnation.
+    pub incarnation: NodeIncarnation,
 }
 
 /// Owned vote (term, candidate, committed flag).
@@ -313,9 +258,47 @@ pub struct PeerSnapshotResponse {
     pub vote: PeerVote,
 }
 
-/// One consensus RPC in either direction (request bodies; responses are
-/// matched by the transport's request id, not by this enum). Pre-vote
-/// reuses the vote shapes under its own kinds.
+/// Owned immutable manifest request (bulk lane).
+///
+/// Requests the canonical manifest bytes for `manifest` by content
+/// identity. The responder serves from its local sidecar store; physical
+/// pack offsets never cross the network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PeerManifestRequest {
+    /// Requested manifest id.
+    pub manifest: [u8; 32],
+}
+
+/// Owned immutable manifest response (bulk lane).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerManifestResponse {
+    /// Echoed manifest id.
+    pub manifest: [u8; 32],
+    /// Canonical manifest bytes (verified by the requester).
+    pub canonical: Vec<u8>,
+}
+
+/// Owned immutable chunk request (bulk lane).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PeerChunkRequest {
+    /// Requested chunk id.
+    pub chunk: [u8; 32],
+}
+
+/// Owned immutable chunk response (bulk lane).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerChunkResponse {
+    /// Echoed chunk id.
+    pub chunk: [u8; 32],
+    /// Logical chunk bytes (verified by the requester).
+    pub bytes: Vec<u8>,
+}
+
+/// One peer RPC. H3 request streams carry these without any further
+/// transport envelope: the route selects the family, the body is the
+/// payload codec below. Pre-vote reuses the vote shape under its own
+/// route. Manifest/chunk sidecar RPCs ride the bulk H3 connection so bulk
+/// transfer never starves critical traffic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerRequest {
     /// Election RPC.
@@ -326,6 +309,10 @@ pub enum PeerRequest {
     Append(PeerAppendRequest),
     /// Snapshot fragment RPC.
     Snapshot(PeerSnapshotRequest),
+    /// Immutable manifest fetch (bulk lane).
+    Manifest(PeerManifestRequest),
+    /// Immutable chunk fetch (bulk lane).
+    Chunk(PeerChunkRequest),
 }
 
 /// One consensus RPC response body.
@@ -339,6 +326,10 @@ pub enum PeerResponse {
     Append(PeerAppendResponse),
     /// Snapshot fragment answer.
     Snapshot(PeerSnapshotResponse),
+    /// Immutable manifest answer (bulk lane).
+    Manifest(PeerManifestResponse),
+    /// Immutable chunk answer (bulk lane).
+    Chunk(PeerChunkResponse),
 }
 
 /// Remote-side RPC failure: the peer decoded the request but its Raft
@@ -351,33 +342,26 @@ pub struct PeerRpcError {
     pub detail: String,
 }
 
-/// Structural frame/codec failure (never a remote verdict).
+/// Structural payload-codec failure (never a remote verdict). QUIC/TLS
+/// already guarantee transport integrity; these faults mean a corrupt or
+/// version-skewed peer body.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum PeerCodecError {
-    /// Fewer bytes than framing promises.
-    #[error("truncated peer frame")]
+    /// Fewer bytes than the payload promises.
+    #[error("truncated peer payload")]
     Truncated,
-    /// A length declaration exceeds the frame ceiling or the input.
+    /// A length declaration exceeds the body cap or the input.
     #[error("oversize peer declaration {len}")]
     Oversize {
         /// Declared length.
         len: usize,
     },
-    /// Wrong framing magic (not a peer socket).
-    #[error("bad peer magic {found:#x}")]
-    BadMagic {
-        /// Observed magic.
-        found: u32,
-    },
-    /// CRC mismatch (corruption, never retried on the same bytes).
-    #[error("peer frame CRC mismatch")]
-    BadCrc,
-    /// Unknown frame kind.
-    #[error("unknown peer frame kind {kind}")]
-    UnknownKind {
-        /// Observed kind.
-        kind: u16,
+    /// Unknown route suffix.
+    #[error("unknown peer route {route}")]
+    UnknownRoute {
+        /// Observed route suffix.
+        route: String,
     },
     /// A payload tag is unknown.
     #[error("unknown peer payload tag {tag}")]
@@ -385,19 +369,21 @@ pub enum PeerCodecError {
         /// Observed tag.
         tag: u8,
     },
-    /// Non-UTF8 address or snapshot id.
+    /// Non-UTF8 address string.
     #[error("non-UTF8 peer string")]
     BadString,
-    /// Trailing bytes after the framed body.
-    #[error("trailing bytes in peer frame")]
+    /// Trailing bytes after the payload body.
+    #[error("trailing bytes in peer payload")]
     TrailingBytes,
+    /// A hex identity in the route is malformed.
+    #[error("malformed peer identity hex: {detail}")]
+    BadHex {
+        /// Human-readable cause.
+        detail: String,
+    },
 }
 
 fn push_u64(out: &mut Vec<u8>, value: u64) {
-    out.extend_from_slice(&value.to_le_bytes());
-}
-
-fn push_u128(out: &mut Vec<u8>, value: u128) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
@@ -441,99 +427,6 @@ fn push_nodes(out: &mut Vec<u8>, nodes: &[(u64, String)]) {
     }
 }
 
-/// Incremental frame decoder over a TCP byte stream: callers push
-/// received bytes and drain complete verified frames. Oversize
-/// declarations fail the connection before any large allocation.
-#[derive(Debug, Default)]
-pub struct FrameDecoder {
-    buffer: Vec<u8>,
-}
-
-impl FrameDecoder {
-    /// Creates an empty decoder.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Appends newly received bytes.
-    pub fn push(&mut self, bytes: &[u8]) {
-        self.buffer.extend_from_slice(bytes);
-    }
-
-    /// Returns the number of buffered (unframed) bytes.
-    #[must_use]
-    pub fn buffered(&self) -> usize {
-        self.buffer.len()
-    }
-
-    /// Takes the next complete verified frame body (`kind u16` +
-    /// payload), or `None` when fewer than one frame is buffered.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PeerCodecError`] on magic, length, or CRC faults. The
-    /// caller must fail the connection on error (the stream position is
-    /// no longer trustworthy).
-    pub fn take_frame(&mut self) -> Result<Option<Vec<u8>>, PeerCodecError> {
-        use PeerCodecError as Fault;
-        const HEADER: usize = 4 + 2 + 4;
-        const CRC: usize = 4;
-        if self.buffer.len() < HEADER {
-            return Ok(None);
-        }
-        let magic = u32::from_le_bytes(self.buffer[..4].try_into().unwrap_or([0; 4]));
-        if magic != PEER_MAGIC {
-            return Err(Fault::BadMagic { found: magic });
-        }
-        let version = u16::from_le_bytes(self.buffer[4..6].try_into().unwrap_or([0; 2]));
-        if version != PEER_PROTOCOL_VERSION {
-            // Unknown versions fail the connection: no downgrade path is
-            // negotiated on an established socket (handshakes already
-            // agreed on this version).
-            return Err(Fault::UnknownKind { kind: version });
-        }
-        let len = u32::from_le_bytes(self.buffer[6..10].try_into().unwrap_or([0; 4])) as usize;
-        if len > PEER_MAX_FRAME_BYTES {
-            return Err(Fault::Oversize { len });
-        }
-        if self.buffer.len() < HEADER + len + CRC {
-            return Ok(None);
-        }
-        let body = self.buffer[HEADER..HEADER + len].to_vec();
-        let found = u32::from_le_bytes(
-            self.buffer[HEADER + len..HEADER + len + CRC]
-                .try_into()
-                .unwrap_or([0; 4]),
-        );
-        if found != crc32c::crc32c(&body) {
-            return Err(Fault::BadCrc);
-        }
-        self.buffer.drain(..HEADER + len + CRC);
-        Ok(Some(body))
-    }
-}
-
-/// Frames one body for the wire. Bodies larger than the frame ceiling
-/// saturate the length declaration so the peer fails `Oversize` (never a
-/// truncated send); all builders in this module stay far below the
-/// ceiling by construction.
-#[must_use]
-pub fn frame_body(body: &[u8]) -> Vec<u8> {
-    debug_assert!(
-        body.len() <= PEER_MAX_FRAME_BYTES,
-        "peer bodies stay below the frame ceiling by construction"
-    );
-    let mut out = Vec::with_capacity(4 + 2 + 4 + body.len() + 4);
-    out.extend_from_slice(&PEER_MAGIC.to_le_bytes());
-    out.extend_from_slice(&PEER_PROTOCOL_VERSION.to_le_bytes());
-    let len = u32::try_from(body.len()).unwrap_or(u32::MAX);
-    out.extend_from_slice(&len.to_le_bytes());
-    out.extend_from_slice(body);
-    out.extend_from_slice(&crc32c::crc32c(body).to_le_bytes());
-    out
-}
-
 struct Reader<'a> {
     input: &'a [u8],
     at: usize,
@@ -561,35 +454,27 @@ impl<'a> Reader<'a> {
         Ok(self.bytes(1)?[0])
     }
 
-    fn u16(&mut self) -> Result<u16, PeerCodecError> {
-        Ok(u16::from_le_bytes(
-            self.bytes(2)?.try_into().unwrap_or([0; 2]),
-        ))
-    }
-
     fn u64(&mut self) -> Result<u64, PeerCodecError> {
         Ok(u64::from_le_bytes(
             self.bytes(8)?.try_into().unwrap_or([0; 8]),
         ))
     }
 
-    fn u128(&mut self) -> Result<u128, PeerCodecError> {
-        Ok(u128::from_le_bytes(
-            self.bytes(16)?.try_into().unwrap_or([0; 16]),
-        ))
-    }
-
     fn blob(&mut self) -> Result<Vec<u8>, PeerCodecError> {
-        let len = u32::from_le_bytes(self.bytes(4)?.try_into().unwrap_or([0; 4])) as usize;
-        if len > PEER_MAX_FRAME_BYTES || len > self.rest() {
-            return Err(PeerCodecError::Oversize { len });
-        }
-        Ok(self.bytes(len)?.to_vec())
+        self.bulk_blob(crate::transport::MAX_RAFT_BODY_BYTES)
     }
 
     fn string(&mut self) -> Result<String, PeerCodecError> {
         let blob = self.blob()?;
         String::from_utf8(blob).map_err(|_| PeerCodecError::BadString)
+    }
+
+    fn bulk_blob(&mut self, max: usize) -> Result<Vec<u8>, PeerCodecError> {
+        let len = u32::from_le_bytes(self.bytes(4)?.try_into().unwrap_or([0; 4])) as usize;
+        if len > max || len > self.rest() {
+            return Err(PeerCodecError::Oversize { len });
+        }
+        Ok(self.bytes(len)?.to_vec())
     }
 
     fn vote(&mut self) -> Result<PeerVote, PeerCodecError> {
@@ -679,227 +564,155 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Encodes a handshake hello body.
-#[must_use]
-pub fn encode_hello(hello: &HandshakeHello) -> Vec<u8> {
-    let mut out = Vec::with_capacity(2 + 2 + 16 + 8 + 8 + 8);
-    out.extend_from_slice(&KIND_HELLO.to_le_bytes());
-    out.extend_from_slice(&hello.version.to_le_bytes());
-    push_u128(&mut out, hello.cluster);
-    push_u64(&mut out, hello.node);
-    push_u64(&mut out, hello.incarnation);
-    push_u64(&mut out, hello.capabilities);
-    out
-}
-
-/// Encodes a handshake accept body.
-#[must_use]
-pub fn encode_accept(accept: &HandshakeAccept) -> Vec<u8> {
-    let mut out = Vec::with_capacity(2 + 2 + 16 + 8 + 8 + 8);
-    out.extend_from_slice(&KIND_ACCEPT.to_le_bytes());
-    out.extend_from_slice(&accept.version.to_le_bytes());
-    push_u128(&mut out, accept.cluster);
-    push_u64(&mut out, accept.node);
-    push_u64(&mut out, accept.incarnation);
-    push_u64(&mut out, accept.capabilities);
-    out
-}
-
-/// Handshake outcome after validating a hello: accept with our identity,
-/// or the precise rejection.
+/// Validates authenticated peer headers for one request: cluster match,
+/// live incarnation, required capabilities.
 ///
-/// Only strictly OLDER generations are stale: an equal incarnation is
-/// the same live process generation reconnecting (transient drops and
+/// Only strictly OLDER generations are stale: an equal incarnation is the
+/// same live process generation reconnecting (transient drops and
 /// suspend/resume heal through this path), while an older one is a
-/// restarted-away generation that must never regain validity (task K).
-/// `INVALID` is never valid anywhere.
+/// restarted-away generation that must never regain validity. `INVALID`
+/// is never valid anywhere.
 ///
 /// # Errors
 ///
-/// Returns [`HandshakeReject`] for version, cluster, incarnation, or
-/// capability mismatches. Every rejection fails the connection.
-pub fn validate_hello(
-    hello: &HandshakeHello,
+/// Returns [`AuthReject`] for cluster, incarnation, or capability
+/// mismatches. Every rejection fails only the request.
+pub fn validate_peer_headers(
+    cluster: u128,
+    node: u64,
+    incarnation: u64,
+    capabilities: u64,
     local: &PeerIdentity,
     table: &IncarnationTable,
-) -> Result<HandshakeAccept, HandshakeReject> {
-    use HandshakeReject as Fault;
-    if hello.version != PEER_PROTOCOL_VERSION {
-        return Err(Fault::UnsupportedVersion {
-            found: hello.version,
-        });
-    }
-    if hello.cluster != local.cluster.as_u128() {
+) -> Result<ValidatedPeer, AuthReject> {
+    use AuthReject as Fault;
+    if cluster != local.cluster.as_u128() {
         return Err(Fault::WrongCluster {
             expected: local.cluster.as_u128(),
-            found: hello.cluster,
+            found: cluster,
         });
     }
-    if hello.incarnation == NodeIncarnation::INVALID.as_u64() {
+    let node_id = NodeId::from_u64(node);
+    if incarnation == NodeIncarnation::INVALID.as_u64() {
         return Err(Fault::StaleIncarnation {
-            node: hello.node,
-            found: hello.incarnation,
-            newest: table.newest(NodeId::from_u64(hello.node)),
+            node,
+            found: incarnation,
+            newest: table.newest(node_id),
         });
     }
-    if let Some(newest) = table.observed(NodeId::from_u64(hello.node))
-        && hello.incarnation < newest.as_u64()
+    if let Some(newest) = table.observed(node_id)
+        && incarnation < newest.as_u64()
     {
         return Err(Fault::StaleIncarnation {
-            node: hello.node,
-            found: hello.incarnation,
+            node,
+            found: incarnation,
             newest: newest.as_u64(),
         });
     }
-    let missing = REQUIRED_CAPABILITIES & !hello.capabilities;
+    let missing = REQUIRED_CAPABILITIES & !capabilities;
     if missing != 0 {
         return Err(Fault::MissingCapability { missing });
     }
-    Ok(HandshakeAccept {
-        version: PEER_PROTOCOL_VERSION,
-        cluster: local.cluster.as_u128(),
-        node: local.node.as_u64(),
-        incarnation: local.incarnation.as_u64(),
-        capabilities: REQUIRED_CAPABILITIES,
+    Ok(ValidatedPeer {
+        node: node_id,
+        incarnation: NodeIncarnation::from_u64(incarnation),
     })
 }
 
-/// Decodes a handshake body (hello, accept, or reject reason).
-///
-/// # Errors
-///
-/// Returns [`PeerCodecError`] on structural faults.
-pub fn decode_handshake(body: &[u8]) -> Result<HandshakeFrame, PeerCodecError> {
-    let mut reader = Reader::new(body);
-    let frame = match reader.u16()? {
-        KIND_HELLO => HandshakeFrame::Hello(HandshakeHello {
-            version: reader.u16()?,
-            cluster: reader.u128()?,
-            node: reader.u64()?,
-            incarnation: reader.u64()?,
-            capabilities: reader.u64()?,
-        }),
-        KIND_ACCEPT => HandshakeFrame::Accept(HandshakeAccept {
-            version: reader.u16()?,
-            cluster: reader.u128()?,
-            node: reader.u64()?,
-            incarnation: reader.u64()?,
-            capabilities: reader.u64()?,
-        }),
-        KIND_REJECT => {
-            let tag = reader.u8()?;
-            let a = reader.u64()?;
-            let b = reader.u64()?;
-            let c = reader.u64()?;
-            let d = reader.u64()?;
-            let reason = match tag {
-                1 => HandshakeReject::UnsupportedVersion {
-                    found: u16::try_from(a).unwrap_or(u16::MAX),
-                },
-                2 => HandshakeReject::WrongCluster {
-                    found: u128::from(a) | (u128::from(b) << 64),
-                    expected: u128::from(c) | (u128::from(d) << 64),
-                },
-                3 => HandshakeReject::StaleIncarnation {
-                    node: a,
-                    found: b,
-                    newest: c,
-                },
-                4 => HandshakeReject::MissingCapability { missing: a },
-                tag => return Err(PeerCodecError::BadTag { tag }),
-            };
-            HandshakeFrame::Reject(reason)
-        }
-        kind => return Err(PeerCodecError::UnknownKind { kind }),
-    };
-    reader.finish()?;
-    Ok(frame)
-}
-
-/// One decoded handshake body.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HandshakeFrame {
-    /// Opening offer.
-    Hello(HandshakeHello),
-    /// Acceptance with the acceptor's identity.
-    Accept(HandshakeAccept),
-    /// Refusal with its reason.
-    Reject(HandshakeReject),
-}
-
-/// Encodes a handshake rejection body: tag plus four fixed 64-bit slots
-/// (`a`, `b`, `c`, `d`) interpreted per tag by [`decode_handshake`].
-/// Cluster ids ride as low/high halves so both sides identify the exact
-/// clusters involved.
+/// Renders 32 identity bytes as lowercase hex for immutable paths.
 #[must_use]
-pub fn encode_reject(reason: &HandshakeReject) -> Vec<u8> {
-    fn split_u128(value: u128) -> (u64, u64) {
-        // Exact halves through bytes (never a lossy numeric cast).
-        let bytes = value.to_le_bytes();
-        let lo = u64::from_le_bytes(bytes[..8].try_into().unwrap_or([0; 8]));
-        let hi = u64::from_le_bytes(bytes[8..].try_into().unwrap_or([0; 8]));
-        (lo, hi)
-    }
-    let mut out = Vec::with_capacity(2 + 1 + 8 * 4);
-    out.extend_from_slice(&KIND_REJECT.to_le_bytes());
-    match *reason {
-        HandshakeReject::UnsupportedVersion { found } => {
-            out.push(1);
-            push_u64(&mut out, u64::from(found));
-            push_u64(&mut out, 0);
-            push_u64(&mut out, 0);
-            push_u64(&mut out, 0);
-        }
-        HandshakeReject::WrongCluster { expected, found } => {
-            out.push(2);
-            let (found_lo, found_hi) = split_u128(found);
-            let (expected_lo, expected_hi) = split_u128(expected);
-            push_u64(&mut out, found_lo);
-            push_u64(&mut out, found_hi);
-            push_u64(&mut out, expected_lo);
-            push_u64(&mut out, expected_hi);
-        }
-        HandshakeReject::StaleIncarnation {
-            node,
-            found,
-            newest,
-        } => {
-            out.push(3);
-            push_u64(&mut out, node);
-            push_u64(&mut out, found);
-            push_u64(&mut out, newest);
-            push_u64(&mut out, 0);
-        }
-        HandshakeReject::MissingCapability { missing } => {
-            out.push(4);
-            push_u64(&mut out, missing);
-            push_u64(&mut out, 0);
-            push_u64(&mut out, 0);
-            push_u64(&mut out, 0);
-        }
+pub fn id32_hex(id: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(64);
+    for byte in id {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
     }
     out
 }
 
-/// Encodes one consensus request body: kind, transport request id,
-/// addressed consensus group (tablet id), then the RPC payload.
+/// Parses lowercase (or upper) hex back into 32 identity bytes.
+///
+/// # Errors
+///
+/// Returns [`PeerCodecError::BadHex`] on length or digit faults.
+pub fn parse_id32_hex(hex: &str) -> Result<[u8; 32], PeerCodecError> {
+    let bad = |detail: String| PeerCodecError::BadHex { detail };
+    if hex.len() != 64 {
+        return Err(bad(format!("expected 64 hex chars, got {}", hex.len())));
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        let pair = hex
+            .get(2 * i..2 * i + 2)
+            .ok_or_else(|| bad("truncated hex".to_owned()))?;
+        *byte =
+            u8::from_str_radix(pair, 16).map_err(|_| bad(format!("invalid hex pair {pair:?}")))?;
+    }
+    Ok(out)
+}
+
+/// H3 route suffixes. Raft routes live under `/_kivi/raft/{tablet}/`;
+/// immutable routes under `/_kivi/immutable/`.
+pub mod route {
+    /// Election RPC route suffix.
+    pub const VOTE: &str = "vote";
+    /// Pre-vote probe route suffix.
+    pub const PREVOTE: &str = "prevote";
+    /// Replication/heartbeat route suffix.
+    pub const APPEND: &str = "append";
+    /// Snapshot-fragment route suffix.
+    pub const SNAPSHOT_FRAG: &str = "snapshot-frag";
+}
+
+/// Renders the H3 path for one request under `group`'s tablet. Manifest
+/// and chunk identities ride the path as lowercase hex; every other
+/// family carries its payload codec as the body.
 #[must_use]
-pub fn encode_request(id: u64, group: u64, request: &PeerRequest) -> Vec<u8> {
+pub fn h3_request_path(group_tablet: u64, request: &PeerRequest) -> String {
+    match request {
+        PeerRequest::Vote(_) => format!("/_kivi/raft/{group_tablet}/{}", route::VOTE),
+        PeerRequest::PreVote(_) => format!("/_kivi/raft/{group_tablet}/{}", route::PREVOTE),
+        PeerRequest::Append(_) => format!("/_kivi/raft/{group_tablet}/{}", route::APPEND),
+        PeerRequest::Snapshot(_) => {
+            format!("/_kivi/raft/{group_tablet}/{}", route::SNAPSHOT_FRAG)
+        }
+        PeerRequest::Manifest(request) => {
+            format!("/_kivi/immutable/manifest/{}", id32_hex(&request.manifest))
+        }
+        PeerRequest::Chunk(request) => {
+            format!("/_kivi/immutable/chunk/{}", id32_hex(&request.chunk))
+        }
+    }
+}
+
+/// Media type for a request family (transport metadata only, never
+/// durable state).
+#[must_use]
+pub const fn h3_media_type(request: &PeerRequest) -> &'static str {
+    match request {
+        PeerRequest::Vote(_)
+        | PeerRequest::PreVote(_)
+        | PeerRequest::Append(_)
+        | PeerRequest::Snapshot(_) => "application/vnd.kivi.raft",
+        PeerRequest::Manifest(_) => "application/vnd.kivi.manifest",
+        PeerRequest::Chunk(_) => "application/vnd.kivi.chunk",
+    }
+}
+
+/// Encodes one request as its H3 `(path, body)`. Manifest/chunk requests
+/// have empty bodies (identity is the path); every other family encodes
+/// its payload codec.
+///
+/// Returns the path plus body bytes.
+#[must_use]
+pub fn encode_h3_request(request: &PeerRequest, group_tablet: u64) -> (String, Vec<u8>) {
     fn push_vote_request(out: &mut Vec<u8>, request: &PeerVoteRequest) {
         push_vote(out, &request.vote);
         push_opt_log(out, request.last_log.as_ref());
         out.push(u8::from(request.leadership_transfer));
     }
+    let path = h3_request_path(group_tablet, request);
     let mut out = Vec::new();
-    let kind = match request {
-        PeerRequest::Vote(_) => KIND_VOTE_REQUEST,
-        PeerRequest::PreVote(_) => KIND_PRE_VOTE_REQUEST,
-        PeerRequest::Append(_) => KIND_APPEND_REQUEST,
-        PeerRequest::Snapshot(_) => KIND_SNAPSHOT_REQUEST,
-    };
-    out.extend_from_slice(&kind.to_le_bytes());
-    push_u64(&mut out, id);
-    push_u64(&mut out, group);
     match request {
         PeerRequest::Vote(request) | PeerRequest::PreVote(request) => {
             push_vote_request(&mut out, request);
@@ -945,252 +758,232 @@ pub fn encode_request(id: u64, group: u64, request: &PeerRequest) -> Vec<u8> {
             push_blob(&mut out, &request.data);
             out.push(u8::from(request.done));
         }
+        PeerRequest::Manifest(_) | PeerRequest::Chunk(_) => {}
     }
-    out
+    (path, out)
 }
 
-/// Encodes one consensus response body, matching `id` and echoing the
-/// addressed `group`, carrying either the answer or the remote refusal.
-#[must_use]
-pub fn encode_response(
-    id: u64,
-    group: u64,
-    result: &Result<PeerResponse, PeerRpcError>,
-    request_kind: u16,
-) -> Vec<u8> {
-    let mut out = Vec::new();
-    let kind = match request_kind {
-        KIND_VOTE_REQUEST => KIND_VOTE_RESPONSE,
-        KIND_PRE_VOTE_REQUEST => KIND_PRE_VOTE_RESPONSE,
-        KIND_APPEND_REQUEST => KIND_APPEND_RESPONSE,
-        _ => KIND_SNAPSHOT_RESPONSE,
-    };
-    out.extend_from_slice(&kind.to_le_bytes());
-    push_u64(&mut out, id);
-    push_u64(&mut out, group);
-    match result {
-        Ok(response) => {
-            out.push(0);
-            match response {
-                PeerResponse::Vote(response) | PeerResponse::PreVote(response) => {
-                    push_vote_response(&mut out, response);
-                }
-                PeerResponse::Append(response) => match response {
-                    PeerAppendResponse::Success => out.push(0),
-                    PeerAppendResponse::PartialSuccess(matched) => {
-                        out.push(1);
-                        push_opt_log(&mut out, matched.as_ref());
-                    }
-                    PeerAppendResponse::Conflict => out.push(2),
-                    PeerAppendResponse::HigherVote(vote) => {
-                        out.push(3);
-                        push_vote(&mut out, vote);
-                    }
-                },
-                PeerResponse::Snapshot(response) => {
-                    push_vote(&mut out, &response.vote);
-                }
-            }
-        }
-        Err(error) => {
-            out.push(1);
-            push_string(&mut out, &error.detail);
-        }
-    }
-    out
-}
-
-fn push_vote_response(out: &mut Vec<u8>, response: &PeerVoteResponse) {
-    push_vote(out, &response.vote);
-    out.push(u8::from(response.granted));
-    push_opt_log(out, response.last_log.as_ref());
-}
-
-/// One decoded consensus body with its request id and addressed group.
+/// Decoded H3 request: addressed tablet plus the RPC.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PeerBody {
-    /// A request awaiting service.
-    Request {
-        /// Transport-level request id (responses echo it).
-        id: u64,
-        /// Addressed consensus group (tablet id): routes the RPC to the
-        /// right Raft instance on a shared mesh.
-        group: u64,
-        /// Request body.
-        request: PeerRequest,
-    },
-    /// A response to a locally issued request.
-    Response {
-        /// Echoed request id.
-        id: u64,
-        /// Answer or remote refusal.
-        result: Result<PeerResponse, PeerRpcError>,
-    },
+pub struct DecodedH3Request {
+    /// Addressed tablet id.
+    pub tablet: u64,
+    /// Request body.
+    pub request: PeerRequest,
 }
 
-/// Decodes one request body (kinds `10`, `12`, `14`, `16`).
-fn decode_request_body(
-    kind: u16,
-    id: u64,
-    group: u64,
-    reader: &mut Reader<'_>,
-) -> Result<PeerBody, PeerCodecError> {
-    fn vote_request(reader: &mut Reader<'_>) -> Result<PeerVoteRequest, PeerCodecError> {
-        Ok(PeerVoteRequest {
-            vote: reader.vote()?,
-            last_log: reader.opt_log()?,
-            leadership_transfer: match reader.u8()? {
-                0 => false,
-                1 => true,
-                tag => return Err(PeerCodecError::BadTag { tag }),
-            },
-        })
-    }
-    let decoded = match kind {
-        KIND_VOTE_REQUEST => PeerBody::Request {
-            id,
-            group,
-            request: PeerRequest::Vote(vote_request(reader)?),
-        },
-        KIND_PRE_VOTE_REQUEST => PeerBody::Request {
-            id,
-            group,
-            request: PeerRequest::PreVote(vote_request(reader)?),
-        },
-        KIND_APPEND_REQUEST => {
-            let vote = reader.vote()?;
-            let prev_log = reader.opt_log()?;
-            let count = reader.u64()?;
-            let count =
-                usize::try_from(count).map_err(|_| PeerCodecError::Oversize { len: usize::MAX })?;
-            if count > 1024 * 1024 {
-                return Err(PeerCodecError::Oversize { len: count });
-            }
-            let mut entries = Vec::with_capacity(count.min(1024));
-            for _ in 0..count {
-                entries.push(PeerEntry {
-                    term: reader.u64()?,
-                    leader: reader.u64()?,
-                    index: reader.u64()?,
-                    payload: reader.entry_payload()?,
+/// Decodes one H3 request path plus body.
+///
+/// # Errors
+///
+/// Returns [`PeerCodecError`] on unknown routes, malformed identities, or
+/// structural payload faults.
+pub fn decode_h3_request(path: &str, body: &[u8]) -> Result<DecodedH3Request, PeerCodecError> {
+    let mut reader = Reader::new(body);
+    let (tablet, request) = if let Some(rest) = path.strip_prefix("/_kivi/raft/") {
+        let (tablet, suffix) =
+            rest.split_once('/')
+                .ok_or_else(|| PeerCodecError::UnknownRoute {
+                    route: path.to_owned(),
+                })?;
+        let tablet: u64 = tablet.parse().map_err(|_| PeerCodecError::UnknownRoute {
+            route: path.to_owned(),
+        })?;
+        let request = match suffix {
+            route::VOTE => PeerRequest::Vote(decode_vote_request(&mut reader)?),
+            route::PREVOTE => PeerRequest::PreVote(decode_vote_request(&mut reader)?),
+            route::APPEND => PeerRequest::Append(decode_append_request(&mut reader)?),
+            route::SNAPSHOT_FRAG => PeerRequest::Snapshot(decode_snapshot_request(&mut reader)?),
+            _ => {
+                return Err(PeerCodecError::UnknownRoute {
+                    route: path.to_owned(),
                 });
             }
-            PeerBody::Request {
-                id,
-                group,
-                request: PeerRequest::Append(PeerAppendRequest {
-                    vote,
-                    prev_log,
-                    entries,
-                    leader_commit: reader.opt_log()?,
-                }),
-            }
-        }
-        KIND_SNAPSHOT_REQUEST => PeerBody::Request {
-            id,
-            group,
-            request: PeerRequest::Snapshot(PeerSnapshotRequest {
-                vote: reader.vote()?,
-                meta: PeerSnapshotMeta {
-                    last_log: reader.opt_log()?,
-                    voters: reader.voters()?,
-                    nodes: reader.nodes()?,
-                    membership_log: reader.opt_log()?,
-                    checkpoint: reader.blob()?,
-                },
-                transfer: reader.u64()?,
-                offset: reader.u64()?,
-                data: reader.blob()?,
-                done: match reader.u8()? {
-                    0 => false,
-                    1 => true,
-                    tag => return Err(PeerCodecError::BadTag { tag }),
-                },
+        };
+        reader.finish()?;
+        (tablet, request)
+    } else if let Some(hex) = path.strip_prefix("/_kivi/immutable/manifest/") {
+        reader.finish()?;
+        (
+            0,
+            PeerRequest::Manifest(PeerManifestRequest {
+                manifest: parse_id32_hex(hex)?,
             }),
-        },
-        kind => return Err(PeerCodecError::UnknownKind { kind }),
+        )
+    } else if let Some(hex) = path.strip_prefix("/_kivi/immutable/chunk/") {
+        reader.finish()?;
+        (
+            0,
+            PeerRequest::Chunk(PeerChunkRequest {
+                chunk: parse_id32_hex(hex)?,
+            }),
+        )
+    } else {
+        return Err(PeerCodecError::UnknownRoute {
+            route: path.to_owned(),
+        });
     };
-    Ok(decoded)
+    Ok(DecodedH3Request { tablet, request })
 }
 
-/// Decodes one response body (kinds `11`, `13`, `15`).
-fn decode_response_body(
-    kind: u16,
-    id: u64,
-    reader: &mut Reader<'_>,
-) -> Result<PeerBody, PeerCodecError> {
-    let failed = reader.u8()?;
-    if failed == 1 {
-        return Ok(PeerBody::Response {
-            id,
-            result: Err(PeerRpcError {
-                detail: reader.string()?,
-            }),
-        });
-    }
-    if failed != 0 {
-        return Err(PeerCodecError::BadTag { tag: failed });
-    }
-    let response = match kind {
-        KIND_VOTE_RESPONSE | KIND_PRE_VOTE_RESPONSE => {
-            let vote = reader.vote()?;
-            let granted = match reader.u8()? {
-                0 => false,
-                1 => true,
-                tag => return Err(PeerCodecError::BadTag { tag }),
-            };
-            let last_log = reader.opt_log()?;
-            let answer = PeerVoteResponse {
-                vote,
-                granted,
-                last_log,
-            };
-            if kind == KIND_VOTE_RESPONSE {
-                PeerResponse::Vote(answer)
-            } else {
-                PeerResponse::PreVote(answer)
-            }
+/// Encodes one response body for the family the request selected.
+/// Manifest/chunk responses are the raw bytes (identity already rode the
+/// request path); Raft responses use the payload codec.
+#[must_use]
+pub fn encode_h3_response(response: &PeerResponse) -> Vec<u8> {
+    let mut out = Vec::new();
+    match response {
+        PeerResponse::Vote(response) | PeerResponse::PreVote(response) => {
+            push_vote_response(&mut out, response);
         }
-        KIND_APPEND_RESPONSE => PeerResponse::Append(match reader.u8()? {
+        PeerResponse::Append(response) => match response {
+            PeerAppendResponse::Success => out.push(0),
+            PeerAppendResponse::PartialSuccess(matched) => {
+                out.push(1);
+                push_opt_log(&mut out, matched.as_ref());
+            }
+            PeerAppendResponse::Conflict => out.push(2),
+            PeerAppendResponse::HigherVote(vote) => {
+                out.push(3);
+                push_vote(&mut out, vote);
+            }
+        },
+        PeerResponse::Snapshot(response) => {
+            push_vote(&mut out, &response.vote);
+        }
+        PeerResponse::Manifest(response) => {
+            out.extend_from_slice(&response.canonical);
+        }
+        PeerResponse::Chunk(response) => {
+            out.extend_from_slice(&response.bytes);
+        }
+    }
+    out
+}
+
+/// Decodes one response body for the family the request selected.
+///
+/// # Errors
+///
+/// Returns [`PeerCodecError`] on structural faults or family mismatch.
+pub fn decode_h3_response(
+    request: &PeerRequest,
+    body: &[u8],
+) -> Result<PeerResponse, PeerCodecError> {
+    let mut reader = Reader::new(body);
+    let response = match request {
+        PeerRequest::Vote(_) => PeerResponse::Vote(decode_vote_response(&mut reader)?),
+        PeerRequest::PreVote(_) => PeerResponse::PreVote(decode_vote_response(&mut reader)?),
+        PeerRequest::Append(_) => PeerResponse::Append(match reader.u8()? {
             0 => PeerAppendResponse::Success,
             1 => PeerAppendResponse::PartialSuccess(reader.opt_log()?),
             2 => PeerAppendResponse::Conflict,
             3 => PeerAppendResponse::HigherVote(reader.vote()?),
             tag => return Err(PeerCodecError::BadTag { tag }),
         }),
-        KIND_SNAPSHOT_RESPONSE => PeerResponse::Snapshot(PeerSnapshotResponse {
+        PeerRequest::Snapshot(_) => PeerResponse::Snapshot(PeerSnapshotResponse {
             vote: reader.vote()?,
         }),
-        kind => return Err(PeerCodecError::UnknownKind { kind }),
+        PeerRequest::Manifest(request) => PeerResponse::Manifest(PeerManifestResponse {
+            manifest: request.manifest,
+            canonical: body.to_vec(),
+        }),
+        PeerRequest::Chunk(request) => PeerResponse::Chunk(PeerChunkResponse {
+            chunk: request.chunk,
+            bytes: body.to_vec(),
+        }),
     };
-    Ok(PeerBody::Response {
-        id,
-        result: Ok(response),
+    // Manifest/chunk bodies are raw bytes (no trailing-byte framing to
+    // check); Raft bodies must consume exactly.
+    if matches!(
+        request,
+        PeerRequest::Vote(_)
+            | PeerRequest::PreVote(_)
+            | PeerRequest::Append(_)
+            | PeerRequest::Snapshot(_)
+    ) {
+        reader.finish()?;
+    }
+    Ok(response)
+}
+
+fn decode_vote_request(reader: &mut Reader<'_>) -> Result<PeerVoteRequest, PeerCodecError> {
+    Ok(PeerVoteRequest {
+        vote: reader.vote()?,
+        last_log: reader.opt_log()?,
+        leadership_transfer: match reader.u8()? {
+            0 => false,
+            1 => true,
+            tag => return Err(PeerCodecError::BadTag { tag }),
+        },
     })
 }
 
-/// Decodes one consensus body (kinds `10–17`).
-///
-/// # Errors
-///
-/// Returns [`PeerCodecError`] on structural faults.
-pub fn decode_body(body: &[u8]) -> Result<PeerBody, PeerCodecError> {
-    let mut reader = Reader::new(body);
-    let kind = reader.u16()?;
-    let id = reader.u64()?;
-    let group = reader.u64()?;
-    let decoded = match kind {
-        KIND_VOTE_REQUEST | KIND_PRE_VOTE_REQUEST | KIND_APPEND_REQUEST | KIND_SNAPSHOT_REQUEST => {
-            decode_request_body(kind, id, group, &mut reader)?
-        }
-        KIND_VOTE_RESPONSE
-        | KIND_PRE_VOTE_RESPONSE
-        | KIND_APPEND_RESPONSE
-        | KIND_SNAPSHOT_RESPONSE => decode_response_body(kind, id, &mut reader)?,
-        kind => return Err(PeerCodecError::UnknownKind { kind }),
+fn decode_vote_response(reader: &mut Reader<'_>) -> Result<PeerVoteResponse, PeerCodecError> {
+    let vote = reader.vote()?;
+    let granted = match reader.u8()? {
+        0 => false,
+        1 => true,
+        tag => return Err(PeerCodecError::BadTag { tag }),
     };
-    reader.finish()?;
-    Ok(decoded)
+    let last_log = reader.opt_log()?;
+    Ok(PeerVoteResponse {
+        vote,
+        granted,
+        last_log,
+    })
+}
+
+fn decode_append_request(reader: &mut Reader<'_>) -> Result<PeerAppendRequest, PeerCodecError> {
+    let vote = reader.vote()?;
+    let prev_log = reader.opt_log()?;
+    let count = reader.u64()?;
+    let count = usize::try_from(count).map_err(|_| PeerCodecError::Oversize { len: usize::MAX })?;
+    if count > 1024 * 1024 {
+        return Err(PeerCodecError::Oversize { len: count });
+    }
+    let mut entries = Vec::with_capacity(count.min(1024));
+    for _ in 0..count {
+        entries.push(PeerEntry {
+            term: reader.u64()?,
+            leader: reader.u64()?,
+            index: reader.u64()?,
+            payload: reader.entry_payload()?,
+        });
+    }
+    Ok(PeerAppendRequest {
+        vote,
+        prev_log,
+        entries,
+        leader_commit: reader.opt_log()?,
+    })
+}
+
+fn decode_snapshot_request(reader: &mut Reader<'_>) -> Result<PeerSnapshotRequest, PeerCodecError> {
+    Ok(PeerSnapshotRequest {
+        vote: reader.vote()?,
+        meta: PeerSnapshotMeta {
+            last_log: reader.opt_log()?,
+            voters: reader.voters()?,
+            nodes: reader.nodes()?,
+            membership_log: reader.opt_log()?,
+            checkpoint: reader.blob()?,
+        },
+        transfer: reader.u64()?,
+        offset: reader.u64()?,
+        data: reader.blob()?,
+        done: match reader.u8()? {
+            0 => false,
+            1 => true,
+            tag => return Err(PeerCodecError::BadTag { tag }),
+        },
+    })
+}
+
+fn push_vote_response(out: &mut Vec<u8>, response: &PeerVoteResponse) {
+    push_vote(out, &response.vote);
+    out.push(u8::from(response.granted));
+    push_opt_log(out, response.last_log.as_ref());
 }
 
 /// Highest incarnation observed per node (task K). Connections and
@@ -1253,95 +1046,62 @@ mod tests {
         }
     }
 
-    fn hello() -> HandshakeHello {
-        HandshakeHello {
-            version: PEER_PROTOCOL_VERSION,
-            cluster: 0x0C10_57E2,
-            node: 2,
-            incarnation: 3,
-            capabilities: REQUIRED_CAPABILITIES,
-        }
+    /// Sample authenticated headers: (cluster, node, incarnation, caps).
+    fn headers() -> (u128, u64, u64, u64) {
+        (0x0C10_57E2, 2, 3, REQUIRED_CAPABILITIES)
     }
 
     #[test]
-    fn handshake_accepts_current_peers() {
+    fn headers_accept_current_peers() {
         let table = IncarnationTable::new();
-        let accept = validate_hello(&hello(), &identity(), &table).expect("accepts");
-        assert_eq!(accept.node, 1);
-        assert_eq!(accept.incarnation, 7);
-        // Hello/accept bodies round-trip through framing.
-        let framed = frame_body(&encode_hello(&hello()));
-        let mut decoder = FrameDecoder::new();
-        decoder.push(&framed);
-        let body = decoder.take_frame().expect("frames").expect("complete");
-        assert!(matches!(
-            decode_handshake(&body).expect("decodes"),
-            HandshakeFrame::Hello(_)
-        ));
-        let framed = frame_body(&encode_accept(&accept));
-        let mut decoder = FrameDecoder::new();
-        decoder.push(&framed);
-        let body = decoder.take_frame().expect("frames").expect("complete");
-        assert!(matches!(
-            decode_handshake(&body).expect("decodes"),
-            HandshakeFrame::Accept(_)
-        ));
-        // Rejections round-trip with their exact reasons.
-        for reason in [
-            HandshakeReject::UnsupportedVersion { found: 7 },
-            HandshakeReject::WrongCluster {
-                expected: 0x0C10_57E2,
-                found: 0xDEAD_BEEF_CAFE_F00D_DEAD_BEEF_CAFE_F00D,
-            },
-            HandshakeReject::StaleIncarnation {
-                node: 2,
-                found: 3,
-                newest: 8,
-            },
-            HandshakeReject::MissingCapability { missing: 0x10 },
+        let (cluster, node, incarnation, caps) = headers();
+        let validated =
+            validate_peer_headers(cluster, node, incarnation, caps, &identity(), &table)
+                .expect("accepts");
+        assert_eq!(validated.node, NodeId::from_u64(2));
+        assert_eq!(validated.incarnation, NodeIncarnation::from_u64(3));
+        // Rejections carry their exact reasons.
+        for (cluster, node, incarnation, caps) in [
+            (
+                0xDEAD_BEEF_CAFE_F00D_DEAD_BEEF_CAFE_F00D,
+                2,
+                3,
+                REQUIRED_CAPABILITIES,
+            ),
+            (0x0C10_57E2, 2, 3, 0),
         ] {
-            let framed = frame_body(&encode_reject(&reason));
-            let mut decoder = FrameDecoder::new();
-            decoder.push(&framed);
-            let body = decoder.take_frame().expect("frames").expect("complete");
-            assert_eq!(
-                decode_handshake(&body).expect("decodes"),
-                HandshakeFrame::Reject(reason)
+            assert!(
+                validate_peer_headers(cluster, node, incarnation, caps, &identity(), &table)
+                    .is_err()
             );
         }
     }
 
     #[test]
-    fn handshake_rejects_wrong_cluster_stale_and_weak_peers() {
+    fn headers_reject_wrong_cluster_stale_and_weak_peers() {
         let mut table = IncarnationTable::new();
+        let (cluster, node, incarnation, caps) = headers();
         // Wrong cluster.
-        let mut foreign = hello();
-        foreign.cluster = 0xDEAD;
         assert!(matches!(
-            validate_hello(&foreign, &identity(), &table),
-            Err(HandshakeReject::WrongCluster { .. })
+            validate_peer_headers(0xDEAD, node, incarnation, caps, &identity(), &table),
+            Err(AuthReject::WrongCluster { .. })
         ));
         // Missing capability.
-        let mut weak = hello();
-        weak.capabilities = 0;
         assert!(matches!(
-            validate_hello(&weak, &identity(), &table),
-            Err(HandshakeReject::MissingCapability { .. })
+            validate_peer_headers(cluster, node, incarnation, 0, &identity(), &table),
+            Err(AuthReject::MissingCapability { .. })
         ));
-        // Stale incarnation after observing a newer generation (the
-        // sample hello carries incarnation 3 against observed 8).
+        // Stale incarnation after observing a newer generation.
         assert!(table.observe(NodeId::from_u64(2), NodeIncarnation::from_u64(8)));
         assert!(matches!(
-            validate_hello(&hello(), &identity(), &table),
-            Err(HandshakeReject::StaleIncarnation { .. })
+            validate_peer_headers(cluster, node, incarnation, caps, &identity(), &table),
+            Err(AuthReject::StaleIncarnation { .. })
         ));
         // Equal incarnations reconnect freely: the same live generation
         // revalidates (transient healing depends on this; only strictly
         // older generations are stale).
-        let mut equal = hello();
-        equal.incarnation = 8;
         assert!(
-            validate_hello(&equal, &identity(), &table).is_ok(),
+            validate_peer_headers(cluster, node, 8, caps, &identity(), &table).is_ok(),
             "equal incarnation must revalidate"
         );
         // Invalid incarnations are never current.
@@ -1360,7 +1120,8 @@ mod tests {
     }
 
     #[test]
-    fn rpc_bodies_round_trip() {
+    #[allow(clippy::too_many_lines)]
+    fn h3_payloads_round_trip() {
         let vote = PeerVote {
             term: 3,
             node: 1,
@@ -1407,62 +1168,77 @@ mod tests {
                 data: vec![1, 2, 3],
                 done: true,
             }),
+            PeerRequest::Manifest(PeerManifestRequest {
+                manifest: [0x11; 32],
+            }),
+            PeerRequest::Chunk(PeerChunkRequest { chunk: [0x22; 32] }),
         ];
-        for (id, request) in cases.iter().enumerate() {
-            let id = id as u64 + 1;
-            // Group 9 rides every body (Multi-Raft multiplexing).
-            let framed = frame_body(&encode_request(id, 9, request));
-            let mut decoder = FrameDecoder::new();
-            // Split delivery still frames (streaming correctness).
-            decoder.push(&framed[..7]);
-            assert!(decoder.take_frame().expect("partial").is_none());
-            decoder.push(&framed[7..]);
-            let body = decoder.take_frame().expect("frames").expect("complete");
-            assert_eq!(
-                decode_body(&body).expect("decodes"),
-                PeerBody::Request {
-                    id,
-                    group: 9,
-                    request: request.clone()
+        for request in &cases {
+            // Tablet 9 rides every Raft path (Multi-Raft multiplexing).
+            let (path, body) = encode_h3_request(request, 9);
+            let decoded = decode_h3_request(&path, &body).expect("decodes");
+            match request {
+                PeerRequest::Manifest(_) | PeerRequest::Chunk(_) => {
+                    assert_eq!(decoded.tablet, 0, "sidecars are group-independent");
                 }
+                _ => assert_eq!(decoded.tablet, 9),
+            }
+            assert_eq!(&decoded.request, request);
+            // Truncated bodies fail the decode (backoff), never apply.
+            // Command-level validation (undecodable `ReplicatedMutation`)
+            // lives in the router codec, tested there.
+            if body.len() > 4 {
+                assert!(decode_h3_request(&path, &body[..body.len() - 1]).is_err());
+            }
+        }
+        // Responses round-trip under the requesting family.
+        let cases = [
+            (
+                &cases[2],
+                PeerResponse::Append(PeerAppendResponse::HigherVote(vote)),
+            ),
+            (
+                &cases[0],
+                PeerResponse::Vote(PeerVoteResponse {
+                    vote,
+                    granted: true,
+                    last_log: Some(log),
+                }),
+            ),
+        ];
+        for (request, response) in cases {
+            let body = encode_h3_response(&response);
+            assert_eq!(
+                decode_h3_response(request, &body).expect("decodes"),
+                response
             );
         }
-        // Responses round-trip with their request kinds.
-        let response = encode_response(
-            9,
-            9,
-            &Ok(PeerResponse::Append(PeerAppendResponse::HigherVote(vote))),
-            KIND_APPEND_REQUEST,
+        // Raw sidecar bodies echo byte-for-byte.
+        let manifest_request = PeerRequest::Manifest(PeerManifestRequest {
+            manifest: [0x11; 32],
+        });
+        let manifest = PeerResponse::Manifest(PeerManifestResponse {
+            manifest: [0x11; 32],
+            canonical: vec![7; 78],
+        });
+        assert_eq!(
+            decode_h3_response(&manifest_request, &encode_h3_response(&manifest)).expect("decodes"),
+            manifest
         );
-        let mut decoder = FrameDecoder::new();
-        decoder.push(&frame_body(&response));
-        let body = decoder.take_frame().expect("frames").expect("complete");
+        // Unknown routes refuse loudly.
         assert!(matches!(
-            decode_body(&body).expect("decodes"),
-            PeerBody::Response { id: 9, .. }
+            decode_h3_request("/_kivi/nope", &[]),
+            Err(PeerCodecError::UnknownRoute { .. })
         ));
-    }
-
-    #[test]
-    fn corrupt_frames_fail_without_allocation() {
-        // Oversize declarations fail before allocation.
-        let mut oversize = frame_body(&encode_hello(&hello()));
-        let len_at = 4 + 2;
-        oversize[len_at..len_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
-        // Re-stamp the CRC over the tampered body so the length fault (not
-        // the CRC fault) is what fails — the length gate runs first.
-        let mut decoder = FrameDecoder::new();
-        decoder.push(&oversize);
         assert!(matches!(
-            decoder.take_frame(),
-            Err(PeerCodecError::BadCrc | PeerCodecError::Oversize { .. })
+            decode_h3_request("/_kivi/immutable/chunk/zzz", &[]),
+            Err(PeerCodecError::BadHex { .. })
         ));
-        // Bad magic fails (once a full header is buffered).
-        let mut decoder = FrameDecoder::new();
-        decoder.push(&[0xFF; 12]);
-        assert!(matches!(
-            decoder.take_frame(),
-            Err(PeerCodecError::BadMagic { .. })
-        ));
+        // Identity hex round-trips (paths embed lowercase hex).
+        assert_eq!(id32_hex(&[0xABu8; 32]), "ab".repeat(32));
+        assert_eq!(
+            parse_id32_hex(&id32_hex(&[0xCD; 32])).expect("parses"),
+            [0xCD; 32]
+        );
     }
 }

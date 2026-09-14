@@ -5,24 +5,24 @@
 //! ```text
 //! OpenRaft RPC
 //!     ↓ (this module's codec: owned Peer* structs, never memory layout)
-//! Kivi peer frame (group-multiplexed bodies)
-//!     ↓ (transport: persistent TCP, handshake, incarnation)
-//! peer TCP
+//! H3 request stream (group in path, Kivi binary body)
+//!     ↓ (transport: QUIC/H3 mesh, TLS identity, incarnation)
+//! peer QUIC
 //! ```
 //!
 //! `OpenRaft` never owns a socket. [`PeerRouter`] is the node's shared
 //! group router (implements `GroupRouter`, is `Send + Sync`): every Raft
 //! group on the node routes `(target node, group id)` through it onto the
-//! one physical mesh (one connection per node pair, never per group). Per group,
-//! [`GroupNetworkFactory`] binds the group id into
+//! shared H3 mesh (one control connection per node pair, never per
+//! group). Per group, [`GroupNetworkFactory`] binds the group id into
 //! [`openraft_multi::GroupNetworkAdapter`]s, which satisfy `OpenRaft`'s
 //! network traits through the blanket impls.
 //!
-//! Kivi owns transport framing, backpressure, connection lifecycle, and
+//! Kivi owns peer identity, request routing, body caps, and
 //! `NodeIncarnation` semantics ([`crate::transport`], [`crate::peer`]).
 //! `openraft-multi` provides only the routing adapters; all
-//! transport-level failures (unreachable, timeout, full queue, remote
-//! refusal, family mismatch) map to retry-safe errors — the safe direction
+//! transport-level failures (unreachable, timeout, remote refusal,
+//! family mismatch) map to retry-safe errors — the safe direction
 //! is always backoff-and-retry, never an invented verdict.
 //!
 //! Election, pre-vote, append/heartbeat, and full-snapshot delivery are
@@ -455,12 +455,18 @@ where
         PeerRequest::Snapshot(_) => Err(refused(
             "snapshot fragments reassemble on the owner thread".to_owned(),
         )),
+        // Sidecar bulk requests never reach the Raft service either: the
+        // owner serves them from the sidecar store. Arriving here is a
+        // routing bug, refused loudly.
+        PeerRequest::Manifest(_) | PeerRequest::Chunk(_) => Err(refused(
+            "sidecar bulk requests serve from the sidecar store".to_owned(),
+        )),
     }
 }
 
-/// Maximum snapshot fragment payload per peer frame. Well under
-/// [`crate::peer::PEER_MAX_FRAME_BYTES`] after framing; the transfer
-/// loops until `done`, so larger checkpoints simply take more frames.
+/// Maximum snapshot fragment payload per H3 request body. Well under the
+/// transport body cap; the transfer loops until `done`, so larger
+/// checkpoints simply take more streams.
 const SNAPSHOT_FRAGMENT_BYTES: usize = 256 * 1024;
 
 /// The node's shared peer router: one physical mesh multiplexing every

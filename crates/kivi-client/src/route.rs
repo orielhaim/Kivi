@@ -55,6 +55,74 @@ impl RouteEntry {
     }
 }
 
+/// Tablet-keyed leader hint cache for replicated clusters.
+///
+/// The sparse [`RouteCache`] below routes single-node ranges; a replicated
+/// deployment has one leader per tablet, potentially different per tablet
+/// in the future. This cache is conceptually keyed by [`TabletId`] even
+/// though the current product replicates a single tablet: hints learned
+/// from `StaleRoute` redirects update here, and the next request prefers
+/// the cached leader endpoint before falling back to seeds. Bounded retry
+/// and same-identity preservation live in the client execute loop; this
+/// type only remembers where the leader was last seen.
+#[derive(Debug, Clone, Default)]
+pub struct TabletLeaderCache {
+    inner: Arc<ArcSwap<Vec<(TabletId, String)>>>,
+}
+
+impl TabletLeaderCache {
+    /// Creates an empty leader cache.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(ArcSwap::from_pointee(Vec::new())),
+        }
+    }
+
+    /// Remembers the leader endpoint for `tablet`.
+    pub fn insert(&self, tablet: TabletId, endpoint: String) {
+        let current = self.inner.load();
+        let mut next: Vec<(TabletId, String)> = current
+            .iter()
+            .filter(|(id, _)| *id != tablet)
+            .cloned()
+            .collect();
+        next.push((tablet, endpoint));
+        self.inner.store(Arc::new(next));
+    }
+
+    /// Returns the last-known leader endpoint for `tablet`, if any.
+    #[must_use]
+    pub fn lookup(&self, tablet: TabletId) -> Option<String> {
+        self.inner
+            .load()
+            .iter()
+            .find_map(|(id, endpoint)| (*id == tablet).then(|| endpoint.clone()))
+    }
+
+    /// Returns any cached leader endpoint (single-tablet fast path: the
+    /// only entry when exactly one tablet is replicated).
+    #[must_use]
+    pub fn any(&self) -> Option<String> {
+        self.inner
+            .load()
+            .first()
+            .map(|(_, endpoint)| endpoint.clone())
+    }
+
+    /// Number of cached tablet leaders (introspection for tests).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.inner.load().len()
+    }
+
+    /// Whether no leader hints are cached yet.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.inner.load().is_empty()
+    }
+}
+
 /// Copy-on-write sparse route cache shared across cloned clients.
 #[derive(Debug, Clone, Default)]
 pub struct RouteCache {
@@ -141,6 +209,21 @@ mod tests {
         assert_eq!(hit.worker, WorkerId::from_u64(0));
         assert_eq!(hit.dir_version, 7);
         assert_eq!(cache.lookup(hash(u128::MAX)), None);
+    }
+
+    #[test]
+    fn tablet_leaders_are_keyed_by_tablet() {
+        let cache = TabletLeaderCache::new();
+        assert!(cache.is_empty());
+        let a = TabletId::from_u64(9);
+        let b = TabletId::from_u64(10);
+        cache.insert(a, "127.0.0.1:9201".to_owned());
+        assert_eq!(cache.lookup(a).as_deref(), Some("127.0.0.1:9201"));
+        assert_eq!(cache.lookup(b), None);
+        assert_eq!(cache.any().as_deref(), Some("127.0.0.1:9201"));
+        cache.insert(a, "127.0.0.1:9202".to_owned());
+        assert_eq!(cache.len(), 1, "same tablet replaces its hint");
+        assert_eq!(cache.lookup(a).as_deref(), Some("127.0.0.1:9202"));
     }
 
     #[test]

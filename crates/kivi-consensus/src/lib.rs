@@ -47,13 +47,16 @@
 
 pub mod cluster;
 pub mod config;
+pub mod gate;
 pub mod mutation;
 pub mod node;
 pub mod peer;
 pub mod router;
+pub mod sidecar;
 pub mod spike;
 pub mod state_machine;
 pub mod store;
+pub mod tls;
 pub mod transport;
 pub mod types;
 
@@ -61,6 +64,7 @@ pub use cluster::{
     Bootstrap, BootstrapError, ClusterTopology, DurableClusterView, NodeDescriptor,
     TabletAssignment, TopologyError, classify_bootstrap, verify_against_durable,
 };
+pub use gate::{SidecarGate, sidecar_io_error};
 pub use mutation::{
     REPLICATED_MUTATION_VERSION, ReplicatedMutation, ReplicatedMutationError, ReplicatedOutcome,
 };
@@ -68,21 +72,24 @@ pub use node::{
     NodeConfig, NodeOpenError, NodeStatus, ProposeError, ProposeOutcome, ReadError, ReplicatedNode,
 };
 pub use peer::{
-    CAP_CONSENSUS_V2, HandshakeAccept, HandshakeFrame, HandshakeHello, HandshakeReject,
-    IncarnationTable, KIND_APPEND_REQUEST, KIND_APPEND_RESPONSE, KIND_PRE_VOTE_REQUEST,
-    KIND_PRE_VOTE_RESPONSE, KIND_SNAPSHOT_REQUEST, KIND_SNAPSHOT_RESPONSE, KIND_VOTE_REQUEST,
-    KIND_VOTE_RESPONSE, PEER_MAX_FRAME_BYTES, PEER_PROTOCOL_VERSION, PeerAppendRequest,
-    PeerAppendResponse, PeerBody, PeerEntry, PeerEntryPayload, PeerIdentity, PeerLogId,
+    AuthReject, CAP_CONSENSUS_V2, CAP_SIDECAR_V1, DecodedH3Request, IncarnationTable,
+    PeerAppendRequest, PeerAppendResponse, PeerChunkRequest, PeerChunkResponse, PeerEntry,
+    PeerEntryPayload, PeerIdentity, PeerLogId, PeerManifestRequest, PeerManifestResponse,
     PeerRequest, PeerResponse, PeerRpcError, PeerSnapshotMeta, PeerSnapshotRequest,
     PeerSnapshotResponse, PeerVote, PeerVoteRequest, PeerVoteResponse, REQUIRED_CAPABILITIES,
-    decode_body, decode_handshake, encode_accept, encode_hello, encode_reject, encode_request,
-    encode_response, frame_body, validate_hello,
+    ValidatedPeer, decode_h3_request, decode_h3_response, encode_h3_request, encode_h3_response,
+    h3_media_type, h3_request_path, id32_hex, parse_id32_hex, route, validate_peer_headers,
 };
 pub use router::{
     GroupNetworkFactory, PeerRouter, RpcCodecError, decode_append_request, decode_snapshot_meta,
     decode_vote_request, decode_wire_entry, decode_wire_log, decode_wire_vote,
     encode_append_request, encode_snapshot_meta, encode_vote_request, encode_wire_entry,
     encode_wire_log, encode_wire_vote, serve_peer_request,
+};
+pub use sidecar::{
+    ImmutableDependencies, PinStage, ProposalPin, SidecarError, SidecarMetrics,
+    SidecarMetricsSnapshot, SidecarPins, SidecarStore, StagedRoot, build_manifest_for,
+    chunk_id_for, split_value,
 };
 pub use state_machine::{
     ANONYMOUS_SESSION, AppliedPointer, DecodedSnapshot, ProposalGate, RangeBase,
@@ -91,6 +98,7 @@ pub use state_machine::{
     StateMachineStatus, commit_of_index, index_of_commit,
 };
 pub use store::{CONSENSUS_LANE, DurableLogReader, DurableRaftStore, StoreOpenError};
+pub use tls::{CertFingerprint, NodeCert, TlsError};
 pub use transport::{PeerHandler, PeerStats, PeerTransport, TransportConfig, TransportError};
 pub use types::{
     ConsensusCore, ConsensusError, ConsensusGroupId, ConsensusLogIndex, ConsensusStatus,

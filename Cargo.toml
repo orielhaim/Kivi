@@ -61,7 +61,10 @@ crossbeam-channel = "0.5"
 # pipelined bytes. No runtime, no I/O of its own.
 async-channel = "2.5"
 getrandom = "0.4"
-compio = { version = "0.19", features = ["net", "time"] }
+compio = { version = "0.19", features = ["net", "time", "quic", "h3", "ring"] }
+http = "1.3"
+rcgen = "0.14"
+rustls = "0.23"
 core_affinity2 = "0.16"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

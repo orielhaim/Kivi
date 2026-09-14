@@ -1644,6 +1644,38 @@ impl ReplicatedStateMachine {
         self.shared.lock().await.inject_snapshot_write_failure = fail;
     }
 
+    /// Lists live chunked roots (manifest + length) for startup
+    /// verification and repair. Returns empty when no large values are
+    /// live; never fails (an unhealthy machine yields its last known
+    /// roots for best-effort repair, never an error).
+    pub async fn chunked_roots(&self) -> Vec<(kivi_types::ManifestId, u64)> {
+        let inner = self.shared.lock().await;
+        inner
+            .tablet
+            .store()
+            .snapshot_entries()
+            .into_iter()
+            .filter_map(|(_key, object)| match object.value() {
+                kivi_state::LogicalValue::Chunked(chunked) => {
+                    Some((chunked.manifest, chunked.logical_len))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Marks the replica unhealthy with a latched detail (startup
+    /// verification found applied roots referencing missing sidecars).
+    /// Reads fail closed; a later repair (sidecar fetch + re-verify, or a
+    /// snapshot install carrying the missing bulk) heals via the snapshot
+    /// path, which resets health on validated install. Never blocks
+    /// consensus transport: the replica stays reachable for repair.
+    pub async fn mark_unhealthy(&self, detail: String) {
+        let mut inner = self.shared.lock().await;
+        inner.healthy = false;
+        inner.last_error = Some(detail);
+    }
+
     /// Returns the voter set of the currently held membership (snapshot
     /// or applied-file ground truth after open; live tracking after).
     /// The node restart path uses this when the retained log holds no

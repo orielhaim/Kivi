@@ -12,6 +12,10 @@ path = "src/main.rs"
 name = "kivi-cli"
 path = "src/bin/kivi-cli.rs"
 
+[[bin]]
+name = "kivi-peer-cert"
+path = "src/bin/kivi-peer-cert.rs"
+
 [features]
 default = []
 # Optional Redis/RESP compatibility edge (default-off). Production serving
@@ -29,6 +33,8 @@ kivi-consensus.workspace = true
 kivi-protocol.workspace = true
 kivi-durability.workspace = true
 kivi-checkpoint.workspace = true
+kivi-chunk.workspace = true
+kivi-codec.workspace = true
 kivi-resp = { workspace = true, optional = true }
 bytes.workspace = true
 clap.workspace = true

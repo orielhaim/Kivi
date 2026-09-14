@@ -296,12 +296,17 @@ impl std::fmt::Debug for LaneWriter {
 }
 
 /// Durable per-group Raft log store. Cloneable: clones share the same
-/// serialized state (log readers for replication streams included) and the
-/// same lane writer.
+/// serialized state (log readers for replication streams included), the
+/// same lane writer, and the same sidecar gate.
+///
+/// The gate enforces the core invariant: a replica never reports a Raft
+/// append durable while required immutable sidecars are missing. See
+/// [`crate::gate`] and [`crate::sidecar`].
 #[derive(Clone)]
 pub struct DurableRaftStore {
     shared: Arc<futures::lock::Mutex<StoreInner>>,
     lane: LaneWriter,
+    gate: Option<crate::gate::SidecarGate>,
 }
 
 /// Log reader sharing the store's serialized state (replication streams
@@ -410,7 +415,21 @@ impl DurableRaftStore {
         Ok(Self {
             shared: Arc::new(futures::lock::Mutex::new(inner)),
             lane: LaneWriter::spawn(lane),
+            gate: None,
         })
+    }
+
+    /// Installs the sidecar durability gate (node open wires this after
+    /// the peer mesh and sidecar store exist; the log open itself stays
+    /// synchronous and runtime-free).
+    pub fn set_gate(&mut self, gate: crate::gate::SidecarGate) {
+        self.gate = Some(gate);
+    }
+
+    /// Returns the installed gate, if any.
+    #[must_use]
+    pub fn gate(&self) -> Option<&crate::gate::SidecarGate> {
+        self.gate.as_ref()
     }
 
     /// Returns the newest committed-membership voter set visible in the
@@ -710,6 +729,34 @@ impl RaftLogStorage<KiviTypeConfig> for DurableRaftStore {
         I: IntoIterator<Item = EntryOf<KiviTypeConfig>> + openraft::OptionalSend,
         I::IntoIter: openraft::OptionalSend,
     {
+        // Sidecar durability gate (core invariant): before staging or
+        // persisting, ensure every ReplaceChunkedRoot's manifest + chunks
+        // are locally durable and verified. No lock is held across the
+        // fetch (bulk moves on the bulk lane); a gate failure returns
+        // `io::Error` without staging, so the append never reports
+        // durable persistence for incomplete sidecars and quorum can never
+        // commit unreconstructible state.
+        //
+        // Collect first (Raft batches are small; large values ride as
+        // sidecars, never inline), gate, then stage.
+        let entries: Vec<EntryOf<KiviTypeConfig>> = entries.into_iter().collect();
+        if let Some(gate) = self.gate.clone() {
+            let mut commands = Vec::new();
+            let mut hint = None;
+            for entry in &entries {
+                if hint.is_none() {
+                    hint = Some(NodeId::from_u64(entry.log_id.leader_id.node_id));
+                }
+                if let openraft::EntryPayload::Normal(command) = &entry.payload {
+                    commands.push(command.encode_to_vec());
+                }
+            }
+            if !commands.is_empty() {
+                gate.ensure_entries(&commands, hint)
+                    .await
+                    .map_err(|error| crate::gate::sidecar_io_error(&error))?;
+            }
+        }
         // Stage records and cache together under one lock (readable on
         // return, same turn) and submit the barrier in FIFO order while
         // still holding it, so concurrent writers cannot invert lane

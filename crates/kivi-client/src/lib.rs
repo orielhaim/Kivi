@@ -38,7 +38,7 @@ use kivi_protocol::{
 use kivi_state::{Key, PartitionHasher};
 use kivi_types::{NamespaceId, RequestIdentity, RequestSeq, SessionId, UnixMicros, WorkerId};
 
-pub use route::{RouteCache, RouteEntry};
+pub use route::{RouteCache, RouteEntry, TabletLeaderCache};
 
 /// Connection establishment timeout default.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -775,6 +775,12 @@ struct Shared {
     delivery_retries: u32,
     seeds: Vec<String>,
     routes: route::RouteCache,
+    /// Per-tablet leader hints for replicated clusters. Keyed by
+    /// `TabletId` so future many-tablet deployments route each tablet to
+    /// its own leader; today it holds at most the single replicated
+    /// tablet. Updated on every `StaleRoute` redirect, consulted when no
+    /// range route covers the key.
+    tablet_leaders: route::TabletLeaderCache,
     pool: Mutex<HashMap<String, Arc<Connection>>>,
     id_counter: AtomicU64,
     stream_counter: AtomicU64,
@@ -840,6 +846,7 @@ impl NativeClient {
                 delivery_retries: config.delivery_retries,
                 seeds: config.seeds,
                 routes: route::RouteCache::new(),
+                tablet_leaders: route::TabletLeaderCache::new(),
                 pool: Mutex::new(HashMap::new()),
                 id_counter: AtomicU64::new(1),
                 stream_counter: AtomicU64::new(1),
@@ -878,6 +885,14 @@ impl NativeClient {
     #[must_use]
     pub fn cached_routes(&self) -> usize {
         self.shared.routes.len()
+    }
+
+    /// Returns the last-known leader endpoint for `tablet`, if any.
+    /// Per-tablet routing hint for replicated clusters; `None` before the
+    /// first redirect or when the hint went stale.
+    #[must_use]
+    pub fn tablet_leader(&self, tablet: kivi_types::TabletId) -> Option<String> {
+        self.shared.tablet_leaders.lookup(tablet)
     }
 
     /// Allocates the next stream id: the high-bit space request ids never
@@ -1065,6 +1080,7 @@ impl NativeClient {
     /// issued under this session before — e.g., sent but unacknowledged
     /// across a crash — so the server dedups it instead of executing
     /// twice). `None` allocates a fresh sequence. Reads ignore `seq`.
+    #[allow(clippy::too_many_lines)]
     fn execute_with_seq(
         &self,
         key: &Key,
@@ -1094,9 +1110,22 @@ impl NativeClient {
                 self.shared.errors.fetch_add(1, Ordering::Relaxed);
                 break Err(ClientError::TooManyRedirects);
             }
-            // Route: cached authority, else the seed with no hint.
+            // Route: cached range authority, else the seed with no hint.
+            // The per-tablet leader cache (`tablet_leaders`) is updated on
+            // every redirect for cluster introspection and future
+            // many-tablet routing, but it never overrides range routing:
+            // single-node deployments replicate many tablets per process,
+            // so any single cached leader endpoint would misroute other
+            // tablets (replicated clusters use a root range covering every
+            // key, so the range hit already lands on the leader). The
+            // mutation identity above is preserved across all hops.
             let (endpoint, hint) = match self.shared.routes.lookup(hash) {
-                Some(route) => (route.endpoint.clone(), Some(route.hint())),
+                Some(route) => {
+                    self.shared
+                        .tablet_leaders
+                        .insert(route.tablet, route.endpoint.clone());
+                    (route.endpoint.clone(), Some(route.hint()))
+                }
                 None => (self.shared.seeds[0].clone(), None),
             };
             let expect = hint.map(|hint| hint.worker);
@@ -1161,10 +1190,19 @@ impl NativeClient {
                 Status::Ok | Status::NotFound => break Ok(response),
                 Status::StaleRoute | Status::NotLocal => {
                     if let ResponseBody::Redirect(info) = &response.body {
+                        self.shared
+                            .tablet_leaders
+                            .insert(info.tablet, info.endpoint.clone());
                         self.shared.routes.insert(RouteEntry::from_redirect(info));
                     }
                     redirects += 1;
                     self.shared.redirects.fetch_add(1, Ordering::Relaxed);
+                    // Bounded backoff on redirects: stale hints during
+                    // election churn retry safely without spinning.
+                    backoff(
+                        self.shared.dial_backoff,
+                        u32::try_from(redirects).unwrap_or(u32::MAX).min(6),
+                    );
                 }
                 Status::Overloaded => {
                     redirects += 1;
@@ -1688,6 +1726,9 @@ impl NativeClient {
                     Status::NotFound => GetOutcome::Done(None),
                     Status::StaleRoute | Status::NotLocal => {
                         if let ResponseBody::Redirect(info) = &response.body {
+                            self.shared
+                                .tablet_leaders
+                                .insert(info.tablet, info.endpoint.clone());
                             self.shared.routes.insert(RouteEntry::from_redirect(info));
                         }
                         GetOutcome::Reroute

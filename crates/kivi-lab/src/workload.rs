@@ -45,6 +45,8 @@ pub enum ValueSize {
     Mb1,
     /// 4 MiB.
     Mb4,
+    /// 64 MiB (replicated large-value range; streams via `put_stream`).
+    Mb64,
 }
 
 impl ValueSize {
@@ -59,6 +61,7 @@ impl ValueSize {
             Self::Kb256 => 256 * 1024,
             Self::Mb1 => 1024 * 1024,
             Self::Mb4 => 4 * 1024 * 1024,
+            Self::Mb64 => 64 * 1024 * 1024,
         }
     }
 }

@@ -12,14 +12,13 @@
 //!
 //! Static topologies name every port before any process starts, which
 //! conflicts with race-free ephemeral discovery. The harness probes nine
-//! loopback ports (peer/native/admin × 3) by bind-then-release and
-//! spawns immediately; if any member fails to bind (a parallel run stole
-//! a probed port), the whole attempt is discarded and retried with fresh
-//! probes (bounded attempts). A bind conflict therefore retries loudly
-//! instead of serving a half cluster — race-free in effect, never silent.
-//! Restarts always take fresh ports (the old listener may still be
-//! releasing); the mesh heals through the restarted member's outbound
-//! dials, and the harness tracks the new endpoints.
+//! loopback ports (UDP for the QUIC peer mesh, TCP for native/admin × 3)
+//! by bind-then-release and spawns immediately; if any member fails to
+//! bind (a parallel run stole a probed port), the whole attempt is
+//! discarded and retried with fresh probes (bounded attempts). A bind
+//! conflict therefore retries loudly instead of serving a half cluster —
+//! race-free in effect, never silent. Restarts reuse static ports (the
+//! mesh heals through the restarted member's outbound dials).
 
 use std::io::{Read as _, Write as _};
 use std::net::TcpStream;
@@ -101,12 +100,23 @@ impl Drop for Cluster {
     }
 }
 
-/// Probes one free loopback port (bind-then-release; the caller spawns
-/// immediately and retries the whole formation on conflict).
+/// Probes one free loopback TCP port (bind-then-release; the caller
+/// spawns immediately and retries the whole formation on conflict).
+/// Native, admin, and RESP edges stay TCP.
 fn free_addr() -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("probe binds");
     let addr = listener.local_addr().expect("probe addr").to_string();
     drop(listener);
+    addr
+}
+
+/// Probes one free loopback UDP port for the QUIC peer mesh. TCP probes
+/// say nothing about UDP availability (separate namespaces), so peer
+/// ports probe UDP while the mesh binds with retries on conflict.
+fn free_udp_addr() -> String {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("probe binds");
+    let addr = socket.local_addr().expect("probe addr").to_string();
+    drop(socket);
     addr
 }
 
@@ -191,8 +201,9 @@ impl Cluster {
     /// STATIC ports (same identity, advanced incarnation, no
     /// re-bootstrap). Static topologies require stable addresses: every
     /// member's maps stay valid across restarts, so redirects and dials
-    /// never go stale. The server retries binds through `TIME_WAIT`
-    /// release, so rapid kill/restart cycles are safe.
+    /// never go stale. Killed processes release UDP ports immediately;
+    /// the server also retries binds through release races, so rapid
+    /// kill/restart cycles are safe.
     ///
     /// # Errors
     ///
@@ -314,6 +325,135 @@ impl Cluster {
         (status, json)
     }
 
+    /// Raw admin POST with a JSON body against one member.
+    ///
+    /// # Panics
+    ///
+    /// Panics on connection or I/O failure.
+    #[must_use]
+    pub fn admin_post(&self, index: usize, path: &str, body: &Value) -> (u16, Value) {
+        let payload = body.to_string();
+        let mut socket =
+            TcpStream::connect(self.nodes[index].admin.clone()).expect("admin connect");
+        socket
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        write!(
+            socket,
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+            payload.len()
+        )
+        .expect("write");
+        let mut raw = String::new();
+        socket.read_to_string(&mut raw).expect("read");
+        let status = raw
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or("0")
+            .parse::<u16>()
+            .unwrap_or(0);
+        let json: Value =
+            serde_json::from_str(raw.split("\r\n\r\n").nth(1).unwrap_or("")).unwrap_or(Value::Null);
+        (status, json)
+    }
+
+    /// Suspends the peer link from member `index` toward node `peer`
+    /// (partition hook: bounded backoff, membership unchanged).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the endpoint errors.
+    pub fn suspend_peer(&self, index: usize, peer: u64) {
+        let (status, _) = self.admin_post(
+            index,
+            "/v1/peers/suspend",
+            &serde_json::json!({ "node": peer }),
+        );
+        assert_eq!(status, 200, "suspend peer {peer} on node {index}");
+    }
+
+    /// Resumes a suspended peer link.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the endpoint errors.
+    pub fn resume_peer(&self, index: usize, peer: u64) {
+        let (status, _) = self.admin_post(
+            index,
+            "/v1/peers/resume",
+            &serde_json::json!({ "node": peer }),
+        );
+        assert_eq!(status, 200, "resume peer {peer} on node {index}");
+    }
+
+    /// Isolates member `index` from every other member (bidirectional
+    /// suspends), returning the peer ids isolated. Heal with
+    /// [`Cluster::heal`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when any suspend fails.
+    pub fn partition(&self, index: usize) {
+        let victim = self.nodes[index].node_id;
+        for (other, node) in self.nodes.iter().enumerate() {
+            if other == index {
+                continue;
+            }
+            self.suspend_peer(index, node.node_id);
+            if self.alive(other) {
+                self.suspend_peer(other, victim);
+            }
+        }
+    }
+
+    /// Heals every link toward/away from member `index`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any resume fails.
+    pub fn heal(&self, index: usize) {
+        let victim = self.nodes[index].node_id;
+        for (other, node) in self.nodes.iter().enumerate() {
+            if other == index {
+                continue;
+            }
+            self.resume_peer(index, node.node_id);
+            if self.alive(other) {
+                self.resume_peer(other, victim);
+            }
+        }
+    }
+
+    /// Triggers a checkpoint snapshot + log purge on member `index`,
+    /// returning the snapshot base index.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the endpoint errors.
+    #[must_use]
+    pub fn snapshot(&self, index: usize) -> u64 {
+        let (status, json) = self.admin_post(index, "/v1/snapshot", &serde_json::json!({}));
+        assert_eq!(status, 200, "snapshot on node {index}: {json}");
+        json["snapshot"].as_u64().unwrap_or(0)
+    }
+
+    /// Parsed `/ready` for one member (readiness reflects replica health,
+    /// transport, membership, and leader knowledge — never just the TCP
+    /// listener).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the endpoint errors.
+    #[must_use]
+    pub fn ready(&self, index: usize) -> Value {
+        let (status, json) = self.admin_get(index, "/ready");
+        assert_eq!(status, 200, "GET /ready on node {index}");
+        json
+    }
+
     /// Parsed `/v1/tablet` for one member.
     ///
     /// # Panics
@@ -410,6 +550,48 @@ impl Cluster {
         }
     }
 
+    /// Waits for exactly one stable leader among live members except
+    /// `exclude`, returning its index. Mirrors the in-process
+    /// `wait_leader_except`: the isolated minority may still believe it
+    /// leads (stale term), so fencing tests must elect the majority
+    /// without it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no single stable majority leader emerges inside the window.
+    #[must_use = "the majority leader index routes the next test step"]
+    pub fn wait_leader_except(&self, exclude: usize) -> usize {
+        let deadline = Instant::now() + LEADER_TIMEOUT;
+        let mut stable = 0usize;
+        let mut last = usize::MAX;
+        loop {
+            let leaders: Vec<usize> = (0..self.nodes.len())
+                .filter(|i| *i != exclude && self.alive(*i) && self.role(*i) == "leader")
+                .collect();
+            if leaders.len() == 1 && leaders[0] == last {
+                stable += 1;
+                if stable >= 3 {
+                    return leaders[0];
+                }
+            } else {
+                stable = 0;
+                last = leaders.first().copied().unwrap_or(usize::MAX);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "majority never elected without node {exclude}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Native endpoint of one member (even when partitioned; direct-dial
+    /// fencing probes use this to pin a client on the isolate).
+    #[must_use]
+    pub fn native_endpoint(&self, index: usize) -> String {
+        self.nodes[index].native.clone()
+    }
+
     /// Waits until every live member applied at least `index`.
     ///
     /// # Panics
@@ -492,7 +674,7 @@ impl Cluster {
     }
 
     fn spawn_once(binary: &PathBuf, want_resp: bool) -> Result<Self, SpawnError> {
-        let peers = [free_addr(), free_addr(), free_addr()];
+        let peers = [free_udp_addr(), free_udp_addr(), free_udp_addr()];
         let natives = [free_addr(), free_addr(), free_addr()];
         let admins = [free_addr(), free_addr(), free_addr()];
         let redis = [free_addr(), free_addr(), free_addr()];
@@ -560,13 +742,16 @@ fn flag_list(addrs: &[String]) -> String {
 }
 
 /// Spawns one member and waits for its `KIVI_READY` (native + admin +
-/// optional RESP).
+/// optional RESP). Test-only insecure peer TLS: fresh data directories
+/// and ephemeral ports per run make static certificate pins impractical,
+/// and all traffic stays on loopback.
 fn spawn_member(
     binary: &PathBuf,
     args: &[String],
 ) -> Result<(Child, String, String, Option<String>), SpawnError> {
     let mut child = Command::new(binary)
         .args(args)
+        .env("KIVI_INSECURE_PEER_TLS", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

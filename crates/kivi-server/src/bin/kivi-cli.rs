@@ -16,6 +16,11 @@ struct Cli {
     /// Seed endpoint (worker 0 doubles as the seed initially).
     #[arg(long, default_value = "127.0.0.1:9000")]
     server: String,
+    /// Extra seed endpoints for clusters (comma-separated or repeated).
+    /// The client starts at `--server` plus these, follows leader hints,
+    /// and preserves mutation identities across redirects.
+    #[arg(long, value_delimiter = ',')]
+    seed: Vec<String>,
     /// Target namespace id.
     #[arg(long, default_value_t = 1)]
     namespace: u64,
@@ -107,8 +112,10 @@ enum Command {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let mut seeds = vec![cli.server.clone()];
+    seeds.extend(cli.seed.iter().cloned());
     let client = NativeClient::new(ClientConfig {
-        seeds: vec![cli.server],
+        seeds,
         namespace: NamespaceId::from_u64(cli.namespace),
         ..ClientConfig::default()
     })?;

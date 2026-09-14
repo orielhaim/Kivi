@@ -41,13 +41,14 @@ use anyhow::Context;
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::routing::get;
+use axum::routing::{get, post};
 use kivi_consensus::{
     ConsensusError, NodeConfig, NodeStatus, ProposeError, ProposeOutcome, ReadError, ReplicatedNode,
 };
 use kivi_protocol::{
     Capabilities, ClientHello, FrameKind, FrameReader, RedirectInfo, Request, Response,
-    ResponseBody, ServerHello, Status, encode_frame,
+    ResponseBody, ServerHello, Status, StreamAbort, StreamBegin, StreamReady, ValueStreamBegin,
+    encode_frame,
 };
 #[cfg(feature = "redis-compat")]
 use kivi_state::Operation;
@@ -68,6 +69,12 @@ use tower_http::trace::TraceLayer;
 /// connection reports worker `0`, and redirects name worker `0`, so the
 /// client's worker validation stays consistent across dials and hints.
 const CLUSTER_WORKER: u64 = 0;
+/// Chunk staging granularity for cluster uploads (matches the chunk
+/// fabric default; bounds per-frame memory and pack records).
+const CLUSTER_CHUNK_SIZE: usize = 1_048_576;
+/// Maximum `StreamData` payload per frame on cluster uploads (bounded
+/// bulk framing; well under the peer and native ceilings).
+const CLUSTER_STREAM_MAX_DATA: u32 = 1_048_576;
 /// Directory version reported in hellos and redirects (the cluster has
 /// no multi-tablet directory yet; the value only needs to be stable).
 const CLUSTER_DIR_VERSION: u64 = 1;
@@ -104,6 +111,8 @@ pub struct ClusterServeConfig {
     pub segment_target_bytes: u64,
     /// Maximum native frame in bytes.
     pub max_frame: usize,
+    /// Static peer TLS certificates per node id (`node → DER path`).
+    pub peer_certs: Vec<(NodeId, std::path::PathBuf)>,
 }
 
 /// Shared cluster serving state: the replicated node plus the static
@@ -172,6 +181,11 @@ pub fn run_from_args(args: &super::Args) -> anyhow::Result<()> {
         redis_bind: args.redis_listen,
         segment_target_bytes: args.wal_segment_target,
         max_frame: args.max_frame,
+        peer_certs: args
+            .cluster_peer_certs
+            .iter()
+            .map(|(id, path)| (NodeId::from_u64(*id), path.clone()))
+            .collect(),
     };
     // The server's Tokio runtime drives the consensus front (whose
     // futures stay `Send` across runtimes) and the Tokio-native edges
@@ -234,20 +248,26 @@ fn build_topology(config: &ClusterServeConfig) -> kivi_consensus::ClusterTopolog
     }
 }
 
-/// Opens the replicated node: pre-binds the peer listener (with
-/// `TIME_WAIT` retries) before recovery, so restarts rebind their
-/// static port and the topology other members dial never changes shape
-/// across restarts.
+/// Opens the replicated node. The QUIC endpoint binds its UDP socket
+/// inside the consensus owner thread (no pre-bound listener, no
+/// `TIME_WAIT` dance — QUIC has no TCP listener backlog); a bind
+/// conflict fails loudly so the harness retries formation. Peer
+/// certificates come from `--cluster-peer-certs`; without them the node
+/// opens only when `KIVI_INSECURE_PEER_TLS=1` (lab tests).
 async fn open_node(config: &ClusterServeConfig) -> anyhow::Result<Arc<ReplicatedNode>> {
     let topology = build_topology(config);
-    let peer_bind = topology
-        .node(config.node)
-        .map(|descriptor| descriptor.peer)
-        .with_context(|| format!("no peer endpoint for node {}", config.node.as_u64()))?;
-    let peer_std = bind_with_retry(peer_bind, "peer").await?;
-    peer_std
-        .set_nonblocking(true)
-        .context("peer listener nonblocking")?;
+    let mut peer_certs = std::collections::HashMap::new();
+    for (node, path) in &config.peer_certs {
+        let der = std::fs::read(path)
+            .with_context(|| format!("peer cert for node {} unreadable", node.as_u64()))?;
+        peer_certs.insert(*node, der);
+    }
+    let insecure_peer_tls = std::env::var("KIVI_INSECURE_PEER_TLS").is_ok_and(|value| value == "1");
+    if peer_certs.is_empty() && !insecure_peer_tls {
+        anyhow::bail!(
+            "peer TLS needs --cluster-peer-certs or KIVI_INSECURE_PEER_TLS=1 (lab tests only)"
+        );
+    }
     let node = Arc::new(
         ReplicatedNode::open(NodeConfig {
             data_dir: config.data_dir.clone(),
@@ -262,7 +282,8 @@ async fn open_node(config: &ClusterServeConfig) -> anyhow::Result<Arc<Replicated
             topology,
             segment_target_bytes: config.segment_target_bytes,
             transport: kivi_consensus::TransportConfig::default(),
-            peer_listener: Some(peer_std),
+            peer_certs,
+            insecure_peer_tls,
         })
         .await
         .context("replicated node failed to open")?,
@@ -386,6 +407,7 @@ async fn serve_native(listener: tokio::net::TcpListener, shared: ClusterShared, 
 
 /// Serves one native connection: exactly one `ClientHello`, one
 /// `ServerHello`, then requests until EOF or violation.
+#[allow(clippy::too_many_lines)]
 async fn serve_native_conn(socket: tokio::net::TcpStream, shared: ClusterShared, max_frame: usize) {
     let (mut reader, mut writer) = socket.into_split();
     let mut frames = FrameReader::new(max_frame);
@@ -419,7 +441,9 @@ async fn serve_native_conn(socket: tokio::net::TcpStream, shared: ClusterShared,
     let reply = ServerHello {
         major: kivi_protocol::PROTOCOL_MAJOR,
         minor: kivi_protocol::PROTOCOL_MINOR,
-        caps: Capabilities::BASE_V1 | Capabilities::DURABLE_MUTATION_DEDUP,
+        caps: Capabilities::BASE_V1
+            | Capabilities::DURABLE_MUTATION_DEDUP
+            | Capabilities::STREAMING,
         cluster: shared.node.cluster(),
         node: shared.node.node(),
         incarnation: shared.node.incarnation(),
@@ -439,6 +463,8 @@ async fn serve_native_conn(socket: tokio::net::TcpStream, shared: ClusterShared,
         return;
     }
     frames = FrameReader::new(negotiated);
+    let mut uploads: std::collections::HashMap<u64, ClusterUpload> =
+        std::collections::HashMap::new();
     loop {
         let count = match reader.read(&mut buf).await {
             Ok(count) if count > 0 => count,
@@ -450,6 +476,18 @@ async fn serve_native_conn(socket: tokio::net::TcpStream, shared: ClusterShared,
         for frame in parsed {
             match frame.kind {
                 FrameKind::Request => {
+                    // `GetStream` streams `ValueStream*` frames under the
+                    // request id; all other opcodes answer with one
+                    // `Response` (chunked roots resolved via sidecars).
+                    if is_get_stream(&frame.payload) {
+                        if handle_get_stream(&shared, &mut writer, &frame.payload, frame.request_id)
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        continue;
+                    }
                     let Some((response, opcode)) = handle_request(&shared, &frame.payload).await
                     else {
                         // Malformed requests close the connection (same
@@ -477,12 +515,483 @@ async fn serve_native_conn(socket: tokio::net::TcpStream, shared: ClusterShared,
                         return;
                     }
                 }
-                // Chunk-fabric streaming has no replicated substrate yet
-                // (task AK): close rather than misserve bulk uploads.
+                FrameKind::StreamBegin => {
+                    if handle_stream_begin(
+                        &shared,
+                        &mut writer,
+                        &mut uploads,
+                        &frame.payload,
+                        frame.request_id,
+                        negotiated,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
+                    }
+                }
+                FrameKind::StreamData => {
+                    if handle_stream_data(&shared, &mut uploads, &frame.payload, frame.request_id)
+                        .await
+                        .is_err()
+                    {
+                        let _ = writer
+                            .write_all(&encode_frame(
+                                FrameKind::StreamAbort,
+                                frame.request_id,
+                                &StreamAbort {
+                                    reason: "upload overflow or unknown stream".to_owned(),
+                                }
+                                .encode(),
+                            ))
+                            .await;
+                        uploads.remove(&frame.request_id);
+                    }
+                }
+                FrameKind::StreamCommit => {
+                    if handle_stream_commit(&shared, &mut writer, &mut uploads, frame.request_id)
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                FrameKind::StreamAbort => {
+                    uploads.remove(&frame.request_id);
+                }
                 _ => return,
             }
         }
     }
+}
+
+/// Whether a request payload names the `GetStream` opcode (delivery
+/// differs: `ValueStream*` frames instead of one `Response`).
+fn is_get_stream(payload: &[u8]) -> bool {
+    Request::decode(payload).is_ok_and(|request| request.opcode == kivi_protocol::Opcode::GetStream)
+}
+
+/// One cluster upload assembling on its connection task.
+///
+/// Chunks stage incrementally (one pack record per full 1 MiB piece, no
+/// per-chunk sync); the manifest + one barrier complete on commit. Staged
+/// chunks pin implicitly via content addressing until the commit proposes;
+/// a dropped connection leaves harmless orphans for deferred GC.
+struct ClusterUpload {
+    key: Vec<u8>,
+    identity: Option<kivi_types::RequestIdentity>,
+    ack_floor: kivi_types::RequestSeq,
+    declared: Option<u64>,
+    received: u64,
+    buf: Vec<u8>,
+    chunks: Vec<(kivi_types::ChunkId, u64)>,
+}
+
+/// Handles `StreamBegin`: validates, registers the upload, answers
+/// `StreamReady` (or `StreamAbort` on definite rejection, pre-commit).
+async fn handle_stream_begin(
+    shared: &ClusterShared,
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    uploads: &mut std::collections::HashMap<u64, ClusterUpload>,
+    payload: &[u8],
+    stream: u64,
+    negotiated: usize,
+) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let abort = |reason: &str| {
+        encode_frame(
+            FrameKind::StreamAbort,
+            stream,
+            &StreamAbort {
+                reason: reason.to_owned(),
+            }
+            .encode(),
+        )
+    };
+    let Ok(begin) = StreamBegin::decode(payload) else {
+        writer.write_all(&abort("malformed stream-begin")).await?;
+        return Ok(());
+    };
+    if begin.namespace != shared.namespace {
+        writer.write_all(&abort("unknown namespace")).await?;
+        return Ok(());
+    }
+    if begin.key.is_empty() {
+        writer.write_all(&abort("empty key")).await?;
+        return Ok(());
+    }
+    if begin
+        .total_len
+        .is_some_and(|total| total > kivi_protocol::MAX_STREAM_UPLOAD_BYTES)
+    {
+        writer
+            .write_all(&abort("upload exceeds the stream bound"))
+            .await?;
+        return Ok(());
+    }
+    if uploads.contains_key(&stream) {
+        writer.write_all(&abort("duplicate stream id")).await?;
+        return Ok(());
+    }
+    uploads.insert(
+        stream,
+        ClusterUpload {
+            key: begin.key,
+            identity: begin.identity,
+            ack_floor: begin.ack_floor,
+            declared: begin.total_len,
+            received: 0,
+            buf: Vec::new(),
+            chunks: Vec::new(),
+        },
+    );
+    let max_data = u32::try_from(negotiated.saturating_sub(256))
+        .unwrap_or(CLUSTER_STREAM_MAX_DATA)
+        .clamp(1, CLUSTER_STREAM_MAX_DATA);
+    writer
+        .write_all(&encode_frame(
+            FrameKind::StreamReady,
+            stream,
+            &StreamReady { max_data }.encode(),
+        ))
+        .await?;
+    Ok(())
+}
+
+/// Handles `StreamData`: appends, stages full 1 MiB pieces (no sync yet,
+/// so residency stays ~1 chunk, never the full 64 MiB).
+/// Returns `Err` on overflow/unknown stream (caller aborts the stream).
+async fn handle_stream_data(
+    shared: &ClusterShared,
+    uploads: &mut std::collections::HashMap<u64, ClusterUpload>,
+    payload: &[u8],
+    stream: u64,
+) -> anyhow::Result<()> {
+    let Some(upload) = uploads.get_mut(&stream) else {
+        anyhow::bail!("unknown stream");
+    };
+    if u32::try_from(payload.len()).unwrap_or(u32::MAX) > CLUSTER_STREAM_MAX_DATA {
+        anyhow::bail!("stream data exceeds negotiated max");
+    }
+    upload.received = upload
+        .received
+        .checked_add(payload.len() as u64)
+        .ok_or_else(|| anyhow::anyhow!("upload overflow"))?;
+    if upload.received > kivi_protocol::MAX_STREAM_UPLOAD_BYTES {
+        anyhow::bail!("upload exceeds the stream bound");
+    }
+    if upload.declared.is_some_and(|total| upload.received > total) {
+        anyhow::bail!("upload exceeds its declared total");
+    }
+    upload.buf.extend_from_slice(payload);
+    // Incremental staging: residency stays ~1 chunk, never the full value.
+    drain_upload_pieces(shared, upload).await?;
+    Ok(())
+}
+
+/// Stages full buffered pieces for an upload (shared by data/commit).
+async fn drain_upload_pieces(
+    shared: &ClusterShared,
+    upload: &mut ClusterUpload,
+) -> anyhow::Result<()> {
+    while upload.buf.len() >= CLUSTER_CHUNK_SIZE {
+        let piece: Vec<u8> = upload.buf.drain(..CLUSTER_CHUNK_SIZE).collect();
+        let id = kivi_codec::integrity::chunk_id(
+            kivi_types::SecurityDomainId::from_u64(shared.namespace.as_u64()),
+            &piece,
+        );
+        // Stage without sync; the commit barriers once. Synchronous
+        // verification happens inside `stage_chunk` (id recompute).
+        shared
+            .node
+            .sidecar()
+            .stage_chunk(id, piece)
+            .await
+            .map_err(|error| anyhow::anyhow!("stage chunk: {error}"))?;
+        upload.chunks.push((id, CLUSTER_CHUNK_SIZE as u64));
+    }
+    Ok(())
+}
+
+/// Handles `StreamCommit`: stages the tail, builds the manifest, syncs
+/// once, proposes the tiny root, and answers `Response::Stored` under the
+/// stream id (or `StreamAbort` on failure, pre-apply).
+#[allow(clippy::too_many_lines)]
+async fn handle_stream_commit(
+    shared: &ClusterShared,
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    uploads: &mut std::collections::HashMap<u64, ClusterUpload>,
+    stream: u64,
+) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let Some(mut upload) = uploads.remove(&stream) else {
+        return Ok(());
+    };
+    let fail = |reason: String| {
+        encode_frame(
+            FrameKind::StreamAbort,
+            stream,
+            &StreamAbort { reason }.encode(),
+        )
+    };
+    if upload
+        .declared
+        .is_some_and(|total| upload.received != total)
+    {
+        writer
+            .write_all(&fail(
+                "upload length mismatches its declared total".to_owned(),
+            ))
+            .await?;
+        return Ok(());
+    }
+    // Stage full pieces buffered so far (commit path stages the tail
+    // below, so every byte is chunked exactly once).
+    if let Err(error) = drain_upload_pieces(shared, &mut upload).await {
+        writer.write_all(&fail(error.to_string())).await?;
+        return Ok(());
+    }
+    // Tail piece (possibly empty when the value aligns exactly).
+    if !upload.buf.is_empty() {
+        let tail: Vec<u8> = std::mem::take(&mut upload.buf);
+        let id = kivi_codec::integrity::chunk_id(
+            kivi_types::SecurityDomainId::from_u64(shared.namespace.as_u64()),
+            &tail,
+        );
+        if let Err(error) = shared.node.sidecar().stage_chunk(id, tail.clone()).await {
+            writer
+                .write_all(&fail(format!("stage tail: {error}")))
+                .await?;
+            return Ok(());
+        }
+        upload.chunks.push((id, tail.len() as u64));
+    }
+    // Empty value: no chunks, empty manifest (total 0).
+    let domain = kivi_types::SecurityDomainId::from_u64(shared.namespace.as_u64());
+    let entries: Vec<kivi_chunk::ChunkEntry> = upload
+        .chunks
+        .iter()
+        .map(|(id, len)| kivi_chunk::ChunkEntry { id: *id, len: *len })
+        .collect();
+    let total = upload.received;
+    let (manifest_obj, manifest) = match kivi_chunk::build_manifest(
+        domain,
+        kivi_chunk::Chunking::DEFAULT,
+        kivi_chunk::ChunkCodecId::NONE,
+        total,
+        entries,
+    ) {
+        Ok(built) => built,
+        Err(error) => {
+            writer
+                .write_all(&fail(format!("build manifest: {error}")))
+                .await?;
+            return Ok(());
+        }
+    };
+    let mut canonical = Vec::new();
+    manifest_obj.encode_canonical(&mut canonical);
+    if let Err(error) = shared
+        .node
+        .sidecar()
+        .stage_manifest(manifest, canonical)
+        .await
+    {
+        writer
+            .write_all(&fail(format!("stage manifest: {error}")))
+            .await?;
+        return Ok(());
+    }
+    if let Err(error) = shared.node.sidecar().sync().await {
+        writer
+            .write_all(&fail(format!("sidecar sync: {error}")))
+            .await?;
+        return Ok(());
+    }
+    // Pin for the proposal lifetime; ownership transfers to live state on
+    // commit (pins release on reply/dedup-hit paths inside propose).
+    {
+        let chunk_ids: Vec<kivi_types::ChunkId> = upload.chunks.iter().map(|(id, _)| *id).collect();
+        let mut pins = shared.node.sidecar().pins().lock().await;
+        pins.pin_root(manifest, &chunk_ids);
+    }
+    let operation = kivi_state::Operation::SetChunked {
+        key: kivi_state::Key::new(upload.key.clone()),
+        manifest,
+        logical_len: total,
+    };
+    let identity = upload.identity.map(|client| MutationIdentity {
+        client,
+        ack_floor: upload.ack_floor,
+    });
+    let now = wall_now();
+    let response = match shared.node.propose(&operation, identity, None, now).await {
+        Ok(outcome) => match outcome {
+            ProposeOutcome::Applied { outcome, .. }
+            | ProposeOutcome::Duplicate { outcome }
+            | ProposeOutcome::Read { outcome } => {
+                // Release the proposal pin: live state now references the
+                // root (or the dedup hit answered from retained state).
+                {
+                    let chunk_ids: Vec<kivi_types::ChunkId> =
+                        upload.chunks.iter().map(|(id, _)| *id).collect();
+                    let mut pins = shared.node.sidecar().pins().lock().await;
+                    pins.unpin_root(&manifest, &chunk_ids);
+                }
+                shape_result(kivi_protocol::Opcode::Set, &outcome)
+            }
+            ProposeOutcome::Rejected { outcome } => {
+                {
+                    let chunk_ids: Vec<kivi_types::ChunkId> =
+                        upload.chunks.iter().map(|(id, _)| *id).collect();
+                    let mut pins = shared.node.sidecar().pins().lock().await;
+                    pins.unpin_root(&manifest, &chunk_ids);
+                }
+                shape_durable(&outcome, kivi_protocol::Opcode::Set)
+            }
+        },
+        Err(error) => {
+            {
+                let chunk_ids: Vec<kivi_types::ChunkId> =
+                    upload.chunks.iter().map(|(id, _)| *id).collect();
+                let mut pins = shared.node.sidecar().pins().lock().await;
+                pins.unpin_root(&manifest, &chunk_ids);
+            }
+            shape_propose_error(shared, &error)
+        }
+    };
+    writer
+        .write_all(&encode_frame(
+            FrameKind::Response,
+            stream,
+            &response.encode(kivi_protocol::Opcode::Set),
+        ))
+        .await?;
+    Ok(())
+}
+
+/// Handles `GetStream`: linearizable read on the leader, then streams
+/// `ValueStreamBegin/Data/End` under the request id (or a terminal
+/// `Response` for absent/redirect/error, which the client loops on).
+#[allow(clippy::too_many_lines)]
+async fn handle_get_stream(
+    shared: &ClusterShared,
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    payload: &[u8],
+    stream: u64,
+) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let Ok(request) = Request::decode(payload) else {
+        return Ok(());
+    };
+    if request.namespace != shared.namespace {
+        let response = Response {
+            status: Status::InvalidRequest,
+            body: ResponseBody::Diagnostic("unknown namespace".to_owned()),
+        };
+        writer
+            .write_all(&encode_frame(
+                FrameKind::Response,
+                stream,
+                &response.encode(kivi_protocol::Opcode::GetStream),
+            ))
+            .await?;
+        return Ok(());
+    }
+    let operation = request.into_operation();
+    let now = wall_now();
+    let outcome = match shared
+        .node
+        .read(&operation, ReadContract::Latest, now)
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let response = shape_read_error(shared, &error);
+            writer
+                .write_all(&encode_frame(
+                    FrameKind::Response,
+                    stream,
+                    &response.encode(kivi_protocol::Opcode::GetStream),
+                ))
+                .await?;
+            return Ok(());
+        }
+    };
+    // Resolve bytes (inline or chunked via sidecars).
+    let bytes = match outcome {
+        OperationResult::Value(Some(value)) => Some(value.to_vec()),
+        OperationResult::Value(None) => None,
+        OperationResult::ChunkedValue {
+            manifest,
+            logical_len,
+        } => {
+            if let Ok(bytes) = shared
+                .node
+                .sidecar()
+                .read_value(manifest, logical_len)
+                .await
+            {
+                Some(bytes)
+            } else {
+                let abort = StreamAbort {
+                    reason: "chunked value unavailable".to_owned(),
+                };
+                writer
+                    .write_all(&encode_frame(
+                        FrameKind::StreamAbort,
+                        stream,
+                        &abort.encode(),
+                    ))
+                    .await?;
+                return Ok(());
+            }
+        }
+        _ => {
+            let response = shape_result(kivi_protocol::Opcode::GetStream, &outcome);
+            writer
+                .write_all(&encode_frame(
+                    FrameKind::Response,
+                    stream,
+                    &response.encode(kivi_protocol::Opcode::GetStream),
+                ))
+                .await?;
+            return Ok(());
+        }
+    };
+    let Some(bytes) = bytes else {
+        let response = Response {
+            status: Status::NotFound,
+            body: ResponseBody::Diagnostic(String::new()),
+        };
+        writer
+            .write_all(&encode_frame(
+                FrameKind::Response,
+                stream,
+                &response.encode(kivi_protocol::Opcode::GetStream),
+            ))
+            .await?;
+        return Ok(());
+    };
+    writer
+        .write_all(&encode_frame(
+            FrameKind::ValueStreamBegin,
+            stream,
+            &ValueStreamBegin {
+                total_len: bytes.len() as u64,
+            }
+            .encode(),
+        ))
+        .await?;
+    for piece in bytes.chunks(CLUSTER_CHUNK_SIZE) {
+        writer
+            .write_all(&encode_frame(FrameKind::ValueStreamData, stream, piece))
+            .await?;
+    }
+    writer
+        .write_all(&encode_frame(FrameKind::ValueStreamEnd, stream, &[]))
+        .await?;
+    Ok(())
 }
 
 /// Handles one decoded request against the replicated node. Returns
@@ -511,19 +1020,10 @@ async fn handle_request(
     }
     // The single replicated tablet owns every key in this stage; hints
     // accelerate nothing and authorize nothing, so they are ignored.
+    // `GetStream` never reaches here (the connection loop streams
+    // `ValueStream*` frames instead of one `Response`).
     let operation = request.into_operation();
     let now = wall_now();
-    if opcode == kivi_protocol::Opcode::GetStream {
-        return Some((
-            Response {
-                status: Status::Unsupported,
-                body: ResponseBody::Diagnostic(
-                    "streaming reads are unsupported in cluster mode".to_owned(),
-                ),
-            },
-            opcode,
-        ));
-    }
     if opcode.is_mutating() {
         let identity = identity.map(|client| MutationIdentity { client, ack_floor });
         Some((
@@ -531,28 +1031,125 @@ async fn handle_request(
                 Ok(outcome) => match outcome {
                     ProposeOutcome::Applied { outcome, .. }
                     | ProposeOutcome::Duplicate { outcome }
-                    | ProposeOutcome::Read { outcome } => shape_result(opcode, &outcome),
-                    ProposeOutcome::Rejected { outcome } => shape_durable(&outcome, opcode),
+                    | ProposeOutcome::Read { outcome } => {
+                        resolve_result(shared, opcode, &operation, &outcome).await
+                    }
+                    ProposeOutcome::Rejected { outcome } => {
+                        resolve_durable(shared, &operation, &outcome, opcode).await
+                    }
                 },
                 Err(error) => shape_propose_error(shared, &error),
             },
             opcode,
         ))
     } else {
-        // Native reads are linearizable in cluster mode (task Q): the
-        // barrier runs on the leader; followers redirect.
+        // Native reads are linearizable in cluster mode: the barrier runs
+        // on the leader; followers redirect. Chunked roots resolve via
+        // sidecars (same bytes as single-node, never wrong bytes).
         Some((
             match shared
                 .node
                 .read(&operation, ReadContract::Latest, now)
                 .await
             {
-                Ok(outcome) => shape_result(opcode, &outcome),
+                Ok(outcome) => resolve_result(shared, opcode, &operation, &outcome).await,
                 Err(error) => shape_read_error(shared, &error),
             },
             opcode,
         ))
     }
+}
+
+/// Resolves a deterministic outcome, fetching chunked bytes via sidecars
+/// when the outcome references immutable state.
+async fn resolve_result(
+    shared: &ClusterShared,
+    opcode: kivi_protocol::Opcode,
+    operation: &kivi_state::Operation,
+    outcome: &OperationResult,
+) -> Response {
+    use kivi_state::OperationResult as R;
+    match outcome {
+        R::ChunkedValue {
+            manifest,
+            logical_len,
+        } => match opcode {
+            kivi_protocol::Opcode::Get => {
+                if *logical_len > kivi_chunk::policy::MAX_LEGACY_VALUE_BYTES {
+                    return Response {
+                        status: Status::ValueTooLarge,
+                        body: ResponseBody::Diagnostic(
+                            "value exceeds legacy GET; use get_stream".to_owned(),
+                        ),
+                    };
+                }
+                match shared
+                    .node
+                    .sidecar()
+                    .read_value(*manifest, *logical_len)
+                    .await
+                {
+                    Ok(bytes) => Response {
+                        status: Status::Ok,
+                        body: ResponseBody::Value(bytes),
+                    },
+                    Err(_) => Response {
+                        status: Status::Internal,
+                        body: ResponseBody::Diagnostic("chunked value unavailable".to_owned()),
+                    },
+                }
+            }
+            kivi_protocol::Opcode::GetRange => {
+                let (offset, len) = match operation {
+                    kivi_state::Operation::GetRange { offset, len, .. } => (*offset, *len),
+                    _ => (0, u64::MAX),
+                };
+                match shared
+                    .node
+                    .sidecar()
+                    .read_value(*manifest, *logical_len)
+                    .await
+                {
+                    Ok(bytes) => Response {
+                        status: Status::Ok,
+                        body: ResponseBody::Value(slice_range(&bytes, offset, len)),
+                    },
+                    Err(_) => Response {
+                        status: Status::Internal,
+                        body: ResponseBody::Diagnostic("chunked value unavailable".to_owned()),
+                    },
+                }
+            }
+            _ => shape_result(opcode, outcome),
+        },
+        _ => shape_result(opcode, outcome),
+    }
+}
+
+/// Resolves a terminal outcome, fetching chunked bytes when completed.
+async fn resolve_durable(
+    shared: &ClusterShared,
+    operation: &kivi_state::Operation,
+    outcome: &DurableOutcome,
+    opcode: kivi_protocol::Opcode,
+) -> Response {
+    match outcome {
+        DurableOutcome::Completed(result) => {
+            resolve_result(shared, opcode, operation, result).await
+        }
+        _ => shape_durable(outcome, opcode),
+    }
+}
+
+/// Slices `[offset, offset+len)` clamped to the value (empty past the end).
+fn slice_range(value: &[u8], offset: u64, len: u64) -> Vec<u8> {
+    let offset = usize::try_from(offset).unwrap_or(usize::MAX);
+    let len = usize::try_from(len).unwrap_or(usize::MAX);
+    if offset >= value.len() {
+        return Vec::new();
+    }
+    let end = offset.saturating_add(len).min(value.len());
+    value[offset..end].to_vec()
 }
 
 /// Shapes a deterministic outcome like the single-node edge (same bodies
@@ -830,18 +1427,39 @@ struct TabletDto {
     detail: Option<String>,
 }
 
-/// Per-peer connection diagnostics.
+/// Per-peer QUIC/H3 diagnostics (control + bulk connections).
 #[derive(Debug, Clone, Serialize)]
 struct PeerDto {
     node: u64,
-    connected: bool,
+    connected_control: bool,
+    connected_bulk: bool,
     suspended: bool,
     incarnation: Option<u64>,
-    queue_depth: usize,
-    queue_bytes: usize,
     reconnects: u64,
-    bytes_sent: u64,
-    bytes_received: u64,
+    control_requests: u64,
+    bulk_requests: u64,
+    control_bytes_sent: u64,
+    control_bytes_received: u64,
+    bulk_bytes_sent: u64,
+    bulk_bytes_received: u64,
+    rtt_ms: Option<u64>,
+    active_streams: u64,
+}
+
+/// Immutable sidecar replication diagnostics.
+#[derive(Debug, Clone, Serialize)]
+struct SidecarDto {
+    bulk_bytes_sent: u64,
+    bulk_bytes_received: u64,
+    manifest_requests: u64,
+    chunk_requests: u64,
+    cache_hits: u64,
+    cache_misses: u64,
+    deduped_bytes: u64,
+    bulk_errors: u64,
+    verification_failures: u64,
+    pending_gated: u64,
+    inflight: u64,
 }
 
 fn tablet_dto(status: &NodeStatus) -> TabletDto {
@@ -868,10 +1486,22 @@ async fn health() -> Json<serde_json::Value> {
 
 async fn ready(State(shared): State<ClusterShared>) -> Json<serde_json::Value> {
     let status = shared.node.status().await;
+    // Deliberate readiness: process alive is not enough. A cluster node is
+    // usable once its peer transport started, its replica initialized with
+    // loaded membership, and its health latch is clear. `leader_known`
+    // distinguishes election-in-flight (still routable via redirects once
+    // a leader emerges) from a ready serving replica.
+    let leader_known = status.leader.is_some();
     Json(serde_json::json!({
         "ready": status.healthy,
+        "initialized": true,
+        "transport": true,
+        "membership_loaded": true,
+        "leader_known": leader_known,
+        "election_pending": !leader_known,
         "role": status.role.to_string(),
         "leader": status.leader.map(|leader| leader.node().as_u64()),
+        "healthy": status.healthy,
     }))
 }
 
@@ -883,7 +1513,11 @@ async fn node_info(State(shared): State<ClusterShared>) -> Json<serde_json::Valu
         "namespace": shared.namespace.as_u64(),
         "tablet": shared.tablet.as_u64(),
         "mode": "replicated",
+        "cluster_mode": "replicated",
+        "peer": shared.node.peer_addr().to_string(),
         "native": shared.native.to_string(),
+        "client_endpoint": shared.native.to_string(),
+        "peer_endpoint": shared.node.peer_addr().to_string(),
     }))
 }
 
@@ -898,18 +1532,99 @@ async fn peers(State(shared): State<ClusterShared>) -> Json<Vec<PeerDto>> {
         .iter()
         .map(|(node, stats)| PeerDto {
             node: node.as_u64(),
-            connected: stats.connected,
+            connected_control: stats.connected_control,
+            connected_bulk: stats.connected_bulk,
             suspended: stats.suspended,
             incarnation: stats.incarnation,
-            queue_depth: stats.queue_depth,
-            queue_bytes: stats.queue_bytes,
             reconnects: stats.reconnects,
-            bytes_sent: stats.bytes_sent,
-            bytes_received: stats.bytes_received,
+            control_requests: stats.control_requests,
+            bulk_requests: stats.bulk_requests,
+            control_bytes_sent: stats.control_bytes_sent,
+            control_bytes_received: stats.control_bytes_received,
+            bulk_bytes_sent: stats.bulk_bytes_sent,
+            bulk_bytes_received: stats.bulk_bytes_received,
+            rtt_ms: stats.rtt_ms,
+            active_streams: stats.active_streams,
         })
         .collect();
     out.sort_by_key(|peer| peer.node);
     Json(out)
+}
+
+async fn sidecar(State(shared): State<ClusterShared>) -> Json<SidecarDto> {
+    let status = shared.node.status().await;
+    Json(SidecarDto {
+        bulk_bytes_sent: status.sidecar.bulk_bytes_sent,
+        bulk_bytes_received: status.sidecar.bulk_bytes_received,
+        manifest_requests: status.sidecar.manifest_requests,
+        chunk_requests: status.sidecar.chunk_requests,
+        cache_hits: status.sidecar.cache_hits,
+        cache_misses: status.sidecar.cache_misses,
+        deduped_bytes: status.sidecar.deduped_bytes,
+        bulk_errors: status.sidecar.bulk_errors,
+        verification_failures: status.sidecar.verification_failures,
+        pending_gated: status.sidecar.pending_gated,
+        inflight: status.sidecar.inflight,
+    })
+}
+
+/// Suspends one peer link (partition test hook and drain tooling).
+/// Body: `{ "node": <u64> }`. Bounded: the transport drops the link and
+/// backs off with bounded reconnects; the peer is NOT removed from
+/// membership, so healing via `/v1/peers/resume` restores replication.
+async fn suspend_peer(
+    State(shared): State<ClusterShared>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(node) = body.get("node").and_then(serde_json::Value::as_u64) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "body must be {\"node\": <u64>}" })),
+        );
+    };
+    if node == 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "node id 0 is reserved" })),
+        );
+    }
+    shared.node.suspend_peer(NodeId::from_u64(node)).await;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "suspended": node })),
+    )
+}
+
+/// Resumes a suspended peer link.
+async fn resume_peer(
+    State(shared): State<ClusterShared>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(node) = body.get("node").and_then(serde_json::Value::as_u64) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "body must be {\"node\": <u64>}" })),
+        );
+    };
+    shared.node.resume_peer(NodeId::from_u64(node)).await;
+    (StatusCode::OK, Json(serde_json::json!({ "resumed": node })))
+}
+
+/// Seals a checkpoint snapshot and purges the Raft log through its base.
+/// Used by operators and the lab harness to force snapshot catch-up:
+/// a lagging follower behind the purge point recovers via snapshot
+/// install, then resumes log replication.
+async fn snapshot(State(shared): State<ClusterShared>) -> (StatusCode, Json<serde_json::Value>) {
+    match shared.node.snapshot_and_purge().await {
+        Ok(base) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "snapshot": base.get() })),
+        ),
+        Err(reason) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": reason })),
+        ),
+    }
 }
 
 /// Serves the cluster admin plane until aborted.
@@ -920,6 +1635,10 @@ async fn serve_admin(listener: tokio::net::TcpListener, shared: ClusterShared) {
         .route("/v1/node", get(node_info))
         .route("/v1/tablet", get(tablet))
         .route("/v1/peers", get(peers))
+        .route("/v1/sidecar", get(sidecar))
+        .route("/v1/peers/suspend", post(suspend_peer))
+        .route("/v1/peers/resume", post(resume_peer))
+        .route("/v1/snapshot", post(snapshot))
         .layer(
             tower::ServiceBuilder::new()
                 .layer(TraceLayer::new_for_http())

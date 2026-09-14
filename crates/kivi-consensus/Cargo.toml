@@ -10,6 +10,8 @@ kivi-state.workspace = true
 kivi-codec.workspace = true
 kivi-durability.workspace = true
 kivi-protocol.workspace = true
+kivi-chunk.workspace = true
+tracing.workspace = true
 bytes.workspace = true
 crc32c.workspace = true
 # Pinned OpenRaft 0.10 pre-release (see crate docs for the selection record).
@@ -31,6 +33,9 @@ compio.workspace = true
 futures.workspace = true
 async-channel.workspace = true
 thiserror.workspace = true
+http.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
 
 [dev-dependencies]
 # Density-experiment measurement only (examples/density.rs). Never ships in

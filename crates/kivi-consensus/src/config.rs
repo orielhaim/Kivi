@@ -76,7 +76,7 @@ openraft::declare_raft_types!(
 );
 
 /// Production Raft config for one replicated tablet group: election and
-/// heartbeat timeouts shaped for commodity TCP and loaded CI boxes
+/// heartbeat timeouts shaped for commodity networks and loaded CI boxes
 /// (multi-second failure detection without flapping under parallel test
 /// load). Snapshots stay enabled (the state machine seals them; purge
 /// follows the snapshot base).

@@ -174,6 +174,27 @@ struct Args {
     /// Native client listen address in cluster mode (`:0` ephemeral).
     #[arg(long, default_value = "127.0.0.1:9000")]
     pub(crate) cluster_native: SocketAddr,
+    /// Static peer TLS certificates `node=path/to/cert.der,...` for
+    /// cluster mode (each file the peer's DER certificate as printed by
+    /// `print-peer-cert`). Absent means `KIVI_INSECURE_PEER_TLS=1` must be
+    /// set (lab tests only, never production).
+    #[arg(long, value_delimiter = ',', value_parser = parse_node_cert_path)]
+    pub(crate) cluster_peer_certs: Vec<(u64, PathBuf)>,
+}
+
+/// Parses one `node=path/to/cert.der` peer certificate mapping.
+fn parse_node_cert_path(spec: &str) -> Result<(u64, PathBuf), String> {
+    let (node, path) = spec
+        .split_once('=')
+        .ok_or_else(|| format!("peer cert mapping must be node=path, got {spec:?}"))?;
+    let node: u64 = node
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid node id in {spec:?}"))?;
+    if node == 0 {
+        return Err(format!("node id 0 is reserved, got {spec:?}"));
+    }
+    Ok((node, PathBuf::from(path.trim())))
 }
 
 /// Parses one `node=host:port` endpoint mapping.
@@ -417,6 +438,58 @@ fn open_durability(
     }
 }
 
+/// Coherent startup modes: exactly one is active per process. The CLI
+/// exposes many flags, but only one of these states is valid; contradictory
+/// combinations fail loudly before any listener binds or state recovers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StartupMode {
+    /// Pure in-memory single node (benchmarks, development).
+    EphemeralSingle,
+    /// Crash-recoverable single node.
+    DurableSingle,
+    /// Replicated cluster member (one tablet group, peer mesh).
+    Cluster,
+}
+
+/// Resolves the startup mode and rejects contradictory flag combinations
+/// early (before locks, recovery, or binds).
+fn startup_mode(args: &Args) -> anyhow::Result<StartupMode> {
+    if args.cluster_mode {
+        if args.ephemeral {
+            anyhow::bail!("--cluster-mode and --ephemeral are mutually exclusive");
+        }
+        if args.data_dir.is_none() {
+            anyhow::bail!("cluster mode requires --data-dir <path>");
+        }
+        if args.cluster_id.is_none() {
+            anyhow::bail!("cluster mode requires --cluster-id <u128>");
+        }
+        if args.node_id.is_none() {
+            anyhow::bail!("cluster mode requires --node-id <u64>");
+        }
+        if args.workers != 2 {
+            tracing::warn!(
+                workers = args.workers,
+                "cluster mode ignores --workers (one replica per process)"
+            );
+        }
+        if args.tablets != 1 {
+            tracing::warn!(
+                tablets = args.tablets,
+                "cluster mode ignores --tablets (one replicated tablet)"
+            );
+        }
+        return Ok(StartupMode::Cluster);
+    }
+    match (&args.ephemeral, &args.data_dir) {
+        (true, None) => Ok(StartupMode::EphemeralSingle),
+        (false, Some(_)) => Ok(StartupMode::DurableSingle),
+        _ => anyhow::bail!(
+            "choose exactly one durability mode: --ephemeral (in-memory) or --data-dir <path> (crash-recoverable)"
+        ),
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -427,8 +500,9 @@ fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     // Replicated cluster mode bypasses the single-node engine entirely:
     // one tablet group, peer mesh, native/admin/RESP edges on Tokio.
-    if args.cluster_mode {
-        return cluster::run_from_args(&args);
+    match startup_mode(&args)? {
+        StartupMode::Cluster => return cluster::run_from_args(&args),
+        StartupMode::EphemeralSingle | StartupMode::DurableSingle => {}
     }
     if args.workers == 0 {
         anyhow::bail!("workers must be nonzero");

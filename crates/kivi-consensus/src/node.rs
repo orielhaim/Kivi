@@ -35,29 +35,31 @@
 //!
 //! ```text
 //! client mutation
-//!     ↓ gate unsupported semantics (explicit capability error)
-//! leader dedup check (read-only; retries answer from any replica)
+//!     ↓ leader dedup check (read-only; retries answer from any replica)
+//!     ↓ sidecar gate (chunked roots verified durable; chunked-base
+//!       range patches restaged reusing untouched chunk ids)
 //!     ↓ prepare deterministic MutationIR + expected outcome
-//! OpenRaft client_write (quorum durable commit)
+//! OpenRaft client_write (quorum durable commit; followers gate the
+//! flush on sidecar durability)
 //!     ↓ state-machine apply + verification (every replica)
 //! dedup outcome available
 //!     ↓ reply
 //! ```
 //!
 //! The Raft log is authoritative in replicated mode: no single-node
-//! mutation WAL entry is appended alongside it (no double-logging).
+//! mutation WAL entry is appended alongside it (no double-logging). Large
+//! values replicate as tiny `ReplaceChunkedRoot` mutations plus immutable
+//! bulk sidecars (see [`crate::sidecar`] and [`crate::gate`]).
 //!
 //! ## Supported operations
 //!
 //! The small/state-local semantic set replicates: inline `SET`, `DELETE`,
 //! `EXISTS`/reads, conditional `SET` (materialized at prepare),
 //! `COUNTER_ADD`, expiry mutations, `PERSIST`, and `SETRANGE` against
-//! inline bases. Anything needing external chunk sidecars
-//! ([`Operation::SetChunked`] and
-//! friends, `SETRANGE` against a chunked base) is rejected with
-//! [`ProposeError::Unsupported`] — an explicit capability error, never an
-//! unsafe fallback. Large/chunked root replication belongs to the next
-//! stage.
+//! inline bases. Large values replicate as [`Operation::SetChunked`] and
+//! friends once staged durably locally; `SETRANGE` against a chunked base
+//! restages here (untouched chunks reuse via content addressing) and
+//! followers fetch only missing sidecars before acknowledging.
 //!
 //! ## Leader-only writes
 //!
@@ -102,9 +104,14 @@ use openraft::type_config::async_runtime::watch::WatchReceiver as _;
 
 use crate::cluster::{Bootstrap, ClusterTopology, DurableClusterView, classify_bootstrap};
 use crate::config::{KiviTypeConfig, cluster_config};
+use crate::gate::SidecarGate;
 use crate::mutation::ReplicatedMutation;
-use crate::peer::{PeerRequest, PeerResponse, PeerRpcError, PeerSnapshotRequest};
+use crate::peer::{
+    PeerChunkResponse, PeerManifestResponse, PeerRequest, PeerResponse, PeerRpcError,
+    PeerSnapshotRequest,
+};
 use crate::router::{GroupNetworkFactory, PeerRouter, decode_snapshot_meta, serve_peer_request};
+use crate::sidecar::SidecarStore;
 use crate::state_machine::{ProposalGate, ReplicatedStateMachine};
 use crate::store::DurableRaftStore;
 use crate::transport::{PeerHandler, PeerStats, PeerTransport, TransportConfig};
@@ -145,10 +152,16 @@ pub struct NodeConfig {
     pub segment_target_bytes: u64,
     /// Peer transport tuning.
     pub transport: TransportConfig,
-    /// Pre-bound peer listener (race-free port discovery for tests and
-    /// harnesses: bind first, then open with the complete topology).
-    /// `None` binds the topology's peer endpoint verbatim.
-    pub peer_listener: Option<std::net::TcpListener>,
+    /// Expected peer certificates (trust anchors) by node for QUIC/TLS
+    /// verification. Every other member must be present; the transport
+    /// refuses to open otherwise. Empty with `insecure_peer_tls` (lab
+    /// only) or when no peers are configured yet.
+    pub peer_certs: HashMap<NodeId, Vec<u8>>,
+    /// Test-only escape hatch for `kivi-lab` (ephemeral ports and fresh
+    /// data directories per run make static pins impractical there).
+    /// Never set in production: without verification any network peer
+    /// could impersonate a member.
+    pub insecure_peer_tls: bool,
 }
 
 /// Why a replicated node could not open.
@@ -194,6 +207,18 @@ pub enum NodeOpenError {
     /// `OpenRaft` membership installation failed on first formation.
     #[error("group initialization failed: {reason}")]
     Initialize {
+        /// Human-readable cause.
+        reason: String,
+    },
+    /// Immutable sidecar store failed to open.
+    #[error("sidecar store failed: {reason}")]
+    Sidecar {
+        /// Human-readable cause.
+        reason: String,
+    },
+    /// Peer TLS identity failed to load or generate.
+    #[error("peer TLS failed: {reason}")]
+    Tls {
         /// Human-readable cause.
         reason: String,
     },
@@ -308,6 +333,8 @@ pub struct NodeStatus {
     pub detail: Option<String>,
     /// Per-peer connection diagnostics.
     pub peers: HashMap<NodeId, PeerStats>,
+    /// Immutable sidecar replication diagnostics.
+    pub sidecar: crate::sidecar::SidecarMetricsSnapshot,
 }
 
 type Reply<T> = futures::channel::oneshot::Sender<T>;
@@ -386,6 +413,7 @@ pub struct ReplicatedNode {
     /// reads go through the owner; this never touches the lane).
     #[allow(dead_code)]
     store: DurableRaftStore,
+    sidecar: SidecarStore,
     owner_tx: async_channel::Sender<OwnerRequest>,
     owner_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     peer_addr: std::net::SocketAddr,
@@ -421,12 +449,15 @@ impl ReplicatedNode {
 }
 
 /// Everything recovery establishes before the owner thread starts:
-/// validated topology, directory identity, durable log and state, and
-/// the dial/membership maps.
+/// validated topology, directory identity, durable log and state,
+/// immutable sidecar store, peer TLS identity, and the dial/membership
+/// maps.
 struct RecoveredParts {
     opened: kivi_durability::OpenDir,
     store: DurableRaftStore,
     machine: ReplicatedStateMachine,
+    sidecar: SidecarStore,
+    tls: crate::transport::TlsMaterial,
     voters: std::collections::BTreeSet<u64>,
     peer_addrs: std::collections::BTreeMap<u64, String>,
     peers: HashMap<NodeId, std::net::SocketAddr>,
@@ -438,6 +469,8 @@ struct RecoveredParts {
 struct OwnerParams {
     store: DurableRaftStore,
     machine: ReplicatedStateMachine,
+    sidecar: SidecarStore,
+    tls: crate::transport::TlsMaterial,
     topology: ClusterTopology,
     transport_config: TransportConfig,
     peer_identity: crate::peer::PeerIdentity,
@@ -447,7 +480,7 @@ struct OwnerParams {
     local: NodeId,
     group: ConsensusGroupId,
     tablet: TabletId,
-    peer_listener: Option<std::net::TcpListener>,
+    namespace: NamespaceId,
     serve_tx: async_channel::Sender<OwnerRequest>,
     requests: async_channel::Receiver<OwnerRequest>,
     ready: futures::channel::oneshot::Sender<Result<std::net::SocketAddr, NodeOpenError>>,
@@ -461,6 +494,7 @@ struct OwnerParams {
 /// # Errors
 ///
 /// Returns [`NodeOpenError`] on topology, identity, or storage failures.
+#[allow(clippy::too_many_lines)]
 fn open_recovered_parts(config: &NodeConfig) -> Result<RecoveredParts, NodeOpenError> {
     use NodeOpenError as Fault;
     config
@@ -525,6 +559,17 @@ fn open_recovered_parts(config: &NodeConfig) -> Result<RecoveredParts, NodeOpenE
     .map_err(|error| Fault::StateMachine {
         reason: error.to_string(),
     })?;
+    // Immutable sidecar store: content-addressed chunks + manifests under
+    // `<data_dir>/sidecar`, one lane, namespace-derived domain. Recovery
+    // replays packs; startup verification (applied roots resolvable)
+    // happens after the owner starts serving.
+    let domain = kivi_types::SecurityDomainId::from_u64(config.namespace.as_u64());
+    let (sidecar, _sidecar_thread) =
+        SidecarStore::open(&config.data_dir, domain, 256 * 1024 * 1024).map_err(|error| {
+            Fault::Sidecar {
+                reason: error.to_string(),
+            }
+        })?;
     let (voters, peer_addrs) = config
         .topology
         .membership_for(config.tablet)
@@ -537,10 +582,23 @@ fn open_recovered_parts(config: &NodeConfig) -> Result<RecoveredParts, NodeOpenE
         .iter()
         .map(|descriptor| (descriptor.node, descriptor.peer))
         .collect();
+    // Peer TLS identity: this node's certificate (generated on first
+    // open) plus the pinned peer certificates from static config.
+    let peer_tls_cert = crate::tls::NodeCert::load_or_generate(&config.data_dir, opened.meta.node)
+        .map_err(|error| Fault::Tls {
+            reason: error.to_string(),
+        })?;
+    let tls = crate::transport::TlsMaterial {
+        cert: peer_tls_cert,
+        peer_certs: config.peer_certs.clone(),
+        insecure_skip_verify: config.insecure_peer_tls,
+    };
     Ok(RecoveredParts {
         opened,
         store,
         machine,
+        sidecar,
+        tls,
         voters,
         peer_addrs,
         peers,
@@ -562,18 +620,20 @@ impl ReplicatedNode {
     /// bootstrap failures. Restarting with conflicting durable
     /// identity/membership fails loudly; a fresh directory forms the
     /// group exactly once.
-    pub async fn open(mut config: NodeConfig) -> Result<Self, NodeOpenError> {
+    pub async fn open(config: NodeConfig) -> Result<Self, NodeOpenError> {
         use NodeOpenError as Fault;
         let RecoveredParts {
             opened,
             store,
             machine,
+            sidecar,
+            tls,
             voters,
             peer_addrs,
             peers,
             group,
         } = open_recovered_parts(&config)?;
-        // Paused mesh: no handshake completes before every member of a
+        // Paused mesh: no H3 request serves before every member of a
         // fresh formation installed membership (static-bootstrap race
         // discipline: a premature granted vote would refuse our own
         // `initialize` as `NotAllowed`).
@@ -588,10 +648,11 @@ impl ReplicatedNode {
         let (ready_tx, ready_rx) =
             futures::channel::oneshot::channel::<Result<std::net::SocketAddr, NodeOpenError>>();
         let router_tx = owner_tx.clone();
-        let peer_listener = config.peer_listener.take();
         let owner_params = OwnerParams {
             store: store.clone(),
             machine: machine.clone(),
+            sidecar: sidecar.clone(),
+            tls,
             topology: config.topology.clone(),
             transport_config,
             peer_identity,
@@ -601,7 +662,7 @@ impl ReplicatedNode {
             local: opened.meta.node,
             group,
             tablet: config.tablet,
-            peer_listener,
+            namespace: config.namespace,
             serve_tx: router_tx,
             requests: owner_rx,
             ready: ready_tx,
@@ -610,9 +671,35 @@ impl ReplicatedNode {
         let peer_addr = ready_rx.await.map_err(|_| Fault::Owner {
             reason: "consensus owner died during startup".to_owned(),
         })??;
+        // Startup verification: every applied chunked root must resolve
+        // locally before serving reads. Missing sidecars poison the replica
+        // (reads fail closed, readiness reflects unhealthy) rather than
+        // serving incomplete state; repair arrives via sidecar fetch or a
+        // snapshot install carrying the missing bulk (which heals health).
+        // Never blocks startup waiting for peers.
+        for (manifest, logical_len) in machine.chunked_roots().await {
+            match sidecar.check_root(manifest, logical_len).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    machine
+                        .mark_unhealthy(format!(
+                            "applied root {manifest} references missing sidecars; repair required"
+                        ))
+                        .await;
+                    break;
+                }
+                Err(error) => {
+                    machine
+                        .mark_unhealthy(format!("sidecar check failed: {error}"))
+                        .await;
+                    break;
+                }
+            }
+        }
         Ok(Self {
             machine,
             store: store.clone(),
+            sidecar: sidecar.clone(),
             owner_tx,
             owner_thread: Mutex::new(Some(thread)),
             peer_addr,
@@ -652,6 +739,22 @@ impl ReplicatedNode {
         &self.data_dir
     }
 
+    /// Returns the immutable sidecar store (leader staging, read serving,
+    /// admin diagnostics). Cloneable; the blocking worker thread is shared.
+    #[must_use]
+    pub fn sidecar(&self) -> &SidecarStore {
+        &self.sidecar
+    }
+
+    /// Ensures proposal sidecars (see [`ensure_proposal_sidecars_for`]).
+    async fn ensure_proposal_sidecars(
+        &self,
+        op: &Operation,
+        now: UnixMicros,
+    ) -> Result<Option<Operation>, ProposeError> {
+        ensure_proposal_sidecars_for(&self.sidecar, &self.machine, op, now).await
+    }
+
     /// Sends one owner request and awaits its reply. A closed queue or a
     /// dropped reply means the owner is gone: `ShuttingDown`, never a
     /// hang.
@@ -687,12 +790,9 @@ impl ReplicatedNode {
         now: UnixMicros,
     ) -> Result<ProposeOutcome, ProposeError> {
         use kivi_state::StorePrepared;
-        // Stage-1 semantic capability boundary: chunk sidecars do not
-        // replicate yet. Inline `SetRange` is fine; a chunked base would
-        // fail apply loudly, so it fails here explicitly instead.
-        gate_unsupported(op, &self.machine, now).await?;
         // Leader dedup check first: retries answer from any replica's
-        // retained state without proposing (lost-response failover).
+        // retained state without proposing (lost-response failover). This
+        // precedes sidecar work so a retry never stages a second root.
         if let Some(marker) = identity {
             match self
                 .machine
@@ -711,8 +811,15 @@ impl ReplicatedNode {
                 ProposalGate::Overloaded => return Err(ProposeError::Overloaded),
             }
         }
+        // Sidecar gate: chunked roots must already be durable locally
+        // (cluster server stages before proposing); chunked-base range
+        // patches restage here reusing untouched chunk ids via content
+        // addressing. Returns a restaged operation when the input cannot
+        // prepare directly.
+        let restaged = self.ensure_proposal_sidecars(op, now).await?;
+        let effective = restaged.as_ref().unwrap_or(op);
         // Deterministic prepare against current state (read-only).
-        let prepared = self.machine.prepare_operation(op, now).await?;
+        let prepared = self.machine.prepare_operation(effective, now).await?;
         let (mutation, expected) = match prepared {
             StorePrepared::Read(outcome) => return Ok(ProposeOutcome::Read { outcome }),
             StorePrepared::Terminal(outcome) => {
@@ -844,6 +951,7 @@ impl ReplicatedNode {
                 healthy: false,
                 detail: Some("consensus owner shut down".to_owned()),
                 peers: HashMap::new(),
+                sidecar: self.sidecar.metrics().snapshot(),
             })
     }
 
@@ -934,6 +1042,8 @@ fn spawn_owner_thread(
             let OwnerParams {
                 store,
                 machine,
+                sidecar,
+                tls,
                 topology,
                 transport_config,
                 peer_identity,
@@ -943,7 +1053,7 @@ fn spawn_owner_thread(
                 local,
                 group,
                 tablet,
-                peer_listener,
+                namespace,
                 serve_tx,
                 requests,
                 ready,
@@ -960,6 +1070,8 @@ fn spawn_owner_thread(
             runtime.block_on(owner_main(OwnerMain {
                 store,
                 machine,
+                sidecar,
+                tls,
                 topology,
                 transport_config,
                 peer_identity,
@@ -969,7 +1081,7 @@ fn spawn_owner_thread(
                 local,
                 group,
                 tablet,
-                peer_listener,
+                namespace,
                 serve_tx,
                 requests,
                 ready,
@@ -991,11 +1103,13 @@ type OwnerRaft = openraft::Raft<KiviTypeConfig, ReplicatedStateMachine>;
 /// membership, starts the mesh, signals readiness, then serves the
 /// request loop until `Shutdown`. Runs inside the node's Compio reactor;
 /// every `.await` here may drive `!Send` Raft futures.
+#[allow(clippy::too_many_lines)]
 async fn owner_main(params: OwnerMain) {
-    use NodeOpenError as Fault;
     let OwnerMain {
         mut store,
         machine,
+        sidecar,
+        tls,
         topology,
         transport_config,
         peer_identity,
@@ -1005,37 +1119,54 @@ async fn owner_main(params: OwnerMain) {
         local,
         group,
         tablet,
-        peer_listener,
+        namespace,
         serve_tx,
         requests,
         ready,
     } = params;
-    // Bind: pre-bound test listener or the topology endpoint verbatim.
-    let listener = match peer_listener {
-        Some(std_listener) => match compio::net::TcpListener::from_std(std_listener) {
-            Ok(listener) => listener,
-            Err(error) => {
-                let _ = ready.send(Err(Fault::Transport {
-                    reason: format!("peer listener adopt failed: {error}"),
-                }));
-                return;
-            }
-        },
-        None => match bind_peer(&peers, local).await {
-            Ok(listener) => listener,
-            Err(error) => {
-                let _ = ready.send(Err(error));
-                return;
-            }
-        },
-    };
-    let started = open_mesh(transport_config, peer_identity, &peers, listener, serve_tx);
+    // Mesh: one UDP endpoint bound to the topology's peer address; QUIC
+    // handshake plus H3 streams replace the old TCP listener/accept pump.
+    // A bind conflict fails loudly so the harness retries formation.
+    let bulk_timeout = transport_config.bulk_timeout;
+    let started = open_mesh(
+        transport_config,
+        peer_identity,
+        peer_identity.cluster,
+        &peers,
+        tls,
+        serve_tx,
+    )
+    .await;
     let (transport, peer_addr) = match started {
         Ok(started) => started,
         Err(error) => {
             let _ = ready.send(Err(error));
             return;
         }
+    };
+    // Sidecar durability gate: other replicas are candidate sources
+    // (leader-first at fetch time via the entry's leader hint). The gate
+    // is installed on the log store before Raft spawns so no append can
+    // report durable persistence without its sidecars. A clone serves
+    // snapshot installs on the owner thread (same deduplicating fetch).
+    let gate = {
+        let domain = kivi_types::SecurityDomainId::from_u64(namespace.as_u64());
+        let mut sources: Vec<NodeId> = peers
+            .keys()
+            .copied()
+            .filter(|peer| *peer != local)
+            .collect();
+        sources.sort_by_key(|peer| peer.as_u64());
+        let gate = SidecarGate::new(
+            sidecar.clone(),
+            transport.clone(),
+            sources,
+            group,
+            domain,
+            bulk_timeout,
+        );
+        store.set_gate(gate.clone());
+        gate
     };
     let router = PeerRouter::new(transport.clone());
     let raft = match spawn_raft(local, group, router, &store, &machine).await {
@@ -1076,8 +1207,12 @@ async fn owner_main(params: OwnerMain) {
             raft: raft.clone(),
             store,
             machine,
+            sidecar,
+            gate,
             transport: transport.clone(),
             group,
+            namespace,
+            tablet,
             transfers: Rc::new(RefCell::new(HashMap::new())),
         },
         raft,
@@ -1118,27 +1253,36 @@ async fn spawn_raft(
     })
 }
 
-/// Opens the peer mesh on an adopted or freshly bound listener (the
-/// fallible mesh half of [`owner_main`], extracted so the main flow
-/// stays readable). Synchronous: binding is the caller's job, this only
-/// spawns tasks, so callers must already run on a Compio reactor.
+/// Opens the QUIC/H3 peer mesh (the fallible mesh half of
+/// [`owner_main`], extracted so the main flow stays readable). Binds one
+/// UDP endpoint and spawns dial/serve tasks; callers must already run on
+/// a Compio reactor.
 ///
 /// # Errors
 ///
 /// Returns [`NodeOpenError`] when the mesh refuses to open.
-fn open_mesh(
+async fn open_mesh(
     transport_config: TransportConfig,
     peer_identity: crate::peer::PeerIdentity,
+    cluster: ClusterId,
     peers: &HashMap<NodeId, std::net::SocketAddr>,
-    listener: compio::net::TcpListener,
+    tls: crate::transport::TlsMaterial,
     serve_tx: async_channel::Sender<OwnerRequest>,
 ) -> Result<(PeerTransport, std::net::SocketAddr), NodeOpenError> {
     use NodeOpenError as Fault;
     let handler: Arc<dyn PeerHandler> = Arc::new(ServeRouter { tx: serve_tx });
-    PeerTransport::open_with_listener(transport_config, peer_identity, peers, handler, listener)
-        .map_err(|error| Fault::Transport {
-            reason: error.to_string(),
-        })
+    PeerTransport::open(
+        transport_config,
+        peer_identity,
+        cluster,
+        peers,
+        tls,
+        handler,
+    )
+    .await
+    .map_err(|error| Fault::Transport {
+        reason: error.to_string(),
+    })
 }
 
 /// Serves the owner request loop until `Shutdown`, then stops Raft and
@@ -1173,10 +1317,13 @@ async fn owner_serve_loop(
 }
 
 /// Owned state on the owner thread: the `!Send` Raft handle, its
-/// storage, the shared mesh, and the snapshot reassembly state.
+/// storage, sidecar store, peer TLS material, shared mesh, and snapshot
+/// reassembly state.
 struct OwnerMain {
     store: DurableRaftStore,
     machine: ReplicatedStateMachine,
+    sidecar: SidecarStore,
+    tls: crate::transport::TlsMaterial,
     topology: ClusterTopology,
     transport_config: TransportConfig,
     peer_identity: crate::peer::PeerIdentity,
@@ -1186,7 +1333,7 @@ struct OwnerMain {
     local: NodeId,
     group: ConsensusGroupId,
     tablet: TabletId,
-    peer_listener: Option<std::net::TcpListener>,
+    namespace: NamespaceId,
     serve_tx: async_channel::Sender<OwnerRequest>,
     requests: async_channel::Receiver<OwnerRequest>,
     ready: futures::channel::oneshot::Sender<Result<std::net::SocketAddr, NodeOpenError>>,
@@ -1201,8 +1348,12 @@ struct OwnerCtx {
     raft: OwnerRaft,
     store: DurableRaftStore,
     machine: ReplicatedStateMachine,
+    sidecar: SidecarStore,
+    gate: SidecarGate,
     transport: PeerTransport,
     group: ConsensusGroupId,
+    namespace: NamespaceId,
+    tablet: TabletId,
     transfers: Rc<RefCell<HashMap<u64, PartialTransfer>>>,
 }
 
@@ -1387,6 +1538,19 @@ impl OwnerCtx {
         let (applied_id, _) = machine.applied_state().await.unwrap_or_default();
         let applied = applied_id.map_or(0, |id| id.index);
         let sm = self.machine.status().await;
+        let running_ok = metrics.running_state.is_ok();
+        let running_error = match &metrics.running_state {
+            Ok(()) => None,
+            Err(error) => Some(format!("raft halted: {error}")),
+        };
+        let detail = match (sm.last_error, running_error) {
+            (Some(sm_error), Some(raft_error)) => Some(format!("{sm_error}; {raft_error}")),
+            (Some(sm_error), None) => Some(sm_error),
+            (None, Some(raft_error)) => Some(raft_error),
+            (None, None) => None,
+        };
+        // Sidecar diagnostics are best-effort (never fail status).
+        let sidecar_metrics = self.sidecar.metrics().snapshot();
         NodeStatus {
             group: self.group,
             replica: ReplicaId::of_node(self.transport.local().node),
@@ -1399,21 +1563,31 @@ impl OwnerCtx {
             applied_commit: sm.applied_commit,
             snapshot: sm.snapshot_index.map(ConsensusLogIndex::new),
             purged: metrics.purged.map(|id| ConsensusLogIndex::new(id.index)),
-            healthy: sm.healthy && metrics.running_state.is_ok(),
-            detail: sm.last_error,
+            healthy: sm.healthy && running_ok,
+            detail,
             peers: self.transport.stats().await,
+            sidecar: sidecar_metrics,
         }
     }
 
     /// Serves one peer RPC for the owned group. Election/append/pre-vote
     /// go straight to Raft; snapshot fragments reassemble here and
-    /// install whole via `install_full_snapshot` once complete.
+    /// install whole via `install_full_snapshot` once complete; manifest
+    /// and chunk sidecars serve from the local sidecar store on the bulk
+    /// lane (content identity only, never pack offsets).
     async fn serve_rpc(
         &self,
         _from: NodeId,
         group: ConsensusGroupId,
         request: PeerRequest,
     ) -> Result<PeerResponse, PeerRpcError> {
+        // Sidecars are group-independent (content-addressed, domain-scoped)
+        // and decode with a zero tablet: serve before the group check.
+        match request {
+            PeerRequest::Manifest(request) => return self.serve_manifest(request).await,
+            PeerRequest::Chunk(request) => return self.serve_chunk(request).await,
+            _ => {}
+        }
         if group != self.group {
             return Err(PeerRpcError {
                 detail: format!("group {group} not served here"),
@@ -1423,6 +1597,56 @@ impl OwnerCtx {
             PeerRequest::Snapshot(fragment) => self.serve_fragment(fragment).await,
             other => serve_peer_request(&self.raft, other).await,
         }
+    }
+
+    /// Serves one manifest fetch from the local sidecar store.
+    async fn serve_manifest(
+        &self,
+        request: crate::peer::PeerManifestRequest,
+    ) -> Result<PeerResponse, PeerRpcError> {
+        let refused = |detail: String| PeerRpcError { detail };
+        let id = kivi_types::ManifestId::from_bytes(request.manifest);
+        if !id.is_valid() {
+            return Err(refused("zero manifest id".to_owned()));
+        }
+        let canonical = self
+            .sidecar
+            .read_manifest(id)
+            .await
+            .map_err(|error| refused(format!("manifest {id} unavailable: {error}")))?;
+        self.sidecar
+            .metrics()
+            .bulk_bytes_sent
+            .fetch_add(canonical.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(PeerResponse::Manifest(PeerManifestResponse {
+            manifest: request.manifest,
+            canonical,
+        }))
+    }
+
+    /// Serves one chunk fetch from the local sidecar store.
+    async fn serve_chunk(
+        &self,
+        request: crate::peer::PeerChunkRequest,
+    ) -> Result<PeerResponse, PeerRpcError> {
+        let refused = |detail: String| PeerRpcError { detail };
+        let id = kivi_types::ChunkId::from_bytes(request.chunk);
+        if !id.is_valid() {
+            return Err(refused("zero chunk id".to_owned()));
+        }
+        let bytes = self
+            .sidecar
+            .read_chunk(id)
+            .await
+            .map_err(|error| refused(format!("chunk {id} unavailable: {error}")))?;
+        self.sidecar
+            .metrics()
+            .bulk_bytes_sent
+            .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(PeerResponse::Chunk(PeerChunkResponse {
+            chunk: request.chunk,
+            bytes,
+        }))
     }
 
     /// Buffers one snapshot fragment; on `done`, validates and installs
@@ -1526,6 +1750,28 @@ impl OwnerCtx {
                 return Err(refused(
                     "snapshot contradicts locally committed history".to_owned(),
                 ));
+            }
+        }
+        // Differential sidecar catch-up: the snapshot body carries only
+        // manifest references; bulk bytes stay in chunk packs. Fetch only
+        // missing immutable objects before installing, so the install never
+        // lands a root it cannot reconstruct. Transfer is content-addressed:
+        // a follower holding 95% of chunks downloads only the missing 5%.
+        if let Ok(decoded) = crate::state_machine::ReplicatedTablet::decode_snapshot(
+            &partial.bytes,
+            self.namespace,
+            self.tablet,
+        ) {
+            let leader_hint = Some(NodeId::from_u64(partial.vote.leader_id.node_id));
+            for (_key, object) in &decoded.objects {
+                if let kivi_state::LogicalValue::Chunked(chunked) = object.value() {
+                    self.gate
+                        .ensure_root(chunked.manifest, chunked.logical_len, leader_hint)
+                        .await
+                        .map_err(|error| {
+                            refused(format!("snapshot sidecar unavailable: {error}"))
+                        })?;
+                }
             }
         }
         let snapshot = SnapshotOf::<KiviTypeConfig, std::io::Cursor<Vec<u8>>> {
@@ -1720,36 +1966,6 @@ async fn classify_from_store(
     classify_bootstrap(has_vote, has_log, has_snapshot)
 }
 
-/// Binds the peer listener for this node: the topology's peer endpoint,
-/// verbatim (operators own ports; tests use ephemeral ones). Runs on the
-/// owner thread (Compio bind).
-///
-/// # Errors
-///
-/// Returns [`NodeOpenError::Transport`] when the bind fails.
-async fn bind_peer(
-    peers: &HashMap<NodeId, std::net::SocketAddr>,
-    local: NodeId,
-) -> Result<compio::net::TcpListener, NodeOpenError> {
-    if let Some(addr) = peers.get(&local).copied() {
-        return bind_addr(addr).await;
-    }
-    bind_addr("127.0.0.1:0".parse().expect("loopback bind address parses")).await
-}
-
-/// Binds one peer listener address.
-///
-/// # Errors
-///
-/// Returns [`NodeOpenError::Transport`] when the bind fails.
-async fn bind_addr(addr: std::net::SocketAddr) -> Result<compio::net::TcpListener, NodeOpenError> {
-    compio::net::TcpListener::bind(addr)
-        .await
-        .map_err(|error| NodeOpenError::Transport {
-            reason: format!("peer listener bind failed: {error}"),
-        })
-}
-
 /// Maps a linearizable-read failure onto Kivi-owned routing errors: a
 /// named leader becomes a hint (falling back to the metrics view when
 /// the error itself is leaderless), quorum loss without a leader is
@@ -1810,40 +2026,156 @@ fn client_write_error(
     }
 }
 
-/// Stage-1 semantic capability gate: rejects operations needing
-/// unreplicated chunk sidecars before anything proposes. Inline
-/// `SetRange` is safe; a chunked base would fail apply loudly, so it
-/// fails here explicitly instead.
+/// Ensures proposal sidecars are durable before replication.
 ///
-/// # Errors
+/// * `SetChunked` / `SetConditionalChunked`: the referenced root must
+///   already be durable locally (cluster server stages before proposing).
+///   Missing sidecars fail closed as unavailable — the leader never
+///   proposes a root referencing volatile buffers.
+/// * `SetRange` against a chunked base: restages by reading the old value
+///   via the sidecar store, applying the patch (zero-pad gaps, Redis
+///   `SETRANGE` semantics), staging the new value (untouched chunk ids
+///   reuse via content addressing), and returning a restaged
+///   `SetConditionalChunked` preserving expiry (`Keep`). Followers fetch
+///   only missing chunks via the durability gate.
+/// * All other operations need no sidecars.
 ///
-/// Returns [`ProposeError::Unsupported`] for chunked roots and
-/// chunked-base range patches; [`ProposeError::Op`] never arises here
-/// (peeks are total).
-async fn gate_unsupported(
-    op: &Operation,
+/// Returns `Ok(None)` to proceed with `op`, `Ok(Some(restaged))` to
+/// proceed with a restaged operation instead.
+#[allow(clippy::too_many_lines)]
+async fn ensure_proposal_sidecars_for(
+    sidecar: &SidecarStore,
     machine: &ReplicatedStateMachine,
+    op: &Operation,
     now: UnixMicros,
-) -> Result<(), ProposeError> {
+) -> Result<Option<Operation>, ProposeError> {
     match op {
-        Operation::SetChunked { .. } | Operation::SetConditionalChunked { .. } => {
-            Err(ProposeError::Unsupported {
-                reason: "chunked roots do not replicate yet (bulk sidecar stage)".to_owned(),
-            })
+        Operation::SetChunked {
+            manifest,
+            logical_len,
+            ..
+        } => {
+            let durable = sidecar
+                .check_root(*manifest, *logical_len)
+                .await
+                .map_err(|error| {
+                    ProposeError::Consensus(ConsensusError::Unavailable {
+                        reason: format!("sidecar check failed: {error}"),
+                    })
+                })?;
+            if !durable {
+                return Err(ProposeError::Consensus(ConsensusError::Unavailable {
+                    reason: format!(
+                        "chunked root {manifest} not durable locally; stage before proposing"
+                    ),
+                }));
+            }
+            Ok(None)
         }
-        Operation::SetRange { key, .. } => {
+        Operation::SetConditionalChunked {
+            manifest,
+            logical_len,
+            ..
+        } => {
+            let durable = sidecar
+                .check_root(*manifest, *logical_len)
+                .await
+                .map_err(|error| {
+                    ProposeError::Consensus(ConsensusError::Unavailable {
+                        reason: format!("sidecar check failed: {error}"),
+                    })
+                })?;
+            if !durable {
+                return Err(ProposeError::Consensus(ConsensusError::Unavailable {
+                    reason: format!(
+                        "chunked root {manifest} not durable locally; stage before proposing"
+                    ),
+                }));
+            }
+            Ok(None)
+        }
+        Operation::SetRange { key, offset, patch } => {
             let base = machine.peek_base(key, now).await.map_err(|error| {
                 ProposeError::Consensus(ConsensusError::Unavailable { reason: error })
             })?;
-            if base == crate::state_machine::RangeBase::Chunked {
+            if base != crate::state_machine::RangeBase::Chunked {
+                return Ok(None);
+            }
+            // Chunked base: restage. Read the reference via a local Get,
+            // resolve bytes via the sidecar store, patch, stage anew.
+            let reference = machine
+                .read_local(&Operation::Get { key: key.clone() }, now)
+                .await
+                .map_err(|error| {
+                    ProposeError::Consensus(ConsensusError::Unavailable {
+                        reason: format!("chunked base unreadable: {error}"),
+                    })
+                })?;
+            let (manifest, logical_len) = match reference {
+                kivi_state::OperationResult::ChunkedValue {
+                    manifest,
+                    logical_len,
+                } => (manifest, logical_len),
+                kivi_state::OperationResult::Value(_) | kivi_state::OperationResult::Length(_) => {
+                    // Raced to inline between peek and read; proceed inline.
+                    return Ok(None);
+                }
+                other => {
+                    return Err(ProposeError::Consensus(ConsensusError::Unavailable {
+                        reason: format!("unexpected chunked base read: {other:?}"),
+                    }));
+                }
+            };
+            let old = sidecar
+                .read_value(manifest, logical_len)
+                .await
+                .map_err(|error| {
+                    ProposeError::Consensus(ConsensusError::Unavailable {
+                        reason: format!("chunked base bytes unreadable: {error}"),
+                    })
+                })?;
+            let patched = apply_range_patch(&old, *offset, patch).map_err(ProposeError::Op)?;
+            if patched.len() as u64 > kivi_chunk::policy::MAX_LEGACY_VALUE_BYTES {
                 return Err(ProposeError::Unsupported {
-                    reason: "range patch against a chunked base needs restaging".to_owned(),
+                    reason: "range result exceeds 64 MiB; rewrite through streaming upload"
+                        .to_owned(),
                 });
             }
-            Ok(())
+            let staged = sidecar.stage_value(&patched).await.map_err(|error| {
+                ProposeError::Consensus(ConsensusError::Unavailable {
+                    reason: format!("restage failed: {error}"),
+                })
+            })?;
+            Ok(Some(Operation::SetConditionalChunked {
+                key: key.clone(),
+                manifest: staged.manifest,
+                logical_len: staged.logical_len,
+                condition: kivi_state::SetCondition::Always,
+                expiry: kivi_state::ExpiryPolicy::Keep,
+            }))
         }
-        _ => Ok(()),
+        _ => Ok(None),
     }
+}
+
+/// Applies a Redis-`SETRANGE` patch: overwrites `[offset, offset+len)`
+/// zero-padding past-the-end gaps. Pure; mirrors `SpliceBytes` apply.
+fn apply_range_patch(
+    base: &[u8],
+    offset: u64,
+    patch: &bytes::Bytes,
+) -> Result<Vec<u8>, kivi_state::OpError> {
+    use kivi_state::OpError;
+    let offset = usize::try_from(offset).map_err(|_| OpError::StaleRangeBase)?;
+    let patch_len = patch.len();
+    let new_len = offset.saturating_add(patch_len).max(base.len());
+    if new_len as u64 > kivi_chunk::policy::MAX_LEGACY_VALUE_BYTES {
+        return Err(OpError::StaleRangeBase);
+    }
+    let mut out = vec![0u8; new_len];
+    out[..base.len()].copy_from_slice(base);
+    out[offset..offset + patch_len].copy_from_slice(patch);
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1919,13 +2251,13 @@ mod tests {
         }
     }
 
-    /// Opens one test node: scratch directory, static identity, optional
-    /// pre-bound listener (race-free ports) or topology-verbatim bind.
+    /// Opens one test node: scratch directory and static identity. QUIC
+    /// binds its UDP socket inside the owner thread, so no pre-bound
+    /// listener crosses the boundary (insecure test TLS: loopback only).
     async fn open_test_node(
         dir: &std::path::Path,
         id: u64,
         topology: &ClusterTopology,
-        listener: Option<std::net::TcpListener>,
     ) -> ReplicatedNode {
         ReplicatedNode::open(NodeConfig {
             data_dir: dir.to_owned(),
@@ -1936,40 +2268,30 @@ mod tests {
             topology: topology.clone(),
             segment_target_bytes: 1024 * 1024,
             transport: crate::transport::TransportConfig::default(),
-            peer_listener: listener,
+            peer_certs: std::collections::HashMap::new(),
+            insecure_peer_tls: true,
         })
         .await
         .expect("node opens")
     }
 
-    /// One test cluster: three nodes on loopback with race-free ports
-    /// (pre-bound std listeners moved into the nodes) and scratch data
-    /// directories. The topology (with the discovered ports) is
+    /// Probes one free loopback UDP port for the QUIC endpoint.
+    fn probe_udp() -> std::net::SocketAddr {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("probe binds");
+        socket.local_addr().expect("probe addr")
+    }
+
+    /// One test cluster: three nodes on loopback with probed ports and
+    /// scratch data directories. The topology (with the probed ports) is
     /// returned for restarts reusing the same addresses.
     async fn cluster() -> (Vec<ReplicatedNode>, Vec<tempfile::TempDir>, ClusterTopology) {
-        let mut listeners = Vec::new();
-        let mut addrs = Vec::new();
-        for _ in 0..3 {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
-            listener.set_nonblocking(true).expect("nonblocking");
-            addrs.push(listener.local_addr().expect("addr"));
-            listeners.push(listener);
-        }
+        let addrs = vec![probe_udp(), probe_udp(), probe_udp()];
         let topology = test_topology(&addrs);
         let mut nodes = Vec::new();
         let mut dirs = Vec::new();
-        let mut listeners = listeners.into_iter();
         for id in [1u64, 2, 3] {
             let dir = tempfile::tempdir().expect("scratch");
-            nodes.push(
-                open_test_node(
-                    dir.path(),
-                    id,
-                    &topology,
-                    Some(listeners.next().expect("listener")),
-                )
-                .await,
-            );
+            nodes.push(open_test_node(dir.path(), id, &topology).await);
             dirs.push(dir);
         }
         (nodes, dirs, topology)
@@ -1977,23 +2299,14 @@ mod tests {
 
     /// Restarts the node at `index` from its existing directory with the
     /// same topology (the bootstrap-existing path: no re-initialization).
-    /// The restarted node binds a fresh ephemeral peer port — verification
-    /// ignores addresses, and the mesh heals through its outbound dials —
-    /// so restarts never race the old listener's release.
+    /// UDP has no `TIME_WAIT`, so the restarted node rebinds its topology
+    /// port verbatim and the mesh heals through outbound dials.
     async fn restart(
         dirs: &[tempfile::TempDir],
         topology: &ClusterTopology,
         index: usize,
     ) -> ReplicatedNode {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
-        listener.set_nonblocking(true).expect("nonblocking");
-        open_test_node(
-            dirs[index].path(),
-            index as u64 + 1,
-            topology,
-            Some(listener),
-        )
-        .await
+        open_test_node(dirs[index].path(), index as u64 + 1, topology).await
     }
 
     /// Waits for exactly one agreed leader, then confirms it stays the
@@ -2080,7 +2393,7 @@ mod tests {
                     // A leader link has exactly one end at the leader.
                     let mine = index == leader;
                     let theirs = peer.as_u64() == leader as u64 + 1;
-                    if mine != theirs && stats.connected {
+                    if mine != theirs && (stats.connected_control || stats.connected_bulk) {
                         down = false;
                     }
                 }
@@ -2282,8 +2595,9 @@ mod tests {
                 weak,
                 OperationResult::Value(Some(bytes::Bytes::from_static(b"1")))
             );
-            // Chunk sidecars are an explicit capability error, not a silent
-            // fallback.
+            // Undurable chunked roots fail closed (never proposed): the
+            // leader stages sidecars before proposing, so a fake manifest
+            // is unavailable, never silently replicated.
             let error = nodes[leader]
                 .propose(
                     &Operation::SetChunked {
@@ -2296,8 +2610,14 @@ mod tests {
                     NOW,
                 )
                 .await
-                .expect_err("chunked roots unsupported");
-            assert!(matches!(error, ProposeError::Unsupported { .. }));
+                .expect_err("undurable chunked root must not propose");
+            assert!(
+                matches!(
+                    error,
+                    ProposeError::Consensus(ConsensusError::Unavailable { .. })
+                ),
+                "fake manifest fails as unavailable, got {error:?}"
+            );
             for node in &nodes {
                 node.shutdown().await;
             }
@@ -2647,10 +2967,14 @@ mod tests {
                 )
                 .await
                 .expect("post-purge write applies");
-            // Restart the leader from its directory: the purge record
+            // Restart the cluster from its directories: the purge record
             // replays, the snapshot base holds, and new writes succeed.
-            nodes[leader].shutdown().await;
+            // Every node shuts down first (dropping a live node would leak
+            // its owner thread and its bound peer port).
             let incarnation = nodes[leader].incarnation();
+            for node in &nodes {
+                node.shutdown().await;
+            }
             drop(nodes);
             let mut fresh = Vec::new();
             for (index, _dir) in dirs.iter().enumerate() {
