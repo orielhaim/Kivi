@@ -14,6 +14,8 @@ members = [
     "crates/kivi-durability",
     "crates/kivi-checkpoint",
     "crates/kivi-chunk",
+    "crates/kivi-resp",
+    "crates/kivi-lab",
 ]
 
 [workspace.package]
@@ -22,6 +24,8 @@ edition = "2024"
 rust-version = "1.98"
 
 [workspace.dependencies]
+kivi-lab = { path = "crates/kivi-lab", version = "0.1.0" }
+kivi-resp = { path = "crates/kivi-resp", version = "0.1.0" }
 kivi-types = { path = "crates/kivi-types", version = "0.1.0" }
 kivi-codec = { path = "crates/kivi-codec", version = "0.1.0" }
 kivi-core = { path = "crates/kivi-core", version = "0.1.0" }

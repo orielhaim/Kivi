@@ -1,0 +1,45 @@
+[package]
+name = "kivi-lab"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+# Test targets that need a RESP-capable server binary (built separately via
+# `-p kivi-server --features redis-compat`). Without it those test files
+# compile to nothing, so ordinary `cargo test --workspace` stays
+# self-contained. When enabled and the binary still lacks RESP, the harness
+# fails loudly — never a silent skip.
+redis-compat = []
+
+[[bin]]
+name = "kivi-lab"
+path = "src/bin/kivi-lab.rs"
+
+[dependencies]
+kivi-types.workspace = true
+kivi-state.workspace = true
+kivi-tablet.workspace = true
+kivi-protocol.workspace = true
+kivi-client.workspace = true
+kivi-engine.workspace = true
+kivi-durability.workspace = true
+kivi-checkpoint.workspace = true
+bytes.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+hdrhistogram.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+# Ecosystem/reference client: conformance cross-checks and the redis-rs →
+# Kivi compatibility test only. Benchmark targets and the harness speak raw
+# RESP so Kivi-vs-Redis comparisons share one identical transport.
+redis = "1.7"
+
+[lints]
+workspace = true

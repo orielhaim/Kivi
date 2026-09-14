@@ -11,7 +11,6 @@
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::process::{Child, Command, Stdio};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -19,255 +18,11 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use kivi_client::{ClientConfig, NativeClient};
+use kivi_lab::process::Server;
 use kivi_state::Key;
 use kivi_types::{NamespaceId, RequestIdentity, RequestSeq, SessionId};
 
 const NS: NamespaceId = NamespaceId::from_u64(1);
-const READY_TIMEOUT: Duration = Duration::from_secs(20);
-
-/// Race-free process spawn: the server binds ephemeral ports (`--port 0`,
-/// `--admin 127.0.0.1:0`) and reports its actual endpoints on stdout
-/// (`KIVI_READY ...`). Tests connect to the reported addresses, so the old
-/// probe-then-bind window — where a parallel test could steal a "reserved"
-/// port between our probe and the server's bind — no longer exists.
-/// Restarts likewise take fresh ports: crash recovery never depends on
-/// socket addresses, only on the data directory.
-fn spawn_process(data_dir: &std::path::Path, extra: &[&str]) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_kivi-server"))
-        .arg("--data-dir")
-        .arg(data_dir)
-        .arg("--port")
-        .arg("0")
-        .arg("--admin")
-        .arg("127.0.0.1:0")
-        .arg("--workers")
-        .arg("2")
-        .arg("--tablets")
-        .arg("1")
-        .args(extra)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("server binary spawns")
-}
-
-/// What a spawned server did inside its startup window.
-enum SpawnOutcome {
-    /// `KIVI_READY` parsed: worker-0 port, then admin port.
-    Ready(u16, u16),
-    /// The process exited before reporting readiness.
-    Exited(std::process::ExitStatus),
-    /// Neither readiness nor exit inside the window (caller kills first).
-    TimedOut,
-}
-
-/// Parses `KIVI_READY workers=<a>,<b> admin=<c>`; returns worker-0 and
-/// admin ports. Anything else (tracing noise on the shared stdout) is
-/// skipped by the caller, never an error.
-fn parse_ready(line: &str) -> Option<(u16, u16)> {
-    let rest = line.strip_prefix("KIVI_READY")?.trim();
-    let mut workers: Option<&str> = None;
-    let mut admin: Option<&str> = None;
-    for token in rest.split_whitespace() {
-        if let Some(value) = token.strip_prefix("workers=") {
-            workers = Some(value);
-        }
-        if let Some(value) = token.strip_prefix("admin=") {
-            admin = Some(value);
-        }
-    }
-    let first = workers?.split(',').next()?;
-    let base = first.rsplit(':').next()?.parse::<u16>().ok()?;
-    let admin = admin?.rsplit(':').next()?.parse::<u16>().ok()?;
-    (base != 0 && admin != 0).then_some((base, admin))
-}
-
-/// Last lines of a dead child's stderr for failure diagnostics.
-fn stderr_tail(child: &mut Child) -> String {
-    let mut log = String::new();
-    if let Some(stderr) = child.stderr.as_mut() {
-        let _ = stderr.read_to_string(&mut log);
-    }
-    log.lines()
-        .rev()
-        .take(8)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Waits for `KIVI_READY` on the child's stdout, watching for early exit
-/// on a reader thread so a silent stall can never hang the harness past
-/// the deadline: the reader only produces lines, the loop owns the clock.
-fn wait_ready_or_exit(child: &mut Child, timeout: Duration) -> SpawnOutcome {
-    let stdout = child.stdout.take().expect("server stdout piped");
-    let (tx, rx) = std::sync::mpsc::channel::<Option<(u16, u16)>>();
-    std::thread::spawn(move || {
-        use std::io::BufRead as _;
-        let mut reader = std::io::BufReader::new(stdout);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match reader.read_line(&mut line) {
-                Ok(0) | Err(_) => {
-                    let _ = tx.send(None);
-                    break;
-                }
-                Ok(_) => {
-                    if let Some(ports) = parse_ready(&line) {
-                        let _ = tx.send(Some(ports));
-                        break;
-                    }
-                }
-            }
-        }
-    });
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Ok(Some(status)) = child.try_wait() {
-            return SpawnOutcome::Exited(status);
-        }
-        match rx.recv_timeout(Duration::from_millis(25)) {
-            Ok(found) => {
-                if let Some(ports) = found {
-                    return SpawnOutcome::Ready(ports.0, ports.1);
-                }
-                // EOF before readiness: the child is dying; loop once more
-                // to collect its exit status below.
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                if let Ok(Some(status)) = child.try_wait() {
-                    return SpawnOutcome::Exited(status);
-                }
-            }
-        }
-        if Instant::now() > deadline {
-            let _ = child.kill();
-            return SpawnOutcome::TimedOut;
-        }
-    }
-}
-
-struct Server {
-    child: Child,
-    base: u16,
-    admin: u16,
-}
-
-impl Server {
-    /// Spawns on ephemeral ports and returns once `KIVI_READY` arrives
-    /// (which the server prints after every listener binds, so recovery
-    /// already ran). An early exit panics with the stderr tail — startup
-    /// failure stays loud, never a silent hang.
-    fn spawn_auto(data_dir: &std::path::Path, extra: &[&str]) -> Self {
-        let mut child = spawn_process(data_dir, extra);
-        match wait_ready_or_exit(&mut child, READY_TIMEOUT) {
-            SpawnOutcome::Ready(base, admin) => {
-                // Belt-and-braces: a successful connect proves the worker
-                // listener serves, not just binds.
-                assert!(
-                    TcpStream::connect(format!("127.0.0.1:{base}")).is_ok(),
-                    "worker {base} accepts after ready"
-                );
-                Self { child, base, admin }
-            }
-            SpawnOutcome::Exited(status) => {
-                panic!(
-                    "server exited during startup: {status}\nstderr tail:\n{}",
-                    stderr_tail(&mut child)
-                );
-            }
-            SpawnOutcome::TimedOut => {
-                panic!(
-                    "server not ready after {READY_TIMEOUT:?}\nstderr tail:\n{}",
-                    stderr_tail(&mut child)
-                );
-            }
-        }
-    }
-
-    fn endpoint(&self) -> String {
-        format!("127.0.0.1:{}", self.base)
-    }
-
-    fn admin_endpoint(&self) -> String {
-        format!("127.0.0.1:{}", self.admin)
-    }
-
-    /// Raw HTTP GET against the admin plane (no HTTP client dependency;
-    /// the responses are tiny JSON documents).
-    fn admin_get(&self, path: &str) -> (u16, String) {
-        let mut socket = TcpStream::connect(self.admin_endpoint()).expect("admin connect");
-        socket
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .expect("timeout");
-        write!(
-            socket,
-            "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-        )
-        .expect("write");
-        let mut body = String::new();
-        socket
-            .read_to_string(&mut body)
-            .expect("read admin response");
-        let status = body
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .split_whitespace()
-            .nth(1)
-            .unwrap_or("0")
-            .parse::<u16>()
-            .unwrap_or(0);
-        let payload = body.split("\r\n\r\n").nth(1).unwrap_or("").to_owned();
-        (status, payload)
-    }
-
-    fn client(&self) -> NativeClient {
-        NativeClient::new(ClientConfig {
-            seeds: vec![self.endpoint()],
-            namespace: NS,
-            ..ClientConfig::default()
-        })
-        .expect("client builds")
-    }
-
-    /// The honest crash: no shutdown handshake, no flush beyond what the
-    /// WAL already persisted per acknowledged write.
-    fn kill(mut self) {
-        self.child.kill().expect("kill succeeds");
-        let _ = self.child.wait();
-    }
-
-    /// Extracts the first JSON number following `"key":` (admin DTOs are
-    /// tiny and machine-shaped; a full JSON parser is not warranted).
-    fn admin_number(&self, path: &str, key: &str) -> u64 {
-        let (status, body) = self.admin_get(path);
-        assert_eq!(status, 200, "GET {path}");
-        let needle = format!("\"{key}\":");
-        let start = body
-            .find(&needle)
-            .unwrap_or_else(|| panic!("{key} present in {path}: {body}"))
-            + needle.len();
-        body[start..]
-            .chars()
-            .take_while(char::is_ascii_digit)
-            .collect::<String>()
-            .parse()
-            .unwrap_or_else(|_| panic!("{key} numeric in {path}: {body}"))
-    }
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
 
 fn read_frame(
     socket: &mut TcpStream,
@@ -347,6 +102,9 @@ impl RawDurable {
             delta: 1,
             expiry: 0,
             offset: 0,
+            len: 0,
+            condition: kivi_protocol::COND_ALWAYS,
+            expiry_policy: kivi_protocol::EXPIRY_CLEAR,
             identity: Some(RequestIdentity::new(session, RequestSeq::from_u64(seq))),
             ack_floor: RequestSeq::from_u64(ack),
         };
@@ -472,7 +230,7 @@ fn stream_bytes(len: usize, seed: u64) -> Vec<u8> {
 #[test]
 fn streamed_upload_replay_after_kill_returns_original_without_reexecuting() {
     let scratch = tempfile::tempdir().expect("scratch");
-    let server = Server::spawn_auto(scratch.path(), &[]);
+    let server = Server::spawn_auto(scratch.path(), &[]).expect("server spawns");
     let endpoint = server.endpoint();
     // Fixed identity across three commits of the same bytes: the "lost
     // responses". Every replay must dedup-hit the first commit's version,
@@ -496,7 +254,7 @@ fn streamed_upload_replay_after_kill_returns_original_without_reexecuting() {
     server.kill();
     // After the crash the dedup memory is gone — but the WAL remembers
     // the small root, so the replay still dedups instead of storing anew.
-    let server = Server::spawn_auto(scratch.path(), &[]);
+    let server = Server::spawn_auto(scratch.path(), &[]).expect("server spawns");
     let mut raw = RawDurable::connect(&server.endpoint());
     let after_crash = commit_once(&mut raw, 102);
     assert_eq!(
@@ -516,7 +274,7 @@ fn streamed_upload_replay_after_kill_returns_original_without_reexecuting() {
 #[test]
 fn kill_mid_upload_leaves_no_root_and_recovers_cleanly() {
     let scratch = tempfile::tempdir().expect("scratch");
-    let server = Server::spawn_auto(scratch.path(), &[]);
+    let server = Server::spawn_auto(scratch.path(), &[]).expect("server spawns");
     let endpoint = server.endpoint();
     let session = SessionId::from_u128(0x00DE_C0DE);
     let mut raw = RawDurable::connect(&endpoint);
@@ -530,7 +288,7 @@ fn kill_mid_upload_leaves_no_root_and_recovers_cleanly() {
     }
     drop(raw);
     server.kill();
-    let server = Server::spawn_auto(scratch.path(), &[]);
+    let server = Server::spawn_auto(scratch.path(), &[]).expect("server spawns");
     let client = server.client();
     assert_eq!(client.get(&Key::from("half")).expect("get"), None);
     // The log continues past the orphaned stage: new writes land fine.
@@ -574,7 +332,7 @@ fn put_stream_sturdy(
 fn concurrent_same_key_uploads_never_tear() {
     use std::sync::Barrier;
     let scratch = tempfile::tempdir().expect("scratch");
-    let server = Server::spawn_auto(scratch.path(), &[]);
+    let server = Server::spawn_auto(scratch.path(), &[]).expect("server spawns");
     let endpoint = server.endpoint();
     let bodies = [
         stream_bytes(1_200_000, 0xA11CE),
@@ -630,7 +388,7 @@ fn concurrent_same_key_uploads_never_tear() {
 #[test]
 fn kill_restart_recovers_acknowledged_writes() {
     let scratch = tempfile::tempdir().expect("scratch");
-    let server = Server::spawn_auto(scratch.path(), &[]);
+    let server = Server::spawn_auto(scratch.path(), &[]).expect("server spawns");
     let client = server.client();
     client
         .set(&Key::from("hello"), bytes::Bytes::from_static(b"world"))
@@ -645,7 +403,7 @@ fn kill_restart_recovers_acknowledged_writes() {
     server.kill();
     // Same data directory, fresh ports: recovery keys off the directory,
     // never the socket addresses.
-    let server = Server::spawn_auto(scratch.path(), &[]);
+    let server = Server::spawn_auto(scratch.path(), &[]).expect("server spawns");
     let client = server.client();
     assert_eq!(
         client.get(&Key::from("hello")).expect("get"),
@@ -660,7 +418,7 @@ fn kill_restart_recovers_acknowledged_writes() {
 fn replay_after_kill_returns_original_without_reexecuting() {
     use kivi_protocol::Status;
     let scratch = tempfile::tempdir().expect("scratch");
-    let server = Server::spawn_auto(scratch.path(), &[]);
+    let server = Server::spawn_auto(scratch.path(), &[]).expect("server spawns");
     let endpoint = server.endpoint();
     // Fixed identity: this is the "lost response" — the client sent
     // (session, seq=1), the reply never arrived, and the retry carries
@@ -676,7 +434,7 @@ fn replay_after_kill_returns_original_without_reexecuting() {
     drop(raw);
     server.kill();
     // After the crash the dedup memory is gone — but the WAL remembers.
-    let server = Server::spawn_auto(scratch.path(), &[]);
+    let server = Server::spawn_auto(scratch.path(), &[]).expect("server spawns");
     let mut raw = RawDurable::connect(&server.endpoint());
     let after_crash = raw.counter_add(3, session, 1, 0, "exact");
     assert_eq!(after_crash.status, Status::Ok);
@@ -693,12 +451,28 @@ fn replay_after_kill_returns_original_without_reexecuting() {
 #[test]
 fn second_process_is_refused_while_first_holds_the_lock() {
     let scratch = tempfile::tempdir().expect("scratch");
-    let server = Server::spawn_auto(scratch.path(), &[]);
+    let server = Server::spawn_auto(scratch.path(), &[]).expect("server spawns");
     // A second process on the same directory must fail fast, never
     // interleave WAL writes with the live owner. It takes ephemeral ports
     // too: only the data-directory lock is under test, so no address can
     // collide with anything.
-    let mut probe = spawn_process(scratch.path(), &[]);
+    let mut probe =
+        std::process::Command::new(kivi_lab::process::server_binary_path().expect("server binary"))
+            .arg("--data-dir")
+            .arg(scratch.path())
+            .arg("--port")
+            .arg("0")
+            .arg("--admin")
+            .arg("127.0.0.1:0")
+            .arg("--workers")
+            .arg("2")
+            .arg("--tablets")
+            .arg("1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("probe spawns");
     let status = probe.wait().expect("probe exits");
     assert!(
         !status.success(),
@@ -710,7 +484,7 @@ fn second_process_is_refused_while_first_holds_the_lock() {
 #[test]
 fn admin_durability_reports_mode_identity_and_recovery() {
     let scratch = tempfile::tempdir().expect("scratch");
-    let server = Server::spawn_auto(scratch.path(), &[]);
+    let server = Server::spawn_auto(scratch.path(), &[]).expect("server spawns");
     let client = server.client();
     for index in 0..3u32 {
         client
@@ -732,7 +506,7 @@ fn admin_durability_reports_mode_identity_and_recovery() {
     );
     drop(client);
     server.kill();
-    let server = Server::spawn_auto(scratch.path(), &[]);
+    let server = Server::spawn_auto(scratch.path(), &[]).expect("server spawns");
     let (status, second) = server.admin_get("/v1/durability");
     assert_eq!(status, 200);
     assert!(
@@ -755,7 +529,8 @@ fn admin_durability_reports_mode_identity_and_recovery() {
 fn segment_rotation_recovers_across_many_segments() {
     let scratch = tempfile::tempdir().expect("scratch");
     // 4 KiB segments: a few hundred small writes must rotate repeatedly.
-    let server = Server::spawn_auto(scratch.path(), &["--wal-segment-target", "4096"]);
+    let server = Server::spawn_auto(scratch.path(), &["--wal-segment-target", "4096"])
+        .expect("server spawns");
     let client = server.client();
     let value = bytes::Bytes::from(vec![b'x'; 97]);
     for index in 0..300u32 {
@@ -771,7 +546,7 @@ fn segment_rotation_recovers_across_many_segments() {
         segments.len()
     );
     server.kill();
-    let server = Server::spawn_auto(scratch.path(), &[]);
+    let server = Server::spawn_auto(scratch.path(), &[]).expect("server spawns");
     let client = server.client();
     for index in [0u32, 1, 149, 150, 298, 299] {
         assert_eq!(
@@ -828,7 +603,7 @@ fn wal_segments(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 fn group_commit_batches_hot_writes_with_one_barrier() {
     let scratch = tempfile::tempdir().expect("scratch");
     // No automatic checkpoints: this measures the commit pipeline alone.
-    let server = Server::spawn_auto(scratch.path(), &["--no-checkpoint"]);
+    let server = Server::spawn_auto(scratch.path(), &["--no-checkpoint"]).expect("server spawns");
     let endpoint = server.endpoint();
     // Eight clients hammer one hot counter: every add is ordered behind
     // the last on its tablet, so sustained load must batch them.
@@ -897,7 +672,8 @@ fn checkpoint_dedup_money_test_retry_after_reclaim_returns_original() {
             "--checkpoint-mutations",
             "5",
         ],
-    );
+    )
+    .expect("server spawns");
     let endpoint = server.endpoint();
     // The lost reply: (session S, seq 1) applies; the client never sees
     // the response and will retry the same bytes after the crash.
@@ -963,7 +739,7 @@ fn checkpoint_dedup_money_test_retry_after_reclaim_returns_original() {
     // Restart, then retry the SAME identity on a fresh connection: the
     // checkpointed dedup state must answer without re-executing, even
     // though the original WAL is long reclaimed.
-    let server = Server::spawn_auto(scratch.path(), &[]);
+    let server = Server::spawn_auto(scratch.path(), &[]).expect("server spawns");
     let mut raw = RawDurable::connect(&server.endpoint());
     let replay = raw.counter_add(10, session, 1, 0, "exact");
     assert_eq!(replay.status, Status::Ok);
@@ -987,7 +763,8 @@ fn wal_reclamation_removes_old_segments_and_survives_kill() {
             "--checkpoint-mutations",
             "60",
         ],
-    );
+    )
+    .expect("server spawns");
     let client = server.client();
     // Phase sizes vs ~190B records and 4KiB segments (~21 records each):
     // phase 1 fills ~3 segments, checkpoint 1 covers the first two fully.
@@ -1044,7 +821,7 @@ fn wal_reclamation_removes_old_segments_and_survives_kill() {
     // Kill mid-steady-state (possibly mid-reclaim: deletes are
     // idempotent) and restart: everything acknowledged comes back.
     server.kill();
-    let server = Server::spawn_auto(scratch.path(), &[]);
+    let server = Server::spawn_auto(scratch.path(), &[]).expect("server spawns");
     let client = server.client();
     for index in 0..120u32 {
         assert_eq!(
@@ -1062,7 +839,7 @@ fn incremental_checkpoint_reuses_clean_bands() {
     let scratch = tempfile::tempdir().expect("scratch");
     // Phase 1 with checkpoints off: 200 writes, then kill. Restart with
     // an eager threshold so exactly one checkpoint covers all of them.
-    let server = Server::spawn_auto(scratch.path(), &["--no-checkpoint"]);
+    let server = Server::spawn_auto(scratch.path(), &["--no-checkpoint"]).expect("server spawns");
     let client = server.client();
     for index in 0..200u32 {
         client
@@ -1074,7 +851,8 @@ fn incremental_checkpoint_reuses_clean_bands() {
     }
     drop(client);
     server.kill();
-    let server = Server::spawn_auto(scratch.path(), &["--checkpoint-mutations", "5"]);
+    let server = Server::spawn_auto(scratch.path(), &["--checkpoint-mutations", "5"])
+        .expect("server spawns");
     await_checkpoints(&server, 1);
     let reused_first = server.admin_number("/v1/checkpoints", "bands_reused");
     assert_eq!(reused_first, 0, "first checkpoint builds everything");
@@ -1124,7 +902,7 @@ fn incremental_checkpoint_reuses_clean_bands() {
     drop(client);
     await_checkpoints(&server, 3);
     server.kill();
-    let server = Server::spawn_auto(scratch.path(), &[]);
+    let server = Server::spawn_auto(scratch.path(), &[]).expect("server spawns");
     let client = server.client();
     for key in &phase3 {
         if key.as_bytes().starts_with(b"inc:") {
@@ -1348,7 +1126,8 @@ fn hammer(endpoint: &str, stop: &AtomicBool, thread: u32) -> HammerOutcome {
 #[test]
 fn concurrent_checkpoint_workload_survives_kill_exactly() {
     let scratch = tempfile::tempdir().expect("scratch");
-    let server = Server::spawn_auto(scratch.path(), &["--checkpoint-mutations", "200"]);
+    let server = Server::spawn_auto(scratch.path(), &["--checkpoint-mutations", "200"])
+        .expect("server spawns");
     let endpoint = server.endpoint();
     // Four threads hammering: distinct SET keys plus one shared hot
     // counter. Every mutation carries its own session and explicit
@@ -1406,7 +1185,7 @@ fn concurrent_checkpoint_workload_survives_kill_exactly() {
         ambiguous.len(),
     );
     // Restart: every acknowledged write is present, exactly.
-    let server = Server::spawn_auto(scratch.path(), &[]);
+    let server = Server::spawn_auto(scratch.path(), &[]).expect("server spawns");
     eprintln!("AM: respawned; verifying");
     let client = server.client();
     for (key, value) in &acked_sets {
@@ -1465,7 +1244,8 @@ fn deleted_current_recovers_from_wal_replay() {
     // Interrupted publication is invisible: with CURRENT gone, recovery
     // replays the WAL from genesis and restores everything acknowledged.
     let scratch = tempfile::tempdir().expect("scratch");
-    let server = Server::spawn_auto(scratch.path(), &["--checkpoint-mutations", "5"]);
+    let server = Server::spawn_auto(scratch.path(), &["--checkpoint-mutations", "5"])
+        .expect("server spawns");
     let client = server.client();
     for index in 0..10u32 {
         client
@@ -1486,7 +1266,7 @@ fn deleted_current_recovers_from_wal_replay() {
             .join("CURRENT"),
     )
     .expect("delete CURRENT");
-    let server = Server::spawn_auto(scratch.path(), &[]);
+    let server = Server::spawn_auto(scratch.path(), &[]).expect("server spawns");
     let client = server.client();
     for index in 0..10u32 {
         assert_eq!(
@@ -1503,7 +1283,8 @@ fn missing_current_manifest_falls_back_to_previous() {
     // manifest must fall back loudly to the retained previous (WAL tail
     // covers the gap) — never partial state, never silent loss.
     let scratch = tempfile::tempdir().expect("scratch");
-    let server = Server::spawn_auto(scratch.path(), &["--checkpoint-mutations", "5"]);
+    let server = Server::spawn_auto(scratch.path(), &["--checkpoint-mutations", "5"])
+        .expect("server spawns");
     let client = server.client();
     for index in 0..5u32 {
         client
@@ -1537,7 +1318,7 @@ fn missing_current_manifest_falls_back_to_previous() {
             .join(format!("{current_manifest}.manifest")),
     )
     .expect("delete current manifest");
-    let server = Server::spawn_auto(scratch.path(), &[]);
+    let server = Server::spawn_auto(scratch.path(), &[]).expect("server spawns");
     let client = server.client();
     for index in 0..10u32 {
         assert_eq!(
@@ -1565,7 +1346,8 @@ fn corrupt_band_is_detected_loudly() {
     // so the previous chain references different files) must fail loudly
     // or fall back — never serve partial state.
     let scratch = tempfile::tempdir().expect("scratch");
-    let server = Server::spawn_auto(scratch.path(), &["--checkpoint-mutations", "5"]);
+    let server = Server::spawn_auto(scratch.path(), &["--checkpoint-mutations", "5"])
+        .expect("server spawns");
     let client = server.client();
     for index in 0..5u32 {
         client
@@ -1613,42 +1395,34 @@ fn corrupt_band_is_detected_loudly() {
     // in both chains) breaks both chains and must fail loudly.
     // Fresh ephemeral ports: recovery reads the data directory, so the
     // probe address is irrelevant and cannot collide with anything.
-    let mut probe = spawn_process(scratch.path(), &[]);
     // Give it a bounded window: success (fallback) or loud exit both end
     // the ambiguity. A hanging or partial server fails the test below.
-    let ready = match wait_ready_or_exit(&mut probe, Duration::from_secs(20)) {
-        SpawnOutcome::Ready(base, admin) => {
-            assert!(
-                std::net::TcpStream::connect(format!("127.0.0.1:{base}")).is_ok(),
-                "ready worker accepts"
-            );
-            Some((base, admin))
+    let outcome = kivi_lab::process::probe_server(
+        kivi_lab::process::ServerMode::DataDir(scratch.path().to_owned()),
+        2,
+        1,
+        &[],
+        false,
+        Duration::from_secs(20),
+    )
+    .expect("probe starts");
+    match outcome {
+        kivi_lab::process::ProbeOutcome::Ready(server) => {
+            // Served: fallback must have restored everything.
+            let client = server.client();
+            for index in 0..10u32 {
+                assert_eq!(
+                    client.get(&Key::from(format!("cb:{index}"))).expect("get"),
+                    Some(bytes::Bytes::from_static(b"v")),
+                    "fallback restores everything or the server must not serve"
+                );
+            }
         }
-        SpawnOutcome::Exited(status) => {
-            assert!(
-                !status.success(),
-                "corrupt band must fail loudly, not exit 0"
-            );
-            None
+        kivi_lab::process::ProbeOutcome::Exited { success, .. } => {
+            assert!(!success, "corrupt band must fail loudly, not exit 0");
         }
-        SpawnOutcome::TimedOut => {
+        kivi_lab::process::ProbeOutcome::TimedOut { .. } => {
             panic!("corrupt band: server neither failed loudly nor served");
-        }
-    };
-    if let Some((base, admin)) = ready {
-        // Served: fallback must have restored everything.
-        let server = Server {
-            child: probe,
-            base,
-            admin,
-        };
-        let client = server.client();
-        for index in 0..10u32 {
-            assert_eq!(
-                client.get(&Key::from(format!("cb:{index}"))).expect("get"),
-                Some(bytes::Bytes::from_static(b"v")),
-                "fallback restores everything or the server must not serve"
-            );
         }
     }
 }

@@ -49,6 +49,24 @@ pub fn splice_inline(base: &[u8], offset: u64, patch: &[u8]) -> Option<bytes::By
     Some(bytes::Bytes::from(out))
 }
 
+/// Slices `[offset, offset + len)` clamped to the logical length (empty
+/// when `offset` is past the end). Pure: the single implementation shared
+/// by inline reads, so admission and tests cannot disagree. `offset`/`len`
+/// are `u64` logical indexes; values larger than memory address space clamp
+/// to the end rather than failing (reads never reject on bounds).
+#[must_use]
+pub fn slice_range(base: &[u8], offset: u64, len: u64) -> bytes::Bytes {
+    let total = base.len() as u64;
+    let start = offset.min(total);
+    let available = total.saturating_sub(start);
+    let take = len.min(available);
+    let start_usize = usize::try_from(start).unwrap_or(usize::MAX).min(base.len());
+    let take_usize = usize::try_from(take)
+        .unwrap_or(usize::MAX)
+        .min(base.len() - start_usize);
+    bytes::Bytes::copy_from_slice(&base[start_usize..start_usize + take_usize])
+}
+
 /// A validated operation: either an immediately answered read or a mutation
 /// awaiting deterministic application.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,6 +193,7 @@ impl ObjectStore {
     /// Returns [`OpError::WrongType`] for type mismatches and
     /// [`OpError::CounterOverflow`] for overflowing additions. Neither
     /// mutates anything.
+    #[allow(clippy::too_many_lines)]
     pub fn prepare(&self, op: &Operation, now: UnixMicros) -> Result<Prepared, OpError> {
         match op {
             Operation::Get { key } => match self.get(key, now) {
@@ -273,7 +292,151 @@ impl ObjectStore {
             Operation::GetExpiry { key } => Ok(Prepared::Read(OperationResult::Expiry(
                 self.get(key, now).map(StoredObject::expiry),
             ))),
+            Operation::GetRange { key, offset, len } => {
+                self.prepare_get_range(key, *offset, *len, now)
+            }
+            Operation::BytesLength { key } => match self.get(key, now) {
+                None => Ok(Prepared::Read(OperationResult::Length(None))),
+                Some(object) => match object.value() {
+                    LogicalValue::Bytes(value) => Ok(Prepared::Read(OperationResult::Length(
+                        Some(value.len() as u64),
+                    ))),
+                    LogicalValue::Chunked(chunked) => Ok(Prepared::Read(OperationResult::Length(
+                        Some(chunked.logical_len),
+                    ))),
+                    LogicalValue::StrictCounter(_) => Err(OpError::WrongType {
+                        expected: ObjectType::Bytes,
+                        found: ObjectType::StrictCounter,
+                    }),
+                },
+            },
+            Operation::SetConditional {
+                key,
+                value,
+                condition,
+                expiry,
+            } => Ok(self.prepare_set_conditional(key, value, *condition, *expiry, now)),
+            Operation::SetConditionalChunked {
+                key,
+                manifest,
+                logical_len,
+                condition,
+                expiry,
+            } => Ok(self.prepare_set_conditional_chunked(
+                key,
+                *manifest,
+                *logical_len,
+                *condition,
+                *expiry,
+                now,
+            )),
         }
+    }
+
+    /// Validates a range read against current state: absent answers `None`,
+    /// inline slices `[offset, offset + len)` clamped to the logical length
+    /// (empty when past the end), counters reject, and chunked roots answer
+    /// as [`ChunkedValue`](OperationResult::ChunkedValue) so the engine can
+    /// resolve and slice without this layer touching the filesystem.
+    fn prepare_get_range(
+        &self,
+        key: &Key,
+        offset: u64,
+        len: u64,
+        now: UnixMicros,
+    ) -> Result<Prepared, OpError> {
+        match self.get(key, now) {
+            None => Ok(Prepared::Read(OperationResult::Value(None))),
+            Some(object) => match object.value() {
+                LogicalValue::Bytes(value) => Ok(Prepared::Read(OperationResult::Value(Some(
+                    slice_range(value, offset, len),
+                )))),
+                LogicalValue::Chunked(chunked) => {
+                    Ok(Prepared::Read(OperationResult::ChunkedValue {
+                        manifest: chunked.manifest,
+                        logical_len: chunked.logical_len,
+                    }))
+                }
+                LogicalValue::StrictCounter(_) => Err(OpError::WrongType {
+                    expected: ObjectType::Bytes,
+                    found: ObjectType::StrictCounter,
+                }),
+            },
+        }
+    }
+
+    /// Validates a conditional store: evaluates the presence condition
+    /// against live state and, when it holds, resolves the expiry policy to
+    /// a concrete stamp carried in the mutation (so replay applies the same
+    /// stamp without re-reading state). Total: conditions never reject with
+    /// an error, they answer not-applied.
+    fn prepare_set_conditional(
+        &self,
+        key: &Key,
+        value: &bytes::Bytes,
+        condition: crate::ops::SetCondition,
+        policy: crate::ops::ExpiryPolicy,
+        now: UnixMicros,
+    ) -> Prepared {
+        let live = self.get(key, now);
+        let holds = match condition {
+            crate::ops::SetCondition::Always => true,
+            crate::ops::SetCondition::IfAbsent => live.is_none(),
+            crate::ops::SetCondition::IfPresent => live.is_some(),
+        };
+        if !holds {
+            return Prepared::Read(OperationResult::ConditionalSet {
+                applied: false,
+                version: None,
+            });
+        }
+        let expiry = match policy {
+            crate::ops::ExpiryPolicy::Clear => Expiry::NEVER,
+            crate::ops::ExpiryPolicy::Keep => live.map_or(Expiry::NEVER, StoredObject::expiry),
+            crate::ops::ExpiryPolicy::ExpireAt(stamp) => Expiry::at(stamp),
+        };
+        Prepared::Write(Mutation::PutBytesWithExpiry {
+            key: key.clone(),
+            value: value.clone(),
+            expiry,
+        })
+    }
+
+    /// Validates a staged conditional chunked store: same condition/expiry
+    /// resolution as inline, but produces a chunked root mutation. Total
+    /// like its inline twin.
+    fn prepare_set_conditional_chunked(
+        &self,
+        key: &Key,
+        manifest: kivi_types::ManifestId,
+        logical_len: u64,
+        condition: crate::ops::SetCondition,
+        policy: crate::ops::ExpiryPolicy,
+        now: UnixMicros,
+    ) -> Prepared {
+        let live = self.get(key, now);
+        let holds = match condition {
+            crate::ops::SetCondition::Always => true,
+            crate::ops::SetCondition::IfAbsent => live.is_none(),
+            crate::ops::SetCondition::IfPresent => live.is_some(),
+        };
+        if !holds {
+            return Prepared::Read(OperationResult::ConditionalSet {
+                applied: false,
+                version: None,
+            });
+        }
+        let expiry = match policy {
+            crate::ops::ExpiryPolicy::Clear => Expiry::NEVER,
+            crate::ops::ExpiryPolicy::Keep => live.map_or(Expiry::NEVER, StoredObject::expiry),
+            crate::ops::ExpiryPolicy::ExpireAt(stamp) => Expiry::at(stamp),
+        };
+        Prepared::Write(Mutation::ReplaceChunkedRootWithExpiry {
+            key: key.clone(),
+            manifest,
+            logical_len,
+            expiry,
+        })
     }
 
     /// Validates a range patch against current state: absent, expired, and
@@ -340,7 +503,9 @@ impl ObjectStore {
             Operation::Get { .. }
             | Operation::Exists { .. }
             | Operation::CounterGet { .. }
-            | Operation::GetExpiry { .. } => match self.prepare(op, now)? {
+            | Operation::GetExpiry { .. }
+            | Operation::GetRange { .. }
+            | Operation::BytesLength { .. } => match self.prepare(op, now)? {
                 Prepared::Read(result) => Ok(StorePrepared::Read(result)),
                 Prepared::Write(_) => {
                     panic!("read-only opcode prepared a mutation: {op:?}")
@@ -413,6 +578,119 @@ impl ObjectStore {
                 Ok(self.predict_expiry(key, Some(*expires_at), now))
             }
             Operation::PersistExpiry { key } => Ok(self.predict_expiry(key, None, now)),
+            Operation::SetConditional {
+                key,
+                value,
+                condition,
+                expiry,
+            } => Ok(self.predict_set_conditional(key, value, *condition, *expiry, now)),
+            Operation::SetConditionalChunked {
+                key,
+                manifest,
+                logical_len,
+                condition,
+                expiry,
+            } => Ok(self.predict_set_conditional_chunked(
+                key,
+                *manifest,
+                *logical_len,
+                *condition,
+                *expiry,
+                now,
+            )),
+        }
+    }
+
+    /// Predicts a conditional store: unmet conditions become terminal
+    /// no-op completions (retry-safe, nothing to replay), met conditions
+    /// become version-predicted writes carrying the resolved expiry.
+    fn predict_set_conditional(
+        &self,
+        key: &Key,
+        value: &bytes::Bytes,
+        condition: crate::ops::SetCondition,
+        policy: crate::ops::ExpiryPolicy,
+        now: UnixMicros,
+    ) -> StorePrepared {
+        let live = self.get(key, now);
+        let holds = match condition {
+            crate::ops::SetCondition::Always => true,
+            crate::ops::SetCondition::IfAbsent => live.is_none(),
+            crate::ops::SetCondition::IfPresent => live.is_some(),
+        };
+        if !holds {
+            return StorePrepared::Terminal(DurableOutcome::Completed(
+                OperationResult::ConditionalSet {
+                    applied: false,
+                    version: None,
+                },
+            ));
+        }
+        let expiry = match policy {
+            crate::ops::ExpiryPolicy::Clear => Expiry::NEVER,
+            crate::ops::ExpiryPolicy::Keep => live.map_or(Expiry::NEVER, StoredObject::expiry),
+            crate::ops::ExpiryPolicy::ExpireAt(stamp) => Expiry::at(stamp),
+        };
+        match self.predict_version(key, now) {
+            Ok(version) => StorePrepared::Write {
+                mutation: Mutation::PutBytesWithExpiry {
+                    key: key.clone(),
+                    value: value.clone(),
+                    expiry,
+                },
+                expected: OperationResult::ConditionalSet {
+                    applied: true,
+                    version: Some(version),
+                },
+            },
+            Err(outcome) => StorePrepared::Terminal(outcome),
+        }
+    }
+
+    /// Predicts a staged conditional chunked store (see
+    /// [`predict_set_conditional`](Self::predict_set_conditional)).
+    fn predict_set_conditional_chunked(
+        &self,
+        key: &Key,
+        manifest: kivi_types::ManifestId,
+        logical_len: u64,
+        condition: crate::ops::SetCondition,
+        policy: crate::ops::ExpiryPolicy,
+        now: UnixMicros,
+    ) -> StorePrepared {
+        let live = self.get(key, now);
+        let holds = match condition {
+            crate::ops::SetCondition::Always => true,
+            crate::ops::SetCondition::IfAbsent => live.is_none(),
+            crate::ops::SetCondition::IfPresent => live.is_some(),
+        };
+        if !holds {
+            return StorePrepared::Terminal(DurableOutcome::Completed(
+                OperationResult::ConditionalSet {
+                    applied: false,
+                    version: None,
+                },
+            ));
+        }
+        let expiry = match policy {
+            crate::ops::ExpiryPolicy::Clear => Expiry::NEVER,
+            crate::ops::ExpiryPolicy::Keep => live.map_or(Expiry::NEVER, StoredObject::expiry),
+            crate::ops::ExpiryPolicy::ExpireAt(stamp) => Expiry::at(stamp),
+        };
+        match self.predict_version(key, now) {
+            Ok(version) => StorePrepared::Write {
+                mutation: Mutation::ReplaceChunkedRootWithExpiry {
+                    key: key.clone(),
+                    manifest,
+                    logical_len,
+                    expiry,
+                },
+                expected: OperationResult::ConditionalSet {
+                    applied: true,
+                    version: Some(version),
+                },
+            },
+            Err(outcome) => StorePrepared::Terminal(outcome),
         }
     }
 
@@ -514,8 +792,8 @@ impl ObjectStore {
     /// addition overflows, or a counter mutation meets a byte string (only
     /// reachable by applying mutations against divergent state — same log
     /// on same state never produces it).
-    // One arm per mutation variant (five today); splitting would scatter
-    // the single total function the model test verifies.
+    // One arm per mutation variant; splitting would scatter the single
+    // total function the model test verifies.
     #[allow(clippy::too_many_lines)]
     pub fn apply(
         &mut self,
@@ -530,6 +808,38 @@ impl ObjectStore {
                 self.objects.insert(
                     key.clone(),
                     StoredObject::new(LogicalValue::Bytes(value.clone()), version, Expiry::NEVER),
+                );
+                Ok(ApplyOutcome::Put { version })
+            }
+            Mutation::PutBytesWithExpiry { key, value, expiry } => {
+                let version = self
+                    .next_version(key, now)
+                    .map_err(|_| ApplyError::VersionExhausted)?;
+                self.objects.insert(
+                    key.clone(),
+                    StoredObject::new(LogicalValue::Bytes(value.clone()), version, *expiry),
+                );
+                Ok(ApplyOutcome::Put { version })
+            }
+            Mutation::ReplaceChunkedRootWithExpiry {
+                key,
+                manifest,
+                logical_len,
+                expiry,
+            } => {
+                let version = self
+                    .next_version(key, now)
+                    .map_err(|_| ApplyError::VersionExhausted)?;
+                self.objects.insert(
+                    key.clone(),
+                    StoredObject::new(
+                        LogicalValue::Chunked(ChunkedRef {
+                            manifest: *manifest,
+                            logical_len: *logical_len,
+                        }),
+                        version,
+                        *expiry,
+                    ),
                 );
                 Ok(ApplyOutcome::Put { version })
             }
@@ -558,11 +868,13 @@ impl ObjectStore {
                 // Admission guarantees an absent, expired, or inline base
                 // with validated arithmetic; anything else is divergent
                 // state (or a corrupt record) and fails loudly, never
-                // wrong bytes. Expiry clears exactly like `PutBytes`.
-                let base: &[u8] = match self.live(key, now) {
-                    None => &[],
+                // wrong bytes. A range patch touches bytes, never the TTL:
+                // the live expiry survives (Redis SETRANGE parity,
+                // differential-tested); absent bases stay immortal.
+                let (base, expiry): (&[u8], Expiry) = match self.live(key, now) {
+                    None => (&[], Expiry::NEVER),
                     Some(current) => match current.value() {
-                        LogicalValue::Bytes(value) => value,
+                        LogicalValue::Bytes(value) => (value, current.expiry()),
                         LogicalValue::StrictCounter(_) => {
                             return Err(ApplyError::TypeMismatch {
                                 expected: ObjectType::Bytes,
@@ -579,7 +891,7 @@ impl ObjectStore {
                     .map_err(|_| ApplyError::VersionExhausted)?;
                 self.objects.insert(
                     key.clone(),
-                    StoredObject::new(LogicalValue::Bytes(spliced), version, Expiry::NEVER),
+                    StoredObject::new(LogicalValue::Bytes(spliced), version, expiry),
                 );
                 Ok(ApplyOutcome::Put { version })
             }
@@ -1179,6 +1491,61 @@ mod tests {
             .expect("missing expiry"),
             OperationResult::ExpirySet { applied: false }
         );
+    }
+
+    #[test]
+    fn set_range_preserves_live_expiry() {
+        let mut store = ObjectStore::new();
+        let deadline = UnixMicros::from_micros(9_000_000);
+        execute(
+            &mut store,
+            &Operation::Set {
+                key: key("k"),
+                value: bytes::Bytes::from_static(b"hello"),
+            },
+            NOW,
+        )
+        .expect("set");
+        execute(
+            &mut store,
+            &Operation::ExpireAt {
+                key: key("k"),
+                expires_at: deadline,
+            },
+            NOW,
+        )
+        .expect("expire");
+        // A patch changes bytes but never the TTL (Redis SETRANGE parity).
+        execute(
+            &mut store,
+            &Operation::SetRange {
+                key: key("k"),
+                offset: 0,
+                patch: bytes::Bytes::from_static(b"X"),
+            },
+            NOW,
+        )
+        .expect("splice");
+        assert_eq!(
+            execute(&mut store, &Operation::Get { key: key("k") }, NOW).expect("get"),
+            OperationResult::Value(Some(bytes::Bytes::from_static(b"Xello")))
+        );
+        assert_eq!(
+            execute(&mut store, &Operation::GetExpiry { key: key("k") }, NOW).expect("expiry"),
+            OperationResult::Expiry(Some(Expiry::at(deadline)))
+        );
+        // Durable preparation predicts the same preserved-expiry outcome.
+        assert!(matches!(
+            store.prepare_durable(
+                &Operation::SetRange {
+                    key: key("k"),
+                    offset: 1,
+                    patch: bytes::Bytes::from_static(b"Y"),
+                },
+                NOW,
+            ),
+            Ok(StorePrepared::Write { .. })
+        ));
     }
 
     #[test]

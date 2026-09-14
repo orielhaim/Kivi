@@ -21,7 +21,7 @@ use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, select};
 use kivi_durability::{DurabilityError, LaneStats, StorageHealth, WorkerLaneStats};
-use kivi_state::{Operation, OperationResult};
+use kivi_state::{ExpiryPolicy, Operation, OperationResult, SetCondition};
 use kivi_types::{ManifestId, MutationIdentity, NamespaceId, TabletId, UnixMicros, WorkerId};
 
 use crate::chunk_lane::{
@@ -698,6 +698,15 @@ pub(crate) fn peek_range_base(
 enum StageWork {
     /// Chunk a full value (large `Set`, or a restaged range result).
     Value(bytes::Bytes),
+    /// Chunk a full conditional value, preserving its condition/policy.
+    ConditionalValue {
+        /// Full logical bytes to chunk.
+        value: bytes::Bytes,
+        /// Presence condition evaluated atomically at prepare.
+        condition: kivi_state::SetCondition,
+        /// Expiry policy resolved at prepare.
+        expiry: kivi_state::ExpiryPolicy,
+    },
     /// Splice a patch into a chunked base without materializing it.
     Splice {
         /// Manifest addressing the base value.
@@ -760,6 +769,35 @@ fn stage_value_work(
                 Err(error) => failed(metrics, respond, WorkerRequestError::ChunkStore(error)),
             }
         }
+        StageWork::ConditionalValue {
+            value,
+            condition,
+            expiry,
+        } => {
+            let mut guard =
+                match crate::chunk_lane::PinnedUpload::begin(&chunks.pins, chunks.domain, &value) {
+                    Ok(guard) => guard,
+                    Err(error) => {
+                        return failed(metrics, respond, WorkerRequestError::ChunkStore(error));
+                    }
+                };
+            match chunks.lane.stage_value_blocking(value) {
+                Ok(staged) => {
+                    guard.set_manifest(staged.manifest);
+                    Ok((
+                        Operation::SetConditionalChunked {
+                            key: key.clone(),
+                            manifest: staged.manifest,
+                            logical_len: staged.logical_len,
+                            condition,
+                            expiry,
+                        },
+                        Some(guard),
+                    ))
+                }
+                Err(error) => failed(metrics, respond, WorkerRequestError::ChunkStore(error)),
+            }
+        }
         StageWork::Splice {
             manifest,
             logical_len,
@@ -771,11 +809,15 @@ fn stage_value_work(
         {
             Ok(staged) => {
                 let guard = crate::chunk_lane::PinnedUpload::staged(&chunks.pins, &staged);
+                // A splice preserves the live expiry like the inline path
+                // does: partial writes touch bytes, never the TTL.
                 Ok((
-                    Operation::SetChunked {
+                    Operation::SetConditionalChunked {
                         key: key.clone(),
                         manifest: staged.manifest,
                         logical_len: staged.logical_len,
+                        condition: SetCondition::Always,
+                        expiry: ExpiryPolicy::Keep,
                     },
                     Some(guard),
                 ))
@@ -783,6 +825,28 @@ fn stage_value_work(
             Err(error) => failed(metrics, respond, WorkerRequestError::ChunkStore(error)),
         },
     }
+}
+
+/// Stages a restaged range result, preserving expiry exactly like the
+/// inline splice does (partial writes touch bytes, never the TTL).
+fn stage_restaged(
+    key: &kivi_state::Key,
+    value: bytes::Bytes,
+    chunks: &WorkerChunks,
+    metrics: &core::cell::Cell<WorkerMetrics>,
+    respond: &Sender<WorkerResponse>,
+) -> Result<(Operation, Option<crate::chunk_lane::PinnedUpload>), ()> {
+    stage_value_work(
+        key,
+        StageWork::ConditionalValue {
+            value,
+            condition: SetCondition::Always,
+            expiry: ExpiryPolicy::Keep,
+        },
+        chunks,
+        metrics,
+        respond,
+    )
 }
 
 /// Namespace for checkpoint captures (durable workers serve exactly one).
@@ -832,8 +896,7 @@ pub(crate) fn handle_request(
                     return;
                 }
                 SetRangePlan::RestageSet { key, value } => {
-                    match stage_value_work(&key, StageWork::Value(value), chunks, metrics, &respond)
-                    {
+                    match stage_restaged(&key, value, chunks, metrics, &respond) {
                         Ok(staged) => staged,
                         Err(()) => return,
                     }
@@ -871,6 +934,25 @@ pub(crate) fn handle_request(
                     Err(()) => return,
                 }
             }
+            LargeSetSplit::StageConditional {
+                key,
+                value,
+                condition,
+                expiry,
+            } => match stage_value_work(
+                &key,
+                StageWork::ConditionalValue {
+                    value,
+                    condition,
+                    expiry,
+                },
+                chunks,
+                metrics,
+                &respond,
+            ) {
+                Ok(staged) => staged,
+                Err(()) => return,
+            },
         },
     };
     let outcome = match durability {

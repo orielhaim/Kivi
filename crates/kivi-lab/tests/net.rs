@@ -334,6 +334,9 @@ fn pipelined_raw_socket_round_trips_in_order() {
             delta: 0,
             expiry: 0,
             offset: 0,
+            len: 0,
+            condition: kivi_protocol::COND_ALWAYS,
+            expiry_policy: kivi_protocol::EXPIRY_CLEAR,
             identity: None,
             ack_floor: RequestSeq::from_u64(0),
         };

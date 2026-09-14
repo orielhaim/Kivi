@@ -26,5 +26,7 @@ pub use mutation::{ApplyError, ApplyOutcome, Mutation};
 pub use object::{
     ChunkedRef, Key, LogicalValue, ObjectType, ObjectVersion, StoredObject, VersionExhausted,
 };
-pub use ops::{DurableOutcome, OpError, Operation, OperationResult, outcome_for};
-pub use store::{ObjectStore, Prepared, StorePrepared, splice_inline};
+pub use ops::{
+    DurableOutcome, ExpiryPolicy, OpError, Operation, OperationResult, SetCondition, outcome_for,
+};
+pub use store::{ObjectStore, Prepared, StorePrepared, slice_range, splice_inline};

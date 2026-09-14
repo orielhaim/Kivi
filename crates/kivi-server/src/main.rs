@@ -10,6 +10,10 @@
 //!   WAL lanes recovered and replayed — all before any listener binds.
 
 mod admin;
+#[cfg(feature = "redis-compat")]
+mod resp;
+#[cfg(feature = "redis-compat")]
+use std::sync::Arc;
 
 use std::io::Write as _;
 use std::net::{IpAddr, SocketAddr};
@@ -131,6 +135,17 @@ struct Args {
     /// an ephemeral port and prints it).
     #[arg(long, default_value = "127.0.0.1:19080")]
     admin: SocketAddr,
+    /// Optional Redis/RESP compatibility listen address (feature
+    /// `redis-compat` only). Absent means native-only: no RESP service
+    /// starts even when compiled in. `:0` selects an ephemeral port.
+    #[cfg(feature = "redis-compat")]
+    #[arg(long)]
+    redis_listen: Option<SocketAddr>,
+    /// Namespace id the RESP frontend serves (Redis DB 0 maps here).
+    /// Single-namespace stage: must equal the engine namespace (1).
+    #[cfg(feature = "redis-compat")]
+    #[arg(long, default_value_t = 1)]
+    redis_namespace: u64,
 }
 
 /// Parses CPU pinning without panicking: `auto`, `none`, or explicit cores
@@ -355,6 +370,7 @@ fn open_durability(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -423,17 +439,60 @@ fn main() -> anyhow::Result<()> {
     for (index, addr) in engine.worker_addrs().iter().enumerate() {
         tracing::info!(worker = index, endpoint = %addr, "worker listening");
     }
-    let state = AdminState {
-        node,
-        cluster,
-        incarnation,
-        engine: engine.admin_handle(),
-    };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("kivi-admin")
         .build()
         .context("admin runtime failed to start")?;
+    // Optional RESP frontend: bound before the ready line prints so the
+    // reported endpoint is authoritative (including `:0` ephemeral ports).
+    // Absent `--redis-listen` means native-only even when compiled in.
+    // The shutdown sender outlives `admin::serve`; dropping it afterwards
+    // trips the frontend's watch so RESP tasks exit before the engine.
+    #[cfg(feature = "redis-compat")]
+    let (resp_admin, resp_shutdown): (
+        Option<resp::RespAdmin>,
+        Option<tokio::sync::watch::Sender<bool>>,
+    ) = match args.redis_listen {
+        None => (None, None),
+        Some(addr) => {
+            if args.redis_namespace != NS.as_u64() {
+                anyhow::bail!(
+                    "single-namespace stage serves namespace 1; --redis-namespace {} has no route",
+                    args.redis_namespace
+                );
+            }
+            let stats = std::sync::Arc::new(resp::RespStats::default());
+            let listener = runtime
+                .block_on(tokio::net::TcpListener::bind(addr))
+                .with_context(|| format!("redis bind failed on {addr}"))?;
+            let endpoint = listener.local_addr().context("redis listener address")?;
+            tracing::info!(endpoint = %endpoint, namespace = args.redis_namespace, "resp frontend listening");
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            runtime.spawn(resp::serve(
+                listener,
+                engine.client(),
+                Arc::clone(&stats),
+                shutdown_rx,
+            ));
+            (
+                Some(resp::RespAdmin {
+                    endpoint,
+                    namespace: args.redis_namespace,
+                    stats,
+                }),
+                Some(shutdown_tx),
+            )
+        }
+    };
+    let state = AdminState {
+        node,
+        cluster,
+        incarnation,
+        engine: engine.admin_handle(),
+        #[cfg(feature = "redis-compat")]
+        resp: resp_admin.clone(),
+    };
     let listener = runtime
         .block_on(tokio::net::TcpListener::bind(args.admin))
         .with_context(|| format!("admin bind failed on {}", args.admin))?;
@@ -447,6 +506,7 @@ fn main() -> anyhow::Result<()> {
     //
     // ```text
     // KIVI_READY workers=127.0.0.1:9000,127.0.0.1:9001 admin=127.0.0.1:19080
+    // KIVI_READY workers=... admin=... redis=127.0.0.1:6379 (with --redis-listen)
     // ```
     let workers = engine
         .worker_addrs()
@@ -454,13 +514,32 @@ fn main() -> anyhow::Result<()> {
         .map(std::string::ToString::to_string)
         .collect::<Vec<_>>()
         .join(",");
-    println!("KIVI_READY workers={workers} admin={admin_addr}");
+    #[cfg(feature = "redis-compat")]
+    {
+        match &state.resp {
+            Some(resp) => {
+                println!(
+                    "KIVI_READY workers={workers} admin={admin_addr} redis={}",
+                    resp.endpoint
+                );
+            }
+            None => {
+                println!("KIVI_READY workers={workers} admin={admin_addr}");
+            }
+        }
+    }
+    #[cfg(not(feature = "redis-compat"))]
+    {
+        println!("KIVI_READY workers={workers} admin={admin_addr}");
+    }
     let _ = std::io::stdout().flush();
     runtime.block_on(admin::serve(listener, state, async {
         if let Err(error) = tokio::signal::ctrl_c().await {
             tracing::warn!(%error, "shutdown signal watch failed; exiting");
         }
     }))?;
+    #[cfg(feature = "redis-compat")]
+    drop(resp_shutdown);
     let report = engine.shutdown().context("engine shutdown failed")?;
     tracing::info!(
         workers_joined = report.workers_joined,

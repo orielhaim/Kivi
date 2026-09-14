@@ -76,6 +76,33 @@ enum Command {
         /// Key to inspect.
         key: String,
     },
+    /// Read a byte slice `[offset, offset + len)`.
+    GetRange {
+        /// Key to slice.
+        key: String,
+        /// Start offset.
+        offset: u64,
+        /// Maximum bytes.
+        len: u64,
+    },
+    /// Report the logical byte length (`(nil)` when absent).
+    BytesLength {
+        /// Key to measure.
+        key: String,
+    },
+    /// Conditionally store bytes (`NX`/`XX`/always with expiry policy).
+    SetConditional {
+        /// Key to write.
+        key: String,
+        /// Value to store when the condition holds.
+        value: String,
+        /// Presence condition: `always`, `nx` (absent), `xx` (present).
+        #[arg(long, default_value = "always")]
+        condition: String,
+        /// Expiry policy: `clear`, `keep`, or `at:<micros>`.
+        #[arg(long, default_value = "clear")]
+        expiry: String,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -142,6 +169,49 @@ fn run(client: &NativeClient, command: &Command) -> Result<(), kivi_client::Clie
                 }
             },
         },
+        Command::GetRange { key, offset, len } => {
+            match client.get_range(&Key::from(key.clone()), *offset, *len)? {
+                Some(value) => println!("{}", String::from_utf8_lossy(&value)),
+                None => println!("(nil)"),
+            }
+        }
+        Command::BytesLength { key } => match client.bytes_length(&Key::from(key.clone()))? {
+            Some(len) => println!("{len}"),
+            None => println!("(nil)"),
+        },
+        Command::SetConditional {
+            key,
+            value,
+            condition,
+            expiry,
+        } => {
+            let condition = match condition.as_str() {
+                "always" => kivi_state::SetCondition::Always,
+                "nx" => kivi_state::SetCondition::IfAbsent,
+                "xx" => kivi_state::SetCondition::IfPresent,
+                _ => return Err(kivi_client::ClientError::InvalidRequest),
+            };
+            let expiry = match expiry.strip_prefix("at:") {
+                Some(stamp) => {
+                    let Ok(micros) = stamp.parse::<u64>() else {
+                        return Err(kivi_client::ClientError::InvalidRequest);
+                    };
+                    kivi_state::ExpiryPolicy::ExpireAt(UnixMicros::from_micros(micros))
+                }
+                None => match expiry.as_str() {
+                    "clear" => kivi_state::ExpiryPolicy::Clear,
+                    "keep" => kivi_state::ExpiryPolicy::Keep,
+                    _ => return Err(kivi_client::ClientError::InvalidRequest),
+                },
+            };
+            let (applied, _) = client.set_conditional(
+                &Key::from(key.clone()),
+                Bytes::from(value.clone()),
+                condition,
+                expiry,
+            )?;
+            println!("{}", if applied { "OK" } else { "(nil)" });
+        }
     }
     Ok(())
 }

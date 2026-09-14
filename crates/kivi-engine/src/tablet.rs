@@ -221,6 +221,9 @@ fn opcode_for(mutation: &Mutation, is_persist_expiry: bool) -> u8 {
         // shapes `Stored{version}` either way (see `operation_opcode`).
         // Range patches answer the same `Stored{version}` shape.
         Mutation::PutBytes { .. } | Mutation::ReplaceChunkedRoot { .. } => Opcode::Set,
+        Mutation::PutBytesWithExpiry { .. } | Mutation::ReplaceChunkedRootWithExpiry { .. } => {
+            Opcode::SetConditional
+        }
         Mutation::SpliceBytes { .. } => Opcode::SetRange,
         Mutation::Delete { .. } => Opcode::Delete,
         Mutation::CounterAdd { .. } => Opcode::CounterAdd,

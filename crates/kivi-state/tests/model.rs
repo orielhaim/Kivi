@@ -156,13 +156,13 @@ impl RefStore {
     }
 
     /// Independent spelling of the splice: absent state reads as empty,
-    /// counters reject, past-the-end gaps zero-pad, and the stored result
-    /// clears expiry like `Set`.
+    /// counters reject, past-the-end gaps zero-pad, and the live expiry
+    /// survives (partial writes never touch the TTL).
     fn splice(&mut self, key: &[u8], offset: u64, patch: &[u8], now: u64) -> Result<Out, RefErr> {
-        let base = match self.live(key, now) {
-            None => Vec::new(),
+        let (base, expiry) = match self.live(key, now) {
+            None => (Vec::new(), None),
             Some(obj) => match obj.kind {
-                RefKind::Bytes => obj.bytes.clone(),
+                RefKind::Bytes => (obj.bytes.clone(), obj.expiry),
                 RefKind::Counter => return Err(RefErr::WrongType),
             },
         };
@@ -183,7 +183,7 @@ impl RefStore {
                 bytes: spliced,
                 int: 0,
                 version,
-                expiry: None,
+                expiry,
             },
         );
         Ok(Out::Stored(version))
@@ -230,6 +230,8 @@ enum Out {
     ExpSet(bool),
     ExpPer(bool),
     Exp(ExpState),
+    Len(Option<u64>),
+    Cond(bool, Option<u64>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -367,6 +369,10 @@ fn norm_result(result: &OperationResult, registry: &BTreeMap<[u8; 32], Vec<u8>>)
                 Some(stamp) => ExpState::At(kivi_types::UnixMicros::as_micros(stamp)),
             },
         }),
+        OperationResult::Length(value) => Out::Len(*value),
+        OperationResult::ConditionalSet { applied, version } => {
+            Out::Cond(*applied, version.map(kivi_state::ObjectVersion::as_u64))
+        }
     }
 }
 

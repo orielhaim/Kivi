@@ -59,12 +59,13 @@ pub enum Mutation {
         logical_len: u64,
     },
     /// Patch a byte range of `key`'s value at `offset` with `patch`,
-    /// zero-padding past-the-end gaps (Redis `SETRANGE` semantics) and
-    /// clearing expiry, exactly like [`PutBytes`](Self::PutBytes). The
-    /// tablet layer only admits this against absent, expired, or inline
-    /// bases whose patched result stays within the legacy inline bound;
-    /// chunked bases are resolved and restaged by the engine first, so
-    /// apply meets no chunk reference it cannot read. Replay is
+    /// zero-padding past-the-end gaps (Redis `SETRANGE` semantics). Unlike
+    /// [`PutBytes`](Self::PutBytes), a splice preserves the live expiry:
+    /// partial writes touch bytes, never the TTL. The tablet layer only
+    /// admits this against absent, expired, or inline bases whose patched
+    /// result stays within the legacy inline bound; chunked bases are
+    /// resolved and restaged by the engine first (with the preserved
+    /// expiry), so apply meets no chunk reference it cannot read. Replay is
     /// deterministic: the same ordered state yields the same base, hence
     /// the same splice.
     SpliceBytes {
@@ -74,6 +75,33 @@ pub enum Mutation {
         offset: u64,
         /// Bytes written starting at `offset`.
         patch: bytes::Bytes,
+    },
+    /// Store bytes under `key` with an explicit expiry, produced only by
+    /// conditional sets whose policy resolved to a concrete stamp at
+    /// preparation time (`Clear` resolves to `NEVER`, `Keep` to the live
+    /// expiry or `NEVER`, `ExpireAt` to its stamp). Overwrites any type.
+    /// The expiry rides in the mutation so replay applies the same stamp
+    /// without re-reading state.
+    PutBytesWithExpiry {
+        /// Target key.
+        key: Key,
+        /// Value to store.
+        value: bytes::Bytes,
+        /// Resolved expiry to attach.
+        expiry: Expiry,
+    },
+    /// Point `key` at a chunked value with an explicit expiry: the chunked
+    /// spelling of [`PutBytesWithExpiry`](Self::PutBytesWithExpiry) for
+    /// conditional stores whose staged value exceeded the inline bound.
+    ReplaceChunkedRootWithExpiry {
+        /// Target key.
+        key: Key,
+        /// Manifest addressing the immutable chunk sequence.
+        manifest: ManifestId,
+        /// Total logical bytes across the manifest.
+        logical_len: u64,
+        /// Resolved expiry to attach.
+        expiry: Expiry,
     },
 }
 
@@ -87,6 +115,10 @@ const TAG_SET_EXPIRY: u8 = 4;
 const TAG_REPLACE_CHUNKED_ROOT: u8 = 5;
 /// Byte-range splice mutation tag. New tags never reuse old ones.
 const TAG_SPLICE_BYTES: u8 = 6;
+/// Conditional inline-store mutation tag. New tags never reuse old ones.
+const TAG_PUT_BYTES_WITH_EXPIRY: u8 = 7;
+/// Conditional chunked-root mutation tag. New tags never reuse old ones.
+const TAG_REPLACE_CHUNKED_ROOT_WITH_EXPIRY: u8 = 8;
 
 impl Mutation {
     /// Returns the single key this mutation touches. Every mutation in
@@ -101,7 +133,9 @@ impl Mutation {
             | Self::CounterAdd { key, .. }
             | Self::SetExpiry { key, .. }
             | Self::ReplaceChunkedRoot { key, .. }
-            | Self::SpliceBytes { key, .. } => key,
+            | Self::SpliceBytes { key, .. }
+            | Self::PutBytesWithExpiry { key, .. }
+            | Self::ReplaceChunkedRootWithExpiry { key, .. } => key,
         }
     }
 
@@ -149,6 +183,48 @@ impl Mutation {
                 offset: *offset,
                 patch: patch.clone(),
             },
+            Self::PutBytesWithExpiry { key, value, expiry } => {
+                let policy = if *expiry == kivi_types::Expiry::NEVER {
+                    crate::ops::ExpiryPolicy::Clear
+                } else {
+                    crate::ops::ExpiryPolicy::ExpireAt(
+                        expiry
+                            .as_stamp()
+                            .unwrap_or(kivi_types::UnixMicros::from_micros(0)),
+                    )
+                };
+                Operation::SetConditional {
+                    key: key.clone(),
+                    value: value.clone(),
+                    condition: crate::ops::SetCondition::Always,
+                    expiry: policy,
+                }
+            }
+            Self::ReplaceChunkedRootWithExpiry {
+                key,
+                manifest: _,
+                logical_len: _,
+                expiry,
+            } => {
+                let policy = if *expiry == kivi_types::Expiry::NEVER {
+                    crate::ops::ExpiryPolicy::Clear
+                } else {
+                    crate::ops::ExpiryPolicy::ExpireAt(
+                        expiry
+                            .as_stamp()
+                            .unwrap_or(kivi_types::UnixMicros::from_micros(0)),
+                    )
+                };
+                // Chunked conditional roots replay through the same
+                // conditional shape; the manifest itself is the mutation's
+                // truth, the operation is only the replay-mapping key.
+                Operation::SetConditional {
+                    key: key.clone(),
+                    value: bytes::Bytes::new(),
+                    condition: crate::ops::SetCondition::Always,
+                    expiry: policy,
+                }
+            }
         }
     }
 }
@@ -162,6 +238,12 @@ impl Encode for Mutation {
             Self::SetExpiry { key, expiry } => 1 + (4 + key.len()) + expiry.encoded_len(),
             Self::ReplaceChunkedRoot { key, .. } => 1 + (4 + key.len()) + 32 + 8,
             Self::SpliceBytes { key, patch, .. } => 1 + (4 + key.len()) + 8 + (4 + patch.len()),
+            Self::PutBytesWithExpiry { key, value, expiry } => {
+                1 + (4 + key.len()) + (4 + value.len()) + expiry.encoded_len()
+            }
+            Self::ReplaceChunkedRootWithExpiry { key, expiry, .. } => {
+                1 + (4 + key.len()) + 32 + 8 + expiry.encoded_len()
+            }
         }
     }
 
@@ -202,11 +284,30 @@ impl Encode for Mutation {
                 offset.encode(out);
                 encode_bytes(out, patch);
             }
+            Self::PutBytesWithExpiry { key, value, expiry } => {
+                out.push(TAG_PUT_BYTES_WITH_EXPIRY);
+                encode_bytes(out, key.as_bytes());
+                encode_bytes(out, value);
+                expiry.encode(out);
+            }
+            Self::ReplaceChunkedRootWithExpiry {
+                key,
+                manifest,
+                logical_len,
+                expiry,
+            } => {
+                out.push(TAG_REPLACE_CHUNKED_ROOT_WITH_EXPIRY);
+                encode_bytes(out, key.as_bytes());
+                out.extend_from_slice(manifest.as_bytes());
+                logical_len.encode(out);
+                expiry.encode(out);
+            }
         }
     }
 }
 
 impl Decode for Mutation {
+    #[allow(clippy::too_many_lines)]
     fn decode(input: &[u8]) -> Result<(Self, usize), CodecError> {
         let (tag, first) = u8::decode(input)?;
         match tag {
@@ -276,6 +377,34 @@ impl Decode for Mutation {
                         patch: bytes::Bytes::from(patch),
                     },
                     first + second + third + fourth,
+                ))
+            }
+            TAG_PUT_BYTES_WITH_EXPIRY => {
+                let (key, second) = decode_byte_vec(&input[first..])?;
+                let (value, third) = decode_byte_vec(&input[first + second..])?;
+                let (expiry, fourth) = Expiry::decode(&input[first + second + third..])?;
+                Ok((
+                    Self::PutBytesWithExpiry {
+                        key: Key::from(key),
+                        value: bytes::Bytes::from(value),
+                        expiry,
+                    },
+                    first + second + third + fourth,
+                ))
+            }
+            TAG_REPLACE_CHUNKED_ROOT_WITH_EXPIRY => {
+                let (key, second) = decode_byte_vec(&input[first..])?;
+                let (raw, third) = <[u8; 32]>::decode(&input[first + second..])?;
+                let (logical_len, fourth) = u64::decode(&input[first + second + third..])?;
+                let (expiry, fifth) = Expiry::decode(&input[first + second + third + fourth..])?;
+                Ok((
+                    Self::ReplaceChunkedRootWithExpiry {
+                        key: Key::from(key),
+                        manifest: ManifestId::from_bytes(raw),
+                        logical_len,
+                        expiry,
+                    },
+                    first + second + third + fourth + fifth,
                 ))
             }
             other => Err(CodecError::InvalidTag {
@@ -387,6 +516,22 @@ mod tests {
                 key: key.clone(),
                 offset: u64::MAX,
                 patch: bytes::Bytes::new(),
+            },
+            Mutation::PutBytesWithExpiry {
+                key: key.clone(),
+                value: bytes::Bytes::from_static(b"v"),
+                expiry: Expiry::NEVER,
+            },
+            Mutation::PutBytesWithExpiry {
+                key: key.clone(),
+                value: bytes::Bytes::from_static(b"v"),
+                expiry: Expiry::at(UnixMicros::from_micros(7)),
+            },
+            Mutation::ReplaceChunkedRootWithExpiry {
+                key: key.clone(),
+                manifest: ManifestId::from_bytes([0x33; 32]),
+                logical_len: 11,
+                expiry: Expiry::NEVER,
             },
         ];
         for mutation in cases {

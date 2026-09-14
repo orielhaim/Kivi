@@ -42,14 +42,14 @@ pub enum Operation {
         /// Total logical bytes across the manifest.
         logical_len: u64,
     },
-    /// Patch a byte range of a value (partial update), overwriting any type
-    /// and clearing any expiry on the stored result exactly like
-    /// [`Set`](Self::Set). Against absent or expired state the base is the
-    /// empty string; past-the-end gaps zero-pad (Redis `SETRANGE`
-    /// semantics). Against byte strings the untouched prefix and suffix
-    /// survive; against counters this fails with
-    /// [`WrongType`](OpError::WrongType) without mutation. Large results
-    /// the engine converts to chunked roots at admission, so the store
+    /// Patch a byte range of a value (partial update). Against absent or
+    /// expired state the base is the empty string; past-the-end gaps
+    /// zero-pad (Redis `SETRANGE` semantics). Against byte strings the
+    /// untouched prefix and suffix survive; against counters this fails with
+    /// [`WrongType`](OpError::WrongType) without mutation. Unlike
+    /// [`Set`](Self::Set), a patch preserves the live expiry: it touches
+    /// bytes, never the TTL. Large results the engine converts to chunked
+    /// roots at admission (carrying the preserved expiry), so the store
     /// spells the outcome as whatever representation fits.
     SetRange {
         /// Key to patch.
@@ -99,6 +99,90 @@ pub enum Operation {
         /// Key to inspect.
         key: Key,
     },
+    /// Read a byte slice of a value without materializing the whole object
+    /// on the caller's terms: `[offset, offset + len)` clamped to the
+    /// logical length (empty when `offset` is past the end). Against absent
+    /// or expired state answers `None`; against counters fails with
+    /// [`WrongType`](OpError::WrongType) without mutation. The engine may
+    /// satisfy this from only the required immutable chunks instead of the
+    /// full payload.
+    GetRange {
+        /// Key to slice.
+        key: Key,
+        /// Logical byte index the slice starts at.
+        offset: u64,
+        /// Maximum bytes to return from `offset`.
+        len: u64,
+    },
+    /// Report the logical byte length of a value (`None` when absent).
+    /// Uses logical metadata only: chunked roots answer from the root
+    /// without reading any chunk payload. Counters fail with
+    /// [`WrongType`](OpError::WrongType) without mutation.
+    BytesLength {
+        /// Key to measure.
+        key: Key,
+    },
+    /// Conditionally store bytes, atomically at the owning tablet. The
+    /// condition is evaluated against live state (present and unexpired)
+    /// and the write applies only when it holds; the expiry policy selects
+    /// the stored expiry (`Clear` clears, `Keep` preserves the live expiry
+    /// or stays immortal when absent, `ExpireAt` attaches a stamp). There
+    /// is deliberately no `ReturnPrevious` in this stage: returning the
+    /// previous value would force materialization of arbitrarily large
+    /// chunked payloads into a bounded response.
+    SetConditional {
+        /// Key to write.
+        key: Key,
+        /// Value to store when the condition holds.
+        value: Bytes,
+        /// Presence condition evaluated atomically.
+        condition: SetCondition,
+        /// Expiry policy for the stored object.
+        expiry: ExpiryPolicy,
+    },
+    /// Conditionally store a large byte string by chunk reference: the
+    /// chunked spelling of [`SetConditional`](Self::SetConditional). The
+    /// engine stages every referenced chunk and proves pack durability
+    /// *before* admitting this; the store trusts the reference exactly as
+    /// it trusts an inline value. Produced by large conditional stores the
+    /// engine converts at admission, never by end users directly.
+    SetConditionalChunked {
+        /// Key to write.
+        key: Key,
+        /// Manifest addressing the immutable chunk sequence.
+        manifest: ManifestId,
+        /// Total logical bytes across the manifest.
+        logical_len: u64,
+        /// Presence condition evaluated atomically.
+        condition: SetCondition,
+        /// Expiry policy for the stored object.
+        expiry: ExpiryPolicy,
+    },
+}
+
+/// Presence condition for [`Operation::SetConditional`]: evaluated against
+/// live state (present and unexpired) atomically at the owning tablet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SetCondition {
+    /// Always store (same admission as [`Operation::Set`] plus policy).
+    Always,
+    /// Store only when no live value exists.
+    IfAbsent,
+    /// Store only when a live value exists.
+    IfPresent,
+}
+
+/// Expiry policy for [`Operation::SetConditional`]: a Kivi-owned model,
+/// not Redis `EX`/`PX`/`KEEPTTL` flags (the RESP adapter translates those
+/// onto this).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExpiryPolicy {
+    /// Clear any expiry (same as [`Operation::Set`]).
+    Clear,
+    /// Preserve the live expiry, or stay immortal when creating.
+    Keep,
+    /// Attach this absolute logical timestamp on store.
+    ExpireAt(UnixMicros),
 }
 
 impl Operation {
@@ -118,7 +202,36 @@ impl Operation {
             | Self::CounterAdd { key, .. }
             | Self::ExpireAt { key, .. }
             | Self::PersistExpiry { key }
-            | Self::GetExpiry { key } => key,
+            | Self::GetExpiry { key }
+            | Self::GetRange { key, .. }
+            | Self::BytesLength { key }
+            | Self::SetConditional { key, .. }
+            | Self::SetConditionalChunked { key, .. } => key,
+        }
+    }
+
+    /// Whether this operation can change logical state (and therefore enters
+    /// the WAL in durable mode). Reads never do, whatever their outcome.
+    /// This is the semantic boundary both frontends share: the native wire
+    /// decoder and the RESP adapter meet here, never in opcode bytes.
+    #[must_use]
+    pub const fn is_mutating(&self) -> bool {
+        match self {
+            Self::Set { .. }
+            | Self::SetChunked { .. }
+            | Self::SetRange { .. }
+            | Self::Delete { .. }
+            | Self::CounterAdd { .. }
+            | Self::ExpireAt { .. }
+            | Self::PersistExpiry { .. }
+            | Self::SetConditional { .. }
+            | Self::SetConditionalChunked { .. } => true,
+            Self::Get { .. }
+            | Self::Exists { .. }
+            | Self::CounterGet { .. }
+            | Self::GetExpiry { .. }
+            | Self::GetRange { .. }
+            | Self::BytesLength { .. } => false,
         }
     }
 }
@@ -177,6 +290,16 @@ pub enum OperationResult {
     },
     /// `GetExpiry` answer (`None` when the key is absent).
     Expiry(Option<Expiry>),
+    /// `BytesLength` answer (`None` when the key is absent).
+    Length(Option<u64>),
+    /// `SetConditional` outcome: whether the condition held and the store
+    /// applied. `applied: false` carries no version and mutated nothing.
+    ConditionalSet {
+        /// Whether the condition held and the value was stored.
+        applied: bool,
+        /// Version after the store (`None` when not applied).
+        version: Option<crate::object::ObjectVersion>,
+    },
 }
 
 /// Native operation failure. Reads and validations fail; validated writes
@@ -267,6 +390,10 @@ const TAG_RES_EXPIRY: u8 = 9;
 /// Engine-internal chunked-read marker. New tag, never reused; see the
 /// variant docs for why it never persists.
 const TAG_RES_CHUNKED: u8 = 10;
+/// Logical byte-length answer tag. New tags never reuse old ones.
+const TAG_RES_LENGTH: u8 = 11;
+/// Conditional-set outcome tag. New tags never reuse old ones.
+const TAG_RES_CONDITIONAL_SET: u8 = 12;
 
 impl Encode for OperationResult {
     fn encoded_len(&self) -> usize {
@@ -281,6 +408,8 @@ impl Encode for OperationResult {
             Self::Counter(value) => 1 + 1 + usize::from(value.is_some()) * 8,
             Self::CounterUpdated { .. } => 1 + 8 + 8,
             Self::Expiry(value) => 1 + 1 + value.as_ref().map_or(0, Expiry::encoded_len),
+            Self::Length(value) => 1 + 1 + usize::from(value.is_some()) * 8,
+            Self::ConditionalSet { version, .. } => 1 + 1 + 1 + version.as_ref().map_or(0, |_| 8),
         }
     }
 
@@ -349,11 +478,33 @@ impl Encode for OperationResult {
                 out.extend_from_slice(manifest.as_bytes());
                 logical_len.encode(out);
             }
+            Self::Length(value) => {
+                out.push(TAG_RES_LENGTH);
+                match value {
+                    None => out.push(0),
+                    Some(len) => {
+                        out.push(1);
+                        len.encode(out);
+                    }
+                }
+            }
+            Self::ConditionalSet { applied, version } => {
+                out.push(TAG_RES_CONDITIONAL_SET);
+                applied.encode(out);
+                match version {
+                    None => out.push(0),
+                    Some(version) => {
+                        out.push(1);
+                        version.encode(out);
+                    }
+                }
+            }
         }
     }
 }
 
 impl Decode for OperationResult {
+    #[allow(clippy::too_many_lines)]
     fn decode(input: &[u8]) -> Result<(Self, usize), CodecError> {
         let (tag, first) = u8::decode(input)?;
         match tag {
@@ -427,6 +578,35 @@ impl Decode for OperationResult {
                         logical_len,
                     },
                     first + second + third,
+                ))
+            }
+            TAG_RES_LENGTH => {
+                let (present, second) = bool::decode(&input[first..])?;
+                if !present {
+                    return Ok((Self::Length(None), first + second));
+                }
+                let (len, third) = u64::decode(&input[first + second..])?;
+                Ok((Self::Length(Some(len)), first + second + third))
+            }
+            TAG_RES_CONDITIONAL_SET => {
+                let (applied, second) = bool::decode(&input[first..])?;
+                let (present, third) = bool::decode(&input[first + second..])?;
+                if !present {
+                    return Ok((
+                        Self::ConditionalSet {
+                            applied,
+                            version: None,
+                        },
+                        first + second + third,
+                    ));
+                }
+                let (version, fourth) = ObjectVersion::decode(&input[first + second + third..])?;
+                Ok((
+                    Self::ConditionalSet {
+                        applied,
+                        version: Some(version),
+                    },
+                    first + second + third + fourth,
                 ))
             }
             other => Err(CodecError::InvalidTag {
@@ -530,6 +710,16 @@ pub fn outcome_for(
             | Mutation::SpliceBytes { .. },
             ApplyOutcome::Put { version },
         ) => OperationResult::Stored { version: *version },
+        // Conditional stores answer with their applied flag: the mutation
+        // only exists when the condition held, so reaching here means
+        // applied with the new version.
+        (
+            Mutation::PutBytesWithExpiry { .. } | Mutation::ReplaceChunkedRootWithExpiry { .. },
+            ApplyOutcome::Put { version },
+        ) => OperationResult::ConditionalSet {
+            applied: true,
+            version: Some(*version),
+        },
         (Mutation::Delete { .. }, ApplyOutcome::Deleted { existed }) => {
             OperationResult::Deleted { existed: *existed }
         }
@@ -593,6 +783,16 @@ mod tests {
             UnixMicros::from_micros(99),
         ))));
         round_trip(&OperationResult::Expiry(Some(Expiry::NEVER)));
+        round_trip(&OperationResult::Length(None));
+        round_trip(&OperationResult::Length(Some(41)));
+        round_trip(&OperationResult::ConditionalSet {
+            applied: false,
+            version: None,
+        });
+        round_trip(&OperationResult::ConditionalSet {
+            applied: true,
+            version: Some(version),
+        });
     }
 
     #[test]
@@ -659,7 +859,7 @@ mod tests {
         assert_eq!(
             outcome_for(
                 &Mutation::SetExpiry {
-                    key,
+                    key: key.clone(),
                     expiry: Expiry::at(UnixMicros::from_micros(5)),
                 },
                 &ApplyOutcome::Expiry {
@@ -670,5 +870,209 @@ mod tests {
             ),
             OperationResult::ExpirySet { applied: true }
         );
+        assert_eq!(
+            outcome_for(
+                &Mutation::PutBytesWithExpiry {
+                    key: key.clone(),
+                    value: Bytes::from_static(b"v"),
+                    expiry: Expiry::NEVER,
+                },
+                &ApplyOutcome::Put { version },
+                false,
+            ),
+            OperationResult::ConditionalSet {
+                applied: true,
+                version: Some(version),
+            }
+        );
+        assert_eq!(
+            outcome_for(
+                &Mutation::ReplaceChunkedRootWithExpiry {
+                    key,
+                    manifest: ManifestId::from_bytes([0x11; 32]),
+                    logical_len: 9,
+                    expiry: Expiry::NEVER,
+                },
+                &ApplyOutcome::Put { version },
+                false,
+            ),
+            OperationResult::ConditionalSet {
+                applied: true,
+                version: Some(version),
+            }
+        );
+    }
+
+    #[test]
+    fn conditional_sets_evaluate_atomically_with_policies() {
+        use crate::store::ObjectStore;
+        let now = UnixMicros::from_micros(1_000_000);
+        let mut store = ObjectStore::new();
+        let key = Key::from("k");
+        // IfAbsent stores on missing.
+        match store
+            .prepare(
+                &Operation::SetConditional {
+                    key: key.clone(),
+                    value: Bytes::from_static(b"v1"),
+                    condition: SetCondition::IfAbsent,
+                    expiry: ExpiryPolicy::Clear,
+                },
+                now,
+            )
+            .expect("prepare")
+        {
+            crate::store::Prepared::Write(mutation) => {
+                store.apply(&mutation, now).expect("apply");
+            }
+            crate::store::Prepared::Read(_) => panic!("IfAbsent on missing must write"),
+        }
+        // IfAbsent refuses when present without mutating the version.
+        match store
+            .prepare(
+                &Operation::SetConditional {
+                    key: key.clone(),
+                    value: Bytes::from_static(b"v2"),
+                    condition: SetCondition::IfAbsent,
+                    expiry: ExpiryPolicy::Clear,
+                },
+                now,
+            )
+            .expect("prepare")
+        {
+            crate::store::Prepared::Read(OperationResult::ConditionalSet { applied, .. }) => {
+                assert!(!applied);
+            }
+            _ => panic!("IfAbsent on present must not apply"),
+        }
+        // IfPresent stores and Keep preserves a dated expiry.
+        let deadline = UnixMicros::from_micros(9_000_000);
+        match store
+            .prepare(
+                &Operation::ExpireAt {
+                    key: key.clone(),
+                    expires_at: deadline,
+                },
+                now,
+            )
+            .expect("prepare")
+        {
+            crate::store::Prepared::Write(mutation) => {
+                store.apply(&mutation, now).expect("apply");
+            }
+            crate::store::Prepared::Read(_) => panic!("expire must write"),
+        }
+        match store
+            .prepare(
+                &Operation::SetConditional {
+                    key: key.clone(),
+                    value: Bytes::from_static(b"v3"),
+                    condition: SetCondition::IfPresent,
+                    expiry: ExpiryPolicy::Keep,
+                },
+                now,
+            )
+            .expect("prepare")
+        {
+            crate::store::Prepared::Write(mutation) => {
+                store.apply(&mutation, now).expect("apply");
+            }
+            crate::store::Prepared::Read(_) => panic!("IfPresent on present must write"),
+        }
+        match store
+            .prepare(&Operation::GetExpiry { key: key.clone() }, now)
+            .expect("prepare")
+        {
+            crate::store::Prepared::Read(OperationResult::Expiry(Some(expiry))) => {
+                assert_eq!(expiry, Expiry::at(deadline));
+            }
+            _ => panic!("Keep must preserve the deadline"),
+        }
+    }
+
+    #[test]
+    fn ranges_slice_and_measure_without_payload_reads() {
+        use crate::store::ObjectStore;
+        let now = UnixMicros::from_micros(1_000_000);
+        let mut store = ObjectStore::new();
+        let key = Key::from("k");
+        // Missing reads answer absent.
+        match store
+            .prepare(
+                &Operation::GetRange {
+                    key: key.clone(),
+                    offset: 0,
+                    len: 4,
+                },
+                now,
+            )
+            .expect("prepare")
+        {
+            crate::store::Prepared::Read(OperationResult::Value(None)) => {}
+            _ => panic!("missing range must be None"),
+        }
+        match store
+            .prepare(&Operation::BytesLength { key: key.clone() }, now)
+            .expect("prepare")
+        {
+            crate::store::Prepared::Read(OperationResult::Length(None)) => {}
+            _ => panic!("missing length must be None"),
+        }
+        match store
+            .prepare(
+                &Operation::Set {
+                    key: key.clone(),
+                    value: Bytes::from_static(b"hello"),
+                },
+                now,
+            )
+            .expect("prepare")
+        {
+            crate::store::Prepared::Write(mutation) => {
+                store.apply(&mutation, now).expect("apply");
+            }
+            crate::store::Prepared::Read(_) => panic!("set must write"),
+        }
+        match store
+            .prepare(
+                &Operation::GetRange {
+                    key: key.clone(),
+                    offset: 1,
+                    len: 3,
+                },
+                now,
+            )
+            .expect("prepare")
+        {
+            crate::store::Prepared::Read(OperationResult::Value(Some(bytes))) => {
+                assert_eq!(&bytes[..], b"ell");
+            }
+            _ => panic!("range must slice"),
+        }
+        match store
+            .prepare(
+                &Operation::GetRange {
+                    key: key.clone(),
+                    offset: 99,
+                    len: 4,
+                },
+                now,
+            )
+            .expect("prepare")
+        {
+            crate::store::Prepared::Read(OperationResult::Value(Some(bytes))) => {
+                assert!(bytes.is_empty());
+            }
+            _ => panic!("past-the-end range must be empty"),
+        }
+        match store
+            .prepare(&Operation::BytesLength { key }, now)
+            .expect("prepare")
+        {
+            crate::store::Prepared::Read(OperationResult::Length(Some(len))) => {
+                assert_eq!(len, 5);
+            }
+            _ => panic!("length must measure"),
+        }
     }
 }

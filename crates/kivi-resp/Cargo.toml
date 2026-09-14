@@ -1,0 +1,18 @@
+[package]
+name = "kivi-resp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+kivi-types.workspace = true
+kivi-state.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+redis-protocol = { version = "6.0.0", default-features = false, features = ["std", "bytes", "resp2", "resp3"] }
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

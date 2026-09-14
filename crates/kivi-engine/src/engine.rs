@@ -1585,6 +1585,14 @@ impl LocalClient {
     /// method below keeps its plain-bytes contract whatever the physical
     /// representation is.
     fn execute(&self, key: &Key, op: Operation) -> Result<OperationResult, EngineError> {
+        // `GetRange` over a chunked root resolves through the lane and
+        // then slices: the store names the reference, this layer applies
+        // the caller's window (a future lane range-read will fetch only
+        // the required chunks instead of the full payload).
+        let range = match &op {
+            Operation::GetRange { offset, len, .. } => Some((*offset, *len)),
+            _ => None,
+        };
         let routing = self.shared.routing.load();
         let hash = PartitionHasher::V1
             .hash(self.shared.namespace, key.as_bytes())
@@ -1626,7 +1634,12 @@ impl LocalClient {
                 logical_len,
             } => {
                 let bytes = lane.read_value_blocking(manifest, logical_len)?;
-                Ok(OperationResult::Value(Some(bytes)))
+                match range {
+                    None => Ok(OperationResult::Value(Some(bytes))),
+                    Some((offset, len)) => Ok(OperationResult::Value(Some(
+                        kivi_state::slice_range(&bytes, offset, len),
+                    ))),
+                }
             }
             other => Ok(other),
         }
@@ -1674,13 +1687,13 @@ impl LocalClient {
         }
     }
 
-    /// Patches a byte range of a value (partial update), overwriting any
-    /// type and clearing expiry on the stored result exactly like
-    /// [`set`](Self::set). Against absent state the base reads as empty;
-    /// past-the-end gaps zero-pad; counters fail with wrong-type. Large
-    /// results and chunked bases restage through the chunk lane, so the
-    /// patch itself stays small — bulk rewrites belong on the streaming
-    /// upload path instead.
+    /// Patches a byte range of a value (partial update). Against absent
+    /// state the base reads as empty; past-the-end gaps zero-pad; counters
+    /// fail with wrong-type. The live expiry survives (unlike
+    /// [`set`](Self::set)): partial writes touch bytes, never the TTL.
+    /// Large results and chunked bases restage through the chunk lane (also
+    /// preserving expiry), so the patch itself stays small — bulk rewrites
+    /// belong on the streaming upload path instead.
     ///
     /// # Errors
     ///
@@ -1701,7 +1714,11 @@ impl LocalClient {
                 patch,
             },
         )? {
-            OperationResult::Stored { .. } => Ok(()),
+            // Restaged range writes (large results, chunked bases) execute
+            // as conditional/chunked ops internally; `Always` always
+            // applies, so this is the same stored outcome in disguise.
+            OperationResult::Stored { .. }
+            | OperationResult::ConditionalSet { applied: true, .. } => Ok(()),
             unexpected => panic!("set-range contract violated: {unexpected:?}"),
         }
     }
@@ -1843,6 +1860,91 @@ impl LocalClient {
         match self.execute(key, Operation::GetExpiry { key: key.clone() })? {
             OperationResult::Expiry(expiry) => Ok(expiry),
             unexpected => panic!("get_expiry contract violated: {unexpected:?}"),
+        }
+    }
+
+    /// Reads a byte slice `[offset, offset + len)` clamped to the logical
+    /// length (`None` when absent; possibly empty when past the end).
+    /// Chunked roots resolve through the lane before slicing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError`] on routing/transport failure or wrong-type access.
+    ///
+    /// # Panics
+    ///
+    /// Panics if tablet execution returns an outcome shape that cannot result
+    /// from the issued operation (an internal contract violation, never a
+    /// runtime condition).
+    pub fn get_range(
+        &self,
+        key: &Key,
+        offset: u64,
+        len: u64,
+    ) -> Result<Option<Bytes>, EngineError> {
+        match self.execute(
+            key,
+            Operation::GetRange {
+                key: key.clone(),
+                offset,
+                len,
+            },
+        )? {
+            OperationResult::Value(value) => Ok(value),
+            unexpected => panic!("get_range contract violated: {unexpected:?}"),
+        }
+    }
+
+    /// Reports the logical byte length (`None` when absent). Chunked roots
+    /// answer from metadata without reading chunk payloads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError`] on routing/transport failure or wrong-type access.
+    ///
+    /// # Panics
+    ///
+    /// Panics if tablet execution returns an outcome shape that cannot result
+    /// from the issued operation (an internal contract violation, never a
+    /// runtime condition).
+    pub fn bytes_length(&self, key: &Key) -> Result<Option<u64>, EngineError> {
+        match self.execute(key, Operation::BytesLength { key: key.clone() })? {
+            OperationResult::Length(value) => Ok(value),
+            unexpected => panic!("bytes_length contract violated: {unexpected:?}"),
+        }
+    }
+
+    /// Conditionally stores bytes, atomically at the owning tablet.
+    /// Returns `(applied, version)`: `applied` names whether the condition
+    /// held, `version` the new version when applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError`] on routing/transport failure.
+    ///
+    /// # Panics
+    ///
+    /// Panics if tablet execution returns an outcome shape that cannot result
+    /// from the issued operation (an internal contract violation, never a
+    /// runtime condition).
+    pub fn set_conditional(
+        &self,
+        key: &Key,
+        value: Bytes,
+        condition: kivi_state::SetCondition,
+        expiry: kivi_state::ExpiryPolicy,
+    ) -> Result<(bool, Option<kivi_state::ObjectVersion>), EngineError> {
+        match self.execute(
+            key,
+            Operation::SetConditional {
+                key: key.clone(),
+                value,
+                condition,
+                expiry,
+            },
+        )? {
+            OperationResult::ConditionalSet { applied, version } => Ok((applied, version)),
+            unexpected => panic!("set_conditional contract violated: {unexpected:?}"),
         }
     }
 }

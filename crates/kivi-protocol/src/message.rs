@@ -89,6 +89,13 @@ pub enum Opcode {
     /// Fetch a value as a stream (`ValueStream*` frames) instead of one
     /// response frame. Large reads never build giant frames either side.
     GetStream = 11,
+    /// Read a byte slice `[offset, offset + len)` clamped to the length.
+    GetRange = 12,
+    /// Report the logical byte length without reading chunk payloads.
+    BytesLength = 13,
+    /// Conditionally store bytes with a Kivi-owned presence condition and
+    /// expiry policy (atomic at the owning tablet).
+    SetConditional = 14,
 }
 
 impl Opcode {
@@ -107,6 +114,9 @@ impl Opcode {
             9 => Some(Self::GetExpiry),
             10 => Some(Self::SetRange),
             11 => Some(Self::GetStream),
+            12 => Some(Self::GetRange),
+            13 => Some(Self::BytesLength),
+            14 => Some(Self::SetConditional),
             _ => None,
         }
     }
@@ -129,6 +139,7 @@ impl Opcode {
                 | Self::ExpireAt
                 | Self::PersistExpiry
                 | Self::SetRange
+                | Self::SetConditional
         )
     }
 }
@@ -147,6 +158,9 @@ impl core::fmt::Display for Opcode {
             Self::GetExpiry => write!(f, "get-expiry"),
             Self::SetRange => write!(f, "set-range"),
             Self::GetStream => write!(f, "get-stream"),
+            Self::GetRange => write!(f, "get-range"),
+            Self::BytesLength => write!(f, "bytes-length"),
+            Self::SetConditional => write!(f, "set-conditional"),
         }
     }
 }
@@ -382,6 +396,20 @@ pub struct ServerHello {
     pub endpoints: Vec<(WorkerId, String)>,
 }
 
+/// Wire values for [`kivi_state::SetCondition`] on `SetConditional`.
+pub const COND_ALWAYS: u8 = 0;
+/// Wire values for [`kivi_state::SetCondition`] on `SetConditional`.
+pub const COND_IF_ABSENT: u8 = 1;
+/// Wire values for [`kivi_state::SetCondition`] on `SetConditional`.
+pub const COND_IF_PRESENT: u8 = 2;
+
+/// Wire values for [`kivi_state::ExpiryPolicy`] on `SetConditional`.
+pub const EXPIRY_CLEAR: u8 = 0;
+/// Wire values for [`kivi_state::ExpiryPolicy`] on `SetConditional`.
+pub const EXPIRY_KEEP: u8 = 1;
+/// Wire values for [`kivi_state::ExpiryPolicy`] on `SetConditional`.
+pub const EXPIRY_AT: u8 = 2;
+
 /// One typed native request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
@@ -397,11 +425,22 @@ pub struct Request {
     pub value: Option<Vec<u8>>,
     /// Addend (meaningful for `CounterAdd` only).
     pub delta: i64,
-    /// Absolute expiry micros (meaningful for `ExpireAt` only).
+    /// Absolute expiry micros (meaningful for `ExpireAt` only, and for
+    /// `SetConditional` when its expiry policy is `ExpireAt`).
     pub expiry: u64,
     /// Patch offset (meaningful for `SetRange` only): the logical byte
     /// index the patch overwrites from, zero-padding past the end.
+    /// Reused as the slice start for `GetRange`.
     pub offset: u64,
+    /// Slice length (meaningful for `GetRange` only): maximum bytes to
+    /// return from `offset`.
+    pub len: u64,
+    /// Presence condition (meaningful for `SetConditional` only):
+    /// [`COND_ALWAYS`], [`COND_IF_ABSENT`], or [`COND_IF_PRESENT`].
+    pub condition: u8,
+    /// Expiry policy (meaningful for `SetConditional` only):
+    /// [`EXPIRY_CLEAR`], [`EXPIRY_KEEP`], or [`EXPIRY_AT`] (with `expiry`).
+    pub expiry_policy: u8,
     /// Retry identity for mutating opcodes (`None` for reads and for
     /// clients that predate durable dedup). Durable servers require it on
     /// every mutating request; ephemeral servers ignore it.
@@ -415,7 +454,9 @@ impl Request {
     /// Translates into the project-owned typed operation. Total: every
     /// decodable request maps to exactly one operation.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn into_operation(self) -> Operation {
+        use kivi_state::{ExpiryPolicy, SetCondition};
         let key = Key::from(self.key);
         match self.opcode {
             // A stream read executes the same read as `Get`; the opcode
@@ -445,6 +486,30 @@ impl Request {
                 offset: self.offset,
                 patch: bytes::Bytes::from(self.value.unwrap_or_default()),
             },
+            Opcode::GetRange => Operation::GetRange {
+                key,
+                offset: self.offset,
+                len: self.len,
+            },
+            Opcode::BytesLength => Operation::BytesLength { key },
+            Opcode::SetConditional => {
+                let condition = match self.condition {
+                    COND_IF_ABSENT => SetCondition::IfAbsent,
+                    COND_IF_PRESENT => SetCondition::IfPresent,
+                    _ => SetCondition::Always,
+                };
+                let expiry = match self.expiry_policy {
+                    EXPIRY_KEEP => ExpiryPolicy::Keep,
+                    EXPIRY_AT => ExpiryPolicy::ExpireAt(UnixMicros::from_micros(self.expiry)),
+                    _ => ExpiryPolicy::Clear,
+                };
+                Operation::SetConditional {
+                    key,
+                    value: bytes::Bytes::from(self.value.unwrap_or_default()),
+                    condition,
+                    expiry,
+                }
+            }
         }
     }
 }
@@ -469,6 +534,11 @@ pub fn operation_opcode(operation: &Operation) -> Opcode {
         Operation::PersistExpiry { .. } => Opcode::PersistExpiry,
         Operation::GetExpiry { .. } => Opcode::GetExpiry,
         Operation::SetRange { .. } => Opcode::SetRange,
+        Operation::GetRange { .. } => Opcode::GetRange,
+        Operation::BytesLength { .. } => Opcode::BytesLength,
+        Operation::SetConditional { .. } | Operation::SetConditionalChunked { .. } => {
+            Opcode::SetConditional
+        }
     }
 }
 
@@ -514,6 +584,15 @@ pub enum ResponseBody {
     ExpiryAt(u64),
     /// The key is live and immortal (no expiry attached).
     ExpiryNever,
+    /// Logical byte length (pairs with `BytesLength`).
+    Length(u64),
+    /// Conditional-store outcome (pairs with `SetConditional`).
+    ConditionalSet {
+        /// Whether the condition held and the value was stored.
+        applied: bool,
+        /// Version after the store (zero when not applied).
+        version: u64,
+    },
     /// Retry directly at the attached authority.
     Redirect(RedirectInfo),
     /// Machine code plus optional human diagnostic (never Rust internals).
@@ -878,13 +957,28 @@ impl Request {
                 push_u64(&mut out, self.offset);
                 push_blob(&mut out, self.value.as_deref().unwrap_or_default());
             }
+            Opcode::GetRange => {
+                push_u64(&mut out, self.offset);
+                push_u64(&mut out, self.len);
+            }
+            Opcode::SetConditional => {
+                push_u8(&mut out, self.condition);
+                push_u8(&mut out, self.expiry_policy);
+                // `expiry` rides only for `EXPIRY_AT`; the other policies
+                // ignore it (zero on encode when unused).
+                if self.expiry_policy == EXPIRY_AT {
+                    push_u64(&mut out, self.expiry);
+                }
+                push_blob(&mut out, self.value.as_deref().unwrap_or_default());
+            }
             Opcode::Get
             | Opcode::Delete
             | Opcode::Exists
             | Opcode::CounterGet
             | Opcode::PersistExpiry
             | Opcode::GetExpiry
-            | Opcode::GetStream => {}
+            | Opcode::GetStream
+            | Opcode::BytesLength => {}
         }
         // Retry identity rides last so pre-identity decoders fail cleanly on
         // length: flag 0 means "no identity, end of request".
@@ -934,6 +1028,9 @@ impl Request {
             delta: 0,
             expiry: 0,
             offset: 0,
+            len: 0,
+            condition: COND_ALWAYS,
+            expiry_policy: EXPIRY_CLEAR,
             identity: None,
             ack_floor: RequestSeq::from_u64(0),
         };
@@ -951,13 +1048,38 @@ impl Request {
                 request.offset = cursor.u64(CONTEXT)?;
                 request.value = Some(cursor.blob(CONTEXT)?.to_vec());
             }
+            Opcode::GetRange => {
+                request.offset = cursor.u64(CONTEXT)?;
+                request.len = cursor.u64(CONTEXT)?;
+            }
+            Opcode::SetConditional => {
+                request.condition = cursor.u8(CONTEXT)?;
+                if !matches!(
+                    request.condition,
+                    COND_ALWAYS | COND_IF_ABSENT | COND_IF_PRESENT
+                ) {
+                    return Err(ProtocolError::Malformed { context: CONTEXT });
+                }
+                request.expiry_policy = cursor.u8(CONTEXT)?;
+                if !matches!(
+                    request.expiry_policy,
+                    EXPIRY_CLEAR | EXPIRY_KEEP | EXPIRY_AT
+                ) {
+                    return Err(ProtocolError::Malformed { context: CONTEXT });
+                }
+                if request.expiry_policy == EXPIRY_AT {
+                    request.expiry = cursor.u64(CONTEXT)?;
+                }
+                request.value = Some(cursor.blob(CONTEXT)?.to_vec());
+            }
             Opcode::Get
             | Opcode::Delete
             | Opcode::Exists
             | Opcode::CounterGet
             | Opcode::PersistExpiry
             | Opcode::GetExpiry
-            | Opcode::GetStream => {}
+            | Opcode::GetStream
+            | Opcode::BytesLength => {}
         }
         // Identity suffix: absent on pre-identity encodings (exact end),
         // otherwise flag 1 plus session/seq/ack. Anything else is malformed.
@@ -1006,6 +1128,11 @@ impl Response {
             ResponseBody::ExpiryNever => {
                 push_u8(&mut out, 0);
             }
+            ResponseBody::Length(len) => push_u64(&mut out, *len),
+            ResponseBody::ConditionalSet { applied, version } => {
+                push_u8(&mut out, u8::from(*applied));
+                push_u64(&mut out, *version);
+            }
             ResponseBody::Redirect(info) => out.extend_from_slice(&info.encode()),
             ResponseBody::Diagnostic(message) => {
                 push_u16(&mut out, u16::try_from(message.len()).unwrap_or(u16::MAX));
@@ -1030,8 +1157,15 @@ impl Response {
             .ok_or(ProtocolError::Malformed { context: CONTEXT })?;
         let body = match status {
             Status::Ok => match opcode {
-                Opcode::Get => ResponseBody::Value(cursor.blob(CONTEXT)?.to_vec()),
+                Opcode::Get | Opcode::GetRange => {
+                    ResponseBody::Value(cursor.blob(CONTEXT)?.to_vec())
+                }
                 Opcode::Set | Opcode::SetRange => ResponseBody::Stored {
+                    version: cursor.u64(CONTEXT)?,
+                },
+                Opcode::BytesLength => ResponseBody::Length(cursor.u64(CONTEXT)?),
+                Opcode::SetConditional => ResponseBody::ConditionalSet {
+                    applied: flag(&mut cursor)?,
                     version: cursor.u64(CONTEXT)?,
                 },
                 // A stream read never completes as a single `Response`
@@ -1063,7 +1197,12 @@ impl Response {
                 },
             },
             Status::NotFound => match opcode {
-                Opcode::Get | Opcode::CounterGet | Opcode::GetExpiry | Opcode::GetStream => {
+                Opcode::Get
+                | Opcode::CounterGet
+                | Opcode::GetExpiry
+                | Opcode::GetStream
+                | Opcode::GetRange
+                | Opcode::BytesLength => {
                     let len = cursor.u16(CONTEXT)? as usize;
                     let bytes = cursor.take(len, CONTEXT)?;
                     ResponseBody::Diagnostic(String::from_utf8_lossy(bytes).into_owned())
@@ -1336,6 +1475,9 @@ mod tests {
             delta: -12,
             expiry: 123_456,
             offset: 77,
+            len: 19,
+            condition: COND_IF_ABSENT,
+            expiry_policy: EXPIRY_AT,
             identity: Some(RequestIdentity::new(
                 kivi_types::SessionId::from_u128(0x00C0_FFEE),
                 RequestSeq::from_u64(41),
@@ -1356,6 +1498,9 @@ mod tests {
     #[case(Opcode::GetExpiry)]
     #[case(Opcode::SetRange)]
     #[case(Opcode::GetStream)]
+    #[case(Opcode::GetRange)]
+    #[case(Opcode::BytesLength)]
+    #[case(Opcode::SetConditional)]
     fn every_operation_round_trips(#[case] opcode: Opcode) {
         let encoded = request(opcode).encode();
         let decoded = Request::decode(&encoded).expect("round trip");
@@ -1385,6 +1530,24 @@ mod tests {
                     panic!("SetRange mistranslated")
                 };
                 assert_eq!(offset, 77);
+            }
+            Opcode::GetRange => {
+                let Operation::GetRange { offset, len, .. } = op else {
+                    panic!("GetRange mistranslated")
+                };
+                assert_eq!(offset, 77);
+                assert_eq!(len, 19);
+            }
+            Opcode::BytesLength => assert!(matches!(op, Operation::BytesLength { .. })),
+            Opcode::SetConditional => {
+                let Operation::SetConditional {
+                    condition, expiry, ..
+                } = op
+                else {
+                    panic!("SetConditional mistranslated")
+                };
+                assert_eq!(condition, kivi_state::SetCondition::IfAbsent);
+                assert!(matches!(expiry, kivi_state::ExpiryPolicy::ExpireAt(_)));
             }
             // GetStream executes the same read as Get; only delivery differs.
             Opcode::GetStream => assert!(matches!(op, Operation::Get { .. })),

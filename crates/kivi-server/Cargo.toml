@@ -12,9 +12,12 @@ path = "src/main.rs"
 name = "kivi-cli"
 path = "src/bin/kivi-cli.rs"
 
-[[bin]]
-name = "kivi-bench"
-path = "src/bin/kivi-bench.rs"
+[features]
+default = []
+# Optional Redis/RESP compatibility edge (default-off). Production serving
+# needs only kivi-resp + redis-protocol; benchmark/reference clients live
+# in kivi-lab and never enter this graph.
+redis-compat = ["dep:kivi-resp"]
 
 [dependencies]
 kivi-types.workspace = true
@@ -25,11 +28,11 @@ kivi-client.workspace = true
 kivi-protocol.workspace = true
 kivi-durability.workspace = true
 kivi-checkpoint.workspace = true
+kivi-resp = { workspace = true, optional = true }
 bytes.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-hdrhistogram.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 axum.workspace = true
@@ -37,9 +40,6 @@ tower.workspace = true
 tower-http.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true
 
 [lints]
 workspace = true

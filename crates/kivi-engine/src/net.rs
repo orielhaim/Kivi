@@ -50,7 +50,7 @@ use kivi_protocol::{
     Request, Response, ServerHello, StreamAbort, StreamBegin, StreamReady, ValueStreamBegin,
     encode_frame,
 };
-use kivi_state::{Key, Operation, OperationResult, PartitionHasher};
+use kivi_state::{ExpiryPolicy, Key, Operation, OperationResult, PartitionHasher, SetCondition};
 use kivi_types::{ClusterId, MutationIdentity, NodeId, NodeIncarnation, TabletId, WorkerId};
 
 use crate::affinity::{AffinityError, AffinityMode, pin_current_thread};
@@ -74,8 +74,13 @@ pub const DEFAULT_TURN_FRAMES: usize = 32;
 pub const DEFAULT_TURN_BYTES: usize = 256 * 1024;
 /// Embedded-path park interval: bounds idle CPU and caps pickup latency
 /// for channel messages on networked workers. `LocalClient` traffic against a
-/// networked worker is an admin/test path (never the fast path), so a short
-/// park is the honest trade: guaranteed reactor progress with no busy spin.
+/// networked worker carries admin calls, tests, and the RESP compatibility
+/// edge (which deliberately reuses local ingress instead of proxying through
+/// the native wire protocol) — never the native fast path, which lives on
+/// the connection tasks and never waits on this timer. 100 µs keeps embedded
+/// pickup latency in the noise while each wake only polls two channels and
+/// a pending flag; the long-term fix is an event-driven wakeup so idle
+/// workers sleep until traffic arrives.
 /// Channel-only workers keep their blocking `select!` loop with zero added
 /// latency; benchmarks of the embedded path use those.
 ///
@@ -83,7 +88,7 @@ pub const DEFAULT_TURN_BYTES: usize = 256 * 1024;
 /// the shorter completion quantum instead so embedded replies track batch
 /// proofs rather than this interval. The quantum only bounds completion
 /// detection, never batching.
-const BRIDGE_PARK_INTERVAL: Duration = Duration::from_millis(10);
+const BRIDGE_PARK_INTERVAL: Duration = Duration::from_micros(100);
 /// Accept-loop shutdown poll interval.
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Startup handshake timeout (bind + runtime creation must report fast).
@@ -534,6 +539,10 @@ struct BridgeStage {
     /// are unknown until the lane replies, so pinning happens at
     /// completion instead of intake).
     pins: Option<Arc<crate::chunk_lane::StagingPins>>,
+    /// Conditional store context (`None` for plain `Set` stages): the
+    /// condition and policy the completion reattaches as
+    /// `SetConditionalChunked`.
+    conditional: Option<(kivi_state::SetCondition, kivi_state::ExpiryPolicy)>,
 }
 
 /// Embedded intake on the reactor bridge: inline ops serve synchronously
@@ -606,6 +615,43 @@ fn bridge_intake(
                     reply,
                     pinned,
                     pins: None,
+                    conditional: None,
+                }),
+                Err(error) => {
+                    let mut snapshot = metrics.get();
+                    snapshot.channel_ops += 1;
+                    metrics.set(snapshot);
+                    let _ = respond.try_send(Err(WorkerRequestError::ChunkStore(error)));
+                }
+            }
+        }
+        crate::chunk_lane::LargeSetSplit::StageConditional {
+            key,
+            value,
+            condition,
+            expiry,
+        } => {
+            let pinned =
+                match crate::chunk_lane::PinnedUpload::begin(&chunks.pins, chunks.domain, &value) {
+                    Ok(pinned) => Some(pinned),
+                    Err(error) => {
+                        let mut snapshot = metrics.get();
+                        snapshot.channel_ops += 1;
+                        metrics.set(snapshot);
+                        let _ = respond.try_send(Err(WorkerRequestError::ChunkStore(error)));
+                        return;
+                    }
+                };
+            match chunks.lane.submit_stage(value) {
+                Ok(reply) => frontier.push_back(BridgeStage {
+                    tablet,
+                    key,
+                    identity,
+                    respond,
+                    reply,
+                    pinned,
+                    pins: None,
+                    conditional: Some((condition, expiry)),
                 }),
                 Err(error) => {
                     let mut snapshot = metrics.get();
@@ -656,7 +702,17 @@ fn bridge_plan_range(
             (None, Some(respond))
         }
         crate::chunk_lane::SetRangePlan::RestageSet { key, value } => {
-            (Some(Operation::Set { key, value }), Some(respond))
+            // Restaged patches keep the conditional/Keep spelling so a
+            // large result preserves expiry exactly like the inline splice.
+            (
+                Some(Operation::SetConditional {
+                    key,
+                    value,
+                    condition: SetCondition::Always,
+                    expiry: ExpiryPolicy::Keep,
+                }),
+                Some(respond),
+            )
         }
         crate::chunk_lane::SetRangePlan::Splice {
             key,
@@ -677,6 +733,7 @@ fn bridge_plan_range(
                     reply,
                     pinned: None,
                     pins: Some(Arc::clone(&chunks.pins)),
+                    conditional: Some((SetCondition::Always, ExpiryPolicy::Keep)),
                 });
                 (None, None)
             }
@@ -735,14 +792,21 @@ fn poll_bridge_stages(
                     .as_ref()
                     .map(|pins| crate::chunk_lane::PinnedUpload::staged(pins, &proof))
                     .or(staged.pinned);
-                (
-                    Operation::SetChunked {
+                let op = match staged.conditional {
+                    None => Operation::SetChunked {
                         key: staged.key,
                         manifest: proof.manifest,
                         logical_len: proof.logical_len,
                     },
-                    pinned,
-                )
+                    Some((condition, expiry)) => Operation::SetConditionalChunked {
+                        key: staged.key,
+                        manifest: proof.manifest,
+                        logical_len: proof.logical_len,
+                        condition,
+                        expiry,
+                    },
+                };
+                (op, pinned)
             }
         };
         let now = SystemClock::wall_now();
@@ -881,6 +945,12 @@ struct OutboxEntry {
     /// Whether this was a `GetStream` read: completions answer with
     /// `ValueStream*` frames instead of a single `Response`.
     streamed: bool,
+    /// `GetRange` window (`None` for every other opcode): applied after
+    /// a chunked root resolves, so range reads never materialize more
+    /// than the window on the wire (the full payload still resolves
+    /// first in this stage; a future lane range-read will fetch only the
+    /// required chunks).
+    range: Option<(u64, u64)>,
     receive: crossbeam_channel::Receiver<crate::worker::WorkerResponse>,
 }
 
@@ -1365,7 +1435,7 @@ impl Conn {
                 .await
             }
             Some(Ok(result)) => {
-                self.respond_result(stream, kivi_protocol::Opcode::Set, &result, false)
+                self.respond_result(stream, kivi_protocol::Opcode::Set, &result, false, None)
                     .await
             }
             Some(Err(error)) => {
@@ -1460,6 +1530,7 @@ impl Conn {
     /// `Set`s stage through the chunk lane first (suspending only this
     /// task) and re-enter as small `SetChunked` roots; chunked reads
     /// resolve through [`respond_result`](Self::respond_result).
+    #[allow(clippy::too_many_lines)]
     async fn handle_routed_request(
         &mut self,
         request_id: u64,
@@ -1523,6 +1594,53 @@ impl Conn {
                         }
                     }
                 }
+                crate::chunk_lane::LargeSetSplit::StageConditional {
+                    key,
+                    value,
+                    condition,
+                    expiry,
+                } => {
+                    let mut guard = match crate::chunk_lane::PinnedUpload::begin(
+                        &self.chunks.pins,
+                        self.chunks.domain,
+                        &value,
+                    ) {
+                        Ok(guard) => guard,
+                        Err(error) => {
+                            return self
+                                .respond_chunk_error(
+                                    request_id,
+                                    kivi_protocol::Opcode::SetConditional,
+                                    &error,
+                                )
+                                .await;
+                        }
+                    };
+                    match self.chunks.lane.stage_value_async(value).await {
+                        Ok(staged) => {
+                            guard.set_manifest(staged.manifest);
+                            (
+                                Operation::SetConditionalChunked {
+                                    key,
+                                    manifest: staged.manifest,
+                                    logical_len: staged.logical_len,
+                                    condition,
+                                    expiry,
+                                },
+                                Some(guard),
+                            )
+                        }
+                        Err(error) => {
+                            return self
+                                .respond_chunk_error(
+                                    request_id,
+                                    kivi_protocol::Opcode::SetConditional,
+                                    &error,
+                                )
+                                .await;
+                        }
+                    }
+                }
             };
         if self.durability.is_some() {
             return self
@@ -1547,7 +1665,11 @@ impl Conn {
                 .await
             }
             Some(Ok(result)) => {
-                self.respond_result(request_id, requested, &result, streamed)
+                let range = match &operation {
+                    Operation::GetRange { offset, len, .. } => Some((*offset, *len)),
+                    _ => None,
+                };
+                self.respond_result(request_id, requested, &result, streamed, range)
                     .await
             }
             Some(Err(error)) => self.respond_op_error(request_id, requested, &error).await,
@@ -1596,7 +1718,18 @@ impl Conn {
                 Ok(None)
             }
             crate::chunk_lane::SetRangePlan::RestageSet { key, value } => {
-                Ok(Some((Operation::Set { key, value }, None)))
+                // Restaged patches keep the conditional/Keep spelling so a
+                // large result preserves expiry exactly like the inline
+                // splice does.
+                Ok(Some((
+                    Operation::SetConditional {
+                        key,
+                        value,
+                        condition: SetCondition::Always,
+                        expiry: ExpiryPolicy::Keep,
+                    },
+                    None,
+                )))
             }
             crate::chunk_lane::SetRangePlan::Splice {
                 key,
@@ -1612,11 +1745,15 @@ impl Conn {
             {
                 Ok(staged) => {
                     let guard = crate::chunk_lane::PinnedUpload::staged(&self.chunks.pins, &staged);
+                    // A splice preserves the live expiry like the inline
+                    // path does: partial writes touch bytes, never the TTL.
                     Ok(Some((
-                        Operation::SetChunked {
+                        Operation::SetConditionalChunked {
                             key,
                             manifest: staged.manifest,
                             logical_len: staged.logical_len,
+                            condition: SetCondition::Always,
+                            expiry: ExpiryPolicy::Keep,
                         },
                         Some(guard),
                     )))
@@ -1642,6 +1779,7 @@ impl Conn {
         opcode: kivi_protocol::Opcode,
         result: &OperationResult,
         streamed: bool,
+        range: Option<(u64, u64)>,
     ) -> Result<(), ConnExit> {
         if streamed {
             return self.respond_stream(request_id, result).await;
@@ -1658,7 +1796,11 @@ impl Conn {
                 .await
             {
                 Ok(bytes) => {
-                    self.respond_ok(request_id, opcode, &OperationResult::Value(Some(bytes)))
+                    let value = match range {
+                        None => bytes,
+                        Some((offset, len)) => kivi_state::slice_range(&bytes, offset, len),
+                    };
+                    self.respond_ok(request_id, opcode, &OperationResult::Value(Some(value)))
                         .await
                 }
                 Err(error) => self.respond_chunk_error(request_id, opcode, &error).await,
@@ -1885,7 +2027,13 @@ impl Conn {
             match self.outbox[cursor].receive.try_recv() {
                 Ok(outcome) => {
                     let entry = self.outbox.remove(cursor).expect("cursor valid");
-                    ready.push((entry.request_id, entry.opcode, entry.streamed, outcome));
+                    ready.push((
+                        entry.request_id,
+                        entry.opcode,
+                        entry.streamed,
+                        entry.range,
+                        outcome,
+                    ));
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => {
                     cursor += 1;
@@ -1898,13 +2046,13 @@ impl Conn {
                 }
             }
         }
-        for (request_id, opcode, streamed, outcome) in ready {
+        for (request_id, opcode, streamed, range, outcome) in ready {
             match outcome {
                 // `respond_result` resolves chunked reads (bumping itself)
                 // and fans `GetStream` completions into value streams;
                 // every other outcome answers inline as before.
                 Ok(result) => {
-                    self.respond_result(request_id, opcode, &result, streamed)
+                    self.respond_result(request_id, opcode, &result, streamed, range)
                         .await?;
                 }
                 Err(error) => {
@@ -2074,10 +2222,15 @@ impl Conn {
                 .commit
                 .poll(&mut self.tablets.borrow_mut(), namespace);
         }
+        let range = match operation {
+            Operation::GetRange { offset, len, .. } => Some((*offset, *len)),
+            _ => None,
+        };
         self.outbox.push_back(OutboxEntry {
             request_id,
             opcode,
             streamed,
+            range,
             receive,
         });
         Ok(())
@@ -2235,10 +2388,47 @@ impl Conn {
                 status: Status::Ok,
                 body: ResponseBody::Value(value.to_vec()),
             },
-            R::Value(None) | R::Counter(None) | R::Expiry(None) => Response {
+            R::Value(None) | R::Counter(None) | R::Expiry(None) | R::Length(None) => Response {
                 status: Status::NotFound,
                 body: ResponseBody::Diagnostic(String::new()),
             },
+            R::Length(Some(len)) => Response {
+                status: Status::Ok,
+                body: ResponseBody::Length(*len),
+            },
+            R::ConditionalSet { applied, version } => {
+                // Restaged range writes execute as conditional/chunked ops
+                // internally but were requested as `SetRange`: shape them
+                // as the `Stored` the opcode promises (the version is the
+                // real post-store version either way). A not-applied
+                // conditional under `SetRange` is unreachable (`Always`
+                // always applies) and fails closed here, never as a forged
+                // `Stored`.
+                if *applied && opcode == kivi_protocol::Opcode::SetRange {
+                    match version {
+                        Some(version) => Response {
+                            status: Status::Ok,
+                            body: ResponseBody::Stored {
+                                version: version.as_u64(),
+                            },
+                        },
+                        None => Response {
+                            status: Status::Internal,
+                            body: ResponseBody::Diagnostic(
+                                "conditional set applied without a version".to_owned(),
+                            ),
+                        },
+                    }
+                } else {
+                    Response {
+                        status: Status::Ok,
+                        body: ResponseBody::ConditionalSet {
+                            applied: *applied,
+                            version: version.map_or(0, kivi_state::ObjectVersion::as_u64),
+                        },
+                    }
+                }
+            }
             R::Stored { version } => Response {
                 status: Status::Ok,
                 body: ResponseBody::Stored {

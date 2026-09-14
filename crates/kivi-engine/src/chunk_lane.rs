@@ -1,6 +1,6 @@
 //! Per-worker chunk lane: staging, durability proofs, verified reads.
 //!
-//! One OS thread per worker owns a [`ChunkStore`](kivi_chunk::ChunkStore)
+//! One OS thread per worker owns a [`ChunkStore`]
 //! plus a bounded chunk cache. Every other context reaches it through ONE
 //! bounded [`async_channel`] job queue, each style awaiting its own way:
 //!
@@ -1622,11 +1622,24 @@ impl Drop for PinnedUpload {
 /// below `threshold` stay inline; larger ones come back for lane staging.
 /// Pure and total over operations: every non-`Set` passes through
 /// untouched, so call-site behavior for all other opcodes is unchanged.
+/// Conditional stores split identically, preserving their condition and
+/// expiry policy into a staged conditional chunked operation.
 pub fn split_large_set(op: kivi_state::Operation, threshold: u64) -> LargeSetSplit {
     match op {
         kivi_state::Operation::Set { key, value } if value.len() as u64 > threshold => {
             LargeSetSplit::Stage { key, value }
         }
+        kivi_state::Operation::SetConditional {
+            key,
+            value,
+            condition,
+            expiry,
+        } if value.len() as u64 > threshold => LargeSetSplit::StageConditional {
+            key,
+            value,
+            condition,
+            expiry,
+        },
         other => LargeSetSplit::Inline(other),
     }
 }
@@ -1786,5 +1799,17 @@ pub enum LargeSetSplit {
         key: kivi_state::Key,
         /// Full logical bytes to chunk.
         value: Bytes,
+    },
+    /// Stage `value` on the owner's chunk lane, then admit
+    /// `SetConditionalChunked` preserving the condition and policy.
+    StageConditional {
+        /// Target key.
+        key: kivi_state::Key,
+        /// Full logical bytes to chunk.
+        value: Bytes,
+        /// Presence condition evaluated atomically at prepare.
+        condition: kivi_state::SetCondition,
+        /// Expiry policy resolved at prepare.
+        expiry: kivi_state::ExpiryPolicy,
     },
 }

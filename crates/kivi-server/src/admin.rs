@@ -53,6 +53,10 @@ pub struct AdminState {
     pub incarnation: NodeIncarnation,
     /// Read-only engine query handle (`Send + Sync`, Tokio-safe).
     pub engine: AdminHandle,
+    /// RESP frontend view (`None` when compiled without the feature or
+    /// running native-only).
+    #[cfg(feature = "redis-compat")]
+    pub resp: Option<super::resp::RespAdmin>,
 }
 
 /// Liveness: the process is up and the admin plane serves.
@@ -83,6 +87,35 @@ struct NodeDto {
     directory_version: u64,
     durability_mode: &'static str,
     data_dir: Option<String>,
+    redis_compat: RedisCompatSummary,
+}
+
+/// RESP compatibility summary embedded in `/v1/node`.
+#[derive(Debug, Clone, Serialize)]
+struct RedisCompatSummary {
+    compiled: bool,
+    enabled: bool,
+    endpoint: Option<String>,
+    namespace: Option<u64>,
+}
+
+/// Full RESP frontend diagnostics (`GET /v1/redis`).
+#[derive(Debug, Clone, Serialize)]
+struct RedisDto {
+    compiled: bool,
+    enabled: bool,
+    endpoint: Option<String>,
+    namespace: Option<u64>,
+    profile: &'static str,
+    connections: u64,
+    connections_total: u64,
+    requests: u64,
+    bytes_in: u64,
+    bytes_out: u64,
+    protocol_errors: u64,
+    unsupported_commands: u64,
+    resp2_connections: u64,
+    resp3_connections: u64,
 }
 
 /// One worker: endpoint, owned tablets, and arrival-path counters (`None`
@@ -239,7 +272,104 @@ async fn node(State(state): State<AdminState>) -> Json<NodeDto> {
         directory_version: routing.version().as_u64(),
         durability_mode: durability_mode(durability),
         data_dir: durability.map(|info| info.data_dir.display().to_string()),
+        redis_compat: redis_summary(&state),
     })
+}
+
+/// Builds the `/v1/node`-embedded RESP summary (compiled/enabled split so
+/// operators can tell "not built" from "built but native-only").
+fn redis_summary(state: &AdminState) -> RedisCompatSummary {
+    #[cfg(feature = "redis-compat")]
+    {
+        match &state.resp {
+            None => RedisCompatSummary {
+                compiled: true,
+                enabled: false,
+                endpoint: None,
+                namespace: None,
+            },
+            Some(resp) => RedisCompatSummary {
+                compiled: true,
+                enabled: true,
+                endpoint: Some(resp.endpoint.to_string()),
+                namespace: Some(resp.namespace),
+            },
+        }
+    }
+    #[cfg(not(feature = "redis-compat"))]
+    {
+        let _ = state;
+        RedisCompatSummary {
+            compiled: false,
+            enabled: false,
+            endpoint: None,
+            namespace: None,
+        }
+    }
+}
+
+/// Full RESP diagnostics (`GET /v1/redis`).
+async fn redis(State(state): State<AdminState>) -> Json<RedisDto> {
+    #[cfg(feature = "redis-compat")]
+    {
+        match &state.resp {
+            None => Json(RedisDto {
+                compiled: true,
+                enabled: false,
+                endpoint: None,
+                namespace: None,
+                profile: kivi_resp::PROFILE_VERSION,
+                connections: 0,
+                connections_total: 0,
+                requests: 0,
+                bytes_in: 0,
+                bytes_out: 0,
+                protocol_errors: 0,
+                unsupported_commands: 0,
+                resp2_connections: 0,
+                resp3_connections: 0,
+            }),
+            Some(resp) => {
+                let snapshot = resp.stats.snapshot();
+                Json(RedisDto {
+                    compiled: true,
+                    enabled: true,
+                    endpoint: Some(resp.endpoint.to_string()),
+                    namespace: Some(resp.namespace),
+                    profile: kivi_resp::PROFILE_VERSION,
+                    connections: snapshot.connections_current,
+                    connections_total: snapshot.connections_total,
+                    requests: snapshot.requests,
+                    bytes_in: snapshot.bytes_in,
+                    bytes_out: snapshot.bytes_out,
+                    protocol_errors: snapshot.protocol_errors,
+                    unsupported_commands: snapshot.unsupported,
+                    resp2_connections: snapshot.resp2_current,
+                    resp3_connections: snapshot.resp3_current,
+                })
+            }
+        }
+    }
+    #[cfg(not(feature = "redis-compat"))]
+    {
+        let _ = state;
+        Json(RedisDto {
+            compiled: false,
+            enabled: false,
+            endpoint: None,
+            namespace: None,
+            profile: "Kivi RESP Compatibility Profile v1",
+            connections: 0,
+            connections_total: 0,
+            requests: 0,
+            bytes_in: 0,
+            bytes_out: 0,
+            protocol_errors: 0,
+            unsupported_commands: 0,
+            resp2_connections: 0,
+            resp3_connections: 0,
+        })
+    }
 }
 
 fn durability_mode(durability: Option<&kivi_engine::EngineDurability>) -> &'static str {
@@ -527,6 +657,7 @@ pub fn router(state: AdminState) -> axum::Router {
         .route("/v1/tablets", get(tablets))
         .route("/v1/durability", get(durability))
         .route("/v1/checkpoints", get(checkpoints))
+        .route("/v1/redis", get(redis))
         .layer(
             tower::ServiceBuilder::new()
                 .layer(TraceLayer::new_for_http())
@@ -600,6 +731,8 @@ mod tests {
             cluster: ClusterId::from_u128(0xC1),
             incarnation: NodeIncarnation::INITIAL,
             engine: engine.admin_handle(),
+            #[cfg(feature = "redis-compat")]
+            resp: None,
         }
     }
 

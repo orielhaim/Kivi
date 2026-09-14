@@ -202,6 +202,27 @@ fn status_error(status: Status, body: &ResponseBody) -> ClientError {
     }
 }
 
+/// Encodes a conditional store's condition/policy onto wire bytes plus the
+/// `expiry` stamp (nonzero only for `ExpireAt`).
+fn encode_conditional(
+    condition: kivi_state::SetCondition,
+    expiry: kivi_state::ExpiryPolicy,
+) -> (u8, u8, u64) {
+    use kivi_protocol::{COND_ALWAYS, COND_IF_ABSENT, COND_IF_PRESENT};
+    use kivi_protocol::{EXPIRY_AT, EXPIRY_CLEAR, EXPIRY_KEEP};
+    let condition_wire = match condition {
+        kivi_state::SetCondition::Always => COND_ALWAYS,
+        kivi_state::SetCondition::IfAbsent => COND_IF_ABSENT,
+        kivi_state::SetCondition::IfPresent => COND_IF_PRESENT,
+    };
+    let (policy_wire, stamp) = match expiry {
+        kivi_state::ExpiryPolicy::Clear => (EXPIRY_CLEAR, 0),
+        kivi_state::ExpiryPolicy::Keep => (EXPIRY_KEEP, 0),
+        kivi_state::ExpiryPolicy::ExpireAt(stamp) => (EXPIRY_AT, stamp.as_micros()),
+    };
+    (condition_wire, policy_wire, stamp)
+}
+
 /// Sleeps the capped exponential backoff for retry `attempt` (from zero).
 fn backoff(base: Duration, attempt: u32) {
     let shifted = base.checked_mul(1 << attempt.min(10)).unwrap_or(base);
@@ -1190,6 +1211,9 @@ impl NativeClient {
             delta: 0,
             expiry: 0,
             offset: 0,
+            len: 0,
+            condition: kivi_protocol::COND_ALWAYS,
+            expiry_policy: kivi_protocol::EXPIRY_CLEAR,
             identity: None,
             ack_floor: RequestSeq::from_u64(0),
         })?;
@@ -1218,6 +1242,9 @@ impl NativeClient {
             delta: 0,
             expiry: 0,
             offset: 0,
+            len: 0,
+            condition: kivi_protocol::COND_ALWAYS,
+            expiry_policy: kivi_protocol::EXPIRY_CLEAR,
             identity: None,
             ack_floor: RequestSeq::from_u64(0),
         })?;
@@ -1228,11 +1255,11 @@ impl NativeClient {
     }
 
     /// Patches a byte range of a value (partial update): `patch` overwrites
-    /// the value starting at `offset`, zero-padding past-the-end gaps and
-    /// clearing expiry exactly like [`set`](Self::set). Counters fail with
-    /// wrong-type; absurd ranges fail inadmittable. The patch travels in
-    /// one request frame — bulk rewrites belong on the streaming upload
-    /// path instead.
+    /// the value starting at `offset`, zero-padding past-the-end gaps. The
+    /// live expiry survives (unlike [`set`](Self::set)): partial writes
+    /// touch bytes, never the TTL. Counters fail with wrong-type; absurd
+    /// ranges fail inadmittable. The patch travels in one request frame —
+    /// bulk rewrites belong on the streaming upload path instead.
     ///
     /// # Errors
     ///
@@ -1250,11 +1277,17 @@ impl NativeClient {
             delta: 0,
             expiry: 0,
             offset,
+            len: 0,
+            condition: kivi_protocol::COND_ALWAYS,
+            expiry_policy: kivi_protocol::EXPIRY_CLEAR,
             identity: None,
             ack_floor: RequestSeq::from_u64(0),
         })?;
         match response.body {
             ResponseBody::Stored { .. } => Ok(()),
+            // Restaged range writes answer `Stored` (the server shapes the
+            // internal conditional outcome by request opcode); anything
+            // else here is a contract break, never a runtime condition.
             _ => Err(ClientError::Internal(
                 "unexpected set-range body".to_owned(),
             )),
@@ -1631,6 +1664,9 @@ impl NativeClient {
             delta: 0,
             expiry: 0,
             offset: 0,
+            len: 0,
+            condition: kivi_protocol::COND_ALWAYS,
+            expiry_policy: kivi_protocol::EXPIRY_CLEAR,
             identity: None,
             ack_floor: RequestSeq::from_u64(0),
         };
@@ -1788,6 +1824,9 @@ impl NativeClient {
                 delta: 0,
                 expiry: 0,
                 offset: 0,
+                len: 0,
+                condition: kivi_protocol::COND_ALWAYS,
+                expiry_policy: kivi_protocol::EXPIRY_CLEAR,
                 identity: None,
                 ack_floor: RequestSeq::from_u64(0),
             },
@@ -1814,6 +1853,9 @@ impl NativeClient {
             delta: 0,
             expiry: 0,
             offset: 0,
+            len: 0,
+            condition: kivi_protocol::COND_ALWAYS,
+            expiry_policy: kivi_protocol::EXPIRY_CLEAR,
             identity: None,
             ack_floor: RequestSeq::from_u64(0),
         })?;
@@ -1839,6 +1881,9 @@ impl NativeClient {
             delta: 0,
             expiry: 0,
             offset: 0,
+            len: 0,
+            condition: kivi_protocol::COND_ALWAYS,
+            expiry_policy: kivi_protocol::EXPIRY_CLEAR,
             identity: None,
             ack_floor: RequestSeq::from_u64(0),
         })?;
@@ -1864,6 +1909,9 @@ impl NativeClient {
             delta: 0,
             expiry: 0,
             offset: 0,
+            len: 0,
+            condition: kivi_protocol::COND_ALWAYS,
+            expiry_policy: kivi_protocol::EXPIRY_CLEAR,
             identity: None,
             ack_floor: RequestSeq::from_u64(0),
         })?;
@@ -1893,6 +1941,9 @@ impl NativeClient {
             delta,
             expiry: 0,
             offset: 0,
+            len: 0,
+            condition: kivi_protocol::COND_ALWAYS,
+            expiry_policy: kivi_protocol::EXPIRY_CLEAR,
             identity: None,
             ack_floor: RequestSeq::from_u64(0),
         })?;
@@ -1934,6 +1985,9 @@ impl NativeClient {
                 delta,
                 expiry: 0,
                 offset: 0,
+                len: 0,
+                condition: kivi_protocol::COND_ALWAYS,
+                expiry_policy: kivi_protocol::EXPIRY_CLEAR,
                 identity: None,
                 ack_floor: RequestSeq::from_u64(0),
             },
@@ -1963,6 +2017,9 @@ impl NativeClient {
             delta: 0,
             expiry: expires_at.as_micros(),
             offset: 0,
+            len: 0,
+            condition: kivi_protocol::COND_ALWAYS,
+            expiry_policy: kivi_protocol::EXPIRY_CLEAR,
             identity: None,
             ack_floor: RequestSeq::from_u64(0),
         })?;
@@ -1990,6 +2047,9 @@ impl NativeClient {
             delta: 0,
             expiry: 0,
             offset: 0,
+            len: 0,
+            condition: kivi_protocol::COND_ALWAYS,
+            expiry_policy: kivi_protocol::EXPIRY_CLEAR,
             identity: None,
             ack_floor: RequestSeq::from_u64(0),
         })?;
@@ -2015,6 +2075,9 @@ impl NativeClient {
             delta: 0,
             expiry: 0,
             offset: 0,
+            len: 0,
+            condition: kivi_protocol::COND_ALWAYS,
+            expiry_policy: kivi_protocol::EXPIRY_CLEAR,
             identity: None,
             ack_floor: RequestSeq::from_u64(0),
         })?;
@@ -2026,6 +2089,166 @@ impl NativeClient {
             ResponseBody::Diagnostic(_) => Ok(None),
             _ => Err(ClientError::Internal(
                 "unexpected get-expiry body".to_owned(),
+            )),
+        }
+    }
+
+    /// Reads a byte slice `[offset, offset + len)` clamped to the logical
+    /// length (`None` when absent; possibly empty when past the end).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport/routing failure or wrong-type access.
+    pub fn get_range(
+        &self,
+        key: &Key,
+        offset: u64,
+        len: u64,
+    ) -> Result<Option<Bytes>, ClientError> {
+        use kivi_protocol::{Opcode, ResponseBody};
+        let response = self.execute(key, Opcode::GetRange, || kivi_protocol::Request {
+            namespace: self.shared.namespace,
+            opcode: Opcode::GetRange,
+            hint: None,
+            key: key.as_bytes().to_vec(),
+            value: None,
+            delta: 0,
+            expiry: 0,
+            offset,
+            len,
+            condition: kivi_protocol::COND_ALWAYS,
+            expiry_policy: kivi_protocol::EXPIRY_CLEAR,
+            identity: None,
+            ack_floor: RequestSeq::from_u64(0),
+        })?;
+        match response.body {
+            ResponseBody::Value(value) => Ok(Some(Bytes::from(value))),
+            ResponseBody::Diagnostic(_) => Ok(None),
+            _ => Err(ClientError::Internal(
+                "unexpected get-range body".to_owned(),
+            )),
+        }
+    }
+
+    /// Reports the logical byte length (`None` when absent). Chunked roots
+    /// answer from metadata without reading chunk payloads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport/routing failure or wrong-type access.
+    pub fn bytes_length(&self, key: &Key) -> Result<Option<u64>, ClientError> {
+        use kivi_protocol::{Opcode, ResponseBody};
+        let response = self.execute(key, Opcode::BytesLength, || kivi_protocol::Request {
+            namespace: self.shared.namespace,
+            opcode: Opcode::BytesLength,
+            hint: None,
+            key: key.as_bytes().to_vec(),
+            value: None,
+            delta: 0,
+            expiry: 0,
+            offset: 0,
+            len: 0,
+            condition: kivi_protocol::COND_ALWAYS,
+            expiry_policy: kivi_protocol::EXPIRY_CLEAR,
+            identity: None,
+            ack_floor: RequestSeq::from_u64(0),
+        })?;
+        match response.body {
+            ResponseBody::Length(len) => Ok(Some(len)),
+            ResponseBody::Diagnostic(_) => Ok(None),
+            _ => Err(ClientError::Internal(
+                "unexpected bytes-length body".to_owned(),
+            )),
+        }
+    }
+
+    /// Conditionally stores bytes, atomically at the owning tablet.
+    /// Returns `(applied, version)`: `applied` names whether the condition
+    /// held, `version` the new version when applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport/routing failure.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn set_conditional(
+        &self,
+        key: &Key,
+        value: Bytes,
+        condition: kivi_state::SetCondition,
+        expiry: kivi_state::ExpiryPolicy,
+    ) -> Result<(bool, Option<u64>), ClientError> {
+        use kivi_protocol::{Opcode, ResponseBody};
+        let (condition_wire, policy_wire, stamp) = encode_conditional(condition, expiry);
+        let response = self.execute(key, Opcode::SetConditional, || kivi_protocol::Request {
+            namespace: self.shared.namespace,
+            opcode: Opcode::SetConditional,
+            hint: None,
+            key: key.as_bytes().to_vec(),
+            value: Some(value.to_vec()),
+            delta: 0,
+            expiry: stamp,
+            offset: 0,
+            len: 0,
+            condition: condition_wire,
+            expiry_policy: policy_wire,
+            identity: None,
+            ack_floor: RequestSeq::from_u64(0),
+        })?;
+        match response.body {
+            ResponseBody::ConditionalSet { applied, version } => {
+                Ok((applied, applied.then_some(version)))
+            }
+            _ => Err(ClientError::Internal(
+                "unexpected set-conditional body".to_owned(),
+            )),
+        }
+    }
+
+    /// Conditionally stores bytes under an explicitly named sequence of
+    /// this session (resumption: same exactly-once contract as
+    /// [`set_with_seq`](Self::set_with_seq)).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport/routing failure, an out-of-range
+    /// sequence, or a server-side rejection.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn set_conditional_with_seq(
+        &self,
+        key: &Key,
+        value: Bytes,
+        condition: kivi_state::SetCondition,
+        expiry: kivi_state::ExpiryPolicy,
+        seq: RequestSeq,
+    ) -> Result<(bool, Option<u64>), ClientError> {
+        use kivi_protocol::{Opcode, ResponseBody};
+        let (condition_wire, policy_wire, stamp) = encode_conditional(condition, expiry);
+        let response = self.execute_with_seq(
+            key,
+            Opcode::SetConditional,
+            || kivi_protocol::Request {
+                namespace: self.shared.namespace,
+                opcode: Opcode::SetConditional,
+                hint: None,
+                key: key.as_bytes().to_vec(),
+                value: Some(value.to_vec()),
+                delta: 0,
+                expiry: stamp,
+                offset: 0,
+                len: 0,
+                condition: condition_wire,
+                expiry_policy: policy_wire,
+                identity: None,
+                ack_floor: RequestSeq::from_u64(0),
+            },
+            Some(seq),
+        )?;
+        match response.body {
+            ResponseBody::ConditionalSet { applied, version } => {
+                Ok((applied, applied.then_some(version)))
+            }
+            _ => Err(ClientError::Internal(
+                "unexpected set-conditional body".to_owned(),
             )),
         }
     }
