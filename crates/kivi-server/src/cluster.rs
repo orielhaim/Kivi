@@ -1,37 +1,42 @@
-//! Replicated cluster mode: one tablet group per process set.
+//! Replicated cluster mode: many tablet groups per process set.
 //!
-//! This module is the explicit cluster configuration (task AF keeps
-//! single-node modes intact; nothing here runs unless `--cluster` is
-//! passed). Each process opens one [`ReplicatedNode`]
-//! (durable log + Kivi state machine + peer mesh + `OpenRaft`) and serves:
+//! This module is the explicit cluster configuration. Each process opens
+//! one [`ConsensusNode`] — many tablet
+//! replicas on fixed Compio workers sharing one H3 peer mesh and one
+//! shared WAL writer — and serves:
 //!
 //! * the native Kivi protocol on Tokio (handshake, requests, redirects),
-//! * a read-only admin plane with replicated-tablet diagnostics,
+//! * a read-only admin plane with per-tablet diagnostics,
 //! * an optional RESP edge translating Redis commands into Kivi semantics.
 //!
-//! No Compio `DataWorker` exists in this process: the isolated Tokio
-//! runtime hosts consensus and serving only, so the state libraries stay
-//! runtime-agnostic and the single-node path keeps its reactor.
+//! No single-node `DataWorker` exists in this process: the isolated Tokio
+//! runtime hosts consensus fronts and serving only, so the state
+//! libraries stay runtime-agnostic and the single-node path keeps its
+//! reactor.
 //!
-//! ## Native routing contract (tasks N, O)
+//! ## Native routing contract
 //!
-//! Only the leader proposes. Followers answer `StaleRoute` with a
-//! `Redirect` at the leader's native endpoint — the existing client
-//! machinery (route cache, same-identity retries, bounded redirect
-//! budget) then carries the request to the leader without any protocol
-//! change and without exposing `OpenRaft` concepts. Unknown leaders map
-//! to retriable `Overloaded` (election in flight: back off and retry).
+//! Every operation routes by key: `PartitionHash` → `DirectorySnapshot` →
+//! `TabletId` → local replica. Only the tablet's leader proposes.
+//! Followers answer `StaleRoute` with a `Redirect` carrying the tablet's
+//! real range (plus directory version, tablet, and leader native
+//! endpoint) — the existing client machinery (sparse range cache,
+//! same-identity retries, bounded redirect budget) then carries the
+//! request to the leader without any protocol change and without
+//! exposing `OpenRaft` concepts. Different tablets have different
+//! leaders; there is no global current leader. Unknown leaders map to
+//! retriable `Overloaded` (election in flight: back off and retry).
 //!
-//! ## RESP behavior (task P)
+//! ## RESP behavior
 //!
 //! RESP stays an edge adapter: no `MOVED`/`ASK`/hash slots. Commands
-//! translate into Kivi semantics and execute against the local replica
-//! (reads serve applied state) or its proposal path (writes). A
-//! non-leader answers a retryable Redis `BUSY` error; retry-capable
-//! clients retry (ideally against the leader endpoint discovered via
-//! admin `/v1/tablet`, which names it). Redis clients never learn
-//! consensus concepts, and no unsafe fallback ever executes a strong
-//! write off-leader.
+//! translate into Kivi semantics, route to their tablet like native
+//! traffic, and execute against the local replica (reads serve applied
+//! state) or its proposal path (writes). A non-leader answers a
+//! retryable Redis `BUSY` error; retry-capable clients retry (ideally
+//! against the leader endpoint discovered via admin `/v1/tablets`, which
+//! names it per tablet). Redis clients never learn consensus concepts,
+//! and no unsafe fallback ever executes a strong write off-leader.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -43,7 +48,8 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use kivi_consensus::{
-    ConsensusError, NodeConfig, NodeStatus, ProposeError, ProposeOutcome, ReadError, ReplicatedNode,
+    ConsensusError, ConsensusGroupId, ConsensusNode, MultiNodeConfig, NodeStatus, ProposeError,
+    ProposeOutcome, ReadError,
 };
 use kivi_protocol::{
     Capabilities, ClientHello, FrameKind, FrameReader, RedirectInfo, Request, Response,
@@ -53,10 +59,10 @@ use kivi_protocol::{
 #[cfg(feature = "redis-compat")]
 use kivi_state::Operation;
 use kivi_state::{DurableOutcome, OpError, OperationResult};
-use kivi_tablet::{DirectoryVersion, HashPrefix, PartitionRange};
+use kivi_tablet::DirectorySnapshot;
 use kivi_types::{
-    ClusterId, MutationIdentity, NamespaceId, NodeId, ReadContract, TabletAuthority, TabletEpoch,
-    TabletId, UnixMicros, WorkerId, WriteGuardGeneration,
+    ClusterId, MutationIdentity, NamespaceId, NodeId, ReadContract, TabletEpoch, TabletId,
+    UnixMicros, WorkerId, WriteGuardGeneration,
 };
 use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -65,9 +71,11 @@ use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
 /// Worker identity reported on cluster native connections. The cluster
-/// has no per-worker endpoints (one tablet, one replica per node); every
-/// connection reports worker `0`, and redirects name worker `0`, so the
-/// client's worker validation stays consistent across dials and hints.
+/// exposes one native endpoint per node (not per consensus worker);
+/// every connection reports worker `0`, and redirects name worker `0`,
+/// so the client's worker validation stays consistent across dials and
+/// hints. Consensus worker assignment is local-physical (which reactor
+/// drives a group) and never crosses the client protocol.
 const CLUSTER_WORKER: u64 = 0;
 /// Chunk staging granularity for cluster uploads (matches the chunk
 /// fabric default; bounds per-frame memory and pack records).
@@ -75,9 +83,6 @@ const CLUSTER_CHUNK_SIZE: usize = 1_048_576;
 /// Maximum `StreamData` payload per frame on cluster uploads (bounded
 /// bulk framing; well under the peer and native ceilings).
 const CLUSTER_STREAM_MAX_DATA: u32 = 1_048_576;
-/// Directory version reported in hellos and redirects (the cluster has
-/// no multi-tablet directory yet; the value only needs to be stable).
-const CLUSTER_DIR_VERSION: u64 = 1;
 /// Admin per-request ceiling.
 const ADMIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// Admin body limit.
@@ -90,8 +95,12 @@ pub struct ClusterServeConfig {
     pub cluster: ClusterId,
     /// This process's node identity.
     pub node: NodeId,
-    /// Tablet replicated.
-    pub tablet: TabletId,
+    /// Tablet count: the static directory tiles the whole hash space with
+    /// this many tablets (any nonzero count).
+    pub tablet_count: usize,
+    /// Consensus worker (Compio reactor) count: tablet groups stripe
+    /// across these deterministically.
+    pub worker_count: usize,
     /// Namespace served.
     pub namespace: NamespaceId,
     /// Data-directory root.
@@ -115,20 +124,61 @@ pub struct ClusterServeConfig {
     pub peer_certs: Vec<(NodeId, std::path::PathBuf)>,
 }
 
-/// Shared cluster serving state: the replicated node plus the static
-/// address maps redirects resolve through.
+/// Shared cluster serving state: the multi-tablet node, its static
+/// directory for key → tablet routing, plus the static address maps
+/// redirects resolve through.
 #[derive(Debug, Clone)]
 pub struct ClusterShared {
-    /// The replicated node.
-    pub node: Arc<ReplicatedNode>,
+    /// The multi-tablet consensus node.
+    pub node: Arc<ConsensusNode>,
+    /// Static tablet directory: every key deterministically maps to
+    /// exactly one active tablet (no gaps, no overlaps).
+    pub directory: DirectorySnapshot,
     /// Native endpoint per node id (redirect targets).
     pub natives: Arc<std::collections::HashMap<NodeId, SocketAddr>>,
     /// This node's native endpoint (advertised in hellos).
     pub native: SocketAddr,
-    /// Tablet replicated.
-    pub tablet: TabletId,
     /// Namespace served.
     pub namespace: NamespaceId,
+}
+
+/// Why key → tablet routing failed (small error enum: the wire
+/// `Response` bodies are built at the call sites).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteError {
+    /// The partition hash algorithm is unavailable in this build.
+    UnsupportedHash,
+    /// No active tablet owns the key (unreachable on a static tiling —
+    /// loud internal, never a silent misroute).
+    NoTablet,
+}
+
+/// Routes key bytes to their tablet through the static directory.
+/// Every key maps to exactly one active tablet (the tiling covers the
+/// whole hash space).
+fn route_key(shared: &ClusterShared, key: &[u8]) -> Result<TabletId, RouteError> {
+    use kivi_state::PartitionHasher;
+    let hash = PartitionHasher::V1
+        .hash(shared.namespace, key)
+        .ok_or(RouteError::UnsupportedHash)?;
+    shared
+        .directory
+        .lookup_by_hash(hash)
+        .ok_or(RouteError::NoTablet)
+}
+
+/// Shapes a routing failure as a wire response.
+fn route_error(error: RouteError) -> Response {
+    match error {
+        RouteError::UnsupportedHash => Response {
+            status: Status::InvalidRequest,
+            body: ResponseBody::Diagnostic("partition hash unsupported".to_owned()),
+        },
+        RouteError::NoTablet => Response {
+            status: Status::Internal,
+            body: ResponseBody::Diagnostic("no tablet owns key".to_owned()),
+        },
+    }
 }
 
 /// Builds the cluster serving configuration from CLI args, failing
@@ -163,7 +213,8 @@ pub fn run_from_args(args: &super::Args) -> anyhow::Result<()> {
     let config = ClusterServeConfig {
         cluster: ClusterId::from_u128(cluster),
         node: NodeId::from_u64(node),
-        tablet: TabletId::from_u64(args.cluster_tablet),
+        tablet_count: args.cluster_tablets,
+        worker_count: args.cluster_workers,
         namespace: NamespaceId::from_u64(1),
         data_dir,
         peers: args
@@ -218,9 +269,26 @@ async fn bind_with_retry(addr: SocketAddr, what: &str) -> anyhow::Result<std::ne
     }
 }
 
+/// Builds the static directory: the whole hash space tiled into
+/// `tablet_count` tablets (validated transitions only; see
+/// [`DirectorySnapshot::static_tiles`]).
+fn build_directory(config: &ClusterServeConfig) -> anyhow::Result<DirectorySnapshot> {
+    DirectorySnapshot::static_tiles(
+        config.namespace,
+        config.tablet_count,
+        TabletEpoch::INITIAL,
+        WriteGuardGeneration::INITIAL,
+    )
+    .context("static tablet directory failed to build")
+}
+
 /// Builds the static topology: every configured peer with its native
-/// redirect target (defaulting to the peer endpoint).
-fn build_topology(config: &ClusterServeConfig) -> kivi_consensus::ClusterTopology {
+/// redirect target, plus one assignment per directory tablet replicating
+/// on every static node (independent Raft leadership per tablet).
+fn build_topology(
+    config: &ClusterServeConfig,
+    tablets: &[TabletId],
+) -> kivi_consensus::ClusterTopology {
     use kivi_consensus::{ClusterTopology, NodeDescriptor, TabletAssignment};
 
     ClusterTopology {
@@ -241,21 +309,33 @@ fn build_topology(config: &ClusterServeConfig) -> kivi_consensus::ClusterTopolog
                 }
             })
             .collect(),
-        tablets: vec![TabletAssignment {
-            tablet: config.tablet,
-            replicas: config.peers.iter().map(|(node, _)| *node).collect(),
-        }],
+        tablets: tablets
+            .iter()
+            .map(|tablet| TabletAssignment {
+                tablet: *tablet,
+                replicas: config.peers.iter().map(|(node, _)| *node).collect(),
+            })
+            .collect(),
     }
 }
 
-/// Opens the replicated node. The QUIC endpoint binds its UDP socket
-/// inside the consensus owner thread (no pre-bound listener, no
+/// Opens the multi-tablet node. The QUIC endpoint binds its UDP socket
+/// inside the consensus mesh thread (no pre-bound listener, no
 /// `TIME_WAIT` dance — QUIC has no TCP listener backlog); a bind
 /// conflict fails loudly so the harness retries formation. Peer
 /// certificates come from `--cluster-peer-certs`; without them the node
 /// opens only when `KIVI_INSECURE_PEER_TLS=1` (lab tests).
-async fn open_node(config: &ClusterServeConfig) -> anyhow::Result<Arc<ReplicatedNode>> {
-    let topology = build_topology(config);
+async fn open_node(
+    config: &ClusterServeConfig,
+    directory: &DirectorySnapshot,
+) -> anyhow::Result<Arc<ConsensusNode>> {
+    let tablets: Vec<TabletId> = directory
+        .tablets()
+        .iter()
+        .filter(|tablet| tablet.state().is_writable())
+        .map(kivi_tablet::TabletDescriptor::id)
+        .collect();
+    let topology = build_topology(config, &tablets);
     let mut peer_certs = std::collections::HashMap::new();
     for (node, path) in &config.peer_certs {
         let der = std::fs::read(path)
@@ -268,22 +348,25 @@ async fn open_node(config: &ClusterServeConfig) -> anyhow::Result<Arc<Replicated
             "peer TLS needs --cluster-peer-certs or KIVI_INSECURE_PEER_TLS=1 (lab tests only)"
         );
     }
+    // Correctness probe (lab tests only): `KIVI_DISABLE_PREFLIGHT=1`
+    // forces the append-gate fallback path, proving preflight is only an
+    // optimization. Production always preflights.
+    let preflight_enabled =
+        !std::env::var("KIVI_DISABLE_PREFLIGHT").is_ok_and(|value| value == "1");
     let node = Arc::new(
-        ReplicatedNode::open(NodeConfig {
+        ConsensusNode::open(MultiNodeConfig {
             data_dir: config.data_dir.clone(),
             namespace: config.namespace,
-            tablet: config.tablet,
-            authority: TabletAuthority::new(
-                config.tablet,
-                TabletEpoch::INITIAL,
-                WriteGuardGeneration::INITIAL,
-            ),
+            tablets,
             local: config.node,
             topology,
             segment_target_bytes: config.segment_target_bytes,
             transport: kivi_consensus::TransportConfig::default(),
             peer_certs,
             insecure_peer_tls,
+            preflight_enabled,
+            worker_count: config.worker_count,
+            durability: kivi_consensus::SharedDurabilityConfig::default(),
         })
         .await
         .context("replicated node failed to open")?,
@@ -291,11 +374,13 @@ async fn open_node(config: &ClusterServeConfig) -> anyhow::Result<Arc<Replicated
     Ok(node)
 }
 
-/// Runs the cluster server until Ctrl-C: opens the replicated node,
-/// serves native, admin, and optional RESP, prints the `KIVI_READY` line
-/// with bound addresses, and shuts down orderly.
+/// Runs the cluster server until Ctrl-C: builds the static directory,
+/// opens the multi-tablet node, serves native, admin, and optional RESP,
+/// prints the `KIVI_READY` line with bound addresses, and shuts down
+/// orderly.
 pub async fn run(config: ClusterServeConfig) -> anyhow::Result<()> {
-    let node = open_node(&config).await?;
+    let directory = build_directory(&config)?;
+    let node = open_node(&config, &directory).await?;
     let native_std = bind_with_retry(config.native_bind, "native").await?;
     native_std
         .set_nonblocking(true)
@@ -318,9 +403,9 @@ pub async fn run(config: ClusterServeConfig) -> anyhow::Result<()> {
         config.natives.iter().copied().collect();
     let shared = ClusterShared {
         node: Arc::clone(&node),
+        directory,
         natives: Arc::new(natives),
         native: native_addr,
-        tablet: config.tablet,
         namespace: config.namespace,
     };
     // Native serving (Tokio tasks per connection).
@@ -346,7 +431,11 @@ pub async fn run(config: ClusterServeConfig) -> anyhow::Result<()> {
             let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
             tokio::spawn(super::resp::serve_with(
                 listener,
-                ClusterExecutor::new(Arc::clone(&node)),
+                ClusterExecutor::new(
+                    Arc::clone(&node),
+                    shared.directory.clone(),
+                    config.namespace,
+                ),
                 Arc::clone(&stats),
                 shutdown_rx,
             ));
@@ -366,12 +455,19 @@ pub async fn run(config: ClusterServeConfig) -> anyhow::Result<()> {
         .map_or(String::new(), |admin| format!(" redis={}", admin.endpoint));
     #[cfg(not(feature = "redis-compat"))]
     let redis_part = String::new();
+    // NOTE: the token is `consensus_workers=`, never `workers=`: the
+    // harness readiness parser treats `workers=<a>,<b>` as the single-node
+    // native list and prefers it over `native=` — a bare `workers=2`
+    // would parse as the native endpoint "2".
     println!(
-        "KIVI_READY native={native_addr} peer={} admin={admin_addr}{redis_part} node={} cluster={} incarnation={}",
+        "KIVI_READY native={native_addr} peer={} admin={admin_addr}{redis_part} node={} cluster={} incarnation={} tablets={} consensus_workers={} dir_version={}",
         node.peer_addr(),
         node.node().as_u64(),
         node.cluster().as_u128(),
         node.incarnation().as_u64(),
+        node.tablets().len(),
+        node.worker_count(),
+        shared.directory.version().as_u64(),
     );
     let _ = std::io::Write::flush(&mut std::io::stdout());
     if let Err(error) = tokio::signal::ctrl_c().await {
@@ -448,7 +544,7 @@ async fn serve_native_conn(socket: tokio::net::TcpStream, shared: ClusterShared,
         node: shared.node.node(),
         incarnation: shared.node.incarnation(),
         worker: WorkerId::from_u64(CLUSTER_WORKER),
-        dir_version: DirectoryVersion::from_u64(CLUSTER_DIR_VERSION),
+        dir_version: shared.directory.version(),
         max_frame: u32::try_from(negotiated).unwrap_or(u32::MAX),
         endpoints: vec![(
             WorkerId::from_u64(CLUSTER_WORKER),
@@ -825,7 +921,27 @@ async fn handle_stream_commit(
         ack_floor: upload.ack_floor,
     });
     let now = wall_now();
-    let response = match shared.node.propose(&operation, identity, None, now).await {
+    // Streamed values route like any other write: the key selects the
+    // tablet whose group commits the tiny root (preflight then moves the
+    // staged sidecars before that root proposes).
+    let tablet = match route_key(shared, &upload.key) {
+        Ok(tablet) => tablet,
+        Err(error) => {
+            writer
+                .write_all(&encode_frame(
+                    FrameKind::Response,
+                    stream,
+                    &route_error(error).encode(kivi_protocol::Opcode::Set),
+                ))
+                .await?;
+            return Ok(());
+        }
+    };
+    let response = match shared
+        .node
+        .propose(tablet, &operation, identity, None, now)
+        .await
+    {
         Ok(outcome) => match outcome {
             ProposeOutcome::Applied { outcome, .. }
             | ProposeOutcome::Duplicate { outcome }
@@ -857,7 +973,7 @@ async fn handle_stream_commit(
                 let mut pins = shared.node.sidecar().pins().lock().await;
                 pins.unpin_root(&manifest, &chunk_ids);
             }
-            shape_propose_error(shared, &error)
+            shape_propose_error(shared, tablet, &error)
         }
     };
     writer
@@ -900,14 +1016,27 @@ async fn handle_get_stream(
     }
     let operation = request.into_operation();
     let now = wall_now();
+    let tablet = match route_key(shared, operation.key().as_bytes()) {
+        Ok(tablet) => tablet,
+        Err(error) => {
+            writer
+                .write_all(&encode_frame(
+                    FrameKind::Response,
+                    stream,
+                    &route_error(error).encode(kivi_protocol::Opcode::GetStream),
+                ))
+                .await?;
+            return Ok(());
+        }
+    };
     let outcome = match shared
         .node
-        .read(&operation, ReadContract::Latest, now)
+        .read(tablet, &operation, ReadContract::Latest, now)
         .await
     {
         Ok(outcome) => outcome,
         Err(error) => {
-            let response = shape_read_error(shared, &error);
+            let response = shape_read_error(shared, tablet, &error);
             writer
                 .write_all(&encode_frame(
                     FrameKind::Response,
@@ -1018,16 +1147,26 @@ async fn handle_request(
             opcode,
         ));
     }
-    // The single replicated tablet owns every key in this stage; hints
-    // accelerate nothing and authorize nothing, so they are ignored.
-    // `GetStream` never reaches here (the connection loop streams
-    // `ValueStream*` frames instead of one `Response`).
+    // Real multi-tablet routing: every operation maps key → tablet, then
+    // proposes/reads against that tablet's group. Request hints accelerate
+    // nothing and authorize nothing, so they are ignored; sparse route
+    // discovery flows through `StaleRoute` redirects carrying the tablet's
+    // real range. `GetStream` never reaches here (the connection loop
+    // streams `ValueStream*` frames instead of one `Response`).
     let operation = request.into_operation();
+    let tablet = match route_key(shared, operation.key().as_bytes()) {
+        Ok(tablet) => tablet,
+        Err(error) => return Some((route_error(error), opcode)),
+    };
     let now = wall_now();
     if opcode.is_mutating() {
         let identity = identity.map(|client| MutationIdentity { client, ack_floor });
         Some((
-            match shared.node.propose(&operation, identity, None, now).await {
+            match shared
+                .node
+                .propose(tablet, &operation, identity, None, now)
+                .await
+            {
                 Ok(outcome) => match outcome {
                     ProposeOutcome::Applied { outcome, .. }
                     | ProposeOutcome::Duplicate { outcome }
@@ -1038,22 +1177,23 @@ async fn handle_request(
                         resolve_durable(shared, &operation, &outcome, opcode).await
                     }
                 },
-                Err(error) => shape_propose_error(shared, &error),
+                Err(error) => shape_propose_error(shared, tablet, &error),
             },
             opcode,
         ))
     } else {
         // Native reads are linearizable in cluster mode: the barrier runs
-        // on the leader; followers redirect. Chunked roots resolve via
-        // sidecars (same bytes as single-node, never wrong bytes).
+        // on the tablet's leader; followers redirect. Chunked roots
+        // resolve via sidecars (same bytes as single-node, never wrong
+        // bytes).
         Some((
             match shared
                 .node
-                .read(&operation, ReadContract::Latest, now)
+                .read(tablet, &operation, ReadContract::Latest, now)
                 .await
             {
                 Ok(outcome) => resolve_result(shared, opcode, &operation, &outcome).await,
-                Err(error) => shape_read_error(shared, &error),
+                Err(error) => shape_read_error(shared, tablet, &error),
             },
             opcode,
         ))
@@ -1279,10 +1419,10 @@ fn replica_node(replica: kivi_consensus::ReplicaId) -> NodeId {
 /// Shapes proposal failures: routing becomes redirects/retriable
 /// statuses (never `OpenRaft` concepts on the wire), validation becomes
 /// stable semantic statuses.
-fn shape_propose_error(shared: &ClusterShared, error: &ProposeError) -> Response {
+fn shape_propose_error(shared: &ClusterShared, tablet: TabletId, error: &ProposeError) -> Response {
     match error {
         ProposeError::Consensus(ConsensusError::NotLeader { hint }) => {
-            redirect_or_overloaded(shared, hint.leader.map(replica_node))
+            redirect_or_overloaded(shared, tablet, hint.leader.map(replica_node))
         }
         ProposeError::Consensus(ConsensusError::LeaderUnknown) => Response {
             status: Status::Overloaded,
@@ -1330,10 +1470,10 @@ fn shape_propose_error(shared: &ClusterShared, error: &ProposeError) -> Response
 }
 
 /// Shapes read failures with the same routing contract as proposals.
-fn shape_read_error(shared: &ClusterShared, error: &ReadError) -> Response {
+fn shape_read_error(shared: &ClusterShared, tablet: TabletId, error: &ReadError) -> Response {
     match error {
         kivi_consensus::ReadError::Consensus(ConsensusError::NotLeader { hint }) => {
-            redirect_or_overloaded(shared, hint.leader.map(replica_node))
+            redirect_or_overloaded(shared, tablet, hint.leader.map(replica_node))
         }
         kivi_consensus::ReadError::Consensus(ConsensusError::LeaderUnknown) => Response {
             status: Status::Overloaded,
@@ -1378,21 +1518,32 @@ fn shape_read_error(shared: &ClusterShared, error: &ReadError) -> Response {
 
 /// Answers `NotLeader` as `StaleRoute` + leader redirect when the leader
 /// endpoint is known, else retriable `Overloaded` (election in flight).
-fn redirect_or_overloaded(shared: &ClusterShared, leader: Option<kivi_types::NodeId>) -> Response {
+/// The redirect carries the tablet's real range (plus directory version
+/// and tablet), so the client's sparse range cache learns per-tablet
+/// routes: different tablets have different leaders.
+fn redirect_or_overloaded(
+    shared: &ClusterShared,
+    tablet: TabletId,
+    leader: Option<kivi_types::NodeId>,
+) -> Response {
     let endpoint = leader.and_then(|node| shared.natives.get(&node).copied());
-    match endpoint {
-        Some(addr) => Response {
+    let range = shared
+        .directory
+        .get(tablet)
+        .map(|descriptor| descriptor.range().clone());
+    match (endpoint, range) {
+        (Some(addr), Some(range)) => Response {
             status: Status::StaleRoute,
             body: ResponseBody::Redirect(RedirectInfo {
-                dir_version: DirectoryVersion::from_u64(CLUSTER_DIR_VERSION),
-                tablet: shared.tablet,
+                dir_version: shared.directory.version(),
+                tablet,
                 epoch: TabletEpoch::INITIAL,
                 worker: WorkerId::from_u64(CLUSTER_WORKER),
                 endpoint: addr.to_string(),
-                range: PartitionRange::Hash(HashPrefix::new(0, 0).expect("root range valid")),
+                range,
             }),
         },
-        None => Response {
+        _ => Response {
             status: Status::Overloaded,
             body: ResponseBody::Diagnostic("leader unknown; retry".to_owned()),
         },
@@ -1408,8 +1559,8 @@ fn wall_now() -> UnixMicros {
     UnixMicros::from_micros(elapsed.as_micros().try_into().unwrap_or(u64::MAX))
 }
 
-/// Read-only cluster admin plane: replicated-tablet diagnostics for
-/// operators and the lab harness (task AE).
+/// Read-only cluster admin plane: per-tablet diagnostics for operators
+/// and the lab harness.
 #[derive(Debug, Clone, Serialize)]
 struct TabletDto {
     group: u64,
@@ -1425,6 +1576,13 @@ struct TabletDto {
     purged: Option<u64>,
     healthy: bool,
     detail: Option<String>,
+    /// Tablet hash-range prefix bits as 32 lowercase hex chars (the full
+    /// `u128` tile origin). `None` for non-hash layouts (never in static
+    /// clusters, which always tile the hash space).
+    range_bits: Option<String>,
+    /// Tablet hash-range prefix length (addresses covered:
+    /// `2^(128-len)`).
+    range_len: Option<u8>,
 }
 
 /// Per-peer QUIC/H3 diagnostics (control + bulk connections).
@@ -1462,7 +1620,19 @@ struct SidecarDto {
     inflight: u64,
 }
 
-fn tablet_dto(status: &NodeStatus) -> TabletDto {
+fn tablet_dto(status: &NodeStatus, directory: &DirectorySnapshot) -> TabletDto {
+    // Static clusters always tile the hash space; non-hash layouts (a
+    // future concern) encode as nulls, never wrong ranges.
+    let (range_bits, range_len) = directory
+        .get(TabletId::from_u64(status.group.tablet().as_u64()))
+        .and_then(|descriptor| match descriptor.range() {
+            kivi_tablet::PartitionRange::Hash(prefix) => Some((
+                Some(format!("{:032x}", prefix.bits())),
+                Some(prefix.prefix_len()),
+            )),
+            kivi_tablet::PartitionRange::Ordered(_) => None,
+        })
+        .unwrap_or((None, None));
     TabletDto {
         group: status.group.tablet().as_u64(),
         replica: status.replica.node().as_u64(),
@@ -1477,6 +1647,8 @@ fn tablet_dto(status: &NodeStatus) -> TabletDto {
         purged: status.purged.map(kivi_consensus::ConsensusLogIndex::get),
         healthy: status.healthy,
         detail: status.detail.clone(),
+        range_bits,
+        range_len,
     }
 }
 
@@ -1485,23 +1657,28 @@ async fn health() -> Json<serde_json::Value> {
 }
 
 async fn ready(State(shared): State<ClusterShared>) -> Json<serde_json::Value> {
-    let status = shared.node.status().await;
-    // Deliberate readiness: process alive is not enough. A cluster node is
-    // usable once its peer transport started, its replica initialized with
-    // loaded membership, and its health latch is clear. `leader_known`
-    // distinguishes election-in-flight (still routable via redirects once
-    // a leader emerges) from a ready serving replica.
-    let leader_known = status.leader.is_some();
+    let statuses = shared.node.status_all().await;
+    // Multi-tablet readiness: process alive is not enough. A node is
+    // usable once its peer mesh started, every configured local replica
+    // loaded, and every group healthy — partial failure is reported
+    // openly (counts), never hidden behind one boolean.
+    let total = statuses.len();
+    let healthy = statuses.iter().filter(|status| status.healthy).count();
+    let leaders_known = statuses
+        .iter()
+        .filter(|status| status.leader.is_some())
+        .count();
     Json(serde_json::json!({
-        "ready": status.healthy,
+        "ready": total > 0 && healthy == total,
         "initialized": true,
         "transport": true,
         "membership_loaded": true,
-        "leader_known": leader_known,
-        "election_pending": !leader_known,
-        "role": status.role.to_string(),
-        "leader": status.leader.map(|leader| leader.node().as_u64()),
-        "healthy": status.healthy,
+        "tablets_total": total,
+        "tablets_healthy": healthy,
+        "leaders_known": leaders_known,
+        "election_pending": leaders_known != total,
+        "leader_known": leaders_known == total,
+        "healthy": healthy == total,
     }))
 }
 
@@ -1511,7 +1688,10 @@ async fn node_info(State(shared): State<ClusterShared>) -> Json<serde_json::Valu
         "cluster": shared.node.cluster().as_u128(),
         "incarnation": shared.node.incarnation().as_u64(),
         "namespace": shared.namespace.as_u64(),
-        "tablet": shared.tablet.as_u64(),
+        "tablets": shared.node.tablets().iter().map(|tablet| tablet.as_u64()).collect::<Vec<_>>(),
+        "tablet_count": shared.node.tablets().len(),
+        "workers": shared.node.worker_count(),
+        "dir_version": shared.directory.version().as_u64(),
         "mode": "replicated",
         "cluster_mode": "replicated",
         "peer": shared.node.peer_addr().to_string(),
@@ -1521,12 +1701,48 @@ async fn node_info(State(shared): State<ClusterShared>) -> Json<serde_json::Valu
     }))
 }
 
-async fn tablet(State(shared): State<ClusterShared>) -> Json<TabletDto> {
-    Json(tablet_dto(&shared.node.status().await))
+/// Per-tablet diagnostics for every local group, sorted by tablet.
+async fn tablets(State(shared): State<ClusterShared>) -> Json<Vec<TabletDto>> {
+    let mut out: Vec<TabletDto> = shared
+        .node
+        .status_all()
+        .await
+        .iter()
+        .map(|status| tablet_dto(status, &shared.directory))
+        .collect();
+    out.sort_by_key(|tablet| tablet.group);
+    Json(out)
+}
+
+/// Single-tablet compatibility: serves the only group when exactly one
+/// tablet is configured; multi-tablet nodes answer `400` directing
+/// callers at `/v1/tablets` (no silent partial view).
+async fn tablet(State(shared): State<ClusterShared>) -> (StatusCode, Json<serde_json::Value>) {
+    let mut statuses = shared.node.status_all().await;
+    if statuses.len() != 1 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "multi-tablet node; use /v1/tablets" })),
+        );
+    }
+    let status = statuses.pop().expect("exactly one status");
+    match serde_json::to_value(tablet_dto(&status, &shared.directory)) {
+        Ok(value) => (StatusCode::OK, Json(value)),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        ),
+    }
 }
 
 async fn peers(State(shared): State<ClusterShared>) -> Json<Vec<PeerDto>> {
-    let status = shared.node.status().await;
+    // Peer stats are node-wide (one shared mesh): any group's status
+    // carries them; fall back to empty when no group exists (unreachable:
+    // at least one tablet is always configured).
+    let statuses = shared.node.status_all().await;
+    let Some(status) = statuses.first() else {
+        return Json(Vec::new());
+    };
     let mut out: Vec<PeerDto> = status
         .peers
         .iter()
@@ -1552,20 +1768,53 @@ async fn peers(State(shared): State<ClusterShared>) -> Json<Vec<PeerDto>> {
 }
 
 async fn sidecar(State(shared): State<ClusterShared>) -> Json<SidecarDto> {
-    let status = shared.node.status().await;
+    // Sidecar metrics are node-wide (one shared content store).
+    let snapshot = shared.node.sidecar().metrics().snapshot();
     Json(SidecarDto {
-        bulk_bytes_sent: status.sidecar.bulk_bytes_sent,
-        bulk_bytes_received: status.sidecar.bulk_bytes_received,
-        manifest_requests: status.sidecar.manifest_requests,
-        chunk_requests: status.sidecar.chunk_requests,
-        cache_hits: status.sidecar.cache_hits,
-        cache_misses: status.sidecar.cache_misses,
-        deduped_bytes: status.sidecar.deduped_bytes,
-        bulk_errors: status.sidecar.bulk_errors,
-        verification_failures: status.sidecar.verification_failures,
-        pending_gated: status.sidecar.pending_gated,
-        inflight: status.sidecar.inflight,
+        bulk_bytes_sent: snapshot.bulk_bytes_sent,
+        bulk_bytes_received: snapshot.bulk_bytes_received,
+        manifest_requests: snapshot.manifest_requests,
+        chunk_requests: snapshot.chunk_requests,
+        cache_hits: snapshot.cache_hits,
+        cache_misses: snapshot.cache_misses,
+        deduped_bytes: snapshot.deduped_bytes,
+        bulk_errors: snapshot.bulk_errors,
+        verification_failures: snapshot.verification_failures,
+        pending_gated: snapshot.pending_gated,
+        inflight: snapshot.inflight,
     })
+}
+
+/// Shared physical durability metrics: physical batches, records/bytes
+/// per batch, barriers, groups per batch, queue depth, barrier latency.
+/// Evidence that cross-group batching actually happens.
+async fn durability(State(shared): State<ClusterShared>) -> Json<serde_json::Value> {
+    let metrics = shared.node.durability_metrics();
+    Json(serde_json::json!({
+        "physical_batches": metrics.physical_batches,
+        "records": metrics.records,
+        "bytes": metrics.bytes,
+        "barriers": metrics.barriers,
+        "group_appearances": metrics.group_appearances,
+        "max_groups_per_batch": metrics.max_groups_per_batch,
+        "max_records_per_batch": metrics.max_records_per_batch,
+        "queue_depth": metrics.queue_depth,
+        "queue_bytes": metrics.queue_bytes,
+        "barrier_latency_us": metrics.barrier_latency_us,
+    }))
+}
+
+/// Sidecar preflight metrics: attempts, quorum-ready rounds, append-gate
+/// fallbacks, ready replies, total latency.
+async fn preflight(State(shared): State<ClusterShared>) -> Json<serde_json::Value> {
+    let metrics = shared.node.preflight_metrics();
+    Json(serde_json::json!({
+        "attempts": metrics.attempts,
+        "quorum_ready": metrics.quorum_ready,
+        "fallbacks": metrics.fallbacks,
+        "ready_replies": metrics.ready_replies,
+        "latency_us": metrics.latency_us,
+    }))
 }
 
 /// Suspends one peer link (partition test hook and drain tooling).
@@ -1610,15 +1859,38 @@ async fn resume_peer(
     (StatusCode::OK, Json(serde_json::json!({ "resumed": node })))
 }
 
-/// Seals a checkpoint snapshot and purges the Raft log through its base.
-/// Used by operators and the lab harness to force snapshot catch-up:
-/// a lagging follower behind the purge point recovers via snapshot
-/// install, then resumes log replication.
-async fn snapshot(State(shared): State<ClusterShared>) -> (StatusCode, Json<serde_json::Value>) {
-    match shared.node.snapshot_and_purge().await {
+/// Seals a checkpoint snapshot and purges one group's Raft log through
+/// its base. Used by operators and the lab harness to force snapshot
+/// catch-up: a lagging follower behind the purge point recovers via
+/// snapshot install, then resumes log replication. Body: `{ "tablet":
+/// <u64> }`, optional when exactly one tablet is configured (otherwise
+/// required — snapshots stay per tablet, never one giant node image).
+async fn snapshot(
+    State(shared): State<ClusterShared>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let tablet = if let Some(id) = body.get("tablet").and_then(serde_json::Value::as_u64) {
+        TabletId::from_u64(id)
+    } else {
+        let tablets = shared.node.tablets();
+        if tablets.len() != 1 {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(
+                    serde_json::json!({ "error": "multi-tablet node; body must be {\"tablet\": <u64>}" }),
+                ),
+            );
+        }
+        tablets[0]
+    };
+    match shared
+        .node
+        .snapshot_and_purge(ConsensusGroupId::of_tablet(tablet))
+        .await
+    {
         Ok(base) => (
             StatusCode::OK,
-            Json(serde_json::json!({ "snapshot": base.get() })),
+            Json(serde_json::json!({ "snapshot": base.get(), "tablet": tablet.as_u64() })),
         ),
         Err(reason) => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1634,8 +1906,11 @@ async fn serve_admin(listener: tokio::net::TcpListener, shared: ClusterShared) {
         .route("/ready", get(ready))
         .route("/v1/node", get(node_info))
         .route("/v1/tablet", get(tablet))
+        .route("/v1/tablets", get(tablets))
         .route("/v1/peers", get(peers))
         .route("/v1/sidecar", get(sidecar))
+        .route("/v1/durability", get(durability))
+        .route("/v1/preflight", get(preflight))
         .route("/v1/peers/suspend", post(suspend_peer))
         .route("/v1/peers/resume", post(resume_peer))
         .route("/v1/snapshot", post(snapshot))
@@ -1666,7 +1941,9 @@ async fn serve_admin(listener: tokio::net::TcpListener, shared: ClusterShared) {
 #[cfg(feature = "redis-compat")]
 #[derive(Debug, Clone)]
 pub struct ClusterExecutor {
-    node: Arc<ReplicatedNode>,
+    node: Arc<ConsensusNode>,
+    directory: DirectorySnapshot,
+    namespace: NamespaceId,
     handle: tokio::runtime::Handle,
 }
 
@@ -1675,28 +1952,46 @@ impl ClusterExecutor {
     /// Binds the executor to its node (call inside the serving runtime
     /// so the handle is current).
     #[must_use]
-    pub fn new(node: Arc<ReplicatedNode>) -> Self {
+    pub fn new(
+        node: Arc<ConsensusNode>,
+        directory: DirectorySnapshot,
+        namespace: NamespaceId,
+    ) -> Self {
         Self {
             node,
+            directory,
+            namespace,
             handle: tokio::runtime::Handle::current(),
         }
     }
 
-    /// Executes one typed operation against the replicated tablet:
+    /// Routes one operation to its tablet through the static directory
+    /// (same key → tablet mapping as the native edge).
+    fn route(&self, op: &Operation) -> Result<TabletId, kivi_resp::ExecuteError> {
+        use kivi_resp::ExecuteError as E;
+        use kivi_state::PartitionHasher;
+        let hash = PartitionHasher::V1
+            .hash(self.namespace, op.key().as_bytes())
+            .ok_or(E::Internal)?;
+        self.directory.lookup_by_hash(hash).ok_or(E::Internal)
+    }
+
+    /// Executes one typed operation against its tablet's replica:
     /// reads serve local applied state, mutations propose anonymously.
     fn execute_inner(&self, op: &Operation) -> Result<OperationResult, kivi_resp::ExecuteError> {
         use kivi_resp::ExecuteError as E;
         // `block_on` from a blocking context: `RespConnection` drains on
         // the blocking pool (`spawn_blocking`), where no async worker
         // runs, so this never re-enters the runtime.
+        let tablet = self.route(op)?;
         if op_is_read(op) {
             self.handle
-                .block_on(self.node.read(op, ReadContract::Any, wall_now()))
+                .block_on(self.node.read(tablet, op, ReadContract::Any, wall_now()))
                 .map_err(|_| E::Internal)
         } else {
             match self
                 .handle
-                .block_on(self.node.propose(op, None, None, wall_now()))
+                .block_on(self.node.propose(tablet, op, None, None, wall_now()))
             {
                 Ok(outcome) => match outcome {
                     ProposeOutcome::Applied { outcome, .. }

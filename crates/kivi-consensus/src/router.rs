@@ -456,10 +456,14 @@ where
             "snapshot fragments reassemble on the owner thread".to_owned(),
         )),
         // Sidecar bulk requests never reach the Raft service either: the
-        // owner serves them from the sidecar store. Arriving here is a
-        // routing bug, refused loudly.
+        // owner serves them from the sidecar store (fetches) or the
+        // durability gate (preflight). Arriving here is a routing bug,
+        // refused loudly.
         PeerRequest::Manifest(_) | PeerRequest::Chunk(_) => Err(refused(
             "sidecar bulk requests serve from the sidecar store".to_owned(),
+        )),
+        PeerRequest::Prepare(_) => Err(refused(
+            "sidecar preflight serves from the durability gate".to_owned(),
         )),
     }
 }

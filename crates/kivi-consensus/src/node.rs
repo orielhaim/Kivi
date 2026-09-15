@@ -99,7 +99,7 @@ use kivi_types::{
     ClusterId, CommitPosition, IdempotencyKey, MutationIdentity, NamespaceId, NodeId, ReadContract,
     TabletAuthority, TabletId, UnixMicros,
 };
-use openraft::storage::{RaftLogReader as _, RaftLogStorage as _, RaftStateMachine as _};
+use openraft::storage::RaftStateMachine as _;
 use openraft::type_config::async_runtime::watch::WatchReceiver as _;
 
 use crate::cluster::{Bootstrap, ClusterTopology, DurableClusterView, classify_bootstrap};
@@ -113,7 +113,7 @@ use crate::peer::{
 use crate::router::{GroupNetworkFactory, PeerRouter, decode_snapshot_meta, serve_peer_request};
 use crate::sidecar::SidecarStore;
 use crate::state_machine::{ProposalGate, ReplicatedStateMachine};
-use crate::store::DurableRaftStore;
+use crate::store::{ConsensusLogStore, DurableRaftStore};
 use crate::transport::{PeerHandler, PeerStats, PeerTransport, TransportConfig};
 use crate::types::{
     ConsensusError, ConsensusGroupId, ConsensusLogIndex, ConsensusTerm, LeaderHint, ReadBarrier,
@@ -127,7 +127,7 @@ const AT_LEAST_TIMEOUT: Duration = Duration::from_secs(10);
 /// reply channel, so depth only bounds burst memory; a full queue fails
 /// the submitter with `ShuttingDown`-class backpressure instead of
 /// growing.
-const OWNER_QUEUE: usize = 256;
+pub(crate) const OWNER_QUEUE: usize = 256;
 
 /// Replicated-node construction parameters. Everything is validated
 /// before serving: topology incoherence, identity conflicts, and corrupt
@@ -162,6 +162,11 @@ pub struct NodeConfig {
     /// Never set in production: without verification any network peer
     /// could impersonate a member.
     pub insecure_peer_tls: bool,
+    /// Whether the leader pre-distributes chunked sidecars to followers
+    /// before proposing the tiny root (`true` in production). `false`
+    /// forces the append-gate fallback path (correctness probe: proves
+    /// preflight is only an optimization).
+    pub preflight_enabled: bool,
 }
 
 /// Why a replicated node could not open.
@@ -335,6 +340,8 @@ pub struct NodeStatus {
     pub peers: HashMap<NodeId, PeerStats>,
     /// Immutable sidecar replication diagnostics.
     pub sidecar: crate::sidecar::SidecarMetricsSnapshot,
+    /// Sidecar preflight diagnostics (attempts, quorum-ready, fallbacks).
+    pub preflight: crate::preflight::PreflightMetricsSnapshot,
 }
 
 type Reply<T> = futures::channel::oneshot::Sender<T>;
@@ -342,21 +349,49 @@ type Reply<T> = futures::channel::oneshot::Sender<T>;
 /// One unit of work for the owner thread. Every variant carries its reply
 /// channel; dropping the reply (owner shutdown race) surfaces as
 /// `ShuttingDown` on the caller, never a hang.
-enum OwnerRequest {
+pub(crate) enum OwnerRequest {
     /// Quorum-commit one deterministic command.
     Propose {
+        /// Addressed group.
+        group: ConsensusGroupId,
         /// Deterministic command plus expectation.
         command: ReplicatedMutation,
         /// Mapped proposal outcome.
         reply: Reply<Result<ProposeOutcome, ProposeError>>,
     },
+    /// Quorum-commit one chunked operation with preflight: the owner
+    /// pre-distributes sidecars to a write quorum, then prepares the
+    /// deterministic mutation against fresh state (condition evaluation
+    /// belongs at this boundary, never before a multi-second preflight)
+    /// and commits it. Small same-tablet writes proceed meanwhile: this
+    /// request runs on its own task and only the final tiny root enters
+    /// Raft ordering.
+    ProposeChunked {
+        /// Addressed group.
+        group: ConsensusGroupId,
+        /// Staged chunked operation (sidecars already durable locally).
+        op: Operation,
+        /// Client identity for exactly-once semantics.
+        identity: Option<MutationIdentity>,
+        /// Idempotency key, if any.
+        idempotency: Option<IdempotencyKey>,
+        /// Client-boundary timestamp (replicas apply the leader's
+        /// materialized stamp).
+        now: UnixMicros,
+        /// Mapped proposal outcome.
+        reply: Reply<Result<ProposeOutcome, ProposeError>>,
+    },
     /// Establish a `ReadIndex` linearizable barrier.
     Barrier {
+        /// Addressed group.
+        group: ConsensusGroupId,
         /// Leadership-bound barrier or routing failure.
         reply: Reply<Result<ReadBarrier, ConsensusError>>,
     },
     /// Wait for local applied coverage of `index` (bounded).
     WaitApplied {
+        /// Addressed group.
+        group: ConsensusGroupId,
         /// Index to cover.
         index: u64,
         /// Covered (`Ok`) or timed out (`Err(())`).
@@ -364,6 +399,8 @@ enum OwnerRequest {
     },
     /// Gather full diagnostics.
     Status {
+        /// Addressed group.
+        group: ConsensusGroupId,
         /// Diagnostics including per-peer stats (the owner holds the
         /// transport handle, so no second hop is needed).
         reply: Reply<NodeStatus>,
@@ -381,6 +418,8 @@ enum OwnerRequest {
     },
     /// Trigger a snapshot seal and purge the log through its base.
     SnapshotPurge {
+        /// Addressed group.
+        group: ConsensusGroupId,
         /// Sealed base or human-readable reason.
         reply: Reply<Result<ConsensusLogIndex, String>>,
     },
@@ -403,6 +442,100 @@ enum OwnerRequest {
     Shutdown,
 }
 
+impl OwnerRequest {
+    /// Returns the addressed group for group-scoped requests. Node-wide
+    /// requests (peer suspend/resume, shutdown) address no group.
+    pub(crate) fn group(&self) -> Option<ConsensusGroupId> {
+        match self {
+            Self::Propose { group, .. }
+            | Self::ProposeChunked { group, .. }
+            | Self::Barrier { group, .. }
+            | Self::WaitApplied { group, .. }
+            | Self::Status { group, .. }
+            | Self::Serve { group, .. }
+            | Self::SnapshotPurge { group, .. } => Some(*group),
+            Self::SuspendPeer { .. } | Self::ResumePeer { .. } | Self::Shutdown => None,
+        }
+    }
+
+    /// Sends the loud "no local replica owns this group" answer for a
+    /// request that reached a worker without a matching replica. The
+    /// multi-tablet front and the group registry route correctly, so this
+    /// fires only on genuine misrouting or unknown groups — never silent,
+    /// never a hang. Node-wide requests have no group to mismatch and are
+    /// ignored (the worker loop handles them directly).
+    pub(crate) fn reply_unroutable(self, local: NodeId) {
+        match self {
+            Self::Propose { group, reply, .. } | Self::ProposeChunked { group, reply, .. } => {
+                let _ = reply.send(Err(ProposeError::Consensus(ConsensusError::Unavailable {
+                    reason: format!("group {group} not served by node {}", local.as_u64()),
+                })));
+            }
+            Self::Barrier { group, reply } => {
+                let _ = reply.send(Err(ConsensusError::Unavailable {
+                    reason: format!("group {group} not served by node {}", local.as_u64()),
+                }));
+            }
+            Self::WaitApplied { reply, .. } => {
+                let _ = reply.send(Err(()));
+            }
+            Self::Status { group, reply } => {
+                let _ = reply.send(NodeStatus {
+                    group,
+                    replica: ReplicaId::of_node(local),
+                    role: ReplicaRole::Follower,
+                    term: ConsensusTerm::INITIAL,
+                    leader: None,
+                    last_log: ConsensusLogIndex::NONE,
+                    committed: ConsensusLogIndex::NONE,
+                    applied: ConsensusLogIndex::NONE,
+                    applied_commit: CommitPosition::UNASSIGNED,
+                    snapshot: None,
+                    purged: None,
+                    healthy: false,
+                    detail: Some(format!(
+                        "group {group} not served by node {}",
+                        local.as_u64()
+                    )),
+                    peers: HashMap::new(),
+                    sidecar: crate::sidecar::SidecarMetricsSnapshot {
+                        bulk_bytes_sent: 0,
+                        bulk_bytes_received: 0,
+                        manifest_requests: 0,
+                        chunk_requests: 0,
+                        cache_hits: 0,
+                        cache_misses: 0,
+                        deduped_bytes: 0,
+                        bulk_errors: 0,
+                        verification_failures: 0,
+                        pending_gated: 0,
+                        inflight: 0,
+                    },
+                    preflight: crate::preflight::PreflightMetricsSnapshot {
+                        attempts: 0,
+                        quorum_ready: 0,
+                        fallbacks: 0,
+                        ready_replies: 0,
+                        latency_us: 0,
+                    },
+                });
+            }
+            Self::Serve { reply, .. } => {
+                let _ = reply.send(Err(PeerRpcError {
+                    detail: format!("group not served by node {}", local.as_u64()),
+                }));
+            }
+            Self::SnapshotPurge { group, reply } => {
+                let _ = reply.send(Err(format!(
+                    "group {group} not served by node {}",
+                    local.as_u64()
+                )));
+            }
+            Self::SuspendPeer { .. } | Self::ResumePeer { .. } | Self::Shutdown => {}
+        }
+    }
+}
+
 /// One replicated Kivi node: a `Send + Sync` front over the Compio owner
 /// thread driving a single tablet group. The `Raft` handle itself never
 /// leaves that thread; every method below is an ordinary `Send` future on
@@ -414,6 +547,8 @@ pub struct ReplicatedNode {
     #[allow(dead_code)]
     store: DurableRaftStore,
     sidecar: SidecarStore,
+    /// Node-wide sidecar preflight metrics (shared with the owner).
+    preflight: Arc<crate::preflight::PreflightMetrics>,
     owner_tx: async_channel::Sender<OwnerRequest>,
     owner_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     peer_addr: std::net::SocketAddr,
@@ -466,8 +601,8 @@ struct RecoveredParts {
 
 /// Parameters crossing into the owner thread at spawn. Everything is
 /// owned (`Send`); the `!Send` Raft handle is built inside.
-struct OwnerParams {
-    store: DurableRaftStore,
+struct OwnerParams<S> {
+    store: S,
     machine: ReplicatedStateMachine,
     sidecar: SidecarStore,
     tls: crate::transport::TlsMaterial,
@@ -481,6 +616,9 @@ struct OwnerParams {
     group: ConsensusGroupId,
     tablet: TabletId,
     namespace: NamespaceId,
+    authority: TabletAuthority,
+    preflight: Arc<crate::preflight::PreflightMetrics>,
+    preflight_enabled: bool,
     serve_tx: async_channel::Sender<OwnerRequest>,
     requests: async_channel::Receiver<OwnerRequest>,
     ready: futures::channel::oneshot::Sender<Result<std::net::SocketAddr, NodeOpenError>>,
@@ -648,6 +786,7 @@ impl ReplicatedNode {
         let (ready_tx, ready_rx) =
             futures::channel::oneshot::channel::<Result<std::net::SocketAddr, NodeOpenError>>();
         let router_tx = owner_tx.clone();
+        let preflight = Arc::new(crate::preflight::PreflightMetrics::default());
         let owner_params = OwnerParams {
             store: store.clone(),
             machine: machine.clone(),
@@ -663,6 +802,9 @@ impl ReplicatedNode {
             group,
             tablet: config.tablet,
             namespace: config.namespace,
+            authority: config.authority,
+            preflight: Arc::clone(&preflight),
+            preflight_enabled: config.preflight_enabled,
             serve_tx: router_tx,
             requests: owner_rx,
             ready: ready_tx,
@@ -700,6 +842,7 @@ impl ReplicatedNode {
             machine,
             store: store.clone(),
             sidecar: sidecar.clone(),
+            preflight,
             owner_tx,
             owner_thread: Mutex::new(Some(thread)),
             peer_addr,
@@ -746,15 +889,6 @@ impl ReplicatedNode {
         &self.sidecar
     }
 
-    /// Ensures proposal sidecars (see [`ensure_proposal_sidecars_for`]).
-    async fn ensure_proposal_sidecars(
-        &self,
-        op: &Operation,
-        now: UnixMicros,
-    ) -> Result<Option<Operation>, ProposeError> {
-        ensure_proposal_sidecars_for(&self.sidecar, &self.machine, op, now).await
-    }
-
     /// Sends one owner request and awaits its reply. A closed queue or a
     /// dropped reply means the owner is gone: `ShuttingDown`, never a
     /// hang.
@@ -762,12 +896,7 @@ impl ReplicatedNode {
         &self,
         build: impl FnOnce(Reply<T>) -> OwnerRequest,
     ) -> Result<T, ConsensusError> {
-        let (reply, rx) = futures::channel::oneshot::channel();
-        self.owner_tx
-            .send(build(reply))
-            .await
-            .map_err(|_| ConsensusError::ShuttingDown)?;
-        rx.await.map_err(|_| ConsensusError::ShuttingDown)
+        owner_call_on(&self.owner_tx, build).await
     }
 
     /// Proposes one client mutation through the replicated path:
@@ -789,77 +918,19 @@ impl ReplicatedNode {
         idempotency: Option<IdempotencyKey>,
         now: UnixMicros,
     ) -> Result<ProposeOutcome, ProposeError> {
-        use kivi_state::StorePrepared;
-        // Leader dedup check first: retries answer from any replica's
-        // retained state without proposing (lost-response failover). This
-        // precedes sidecar work so a retry never stages a second root.
-        if let Some(marker) = identity {
-            match self
-                .machine
-                .check_proposal(&marker)
-                .await
-                .map_err(|error| {
-                    ProposeError::Consensus(ConsensusError::Unavailable {
-                        reason: error.to_string(),
-                    })
-                })? {
-                ProposalGate::Admit => {}
-                ProposalGate::Hit { outcome } => {
-                    return Ok(ProposeOutcome::Duplicate { outcome });
-                }
-                ProposalGate::Expired => return Err(ProposeError::Expired),
-                ProposalGate::Overloaded => return Err(ProposeError::Overloaded),
-            }
-        }
-        // Sidecar gate: chunked roots must already be durable locally
-        // (cluster server stages before proposing); chunked-base range
-        // patches restage here reusing untouched chunk ids via content
-        // addressing. Returns a restaged operation when the input cannot
-        // prepare directly.
-        let restaged = self.ensure_proposal_sidecars(op, now).await?;
-        let effective = restaged.as_ref().unwrap_or(op);
-        // Deterministic prepare against current state (read-only).
-        let prepared = self.machine.prepare_operation(effective, now).await?;
-        let (mutation, expected) = match prepared {
-            StorePrepared::Read(outcome) => return Ok(ProposeOutcome::Read { outcome }),
-            StorePrepared::Terminal(outcome) => {
-                return Ok(ProposeOutcome::Rejected { outcome });
-            }
-            StorePrepared::Write { mutation, expected } => (mutation, expected),
-        };
-        // No separate leader pre-check (`is_leader` is deprecated in
-        // favor of the barrier): `client_write` fails fast with
-        // `ForwardToLeader` on followers, which maps to `NotLeader` with
-        // a hint below. A stale pre-check would only add a
-        // lost-leadership race without removing this mapping.
-        // Identity-less requests envelop the reserved anonymous identity
-        // (no retry contract): the state machine applies them fresh
-        // without dedup install, so unrelated anonymous writes never
-        // alias. Client adapters must never issue session zero.
-        let client = identity.map_or(
-            kivi_types::RequestIdentity::new(
-                kivi_types::SessionId::from_u128(crate::state_machine::ANONYMOUS_SESSION),
-                kivi_types::RequestSeq::from_u64(0),
-            ),
-            |marker| marker.client,
-        );
-        let envelope = kivi_state::MutationEnvelope::new(
+        propose_caller_side(
+            &self.machine,
+            &self.sidecar,
             self.namespace,
             self.authority,
-            client,
+            &self.owner_tx,
+            self.group,
+            op,
+            identity,
             idempotency,
-            mutation,
-        );
-        let command = ReplicatedMutation::new(
-            envelope,
-            expected,
             now,
-            identity.map_or(kivi_types::RequestSeq::from_u64(0), |marker| {
-                marker.ack_floor
-            }),
-        );
-        self.owner_call(|reply| OwnerRequest::Propose { command, reply })
-            .await?
+        )
+        .await
     }
 
     /// Serves one read under its contract.
@@ -874,59 +945,7 @@ impl ReplicatedNode {
         contract: ReadContract,
         now: UnixMicros,
     ) -> Result<OperationResult, ReadError> {
-        match contract {
-            ReadContract::Latest => {
-                // Leader-only strong read: the `ReadIndex` barrier proves
-                // leadership with a quorum AND waits for local applied
-                // coverage of its boundary (0.10 `ensure_linearizable`
-                // awaits readiness itself), and fails with
-                // `ForwardToLeader` on followers.
-                self.owner_call(|reply| OwnerRequest::Barrier { reply })
-                    .await
-                    .map_err(ReadError::Consensus)?
-                    .map_err(ReadError::Consensus)?;
-                Ok(self.read_applied(op, now).await?)
-            }
-            ReadContract::Any | ReadContract::BoundedStale { .. } => {
-                // Weak read over local applied state; no staleness bound
-                // is claimed in this stage.
-                Ok(self.read_applied(op, now).await?)
-            }
-            ReadContract::AtLeast(token) => {
-                // Any replica whose applied coverage reaches the token
-                // serves it (committed by definition of applied). The
-                // wait runs on the owner thread (reactor sleep); this
-                // future stays runtime-agnostic.
-                let index =
-                    crate::state_machine::index_of_commit(token.position()).ok_or_else(|| {
-                        ReadError::Consensus(ConsensusError::Unavailable {
-                            reason: "at-least token names no log slot".to_owned(),
-                        })
-                    })?;
-                self.owner_call(|reply| OwnerRequest::WaitApplied { index, reply })
-                    .await
-                    .map_err(ReadError::Consensus)?
-                    .map_err(|()| ReadError::CoverageTimeout)?;
-                Ok(self.read_applied(op, now).await?)
-            }
-        }
-    }
-
-    /// Reads local applied state, mapping machine faults honestly.
-    async fn read_applied(
-        &self,
-        op: &Operation,
-        now: UnixMicros,
-    ) -> Result<OperationResult, ReadError> {
-        self.machine
-            .read_local(op, now)
-            .await
-            .map_err(|error| match error {
-                crate::state_machine::StateMachineFault::NotARead => ReadError::NotARead,
-                other => ReadError::Consensus(ConsensusError::Unavailable {
-                    reason: other.to_string(),
-                }),
-            })
+        read_caller_side(&self.machine, &self.owner_tx, self.group, op, contract, now).await
     }
 
     /// Reads full diagnostics: group, role, term, leader, log pointers,
@@ -934,7 +953,8 @@ impl ReplicatedNode {
     pub async fn status(&self) -> NodeStatus {
         // The owner is gone only after shutdown; a dead owner reports a
         // closed status rather than hanging the admin plane.
-        self.owner_call(|reply| OwnerRequest::Status { reply })
+        let group = self.group;
+        self.owner_call(|reply| OwnerRequest::Status { group, reply })
             .await
             .unwrap_or_else(|_| NodeStatus {
                 group: self.group,
@@ -952,6 +972,7 @@ impl ReplicatedNode {
                 detail: Some("consensus owner shut down".to_owned()),
                 peers: HashMap::new(),
                 sidecar: self.sidecar.metrics().snapshot(),
+                preflight: self.preflight.snapshot(),
             })
     }
 
@@ -970,8 +991,9 @@ impl ReplicatedNode {
     /// before the deadline.
     pub async fn snapshot_and_purge(&self) -> Result<ConsensusLogIndex, String> {
         let (reply, rx) = futures::channel::oneshot::channel();
+        let group = self.group;
         self.owner_tx
-            .send(OwnerRequest::SnapshotPurge { reply })
+            .send(OwnerRequest::SnapshotPurge { group, reply })
             .await
             .map_err(|_| "consensus owner shut down".to_owned())?;
         rx.await
@@ -1023,6 +1045,209 @@ impl ReplicatedNode {
     }
 }
 
+/// Sends one owner request over an explicit queue and awaits its reply.
+/// A closed queue or a dropped reply means the owner is gone:
+/// `ShuttingDown`, never a hang. Shared by the single-group node and the
+/// multi-tablet workers (both fronts stay `Send` while `Raft` handles stay
+/// pinned to their reactors).
+pub(crate) async fn owner_call_on<T>(
+    owner_tx: &async_channel::Sender<OwnerRequest>,
+    build: impl FnOnce(Reply<T>) -> OwnerRequest,
+) -> Result<T, ConsensusError> {
+    let (reply, rx) = futures::channel::oneshot::channel();
+    owner_tx
+        .send(build(reply))
+        .await
+        .map_err(|_| ConsensusError::ShuttingDown)?;
+    rx.await.map_err(|_| ConsensusError::ShuttingDown)
+}
+
+/// Caller-side proposal shared by the single-group node and every
+/// multi-tablet replica: leader dedup check, local sidecar staging,
+/// chunked preflight dispatch vs. small-write prepare, quorum commit.
+/// Only the commit hops to the owner thread; the stages before it run on
+/// the caller's shared machine state.
+///
+/// # Errors
+///
+/// Returns [`ProposeError`] for routing, dedup, capability, or validation
+/// failures.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn propose_caller_side(
+    machine: &ReplicatedStateMachine,
+    sidecar: &SidecarStore,
+    namespace: NamespaceId,
+    authority: TabletAuthority,
+    owner_tx: &async_channel::Sender<OwnerRequest>,
+    group: ConsensusGroupId,
+    op: &Operation,
+    identity: Option<MutationIdentity>,
+    idempotency: Option<IdempotencyKey>,
+    now: UnixMicros,
+) -> Result<ProposeOutcome, ProposeError> {
+    use kivi_state::StorePrepared;
+    // Leader dedup check first: retries answer from any replica's
+    // retained state without proposing (lost-response failover). This
+    // precedes sidecar work so a retry never stages a second root.
+    if let Some(marker) = identity {
+        match machine.check_proposal(&marker).await.map_err(|error| {
+            ProposeError::Consensus(ConsensusError::Unavailable {
+                reason: error.to_string(),
+            })
+        })? {
+            ProposalGate::Admit => {}
+            ProposalGate::Hit { outcome } => {
+                return Ok(ProposeOutcome::Duplicate { outcome });
+            }
+            ProposalGate::Expired => return Err(ProposeError::Expired),
+            ProposalGate::Overloaded => return Err(ProposeError::Overloaded),
+        }
+    }
+    // Sidecar staging: chunked roots must already be durable locally
+    // (cluster server stages before proposing); chunked-base range patches
+    // restage here reusing untouched chunk ids via content addressing.
+    let restaged = ensure_proposal_sidecars_for(sidecar, machine, op, now).await?;
+    let effective = restaged.as_ref().unwrap_or(op);
+    // Chunked operations take the preflight path: the owner
+    // pre-distributes sidecars to a write quorum first, then prepares the
+    // mutation against fresh state at the proposal boundary. The condition
+    // of a conditional write must evaluate after the multi-second
+    // preflight — never before it — so the caller must NOT prepare here
+    // (a stale expectation would silently overwrite newer state). Small
+    // writes keep the fast path below.
+    if matches!(
+        effective,
+        Operation::SetChunked { .. } | Operation::SetConditionalChunked { .. }
+    ) {
+        let staged = effective.clone();
+        return owner_call_on(owner_tx, |reply| OwnerRequest::ProposeChunked {
+            group,
+            op: staged,
+            identity,
+            idempotency,
+            now,
+            reply,
+        })
+        .await?;
+    }
+    // Deterministic prepare against current state (read-only).
+    let prepared = machine.prepare_operation(effective, now).await?;
+    let (mutation, expected) = match prepared {
+        StorePrepared::Read(outcome) => return Ok(ProposeOutcome::Read { outcome }),
+        StorePrepared::Terminal(outcome) => {
+            return Ok(ProposeOutcome::Rejected { outcome });
+        }
+        StorePrepared::Write { mutation, expected } => (mutation, expected),
+    };
+    // No separate leader pre-check (`is_leader` is deprecated in
+    // favor of the barrier): `client_write` fails fast with
+    // `ForwardToLeader` on followers, which maps to `NotLeader` with
+    // a hint below. A stale pre-check would only add a
+    // lost-leadership race without removing this mapping.
+    // Identity-less requests envelop the reserved anonymous identity
+    // (no retry contract): the state machine applies them fresh
+    // without dedup install, so unrelated anonymous writes never
+    // alias. Client adapters must never issue session zero.
+    let client = identity.map_or(
+        kivi_types::RequestIdentity::new(
+            kivi_types::SessionId::from_u128(crate::state_machine::ANONYMOUS_SESSION),
+            kivi_types::RequestSeq::from_u64(0),
+        ),
+        |marker| marker.client,
+    );
+    let envelope =
+        kivi_state::MutationEnvelope::new(namespace, authority, client, idempotency, mutation);
+    let command = ReplicatedMutation::new(
+        envelope,
+        expected,
+        now,
+        identity.map_or(kivi_types::RequestSeq::from_u64(0), |marker| {
+            marker.ack_floor
+        }),
+    );
+    owner_call_on(owner_tx, |reply| OwnerRequest::Propose {
+        group,
+        command,
+        reply,
+    })
+    .await?
+}
+
+/// Caller-side read shared by the single-group node and every
+/// multi-tablet replica: contract dispatch over one group's machine and
+/// owner queue.
+///
+/// # Errors
+///
+/// Returns [`ReadError`] for routing, validation, or coverage failures.
+pub(crate) async fn read_caller_side(
+    machine: &ReplicatedStateMachine,
+    owner_tx: &async_channel::Sender<OwnerRequest>,
+    group: ConsensusGroupId,
+    op: &Operation,
+    contract: ReadContract,
+    now: UnixMicros,
+) -> Result<OperationResult, ReadError> {
+    match contract {
+        ReadContract::Latest => {
+            // Leader-only strong read: the `ReadIndex` barrier proves
+            // leadership with a quorum AND waits for local applied
+            // coverage of its boundary (0.10 `ensure_linearizable`
+            // awaits readiness itself), and fails with
+            // `ForwardToLeader` on followers.
+            owner_call_on(owner_tx, |reply| OwnerRequest::Barrier { group, reply })
+                .await
+                .map_err(ReadError::Consensus)?
+                .map_err(ReadError::Consensus)?;
+            Ok(read_applied_on(machine, op, now).await?)
+        }
+        ReadContract::Any | ReadContract::BoundedStale { .. } => {
+            // Weak read over local applied state; no staleness bound
+            // is claimed in this stage.
+            Ok(read_applied_on(machine, op, now).await?)
+        }
+        ReadContract::AtLeast(token) => {
+            // Any replica whose applied coverage reaches the token
+            // serves it (committed by definition of applied). The
+            // wait runs on the owner thread (reactor sleep); this
+            // future stays runtime-agnostic.
+            let index =
+                crate::state_machine::index_of_commit(token.position()).ok_or_else(|| {
+                    ReadError::Consensus(ConsensusError::Unavailable {
+                        reason: "at-least token names no log slot".to_owned(),
+                    })
+                })?;
+            owner_call_on(owner_tx, |reply| OwnerRequest::WaitApplied {
+                group,
+                index,
+                reply,
+            })
+            .await
+            .map_err(ReadError::Consensus)?
+            .map_err(|()| ReadError::CoverageTimeout)?;
+            Ok(read_applied_on(machine, op, now).await?)
+        }
+    }
+}
+
+/// Reads local applied state, mapping machine faults honestly. Shared by
+/// both fronts.
+pub(crate) async fn read_applied_on(
+    machine: &ReplicatedStateMachine,
+    op: &Operation,
+    now: UnixMicros,
+) -> Result<OperationResult, ReadError> {
+    machine
+        .read_local(op, now)
+        .await
+        .map_err(|error| match error {
+            crate::state_machine::StateMachineFault::NotARead => ReadError::NotARead,
+            other => ReadError::Consensus(ConsensusError::Unavailable {
+                reason: other.to_string(),
+            }),
+        })
+}
+
 /// Spawns the Compio owner thread driving one node's consensus work.
 /// Returns the thread handle; readiness (bound peer address or startup
 /// failure) arrives separately over the params' `ready` channel so a
@@ -1031,9 +1256,12 @@ impl ReplicatedNode {
 /// # Errors
 ///
 /// Returns [`NodeOpenError::Owner`] when the OS refuses the thread.
-fn spawn_owner_thread(
-    owner_params: OwnerParams,
-) -> Result<std::thread::JoinHandle<()>, NodeOpenError> {
+fn spawn_owner_thread<S>(
+    owner_params: OwnerParams<S>,
+) -> Result<std::thread::JoinHandle<()>, NodeOpenError>
+where
+    S: ConsensusLogStore,
+{
     std::thread::Builder::new()
         .name("kivi-consensus".to_owned())
         .spawn(move || {
@@ -1054,6 +1282,9 @@ fn spawn_owner_thread(
                 group,
                 tablet,
                 namespace,
+                authority,
+                preflight,
+                preflight_enabled,
                 serve_tx,
                 requests,
                 ready,
@@ -1082,6 +1313,9 @@ fn spawn_owner_thread(
                 group,
                 tablet,
                 namespace,
+                authority,
+                preflight,
+                preflight_enabled,
                 serve_tx,
                 requests,
                 ready,
@@ -1097,14 +1331,17 @@ fn replica_of(id: u64) -> ReplicaId {
     ReplicaId::of_node(NodeId::from_u64(id))
 }
 
-type OwnerRaft = openraft::Raft<KiviTypeConfig, ReplicatedStateMachine>;
+pub(crate) type OwnerRaft = openraft::Raft<KiviTypeConfig, ReplicatedStateMachine>;
 
 /// Owner thread main: opens the mesh, spawns Raft, bootstraps
 /// membership, starts the mesh, signals readiness, then serves the
 /// request loop until `Shutdown`. Runs inside the node's Compio reactor;
 /// every `.await` here may drive `!Send` Raft futures.
 #[allow(clippy::too_many_lines)]
-async fn owner_main(params: OwnerMain) {
+async fn owner_main<S>(params: OwnerMain<S>)
+where
+    S: ConsensusLogStore,
+{
     let OwnerMain {
         mut store,
         machine,
@@ -1120,6 +1357,9 @@ async fn owner_main(params: OwnerMain) {
         group,
         tablet,
         namespace,
+        authority,
+        preflight,
+        preflight_enabled,
         serve_tx,
         requests,
         ready,
@@ -1202,6 +1442,8 @@ async fn owner_main(params: OwnerMain) {
         transport.shutdown().await;
         return;
     }
+    let mut voter_list: Vec<NodeId> = voters.iter().map(|id| NodeId::from_u64(*id)).collect();
+    voter_list.sort_by_key(|node| node.as_u64());
     owner_serve_loop(
         OwnerCtx {
             raft: raft.clone(),
@@ -1212,7 +1454,13 @@ async fn owner_main(params: OwnerMain) {
             transport: transport.clone(),
             group,
             namespace,
+            authority,
             tablet,
+            local,
+            voters: voter_list,
+            bulk_timeout,
+            preflight,
+            preflight_enabled,
             transfers: Rc::new(RefCell::new(HashMap::new())),
         },
         raft,
@@ -1229,13 +1477,16 @@ async fn owner_main(params: OwnerMain) {
 ///
 /// Returns [`NodeOpenError`] when the Raft config is incoherent or the
 /// spawn fails.
-async fn spawn_raft(
+pub(crate) async fn spawn_raft<S>(
     local: NodeId,
     group: ConsensusGroupId,
     router: PeerRouter,
-    store: &DurableRaftStore,
+    store: &S,
     machine: &ReplicatedStateMachine,
-) -> Result<OwnerRaft, NodeOpenError> {
+) -> Result<OwnerRaft, NodeOpenError>
+where
+    S: ConsensusLogStore,
+{
     use NodeOpenError as Fault;
     let raft_config = cluster_config().map_err(|error| Fault::Topology {
         reason: format!("invalid raft config: {error}"),
@@ -1292,12 +1543,14 @@ async fn open_mesh(
 /// diagnostics, and peer RPCs meanwhile — awaiting inline deadlocks
 /// any client that overlaps a pending proposal with another request).
 /// All tasks stay on this reactor (`!Send` handles never leave it).
-async fn owner_serve_loop(
-    ctx: OwnerCtx,
+async fn owner_serve_loop<S>(
+    ctx: OwnerCtx<S>,
     raft: OwnerRaft,
     transport: PeerTransport,
     requests: async_channel::Receiver<OwnerRequest>,
-) {
+) where
+    S: ConsensusLogStore,
+{
     while let Ok(request) = requests.recv().await {
         match request {
             OwnerRequest::Shutdown => break,
@@ -1319,8 +1572,8 @@ async fn owner_serve_loop(
 /// Owned state on the owner thread: the `!Send` Raft handle, its
 /// storage, sidecar store, peer TLS material, shared mesh, and snapshot
 /// reassembly state.
-struct OwnerMain {
-    store: DurableRaftStore,
+struct OwnerMain<S> {
+    store: S,
     machine: ReplicatedStateMachine,
     sidecar: SidecarStore,
     tls: crate::transport::TlsMaterial,
@@ -1334,6 +1587,9 @@ struct OwnerMain {
     group: ConsensusGroupId,
     tablet: TabletId,
     namespace: NamespaceId,
+    authority: TabletAuthority,
+    preflight: Arc<crate::preflight::PreflightMetrics>,
+    preflight_enabled: bool,
     serve_tx: async_channel::Sender<OwnerRequest>,
     requests: async_channel::Receiver<OwnerRequest>,
     ready: futures::channel::oneshot::Sender<Result<std::net::SocketAddr, NodeOpenError>>,
@@ -1343,22 +1599,33 @@ struct OwnerMain {
 /// request runs on its own task; interior mutability is single-threaded
 /// (`Rc<RefCell<..>>`) because nothing here ever leaves the owner
 /// reactor.
+///
+/// Generic over the logical log store so the single-group node and every
+/// multi-tablet worker share one implementation: the `Raft` handle type
+/// is store-independent, and all group behavior (proposals, barriers,
+/// peer RPCs, snapshots, preflight) lives here once.
 #[derive(Clone)]
-struct OwnerCtx {
-    raft: OwnerRaft,
-    store: DurableRaftStore,
-    machine: ReplicatedStateMachine,
-    sidecar: SidecarStore,
-    gate: SidecarGate,
-    transport: PeerTransport,
-    group: ConsensusGroupId,
-    namespace: NamespaceId,
-    tablet: TabletId,
-    transfers: Rc<RefCell<HashMap<u64, PartialTransfer>>>,
+pub(crate) struct OwnerCtx<S> {
+    pub(crate) raft: OwnerRaft,
+    pub(crate) store: S,
+    pub(crate) machine: ReplicatedStateMachine,
+    pub(crate) sidecar: SidecarStore,
+    pub(crate) gate: SidecarGate,
+    pub(crate) transport: PeerTransport,
+    pub(crate) group: ConsensusGroupId,
+    pub(crate) namespace: NamespaceId,
+    pub(crate) authority: TabletAuthority,
+    pub(crate) tablet: TabletId,
+    pub(crate) local: NodeId,
+    pub(crate) voters: Vec<NodeId>,
+    pub(crate) bulk_timeout: Duration,
+    pub(crate) preflight: Arc<crate::preflight::PreflightMetrics>,
+    pub(crate) preflight_enabled: bool,
+    pub(crate) transfers: Rc<RefCell<HashMap<u64, PartialTransfer>>>,
 }
 
 /// One in-flight snapshot transfer being reassembled from fragments.
-struct PartialTransfer {
+pub(crate) struct PartialTransfer {
     vote: openraft::type_config::alias::VoteOf<KiviTypeConfig>,
     meta: openraft::type_config::alias::SnapshotMetaOf<KiviTypeConfig>,
     bytes: Vec<u8>,
@@ -1401,24 +1668,96 @@ impl PeerHandler for ServeRouter {
     }
 }
 
-impl OwnerCtx {
+impl<S> OwnerCtx<S>
+where
+    S: ConsensusLogStore,
+{
     /// Serves one request on its own task (see the loop above for why
-    /// nothing awaits inline there).
-    async fn serve_one(&self, request: OwnerRequest) {
+    /// nothing awaits inline there). Group-scoped requests naming another
+    /// group are refused loudly (a worker loop misroute, never silent):
+    /// the multi-tablet front routes by group before reaching a replica.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) async fn serve_one(&self, request: OwnerRequest) {
         match request {
-            OwnerRequest::Propose { command, reply } => {
+            OwnerRequest::Propose {
+                group,
+                command,
+                reply,
+            } => {
+                if group != self.group {
+                    let _ = reply.send(Err(ProposeError::Consensus(ConsensusError::Unavailable {
+                        reason: format!("group {group} not served here"),
+                    })));
+                    return;
+                }
                 let outcome = self.propose(command).await;
                 let _ = reply.send(outcome);
             }
-            OwnerRequest::Barrier { reply } => {
+            OwnerRequest::ProposeChunked {
+                group,
+                op,
+                identity,
+                idempotency,
+                now,
+                reply,
+            } => {
+                if group != self.group {
+                    let _ = reply.send(Err(ProposeError::Consensus(ConsensusError::Unavailable {
+                        reason: format!("group {group} not served here"),
+                    })));
+                    return;
+                }
+                let outcome = self.propose_chunked(op, identity, idempotency, now).await;
+                let _ = reply.send(outcome);
+            }
+            OwnerRequest::Barrier { group, reply } => {
+                if group != self.group {
+                    let _ = reply.send(Err(ConsensusError::Unavailable {
+                        reason: format!("group {group} not served here"),
+                    }));
+                    return;
+                }
                 let barrier = self.barrier().await;
                 let _ = reply.send(barrier);
             }
-            OwnerRequest::WaitApplied { index, reply } => {
+            OwnerRequest::WaitApplied {
+                group,
+                index,
+                reply,
+            } => {
+                if group != self.group {
+                    let _ = reply.send(Err(()));
+                    return;
+                }
                 let covered = self.wait_applied(index).await;
                 let _ = reply.send(covered);
             }
-            OwnerRequest::Status { reply } => {
+            OwnerRequest::Status { group, reply } => {
+                if group != self.group {
+                    // No status to report for a foreign group; the caller
+                    // aggregates per-group statuses and treats a missing
+                    // group as its own signal. Reply unhealthy-closed
+                    // rather than hanging the admin plane.
+                    let _ = reply.send(NodeStatus {
+                        group,
+                        replica: ReplicaId::of_node(self.transport.local().node),
+                        role: ReplicaRole::Follower,
+                        term: ConsensusTerm::INITIAL,
+                        leader: None,
+                        last_log: ConsensusLogIndex::NONE,
+                        committed: ConsensusLogIndex::NONE,
+                        applied: ConsensusLogIndex::NONE,
+                        applied_commit: CommitPosition::UNASSIGNED,
+                        snapshot: None,
+                        purged: None,
+                        healthy: false,
+                        detail: Some(format!("group {group} not served here")),
+                        peers: HashMap::new(),
+                        sidecar: self.sidecar.metrics().snapshot(),
+                        preflight: self.preflight.snapshot(),
+                    });
+                    return;
+                }
                 let status = self.status().await;
                 let _ = reply.send(status);
             }
@@ -1431,7 +1770,11 @@ impl OwnerCtx {
                 let answer = self.serve_rpc(from, group, request).await;
                 let _ = reply.send(answer);
             }
-            OwnerRequest::SnapshotPurge { reply } => {
+            OwnerRequest::SnapshotPurge { group, reply } => {
+                if group != self.group {
+                    let _ = reply.send(Err(format!("group {group} not served here")));
+                    return;
+                }
                 let sealed = self.snapshot_purge().await;
                 let _ = reply.send(sealed);
             }
@@ -1446,6 +1789,110 @@ impl OwnerCtx {
             // Handled by the loop (breaks it); unreachable here.
             OwnerRequest::Shutdown => {}
         }
+    }
+
+    /// Stops this replica's `Raft` instance. Runs on the owning reactor
+    /// (the handle is `!Send`); the worker loop calls this for every
+    /// local replica before its reactor exits.
+    pub(crate) async fn shutdown_raft(&self) {
+        let _ = self.raft.shutdown().await;
+    }
+
+    /// Quorum-commits one chunked operation with sidecar preflight. Runs
+    /// on the owner thread as its own task, so small same-tablet writes
+    /// keep entering and committing through Raft while bulk sidecars move:
+    /// only the final tiny root participates in Raft ordering.
+    ///
+    /// Ordering is: stage (done by the caller) → preflight followers to a
+    /// write quorum → prepare the mutation against fresh state → propose.
+    /// The logical condition of a conditional write evaluates at the
+    /// prepare step, after the multi-second preflight, so a long-prepared
+    /// write can never silently overwrite newer state. Immutable staging
+    /// may happen early; logical evaluation belongs here. Preflight
+    /// failure (or disabled preflight) falls back to the append gate: the
+    /// proposal proceeds and followers fetch on demand.
+    async fn propose_chunked(
+        &self,
+        op: Operation,
+        identity: Option<MutationIdentity>,
+        idempotency: Option<IdempotencyKey>,
+        now: UnixMicros,
+    ) -> Result<ProposeOutcome, ProposeError> {
+        use kivi_state::StorePrepared;
+        // Extract the immutable root staged locally by the caller.
+        let (manifest, logical_len) = match &op {
+            Operation::SetChunked {
+                manifest,
+                logical_len,
+                ..
+            }
+            | Operation::SetConditionalChunked {
+                manifest,
+                logical_len,
+                ..
+            } => (*manifest, *logical_len),
+            _ => {
+                return Err(ProposeError::Consensus(ConsensusError::Unavailable {
+                    reason: "chunked proposal path requires a chunked operation".to_owned(),
+                }));
+            }
+        };
+        // Preflight followers concurrently; the leader already holds the
+        // root durably (the caller verified). A quorum (including us)
+        // durable-ready means prepared followers append immediately and
+        // the tiny root commits quickly. Stragglers catch up through the
+        // authoritative append gate.
+        let followers: Vec<NodeId> = self
+            .voters
+            .iter()
+            .copied()
+            .filter(|peer| *peer != self.local)
+            .collect();
+        crate::preflight::preflight_to_quorum(
+            &self.transport,
+            self.group,
+            manifest,
+            logical_len,
+            &followers,
+            self.voters.len(),
+            self.bulk_timeout,
+            self.preflight_enabled,
+            &self.preflight,
+        )
+        .await;
+        // Fresh prepare against current state: deterministic MutationIR +
+        // expected outcome evaluated NOW (after preflight), so concurrent
+        // small writes to the same key keep normal proposal/order
+        // semantics and conditional writes stay atomic.
+        let prepared = self.machine.prepare_operation(&op, now).await?;
+        let (mutation, expected) = match prepared {
+            StorePrepared::Read(outcome) => return Ok(ProposeOutcome::Read { outcome }),
+            StorePrepared::Terminal(outcome) => return Ok(ProposeOutcome::Rejected { outcome }),
+            StorePrepared::Write { mutation, expected } => (mutation, expected),
+        };
+        let client = identity.map_or(
+            kivi_types::RequestIdentity::new(
+                kivi_types::SessionId::from_u128(crate::state_machine::ANONYMOUS_SESSION),
+                kivi_types::RequestSeq::from_u64(0),
+            ),
+            |marker| marker.client,
+        );
+        let envelope = kivi_state::MutationEnvelope::new(
+            self.namespace,
+            self.authority,
+            client,
+            idempotency,
+            mutation,
+        );
+        let command = ReplicatedMutation::new(
+            envelope,
+            expected,
+            now,
+            identity.map_or(kivi_types::RequestSeq::from_u64(0), |marker| {
+                marker.ack_floor
+            }),
+        );
+        self.propose(command).await
     }
 
     /// Quorum-commits one deterministic command and maps the result onto
@@ -1567,6 +2014,7 @@ impl OwnerCtx {
             detail,
             peers: self.transport.stats().await,
             sidecar: sidecar_metrics,
+            preflight: self.preflight.snapshot(),
         }
     }
 
@@ -1574,7 +2022,10 @@ impl OwnerCtx {
     /// go straight to Raft; snapshot fragments reassemble here and
     /// install whole via `install_full_snapshot` once complete; manifest
     /// and chunk sidecars serve from the local sidecar store on the bulk
-    /// lane (content identity only, never pack offsets).
+    /// lane (content identity only, never pack offsets); preflight
+    /// prepares immutable roots through the durability gate on the bulk
+    /// lane (same acquisition primitives as the append gate, replying
+    /// only once durable — never consensus, never logical state).
     async fn serve_rpc(
         &self,
         _from: NodeId,
@@ -1586,6 +2037,7 @@ impl OwnerCtx {
         match request {
             PeerRequest::Manifest(request) => return self.serve_manifest(request).await,
             PeerRequest::Chunk(request) => return self.serve_chunk(request).await,
+            PeerRequest::Prepare(request) => return self.serve_prepare(request).await,
             _ => {}
         }
         if group != self.group {
@@ -1646,6 +2098,35 @@ impl OwnerCtx {
         Ok(PeerResponse::Chunk(PeerChunkResponse {
             chunk: request.chunk,
             bytes,
+        }))
+    }
+
+    /// Serves one sidecar preflight: ensures the named immutable root is
+    /// locally durable and verified through the exact same acquisition
+    /// primitives as the append gate and snapshot recovery, replying only
+    /// once the durability requirement is satisfied. Mutates no logical
+    /// state and creates no Raft decision. Abandoned preflight data stays
+    /// as reusable content-addressed cache.
+    async fn serve_prepare(
+        &self,
+        request: crate::peer::PeerPrepareRequest,
+    ) -> Result<PeerResponse, PeerRpcError> {
+        let refused = |detail: String| PeerRpcError { detail };
+        let id = kivi_types::ManifestId::from_bytes(request.manifest);
+        if !id.is_valid() {
+            return Err(refused("zero manifest id".to_owned()));
+        }
+        self.gate
+            .ensure_root(id, request.logical_len, None)
+            .await
+            .map_err(|error| {
+                refused(format!(
+                    "preflight root {id} unavailable: {}",
+                    crate::gate::sidecar_io_error(&error)
+                ))
+            })?;
+        Ok(PeerResponse::Prepared(crate::peer::PeerPreparedResponse {
+            manifest: request.manifest,
         }))
     }
 
@@ -1858,14 +2339,14 @@ fn vote_is_stale(
 }
 
 /// Inputs to [`bootstrap_group`], bundled so the arg count stays readable.
-struct BootstrapInputs<'a> {
-    topology: &'a ClusterTopology,
-    tablet: TabletId,
-    local: NodeId,
-    cluster: ClusterId,
-    node: NodeId,
-    voters: &'a std::collections::BTreeSet<u64>,
-    peer_addrs: &'a std::collections::BTreeMap<u64, String>,
+pub(crate) struct BootstrapInputs<'a> {
+    pub(crate) topology: &'a ClusterTopology,
+    pub(crate) tablet: TabletId,
+    pub(crate) local: NodeId,
+    pub(crate) cluster: ClusterId,
+    pub(crate) node: NodeId,
+    pub(crate) voters: &'a std::collections::BTreeSet<u64>,
+    pub(crate) peer_addrs: &'a std::collections::BTreeMap<u64, String>,
 }
 
 /// Installs or verifies group membership: first formation installs the
@@ -1880,12 +2361,15 @@ struct BootstrapInputs<'a> {
 /// Returns [`NodeOpenError::Initialize`] when first formation fails, or
 /// [`NodeOpenError::Bootstrap`] when restart config conflicts with
 /// durable state.
-async fn bootstrap_group(
+pub(crate) async fn bootstrap_group<S>(
     inputs: &BootstrapInputs<'_>,
-    store: &mut DurableRaftStore,
+    store: &mut S,
     machine: &ReplicatedStateMachine,
     raft: &OwnerRaft,
-) -> Result<(), NodeOpenError> {
+) -> Result<(), NodeOpenError>
+where
+    S: ConsensusLogStore,
+{
     use NodeOpenError as Fault;
     let BootstrapInputs {
         topology,
@@ -1953,10 +2437,10 @@ async fn bootstrap_group(
 
 /// Decides fresh vs. existing from durable signals: any vote, any log
 /// entry, or any snapshot base means existing.
-async fn classify_from_store(
-    store: &mut DurableRaftStore,
-    machine: &ReplicatedStateMachine,
-) -> Bootstrap {
+async fn classify_from_store<S>(store: &mut S, machine: &ReplicatedStateMachine) -> Bootstrap
+where
+    S: ConsensusLogStore,
+{
     let has_vote = matches!(store.read_vote().await, Ok(Some(_)));
     let has_log = store
         .get_log_state()
@@ -2270,6 +2754,7 @@ mod tests {
             transport: crate::transport::TransportConfig::default(),
             peer_certs: std::collections::HashMap::new(),
             insecure_peer_tls: true,
+            preflight_enabled: true,
         })
         .await
         .expect("node opens")

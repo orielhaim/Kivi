@@ -275,6 +275,96 @@ impl DirectorySnapshot {
         )
     }
 
+    /// Builds a static directory tiling the entire `u128` hash space with
+    /// exactly `count` active tablets, using only validated transitions
+    /// (recursive halving through allocate/stage/seal/activate/retire).
+    /// Tablet ids are `1..=count` (as `u64`).
+    ///
+    /// Splits always halve the current largest piece, so any `count >= 1`
+    /// tiles exactly: powers of two yield uniform prefix lengths while
+    /// other counts mix lengths (binary-buddy tiling). No gaps, no
+    /// overlaps: every hash routes to exactly one active tablet. All
+    /// tablets start at the supplied fencing generations.
+    ///
+    /// This is the first real multi-tablet static cluster layout: every
+    /// tablet replicates on the same static voter set (independent Raft
+    /// leadership per tablet). Later placement may assign different
+    /// replica sets; routing stays keyed by this snapshot either way.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DirectoryError::InvalidTabletCount`] for a zero count.
+    pub fn static_tiles(
+        namespace: NamespaceId,
+        count: usize,
+        epoch: TabletEpoch,
+        guard: WriteGuardGeneration,
+    ) -> Result<Self, DirectoryError> {
+        use crate::range::HashPrefix;
+        if count == 0 {
+            return Err(DirectoryError::InvalidTabletCount { count });
+        }
+        let mut next_id = 1u64;
+        let mut directory = Self::bootstrap(
+            namespace,
+            TabletId::from_u64(next_id),
+            PartitionRange::Hash(HashPrefix::new(0, 0)?),
+            epoch,
+            guard,
+        )?
+        .stage(TabletId::from_u64(next_id))
+        .and_then(|snapshot| snapshot.activate(TabletId::from_u64(next_id)))?;
+        let mut leaves = vec![(TabletId::from_u64(next_id), HashPrefix::new(0, 0)?)];
+        while leaves.len() < count {
+            // Split the largest piece (shortest prefix); ties break by
+            // storage order, so the tiling is deterministic.
+            let mut split = 0;
+            for (index, (_, prefix)) in leaves.iter().enumerate() {
+                if prefix.prefix_len() < leaves[split].1.prefix_len() {
+                    split = index;
+                }
+            }
+            let (parent, prefix) = leaves[split];
+            if prefix.prefix_len() == 128 {
+                // Single-address piece: unsplittable (unreachable for any
+                // realistic count — the address space holds 2^128 points).
+                return Err(DirectoryError::InvalidTabletCount { count });
+            }
+            let len = prefix.prefix_len() + 1;
+            let half = 1u128 << (128 - len);
+            next_id += 1;
+            let left = TabletId::from_u64(next_id);
+            next_id += 1;
+            let right = TabletId::from_u64(next_id);
+            let left_prefix = HashPrefix::new(prefix.bits(), len)?;
+            let right_prefix = HashPrefix::new(prefix.bits() | half, len)?;
+            directory = directory
+                .allocate(
+                    left,
+                    PartitionRange::Hash(left_prefix),
+                    TabletEpoch::INITIAL,
+                    WriteGuardGeneration::INITIAL,
+                )
+                .and_then(|snapshot| snapshot.stage(left))?;
+            directory = directory
+                .allocate(
+                    right,
+                    PartitionRange::Hash(right_prefix),
+                    TabletEpoch::INITIAL,
+                    WriteGuardGeneration::INITIAL,
+                )
+                .and_then(|snapshot| snapshot.stage(right))?;
+            directory = directory.seal(parent)?;
+            directory = directory.activate(left)?;
+            directory = directory.activate(right)?;
+            directory = directory.retire(parent, Redirect::new(vec![left, right]))?;
+            leaves.remove(split);
+            leaves.push((left, left_prefix));
+            leaves.push((right, right_prefix));
+        }
+        Ok(directory)
+    }
+
     /// Routes a partition hash to its active tablet, if any.
     ///
     /// Considers active tablets only, in storage order; gaps (no covering
@@ -551,6 +641,12 @@ pub enum DirectoryError {
     UnexpectedRedirect {
         /// Affected tablet.
         tablet: TabletId,
+    },
+    /// A static tiling requested an unusable tablet count.
+    #[error("invalid static tablet count {count}")]
+    InvalidTabletCount {
+        /// Requested count (must be nonzero).
+        count: usize,
     },
 }
 
@@ -924,6 +1020,47 @@ mod tests {
         // The old triple names the wrong tablet now: rejected, never re-authorized.
         assert!(old.check_against(&current).is_err());
         assert_ne!(old, current);
+    }
+
+    /// Static tilings cover the whole hash space with no gaps or overlaps
+    /// for uniform and non-uniform counts alike.
+    #[test]
+    fn static_tiles_cover_everything_exactly_once() {
+        use std::collections::BTreeSet;
+        for count in [1usize, 2, 3, 4, 5, 7, 16, 100] {
+            let directory =
+                DirectorySnapshot::static_tiles(NS, count, EPOCH, GUARD).expect("tiles build");
+            let active: Vec<_> = directory
+                .tablets()
+                .iter()
+                .filter(|tablet| tablet.state().is_writable())
+                .collect();
+            assert_eq!(active.len(), count, "count {count} yields {count} actives");
+            // Every probe point routes somewhere (no gaps).
+            let mut rng_state = 0x9E37_79B9_7F4A_7C15u64;
+            let mut seen = BTreeSet::new();
+            for _ in 0..4096 {
+                rng_state ^= rng_state << 13;
+                rng_state ^= rng_state >> 7;
+                rng_state ^= rng_state << 17;
+                let hash = PartitionHash::from_u128(
+                    u128::from(rng_state) << 64 | u128::from(rng_state ^ 0xD1B5_4D95),
+                );
+                let routed = directory.lookup_by_hash(hash).expect("no gaps");
+                seen.insert(routed);
+            }
+            // Tiling is exact: every active tablet owns some probe point
+            // (no dead ranges) once probes outnumber tablets well.
+            if count <= 16 {
+                assert_eq!(seen.len(), count, "count {count} tiles all live");
+            }
+            // Ids are unique and nonzero (splits retire the genesis id and
+            // mint fresh children; contiguity is not promised).
+            let ids: BTreeSet<u64> = active.iter().map(|tablet| tablet.id().as_u64()).collect();
+            assert_eq!(ids.len(), count);
+            assert!(!ids.contains(&0));
+        }
+        assert!(DirectorySnapshot::static_tiles(NS, 0, EPOCH, GUARD).is_err());
     }
 
     /// Bounded exhaustive-style invariant sweep over synthetic directory

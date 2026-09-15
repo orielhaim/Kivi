@@ -23,6 +23,8 @@
 //! POST /_kivi/raft/{tablet}/prevote
 //! POST /_kivi/raft/{tablet}/append
 //! POST /_kivi/raft/{tablet}/snapshot-frag
+//! POST /_kivi/raft/{tablet}/prepare     (bulk lane: sidecar preflight,
+//!                                       body: manifest + length)
 //! GET  /_kivi/immutable/manifest/{hex}  (body: canonical manifest bytes)
 //! GET  /_kivi/immutable/chunk/{hex}     (body: raw chunk bytes)
 //! ```
@@ -82,6 +84,8 @@ use crate::types::ConsensusGroupId;
 
 /// Media type for Raft RPC bodies (Kivi-owned binary codecs).
 const MEDIA_RAFT: &str = "application/vnd.kivi.raft";
+/// Media type for sidecar-preflight acks (manifest echo).
+const MEDIA_PREPARE: &str = "application/vnd.kivi.prepare";
 /// Media type for manifest bodies (canonical manifest bytes).
 const MEDIA_MANIFEST: &str = "application/vnd.kivi.manifest";
 /// Media type for chunk bodies (raw logical chunk bytes).
@@ -109,12 +113,14 @@ fn varint_saturating(value: u64) -> VarInt {
     VarInt::from_u64(value).unwrap_or(VarInt::MAX)
 }
 
-/// Which H3 connection of a pair carries a request.
+/// Which H3 connection of a pair carries a request. Independent of the
+/// HTTP method: the bulk connection carries both empty-body GET fetches
+/// (manifests, chunks) and the sidecar-preflight POST.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Lane {
     /// Votes, heartbeats, appends, snapshot fragments.
     Control,
-    /// Manifests, chunks.
+    /// Manifests, chunks, preflight.
     Bulk,
 }
 
@@ -547,8 +553,9 @@ impl PeerTransport {
             .await
     }
 
-    /// Issues one bulk-lane RPC (manifest/chunk sidecars) on the bulk H3
-    /// connection, independent of control congestion/flow domains.
+    /// Issues one bulk-lane RPC (manifest/chunk sidecars, preflight) on
+    /// the bulk H3 connection, independent of control congestion/flow
+    /// domains.
     ///
     /// # Errors
     ///
@@ -1068,11 +1075,12 @@ impl MeshDriver {
             crate::tls::server_name_for(command.target),
             path
         );
+        // Method follows the request family, not the lane: the bulk lane
+        // carries both empty-body GET fetches (manifest/chunk, identity in
+        // the path) and the sidecar-preflight POST (small body). The lane
+        // still selects the connection plus counters and caps.
         let request = http::Request::builder()
-            .method(match command.lane {
-                Lane::Control => http::Method::POST,
-                Lane::Bulk => http::Method::GET,
-            })
+            .method(crate::peer::h3_method(&command.request))
             .uri(uri)
             .header("content-type", media)
             .header(HDR_CLUSTER, inner.cluster.as_u128().to_string())
@@ -1445,7 +1453,8 @@ impl MeshDriver {
         if let Some(link) = inner.links.get(&from) {
             *link.incarnation.lock().await = Some(incarnation);
         }
-        // Only Raft POST bodies and empty bulk GETs exist; cap everything.
+        // Bodies are Raft POSTs, the small bulk preflight POST, or empty
+        // bulk GETs; cap everything.
         let path = request.uri().path().to_owned();
         let is_bulk = path.starts_with("/_kivi/immutable/");
         let cap = if is_bulk {
@@ -1494,7 +1503,9 @@ impl MeshDriver {
         // First validated request of a lane marks inbound connectivity
         // (the dialer opens one QUIC connection per lane).
         let lane = match &decoded.request {
-            PeerRequest::Manifest(_) | PeerRequest::Chunk(_) => Lane::Bulk,
+            PeerRequest::Manifest(_) | PeerRequest::Chunk(_) | PeerRequest::Prepare(_) => {
+                Lane::Bulk
+            }
             _ => Lane::Control,
         };
         self.note_inbound_lane(from, lane, conn);
@@ -1514,6 +1525,7 @@ impl MeshDriver {
                         MEDIA_RAFT
                     }
                     PeerResponse::Snapshot(_) => MEDIA_RAFT,
+                    PeerResponse::Prepared(_) => MEDIA_PREPARE,
                     PeerResponse::Manifest(_) => MEDIA_MANIFEST,
                     PeerResponse::Chunk(_) => MEDIA_CHUNK,
                 };

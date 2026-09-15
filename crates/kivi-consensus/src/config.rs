@@ -1,11 +1,12 @@
 //! `OpenRaft` containment zone: the project-owned 0.10 type configuration.
 //!
-//! Everything in this module (and in [`crate::store`], [`crate::state_machine`],
-//! [`crate::transport`], [`crate::router`], and the owner half of [`crate::node`])
-//! names `OpenRaft` types. Nothing outside this crate may do so: the rest of
-//! the workspace sees only [`crate::types`]. `OpenRaft`'s API is explicitly
-//! pre-1.0 and unstable, so this crate absorbs its churn behind the narrow
-//! [`ConsensusCore`](crate::types::ConsensusCore) trait.
+//! Everything in this module (and in [`crate::store`], [`crate::shared`],
+//! [`crate::state_machine`], [`crate::transport`], [`crate::router`], and
+//! the owner halves of [`crate::node`] and [`crate::multi`]) names
+//! `OpenRaft` types. Nothing outside this crate may do so: the rest of
+//! the workspace sees only [`crate::types`] and the node fronts.
+//! `OpenRaft`'s API is explicitly pre-1.0 and unstable, so this crate
+//! absorbs its churn behind those fronts.
 //!
 //! ## `OpenRaft` selection record
 //!

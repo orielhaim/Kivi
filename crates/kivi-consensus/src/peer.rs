@@ -294,11 +294,31 @@ pub struct PeerChunkResponse {
     pub bytes: Vec<u8>,
 }
 
+/// Owned sidecar preflight request (bulk lane).
+///
+/// Names one immutable root by content identity plus its logical length.
+/// The responder ensures the manifest and every referenced chunk are
+/// locally durable and verified before replying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PeerPrepareRequest {
+    /// Root manifest id.
+    pub manifest: [u8; 32],
+    /// Logical value length in bytes (sizes the acquisition).
+    pub logical_len: u64,
+}
+
+/// Owned sidecar preflight response (bulk lane).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PeerPreparedResponse {
+    /// Echoed manifest id (durable locally).
+    pub manifest: [u8; 32],
+}
+
 /// One peer RPC. H3 request streams carry these without any further
 /// transport envelope: the route selects the family, the body is the
 /// payload codec below. Pre-vote reuses the vote shape under its own
-/// route. Manifest/chunk sidecar RPCs ride the bulk H3 connection so bulk
-/// transfer never starves critical traffic.
+/// route. Manifest/chunk sidecar RPCs (and sidecar preflight) ride the
+/// bulk H3 connection so bulk transfer never starves critical traffic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerRequest {
     /// Election RPC.
@@ -313,6 +333,13 @@ pub enum PeerRequest {
     Manifest(PeerManifestRequest),
     /// Immutable chunk fetch (bulk lane).
     Chunk(PeerChunkRequest),
+    /// Sidecar preflight: "prepare immutable root M" (bulk lane). The
+    /// follower acquires, verifies, and durably installs the manifest plus
+    /// all referenced chunks through the same acquisition primitives as
+    /// the append gate, replying only once durable. Preflight mutates no
+    /// logical state and creates no Raft decision; it is purely an
+    /// optimization moving sidecar movement before the tiny root proposal.
+    Prepare(PeerPrepareRequest),
 }
 
 /// One consensus RPC response body.
@@ -330,6 +357,8 @@ pub enum PeerResponse {
     Manifest(PeerManifestResponse),
     /// Immutable chunk answer (bulk lane).
     Chunk(PeerChunkResponse),
+    /// Sidecar preflight answer (bulk lane): the root is durable locally.
+    Prepared(PeerPreparedResponse),
 }
 
 /// Remote-side RPC failure: the peer decoded the request but its Raft
@@ -526,6 +555,10 @@ impl<'a> Reader<'a> {
         Ok(out)
     }
 
+    fn id32(&mut self) -> Result<[u8; 32], PeerCodecError> {
+        Ok(self.bytes(32)?.try_into().unwrap_or([0; 32]))
+    }
+
     fn voters(&mut self) -> Result<Vec<u64>, PeerCodecError> {
         let count = self.u64()?;
         let count =
@@ -662,6 +695,8 @@ pub mod route {
     pub const APPEND: &str = "append";
     /// Snapshot-fragment route suffix.
     pub const SNAPSHOT_FRAG: &str = "snapshot-frag";
+    /// Sidecar-preflight route suffix (bulk lane, per-group Raft route).
+    pub const PREPARE: &str = "prepare";
 }
 
 /// Renders the H3 path for one request under `group`'s tablet. Manifest
@@ -675,6 +710,9 @@ pub fn h3_request_path(group_tablet: u64, request: &PeerRequest) -> String {
         PeerRequest::Append(_) => format!("/_kivi/raft/{group_tablet}/{}", route::APPEND),
         PeerRequest::Snapshot(_) => {
             format!("/_kivi/raft/{group_tablet}/{}", route::SNAPSHOT_FRAG)
+        }
+        PeerRequest::Prepare(_) => {
+            format!("/_kivi/raft/{group_tablet}/{}", route::PREPARE)
         }
         PeerRequest::Manifest(request) => {
             format!("/_kivi/immutable/manifest/{}", id32_hex(&request.manifest))
@@ -694,8 +732,27 @@ pub const fn h3_media_type(request: &PeerRequest) -> &'static str {
         | PeerRequest::PreVote(_)
         | PeerRequest::Append(_)
         | PeerRequest::Snapshot(_) => "application/vnd.kivi.raft",
+        PeerRequest::Prepare(_) => "application/vnd.kivi.prepare",
         PeerRequest::Manifest(_) => "application/vnd.kivi.manifest",
         PeerRequest::Chunk(_) => "application/vnd.kivi.chunk",
+    }
+}
+
+/// HTTP method for a request family (transport metadata only, never
+/// durable state). Identity-in-path bulk fetches are empty-body GETs;
+/// every other family — Raft RPCs and the sidecar-preflight POST, which
+/// carries its manifest identity plus logical length as a small body — is
+/// a POST. A GET with a body is never emitted: intermediaries may drop
+/// the body, which would corrupt preflight into an undecodable request.
+#[must_use]
+pub fn h3_method(request: &PeerRequest) -> http::Method {
+    match request {
+        PeerRequest::Manifest(_) | PeerRequest::Chunk(_) => http::Method::GET,
+        PeerRequest::Vote(_)
+        | PeerRequest::PreVote(_)
+        | PeerRequest::Append(_)
+        | PeerRequest::Snapshot(_)
+        | PeerRequest::Prepare(_) => http::Method::POST,
     }
 }
 
@@ -758,6 +815,10 @@ pub fn encode_h3_request(request: &PeerRequest, group_tablet: u64) -> (String, V
             push_blob(&mut out, &request.data);
             out.push(u8::from(request.done));
         }
+        PeerRequest::Prepare(request) => {
+            out.extend_from_slice(&request.manifest);
+            push_u64(&mut out, request.logical_len);
+        }
         PeerRequest::Manifest(_) | PeerRequest::Chunk(_) => {}
     }
     (path, out)
@@ -794,6 +855,7 @@ pub fn decode_h3_request(path: &str, body: &[u8]) -> Result<DecodedH3Request, Pe
             route::PREVOTE => PeerRequest::PreVote(decode_vote_request(&mut reader)?),
             route::APPEND => PeerRequest::Append(decode_append_request(&mut reader)?),
             route::SNAPSHOT_FRAG => PeerRequest::Snapshot(decode_snapshot_request(&mut reader)?),
+            route::PREPARE => PeerRequest::Prepare(decode_prepare_request(&mut reader)?),
             _ => {
                 return Err(PeerCodecError::UnknownRoute {
                     route: path.to_owned(),
@@ -851,6 +913,9 @@ pub fn encode_h3_response(response: &PeerResponse) -> Vec<u8> {
         PeerResponse::Snapshot(response) => {
             push_vote(&mut out, &response.vote);
         }
+        PeerResponse::Prepared(response) => {
+            out.extend_from_slice(&response.manifest);
+        }
         PeerResponse::Manifest(response) => {
             out.extend_from_slice(&response.canonical);
         }
@@ -884,6 +949,10 @@ pub fn decode_h3_response(
         PeerRequest::Snapshot(_) => PeerResponse::Snapshot(PeerSnapshotResponse {
             vote: reader.vote()?,
         }),
+        PeerRequest::Prepare(_) => {
+            let manifest = reader.id32()?;
+            PeerResponse::Prepared(PeerPreparedResponse { manifest })
+        }
         PeerRequest::Manifest(request) => PeerResponse::Manifest(PeerManifestResponse {
             manifest: request.manifest,
             canonical: body.to_vec(),
@@ -893,15 +962,10 @@ pub fn decode_h3_response(
             bytes: body.to_vec(),
         }),
     };
-    // Manifest/chunk bodies are raw bytes (no trailing-byte framing to
-    // check); Raft bodies must consume exactly.
-    if matches!(
-        request,
-        PeerRequest::Vote(_)
-            | PeerRequest::PreVote(_)
-            | PeerRequest::Append(_)
-            | PeerRequest::Snapshot(_)
-    ) {
+    // Manifest/chunk/prepare-ack bodies are fixed-shape and must consume
+    // exactly (prepare acks echo 32 manifest bytes); only manifest/chunk
+    // bulk payloads are raw variable bytes.
+    if !matches!(request, PeerRequest::Manifest(_) | PeerRequest::Chunk(_)) {
         reader.finish()?;
     }
     Ok(response)
@@ -956,6 +1020,13 @@ fn decode_append_request(reader: &mut Reader<'_>) -> Result<PeerAppendRequest, P
         prev_log,
         entries,
         leader_commit: reader.opt_log()?,
+    })
+}
+
+fn decode_prepare_request(reader: &mut Reader<'_>) -> Result<PeerPrepareRequest, PeerCodecError> {
+    Ok(PeerPrepareRequest {
+        manifest: reader.id32()?,
+        logical_len: reader.u64()?,
     })
 }
 
@@ -1172,6 +1243,10 @@ mod tests {
                 manifest: [0x11; 32],
             }),
             PeerRequest::Chunk(PeerChunkRequest { chunk: [0x22; 32] }),
+            PeerRequest::Prepare(PeerPrepareRequest {
+                manifest: [0x33; 32],
+                logical_len: 1234,
+            }),
         ];
         for request in &cases {
             // Tablet 9 rides every Raft path (Multi-Raft multiplexing).
@@ -1180,8 +1255,21 @@ mod tests {
             match request {
                 PeerRequest::Manifest(_) | PeerRequest::Chunk(_) => {
                     assert_eq!(decoded.tablet, 0, "sidecars are group-independent");
+                    assert_eq!(
+                        h3_method(request),
+                        http::Method::GET,
+                        "fetches are empty-body GETs"
+                    );
+                    assert!(body.is_empty(), "GETs carry no body");
                 }
-                _ => assert_eq!(decoded.tablet, 9),
+                _ => {
+                    assert_eq!(decoded.tablet, 9);
+                    assert_eq!(
+                        h3_method(request),
+                        http::Method::POST,
+                        "bodied families are POSTs"
+                    );
+                }
             }
             assert_eq!(&decoded.request, request);
             // Truncated bodies fail the decode (backoff), never apply.
@@ -1224,6 +1312,18 @@ mod tests {
         assert_eq!(
             decode_h3_response(&manifest_request, &encode_h3_response(&manifest)).expect("decodes"),
             manifest
+        );
+        // Preflight acks echo the prepared manifest identity.
+        let prepare_request = PeerRequest::Prepare(PeerPrepareRequest {
+            manifest: [0x33; 32],
+            logical_len: 1234,
+        });
+        let prepared = PeerResponse::Prepared(PeerPreparedResponse {
+            manifest: [0x33; 32],
+        });
+        assert_eq!(
+            decode_h3_response(&prepare_request, &encode_h3_response(&prepared)).expect("decodes"),
+            prepared
         );
         // Unknown routes refuse loudly.
         assert!(matches!(

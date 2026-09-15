@@ -1,0 +1,31 @@
+# Real-process and fsync-heavy suites are bounded; everything else keeps
+# full parallelism.
+#
+# Why: running dozens of 3-process QUIC/H3 clusters, fsync storms, and
+# checkpoint hammers in parallel saturates Windows fsync and loopback
+# throughput, which made `stale_leader_hint` flake under a full parallel
+# suite while passing standalone — and later starved a single-node
+# durability upload of a 10 s read under the same conditions. Bounding
+# only the heavy suites is preferable to nondeterministic timing
+# failures (and to blindly multiplying timeouts).
+#
+# `heavy-cluster` (2-way): every lab integration binary spawns real
+# server processes (single-node ephemeral servers as well as 3-node
+# QUIC/H3 clusters).
+[test-groups.heavy-cluster]
+max-threads = 2
+
+# `bulk-serial` (1-way): the tens-of-MiB bulk-transfer tests move ~130 MB
+# per test over loopback QUIC plus matching fsync storms; serializing
+# just these keeps the disk/loopback headroom the latency-sensitive
+# suites need. Listed after `heavy-cluster` so the narrower group wins.
+[test-groups.bulk-serial]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = "package(kivi-lab)"
+test-group = "heavy-cluster"
+
+[[profile.default.overrides]]
+filter = "test(large_64mib_replicated_stream) or test(large_failover_after_commit_serves_exact_bytes) or test(large_mid_upload_kill_leaves_no_torn_value) or test(preflight_same_tablet_small_writes_stay_fast) or test(preflight_other_tablet_stays_isolated) or test(multi_tablet_large_value_preflight_decomposition) or test(multi_tablet_independent_ordering)"
+test-group = "bulk-serial"

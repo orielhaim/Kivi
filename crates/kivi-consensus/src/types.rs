@@ -183,27 +183,6 @@ pub struct ReadBarrier {
     pub boundary: ConsensusLogIndex,
 }
 
-/// Read-only per-group diagnostics for the admin plane.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ConsensusStatus {
-    /// Group described.
-    pub group: ConsensusGroupId,
-    /// This replica.
-    pub replica: ReplicaId,
-    /// Observed role.
-    pub role: ReplicaRole,
-    /// Observed term.
-    pub term: ConsensusTerm,
-    /// Best-known leader.
-    pub leader: Option<ReplicaId>,
-    /// Last log entry (voted or appended).
-    pub last_log: ConsensusLogIndex,
-    /// Last committed entry.
-    pub committed: ConsensusLogIndex,
-    /// Last entry applied to the tablet state machine.
-    pub applied: ConsensusLogIndex,
-}
-
 /// Kivi-owned consensus failures. These — never `OpenRaft` error types —
 /// cross the crate boundary and travel to clients over the native protocol.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -228,57 +207,4 @@ pub enum ConsensusError {
     /// The replica is shutting down.
     #[error("consensus shutting down")]
     ShuttingDown,
-}
-
-/// Narrow Kivi-owned consensus interface.
-///
-/// Deliberately small: only operations with actual callers exist here.
-/// `OpenRaft` stays an implementation detail behind this trait — including
-/// its `Raft`, `LogId`, and `Vote` types, which must never appear in these
-/// signatures.
-pub trait ConsensusCore: Send + Sync {
-    /// Proposes one deterministic mutation envelope for commit. Success
-    /// means quorum-committed, leader-applied, and dedup-installed (the
-    /// strong write contract); the returned bytes are the deterministic
-    /// outcome for the caller's request identity.
-    fn propose(
-        &self,
-        envelope: ProposeEnvelope,
-    ) -> impl Future<Output = Result<ProposedOutcome, ConsensusError>> + Send;
-
-    /// Establishes a linearizable-read barrier: on success the leader has
-    /// confirmed its leadership with a quorum and the returned index is
-    /// the applied watermark a `Latest` read must cover.
-    fn ensure_linearizable(
-        &self,
-    ) -> impl Future<Output = Result<ConsensusLogIndex, ConsensusError>> + Send;
-
-    /// Returns current read-only diagnostics.
-    fn status(&self) -> ConsensusStatus;
-
-    /// Stops the group cleanly.
-    fn shutdown(&self) -> impl Future<Output = ()> + Send;
-}
-
-/// What [`ConsensusCore::propose`] carries across the boundary.
-///
-/// The consensus layer treats the mutation as opaque deterministic bytes;
-/// their meaning (`MutationIR`, request identity, expected outcome) is owned
-/// by the tablet layer. Stage G replaces the payload sketch with
-/// `ReplicatedMutation`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProposeEnvelope {
-    /// Group addressed.
-    pub group: ConsensusGroupId,
-    /// Deterministic mutation bytes (canonical, versioned, Kivi-owned).
-    pub payload: Vec<u8>,
-}
-
-/// Outcome installed by [`ConsensusCore::propose`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProposedOutcome {
-    /// Committed log index of the proposal.
-    pub index: ConsensusLogIndex,
-    /// Deterministic outcome bytes for the request identity.
-    pub outcome: Vec<u8>,
 }

@@ -90,6 +90,13 @@ fn minority_partition_fences_old_leader() {
 /// Stale leader hints retry safely: a client that learned the old leader
 /// keeps its mutation identity across the failover, updates its hint, and
 /// either succeeds on the new leader or fails bounded (never loops).
+///
+/// Under a full parallel suite the post-kill election and mesh heal are
+/// load-sensitive (Windows fsync + 3-process QUIC/H3 formation), so this
+/// test is condition-driven throughout: it converges the first write
+/// before the kill, waits for the new leader to cover that watermark, and
+/// retries the second write on retryable routing errors instead of
+/// assuming the first post-election attempt lands.
 #[test]
 fn stale_leader_hint_recovers_with_same_identity() {
     use kivi_types::{RequestSeq, SessionId};
@@ -97,21 +104,56 @@ fn stale_leader_hint_recovers_with_same_identity() {
     let mut cluster = Cluster::spawn().expect("cluster spawns");
     let leader = cluster.wait_leader();
     let session = SessionId::from_u128(0x0005_7A1E_0000_0000_0001u128);
-    // Learn the old leader hint with a first write.
+    // Learn the old leader hint with a first write, then converge it so
+    // the kill cannot truncate an uncommitted suffix (that path is covered
+    // separately by the log-conflict test).
     cluster
         .client_with_session(session)
         .counter_add_with_seq(&key("hint"), 1, RequestSeq::from_u64(1))
         .expect("first write learns hint");
+    cluster.wait_converged();
+    let watermark = cluster.applied(leader);
     // Kill the hinted leader: every cached hint is now stale.
     cluster.kill(leader);
     let elected = cluster.wait_leader();
     assert_ne!(elected, leader, "new leader emerges");
-    // Retry a NEW identity through the stale-hint client: bounded retry
-    // must land on the new leader (identity preserved exactly once).
-    let retry = cluster
-        .client_with_session(session)
-        .counter_add_with_seq(&key("hint"), 1, RequestSeq::from_u64(2))
-        .expect("stale hint recovers");
+    // The stable-role poll can observe the new leader before it covers
+    // the pre-kill watermark; wait for coverage so the next proposal does
+    // not race replication catch-up.
+    cluster.wait_applied(watermark);
+    // Retry a NEW identity through the stale-hint client: bounded
+    // condition-driven retries must land on the new leader (identity
+    // preserved exactly once). Election-in-flight answers (`Overloaded`,
+    // timeouts) are retryable here — only a terminal acknowledgement or
+    // the deadline decides.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let retry = loop {
+        match cluster.client_with_session(session).counter_add_with_seq(
+            &key("hint"),
+            1,
+            RequestSeq::from_u64(2),
+        ) {
+            Ok(value) => break value,
+            Err(error) => {
+                let retryable = matches!(
+                    error,
+                    kivi_client::ClientError::Overloaded
+                        | kivi_client::ClientError::Timeout
+                        | kivi_client::ClientError::Io(_)
+                        | kivi_client::ClientError::SessionOverloaded
+                );
+                assert!(
+                    retryable,
+                    "stale hint fails only retryably while electing: {error:?}"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "stale hint never recovered: {error:?}"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    };
     assert_eq!(retry, 2, "second add applies once on the new leader");
     let value = cluster
         .client()

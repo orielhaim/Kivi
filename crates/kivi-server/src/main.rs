@@ -160,9 +160,16 @@ struct Args {
     /// This process's node identity for cluster mode.
     #[arg(long)]
     pub(crate) node_id: Option<u64>,
-    /// Tablet replicated in cluster mode.
-    #[arg(long, default_value_t = 1)]
-    pub(crate) cluster_tablet: u64,
+    /// Tablet count in cluster mode: the static directory tiles the whole
+    /// hash space with this many tablets (any nonzero count; splits halve
+    /// the largest piece, so non-powers of two mix prefix lengths).
+    #[arg(long, default_value_t = 1, value_parser = parse_cluster_tablets)]
+    pub(crate) cluster_tablets: usize,
+    /// Consensus worker (Compio reactor) count in cluster mode: tablet
+    /// groups stripe across these deterministically (`(tablet-1) % workers`
+    /// on tablet ids). Thread count scales with workers, never tablets.
+    #[arg(long, default_value_t = 2, value_parser = parse_cluster_workers)]
+    pub(crate) cluster_workers: usize,
     /// Static peer endpoints `node=host:port,...` for cluster mode.
     #[arg(long, value_delimiter = ',', value_parser = parse_node_endpoint)]
     pub(crate) cluster_peers: Vec<(u64, SocketAddr)>,
@@ -253,6 +260,29 @@ fn parse_affinity(spec: &str) -> Result<AffinityMode, String> {
             Ok(AffinityMode::Explicit(cores))
         }
     }
+}
+
+/// Parses the cluster tablet count: any nonzero count (static buddy
+/// tiling covers non-powers of two with mixed prefix lengths).
+fn parse_cluster_tablets(spec: &str) -> Result<usize, String> {
+    let count: usize = spec
+        .parse()
+        .map_err(|_| format!("invalid cluster tablet count {spec:?}"))?;
+    if count == 0 {
+        return Err("cluster tablet count must be nonzero".to_owned());
+    }
+    Ok(count)
+}
+
+/// Parses the cluster worker count: any nonzero count.
+fn parse_cluster_workers(spec: &str) -> Result<usize, String> {
+    let count: usize = spec
+        .parse()
+        .map_err(|_| format!("invalid cluster worker count {spec:?}"))?;
+    if count == 0 {
+        return Err("cluster worker count must be nonzero".to_owned());
+    }
+    Ok(count)
 }
 
 /// Parses the tablet count: 1 (root) or a power of two for even splits.
@@ -467,16 +497,14 @@ fn startup_mode(args: &Args) -> anyhow::Result<StartupMode> {
         if args.node_id.is_none() {
             anyhow::bail!("cluster mode requires --node-id <u64>");
         }
-        if args.workers != 2 {
+        // Cluster mode honors --cluster-tablets/--cluster-workers (one
+        // replica of every tablet per process); single-node --workers and
+        // --tablets do not apply here.
+        if args.workers != 2 || args.tablets != 1 {
             tracing::warn!(
                 workers = args.workers,
-                "cluster mode ignores --workers (one replica per process)"
-            );
-        }
-        if args.tablets != 1 {
-            tracing::warn!(
                 tablets = args.tablets,
-                "cluster mode ignores --tablets (one replicated tablet)"
+                "cluster mode uses --cluster-tablets/--cluster-workers, not --workers/--tablets"
             );
         }
         return Ok(StartupMode::Cluster);
@@ -492,9 +520,16 @@ fn startup_mode(args: &Args) -> anyhow::Result<StartupMode> {
 
 #[allow(clippy::too_many_lines)]
 fn main() -> anyhow::Result<()> {
+    // Default verbosity keeps Kivi's own `info` narration but quiets
+    // `openraft` (per-election/per-tick `info` spam: ~300k lines in two
+    // minutes at 1000 groups — pure overhead at scale, still fully
+    // visible with `RUST_LOG=info`, which overrides this default
+    // entirely). One obvious tuning from multi-tablet density runs; the
+    // Raft task engine itself is untouched.
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info,openraft=warn")),
         )
         .init();
     let args = Args::parse();
@@ -732,5 +767,49 @@ mod tests {
     fn server_args_reject_bad_input_without_panicking() {
         assert!(Args::try_parse_from(["kivi-server", "--pin", "banana"]).is_err());
         assert!(Args::try_parse_from(["kivi-server", "--tablets", "6"]).is_err());
+    }
+
+    #[test]
+    fn cluster_tablet_count_accepts_any_nonzero_count() {
+        // Unlike single-node even splits, static buddy tiling covers
+        // non-powers of two with mixed prefix lengths.
+        assert_eq!(parse_cluster_tablets("1"), Ok(1));
+        assert_eq!(parse_cluster_tablets("16"), Ok(16));
+        assert_eq!(parse_cluster_tablets("100"), Ok(100));
+        assert!(parse_cluster_tablets("0").is_err());
+        assert!(parse_cluster_tablets("lots").is_err());
+    }
+
+    #[test]
+    fn cluster_worker_count_must_be_nonzero() {
+        assert_eq!(parse_cluster_workers("1"), Ok(1));
+        assert_eq!(parse_cluster_workers("4"), Ok(4));
+        assert!(parse_cluster_workers("0").is_err());
+        assert!(parse_cluster_workers("many").is_err());
+    }
+
+    #[test]
+    fn cluster_args_parse_end_to_end() {
+        let args = Args::try_parse_from([
+            "kivi-server",
+            "--cluster-mode",
+            "--cluster-id",
+            "12345",
+            "--node-id",
+            "1",
+            "--cluster-tablets",
+            "16",
+            "--cluster-workers",
+            "4",
+            "--data-dir",
+            "./data-a",
+            "--cluster-peers",
+            "1=127.0.0.1:9101",
+            "--cluster-natives",
+            "1=127.0.0.1:9201",
+        ])
+        .expect("cluster args parse");
+        assert_eq!(args.cluster_tablets, 16);
+        assert_eq!(args.cluster_workers, 4);
     }
 }

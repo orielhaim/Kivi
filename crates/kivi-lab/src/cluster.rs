@@ -30,7 +30,7 @@ use kivi_client::{ClientConfig, NativeClient};
 use kivi_types::NamespaceId;
 use serde_json::Value;
 
-use super::process::{READY_TIMEOUT, SpawnError, WaitOutcome, server_binary_path, stderr_tail};
+use super::process::{READY_TIMEOUT, SpawnError, server_binary_path};
 
 /// How long a cluster election may take (loaded CI boxes elect slowly).
 pub const LEADER_TIMEOUT: Duration = Duration::from_secs(45);
@@ -41,8 +41,10 @@ const SPAWN_ATTEMPTS: usize = 3;
 /// Fixed test cluster identity (deterministic across runs; data
 /// directories isolate state, never the id).
 pub const TEST_CLUSTER_ID: u128 = 0xC105_7E57;
-/// Replicated tablet under test.
-pub const TEST_TABLET: u64 = 9;
+/// Default tablet count for single-tablet regression clusters.
+pub const TEST_TABLETS: usize = 1;
+/// Default consensus worker count for test clusters.
+pub const TEST_WORKERS: usize = 2;
 
 /// One cluster member: a live child or a killed slot awaiting restart.
 pub struct ClusterNode {
@@ -72,12 +74,17 @@ impl std::fmt::Debug for ClusterNode {
     }
 }
 
-/// Three real server processes forming one replicated tablet group.
+/// Three real server processes forming replicated tablet groups (one
+/// replica of every tablet per process in this static stage).
 /// Dropping kills every remaining child (tests never leak processes).
 pub struct Cluster {
     nodes: Vec<ClusterNode>,
     id: u128,
     binary: PathBuf,
+    tablet_count: usize,
+    worker_count: usize,
+    extra_env: Vec<(String, String)>,
+    ready_timeout: Duration,
 }
 
 impl std::fmt::Debug for Cluster {
@@ -91,10 +98,17 @@ impl std::fmt::Debug for Cluster {
 
 impl Drop for Cluster {
     fn drop(&mut self) {
+        // `KIVI_LAB_KEEP_DIRS` preserves data directories (with per-member
+        // server logs) for post-mortems instead of deleting them.
+        let keep = std::env::var("KIVI_LAB_KEEP_DIRS").is_ok();
         for node in &mut self.nodes {
             if let Some(mut child) = node.child.take() {
                 let _ = child.kill();
                 let _ = child.wait();
+            }
+            if keep {
+                node.data_dir.disable_cleanup(true);
+                eprintln!("kivi-lab: kept data dir {}", node.data_dir.path().display());
             }
         }
     }
@@ -121,8 +135,9 @@ fn free_udp_addr() -> String {
 }
 
 impl Cluster {
-    /// Spawns a fresh 3-node cluster (new data directories) and waits
-    /// for exactly one leader. Retries formation on bind conflicts.
+    /// Spawns a fresh 3-node single-tablet cluster (new data directories)
+    /// and waits for exactly one leader. Retries formation on bind
+    /// conflicts.
     ///
     /// # Errors
     ///
@@ -130,7 +145,7 @@ impl Cluster {
     /// during startup, readiness times out repeatedly, or no leader
     /// emerges.
     pub fn spawn() -> Result<Self, SpawnError> {
-        Self::spawn_with(false)
+        Self::spawn_with_tablets(TEST_TABLETS, TEST_WORKERS, false)
     }
 
     /// Spawns like [`Cluster::spawn`] with a RESP edge per member. Fails
@@ -142,14 +157,121 @@ impl Cluster {
     /// Returns [`SpawnError`] like [`Cluster::spawn`], plus
     /// [`SpawnError::RespUnavailable`] for a non-RESP binary.
     pub fn spawn_with_resp() -> Result<Self, SpawnError> {
-        Self::spawn_with(true)
+        Self::spawn_with_tablets(TEST_TABLETS, TEST_WORKERS, true)
     }
 
-    fn spawn_with(want_resp: bool) -> Result<Self, SpawnError> {
+    /// Spawns a fresh 3-node cluster with `tablet_count` tablets striped
+    /// over `worker_count` consensus workers per node, waiting for every
+    /// tablet to elect exactly one leader. Retries formation on bind
+    /// conflicts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpawnError`] like [`Cluster::spawn`].
+    pub fn spawn_with_tablets(
+        tablet_count: usize,
+        worker_count: usize,
+        want_resp: bool,
+    ) -> Result<Self, SpawnError> {
+        Self::spawn_full(tablet_count, worker_count, want_resp, &[])
+    }
+
+    /// Spawns like [`Cluster::spawn_with_tablets`] with an explicit
+    /// readiness window per member (large formations open hundreds of
+    /// groups per process; the default 20 s window suits small ones).
+    /// The window persists on the cluster for later restarts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpawnError`] like [`Cluster::spawn`].
+    pub fn spawn_with_tablets_timeout(
+        tablet_count: usize,
+        worker_count: usize,
+        want_resp: bool,
+        ready_timeout: Duration,
+    ) -> Result<Self, SpawnError> {
+        Self::spawn_full_timeout(tablet_count, worker_count, want_resp, &[], ready_timeout)
+    }
+
+    /// Spawns like [`Cluster::spawn_with_tablets`] with extra environment
+    /// variables for every member (correctness probes such as
+    /// `KIVI_DISABLE_PREFLIGHT=1`; test-only insecure peer TLS is always
+    /// set).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpawnError`] like [`Cluster::spawn`].
+    pub fn spawn_full(
+        tablet_count: usize,
+        worker_count: usize,
+        want_resp: bool,
+        extra_env: &[(&str, &str)],
+    ) -> Result<Self, SpawnError> {
+        Self::spawn_full_timeout(
+            tablet_count,
+            worker_count,
+            want_resp,
+            extra_env,
+            READY_TIMEOUT,
+        )
+    }
+
+    /// Spawns like [`Cluster::spawn_full`] with an explicit readiness
+    /// window per member (persisted for later restarts).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpawnError`] like [`Cluster::spawn`].
+    pub fn spawn_full_timeout(
+        tablet_count: usize,
+        worker_count: usize,
+        want_resp: bool,
+        extra_env: &[(&str, &str)],
+        ready_timeout: Duration,
+    ) -> Result<Self, SpawnError> {
+        let cluster = Self::spawn_bare(
+            tablet_count,
+            worker_count,
+            want_resp,
+            extra_env,
+            ready_timeout,
+        )?;
+        // Single-tablet clusters keep the legacy single-leader wait;
+        // multi-tablet formations wait for every tablet to elect.
+        if cluster.tablet_count == 1 {
+            let _ = cluster.wait_leader();
+        } else {
+            let _ = cluster.wait_all_leaders();
+        }
+        Ok(cluster)
+    }
+
+    /// Spawns a fresh 3-node cluster WITHOUT waiting for elections:
+    /// members are up (ready) but groups may still be campaigning. Density
+    /// probes use this with their own generous convergence loops; every
+    /// other spawn helper waits for stable leadership before returning.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpawnError`] like [`Cluster::spawn`].
+    pub fn spawn_bare(
+        tablet_count: usize,
+        worker_count: usize,
+        want_resp: bool,
+        extra_env: &[(&str, &str)],
+        ready_timeout: Duration,
+    ) -> Result<Self, SpawnError> {
         let binary = server_binary_path()?;
         let mut last = SpawnError::Io("no spawn attempt ran".to_owned());
         for _ in 0..SPAWN_ATTEMPTS {
-            match Self::spawn_once(&binary, want_resp) {
+            match Self::spawn_once(
+                &binary,
+                tablet_count,
+                worker_count,
+                want_resp,
+                extra_env,
+                ready_timeout,
+            ) {
                 Ok(cluster) => return Ok(cluster),
                 Err(error) => {
                     last = error;
@@ -170,8 +292,9 @@ impl Cluster {
         }
     }
 
-    /// Restarts every member from its existing data directory with fresh
-    /// ports, then waits for exactly one leader.
+    /// Restarts every member from its existing data directory on its
+    /// static ports, then waits for leadership everywhere (one leader for
+    /// single-tablet clusters, one per tablet otherwise).
     ///
     /// # Errors
     ///
@@ -184,7 +307,11 @@ impl Cluster {
         for index in 0..self.nodes.len() {
             self.restart(index)?;
         }
-        let _ = self.wait_leader();
+        if self.tablet_count == 1 {
+            let _ = self.wait_leader();
+        } else {
+            let _ = self.wait_all_leaders();
+        }
         Ok(())
     }
 
@@ -227,7 +354,15 @@ impl Cluster {
             args.push(redis);
         }
         let binary = self.binary.clone();
-        let (child, ready_native, ready_admin, ready_resp) = spawn_member(&binary, &args)?;
+        let env: Vec<(&str, &str)> = self
+            .extra_env
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        let data_dir = self.nodes[index].data_dir.path().to_owned();
+        let ready_timeout = self.ready_timeout;
+        let (child, ready_native, ready_admin, ready_resp) =
+            spawn_member(&binary, &args, &data_dir, &env, ready_timeout)?;
         let node = &mut self.nodes[index];
         node.child = Some(child);
         node.native = ready_native;
@@ -299,8 +434,9 @@ impl Cluster {
     /// Panics on connection or I/O failure.
     #[must_use]
     pub fn admin_get(&self, index: usize, path: &str) -> (u16, Value) {
-        let mut socket =
-            TcpStream::connect(self.nodes[index].admin.clone()).expect("admin connect");
+        let admin = self.nodes[index].admin.clone();
+        let mut socket = TcpStream::connect(admin.clone())
+            .unwrap_or_else(|error| panic!("admin connect node {index} ({admin}): {error}"));
         socket
             .set_read_timeout(Some(Duration::from_secs(10)))
             .expect("timeout");
@@ -308,9 +444,11 @@ impl Cluster {
             socket,
             "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
         )
-        .expect("write");
+        .unwrap_or_else(|error| panic!("admin write node {index} ({admin}) {path}: {error}"));
         let mut body = String::new();
-        socket.read_to_string(&mut body).expect("read");
+        socket
+            .read_to_string(&mut body)
+            .unwrap_or_else(|error| panic!("admin read node {index} ({admin}) {path}: {error}"));
         let status = body
             .lines()
             .next()
@@ -333,8 +471,9 @@ impl Cluster {
     #[must_use]
     pub fn admin_post(&self, index: usize, path: &str, body: &Value) -> (u16, Value) {
         let payload = body.to_string();
-        let mut socket =
-            TcpStream::connect(self.nodes[index].admin.clone()).expect("admin connect");
+        let admin = self.nodes[index].admin.clone();
+        let mut socket = TcpStream::connect(admin.clone())
+            .unwrap_or_else(|error| panic!("admin connect node {index} ({admin}): {error}"));
         socket
             .set_read_timeout(Some(Duration::from_secs(10)))
             .expect("timeout");
@@ -343,9 +482,11 @@ impl Cluster {
             "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
             payload.len()
         )
-        .expect("write");
+        .unwrap_or_else(|error| panic!("admin write node {index} ({admin}) {path}: {error}"));
         let mut raw = String::new();
-        socket.read_to_string(&mut raw).expect("read");
+        socket
+            .read_to_string(&mut raw)
+            .unwrap_or_else(|error| panic!("admin read node {index} ({admin}) {path}: {error}"));
         let status = raw
             .lines()
             .next()
@@ -656,8 +797,10 @@ impl Cluster {
             self.id.to_string(),
             "--node-id".to_owned(),
             node_id.to_string(),
-            "--cluster-tablet".to_owned(),
-            TEST_TABLET.to_string(),
+            "--cluster-tablets".to_owned(),
+            self.tablet_count.to_string(),
+            "--cluster-workers".to_owned(),
+            self.worker_count.to_string(),
             "--data-dir".to_owned(),
             data_dir.display().to_string(),
         ]
@@ -673,7 +816,14 @@ impl Cluster {
         self.nodes.iter().map(|node| node.native.clone()).collect()
     }
 
-    fn spawn_once(binary: &PathBuf, want_resp: bool) -> Result<Self, SpawnError> {
+    fn spawn_once(
+        binary: &PathBuf,
+        tablet_count: usize,
+        worker_count: usize,
+        want_resp: bool,
+        extra_env: &[(&str, &str)],
+        ready_timeout: Duration,
+    ) -> Result<Self, SpawnError> {
         let peers = [free_udp_addr(), free_udp_addr(), free_udp_addr()];
         let natives = [free_addr(), free_addr(), free_addr()];
         let admins = [free_addr(), free_addr(), free_addr()];
@@ -689,8 +839,10 @@ impl Cluster {
                 cluster_id.to_string(),
                 "--node-id".to_owned(),
                 node_id.to_string(),
-                "--cluster-tablet".to_owned(),
-                TEST_TABLET.to_string(),
+                "--cluster-tablets".to_owned(),
+                tablet_count.to_string(),
+                "--cluster-workers".to_owned(),
+                worker_count.to_string(),
                 "--data-dir".to_owned(),
                 data_dir.path().display().to_string(),
                 "--cluster-peers".to_owned(),
@@ -706,7 +858,8 @@ impl Cluster {
                 args.push("--redis-listen".to_owned());
                 args.push(redis[index].clone());
             }
-            let (child, ready_native, ready_admin, ready_resp) = spawn_member(binary, &args)?;
+            let (child, ready_native, ready_admin, ready_resp) =
+                spawn_member(binary, &args, data_dir.path(), extra_env, ready_timeout)?;
             if want_resp && ready_resp.is_none() {
                 drop(child);
                 return Err(SpawnError::RespUnavailable);
@@ -721,13 +874,349 @@ impl Cluster {
                 resp: ready_resp,
             });
         }
-        let cluster = Self {
+        Ok(Self {
             nodes,
             id: cluster_id,
             binary: binary.clone(),
+            tablet_count,
+            worker_count,
+            extra_env: extra_env
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                .collect(),
+            ready_timeout,
+        })
+    }
+
+    /// Configured tablet count.
+    #[must_use]
+    pub fn tablet_count(&self) -> usize {
+        self.tablet_count
+    }
+
+    /// Configured worker count.
+    #[must_use]
+    pub fn worker_count(&self) -> usize {
+        self.worker_count
+    }
+
+    /// Parsed `/v1/tablets` for one member (per-tablet diagnostics for
+    /// every local group, sorted by tablet).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the endpoint errors.
+    #[must_use]
+    pub fn tablets_status(&self, index: usize) -> Value {
+        let (status, json) = self.admin_get(index, "/v1/tablets");
+        assert_eq!(status, 200, "GET /v1/tablets on node {index}");
+        json
+    }
+
+    /// Parsed `/v1/tablets` for one member, or `None` when the member is
+    /// temporarily unable to serve it (e.g. the 5 s admin ceiling under a
+    /// 1000-group debug fan-out). Polling loops use this and retry;
+    /// correctness assertions keep using [`tablets_status`](Self::tablets_status).
+    #[must_use]
+    pub fn tablets_status_opt(&self, index: usize) -> Option<Value> {
+        let (status, json) = self.admin_get(index, "/v1/tablets");
+        (status == 200).then_some(json)
+    }
+
+    /// Tablet ids served by one member (from `/v1/tablets`).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the endpoint errors or tablet ids are missing.
+    #[must_use]
+    pub fn tablet_ids(&self, index: usize) -> Vec<u64> {
+        self.tablets_status(index)
+            .as_array()
+            .expect("tablets array")
+            .iter()
+            .map(|tablet| tablet["group"].as_u64().expect("tablet group"))
+            .collect()
+    }
+
+    /// Per-tablet applied indexes of one member (`tablet → applied`).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the endpoint errors or fields are missing.
+    #[must_use]
+    pub fn tablets_applied(&self, index: usize) -> std::collections::BTreeMap<u64, u64> {
+        self.tablets_status(index)
+            .as_array()
+            .expect("tablets array")
+            .iter()
+            .map(|tablet| {
+                (
+                    tablet["group"].as_u64().expect("tablet group"),
+                    tablet["applied"].as_u64().expect("tablet applied"),
+                )
+            })
+            .collect()
+    }
+
+    /// Per-tablet leader node ids of one member (`tablet → leader`), as
+    /// last observed by that member.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the endpoint errors.
+    #[must_use]
+    pub fn tablets_leaders(&self, index: usize) -> std::collections::BTreeMap<u64, Option<u64>> {
+        self.tablets_status(index)
+            .as_array()
+            .expect("tablets array")
+            .iter()
+            .map(|tablet| {
+                (
+                    tablet["group"].as_u64().expect("tablet group"),
+                    tablet["leader"].as_u64(),
+                )
+            })
+            .collect()
+    }
+
+    /// Waits until every tablet has exactly one stable leader across live
+    /// members (stable across consecutive polls, so callers never catch a
+    /// handover mid-flight), returning `(tablet, leader_node_index)` in
+    /// tablet order.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any tablet never reaches one stable leader inside the
+    /// window.
+    #[must_use = "the leader map routes the next test step"]
+    pub fn wait_all_leaders(&self) -> Vec<(u64, usize)> {
+        let deadline = Instant::now() + LEADER_TIMEOUT;
+        // Tablet set first (members agree on the static set). A member
+        // under load may 503 its fan-out; retry for the set like any
+        // other poll round.
+        let tablets = loop {
+            if let Some(status) = self.tablets_status_opt(self.live_index()) {
+                break status
+                    .as_array()
+                    .expect("tablets array")
+                    .iter()
+                    .map(|tablet| tablet["group"].as_u64().expect("tablet group"))
+                    .collect::<Vec<_>>();
+            }
+            assert!(Instant::now() < deadline, "tablet set never readable");
+            std::thread::sleep(Duration::from_millis(200));
         };
-        let _ = cluster.wait_leader();
-        Ok(cluster)
+        let mut stable = 0usize;
+        let mut last: Vec<(u64, usize)> = Vec::new();
+        loop {
+            let mut current: Vec<(u64, usize)> = Vec::new();
+            let mut ok = true;
+            for tablet in &tablets {
+                // Slow members answer 503 under fan-out load: skip them
+                // this round instead of failing the whole wait.
+                let leaders: Vec<usize> = (0..self.nodes.len())
+                    .filter(|i| {
+                        self.alive(*i)
+                            && self.tablets_status_opt(*i).is_some_and(|status| {
+                                status.as_array().is_some_and(|statuses| {
+                                    statuses.iter().any(|entry| {
+                                        entry["group"].as_u64() == Some(*tablet)
+                                            && entry["role"].as_str() == Some("leader")
+                                    })
+                                })
+                            })
+                    })
+                    .collect();
+                if leaders.len() != 1 {
+                    ok = false;
+                    break;
+                }
+                current.push((*tablet, leaders[0]));
+            }
+            if ok && current == last {
+                stable += 1;
+                if stable >= 3 {
+                    return current;
+                }
+            } else {
+                stable = 0;
+                last = current;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "tablets never reached one stable leader each"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    /// Index of one live member (formation always leaves one).
+    ///
+    /// # Panics
+    ///
+    /// Panics when no member is alive.
+    #[must_use]
+    pub fn live_index(&self) -> usize {
+        (0..self.nodes.len())
+            .find(|i| self.alive(*i))
+            .expect("a live member")
+    }
+
+    /// Index of the live member leading `tablet` right now (by its own
+    /// authoritative role view). Call after convergence/election waits;
+    /// leadership may move at any time.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no live member currently leads the tablet.
+    #[must_use]
+    pub fn leader_of(&self, tablet: u64) -> usize {
+        (0..self.nodes.len())
+            .filter(|i| self.alive(*i))
+            .find(|i| {
+                self.tablets_status(*i).as_array().is_some_and(|statuses| {
+                    statuses.iter().any(|entry| {
+                        entry["group"].as_u64() == Some(tablet)
+                            && entry["role"].as_str() == Some("leader")
+                    })
+                })
+            })
+            .expect("a live leader for the tablet")
+    }
+
+    /// Waits until every live member converges per tablet: for each
+    /// tablet, all live members report the same applied index.
+    ///
+    /// # Panics
+    ///
+    /// Panics on timeout.
+    pub fn wait_converged_all(&self) {
+        let deadline = Instant::now() + CONVERGE_TIMEOUT;
+        loop {
+            let mut per_tablet: std::collections::BTreeMap<u64, u64> =
+                std::collections::BTreeMap::new();
+            let mut converged = true;
+            let mut polled = 0usize;
+            for i in 0..self.nodes.len() {
+                if !self.alive(i) {
+                    continue;
+                }
+                // Slow members answer 503 under fan-out load: skip them
+                // this round (a skipped member simply is not converged
+                // yet as far as this round can tell).
+                let Some(status) = self.tablets_status_opt(i) else {
+                    converged = false;
+                    continue;
+                };
+                polled += 1;
+                for entry in status.as_array().cloned().unwrap_or_default() {
+                    let tablet = entry["group"].as_u64().expect("tablet group");
+                    let applied = entry["applied"].as_u64().expect("tablet applied");
+                    match per_tablet.get(&tablet) {
+                        None => {
+                            per_tablet.insert(tablet, applied);
+                        }
+                        Some(watermark) if *watermark != applied => {
+                            converged = false;
+                        }
+                        Some(_) => {}
+                    }
+                }
+            }
+            if converged && polled > 0 && !per_tablet.is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "tablets never converged");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    /// Finds `per_tablet` keys landing on each tablet of the static
+    /// directory (`tablet → keys`), by hashing candidates with the
+    /// production partition hash and matching the ranges served on admin
+    /// `/v1/tablets`. Key strings are deterministic (`mt-key-{i:06}`), so
+    /// runs agree on the same mapping.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the endpoint errors, ranges are missing, or some
+    /// tablet never fills inside the candidate budget.
+    #[must_use]
+    pub fn keys_for_tablets(
+        &self,
+        per_tablet: usize,
+    ) -> std::collections::BTreeMap<u64, Vec<String>> {
+        use kivi_state::PartitionHasher;
+        let namespace = NamespaceId::from_u64(1);
+        let ranges: Vec<(u64, u128, u8)> = self
+            .tablets_status(self.live_index())
+            .as_array()
+            .expect("tablets array")
+            .iter()
+            .map(|tablet| {
+                let group = tablet["group"].as_u64().expect("tablet group");
+                let bits = tablet["range_bits"].as_str().expect("tablet range bits");
+                let bits = u128::from_str_radix(bits, 16).expect("hex range bits");
+                let len = tablet["range_len"].as_u64().expect("tablet range len");
+                let len = u8::try_from(len).expect("range len fits u8");
+                (group, bits, len)
+            })
+            .collect();
+        assert!(!ranges.is_empty(), "cluster serves tablets");
+        let route = |hash: u128| -> Option<u64> {
+            ranges.iter().find_map(|(group, bits, len)| {
+                let shift = 128 - *len;
+                (hash >> shift == *bits >> shift).then_some(*group)
+            })
+        };
+        let mut out: std::collections::BTreeMap<u64, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for group in ranges.iter().map(|(group, _, _)| *group) {
+            out.insert(group, Vec::new());
+        }
+        for i in 0..100_000u32 {
+            if out.values().all(|keys| keys.len() >= per_tablet) {
+                break;
+            }
+            let candidate = format!("mt-key-{i:06}");
+            let hash = PartitionHasher::V1
+                .hash(namespace, candidate.as_bytes())
+                .expect("supported")
+                .as_u128();
+            if let Some(group) = route(hash)
+                && out[&group].len() < per_tablet
+            {
+                out.get_mut(&group).expect("tablet bucket").push(candidate);
+            }
+        }
+        for (group, keys) in &out {
+            assert_eq!(
+                keys.len(),
+                per_tablet,
+                "tablet {group} fills {per_tablet} keys inside the budget"
+            );
+        }
+        out
+    }
+
+    /// Triggers a checkpoint snapshot + log purge for `tablet` on member
+    /// `index`, returning the snapshot base index.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the endpoint errors.
+    #[must_use]
+    pub fn snapshot_tablet(&self, index: usize, tablet: u64) -> u64 {
+        let (status, json) = self.admin_post(
+            index,
+            "/v1/snapshot",
+            &serde_json::json!({ "tablet": tablet }),
+        );
+        assert_eq!(
+            status, 200,
+            "snapshot tablet {tablet} on node {index}: {json}"
+        );
+        json["snapshot"].as_u64().unwrap_or(0)
     }
 }
 
@@ -745,19 +1234,45 @@ fn flag_list(addrs: &[String]) -> String {
 /// optional RESP). Test-only insecure peer TLS: fresh data directories
 /// and ephemeral ports per run make static certificate pins impractical,
 /// and all traffic stays on loopback.
+///
+/// Server output goes to per-member log files in the data directory
+/// (appended across restarts): pipes would need continuous draining and
+/// truncation would lose the failure story, while files keep every
+/// member's full story beside its data for post-mortems.
 fn spawn_member(
     binary: &PathBuf,
     args: &[String],
+    data_dir: &std::path::Path,
+    extra_env: &[(&str, &str)],
+    ready_timeout: Duration,
 ) -> Result<(Child, String, String, Option<String>), SpawnError> {
-    let mut child = Command::new(binary)
+    use std::fs::OpenOptions;
+    let stdout_log = data_dir.join("server-stdout.log");
+    let stderr_log = data_dir.join("server-stderr.log");
+    let stdout_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&stdout_log)
+        .map_err(|error| SpawnError::Io(error.to_string()))?;
+    let stderr_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&stderr_log)
+        .map_err(|error| SpawnError::Io(error.to_string()))?;
+    let mut command = Command::new(binary);
+    command
         .args(args)
         .env("KIVI_INSECURE_PEER_TLS", "1")
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file));
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    let mut child = command
         .spawn()
         .map_err(|error| SpawnError::Io(error.to_string()))?;
-    match super::process::wait_ready_or_exit(&mut child, READY_TIMEOUT) {
+    match wait_ready_file(&mut child, &stdout_log, ready_timeout) {
         WaitOutcome::Ready(native, admin, resp) => Ok((
             child,
             native.into_iter().next().unwrap_or_default(),
@@ -766,8 +1281,82 @@ fn spawn_member(
         )),
         WaitOutcome::Exited(status) => Err(SpawnError::Exited(
             status.to_string(),
-            stderr_tail(&mut child),
+            file_tail(&stderr_log),
         )),
-        WaitOutcome::TimedOut => Err(SpawnError::TimedOut(READY_TIMEOUT, stderr_tail(&mut child))),
+        WaitOutcome::TimedOut => Err(SpawnError::TimedOut(ready_timeout, file_tail(&stderr_log))),
+    }
+}
+
+/// Last lines of a log file for failure diagnostics (bounded tail, never
+/// the whole file).
+fn file_tail(path: &std::path::Path) -> String {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    text.lines()
+        .rev()
+        .take(8)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Internal ready-wait outcome over a tailed log file (child ownership
+/// stays with the caller).
+enum WaitOutcome {
+    /// `KIVI_READY` parsed: native endpoints, admin endpoint, optional RESP.
+    Ready(Vec<String>, String, Option<String>),
+    /// The process exited before reporting readiness.
+    Exited(std::process::ExitStatus),
+    /// Neither readiness nor exit inside the window (child already killed).
+    TimedOut,
+}
+
+/// Waits for `KIVI_READY` by tailing the member's stdout log file: reads
+/// only appended bytes per quantum (the clock owns the deadline, file
+/// growth never blocks the harness). A silent stall can never hang past
+/// the deadline; early exit reports immediately.
+fn wait_ready_file(
+    child: &mut Child,
+    stdout_log: &std::path::Path,
+    timeout: Duration,
+) -> WaitOutcome {
+    use std::io::{Read as _, Seek as _};
+    let mut offset = 0u64;
+    let mut pending = String::new();
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            return WaitOutcome::Exited(status);
+        }
+        if let Ok(mut file) = std::fs::File::open(stdout_log)
+            && file.seek(std::io::SeekFrom::Start(offset)).is_ok()
+        {
+            let mut fresh = String::new();
+            if file.read_to_string(&mut fresh).is_ok() {
+                pending.push_str(&fresh);
+                // Scan complete lines for readiness (tracing noise is
+                // skipped); the trailing partial line stays buffered.
+                let mut consumed = 0usize;
+                let mut found = None;
+                while let Some(end) = pending[consumed..].find('\n') {
+                    let line = &pending[consumed..consumed + end];
+                    if found.is_none() {
+                        found = super::process::parse_ready(line);
+                    }
+                    consumed += end + 1;
+                }
+                pending.drain(..consumed);
+                offset += consumed as u64;
+                if let Some(ports) = found {
+                    return WaitOutcome::Ready(ports.0, ports.1, ports.2);
+                }
+            }
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            return WaitOutcome::TimedOut;
+        }
+        std::thread::sleep(Duration::from_millis(25));
     }
 }

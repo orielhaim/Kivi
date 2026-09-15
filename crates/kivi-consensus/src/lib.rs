@@ -6,12 +6,13 @@
 //! No `OpenRaft` type may leak into `kivi-state`, `kivi-tablet`,
 //! `kivi-protocol`, `kivi-resp`, `kivi-client`, `kivi-chunk`, or
 //! `MutationIR`. `OpenRaft` lives in [`config`], [`router`], [`spike`],
-//! [`state_machine`], [`store`], [`transport`], and the owner half of
-//! [`node`] (the private containment zone, and only in private fields
-//! there — every public signature outside [`config`] is Kivi-owned);
-//! everything else in the workspace talks to [`ConsensusCore`] and the
-//! owned types in [`types`]. `OpenRaft`'s API is explicitly pre-1.0 and
-//! unstable, so this crate absorbs its churn behind the narrow trait below.
+//! [`state_machine`], [`store`], [`shared`], [`transport`], and the owner
+//! halves of [`node`] and [`multi`] (the private containment zone, and
+//! only in private fields there — every public signature outside
+//! [`config`] is Kivi-owned); everything else in the workspace talks to
+//! the node fronts ([`ReplicatedNode`], [`ConsensusNode`]) and the owned
+//! types in [`types`]. `OpenRaft`'s API is explicitly pre-1.0 and
+//! unstable, so this crate absorbs its churn behind those fronts.
 //!
 //! ## `OpenRaft` selection record
 //!
@@ -48,10 +49,13 @@
 pub mod cluster;
 pub mod config;
 pub mod gate;
+pub mod multi;
 pub mod mutation;
 pub mod node;
 pub mod peer;
+pub mod preflight;
 pub mod router;
+pub mod shared;
 pub mod sidecar;
 pub mod spike;
 pub mod state_machine;
@@ -59,12 +63,14 @@ pub mod store;
 pub mod tls;
 pub mod transport;
 pub mod types;
+pub mod worker;
 
 pub use cluster::{
     Bootstrap, BootstrapError, ClusterTopology, DurableClusterView, NodeDescriptor,
     TabletAssignment, TopologyError, classify_bootstrap, verify_against_durable,
 };
 pub use gate::{SidecarGate, sidecar_io_error};
+pub use multi::{ConsensusNode, MultiNodeConfig};
 pub use mutation::{
     REPLICATED_MUTATION_VERSION, ReplicatedMutation, ReplicatedMutationError, ReplicatedOutcome,
 };
@@ -75,16 +81,25 @@ pub use peer::{
     AuthReject, CAP_CONSENSUS_V2, CAP_SIDECAR_V1, DecodedH3Request, IncarnationTable,
     PeerAppendRequest, PeerAppendResponse, PeerChunkRequest, PeerChunkResponse, PeerEntry,
     PeerEntryPayload, PeerIdentity, PeerLogId, PeerManifestRequest, PeerManifestResponse,
-    PeerRequest, PeerResponse, PeerRpcError, PeerSnapshotMeta, PeerSnapshotRequest,
-    PeerSnapshotResponse, PeerVote, PeerVoteRequest, PeerVoteResponse, REQUIRED_CAPABILITIES,
-    ValidatedPeer, decode_h3_request, decode_h3_response, encode_h3_request, encode_h3_response,
-    h3_media_type, h3_request_path, id32_hex, parse_id32_hex, route, validate_peer_headers,
+    PeerPrepareRequest, PeerPreparedResponse, PeerRequest, PeerResponse, PeerRpcError,
+    PeerSnapshotMeta, PeerSnapshotRequest, PeerSnapshotResponse, PeerVote, PeerVoteRequest,
+    PeerVoteResponse, REQUIRED_CAPABILITIES, ValidatedPeer, decode_h3_request, decode_h3_response,
+    encode_h3_request, encode_h3_response, h3_media_type, h3_method, h3_request_path, id32_hex,
+    parse_id32_hex, route, validate_peer_headers,
+};
+pub use preflight::{
+    PreflightMetrics, PreflightMetricsSnapshot, PreflightOutcome, followers_needed,
+    preflight_to_quorum, quorum_needed,
 };
 pub use router::{
     GroupNetworkFactory, PeerRouter, RpcCodecError, decode_append_request, decode_snapshot_meta,
     decode_vote_request, decode_wire_entry, decode_wire_log, decode_wire_vote,
     encode_append_request, encode_snapshot_meta, encode_vote_request, encode_wire_entry,
     encode_wire_log, encode_wire_vote, serve_peer_request,
+};
+pub use shared::{
+    GroupLogReader, GroupRaftStore, SharedDurabilityConfig, SharedDurabilityMetrics,
+    SharedDurabilityStats, SharedOpenError, SharedRaftDurability, dispatch_by_group,
 };
 pub use sidecar::{
     ImmutableDependencies, PinStage, ProposalPin, SidecarError, SidecarMetrics,
@@ -97,11 +112,13 @@ pub use state_machine::{
     SealedSnapshotBuilder, SessionState, StateMachineFault, StateMachineOpenError,
     StateMachineStatus, commit_of_index, index_of_commit,
 };
-pub use store::{CONSENSUS_LANE, DurableLogReader, DurableRaftStore, StoreOpenError};
+pub use store::{
+    CONSENSUS_LANE, ConsensusLogStore, DurableLogReader, DurableRaftStore, StoreOpenError,
+};
 pub use tls::{CertFingerprint, NodeCert, TlsError};
 pub use transport::{PeerHandler, PeerStats, PeerTransport, TransportConfig, TransportError};
 pub use types::{
-    ConsensusCore, ConsensusError, ConsensusGroupId, ConsensusLogIndex, ConsensusStatus,
-    ConsensusTerm, LeaderHint, ProposeEnvelope, ProposedOutcome, ReadBarrier, ReplicaId,
-    ReplicaRole,
+    ConsensusError, ConsensusGroupId, ConsensusLogIndex, ConsensusTerm, LeaderHint, ReadBarrier,
+    ReplicaId, ReplicaRole,
 };
+pub use worker::{tablets_for_worker, worker_for_tablet};

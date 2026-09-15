@@ -2,11 +2,12 @@
 //!
 //! One [`DurableRaftStore`] backs one consensus group's log side
 //! ([`openraft::storage::RaftLogStorage`] +
-//! [`openraft::storage::RaftLogReader`]). It persists Kivi-owned
-//! [`kivi_durability::RaftRecord`]s through a dedicated WAL lane in the
-//! node's data directory — the same segmented, checksummed, crash-safe
-//! infrastructure as tablet history, so a future physical WAL holds many
-//! groups with no format change.
+//! [`openraft::storage::RaftLogReader`]). It is a thin façade over one
+//! [`GroupRaftStore`](crate::shared::GroupRaftStore): Kivi-owned
+//! [`kivi_durability::RaftRecord`]s persist through the node-wide shared
+//! WAL writer — the same segmented, checksummed, crash-safe
+//! infrastructure as tablet history, with one physical WAL holding every
+//! group and no format change.
 //!
 //! ## No double-log
 //!
@@ -30,7 +31,7 @@
 //! * `append` — "**should return immediately after saving in memory**" and
 //!   "**when the callback is called, the entries must be persisted**".
 //!   Entries stage into the cache (readable on return, as required) while
-//!   the lane thread persists; the [`openraft::storage::IOFlushed`]
+//!   the shared writer persists; the [`openraft::storage::IOFlushed`]
 //!   callback fires only after the barrier acks. A barrier failure removes
 //!   the staged suffix so the cache never advertises undurable history.
 //!   Replication acknowledgements therefore always imply durable
@@ -52,22 +53,20 @@
 //! * `read_vote` lives on [`openraft::storage::RaftLogReader`] in 0.10
 //!   (both the store and [`DurableLogReader`] implement it).
 //!
-//! ## Lane thread
+//! ## Shared writer thread
 //!
-//! The WAL barrier is synchronous `std::fs` plus `fsync`. Under the old
-//! Tokio island that ran inside `block_in_place`; on a single-threaded
-//! Compio reactor blocking is forbidden, so each store owns a dedicated
-//! lane-writer thread holding the WAL lane exclusively.
-//! Barriers cross as bounded [`async_channel`] jobs with
-//! [`futures::channel::oneshot`] acks — the reactor yields while `fsync`
-//! runs elsewhere. One thread per group is the day-one shape (correct and
-//! simple); the documented Multi-Raft follow-up is one node-shared lane
-//! writer batching many groups' barriers physically (RFC §60).
+//! The WAL barrier is synchronous `std::fs` plus `fsync`. On a
+//! single-threaded Compio reactor blocking is forbidden, so barriers
+//! cross as bounded channel jobs with oneshot acks to the node-wide
+//! shared writer thread — the reactor yields while `fsync` runs
+//! elsewhere. There is no thread per group: one writer serves every
+//! group on the node (RFC §60), batching concurrent groups' records into
+//! single physical batches.
 //!
 //! All write paths serialize through one [`futures::lock::Mutex`]: it is
 //! held across stage-plus-submit only, never across the barrier ack, so no
-//! reactor task stalls on `fsync` latency. FIFO lane submission preserves
-//! the log order the consecutive-log invariant requires.
+//! reactor task stalls on `fsync` latency. FIFO submission preserves
+//! the per-group log order the consecutive-log invariant requires.
 //!
 //! ## State machine side
 //!
@@ -75,33 +74,22 @@
 //! production apply path (`MutationIR` into `LiveTablet`) live in
 //! [`crate::state_machine`].
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use crate::config::KiviTypeConfig;
-use crate::mutation::ReplicatedMutation;
 use crate::types::ConsensusGroupId;
-use kivi_durability::{
-    DurabilityError, LaneFloor, LaneIdentity, LocalWalLane, RaftEntryPayload, RaftRecord,
-};
-use kivi_types::{NamespaceId, NodeId, TabletId};
+use kivi_durability::LaneIdentity;
+use kivi_types::NamespaceId;
 use openraft::storage::{IOFlushed, LogState, RaftLogReader, RaftLogStorage};
 use openraft::type_config::alias::{EntryOf, LogIdOf, VoteOf};
-use openraft::vote::RaftLeaderId as _;
 
 /// WAL lane reserved for consensus history (`wal/lane-65535/`). Worker
 /// lanes number `0..worker_count`; the top lane id can never collide with
 /// one, so consensus history shares the directory (and the reclamation
 /// domain) without sharing any worker's file sequence.
 pub const CONSENSUS_LANE: u16 = u16::MAX;
-
-/// Bound on in-flight lane barriers per store. The barrier path holds no
-/// cache lock while awaiting the ack, so depth here only bounds memory;
-/// one outstanding barrier per writer is the norm, and a full channel
-/// applies honest backpressure instead of unbounded growth.
-const LANE_QUEUE: usize = 64;
 
 /// Why a durable store could not be opened.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -127,242 +115,70 @@ pub enum StoreOpenError {
     },
 }
 
-/// One cached log entry: Kivi-owned fields, convertible both ways without
-/// touching `OpenRaft` memory layout on disk.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct StoredEntry {
-    term: u64,
-    leader: u64,
-    payload: StoredPayload,
+/// Logical per-group durability is implemented once in
+/// [`GroupRaftStore`](crate::shared::GroupRaftStore) (logical cache plus
+/// the node-wide shared writer); this module keeps the single-group
+/// façade ([`DurableRaftStore`]) over it, so one code path serves every
+/// group count and no OS thread is ever owned per group.
+///
+/// Lightweight logical group view over physical consensus durability:
+/// one object per `OpenRaft` group implementing its storage traits, with
+/// no hidden writer thread inside the view itself (physical writing lives
+/// in the node-wide shared writer).
+///
+/// Both the single-group [`DurableRaftStore`] façade and the multi-group
+/// [`GroupRaftStore`](crate::shared::GroupRaftStore) implement this, so
+/// the owner machinery (proposals, barriers, peer RPCs, snapshots,
+/// preflight) is written once generically and shared by both modes.
+pub trait ConsensusLogStore:
+    RaftLogStorage<KiviTypeConfig> + RaftLogReader<KiviTypeConfig> + Clone + Send + 'static
+{
+    /// Installs the sidecar durability gate (wired after the peer mesh and
+    /// sidecar store exist).
+    fn set_gate(&mut self, gate: crate::gate::SidecarGate);
+    /// Returns the installed gate, if any.
+    fn gate(&self) -> Option<&crate::gate::SidecarGate>;
+    /// Returns the newest committed-membership voter set visible in the
+    /// retained log (newest-first scan). Empty when none survives — the
+    /// caller falls back to the state machine's snapshot membership.
+    fn membership_voters(&self) -> impl Future<Output = BTreeSet<u64>> + Send;
 }
 
-/// Cached entry payload (mirrors [`RaftEntryPayload`] 1:1).
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum StoredPayload {
-    Blank,
-    Normal(Vec<u8>),
-    Membership(StoredMembershipData),
-}
-
-/// Cached membership (voters plus dialable nodes).
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct StoredMembershipData {
-    voters: Vec<u64>,
-    nodes: Vec<(u64, String)>,
-}
-
-/// Cached log id (term, leader, index).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct StoredLogId {
-    term: u64,
-    leader: u64,
-    index: u64,
-}
-
-impl StoredLogId {
-    fn openraft(self) -> LogIdOf<KiviTypeConfig> {
-        use openraft::impls::leader_id_adv::LeaderId;
-        openraft::LogId::new(LeaderId::new(self.term, self.leader), self.index)
-    }
-}
-
-/// Cached vote.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct StoredVote {
-    term: u64,
-    candidate: u64,
-    committed: bool,
-}
-
-impl StoredVote {
-    fn openraft(self) -> VoteOf<KiviTypeConfig> {
-        if self.committed {
-            openraft::impls::Vote::new_committed(self.term, self.candidate)
-        } else {
-            openraft::impls::Vote::new(self.term, self.candidate)
-        }
-    }
-}
-
-/// Logical group cache: everything `OpenRaft` reads, rebuilt by folding
-/// [`RaftRecord`]s in file order at open. The WAL lane itself lives on the
-/// [`LaneWriter`] thread; this cache never touches files.
-struct StoreInner {
-    namespace: NamespaceId,
-    group: TabletId,
-    vote: Option<StoredVote>,
-    entries: BTreeMap<u64, StoredEntry>,
-    last_purged: Option<StoredLogId>,
-    committed: Option<StoredLogId>,
-    snapshot_base: Option<StoredLogId>,
-    /// Logical conflicting-suffix removals observed (live
-    /// `truncate_after` calls plus recovery-fold replays of
-    /// `RaftTruncate` markers). Operator/diagnostic accounting only: it
-    /// proves the durable truncate record drove a suffix replacement
-    /// rather than a memory-only path.
-    truncations: u64,
-}
-
-/// Maps a durability failure onto the `io::Error` the 0.10 storage traits
-/// require. The message preserves the typed cause; the lane's health latch
-/// (terminal failure stays terminal) lives in the lane itself.
-fn lane_io_error(error: &DurabilityError) -> io::Error {
-    io::Error::other(error.to_string())
-}
-
-/// One barrier job for the lane thread.
-struct LaneJob {
-    records: Vec<RaftRecord>,
-    ack: futures::channel::oneshot::Sender<Result<(), DurabilityError>>,
-}
-
-/// Exclusive owner of the group's WAL lane, parked on its own thread. The
-/// thread exits when the last [`DurableRaftStore`] clone drops (the channel
-/// closes); no join is required for correctness, and [`shutdown`](Self::shutdown)
-/// joins for clean process teardown in tests and density runs.
-#[derive(Clone)]
-struct LaneWriter {
-    tx: async_channel::Sender<LaneJob>,
-}
-
-impl LaneWriter {
-    /// Spawns the lane thread owning `lane`.
-    fn spawn(mut lane: LocalWalLane) -> Self {
-        let (tx, rx) = async_channel::bounded::<LaneJob>(LANE_QUEUE);
-        std::thread::Builder::new()
-            .name("kivi-consensus-lane".to_owned())
-            .spawn(move || {
-                while let Ok(job) = rx.recv_blocking() {
-                    let result = lane.append_raft_records(&job.records).map(|_| ());
-                    // The submitter may be gone (shutdown race); its
-                    // records are still durable — dropping the ack only
-                    // skips a notification that has nowhere to go.
-                    let _ = job.ack.send(result);
-                }
-            })
-            .expect("consensus lane thread spawns");
-        Self { tx }
-    }
-
-    /// Submits one barrier job in FIFO order and returns the ack
-    /// receiver. The send only waits for channel capacity (the lane
-    /// thread drains independently), never for the `fsync` itself — so
-    /// callers may hold the cache lock across `submit` (which serializes
-    /// submit order) but must release it before awaiting the ack.
-    async fn submit(
-        &self,
-        records: Vec<RaftRecord>,
-    ) -> futures::channel::oneshot::Receiver<Result<(), DurabilityError>> {
-        let (ack, rx) = futures::channel::oneshot::channel();
-        // A closed channel means the lane thread died mid-submit; the
-        // receiver observes the same condition as a dropped sender below.
-        let _ = self.tx.send(LaneJob { records, ack }).await;
-        rx
-    }
-
-    /// Runs one barrier: FIFO submit, reactor-friendly wait for the
-    /// `fsync`-backed ack. A closed channel means the lane thread died,
-    /// which is a process-fatal condition surfaced as an I/O error.
-    /// Callers holding the cache lock must use [`submit`](Self::submit)
-    /// instead and await the ack after releasing it.
-    #[cfg(test)]
-    async fn barrier(&self, records: Vec<RaftRecord>) -> Result<(), DurabilityError> {
-        let rx = self.submit(records).await;
-        rx.await.map_err(|_| lane_exited())?
-    }
-}
-
-fn lane_exited() -> DurabilityError {
-    DurabilityError::InvalidConfig {
-        reason: "consensus lane thread exited",
-    }
-}
-
-/// Awaits one barrier ack, mapping every failure onto the `io::Error`
-/// the 0.10 storage traits require.
-async fn await_barrier(
-    rx: futures::channel::oneshot::Receiver<Result<(), DurabilityError>>,
-) -> Result<(), io::Error> {
-    let acked = rx.await.map_err(|_| lane_io_error(&lane_exited()))?;
-    acked.map_err(|error| lane_io_error(&error))
-}
-
-impl std::fmt::Debug for LaneWriter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LaneWriter")
-            .field("capacity", &LANE_QUEUE)
-            .finish_non_exhaustive()
-    }
-}
-
-/// Durable per-group Raft log store. Cloneable: clones share the same
-/// serialized state (log readers for replication streams included), the
-/// same lane writer, and the same sidecar gate.
+/// Durable single-group Raft log store: a thin façade over one
+/// [`GroupRaftStore`](crate::shared::GroupRaftStore) on a node-wide
+/// shared writer. Cloneable: clones share the same logical cache, writer,
+/// and sidecar gate.
+///
+/// There is deliberately no per-group lane thread here (nor anywhere
+/// else): one OS thread per Raft group does not scale to many tablets, so
+/// every group — one or one thousand — shares the physical writer (see
+/// [`crate::shared`]).
 ///
 /// The gate enforces the core invariant: a replica never reports a Raft
 /// append durable while required immutable sidecars are missing. See
 /// [`crate::gate`] and [`crate::sidecar`].
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct DurableRaftStore {
-    shared: Arc<futures::lock::Mutex<StoreInner>>,
-    lane: LaneWriter,
-    gate: Option<crate::gate::SidecarGate>,
+    view: crate::shared::GroupRaftStore,
 }
 
-/// Log reader sharing the store's serialized state (replication streams
-/// read through this; the log side owns the writes).
-#[derive(Clone)]
+/// Log reader sharing the store's logical cache (replication streams read
+/// through this; the log side owns the writes).
+#[derive(Clone, Debug)]
 pub struct DurableLogReader {
-    shared: Arc<futures::lock::Mutex<StoreInner>>,
-}
-
-impl std::fmt::Debug for DurableRaftStore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Summarize the logical state without blocking (a contended lock
-        // still formats).
-        match self.shared.try_lock() {
-            Some(inner) => f
-                .debug_struct("DurableRaftStore")
-                .field("group", &inner.group)
-                .field("entries", &inner.entries.len())
-                .field("vote", &inner.vote)
-                .finish_non_exhaustive(),
-            None => f
-                .debug_struct("DurableRaftStore")
-                .field("state", &"locked")
-                .finish_non_exhaustive(),
-        }
-    }
-}
-
-impl std::fmt::Debug for DurableLogReader {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.shared.try_lock() {
-            Some(inner) => f
-                .debug_struct("DurableLogReader")
-                .field("group", &inner.group)
-                .field("entries", &inner.entries.len())
-                .finish_non_exhaustive(),
-            None => f
-                .debug_struct("DurableLogReader")
-                .field("state", &"locked")
-                .finish_non_exhaustive(),
-        }
-    }
+    view: crate::shared::GroupLogReader,
 }
 
 impl DurableRaftStore {
     /// Opens (or reopens) the group's durable log in the node's data
-    /// directory: the consensus lane is opened or resumed, its history
-    /// recovered, and the logical group state rebuilt by folding
-    /// vote/entry/truncate/purge/committed/snapshot markers in file order.
-    /// The recovered lane moves onto a dedicated writer thread; this call
-    /// is synchronous and touches no async runtime.
+    /// directory through the node-wide shared writer: the shared lane is
+    /// opened or resumed, its history recovered once, and this group's
+    /// logical state rebuilt by folding its own records in file order.
+    /// This call is synchronous and touches no async runtime.
     ///
-    /// Only this group's consensus records fold; other groups' records
-    /// (shared-lane Multi-Raft) and tablet-family entries (not group
-    /// history) are skipped by the fold. Forming a group on a non-fresh
-    /// directory is a bootstrap concern, rejected there.
+    /// Only this group's consensus records fold; other groups' records on
+    /// the shared lane are skipped by the fold. Forming a group on a
+    /// non-fresh directory is a bootstrap concern, rejected there.
     ///
     /// # Errors
     ///
@@ -375,61 +191,57 @@ impl DurableRaftStore {
         identity: LaneIdentity,
         segment_target_bytes: u64,
     ) -> Result<Self, StoreOpenError> {
-        let wal_dir = data_dir.join(kivi_durability::node::WAL_DIR_NAME);
-        let mut lane = LocalWalLane::open(&wal_dir, CONSENSUS_LANE, identity, segment_target_bytes)
-            .map_err(|error| StoreOpenError::Lane {
-                reason: error.to_string(),
-            })?;
-        let recovery = lane
-            .recover_from(LaneFloor::for_lane(CONSENSUS_LANE))
-            .map_err(|error| StoreOpenError::Lane {
-                reason: error.to_string(),
-            })?;
-        let tablet = group.tablet();
-        let mut inner = StoreInner {
-            namespace,
-            group: tablet,
-            vote: None,
-            entries: BTreeMap::new(),
-            last_purged: None,
-            committed: None,
-            snapshot_base: None,
-            truncations: 0,
+        // Zero linger: a lone group seals immediately (no batching delay
+        // without concurrency); the shared writer still owns the single
+        // physical thread, so no per-group thread exists either way.
+        let config = crate::shared::SharedDurabilityConfig {
+            linger: std::time::Duration::ZERO,
+            ..crate::shared::SharedDurabilityConfig::default()
         };
-        for recovered in &recovery.records {
-            let kivi_durability::WalEntry::Consensus(record) = &recovered.entry else {
-                continue;
-            };
-            if record.group() != tablet {
-                continue;
-            }
-            if record.namespace() != namespace {
-                return Err(StoreOpenError::NamespaceMismatch {
-                    group: tablet.as_u64(),
-                    expected: namespace.as_u64(),
-                    found: record.namespace().as_u64(),
-                });
-            }
-            inner.fold(record);
-        }
-        Ok(Self {
-            shared: Arc::new(futures::lock::Mutex::new(inner)),
-            lane: LaneWriter::spawn(lane),
-            gate: None,
-        })
+        let (durability, recovered) = crate::shared::SharedRaftDurability::open(
+            data_dir,
+            identity,
+            segment_target_bytes,
+            config,
+        )
+        .map_err(|error| match error {
+            crate::shared::SharedOpenError::Lane { reason } => StoreOpenError::Lane { reason },
+            crate::shared::SharedOpenError::NamespaceMismatch { .. } => StoreOpenError::Lane {
+                reason: "shared lane recovery failed".to_owned(),
+            },
+        })?;
+        let view = crate::shared::GroupRaftStore::from_recovered(
+            namespace,
+            group,
+            &durability,
+            &recovered,
+        )
+        .map_err(|error| match error {
+            crate::shared::SharedOpenError::NamespaceMismatch {
+                group,
+                expected,
+                found,
+            } => StoreOpenError::NamespaceMismatch {
+                group,
+                expected,
+                found,
+            },
+            crate::shared::SharedOpenError::Lane { reason } => StoreOpenError::Lane { reason },
+        })?;
+        Ok(Self { view })
     }
 
     /// Installs the sidecar durability gate (node open wires this after
     /// the peer mesh and sidecar store exist; the log open itself stays
     /// synchronous and runtime-free).
     pub fn set_gate(&mut self, gate: crate::gate::SidecarGate) {
-        self.gate = Some(gate);
+        self.view.set_gate(gate);
     }
 
     /// Returns the installed gate, if any.
     #[must_use]
     pub fn gate(&self) -> Option<&crate::gate::SidecarGate> {
-        self.gate.as_ref()
+        self.view.gate()
     }
 
     /// Returns the newest committed-membership voter set visible in the
@@ -438,13 +250,7 @@ impl DurableRaftStore {
     /// falls back to the state machine's snapshot membership, which
     /// grounds every purge.
     pub async fn membership_voters(&self) -> std::collections::BTreeSet<u64> {
-        let inner = self.shared.lock().await;
-        for (_, stored) in inner.entries.iter().rev() {
-            if let StoredPayload::Membership(membership) = &stored.payload {
-                return membership.voters.iter().copied().collect();
-            }
-        }
-        std::collections::BTreeSet::new()
+        self.view.membership_voters().await
     }
 
     /// Data directory path backing this store (operator introspection).
@@ -457,190 +263,23 @@ impl DurableRaftStore {
     }
 }
 
-impl StoreInner {
-    /// Folds one recovered consensus record into the logical group state
-    /// (recovery-time rebuild; mirrors the live mutation paths below).
-    fn fold(&mut self, record: &RaftRecord) {
-        match record {
-            RaftRecord::Vote(vote) => {
-                self.vote = Some(StoredVote {
-                    term: vote.term,
-                    candidate: vote.candidate.as_u64(),
-                    committed: vote.committed,
-                });
-            }
-            RaftRecord::Entry(entry) => {
-                self.entries.insert(
-                    entry.index,
-                    StoredEntry {
-                        term: entry.term,
-                        leader: entry.leader.as_u64(),
-                        payload: match &entry.payload {
-                            RaftEntryPayload::Blank => StoredPayload::Blank,
-                            RaftEntryPayload::Normal(command) => {
-                                StoredPayload::Normal(command.clone())
-                            }
-                            RaftEntryPayload::Membership(membership) => {
-                                StoredPayload::Membership(StoredMembershipData {
-                                    voters: membership.voters.clone(),
-                                    nodes: membership.nodes.clone(),
-                                })
-                            }
-                        },
-                    },
-                );
-            }
-            RaftRecord::Truncate(marker) => {
-                self.entries.retain(|index, _| *index < marker.from_index);
-                self.truncations += 1;
-            }
-            RaftRecord::Purge(marker) => {
-                self.entries
-                    .retain(|index, _| *index > marker.through_index);
-                let purged = StoredLogId {
-                    term: marker.term,
-                    leader: marker.leader.as_u64(),
-                    index: marker.through_index,
-                };
-                if self
-                    .last_purged
-                    .is_none_or(|prev| prev.index <= purged.index)
-                {
-                    self.last_purged = Some(purged);
-                }
-            }
-            RaftRecord::Committed(pointer) => {
-                self.committed = Some(StoredLogId {
-                    term: pointer.term,
-                    leader: pointer.leader.as_u64(),
-                    index: pointer.index,
-                });
-            }
-            RaftRecord::SnapshotInstalled(snapshot) => {
-                self.snapshot_base = Some(StoredLogId {
-                    term: snapshot.term,
-                    leader: snapshot.leader.as_u64(),
-                    index: snapshot.index,
-                });
-            }
-        }
+impl ConsensusLogStore for DurableRaftStore {
+    fn set_gate(&mut self, gate: crate::gate::SidecarGate) {
+        DurableRaftStore::set_gate(self, gate);
     }
 
-    fn last_log_id(&self) -> Option<StoredLogId> {
-        self.entries
-            .last_key_value()
-            .map(|(index, entry)| StoredLogId {
-                term: entry.term,
-                leader: entry.leader,
-                index: *index,
-            })
-            .or(self.last_purged)
+    fn gate(&self) -> Option<&crate::gate::SidecarGate> {
+        DurableRaftStore::gate(self)
+    }
+
+    async fn membership_voters(&self) -> BTreeSet<u64> {
+        DurableRaftStore::membership_voters(self).await
     }
 }
 
-/// Converts an `OpenRaft` entry into its Kivi-owned record form. Command
-/// bytes are the canonical [`ReplicatedMutation`] encoding (never JSON,
-/// never `OpenRaft` memory layout). The 0.10 `leader_id_adv` leader carries
-/// its node id directly (`node_id`, never `Option`): every persisted entry
-/// names its leader by construction.
-fn entry_to_record(
-    namespace: NamespaceId,
-    group: TabletId,
-    entry: &EntryOf<KiviTypeConfig>,
-) -> RaftRecord {
-    use kivi_durability::{RaftEntry, RaftMembership};
-    use openraft::EntryPayload;
-    let payload = match &entry.payload {
-        EntryPayload::Blank => kivi_durability::RaftEntryPayload::Blank,
-        EntryPayload::Normal(command) => {
-            kivi_durability::RaftEntryPayload::Normal(command.encode_to_vec())
-        }
-        EntryPayload::Membership(membership) => {
-            let voters: Vec<u64> = membership.voter_ids().collect();
-            let nodes: Vec<(u64, String)> = membership
-                .nodes()
-                .map(|(id, node)| (*id, node.addr.clone()))
-                .collect();
-            kivi_durability::RaftEntryPayload::Membership(RaftMembership { voters, nodes })
-        }
-    };
-    RaftRecord::Entry(RaftEntry {
-        namespace,
-        group,
-        index: entry.log_id.index,
-        term: entry.log_id.leader_id.term,
-        leader: NodeId::from_u64(entry.log_id.leader_id.node_id),
-        payload,
-    })
-}
-
-/// Converts a stored entry back into `OpenRaft` form for readers. Command
-/// bytes decode here (they were validated at write); undecodable bytes are
-/// an `io::Error`, never a silent skip. (In practice this path only serves
-/// entries this binary wrote: the WAL framing CRC already excludes
-/// corruption.)
-fn stored_to_entry(index: u64, stored: &StoredEntry) -> Result<EntryOf<KiviTypeConfig>, io::Error> {
-    use openraft::EntryPayload;
-    use openraft::impls::leader_id_adv::LeaderId;
-    let log_id = openraft::LogId::new(LeaderId::new(stored.term, stored.leader), index);
-    let payload = match &stored.payload {
-        StoredPayload::Blank => EntryPayload::Blank,
-        StoredPayload::Normal(command) => {
-            let mutation = ReplicatedMutation::decode_exact(command).map_err(|error| {
-                io::Error::other(format!("stored command entry fails to decode: {error}"))
-            })?;
-            EntryPayload::Normal(mutation)
-        }
-        StoredPayload::Membership(membership) => {
-            let voters: BTreeSet<u64> = membership.voters.iter().copied().collect();
-            let nodes: BTreeMap<u64, openraft::BasicNode> = membership
-                .nodes
-                .iter()
-                .map(|(id, addr)| (*id, openraft::BasicNode::new(addr.clone())))
-                .collect();
-            let membership = openraft::Membership::new(vec![voters], nodes).map_err(|error| {
-                io::Error::other(format!("stored membership entry invalid: {error}"))
-            })?;
-            EntryPayload::Membership(membership)
-        }
-    };
-    Ok(openraft::Entry { log_id, payload })
-}
-
-/// Converts an `OpenRaft` vote into its Kivi-owned record form. Votes on
-/// this path always name their candidate (self-votes and granted votes
-/// alike); the `leader_id_adv` leader id carries it directly.
-fn vote_to_record(
-    namespace: NamespaceId,
-    group: TabletId,
-    vote: &VoteOf<KiviTypeConfig>,
-) -> RaftRecord {
-    RaftRecord::Vote(kivi_durability::RaftVote {
-        namespace,
-        group,
-        term: vote.leader_id.term,
-        candidate: NodeId::from_u64(vote.leader_id.node_id),
-        committed: vote.committed,
-    })
-}
-
-/// Extracts a log id's leader (log ids on the truncate/purge/committed
-/// paths always name one; only the default vote does not).
-fn entry_leader_of(log_id: &LogIdOf<KiviTypeConfig>) -> u64 {
-    log_id.leader_id.node_id
-}
-
-fn read_entries(
-    inner: &StoreInner,
-    range: (std::ops::Bound<u64>, std::ops::Bound<u64>),
-) -> Result<Vec<EntryOf<KiviTypeConfig>>, io::Error> {
-    inner
-        .entries
-        .range((range.0, range.1))
-        .map(|(index, stored)| stored_to_entry(*index, stored))
-        .collect()
-}
-
+/// Logical group behavior lives in [`GroupRaftStore`](crate::shared::GroupRaftStore);
+/// the façade below delegates every storage-trait call to its view, so one
+/// implementation serves single-group nodes and multi-tablet workers alike.
 impl RaftLogReader<KiviTypeConfig> for DurableLogReader {
     async fn try_get_log_entries<RB>(
         &mut self,
@@ -649,15 +288,11 @@ impl RaftLogReader<KiviTypeConfig> for DurableLogReader {
     where
         RB: std::ops::RangeBounds<u64> + Clone + std::fmt::Debug + openraft::OptionalSend,
     {
-        let inner = self.shared.lock().await;
-        read_entries(
-            &inner,
-            (range.start_bound().cloned(), range.end_bound().cloned()),
-        )
+        self.view.try_get_log_entries(range).await
     }
 
     async fn read_vote(&mut self) -> Result<Option<VoteOf<KiviTypeConfig>>, io::Error> {
-        Ok(self.shared.lock().await.vote.map(StoredVote::openraft))
+        self.view.read_vote().await
     }
 }
 
@@ -669,15 +304,11 @@ impl RaftLogReader<KiviTypeConfig> for DurableRaftStore {
     where
         RB: std::ops::RangeBounds<u64> + Clone + std::fmt::Debug + openraft::OptionalSend,
     {
-        DurableLogReader {
-            shared: Arc::clone(&self.shared),
-        }
-        .try_get_log_entries(range)
-        .await
+        self.get_log_reader().await.try_get_log_entries(range).await
     }
 
     async fn read_vote(&mut self) -> Result<Option<VoteOf<KiviTypeConfig>>, io::Error> {
-        Ok(self.shared.lock().await.vote.map(StoredVote::openraft))
+        self.get_log_reader().await.read_vote().await
     }
 }
 
@@ -685,39 +316,18 @@ impl RaftLogStorage<KiviTypeConfig> for DurableRaftStore {
     type LogReader = DurableLogReader;
 
     async fn get_log_state(&mut self) -> Result<LogState<KiviTypeConfig>, io::Error> {
-        let inner = self.shared.lock().await;
-        Ok(LogState {
-            last_purged_log_id: inner.last_purged.map(StoredLogId::openraft),
-            last_log_id: inner.last_log_id().map(StoredLogId::openraft),
-        })
+        self.view.get_log_state().await
     }
 
     #[allow(clippy::unused_async_trait_impl)]
     async fn get_log_reader(&mut self) -> Self::LogReader {
         DurableLogReader {
-            shared: Arc::clone(&self.shared),
+            view: self.view.get_log_reader().await,
         }
     }
 
     async fn save_vote(&mut self, vote: &VoteOf<KiviTypeConfig>) -> Result<(), io::Error> {
-        // Fencing first: the barrier proves durability before the cache
-        // installs, so a crash between the two replays the record and
-        // converges identically. Submit order serializes through the
-        // cache lock; the lock is NOT held across the barrier ack (the
-        // reactor stays responsive while `fsync` runs on the lane thread).
-        let stored = StoredVote {
-            term: vote.leader_id.term,
-            candidate: vote.leader_id.node_id,
-            committed: vote.committed,
-        };
-        let ack = {
-            let inner = self.shared.lock().await;
-            let record = vote_to_record(inner.namespace, inner.group, vote);
-            self.lane.submit(vec![record]).await
-        };
-        await_barrier(ack).await?;
-        self.shared.lock().await.vote = Some(stored);
-        Ok(())
+        self.view.save_vote(vote).await
     }
 
     async fn append<I>(
@@ -729,198 +339,29 @@ impl RaftLogStorage<KiviTypeConfig> for DurableRaftStore {
         I: IntoIterator<Item = EntryOf<KiviTypeConfig>> + openraft::OptionalSend,
         I::IntoIter: openraft::OptionalSend,
     {
-        // Sidecar durability gate (core invariant): before staging or
-        // persisting, ensure every ReplaceChunkedRoot's manifest + chunks
-        // are locally durable and verified. No lock is held across the
-        // fetch (bulk moves on the bulk lane); a gate failure returns
-        // `io::Error` without staging, so the append never reports
-        // durable persistence for incomplete sidecars and quorum can never
-        // commit unreconstructible state.
-        //
-        // Collect first (Raft batches are small; large values ride as
-        // sidecars, never inline), gate, then stage.
-        let entries: Vec<EntryOf<KiviTypeConfig>> = entries.into_iter().collect();
-        if let Some(gate) = self.gate.clone() {
-            let mut commands = Vec::new();
-            let mut hint = None;
-            for entry in &entries {
-                if hint.is_none() {
-                    hint = Some(NodeId::from_u64(entry.log_id.leader_id.node_id));
-                }
-                if let openraft::EntryPayload::Normal(command) = &entry.payload {
-                    commands.push(command.encode_to_vec());
-                }
-            }
-            if !commands.is_empty() {
-                gate.ensure_entries(&commands, hint)
-                    .await
-                    .map_err(|error| crate::gate::sidecar_io_error(&error))?;
-            }
-        }
-        // Stage records and cache together under one lock (readable on
-        // return, same turn) and submit the barrier in FIFO order while
-        // still holding it, so concurrent writers cannot invert lane
-        // order. The lock is released before awaiting the barrier ack, so
-        // the reactor never stalls on `fsync`. A barrier failure removes
-        // the staged suffix so the cache never advertises undurable
-        // history.
-        let (staged, ack) = {
-            let mut inner = self.shared.lock().await;
-            let mut records = Vec::new();
-            let mut staged = Vec::new();
-            for entry in entries {
-                let index = entry.log_id.index;
-                let record = entry_to_record(inner.namespace, inner.group, &entry);
-                let stored = StoredEntry {
-                    term: entry.log_id.leader_id.term,
-                    leader: entry.log_id.leader_id.node_id,
-                    payload: match &entry.payload {
-                        openraft::EntryPayload::Blank => StoredPayload::Blank,
-                        openraft::EntryPayload::Normal(command) => {
-                            StoredPayload::Normal(command.encode_to_vec())
-                        }
-                        openraft::EntryPayload::Membership(membership) => {
-                            StoredPayload::Membership(StoredMembershipData {
-                                voters: membership.voter_ids().collect(),
-                                nodes: membership
-                                    .nodes()
-                                    .map(|(id, node)| (*id, node.addr.clone()))
-                                    .collect(),
-                            })
-                        }
-                    },
-                };
-                staged.push(index);
-                records.push(record);
-                inner.entries.insert(index, stored);
-            }
-            // FIFO submit while holding the cache lock: submit order
-            // equals install order, so the lane can never observe a hole.
-            // The send only waits for channel capacity (the lane thread
-            // drains independently and never needs this lock), never for
-            // the `fsync` itself.
-            let ack = self.lane.submit(records).await;
-            (staged, ack)
-        };
-        match await_barrier(ack).await {
-            Ok(()) => {
-                callback.io_completed(Ok(()));
-                Ok(())
-            }
-            Err(error) => {
-                // Roll back precisely the staged indexes (not "everything
-                // after"), so a concurrent writer's newer entries survive.
-                // (In practice OpenRaft serializes writers, so this
-                // removes exactly our stage.)
-                let mut inner = self.shared.lock().await;
-                for index in &staged {
-                    inner.entries.remove(index);
-                }
-                drop(inner);
-                callback.io_completed(Err(io::Error::other(error.to_string())));
-                Err(error)
-            }
-        }
+        self.view.append(entries, callback).await
     }
 
     async fn truncate_after(
         &mut self,
         last_kept: Option<LogIdOf<KiviTypeConfig>>,
     ) -> Result<(), io::Error> {
-        // 0.10's exclusive keep-through marker maps onto the unchanged
-        // Kivi-owned `RaftTruncate { from_index }` (inclusive removal):
-        // `from_index = last_kept + 1`, `None` (drop everything) maps to
-        // `from_index = 0`, which is exact because index 0 is a legal
-        // entry — no off-by-one, no format change.
-        let from_index = last_kept
-            .as_ref()
-            .map_or(0, |id| id.index.saturating_add(1));
-        let ack = {
-            let inner = self.shared.lock().await;
-            let record = RaftRecord::Truncate(kivi_durability::RaftTruncate {
-                namespace: inner.namespace,
-                group: inner.group,
-                from_index,
-            });
-            // Submit serialized through the cache lock; the marker is
-            // durable before the cache drops the suffix, so a crash
-            // between the two replays the marker and converges
-            // identically (the logical-truncation contract).
-            self.lane.submit(vec![record]).await
-        };
-        await_barrier(ack).await?;
-        let mut inner = self.shared.lock().await;
-        inner.entries.retain(|index, _| *index < from_index);
-        inner.truncations += 1;
-        Ok(())
+        self.view.truncate_after(last_kept).await
     }
 
     async fn purge(&mut self, log_id: LogIdOf<KiviTypeConfig>) -> Result<(), io::Error> {
-        let purged = StoredLogId {
-            term: log_id.leader_id.term,
-            leader: entry_leader_of(&log_id),
-            index: log_id.index,
-        };
-        let ack = {
-            let inner = self.shared.lock().await;
-            let record = RaftRecord::Purge(kivi_durability::RaftPurge {
-                namespace: inner.namespace,
-                group: inner.group,
-                term: log_id.leader_id.term,
-                leader: NodeId::from_u64(entry_leader_of(&log_id)),
-                through_index: log_id.index,
-            });
-            self.lane.submit(vec![record]).await
-        };
-        await_barrier(ack).await?;
-        let mut inner = self.shared.lock().await;
-        inner.entries.retain(|index, _| *index > log_id.index);
-        if inner
-            .last_purged
-            .is_none_or(|prev| prev.index <= purged.index)
-        {
-            inner.last_purged = Some(purged);
-        }
-        Ok(())
+        self.view.purge(log_id).await
     }
 
     async fn save_committed(
         &mut self,
         committed: Option<LogIdOf<KiviTypeConfig>>,
     ) -> Result<(), io::Error> {
-        let Some(log_id) = committed else {
-            // Clearing the pointer has no durable meaning in this store:
-            // absence already means "re-derive at startup".
-            return Ok(());
-        };
-        let stored = StoredLogId {
-            term: log_id.leader_id.term,
-            leader: entry_leader_of(&log_id),
-            index: log_id.index,
-        };
-        let ack = {
-            let inner = self.shared.lock().await;
-            let record = RaftRecord::Committed(kivi_durability::RaftCommitted {
-                namespace: inner.namespace,
-                group: inner.group,
-                term: log_id.leader_id.term,
-                leader: NodeId::from_u64(entry_leader_of(&log_id)),
-                index: log_id.index,
-            });
-            self.lane.submit(vec![record]).await
-        };
-        await_barrier(ack).await?;
-        self.shared.lock().await.committed = Some(stored);
-        Ok(())
+        self.view.save_committed(committed).await
     }
 
     async fn read_committed(&mut self) -> Result<Option<LogIdOf<KiviTypeConfig>>, io::Error> {
-        Ok(self
-            .shared
-            .lock()
-            .await
-            .committed
-            .map(StoredLogId::openraft))
+        self.view.read_committed().await
     }
 }
 
@@ -1150,9 +591,8 @@ mod tests {
         seed.persist_records(records.clone())
             .await
             .expect("seed batch persists");
-        let mut inner = seed.shared.lock().await;
         for record in &records {
-            inner.fold(record);
+            seed.fold_record(record).await;
         }
     }
 
@@ -1226,57 +666,51 @@ mod tests {
 }
 
 /// Test/operator handle to the store's logical state without going through
-/// the `OpenRaft` traits.
+/// the `OpenRaft` traits. Delegates to the view's test hooks: one
+/// implementation serves both store shapes.
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::DurableRaftStore;
 
     impl DurableRaftStore {
-        /// Persists raw records through the lane barrier without folding
+        /// Persists raw records through the shared barrier without folding
         /// (record-level seeding; the caller folds explicitly).
         pub(crate) async fn persist_records(
             &self,
             records: Vec<kivi_durability::RaftRecord>,
         ) -> Result<(), kivi_durability::DurabilityError> {
-            self.lane.barrier(records).await
+            self.view.persist_raw(records).await
+        }
+
+        /// Folds one raw record into the logical cache without persisting.
+        pub(crate) async fn fold_record(&self, record: &kivi_durability::RaftRecord) {
+            self.view.fold_raw(record).await;
         }
 
         /// Returns the cached entry indexes in order.
         pub(crate) async fn cached_indexes(&self) -> Vec<u64> {
-            self.shared.lock().await.entries.keys().copied().collect()
+            self.view.cached_indexes().await
         }
 
         /// Returns the cached vote.
         pub(crate) async fn cached_vote(&self) -> Option<(u64, u64, bool)> {
-            self.shared
-                .lock()
-                .await
-                .vote
-                .map(|vote| (vote.term, vote.candidate, vote.committed))
+            self.view.cached_vote().await
         }
 
         /// Returns the cached commit pointer.
         pub(crate) async fn cached_committed(&self) -> Option<(u64, u64, u64)> {
-            self.shared
-                .lock()
-                .await
-                .committed
-                .map(|pointer| (pointer.term, pointer.leader, pointer.index))
+            self.view.cached_committed().await
         }
 
         /// Returns the cached snapshot base.
         pub(crate) async fn cached_snapshot_base(&self) -> Option<(u64, u64, u64)> {
-            self.shared
-                .lock()
-                .await
-                .snapshot_base
-                .map(|base| (base.term, base.leader, base.index))
+            self.view.cached_snapshot_base().await
         }
 
         /// Returns observed logical truncations (live calls plus
         /// recovery-fold replays of durable markers).
         pub(crate) async fn cached_truncate_count(&self) -> u64 {
-            self.shared.lock().await.truncations
+            self.view.cached_truncate_count().await
         }
     }
 }
