@@ -122,6 +122,14 @@ pub struct ClusterServeConfig {
     pub max_frame: usize,
     /// Static peer TLS certificates per node id (`node → DER path`).
     pub peer_certs: Vec<(NodeId, std::path::PathBuf)>,
+    /// Admin endpoints per node id (reconciler forwarding targets).
+    pub admins: Vec<(NodeId, SocketAddr)>,
+    /// Control-plane voter ids (initial product: first three nodes;
+    /// added data nodes join control as learners).
+    pub control_voters: Vec<NodeId>,
+    /// Control-plane seeds proving the cluster already exists (joiners
+    /// only; empty on founders and ignored on restart).
+    pub control_seeds: Vec<SocketAddr>,
 }
 
 /// Shared cluster serving state: the multi-tablet node, its static
@@ -209,7 +217,23 @@ pub fn run_from_args(args: &super::Args) -> anyhow::Result<()> {
     if args.cluster_natives.is_empty() {
         anyhow::bail!("cluster mode requires --cluster-natives node=host:port,...");
     }
+    if args.cluster_admins.is_empty() {
+        anyhow::bail!("cluster mode requires --cluster-admins node=host:port,...");
+    }
     let natives = args.cluster_natives.clone();
+    // Control voters default to the three lowest peer ids (initial
+    // product: the first three nodes stay the control voters).
+    let mut peer_ids: Vec<u64> = args.cluster_peers.iter().map(|(id, _)| *id).collect();
+    peer_ids.sort_unstable();
+    peer_ids.dedup();
+    let control_voters: Vec<NodeId> = if args.control_voters.is_empty() {
+        peer_ids.into_iter().take(3).map(NodeId::from_u64).collect()
+    } else {
+        let mut voters = args.control_voters.clone();
+        voters.sort_unstable();
+        voters.dedup();
+        voters.into_iter().map(NodeId::from_u64).collect()
+    };
     let config = ClusterServeConfig {
         cluster: ClusterId::from_u128(cluster),
         node: NodeId::from_u64(node),
@@ -237,6 +261,13 @@ pub fn run_from_args(args: &super::Args) -> anyhow::Result<()> {
             .iter()
             .map(|(id, path)| (NodeId::from_u64(*id), path.clone()))
             .collect(),
+        admins: args
+            .cluster_admins
+            .iter()
+            .map(|(id, addr)| (NodeId::from_u64(*id), *addr))
+            .collect(),
+        control_voters,
+        control_seeds: args.control_seeds.clone(),
     };
     // The server's Tokio runtime drives the consensus front (whose
     // futures stay `Send` across runtimes) and the Tokio-native edges
@@ -353,11 +384,42 @@ async fn open_node(
     // optimization. Production always preflights.
     let preflight_enabled =
         !std::env::var("KIVI_DISABLE_PREFLIGHT").is_ok_and(|value| value == "1");
+    // System control participation: every node joins the control group
+    // (voter when listed, learner otherwise). Voter dial info rides the
+    // control config; seeds are explicit operator intent
+    // (`--control-seeds`, joiners only): founding voters boot without
+    // them and initialize exactly once, joiners wait for `add_learner`,
+    // restarts ignore them.
+    let peer_by_node: std::collections::HashMap<NodeId, SocketAddr> =
+        config.peers.iter().copied().collect();
+    let mut control_voters: std::collections::BTreeSet<u64> = config
+        .control_voters
+        .iter()
+        .map(|node| node.as_u64())
+        .collect();
+    if control_voters.is_empty() {
+        control_voters = peer_by_node.keys().map(|node| node.as_u64()).collect();
+    }
+    let control_peer_addrs: std::collections::BTreeMap<u64, String> = control_voters
+        .iter()
+        .filter_map(|voter| {
+            peer_by_node
+                .get(&NodeId::from_u64(*voter))
+                .map(|addr| (*voter, addr.to_string()))
+        })
+        .collect();
+    let control_seeds: Vec<SocketAddr> = config.control_seeds.clone();
+    // Joiners (fresh nodes outside the voter set) start data-empty: the
+    // control plane assigns their replicas through migration, so no
+    // static tablet list is required at join time (§9).
+    let joiner = !control_voters.contains(&config.node.as_u64())
+        && !config.data_dir.join("consensus-sm").exists();
+    let data_tablets: Vec<TabletId> = if joiner { Vec::new() } else { tablets };
     let node = Arc::new(
         ConsensusNode::open(MultiNodeConfig {
             data_dir: config.data_dir.clone(),
             namespace: config.namespace,
-            tablets,
+            tablets: data_tablets,
             local: config.node,
             topology,
             segment_target_bytes: config.segment_target_bytes,
@@ -367,6 +429,11 @@ async fn open_node(
             preflight_enabled,
             worker_count: config.worker_count,
             durability: kivi_consensus::SharedDurabilityConfig::default(),
+            control: Some(kivi_consensus::ControlGroupConfig {
+                voters: control_voters,
+                peer_addrs: control_peer_addrs,
+                seeds: control_seeds,
+            }),
         })
         .await
         .context("replicated node failed to open")?,
@@ -408,6 +475,10 @@ pub async fn run(config: ClusterServeConfig) -> anyhow::Result<()> {
         native: native_addr,
         namespace: config.namespace,
     };
+    // Control-plane genesis + migration reconciler (background Tokio
+    // tasks; both idle on non-leaders and exit with the server).
+    let seed = genesis_seed(&config, &shared.directory);
+    let (genesis, reconciler) = spawn_control_loops(&node, seed);
     // Native serving (Tokio tasks per connection).
     let native = {
         let shared = shared.clone();
@@ -418,37 +489,10 @@ pub async fn run(config: ClusterServeConfig) -> anyhow::Result<()> {
         let shared = shared.clone();
         tokio::spawn(async move { serve_admin(admin_listener, shared).await })
     };
-    // Optional RESP edge.
+    // Optional RESP edge (edge adapter; never `MOVED`/`ASK`).
     #[cfg(feature = "redis-compat")]
-    let (resp_admin, resp_shutdown) = match config.redis_bind {
-        None => (None, None),
-        Some(addr) => {
-            let listener = tokio::net::TcpListener::bind(addr)
-                .await
-                .with_context(|| format!("redis bind failed on {addr}"))?;
-            let endpoint = listener.local_addr().context("redis listener address")?;
-            let stats = Arc::new(super::resp::RespStats::default());
-            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-            tokio::spawn(super::resp::serve_with(
-                listener,
-                ClusterExecutor::new(
-                    Arc::clone(&node),
-                    shared.directory.clone(),
-                    config.namespace,
-                ),
-                Arc::clone(&stats),
-                shutdown_rx,
-            ));
-            (
-                Some(super::resp::RespAdmin {
-                    endpoint,
-                    namespace: config.namespace.as_u64(),
-                    stats,
-                }),
-                Some(shutdown_tx),
-            )
-        }
-    };
+    let (resp_admin, resp_shutdown) =
+        start_resp_edge(&node, &shared, config.redis_bind, config.namespace).await?;
     #[cfg(feature = "redis-compat")]
     let redis_part = resp_admin
         .as_ref()
@@ -479,9 +523,108 @@ pub async fn run(config: ClusterServeConfig) -> anyhow::Result<()> {
     drop(resp_admin);
     native.abort();
     admin.abort();
+    genesis.abort();
+    reconciler.abort();
     node.shutdown().await;
     tracing::info!("kivi-server (cluster) stopped");
     Ok(())
+}
+
+/// Starts the optional RESP edge against the replicated node. Absent
+/// bind means native-only even when compiled in.
+#[cfg(feature = "redis-compat")]
+async fn start_resp_edge(
+    node: &Arc<ConsensusNode>,
+    shared: &ClusterShared,
+    bind: Option<SocketAddr>,
+    namespace: NamespaceId,
+) -> anyhow::Result<(
+    Option<super::resp::RespAdmin>,
+    Option<tokio::sync::watch::Sender<bool>>,
+)> {
+    let Some(addr) = bind else {
+        return Ok((None, None));
+    };
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("redis bind failed on {addr}"))?;
+    let endpoint = listener.local_addr().context("redis listener address")?;
+    let stats = Arc::new(super::resp::RespStats::default());
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(super::resp::serve_with(
+        listener,
+        ClusterExecutor::new(Arc::clone(node), shared.directory.clone(), namespace),
+        Arc::clone(&stats),
+        shutdown_rx,
+    ));
+    Ok((
+        Some(super::resp::RespAdmin {
+            endpoint,
+            namespace: namespace.as_u64(),
+            stats,
+        }),
+        Some(shutdown_tx),
+    ))
+}
+
+/// Spawns control-plane genesis plus the migration reconciler (both
+/// idle on non-leaders; both abort with the server).
+fn spawn_control_loops(
+    node: &Arc<ConsensusNode>,
+    seed: super::control::GenesisSeed,
+) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
+    let genesis = {
+        let node = Arc::clone(node);
+        tokio::spawn(async move { super::control::genesis_loop(node, seed).await })
+    };
+    let reconciler = {
+        let node = Arc::clone(node);
+        tokio::spawn(async move {
+            super::control::reconcile_loop(node, super::control::ReconcilePolicy::default()).await;
+        })
+    };
+    (genesis, reconciler)
+}
+
+/// Builds the genesis seed from static startup flags: every configured
+/// peer becomes a registry record (fingerprints from pin files when
+/// present, unenforced zeros in lab-insecure mode), and every writable
+/// directory tablet starts fully replicated across all seed nodes.
+/// After bootstrap the replicated control plane owns placement;
+/// restarts ignore these flags.
+fn genesis_seed(
+    config: &ClusterServeConfig,
+    directory: &DirectorySnapshot,
+) -> super::control::GenesisSeed {
+    use std::collections::HashMap;
+    let ders: HashMap<NodeId, Vec<u8>> = config
+        .peer_certs
+        .iter()
+        .filter_map(|(node, path)| std::fs::read(path).ok().map(|der| (*node, der)))
+        .collect();
+    let natives: HashMap<NodeId, SocketAddr> = config.natives.iter().copied().collect();
+    let admins: HashMap<NodeId, SocketAddr> = config.admins.iter().copied().collect();
+    let nodes = config
+        .peers
+        .iter()
+        .map(|(node, peer)| super::control::SeedNode {
+            node: *node,
+            peer: *peer,
+            native: natives.get(node).copied().unwrap_or(*peer),
+            admin: admins.get(node).copied().unwrap_or(config.admin_bind),
+            fingerprint: ders.get(node).map_or([0u8; 32], |der| {
+                kivi_codec::integrity::blake3_256(der.as_slice())
+            }),
+            domain: String::new(),
+        })
+        .collect();
+    let tablets: Vec<TabletId> = directory
+        .tablets()
+        .iter()
+        .filter(|tablet| tablet.state().is_writable())
+        .map(kivi_tablet::TabletDescriptor::id)
+        .collect();
+    super::control::GenesisSeed { nodes, tablets }
 }
 
 /// Serves native connections until aborted: handshake, then one request
@@ -973,7 +1116,7 @@ async fn handle_stream_commit(
                 let mut pins = shared.node.sidecar().pins().lock().await;
                 pins.unpin_root(&manifest, &chunk_ids);
             }
-            shape_propose_error(shared, tablet, &error)
+            shape_propose_error(shared, tablet, &error).await
         }
     };
     writer
@@ -1036,7 +1179,7 @@ async fn handle_get_stream(
     {
         Ok(outcome) => outcome,
         Err(error) => {
-            let response = shape_read_error(shared, tablet, &error);
+            let response = shape_read_error(shared, tablet, &error).await;
             writer
                 .write_all(&encode_frame(
                     FrameKind::Response,
@@ -1177,7 +1320,7 @@ async fn handle_request(
                         resolve_durable(shared, &operation, &outcome, opcode).await
                     }
                 },
-                Err(error) => shape_propose_error(shared, tablet, &error),
+                Err(error) => shape_propose_error(shared, tablet, &error).await,
             },
             opcode,
         ))
@@ -1193,7 +1336,7 @@ async fn handle_request(
                 .await
             {
                 Ok(outcome) => resolve_result(shared, opcode, &operation, &outcome).await,
-                Err(error) => shape_read_error(shared, tablet, &error),
+                Err(error) => shape_read_error(shared, tablet, &error).await,
             },
             opcode,
         ))
@@ -1416,10 +1559,46 @@ fn replica_node(replica: kivi_consensus::ReplicaId) -> NodeId {
     replica.node()
 }
 
+/// Redirects a request this node cannot serve to a desired replica from
+/// replicated control state (migration-aware routing, §32). Returns
+/// `None` when no desired replica is known, letting the caller fall
+/// back to a retryable answer.
+async fn desired_redirect(shared: &ClusterShared, tablet: TabletId) -> Option<Response> {
+    let state = shared.node.control_state().await?;
+    let desired = state.desired(tablet)?;
+    // Prefer the first desired voter with a known native endpoint
+    // (registry first, static flags second).
+    desired.replicas.iter().find_map(|voter| {
+        let endpoint = state
+            .node(*voter)
+            .map(|record| record.native)
+            .or_else(|| shared.natives.get(voter).copied())?;
+        let range = shared
+            .directory
+            .get(tablet)
+            .map(|descriptor| descriptor.range().clone())?;
+        Some(Response {
+            status: Status::StaleRoute,
+            body: ResponseBody::Redirect(RedirectInfo {
+                dir_version: shared.directory.version(),
+                tablet,
+                epoch: TabletEpoch::INITIAL,
+                worker: WorkerId::from_u64(CLUSTER_WORKER),
+                endpoint: endpoint.to_string(),
+                range,
+            }),
+        })
+    })
+}
+
 /// Shapes proposal failures: routing becomes redirects/retriable
 /// statuses (never `OpenRaft` concepts on the wire), validation becomes
 /// stable semantic statuses.
-fn shape_propose_error(shared: &ClusterShared, tablet: TabletId, error: &ProposeError) -> Response {
+async fn shape_propose_error(
+    shared: &ClusterShared,
+    tablet: TabletId,
+    error: &ProposeError,
+) -> Response {
     match error {
         ProposeError::Consensus(ConsensusError::NotLeader { hint }) => {
             redirect_or_overloaded(shared, tablet, hint.leader.map(replica_node))
@@ -1428,6 +1607,16 @@ fn shape_propose_error(shared: &ClusterShared, tablet: TabletId, error: &Propose
             status: Status::Overloaded,
             body: ResponseBody::Diagnostic("leader unknown; retry".to_owned()),
         },
+        ProposeError::Consensus(ConsensusError::Unavailable { reason })
+            if reason.contains("not served by this node") =>
+        {
+            // Normal during migration: this node holds no replica.
+            // Route through desired placement instead of a generic miss.
+            desired_redirect(shared, tablet).await.unwrap_or(Response {
+                status: Status::Overloaded,
+                body: ResponseBody::Diagnostic("tablet migrating; retry".to_owned()),
+            })
+        }
         ProposeError::Consensus(ConsensusError::Unavailable { .. }) => Response {
             status: Status::Internal,
             body: ResponseBody::Diagnostic("consensus unavailable".to_owned()),
@@ -1470,7 +1659,7 @@ fn shape_propose_error(shared: &ClusterShared, tablet: TabletId, error: &Propose
 }
 
 /// Shapes read failures with the same routing contract as proposals.
-fn shape_read_error(shared: &ClusterShared, tablet: TabletId, error: &ReadError) -> Response {
+async fn shape_read_error(shared: &ClusterShared, tablet: TabletId, error: &ReadError) -> Response {
     match error {
         kivi_consensus::ReadError::Consensus(ConsensusError::NotLeader { hint }) => {
             redirect_or_overloaded(shared, tablet, hint.leader.map(replica_node))
@@ -1479,6 +1668,14 @@ fn shape_read_error(shared: &ClusterShared, tablet: TabletId, error: &ReadError)
             status: Status::Overloaded,
             body: ResponseBody::Diagnostic("leader unknown; retry".to_owned()),
         },
+        kivi_consensus::ReadError::Consensus(ConsensusError::Unavailable { reason })
+            if reason.contains("not served by this node") =>
+        {
+            desired_redirect(shared, tablet).await.unwrap_or(Response {
+                status: Status::Overloaded,
+                body: ResponseBody::Diagnostic("tablet migrating; retry".to_owned()),
+            })
+        }
         kivi_consensus::ReadError::Consensus(ConsensusError::Unavailable { .. }) => Response {
             status: Status::Internal,
             body: ResponseBody::Diagnostic("consensus unavailable".to_owned()),
@@ -1661,15 +1858,59 @@ async fn ready(State(shared): State<ClusterShared>) -> Json<serde_json::Value> {
     // Multi-tablet readiness: process alive is not enough. A node is
     // usable once its peer mesh started, every configured local replica
     // loaded, and every group healthy — partial failure is reported
-    // openly (counts), never hidden behind one boolean.
+    // openly (counts), never hidden behind one boolean. A cluster can be
+    // ready while rebalancing: migrations never gate readiness (§44).
     let total = statuses.len();
     let healthy = statuses.iter().filter(|status| status.healthy).count();
     let leaders_known = statuses
         .iter()
         .filter(|status| status.leader.is_some())
         .count();
+    // Control-plane summary for operators: registry counts by lifecycle
+    // plus migration progress. Absent when this node hosts no control
+    // replica yet.
+    let control = shared.node.control_state().await.map(|state| {
+        let mut active = 0u64;
+        let mut joining = 0u64;
+        let mut draining = 0u64;
+        let mut drained = 0u64;
+        for record in state.nodes() {
+            match record.state {
+                kivi_control::NodeState::Active => active += 1,
+                kivi_control::NodeState::Joining => joining += 1,
+                kivi_control::NodeState::Draining => draining += 1,
+                kivi_control::NodeState::Drained => drained += 1,
+                kivi_control::NodeState::Removed => {}
+            }
+        }
+        let live = state
+            .migrations()
+            .filter(|plan| !plan.phase.is_terminal())
+            .count() as u64;
+        let tablets_migrating = state
+            .placements()
+            .filter(|desired| !state.live_plans_for(desired.tablet).is_empty())
+            .count() as u64;
+        serde_json::json!({
+            "present": true,
+            "placement_version": state.placement_version().as_u64(),
+            "nodes_active": active,
+            "nodes_joining": joining,
+            "nodes_draining": draining,
+            "nodes_drained": drained,
+            "migrations_live": live,
+            "tablets_migrating": tablets_migrating,
+        })
+    });
+    // A data-empty joiner (no tablets yet, control present) is usable:
+    // readiness reflects node/control usability, never zero migrations
+    // or zero local tablets.
+    let control_present = control
+        .as_ref()
+        .and_then(|control| control.get("present").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false);
     Json(serde_json::json!({
-        "ready": total > 0 && healthy == total,
+        "ready": healthy == total && (total > 0 || control_present),
         "initialized": true,
         "transport": true,
         "membership_loaded": true,
@@ -1679,6 +1920,7 @@ async fn ready(State(shared): State<ClusterShared>) -> Json<serde_json::Value> {
         "election_pending": leaders_known != total,
         "leader_known": leaders_known == total,
         "healthy": healthy == total,
+        "control": control.unwrap_or(serde_json::json!({ "present": false })),
     }))
 }
 
@@ -1701,16 +1943,93 @@ async fn node_info(State(shared): State<ClusterShared>) -> Json<serde_json::Valu
     }))
 }
 
-/// Per-tablet diagnostics for every local group, sorted by tablet.
-async fn tablets(State(shared): State<ClusterShared>) -> Json<Vec<TabletDto>> {
-    let mut out: Vec<TabletDto> = shared
-        .node
-        .status_all()
-        .await
-        .iter()
-        .map(|status| tablet_dto(status, &shared.directory))
-        .collect();
-    out.sort_by_key(|tablet| tablet.group);
+/// Per-tablet diagnostics for every local group, sorted by tablet,
+/// enriched with desired vs actual placement (§43): desired voters from
+/// replicated control state when present, actual voters/learners from
+/// live membership, and a placement verdict per tablet.
+async fn tablets(State(shared): State<ClusterShared>) -> Json<Vec<serde_json::Value>> {
+    let control = shared.node.control_state().await;
+    let statuses = shared.node.status_all().await;
+    let mut observed = std::collections::BTreeMap::new();
+    for status in &statuses {
+        let tablet = TabletId::from_u64(status.group.tablet().as_u64());
+        if let Ok(obs) = shared.node.observe_membership(tablet).await {
+            observed.insert(tablet.as_u64(), obs);
+        }
+    }
+    let health: std::collections::HashMap<u64, super::control::PlacementHealth> = control
+        .as_ref()
+        .map(|state| super::control::placement_health(state, &observed))
+        .map(|list| {
+            list.into_iter()
+                .map(|item| (item.tablet.as_u64(), item))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for status in &statuses {
+        let id = status.group.tablet().as_u64();
+        let item = health.get(&id);
+        let mut value = serde_json::to_value(tablet_dto(status, &shared.directory))
+            .unwrap_or(serde_json::Value::Null);
+        if let serde_json::Value::Object(ref mut map) = value {
+            map.insert(
+                "voters".to_owned(),
+                item.and_then(|item| item.actual.clone()).map_or(
+                    serde_json::Value::Null,
+                    |voters| {
+                        serde_json::json!(
+                            voters.iter().map(|node| node.as_u64()).collect::<Vec<_>>()
+                        )
+                    },
+                ),
+            );
+            map.insert(
+                "learners".to_owned(),
+                item.map_or(serde_json::json!([]), |item| {
+                    serde_json::json!(
+                        item.learners
+                            .iter()
+                            .map(|node| node.as_u64())
+                            .collect::<Vec<_>>()
+                    )
+                }),
+            );
+            map.insert(
+                "desired".to_owned(),
+                item.map_or(serde_json::Value::Null, |item| {
+                    serde_json::json!(
+                        item.desired
+                            .iter()
+                            .map(|node| node.as_u64())
+                            .collect::<Vec<_>>()
+                    )
+                }),
+            );
+            map.insert(
+                "placement".to_owned(),
+                serde_json::Value::String(
+                    item.map_or("unknown", |item| {
+                        if item.healthy {
+                            "healthy"
+                        } else if item.migrating || item.actual.is_some() {
+                            "converging"
+                        } else {
+                            "unobserved"
+                        }
+                    })
+                    .to_owned(),
+                ),
+            );
+        }
+        out.push(value);
+    }
+    out.sort_by_key(|value| {
+        value
+            .get("group")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(u64::MAX)
+    });
     Json(out)
 }
 
@@ -1859,6 +2178,94 @@ async fn resume_peer(
     (StatusCode::OK, Json(serde_json::json!({ "resumed": node })))
 }
 
+/// Adds a dialable peer link for a dynamically admitted node. Body:
+/// `{ "node": <u64>, "addr": "<peer endpoint>" }`. The reconciler's
+/// mesh sync performs this automatically from registry commits; the
+/// endpoint exists for manual repair and tests.
+async fn peers_add(
+    State(shared): State<ClusterShared>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let (Some(node), Some(addr)) = (
+        body.get("node").and_then(serde_json::Value::as_u64),
+        body.get("addr").and_then(serde_json::Value::as_str),
+    ) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::json!({ "error": "body must be {\"node\": <u64>, \"addr\": \"<peer>\"}" }),
+            ),
+        );
+    };
+    if node == 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "node id 0 is reserved" })),
+        );
+    }
+    let Ok(addr) = addr.parse::<SocketAddr>() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "addr must be a socket address" })),
+        );
+    };
+    let added = shared.node.add_peer_dial(NodeId::from_u64(node), addr);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "added": added })),
+    )
+}
+
+/// Pins a dynamically admitted peer's certificate DER for TLS
+/// verification. Body: `{ "node": <u64>, "cert_der_hex": "<hex>" }`.
+/// Static anchors keep precedence; the reconciler cannot distribute
+/// DERs itself (the registry carries fingerprints), so operators push
+/// them over this endpoint after approving the admission.
+async fn peers_trust(
+    State(shared): State<ClusterShared>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let (Some(node), Some(hex)) = (
+        body.get("node").and_then(serde_json::Value::as_u64),
+        body.get("cert_der_hex").and_then(serde_json::Value::as_str),
+    ) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::json!({ "error": "body must be {\"node\": <u64>, \"cert_der_hex\": \"<hex>\"}" }),
+            ),
+        );
+    };
+    if node == 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "node id 0 is reserved" })),
+        );
+    }
+    if hex.len() > 8192 || !hex.len().is_multiple_of(2) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::json!({ "error": "cert_der_hex must be even-length hex under 8 KiB" }),
+            ),
+        );
+    }
+    let mut der = Vec::with_capacity(hex.len() / 2);
+    for index in 0..hex.len() / 2 {
+        match u8::from_str_radix(&hex[2 * index..2 * index + 2], 16) {
+            Ok(byte) => der.push(byte),
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": "cert_der_hex is not hex" })),
+                );
+            }
+        }
+    }
+    shared.node.trust_peer(NodeId::from_u64(node), der);
+    (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+}
+
 /// Seals a checkpoint snapshot and purges one group's Raft log through
 /// its base. Used by operators and the lab harness to force snapshot
 /// catch-up: a lagging follower behind the purge point recovers via
@@ -1899,6 +2306,715 @@ async fn snapshot(
     }
 }
 
+/// Hex rendering for certificate fingerprints in admin output.
+fn hex32(bytes: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(64);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// Parses a 64-hex-char fingerprint (empty/absent means unenforced:
+/// lab-insecure only).
+fn parse_fingerprint(value: Option<&str>) -> Result<[u8; 32], String> {
+    let Some(hex) = value else {
+        return Ok([0u8; 32]);
+    };
+    if hex.len() != 64 {
+        return Err(format!(
+            "fingerprint must be 64 hex chars, got {}",
+            hex.len()
+        ));
+    }
+    let mut out = [0u8; 32];
+    for (index, chunk) in out.iter_mut().enumerate() {
+        *chunk = u8::from_str_radix(&hex[2 * index..2 * index + 2], 16)
+            .map_err(|_| format!("fingerprint is not hex at byte {index}"))?;
+    }
+    Ok(out)
+}
+
+/// Replicated control image for operators: registry, desired
+/// placements, migration plans, and versions. `present=false` when this
+/// node hosts no control replica (pure data host without a control
+/// learner yet).
+async fn control(State(shared): State<ClusterShared>) -> Json<serde_json::Value> {
+    let Some(state) = shared.node.control_state().await else {
+        return Json(serde_json::json!({ "present": false }));
+    };
+    let nodes: Vec<serde_json::Value> = state
+        .nodes()
+        .map(|record| {
+            serde_json::json!({
+                "node": record.node.as_u64(),
+                "peer": record.peer.to_string(),
+                "native": record.native.to_string(),
+                "admin": record.admin.to_string(),
+                "fingerprint": hex32(&record.cert_fingerprint),
+                "domain": record.failure_domain,
+                "weight": record.weight,
+                "state": format!("{:?}", record.state),
+            })
+        })
+        .collect();
+    let placements: Vec<serde_json::Value> = state
+        .placements()
+        .map(|desired| {
+            serde_json::json!({
+                "tablet": desired.tablet.as_u64(),
+                "replicas": desired.replicas.iter().map(|node| node.as_u64()).collect::<Vec<_>>(),
+                "version": desired.version.as_u64(),
+            })
+        })
+        .collect();
+    let migrations: Vec<serde_json::Value> = state
+        .migrations()
+        .map(|plan| {
+            serde_json::json!({
+                "id": plan.id.as_u64(),
+                "tablet": plan.tablet.as_u64(),
+                "generation": plan.generation.as_u64(),
+                "from": plan.from.as_u64(),
+                "to": plan.to.as_u64(),
+                "desired": plan.desired_voters.iter().map(|node| node.as_u64()).collect::<Vec<_>>(),
+                "phase": format!("{:?}", plan.phase),
+            })
+        })
+        .collect();
+    Json(serde_json::json!({
+        "present": true,
+        "placement_version": state.placement_version().as_u64(),
+        "generation": state.generation().as_u64(),
+        "next_plan_id": state.next_plan_id().as_u64(),
+        "nodes": nodes,
+        "placements": placements,
+        "migrations": migrations,
+    }))
+}
+
+/// Live migration plans (same objects as `/v1/control`, plan-focused).
+async fn migrations(State(shared): State<ClusterShared>) -> Json<serde_json::Value> {
+    let Some(state) = shared.node.control_state().await else {
+        return Json(serde_json::json!({ "present": false, "migrations": [] }));
+    };
+    let live = state
+        .migrations()
+        .filter(|plan| !plan.phase.is_terminal())
+        .count();
+    Json(serde_json::json!({
+        "present": true,
+        "live": live,
+        "migrations": state.migrations().map(|plan| serde_json::json!({
+            "id": plan.id.as_u64(),
+            "tablet": plan.tablet.as_u64(),
+            "from": plan.from.as_u64(),
+            "to": plan.to.as_u64(),
+            "phase": format!("{:?}", plan.phase),
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+/// Observed membership for one tablet group: actual voters, learners,
+/// leader, term, joint flag, and replication lag. Powers reconciler
+/// forwarding and operator inspection (§43).
+async fn tablet_membership(
+    State(shared): State<ClusterShared>,
+    axum::extract::Path(id): axum::extract::Path<u64>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if id == 0 || id == kivi_consensus::CONTROL_TABLET_RAW {
+        // The control group's membership is served by id too (operators
+        // manage control voters through the same endpoints).
+    }
+    match shared.node.observe_membership(TabletId::from_u64(id)).await {
+        Ok(observed) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "tablet": id,
+                "voters": observed.voters.into_iter().collect::<Vec<_>>(),
+                "learners": observed.learners.into_iter().collect::<Vec<_>>(),
+                "leader": observed.leader.map(|replica| replica.node().as_u64()),
+                "term": observed.term.get(),
+                "joint": observed.is_joint,
+                "lag": observed.lag,
+            })),
+        ),
+        Err(reason) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": reason })),
+        ),
+    }
+}
+
+/// Registers a learner on one group's leader. Body: `{ "node": <u64>,
+/// "addr": "<peer endpoint>", "blocking": <bool> }`. Non-blocking in
+/// production: catch-up is polled through replication lag.
+async fn tablet_learners(
+    State(shared): State<ClusterShared>,
+    axum::extract::Path(id): axum::extract::Path<u64>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let (Some(node), Some(addr)) = (
+        body.get("node").and_then(serde_json::Value::as_u64),
+        body.get("addr").and_then(serde_json::Value::as_str),
+    ) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::json!({ "error": "body must be {\"node\": <u64>, \"addr\": \"<peer>\"}" }),
+            ),
+        );
+    };
+    if node == 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "node id 0 is reserved" })),
+        );
+    }
+    let blocking = body
+        .get("blocking")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    match shared
+        .node
+        .add_learner(
+            TabletId::from_u64(id),
+            NodeId::from_u64(node),
+            addr.to_owned(),
+            blocking,
+        )
+        .await
+    {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))),
+        Err(reason) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": reason })),
+        ),
+    }
+}
+
+/// Replaces one group's voter set through joint consensus. Body:
+/// `{ "voters": [<u64>], "retain": <bool> }`. New voters must already
+/// be learners; planned migration uses `retain=false`.
+async fn tablet_members(
+    State(shared): State<ClusterShared>,
+    axum::extract::Path(id): axum::extract::Path<u64>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(voters) = body.get("voters").and_then(serde_json::Value::as_array) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "body must be {\"voters\": [<u64>]}" })),
+        );
+    };
+    let voters: std::collections::BTreeSet<u64> = voters
+        .iter()
+        .filter_map(serde_json::Value::as_u64)
+        .collect();
+    if voters.is_empty() || voters.contains(&0) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "voter set must be nonempty with no zero ids" })),
+        );
+    }
+    let retain = body
+        .get("retain")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let tablet = TabletId::from_u64(id);
+    if let Err(reason) = shared
+        .node
+        .change_membership(tablet, voters.clone(), retain)
+        .await
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": reason })),
+        );
+    }
+    // Converge the joint: the committed joint config needs its uniform
+    // successor, proposed here on the tablet leader (the reconciler
+    // covers migration plans the same way). Poll briefly, re-proposing
+    // while joint persists — re-proposing the same desired set after a
+    // committed joint is safe (propose-after-commit holds) and lands
+    // directly on the uniform config. Stays inside the admin deadline;
+    // callers retry on 503.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+    loop {
+        match shared.node.observe_membership(tablet).await {
+            Ok(observed) if !observed.is_joint => {
+                break (StatusCode::OK, Json(serde_json::json!({ "ok": true })));
+            }
+            Ok(_) => {
+                if tokio::time::Instant::now() >= deadline {
+                    break (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({ "error": "joint membership pending; retry" })),
+                    );
+                }
+                let _ = shared
+                    .node
+                    .change_membership(tablet, voters.clone(), retain)
+                    .await;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(_) => break (StatusCode::OK, Json(serde_json::json!({ "ok": true }))),
+        }
+    }
+}
+
+/// Hands group leadership to a retained voter. Body: `{ "to": <u64> }`.
+/// Fire-and-forget: a non-leader ignores it; the reconciler
+/// re-observes and continues.
+async fn tablet_leader(
+    State(shared): State<ClusterShared>,
+    axum::extract::Path(id): axum::extract::Path<u64>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(to) = body.get("to").and_then(serde_json::Value::as_u64) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "body must be {\"to\": <u64>}" })),
+        );
+    };
+    match shared
+        .node
+        .transfer_leader(TabletId::from_u64(id), NodeId::from_u64(to))
+        .await
+    {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))),
+        Err(reason) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": reason })),
+        ),
+    }
+}
+
+/// Creates an empty local replica for a migration target. Body:
+/// `{ "node": <u64>, "voters": [<u64>], "generation": <u64> }`. The
+/// `node` names the intended target: a mismatch fails loudly instead
+/// of creating a replica on the wrong member after a stale registry
+/// read.
+async fn tablet_ensure(
+    State(shared): State<ClusterShared>,
+    axum::extract::Path(id): axum::extract::Path<u64>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let (Some(node), Some(voters), Some(generation)) = (
+        body.get("node").and_then(serde_json::Value::as_u64),
+        body.get("voters").and_then(serde_json::Value::as_array),
+        body.get("generation").and_then(serde_json::Value::as_u64),
+    ) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::json!({ "error": "body must be {\"node\": <u64>, \"voters\": [<u64>], \"generation\": <u64>}" }),
+            ),
+        );
+    };
+    if node != shared.node.node().as_u64() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "ensure targets another node; refusing" })),
+        );
+    }
+    let voters: std::collections::BTreeSet<u64> = voters
+        .iter()
+        .filter_map(serde_json::Value::as_u64)
+        .collect();
+    match shared
+        .node
+        .ensure_group(TabletId::from_u64(id), voters, generation)
+        .await
+    {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))),
+        Err(reason) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": reason })),
+        ),
+    }
+}
+
+/// Retires the local replica after membership no longer requires it.
+/// Body: `{ "node": <u64>, "generation": <u64> }`. The `node` names
+/// the intended source: a mismatch fails loudly instead of retiring
+/// the wrong member's replica after a stale registry read.
+async fn tablet_retire(
+    State(shared): State<ClusterShared>,
+    axum::extract::Path(id): axum::extract::Path<u64>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let (Some(node), Some(generation)) = (
+        body.get("node").and_then(serde_json::Value::as_u64),
+        body.get("generation").and_then(serde_json::Value::as_u64),
+    ) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::json!({ "error": "body must be {\"node\": <u64>, \"generation\": <u64>}" }),
+            ),
+        );
+    };
+    if node != shared.node.node().as_u64() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "retire targets another node; refusing" })),
+        );
+    }
+    match shared
+        .node
+        .retire_group(TabletId::from_u64(id), generation)
+        .await
+    {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))),
+        Err(reason) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": reason })),
+        ),
+    }
+}
+
+/// Admits a node: commits `RegisterNode` (as `Joining`) then activates
+/// it. Body: `{ "node": <u64>, "peer": "<addr>", "native": "<addr>",
+/// "admin": "<addr>", "fingerprint": "<64 hex>"?, "domain": "<s>"? }`.
+/// Effective only after the replicated commit (§8: no implicit trust).
+async fn control_node_add(
+    State(shared): State<ClusterShared>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let (Some(node), Some(peer), Some(native), Some(admin)) = (
+        body.get("node").and_then(serde_json::Value::as_u64),
+        body.get("peer").and_then(serde_json::Value::as_str),
+        body.get("native").and_then(serde_json::Value::as_str),
+        body.get("admin").and_then(serde_json::Value::as_str),
+    ) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::json!({ "error": "body must be {\"node\", \"peer\", \"native\", \"admin\"}" }),
+            ),
+        );
+    };
+    if node == 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "node id 0 is reserved" })),
+        );
+    }
+    let parse = |value: &str| value.parse::<SocketAddr>();
+    let (Ok(peer), Ok(native), Ok(admin)) = (parse(peer), parse(native), parse(admin)) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "peer/native/admin must be socket addresses" })),
+        );
+    };
+    let fingerprint =
+        match parse_fingerprint(body.get("fingerprint").and_then(serde_json::Value::as_str)) {
+            Ok(fingerprint) => fingerprint,
+            Err(reason) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": reason })),
+                );
+            }
+        };
+    let domain = body
+        .get("domain")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let record = kivi_control::NodeRecord {
+        node: NodeId::from_u64(node),
+        peer,
+        native,
+        admin,
+        cert_fingerprint: fingerprint,
+        failure_domain: domain,
+        weight: 1,
+        state: kivi_control::NodeState::Joining,
+    };
+    if let Err(reason) = shared
+        .node
+        .propose_control(kivi_control::ControlMutation::RegisterNode { record })
+        .await
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": reason })),
+        );
+    }
+    if let Err(reason) = shared
+        .node
+        .propose_control(kivi_control::ControlMutation::SetNodeState {
+            node: NodeId::from_u64(node),
+            state: kivi_control::NodeState::Active,
+        })
+        .await
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": reason })),
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "node": node })),
+    )
+}
+
+/// Starts draining a node: marks it `Draining` (excluded from new
+/// placements) and creates replacement migration plans for every tablet
+/// desiring it. Leaderships transfer away through the normal plan flow.
+async fn control_node_drain(
+    State(shared): State<ClusterShared>,
+    axum::extract::Path(id): axum::extract::Path<u64>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let node = NodeId::from_u64(id);
+    if let Err(reason) = shared
+        .node
+        .propose_control(kivi_control::ControlMutation::SetNodeState {
+            node,
+            state: kivi_control::NodeState::Draining,
+        })
+        .await
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": reason })),
+        );
+    }
+    // Plans derive from fresh state (the drain mark must be visible).
+    let mut attempts = 0;
+    loop {
+        let Some(state) = shared.node.control_state().await else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": "no local control image" })),
+            );
+        };
+        if state
+            .node(node)
+            .is_some_and(|record| record.state == kivi_control::NodeState::Draining)
+        {
+            let policy = super::control::ReconcilePolicy::default();
+            let intents = super::control::drain_intents(&state, node, &policy);
+            return match super::control::create_plans(&shared.node, &state, &intents).await {
+                Ok(ids) => (
+                    StatusCode::OK,
+                    Json(
+                        serde_json::json!({ "ok": true, "plans": ids.iter().map(|id| id.as_u64()).collect::<Vec<_>>() }),
+                    ),
+                ),
+                Err(reason) => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({ "error": reason })),
+                ),
+            };
+        }
+        attempts += 1;
+        if attempts > 40 {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": "drain mark not visible; retry" })),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Removes a node after safe drain. Fails loudly when the node still
+/// desires tablets, still votes anywhere observed locally, or still
+/// votes in the control group — never silently deletes an active
+/// voter (§29). No force mode.
+async fn control_node_remove(
+    State(shared): State<ClusterShared>,
+    axum::extract::Path(id): axum::extract::Path<u64>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let node = NodeId::from_u64(id);
+    let Some(state) = shared.node.control_state().await else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "no local control image" })),
+        );
+    };
+    if !state.removable(node) {
+        return (
+            StatusCode::CONFLICT,
+            Json(
+                serde_json::json!({ "error": "node still draining or desired; drain first and wait for Drained" }),
+            ),
+        );
+    }
+    // Refuse while the node still votes in the control group (replace
+    // control membership first through the tablet endpoints).
+    if let Ok(observed) = shared
+        .node
+        .observe_membership(TabletId::from_u64(kivi_consensus::CONTROL_TABLET_RAW))
+        .await
+        && observed.is_voter(node)
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(
+                serde_json::json!({ "error": "node still votes in the control group; shrink control membership first" }),
+            ),
+        );
+    }
+    match shared
+        .node
+        .propose_control(kivi_control::ControlMutation::SetNodeState {
+            node,
+            state: kivi_control::NodeState::Removed,
+        })
+        .await
+    {
+        Ok(_) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))),
+        Err(reason) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": reason })),
+        ),
+    }
+}
+
+/// Computes desired placements from current topology and creates
+/// migration plans, bounded by the reconciler policy (no unbounded
+/// snapshot storms, §25–26).
+async fn control_rebalance(
+    State(shared): State<ClusterShared>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(state) = shared.node.control_state().await else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "no local control image" })),
+        );
+    };
+    let policy = super::control::ReconcilePolicy::default();
+    let intents = super::control::rebalance_intents(&state, &policy);
+    match super::control::create_plans(&shared.node, &state, &intents).await {
+        Ok(ids) => (
+            StatusCode::OK,
+            Json(
+                serde_json::json!({ "ok": true, "plans": ids.iter().map(|id| id.as_u64()).collect::<Vec<_>>() }),
+            ),
+        ),
+        Err(reason) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": reason })),
+        ),
+    }
+}
+
+/// Rebalances tablet leadership explicitly (§53): graceful handoffs
+/// away from overrepresented leaders, never continuous (no flapping).
+async fn control_leadership(
+    State(shared): State<ClusterShared>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(state) = shared.node.control_state().await else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "no local control image" })),
+        );
+    };
+    let transfers = super::control::rebalance_leadership(&shared.node, &state).await;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "leadership_transfers": transfers })),
+    )
+}
+
+/// Manual tablet move through the same persisted plan pathway as auto
+/// rebalance (no second migration pathway, §46). Body:
+/// `{ "tablet": <u64>, "from": <u64>, "to": <u64> }`.
+async fn control_migrations_create(
+    State(shared): State<ClusterShared>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let (Some(tablet), Some(from), Some(to)) = (
+        body.get("tablet").and_then(serde_json::Value::as_u64),
+        body.get("from").and_then(serde_json::Value::as_u64),
+        body.get("to").and_then(serde_json::Value::as_u64),
+    ) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "body must be {\"tablet\", \"from\", \"to\"}" })),
+        );
+    };
+    if from == to || from == 0 || to == 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "from and to must differ and be nonzero" })),
+        );
+    }
+    let Some(state) = shared.node.control_state().await else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "no local control image" })),
+        );
+    };
+    let tablet = TabletId::from_u64(tablet);
+    let from = NodeId::from_u64(from);
+    let to = NodeId::from_u64(to);
+    let Some(current) = state.desired(tablet) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "tablet has no desired placement" })),
+        );
+    };
+    if !current.contains(from) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "source is not a desired voter of the tablet" })),
+        );
+    }
+    if current.contains(to) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "target already desires the tablet" })),
+        );
+    }
+    if state
+        .node(to)
+        .is_none_or(|record| record.state != kivi_control::NodeState::Active)
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "target must be an Active node" })),
+        );
+    }
+    if !state.live_plans_for(tablet).is_empty() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "tablet already has a live migration plan" })),
+        );
+    }
+    let mut voters: Vec<NodeId> = current
+        .replicas
+        .iter()
+        .copied()
+        .filter(|node| *node != from)
+        .collect();
+    voters.push(to);
+    let intent = kivi_control::MigrationIntent {
+        tablet,
+        from,
+        to,
+        desired_voters: voters,
+    };
+    match super::control::create_plans(&shared.node, &state, &[intent]).await {
+        Ok(ids) => (
+            StatusCode::OK,
+            Json(
+                serde_json::json!({ "ok": true, "plans": ids.iter().map(|id| id.as_u64()).collect::<Vec<_>>() }),
+            ),
+        ),
+        Err(reason) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": reason })),
+        ),
+    }
+}
+
 /// Serves the cluster admin plane until aborted.
 async fn serve_admin(listener: tokio::net::TcpListener, shared: ClusterShared) {
     let router = axum::Router::new()
@@ -1913,7 +3029,26 @@ async fn serve_admin(listener: tokio::net::TcpListener, shared: ClusterShared) {
         .route("/v1/preflight", get(preflight))
         .route("/v1/peers/suspend", post(suspend_peer))
         .route("/v1/peers/resume", post(resume_peer))
+        .route("/v1/peers/add", post(peers_add))
+        .route("/v1/peers/trust", post(peers_trust))
         .route("/v1/snapshot", post(snapshot))
+        .route("/v1/control", get(control))
+        .route("/v1/control/migrations", get(migrations))
+        .route(
+            "/v1/control/migrations/create",
+            post(control_migrations_create),
+        )
+        .route("/v1/control/nodes", post(control_node_add))
+        .route("/v1/control/nodes/{id}/drain", post(control_node_drain))
+        .route("/v1/control/nodes/{id}/remove", post(control_node_remove))
+        .route("/v1/control/rebalance", post(control_rebalance))
+        .route("/v1/control/leadership", post(control_leadership))
+        .route("/v1/tablets/{id}/membership", get(tablet_membership))
+        .route("/v1/tablets/{id}/learners", post(tablet_learners))
+        .route("/v1/tablets/{id}/members", post(tablet_members))
+        .route("/v1/tablets/{id}/leader", post(tablet_leader))
+        .route("/v1/tablets/{id}/ensure", post(tablet_ensure))
+        .route("/v1/tablets/{id}/retire", post(tablet_retire))
         .layer(
             tower::ServiceBuilder::new()
                 .layer(TraceLayer::new_for_http())

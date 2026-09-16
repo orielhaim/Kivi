@@ -255,7 +255,14 @@ impl RaftStateMachine<KiviTypeConfig> for MemStateMachine {
                 }
                 EntryPayload::Normal(command) => {
                     core.applied_commands += 1;
-                    crate::mutation::ReplicatedOutcome::new(command.expected().clone())
+                    match command {
+                        crate::command::ConsensusCommand::Tablet(mutation) => {
+                            crate::mutation::ReplicatedOutcome::new(mutation.expected().clone())
+                        }
+                        crate::command::ConsensusCommand::Control(_) => {
+                            crate::mutation::ReplicatedOutcome::none()
+                        }
+                    }
                 }
             };
             drop(core);

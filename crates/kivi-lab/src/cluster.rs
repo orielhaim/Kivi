@@ -75,7 +75,8 @@ impl std::fmt::Debug for ClusterNode {
 }
 
 /// Three real server processes forming replicated tablet groups (one
-/// replica of every tablet per process in this static stage).
+/// replica of every tablet per process at formation; membership moves
+/// through the control plane afterwards).
 /// Dropping kills every remaining child (tests never leak processes).
 pub struct Cluster {
     nodes: Vec<ClusterNode>,
@@ -345,6 +346,8 @@ impl Cluster {
         args.push(flag_list(&self.peer_addrs()));
         args.push("--cluster-natives".to_owned());
         args.push(flag_list(&self.native_addrs()));
+        args.push("--cluster-admins".to_owned());
+        args.push(flag_list(&self.admin_addrs()));
         args.push("--cluster-native".to_owned());
         args.push(self.nodes[index].native.clone());
         args.push("--admin".to_owned());
@@ -427,16 +430,37 @@ impl Cluster {
         .expect("cluster client builds")
     }
 
+    /// Diagnoses a dead member for failure output: exit status plus
+    /// the tail of its server log (post-mortem without keeping dirs).
+    fn diagnose(&self, index: usize) -> String {
+        let node = &self.nodes[index];
+        let status = if node.child.is_some() {
+            "still spawned"
+        } else {
+            "no child handle"
+        };
+        let tail = file_tail(&node.data_dir.path().join("server-stderr.log"));
+        format!(
+            "member {index} (node {}): {status}; stderr tail: {tail}",
+            node.node_id
+        )
+    }
+
     /// Raw admin GET against one member (status + parsed JSON).
     ///
     /// # Panics
     ///
-    /// Panics on connection or I/O failure.
+    /// Panics on connection or I/O failure (naming the member and its
+    /// exit state instead of a bare refused dial).
     #[must_use]
     pub fn admin_get(&self, index: usize, path: &str) -> (u16, Value) {
         let admin = self.nodes[index].admin.clone();
-        let mut socket = TcpStream::connect(admin.clone())
-            .unwrap_or_else(|error| panic!("admin connect node {index} ({admin}): {error}"));
+        let mut socket = TcpStream::connect(admin.clone()).unwrap_or_else(|error| {
+            panic!(
+                "admin connect node {index} ({admin}) {path}: {error}; {}",
+                self.diagnose(index)
+            )
+        });
         socket
             .set_read_timeout(Some(Duration::from_secs(10)))
             .expect("timeout");
@@ -472,8 +496,12 @@ impl Cluster {
     pub fn admin_post(&self, index: usize, path: &str, body: &Value) -> (u16, Value) {
         let payload = body.to_string();
         let admin = self.nodes[index].admin.clone();
-        let mut socket = TcpStream::connect(admin.clone())
-            .unwrap_or_else(|error| panic!("admin connect node {index} ({admin}): {error}"));
+        let mut socket = TcpStream::connect(admin.clone()).unwrap_or_else(|error| {
+            panic!(
+                "admin connect node {index} ({admin}) {path}: {error}; {}",
+                self.diagnose(index)
+            )
+        });
         socket
             .set_read_timeout(Some(Duration::from_secs(10)))
             .expect("timeout");
@@ -806,14 +834,29 @@ impl Cluster {
         ]
     }
 
-    /// Current raw peer addresses in node-id order.
-    fn peer_addrs(&self) -> Vec<String> {
-        self.nodes.iter().map(|node| node.peer.clone()).collect()
+    /// Current peer addresses with node ids.
+    fn peer_addrs(&self) -> Vec<(u64, String)> {
+        self.nodes
+            .iter()
+            .map(|node| (node.node_id, node.peer.clone()))
+            .collect()
     }
 
-    /// Current raw native addresses in node-id order.
-    fn native_addrs(&self) -> Vec<String> {
-        self.nodes.iter().map(|node| node.native.clone()).collect()
+    /// Current native addresses with node ids.
+    fn native_addrs(&self) -> Vec<(u64, String)> {
+        self.nodes
+            .iter()
+            .map(|node| (node.node_id, node.native.clone()))
+            .collect()
+    }
+
+    /// Current admin addresses with node ids (reconciler forwarding
+    /// targets; the registry records each node's own endpoint).
+    fn admin_addrs(&self) -> Vec<(u64, String)> {
+        self.nodes
+            .iter()
+            .map(|node| (node.node_id, node.admin.clone()))
+            .collect()
     }
 
     fn spawn_once(
@@ -846,9 +889,23 @@ impl Cluster {
                 "--data-dir".to_owned(),
                 data_dir.path().display().to_string(),
                 "--cluster-peers".to_owned(),
-                flag_list(&peers),
+                flag_list(&[
+                    (1u64, peers[0].clone()),
+                    (2, peers[1].clone()),
+                    (3, peers[2].clone()),
+                ]),
                 "--cluster-natives".to_owned(),
-                flag_list(&natives),
+                flag_list(&[
+                    (1u64, natives[0].clone()),
+                    (2, natives[1].clone()),
+                    (3, natives[2].clone()),
+                ]),
+                "--cluster-admins".to_owned(),
+                flag_list(&[
+                    (1u64, admins[0].clone()),
+                    (2, admins[1].clone()),
+                    (3, admins[2].clone()),
+                ]),
                 "--cluster-native".to_owned(),
                 natives[index].clone(),
                 "--admin".to_owned(),
@@ -1091,7 +1148,18 @@ impl Cluster {
     ///
     /// Panics on timeout.
     pub fn wait_converged_all(&self) {
-        let deadline = Instant::now() + CONVERGE_TIMEOUT;
+        self.wait_converged_all_timeout(CONVERGE_TIMEOUT);
+    }
+
+    /// Waits like [`wait_converged_all`](Self::wait_converged_all) with
+    /// an explicit deadline (rolling restarts over many tablets need
+    /// longer than the default window).
+    ///
+    /// # Panics
+    ///
+    /// Panics past the deadline.
+    pub fn wait_converged_all_timeout(&self, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
         loop {
             let mut per_tablet: std::collections::BTreeMap<u64, u64> =
                 std::collections::BTreeMap::new();
@@ -1218,14 +1286,647 @@ impl Cluster {
         );
         json["snapshot"].as_u64().unwrap_or(0)
     }
+
+    /// Spawns one more member WITHOUT restarting existing ones and
+    /// registers it with the control plane (explicit admission). The new
+    /// node starts data-empty; placement arrives through migration.
+    /// Returns the member index. Existing members learn its mesh address
+    /// from replicated registry commits (no restarts).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the member fails to start or admission is refused.
+    #[must_use]
+    pub fn add_node(&mut self) -> usize {
+        let node_id = self
+            .nodes
+            .iter()
+            .map(|node| node.node_id)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let peer = free_udp_addr();
+        let native = free_addr();
+        let admin = free_addr();
+        let data_dir = tempfile::tempdir()
+            .unwrap_or_else(|error| panic!("tempdir for node {node_id}: {error}"));
+        let mut args = self.base_args(node_id, data_dir.path());
+        let mut peers = self.peer_addrs();
+        peers.push((node_id, peer.clone()));
+        let mut natives = self.native_addrs();
+        natives.push((node_id, native.clone()));
+        let mut admin_addrs = self.admin_addrs();
+        admin_addrs.push((node_id, admin.clone()));
+        args.push("--cluster-peers".to_owned());
+        args.push(flag_list(&peers));
+        args.push("--cluster-natives".to_owned());
+        args.push(flag_list(&natives));
+        args.push("--cluster-admins".to_owned());
+        args.push(flag_list(&admin_addrs));
+        // Explicit join intent: the existing peers prove the cluster
+        // already exists, so the fresh directory waits for `add_learner`
+        // instead of initializing a forked control group.
+        let seeds: Vec<String> = self
+            .peer_addrs()
+            .into_iter()
+            .map(|(_, addr)| addr)
+            .collect();
+        if !seeds.is_empty() {
+            args.push("--control-seeds".to_owned());
+            args.push(seeds.join(","));
+        }
+        args.push("--cluster-native".to_owned());
+        args.push(native.clone());
+        args.push("--admin".to_owned());
+        args.push(admin.clone());
+        let env: Vec<(&str, &str)> = self
+            .extra_env
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        let ready_timeout = self.ready_timeout;
+        let (child, ready_native, ready_admin, _) =
+            spawn_member(&self.binary, &args, data_dir.path(), &env, ready_timeout)
+                .unwrap_or_else(|error| panic!("spawn node {node_id}: {error:?}"));
+        self.nodes.push(ClusterNode {
+            child: Some(child),
+            node_id,
+            data_dir,
+            native: ready_native,
+            peer,
+            admin: ready_admin,
+            resp: None,
+        });
+        let index = self.nodes.len() - 1;
+        // Explicit admission through the control leader (retried: the
+        // new member's own control learner is still catching up).
+        let body = serde_json::json!({
+            "node": node_id,
+            "peer": self.nodes[index].peer,
+            "native": self.nodes[index].native,
+            "admin": self.nodes[index].admin,
+        });
+        self.post_control(
+            "/v1/control/nodes",
+            &body,
+            &format!("admit node {node_id}"),
+            Duration::from_secs(120),
+        );
+        index
+    }
+
+    /// Member index for one node id (`None` after drops).
+    #[must_use]
+    pub fn index_of(&self, node_id: u64) -> Option<usize> {
+        self.nodes.iter().position(|node| node.node_id == node_id)
+    }
+
+    /// Number of member slots (including dead ones not yet dropped).
+    #[must_use]
+    pub fn member_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Fetches `/v1/control` from one member (registry, placements,
+    /// plans, versions).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the endpoint errors.
+    #[must_use]
+    pub fn control(&self, index: usize) -> Value {
+        let (status, json) = self.admin_get(index, "/v1/control");
+        assert_eq!(status, 200, "control on node {index}: {json}");
+        json
+    }
+
+    /// Waits until the registry names `count` nodes (any state).
+    ///
+    /// # Panics
+    ///
+    /// Panics past the deadline.
+    pub fn wait_control_nodes(&self, count: usize, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let mut seen = 0;
+            for index in 0..self.nodes.len() {
+                if self.nodes[index].child.is_none() {
+                    continue;
+                }
+                let (_, json) = self.admin_get(index, "/v1/control");
+                if let Some(nodes) = json.get("nodes").and_then(Value::as_array) {
+                    seen = seen.max(nodes.len());
+                }
+            }
+            if seen >= count {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "registry never reached {count} nodes"
+            );
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+
+    /// Posts to the control leader (retried across live members until
+    /// one commits): control mutations only commit on the leader, and
+    /// leadership moves across kills and drains.
+    ///
+    /// # Panics
+    ///
+    /// Panics past the deadline.
+    fn post_control(&self, path: &str, body: &Value, what: &str, timeout: Duration) -> Value {
+        let deadline = Instant::now() + timeout;
+        let mut last = String::new();
+        loop {
+            let mut order: Vec<usize> = (0..self.nodes.len())
+                .filter(|index| self.nodes[*index].child.is_some())
+                .collect();
+            if let Some(leader) = self.control_leader_index()
+                && let Some(position) = order.iter().position(|index| *index == leader)
+            {
+                order.remove(position);
+                order.insert(0, leader);
+            }
+            for index in order {
+                let (status, json) = self.admin_post(index, path, body);
+                if status == 200 {
+                    return json;
+                }
+                last = format!("member {index}: {status} {json}");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{what} never committed (last: {last})"
+            );
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    /// Triggers a bounded rebalance through the control leader.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the endpoint refuses.
+    #[must_use]
+    pub fn rebalance(&self) -> Value {
+        self.post_control(
+            "/v1/control/rebalance",
+            &serde_json::json!({}),
+            "rebalance",
+            Duration::from_secs(120),
+        )
+    }
+
+    /// Moves one tablet replica through the persisted plan pathway.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the endpoint refuses.
+    #[must_use]
+    pub fn move_tablet(&self, tablet: u64, from: u64, to: u64) -> Value {
+        self.post_control(
+            "/v1/control/migrations/create",
+            &serde_json::json!({ "tablet": tablet, "from": from, "to": to }),
+            &format!("move tablet {tablet} {from}->{to}"),
+            Duration::from_secs(120),
+        )
+    }
+
+    /// Fetches live migration plans from one member.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the endpoint errors.
+    #[must_use]
+    pub fn migrations(&self, index: usize) -> Value {
+        let (status, json) = self.admin_get(index, "/v1/control/migrations");
+        assert_eq!(status, 200, "migrations on node {index}: {json}");
+        json
+    }
+
+    /// Waits until no live (non-terminal) migration plans remain and
+    /// none failed.
+    ///
+    /// # Panics
+    ///
+    /// Panics past the deadline or when a plan fails.
+    pub fn wait_migrations_done(&self, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        let mut ticks = 0u32;
+        loop {
+            let mut live = usize::MAX;
+            let mut failed = 0;
+            let mut probed = false;
+            let mut detail = String::new();
+            for index in 0..self.nodes.len() {
+                if self.nodes[index].child.is_none() {
+                    continue;
+                }
+                let (_, json) = self.admin_get(index, "/v1/control/migrations");
+                let Some(plans) = json.get("migrations").and_then(Value::as_array) else {
+                    continue;
+                };
+                probed = true;
+                detail = format!("{json}");
+                let node_live = plans
+                    .iter()
+                    .filter(|plan| {
+                        !matches!(
+                            plan.get("phase").and_then(Value::as_str),
+                            Some("Completed" | "Failed")
+                        )
+                    })
+                    .count();
+                failed += plans
+                    .iter()
+                    .filter(|plan| {
+                        matches!(plan.get("phase").and_then(Value::as_str), Some("Failed"))
+                    })
+                    .count();
+                live = live.min(node_live);
+            }
+            assert!(probed, "no live member serves migrations");
+            assert_eq!(failed, 0, "migration plans failed");
+            if live == 0 {
+                return;
+            }
+            ticks += 1;
+            if ticks % 20 == 1 {
+                eprintln!("wait migrations: {detail}");
+            }
+            assert!(Instant::now() < deadline, "migrations never completed");
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    /// Starts draining one node (replicas migrate away, then `Drained`).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the endpoint refuses.
+    #[must_use]
+    pub fn drain_node(&self, id: u64) -> Value {
+        self.post_control(
+            &format!("/v1/control/nodes/{id}/drain"),
+            &serde_json::json!({}),
+            &format!("drain node {id}"),
+            Duration::from_secs(180),
+        )
+    }
+
+    /// Waits until the registry reports `node_id` in `state`
+    /// (`"Active"`, `"Draining"`, `"Drained"`, ...), with progress
+    /// heartbeats (tablets still desiring the node, live plans).
+    ///
+    /// # Panics
+    ///
+    /// Panics past the deadline.
+    pub fn wait_node_state(&self, node_id: u64, state: &str, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        let mut ticks = 0u32;
+        loop {
+            let alive: Vec<u64> = (0..self.nodes.len())
+                .filter(|index| self.nodes[*index].child.is_some())
+                .map(|index| self.nodes[index].node_id)
+                .collect();
+            for index in 0..self.nodes.len() {
+                if self.nodes[index].child.is_none() {
+                    continue;
+                }
+                let (_, json) = self.admin_get(index, "/v1/control");
+                let reached = json
+                    .get("nodes")
+                    .and_then(Value::as_array)
+                    .is_some_and(|nodes| {
+                        nodes.iter().any(|node| {
+                            node.get("node").and_then(Value::as_u64) == Some(node_id)
+                                && node.get("state").and_then(Value::as_str) == Some(state)
+                        })
+                    });
+                if reached {
+                    return;
+                }
+                ticks += 1;
+                if ticks % 20 == 1 {
+                    Self::drain_heartbeat(self, node_id, state, &alive, &json);
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "node {node_id} never reached {state}"
+            );
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    /// Drain progress heartbeat: tablets still desiring the node, live
+    /// plans by phase, stuck plan identities, liveness, and the control
+    /// leader (which member's reconciler is driving).
+    fn drain_heartbeat(&self, node_id: u64, state: &str, alive: &[u64], json: &Value) {
+        let placements =
+            json.get("placements")
+                .and_then(Value::as_array)
+                .map_or(usize::MAX, |placements| {
+                    placements
+                        .iter()
+                        .filter(|placement| {
+                            placement
+                                .get("replicas")
+                                .and_then(Value::as_array)
+                                .is_some_and(|replicas| {
+                                    replicas
+                                        .iter()
+                                        .any(|replica| replica.as_u64() == Some(node_id))
+                                })
+                        })
+                        .count()
+                });
+        let phases = json
+            .get("migrations")
+            .and_then(Value::as_array)
+            .map(|plans| {
+                let mut histogram: std::collections::BTreeMap<String, usize> =
+                    std::collections::BTreeMap::new();
+                for plan in plans {
+                    let phase = plan
+                        .get("phase")
+                        .and_then(Value::as_str)
+                        .unwrap_or("?")
+                        .to_owned();
+                    if phase != "Completed" && phase != "Failed" {
+                        *histogram.entry(phase).or_default() += 1;
+                    }
+                }
+                histogram
+            })
+            .unwrap_or_default();
+        let live: usize = phases.values().sum();
+        let stuck: Vec<String> = json
+            .get("migrations")
+            .and_then(Value::as_array)
+            .map(|plans| {
+                plans
+                    .iter()
+                    .filter(|plan| {
+                        !matches!(
+                            plan.get("phase").and_then(Value::as_str),
+                            Some("Completed" | "Failed")
+                        )
+                    })
+                    .map(|plan| {
+                        format!(
+                            "{}:{}:{}->{}",
+                            plan.get("id")
+                                .map_or_else(|| String::from("?"), ToString::to_string),
+                            plan.get("tablet")
+                                .map_or_else(|| String::from("?"), ToString::to_string),
+                            plan.get("from")
+                                .map_or_else(|| String::from("?"), ToString::to_string),
+                            plan.get("to")
+                                .map_or_else(|| String::from("?"), ToString::to_string),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let leader = self.control_leader_index().map_or_else(
+            || "none".to_owned(),
+            |leader| self.nodes[leader].node_id.to_string(),
+        );
+        eprintln!(
+            "wait node {node_id} -> {state}: alive={alive:?} control_leader={leader} {placements} desire it, {live} live plans {phases:?} stuck={stuck:?}"
+        );
+    }
+
+    /// Removes a safely drained node (fails loudly otherwise).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the endpoint refuses.
+    #[must_use]
+    pub fn remove_node(&self, id: u64) -> Value {
+        self.post_control(
+            &format!("/v1/control/nodes/{id}/remove"),
+            &serde_json::json!({}),
+            &format!("remove node {id}"),
+            Duration::from_secs(180),
+        )
+    }
+
+    /// Fetches one tablet's observed membership through one member.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the member hosts no such group.
+    #[must_use]
+    pub fn tablet_membership(&self, index: usize, tablet: u64) -> Value {
+        let (status, json) = self.admin_get(index, &format!("/v1/tablets/{tablet}/membership"));
+        assert_eq!(
+            status, 200,
+            "membership tablet {tablet} on node {index}: {json}"
+        );
+        json
+    }
+
+    /// Waits until some live member observes exactly `voters` for
+    /// `tablet` (sorted comparison).
+    ///
+    /// # Panics
+    ///
+    /// Panics past the deadline.
+    pub fn wait_tablet_voters(&self, tablet: u64, voters: &[u64], timeout: Duration) {
+        let mut want = voters.to_vec();
+        want.sort_unstable();
+        let deadline = Instant::now() + timeout;
+        let mut ticks = 0u32;
+        loop {
+            for index in 0..self.nodes.len() {
+                if self.nodes[index].child.is_none() {
+                    continue;
+                }
+                let (_, json) = self.admin_get(index, &format!("/v1/tablets/{tablet}/membership"));
+                let mut seen: Vec<u64> = json
+                    .get("voters")
+                    .and_then(Value::as_array)
+                    .map(|ids| ids.iter().filter_map(Value::as_u64).collect())
+                    .unwrap_or_default();
+                seen.sort_unstable();
+                if seen == want {
+                    return;
+                }
+            }
+            ticks += 1;
+            if ticks % 40 == 1 {
+                // Heartbeat for CI forensics: plan phases plus every
+                // live member's observed voters/learners/leader.
+                let mut plans = String::new();
+                for index in 0..self.nodes.len() {
+                    if self.nodes[index].child.is_none() {
+                        continue;
+                    }
+                    let (_, control) = self.admin_get(index, "/v1/control/migrations");
+                    plans = format!("{control}");
+                    break;
+                }
+                let mut views = Vec::new();
+                for index in 0..self.nodes.len() {
+                    if self.nodes[index].child.is_none() {
+                        continue;
+                    }
+                    let (status, json) =
+                        self.admin_get(index, &format!("/v1/tablets/{tablet}/membership"));
+                    views.push(format!("m{index}:{status}:{json}"));
+                }
+                eprintln!(
+                    "wait voters {want:?} for tablet {tablet}: plans={plans} views=[{}]",
+                    views.join(" ")
+                );
+            }
+            assert!(
+                Instant::now() < deadline,
+                "tablet {tablet} voters never became {want:?}"
+            );
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+    /// Finds the control leader's member index through per-member
+    /// control-membership observations (`None` while campaigning).
+    #[must_use]
+    pub fn control_leader_index(&self) -> Option<usize> {
+        const CONTROL_TABLET: u64 = u64::MAX;
+        for index in 0..self.nodes.len() {
+            if self.nodes[index].child.is_none() {
+                continue;
+            }
+            let (status, json) =
+                self.admin_get(index, &format!("/v1/tablets/{CONTROL_TABLET}/membership"));
+            if status != 200 {
+                continue;
+            }
+            let leader = json.get("leader").and_then(Value::as_u64);
+            if leader == Some(self.nodes[index].node_id) {
+                return Some(index);
+            }
+        }
+        None
+    }
+
+    /// Drops one member slot entirely (kill + forget): later
+    /// `restart_all` skips it, modeling a removed node that never comes
+    /// back. Mesh flags for restarts rebuild from the remaining slots.
+    pub fn drop_node(&mut self, index: usize) {
+        if index < self.nodes.len() {
+            if let Some(mut child) = self.nodes[index].child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            if std::env::var("KIVI_LAB_KEEP_DIRS").is_ok() {
+                self.nodes[index].data_dir.disable_cleanup(true);
+                eprintln!(
+                    "kivi-lab: kept dropped data dir {}",
+                    self.nodes[index].data_dir.path().display()
+                );
+            }
+            self.nodes.remove(index);
+        }
+    }
+
+    /// Replaces the control voter set through joint consensus on the
+    /// control leader (control-plane membership itself, §31), waiting
+    /// for the uniform successor — not just the joint commit. New
+    /// voters must already be control learners (the reconciler admits
+    /// `Active` data nodes automatically).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the uniform set never lands.
+    pub fn set_control_voters(&self, voters: &[u64]) {
+        const CONTROL_TABLET: u64 = u64::MAX;
+        let mut want: Vec<u64> = voters.to_vec();
+        want.sort_unstable();
+        let body = serde_json::json!({ "voters": voters, "retain": false });
+        let deadline = Instant::now() + Duration::from_secs(180);
+        loop {
+            // Re-propose while joint: the committed joint config needs
+            // its uniform successor re-proposed explicitly.
+            if let Some(leader) = self.control_leader_index() {
+                let _ = self.admin_post(
+                    leader,
+                    &format!("/v1/tablets/{CONTROL_TABLET}/members"),
+                    &body,
+                );
+            }
+            for index in 0..self.nodes.len() {
+                if self.nodes[index].child.is_none() {
+                    continue;
+                }
+                let (status, json) =
+                    self.admin_get(index, &format!("/v1/tablets/{CONTROL_TABLET}/membership"));
+                if status != 200 {
+                    continue;
+                }
+                let joint = json.get("joint").and_then(Value::as_bool).unwrap_or(true);
+                let mut seen: Vec<u64> = json
+                    .get("voters")
+                    .and_then(Value::as_array)
+                    .map(|ids| ids.iter().filter_map(Value::as_u64).collect())
+                    .unwrap_or_default();
+                seen.sort_unstable();
+                if !joint && seen == want {
+                    return;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "control membership never became uniform {want:?}"
+            );
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    /// Desired replica counts per node from the registry placements.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no live member serves control state.
+    #[must_use]
+    pub fn replica_counts(&self) -> std::collections::HashMap<u64, usize> {
+        for index in 0..self.nodes.len() {
+            if self.nodes[index].child.is_none() {
+                continue;
+            }
+            let (_, json) = self.admin_get(index, "/v1/control");
+            let Some(placements) = json.get("placements").and_then(Value::as_array) else {
+                continue;
+            };
+            let mut counts = std::collections::HashMap::new();
+            for placement in placements {
+                let replicas: Vec<u64> = placement
+                    .get("replicas")
+                    .and_then(Value::as_array)
+                    .map(|ids| ids.iter().filter_map(Value::as_u64).collect())
+                    .unwrap_or_default();
+                for replica in replicas {
+                    *counts.entry(replica).or_insert(0) += 1;
+                }
+            }
+            return counts;
+        }
+        panic!("no live member serves control state");
+    }
 }
 
-/// Formats raw addresses as a `1=a,2=b,3=c` flag value.
-fn flag_list(addrs: &[String]) -> String {
-    addrs
+/// Formats `(id, address)` pairs as a `1=a,2=b,3=c` flag value.
+/// Node ids ride explicitly (never positionally) so removed nodes leave
+/// no ambiguity for later restarts and joins.
+fn flag_list(addrs: &[(u64, String)]) -> String {
+    let mut sorted = addrs.to_vec();
+    sorted.sort_by_key(|(id, _)| *id);
+    sorted
         .iter()
-        .enumerate()
-        .map(|(i, addr)| format!("{}={addr}", i + 1))
+        .map(|(id, addr)| format!("{id}={addr}"))
         .collect::<Vec<_>>()
         .join(",")
 }

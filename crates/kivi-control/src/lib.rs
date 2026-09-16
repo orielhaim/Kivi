@@ -1,0 +1,34 @@
+//! Replicated cluster control plane: typed desired topology.
+//!
+//! The control plane owns **desired** cluster topology; each tablet's own
+//! Raft membership remains authoritative for its actual voter state.
+//! Migration reconciles actual toward desired through persisted plans.
+//!
+//! ```text
+//! Cluster Control Plane (one system Raft group)
+//!         │
+//!         ├── NodeRegistry (admitted nodes + lifecycle)
+//!         ├── DesiredReplicaSets (per-tablet desired voters)
+//!         ├── MigrationPlans (persistent multi-step moves)
+//!         └── PlacementVersion / ClusterGeneration (fencing)
+//! ```
+//!
+//! Control state is project-owned typed mutations with canonical
+//! little-endian encoding. `OpenRaft` Rust structs are never persisted
+//! as canonical control state.
+
+pub mod migration;
+pub mod mutation;
+pub mod node;
+pub mod placement;
+pub mod planner;
+pub mod state;
+
+pub use migration::{MigrationError, MigrationPhase, MigrationPlan, MigrationPlanId};
+pub use mutation::{CONTROL_MUTATION_VERSION, ControlMutation, ControlMutationError};
+pub use node::{NodeError, NodeRecord, NodeState};
+pub use placement::{DesiredReplicaSet, PlacementError, PlacementVersion};
+pub use planner::{
+    MigrationIntent, PlannerConfig, PlannerError, intents_to_plans, plan_drain, plan_rebalance,
+};
+pub use state::{ClusterGeneration, ControlSnapshotError, ControlState};

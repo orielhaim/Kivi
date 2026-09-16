@@ -283,7 +283,11 @@ pub trait PeerHandler: Send + Sync + 'static {
 }
 
 /// TLS material for the mesh: this node's certificate plus how to verify
-/// everyone else. Exactly one of `peer_certs` / `insecure_skip_verify`
+/// everyone else. Static `peer_certs` seed verification;
+/// [`TrustRegistry`](crate::tls::TrustRegistry) extends it as the
+/// replicated control plane commits node admissions — authenticated
+/// node identity comes from the registry, not from restarting every
+/// node with new flags. Exactly one of pins / `insecure_skip_verify`
 /// authenticates outgoing connections.
 #[derive(Debug, Clone)]
 pub struct TlsMaterial {
@@ -291,6 +295,9 @@ pub struct TlsMaterial {
     pub cert: NodeCert,
     /// Expected peer certificates (trust anchors) by node.
     pub peer_certs: HashMap<NodeId, Vec<u8>>,
+    /// Dynamically admitted peer pins (shared with the node front, so
+    /// registry commits extend verification without a restart).
+    pub trust: Option<crate::tls::TrustRegistry>,
     /// Test-only escape hatch for `kivi-lab` (ephemeral ports and fresh
     /// data directories per run make static pins impractical there).
     /// Never set in production: without verification any network peer
@@ -372,13 +379,28 @@ struct TransportInner {
     local: PeerIdentity,
     cluster: ClusterId,
     config: TransportConfig,
-    links: HashMap<NodeId, Arc<PeerLink>>,
+    /// Dialable peer links. Behind a read-write lock so the replicated
+    /// control plane can admit nodes at runtime: `add_peer` inserts the
+    /// joining node's link and the driver's heal loop dials it — no
+    /// restart, no flag edits.
+    links: std::sync::RwLock<HashMap<NodeId, Arc<PeerLink>>>,
+    /// Dynamic trust pins shared with the node front (see
+    /// [`TlsMaterial::trust`](TlsMaterial::trust)).
+    trust: Option<crate::tls::TrustRegistry>,
     incarnations: futures::lock::Mutex<IncarnationTable>,
     running: AtomicBool,
     ready: AtomicBool,
     handler: Arc<dyn PeerHandler>,
     driver_tx: async_channel::Sender<DriverCommand>,
     active_streams: AtomicU64,
+}
+
+impl TransportInner {
+    /// Returns the dialable link for one peer, if admitted (statically
+    /// or dynamically).
+    fn link(&self, peer: NodeId) -> Option<Arc<PeerLink>> {
+        self.links.read().ok()?.get(&peer).cloned()
+    }
 }
 
 /// QUIC/H3 peer mesh. Cloneable (`Send + Sync`): connection tasks run on
@@ -391,9 +413,14 @@ pub struct PeerTransport {
 
 impl std::fmt::Debug for PeerTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let peers = self
+            .inner
+            .links
+            .read()
+            .map_or(usize::MAX, |links| links.len());
         f.debug_struct("PeerTransport")
             .field("local", &self.inner.local)
-            .field("peers", &self.inner.links.len())
+            .field("peers", &peers)
             .finish_non_exhaustive()
     }
 }
@@ -500,7 +527,8 @@ impl PeerTransport {
                 local,
                 cluster,
                 config,
-                links,
+                links: std::sync::RwLock::new(links),
+                trust: tls.trust.clone(),
                 incarnations: futures::lock::Mutex::new(IncarnationTable::new()),
                 running: AtomicBool::new(true),
                 ready: AtomicBool::new(!paused),
@@ -510,22 +538,19 @@ impl PeerTransport {
             }),
         };
         {
-            // Tuned rustls client config for per-dial QUIC configs: pinned
-            // anchors normally, the test-only insecure verifier for lab.
-            let rustls_client = Arc::new(if tls.insecure_skip_verify {
-                crate::tls::client_config_insecure()
-            } else {
+            // Static pins still validate at open (fail-closed before any
+            // dial); dynamic pins merge per dial (see `dial_client_config`).
+            if !tls.insecure_skip_verify {
                 crate::tls::client_config_pinned(&tls.peer_certs).map_err(|detail| {
                     TransportError::Unreachable {
                         detail: format!("peer TLS client config: {detail}"),
                     }
-                })?
-            });
+                })?;
+            }
             let driver = MeshDriver {
                 transport: transport.clone(),
                 endpoint,
                 tls: Arc::new(tls),
-                rustls_client,
                 quic_transport: Arc::new(transport.inner.config.quic_transport()),
                 outgoing: std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())),
                 incoming: std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())),
@@ -580,7 +605,12 @@ impl PeerTransport {
         request: PeerRequest,
         timeout: Duration,
     ) -> Result<PeerResponse, TransportError> {
-        if !self.inner.links.contains_key(&target) {
+        let known = self
+            .inner
+            .links
+            .read()
+            .is_ok_and(|links| links.contains_key(&target));
+        if !known {
             return Err(TransportError::UnknownPeer {
                 node: target.as_u64(),
             });
@@ -607,10 +637,55 @@ impl PeerTransport {
         }
     }
 
+    /// Adds a dialable peer link for a dynamically admitted node
+    /// (replicated registry commit). Returns whether the link is new.
+    /// Safe to call from any thread; the driver's heal loop dials the
+    /// new link on its next pass. Never removes or replaces existing
+    /// links (admission only adds).
+    #[must_use]
+    pub fn add_peer(&self, peer: NodeId, addr: SocketAddr) -> bool {
+        use std::collections::hash_map::Entry;
+        if peer == self.inner.local.node {
+            return false;
+        }
+        self.inner.links.write().is_ok_and(|mut links| {
+            if let Entry::Vacant(slot) = links.entry(peer) {
+                slot.insert(Arc::new(PeerLink::new(addr)));
+                true
+            } else {
+                false
+            }
+        })
+    }
+
+    /// Pins a dynamically admitted peer's certificate DER for TLS
+    /// verification (both dials and incoming connections). Static pins
+    /// keep precedence on conflict (a registry pin never overrides an
+    /// operator-configured anchor for the same node).
+    pub fn trust_peer(&self, peer: NodeId, cert_der: Vec<u8>) {
+        let Some(trust) = self.inner.trust.as_ref() else {
+            return;
+        };
+        if let Ok(mut pins) = trust.write() {
+            pins.entry(peer).or_insert(cert_der);
+        }
+    }
+
     /// Snapshots per-peer diagnostics (admin plane).
     pub async fn stats(&self) -> HashMap<NodeId, PeerStats> {
+        let links: Vec<(NodeId, Arc<PeerLink>)> = self
+            .inner
+            .links
+            .read()
+            .map(|links| {
+                links
+                    .iter()
+                    .map(|(node, link)| (*node, Arc::clone(link)))
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut out = HashMap::new();
-        for (node, link) in &self.inner.links {
+        for (node, link) in &links {
             out.insert(
                 *node,
                 PeerStats {
@@ -643,7 +718,13 @@ impl PeerTransport {
     /// Returns only after the link's in-flight streams drained (bounded),
     /// so the partition is airtight for fencing verdicts.
     pub async fn suspend_peer(&self, peer: NodeId) {
-        let Some(link) = self.inner.links.get(&peer) else {
+        let link = self
+            .inner
+            .links
+            .read()
+            .ok()
+            .and_then(|links| links.get(&peer).cloned());
+        let Some(link) = link else {
             return;
         };
         link.suspended.store(true, Ordering::SeqCst);
@@ -668,7 +749,13 @@ impl PeerTransport {
     /// Resumes a suspended peer link.
     #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn resume_peer(&self, peer: NodeId) {
-        if let Some(link) = self.inner.links.get(&peer) {
+        if let Some(link) = self
+            .inner
+            .links
+            .read()
+            .ok()
+            .and_then(|links| links.get(&peer).cloned())
+        {
             link.suspended.store(false, Ordering::SeqCst);
         }
     }
@@ -799,10 +886,6 @@ struct MeshDriver {
     transport: PeerTransport,
     endpoint: Endpoint,
     tls: Arc<TlsMaterial>,
-    /// Tuned rustls client config for per-dial QUIC configs (pinned
-    /// anchors, or the test-only insecure verifier): transport windows
-    /// plus no 0-RTT in every mode.
-    rustls_client: Arc<rustls::ClientConfig>,
     quic_transport: Arc<QuicTransportConfig>,
     outgoing: std::rc::Rc<std::cell::RefCell<HashMap<(NodeId, Lane), Outgoing>>>,
     /// Incoming QUIC connections by validated peer (suspend drops them).
@@ -867,7 +950,19 @@ impl MeshDriver {
         // Only the higher NodeId dials: two connections per pair, no
         // simultaneous-open coordination needed.
         let mut tasks = Vec::new();
-        for (node, link) in self.transport.inner.links.clone() {
+        let links: Vec<(NodeId, Arc<PeerLink>)> = self
+            .transport
+            .inner
+            .links
+            .read()
+            .map(|links| {
+                links
+                    .iter()
+                    .map(|(node, link)| (*node, Arc::clone(link)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (node, link) in links {
             if node.as_u64() < self.transport.inner.local.node.as_u64() {
                 continue;
             }
@@ -918,7 +1013,14 @@ impl MeshDriver {
                 tracked.conn.close(VarInt::from_u32(0), b"suspended");
             }
         }
-        if let Some(link) = self.transport.inner.links.get(&peer) {
+        if let Some(link) = self
+            .transport
+            .inner
+            .links
+            .read()
+            .ok()
+            .and_then(|links| links.get(&peer).cloned())
+        {
             link.connected_control.store(false, Ordering::SeqCst);
             link.connected_bulk.store(false, Ordering::SeqCst);
         }
@@ -949,7 +1051,14 @@ impl MeshDriver {
         }
         let control = conns.iter().any(|tracked| tracked.control);
         let bulk = conns.iter().any(|tracked| tracked.bulk);
-        if let Some(link) = self.transport.inner.links.get(&node) {
+        if let Some(link) = self
+            .transport
+            .inner
+            .links
+            .read()
+            .ok()
+            .and_then(|links| links.get(&node).cloned())
+        {
             link.connected_control.store(control, Ordering::SeqCst);
             link.connected_bulk.store(bulk, Ordering::SeqCst);
             let rtt_ms = conn.rtt().as_millis();
@@ -975,7 +1084,14 @@ impl MeshDriver {
         if conns.is_empty() {
             incoming.remove(&node);
         }
-        if let Some(link) = self.transport.inner.links.get(&node) {
+        if let Some(link) = self
+            .transport
+            .inner
+            .links
+            .read()
+            .ok()
+            .and_then(|links| links.get(&node).cloned())
+        {
             link.connected_control.store(control, Ordering::SeqCst);
             link.connected_bulk.store(bulk, Ordering::SeqCst);
         }
@@ -985,11 +1101,28 @@ impl MeshDriver {
     /// plus no 0-RTT in every mode (replayable handshakes must never
     /// carry mutating Raft RPCs; all peer RPCs are idempotent besides,
     /// but the safe default stands).
+    ///
+    /// Pins merge static anchors with the dynamic trust registry on
+    /// every dial, so control-plane admissions extend verification
+    /// without a restart. Static anchors win on conflict (a registry
+    /// pin never overrides an operator-configured anchor).
     fn dial_client_config(&self) -> Option<ClientConfig> {
-        let crypto = compio::quic::crypto::rustls::QuicClientConfig::try_from(Arc::clone(
-            &self.rustls_client,
-        ))
-        .ok()?;
+        let rustls_client = if self.tls.insecure_skip_verify {
+            crate::tls::client_config_insecure()
+        } else {
+            let mut pins = self.tls.peer_certs.clone();
+            if let Some(trust) = self.transport.inner.trust.as_ref()
+                && let Ok(dynamic) = trust.read()
+            {
+                for (node, der) in dynamic.iter() {
+                    pins.entry(*node).or_insert_with(|| der.clone());
+                }
+            }
+            crate::tls::client_config_pinned(&pins).ok()?
+        };
+        let crypto =
+            compio::quic::crypto::rustls::QuicClientConfig::try_from(Arc::new(rustls_client))
+                .ok()?;
         let mut config = ClientConfig::new(Arc::new(crypto));
         config.transport_config(Arc::clone(&self.quic_transport));
         Some(config)
@@ -1009,9 +1142,14 @@ impl MeshDriver {
     async fn execute_inner(&self, command: &CallCommand) -> Result<PeerResponse, TransportError> {
         use TransportError as Fault;
         let inner = &self.transport.inner;
-        let link = inner.links.get(&command.target).ok_or(Fault::UnknownPeer {
-            node: command.target.as_u64(),
-        })?;
+        let link = inner
+            .links
+            .read()
+            .ok()
+            .and_then(|links| links.get(&command.target).cloned())
+            .ok_or(Fault::UnknownPeer {
+                node: command.target.as_u64(),
+            })?;
         if link.suspended.load(Ordering::SeqCst) {
             // Suspended links fail fast as timeouts (partition tests and
             // drain tooling expect `Timeout`, never a hang).
@@ -1031,7 +1169,7 @@ impl MeshDriver {
         counters.requests.fetch_add(1, Ordering::SeqCst);
         inner.active_streams.fetch_add(1, Ordering::SeqCst);
         let result = self
-            .h3_round_trip(command, link, &path, media, &body, max_body)
+            .h3_round_trip(command, &link, &path, media, &body, max_body)
             .await;
         inner.active_streams.fetch_sub(1, Ordering::SeqCst);
         let response_body = result?;
@@ -1259,7 +1397,14 @@ impl MeshDriver {
     /// redials instead of reusing a broken stream.
     fn drop_outgoing(&self, target: NodeId, lane: Lane) {
         self.outgoing.borrow_mut().remove(&(target, lane));
-        if let Some(link) = self.transport.inner.links.get(&target) {
+        if let Some(link) = self
+            .transport
+            .inner
+            .links
+            .read()
+            .ok()
+            .and_then(|links| links.get(&target).cloned())
+        {
             match lane {
                 Lane::Control => link.connected_control.store(false, Ordering::SeqCst),
                 Lane::Bulk => link.connected_bulk.store(false, Ordering::SeqCst),
@@ -1342,17 +1487,37 @@ impl MeshDriver {
     /// configured node. Unknown certificates serve nothing: the handshake
     /// TLS already rejected untrusted peers in normal mode, and this maps
     /// the trusted certificate to its Kivi identity so a request claiming
-    /// another node is refused. In test-only insecure mode there is no pin
-    /// to bind (loopback lab traffic); identity then rests on the
-    /// validated headers alone.
+    /// another node is refused. Static pins win on conflict; dynamic
+    /// registry pins extend the set without a restart. In test-only
+    /// insecure mode there is no pin to bind (loopback lab traffic);
+    /// identity then rests on the validated headers alone.
     fn incoming_peer(&self, conn: &Connection) -> Option<NodeId> {
-        if self.tls.peer_certs.is_empty() {
+        if self.tls.peer_certs.is_empty()
+            && self
+                .transport
+                .inner
+                .trust
+                .as_ref()
+                .is_none_or(|trust| trust.read().map_or(true, |pins| pins.is_empty()))
+        {
             return None;
         }
         let chain = conn.peer_identity()?;
         let leaf = chain.first()?;
-        self.tls
+        if let Some(node) = self
+            .tls
             .peer_certs
+            .iter()
+            .find_map(|(node, der)| (*der == leaf.as_ref()).then_some(*node))
+        {
+            return Some(node);
+        }
+        self.transport
+            .inner
+            .trust
+            .as_ref()?
+            .read()
+            .ok()?
             .iter()
             .find_map(|(node, der)| (*der == leaf.as_ref()).then_some(*node))
     }
@@ -1416,8 +1581,7 @@ impl MeshDriver {
         }
         let from = NodeId::from_u64(node);
         if inner
-            .links
-            .get(&from)
+            .link(from)
             .is_some_and(|link| link.suspended.load(Ordering::SeqCst))
         {
             serve_refuse(
@@ -1450,7 +1614,7 @@ impl MeshDriver {
             let mut table = inner.incarnations.lock().await;
             table.observe(validated.node, validated.incarnation);
         }
-        if let Some(link) = inner.links.get(&from) {
+        if let Some(link) = inner.link(from) {
             *link.incarnation.lock().await = Some(incarnation);
         }
         // Bodies are Raft POSTs, the small bulk preflight POST, or empty
@@ -1509,12 +1673,12 @@ impl MeshDriver {
             _ => Lane::Control,
         };
         self.note_inbound_lane(from, lane, conn);
-        if let Some(link) = inner.links.get(&from) {
+        if let Some(link) = inner.link(from) {
             link.active.fetch_add(1, Ordering::SeqCst);
         }
         inner.active_streams.fetch_add(1, Ordering::SeqCst);
         let answer = inner.handler.handle(from, group, decoded.request).await;
-        if let Some(link) = inner.links.get(&from) {
+        if let Some(link) = inner.link(from) {
             link.active.fetch_sub(1, Ordering::SeqCst);
         }
         inner.active_streams.fetch_sub(1, Ordering::SeqCst);
@@ -1737,6 +1901,7 @@ mod tests {
             cert: NodeCert::load_or_generate(dir, NodeId::from_u64(node))
                 .expect("test cert generates"),
             peer_certs: HashMap::new(),
+            trust: None,
             insecure_skip_verify: true,
         }
     }
@@ -2254,6 +2419,7 @@ mod tests {
                 TlsMaterial {
                     cert: cert_a,
                     peer_certs: pinned,
+                    trust: None,
                     insecure_skip_verify: false,
                 },
                 echo(),

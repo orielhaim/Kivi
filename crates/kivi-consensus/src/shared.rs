@@ -59,8 +59,8 @@ use kivi_durability::{
 };
 use kivi_types::{NamespaceId, NodeId, TabletId};
 
+use crate::command::ConsensusCommand;
 use crate::config::KiviTypeConfig;
-use crate::mutation::ReplicatedMutation;
 use crate::store::CONSENSUS_LANE;
 use crate::types::ConsensusGroupId;
 use openraft::storage::{IOFlushed, LogState, RaftLogReader, RaftLogStorage};
@@ -656,10 +656,10 @@ fn group_stored_to_entry(
     let payload = match &stored.payload {
         GroupStoredPayload::Blank => EntryPayload::Blank,
         GroupStoredPayload::Normal(command) => {
-            let mutation = ReplicatedMutation::decode_exact(command).map_err(|error| {
+            let mantra = ConsensusCommand::decode_exact(command).map_err(|error| {
                 io::Error::other(format!("stored command entry fails to decode: {error}"))
             })?;
-            EntryPayload::Normal(mutation)
+            EntryPayload::Normal(mantra)
         }
         GroupStoredPayload::Membership(membership) => {
             let voters: BTreeSet<u64> = membership.voters.iter().copied().collect();

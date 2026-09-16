@@ -1104,37 +1104,76 @@ impl NativeClient {
         let mut redirects = 0usize;
         let mut reconnects = 0usize;
         let mut deliveries = 0u32;
+        // Consecutive `Overloaded` answers from one endpoint (a deaf or
+        // partitioned member): bounded retries honor genuine elections,
+        // then the route evicts and fails over instead of pinning on a
+        // black hole.
+        let mut overloaded_streak = 0u32;
+        // Dead-member failover: endpoints that fail this call are
+        // remembered (`tried`) and never redialed within the call, so a
+        // killed or retired member fails over across untried seeds
+        // instead of stranding the request on a grave (§34). Rotation
+        // terminates: every seed is tried at most once per call, and
+        // the redirect budget backstops everything else.
+        let mut tried: Vec<String> = Vec::new();
+        let mut seed_cursor = 0usize;
         self.shared.requests.fetch_add(1, Ordering::Relaxed);
         let outcome: Result<Response, ClientError> = loop {
             if redirects > self.shared.max_redirects {
                 self.shared.errors.fetch_add(1, Ordering::Relaxed);
                 break Err(ClientError::TooManyRedirects);
             }
-            // Route: cached range authority, else the seed with no hint.
-            // The per-tablet leader cache (`tablet_leaders`) is updated on
+            // Route: cached range authority (unless already tried dead
+            // this call), else the next untried seed with no hint. The
+            // per-tablet leader cache (`tablet_leaders`) is updated on
             // every redirect for cluster introspection and future
             // many-tablet routing, but it never overrides range routing:
-            // single-node deployments replicate many tablets per process,
-            // so any single cached leader endpoint would misroute other
-            // tablets (replicated clusters use a root range covering every
-            // key, so the range hit already lands on the leader). The
-            // mutation identity above is preserved across all hops.
+            // single-node deployments replicate many tablets per
+            // process, so any single cached leader endpoint would
+            // misroute other tablets (replicated clusters use a root
+            // range covering every key, so the range hit already lands on
+            // the leader). The mutation identity above is preserved
+            // across all hops.
             let (endpoint, hint) = match self.shared.routes.lookup(hash) {
-                Some(route) => {
+                Some(route) if !tried.contains(&route.endpoint) => {
                     self.shared
                         .tablet_leaders
                         .insert(route.tablet, route.endpoint.clone());
                     (route.endpoint.clone(), Some(route.hint()))
                 }
-                None => (self.shared.seeds[0].clone(), None),
+                _ => {
+                    let mut pick = None;
+                    for _ in 0..self.shared.seeds.len() {
+                        let candidate =
+                            self.shared.seeds[seed_cursor % self.shared.seeds.len()].clone();
+                        seed_cursor += 1;
+                        if !tried.contains(&candidate) {
+                            pick = Some(candidate);
+                            break;
+                        }
+                    }
+                    let Some(endpoint) = pick else {
+                        self.shared.errors.fetch_add(1, Ordering::Relaxed);
+                        break Err(ClientError::Io("all known endpoints failed".to_owned()));
+                    };
+                    (endpoint, None)
+                }
             };
             let expect = hint.map(|hint| hint.worker);
-            let conn = match self.connection(&endpoint, expect) {
-                Ok(conn) => conn,
-                Err(error) => {
-                    self.shared.errors.fetch_add(1, Ordering::Relaxed);
-                    break Err(error);
-                }
+            let Ok(conn) = self.connection(&endpoint, expect) else {
+                // A dead endpoint (killed member, retired replica)
+                // evicts its cached routes and is never retried this
+                // call; the next iteration picks an untried seed or
+                // exhausts. Rotation does not consume redirect
+                // budget (the tried-set already bounds it); the
+                // budget counts routing loops only. No sleep: a
+                // refused dial is definitive (backoff lives on
+                // congestion paths, not graves).
+                self.drop_connection(&endpoint);
+                self.shared.routes.evict_endpoint(&endpoint);
+                self.shared.tablet_leaders.evict_endpoint(&endpoint);
+                tried.push(endpoint);
+                continue;
             };
             let mut request = build();
             request.hint = hint;
@@ -1181,11 +1220,51 @@ impl NativeClient {
                     self.shared.errors.fetch_add(1, Ordering::Relaxed);
                     break Err(ClientError::AmbiguousOutcome);
                 }
+                Err(ClientError::Io(_)) => {
+                    // The endpoint died mid-request (kill, restart,
+                    // retire): same failover as a refused dial when the
+                    // retry is provably safe (reads, or mutating
+                    // requests under durable dedup with a preserved
+                    // identity). Otherwise the outcome stays ambiguous
+                    // rather than risking a duplicate execution. The
+                    // tried-set bounds rotation; the redirect budget
+                    // backstops it.
+                    let safe = !mutating || conn.durable_dedup();
+                    if !safe {
+                        self.shared.errors.fetch_add(1, Ordering::Relaxed);
+                        break Err(ClientError::AmbiguousOutcome);
+                    }
+                    self.drop_connection(&endpoint);
+                    self.shared.routes.evict_endpoint(&endpoint);
+                    self.shared.tablet_leaders.evict_endpoint(&endpoint);
+                    tried.push(endpoint);
+                    reconnects = 0;
+                    backoff(
+                        self.shared.dial_backoff,
+                        u32::try_from(redirects).unwrap_or(u32::MAX).min(6),
+                    );
+                    continue;
+                }
                 Err(error) => {
                     self.shared.errors.fetch_add(1, Ordering::Relaxed);
                     break Err(error);
                 }
             };
+            if std::env::var("KIVI_CLIENT_TRACE").is_ok() {
+                let detail = match &response.body {
+                    kivi_protocol::ResponseBody::Redirect(info) => {
+                        format!("redirect tablet={} to={}", info.tablet, info.endpoint)
+                    }
+                    kivi_protocol::ResponseBody::Diagnostic(text) => {
+                        format!("diagnostic {text:?}")
+                    }
+                    _ => String::from("(body)"),
+                };
+                eprintln!(
+                    "CLIENT hop redirects={redirects} endpoint={endpoint} status={:?} {detail}",
+                    response.status
+                );
+            }
             match response.status {
                 Status::Ok | Status::NotFound => break Ok(response),
                 Status::StaleRoute | Status::NotLocal => {
@@ -1195,6 +1274,7 @@ impl NativeClient {
                             .insert(info.tablet, info.endpoint.clone());
                         self.shared.routes.insert(RouteEntry::from_redirect(info));
                     }
+                    overloaded_streak = 0;
                     redirects += 1;
                     self.shared.redirects.fetch_add(1, Ordering::Relaxed);
                     // Bounded backoff on redirects: stale hints during
@@ -1205,8 +1285,26 @@ impl NativeClient {
                     );
                 }
                 Status::Overloaded => {
+                    // Election or migration churn: back off (like
+                    // redirects) instead of spinning the budget dry in
+                    // milliseconds while a leader emerges. Past a short
+                    // streak, the endpoint is deaf rather than busy:
+                    // evict and fail over instead of pinning on it.
                     redirects += 1;
+                    overloaded_streak += 1;
                     self.shared.redirects.fetch_add(1, Ordering::Relaxed);
+                    if overloaded_streak >= 3 {
+                        overloaded_streak = 0;
+                        self.drop_connection(&endpoint);
+                        self.shared.routes.evict_endpoint(&endpoint);
+                        self.shared.tablet_leaders.evict_endpoint(&endpoint);
+                        tried.push(endpoint);
+                    } else {
+                        backoff(
+                            self.shared.dial_backoff,
+                            u32::try_from(redirects).unwrap_or(u32::MAX).min(6),
+                        );
+                    }
                 }
                 other => {
                     self.shared.errors.fetch_add(1, Ordering::Relaxed);
@@ -1411,6 +1509,11 @@ impl NativeClient {
             ))?;
         let mut redirects = 0usize;
         let mut reconnects = 0usize;
+        // Same dead-member failover as `execute_with_seq` (reads
+        // re-run safely, so rotation never risks duplication): failed
+        // endpoints are tried at most once per call.
+        let mut tried: Vec<String> = Vec::new();
+        let mut seed_cursor = 0usize;
         self.shared.requests.fetch_add(1, Ordering::Relaxed);
         loop {
             if redirects > self.shared.max_redirects {
@@ -1418,16 +1521,37 @@ impl NativeClient {
                 return Err(ClientError::TooManyRedirects);
             }
             let (endpoint, hint) = match self.shared.routes.lookup(hash) {
-                Some(route) => (route.endpoint.clone(), Some(route.hint())),
-                None => (self.shared.seeds[0].clone(), None),
+                Some(route) if !tried.contains(&route.endpoint) => {
+                    (route.endpoint.clone(), Some(route.hint()))
+                }
+                _ => {
+                    let mut pick = None;
+                    for _ in 0..self.shared.seeds.len() {
+                        let candidate =
+                            self.shared.seeds[seed_cursor % self.shared.seeds.len()].clone();
+                        seed_cursor += 1;
+                        if !tried.contains(&candidate) {
+                            pick = Some(candidate);
+                            break;
+                        }
+                    }
+                    let Some(endpoint) = pick else {
+                        self.shared.errors.fetch_add(1, Ordering::Relaxed);
+                        return Err(ClientError::Io("all known endpoints failed".to_owned()));
+                    };
+                    (endpoint, None)
+                }
             };
             let expect = hint.map(|hint| hint.worker);
-            let conn = match self.connection(&endpoint, expect) {
-                Ok(conn) => conn,
-                Err(error) => {
-                    self.shared.errors.fetch_add(1, Ordering::Relaxed);
-                    return Err(error);
-                }
+            let Ok(conn) = self.connection(&endpoint, expect) else {
+                // Refused dials fail over immediately (no sleep: the
+                // refusal is definitive; the tried-set terminates
+                // without consuming redirect budget).
+                self.drop_connection(&endpoint);
+                self.shared.routes.evict_endpoint(&endpoint);
+                self.shared.tablet_leaders.evict_endpoint(&endpoint);
+                tried.push(endpoint);
+                continue;
             };
             if !conn.streaming() {
                 self.shared.errors.fetch_add(1, Ordering::Relaxed);
@@ -1449,16 +1573,19 @@ impl NativeClient {
                 }
                 GetOutcome::Reconnect => {
                     // Reads have no side effects: redial and retry, like
-                    // `execute_with_seq`, bounded the same way.
+                    // `execute_with_seq`, failing over across untried
+                    // seeds when one member stays down.
                     reconnects += 1;
-                    if reconnects > 2 {
-                        self.shared.errors.fetch_add(1, Ordering::Relaxed);
-                        return Err(ClientError::AmbiguousOutcome);
-                    }
                     self.drop_connection(&endpoint);
+                    if reconnects > 2 {
+                        self.shared.routes.evict_endpoint(&endpoint);
+                        self.shared.tablet_leaders.evict_endpoint(&endpoint);
+                        tried.push(endpoint);
+                        reconnects = 0;
+                    }
                     backoff(
                         self.shared.dial_backoff,
-                        u32::try_from(reconnects).unwrap_or(u32::MAX),
+                        u32::try_from(redirects).unwrap_or(u32::MAX).min(6),
                     );
                 }
                 GetOutcome::Fail(error) => {

@@ -16,6 +16,7 @@ members = [
     "crates/kivi-chunk",
     "crates/kivi-resp",
     "crates/kivi-consensus",
+    "crates/kivi-control",
     "crates/kivi-lab",
 ]
 

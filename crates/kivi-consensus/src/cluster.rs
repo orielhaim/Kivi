@@ -1,7 +1,10 @@
-//! Static distributed topology and durable bootstrap semantics
-//! (tasks F, G).
+//! Static bootstrap topology and durable restart semantics.
 //!
-//! The first replicated deployment is one statically configured cluster:
+//! The static [`ClusterTopology`] is formation input only: it names the
+//! initial members, dial endpoints, and tablet assignments for a fresh
+//! cluster's first boot. After bootstrap the replicated control plane
+//! owns placement; restarts recover durable state and never re-verify
+//! voter sets against these flags (see [`verify_against_durable`]).
 //!
 //! ```text
 //! ClusterId
@@ -9,34 +12,33 @@
 //!   Tablet { TabletId, replicas: [NodeId] }
 //! ```
 //!
-//! Supported initial topology: 1 replicated tablet × 3 voting replicas,
-//! one replica per node. The durable format never hardcodes the replica
-//! count: voters are an ordered set, so larger or smaller static groups
-//! (and later multi-tablet groups) reuse the same types.
+//! The durable format never hardcodes the replica count: voters are an
+//! ordered set, so groups of any size reuse the same types. Learners,
+//! voter replacement, and membership evolution all flow through the
+//! normal Raft log path after formation.
 //!
-//! Out of scope: learners, add/remove voter, placement, migration,
-//! split/merge, control-plane Raft (task AL).
+//! ## Bootstrap semantics
 //!
-//! ## Bootstrap semantics (task G)
-//!
-//! Membership installs exactly once. First formation persists the
-//! `OpenRaft` membership entry through the normal log path and the group
-//! forms; restarts recover existing Raft state and must NOT initialize a
-//! new group. Startup config conflicting with durable identity or
-//! membership fails loudly.
+//! Membership installs exactly once, and only on a brand-new data
+//! directory. First formation persists the `OpenRaft` membership entry
+//! through the normal log path and the group forms; rejoins recover
+//! existing Raft state and must NOT initialize a new group
+//! (initializing on rejoin would fork a live group's history).
+//! Startup config conflicting with durable identity fails loudly.
 //!
 //! [`classify_bootstrap`] decides fresh vs. existing from durable state
-//! (vote, log, snapshot base — all three empty means fresh). Every node in
-//! a fresh static cluster calls `initialize` on its own `Raft` instance
-//! with the joint membership; `OpenRaft`'s contract makes a repeated local
-//! `initialize` with identical membership benign (already-initialized),
-//! which is the race the density spike met: concurrent local
-//! initialization attempts converge instead of forking groups.
+//! (vote, log, snapshot base — all three empty means fresh). Every node
+//! in a fresh static cluster calls `initialize` on its own `Raft`
+//! instance with the joint membership; `OpenRaft`'s contract makes a
+//! repeated local `initialize` with identical membership benign
+//! (already-initialized), which is the race the density spike met:
+//! concurrent local initialization attempts converge instead of forking
+//! groups.
 //!
 //! [`verify_against_durable`] enforces restart discipline: cluster and
-//! node identity must match the data directory, and the configured voter
-//! set must equal the durable membership. Endpoint addresses may change
-//! across restarts (operator port remapping); identities may not.
+//! node identity must match the data directory, and the tablet must
+//! still be assigned locally. Endpoint addresses may change across
+//! restarts (operator port remapping); identities may not.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
@@ -248,18 +250,16 @@ pub const fn classify_bootstrap(
     }
 }
 
-/// Durable identity and membership observed at startup, for restart
-/// verification.
+/// Durable identity observed at startup, for restart verification.
+/// Voter sets are deliberately NOT part of restart verification: the
+/// replicated control plane moves them while members are down, so the
+/// open-time desired oracle (not this view) fences removed replicas.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DurableClusterView {
     /// Cluster identity from the data directory.
     pub cluster: ClusterId,
     /// Node identity from the data directory.
     pub node: NodeId,
-    /// Voter set from the durable log/snapshot membership (empty when the
-    /// group never committed membership — only possible on a fresh
-    /// directory, which never reaches verification).
-    pub voters: BTreeSet<u64>,
 }
 
 /// Why startup refused to join the configured cluster.
@@ -288,26 +288,25 @@ pub enum BootstrapError {
         /// The local node.
         node: u64,
     },
-    /// The configured voter set differs from durable membership:
-    /// re-bootstrapping over history would fork it.
-    #[error("membership mismatch: durable voters {durable:?}, configured voters {configured:?}")]
-    MembershipMismatch {
-        /// Configured voters.
-        configured: BTreeSet<u64>,
-        /// Durable voters.
-        durable: BTreeSet<u64>,
-    },
 }
 
 /// Verifies startup config against durable state (restart discipline):
-/// identities must match exactly, and the configured voter set for the
-/// tablet must equal the durable voter set. Endpoint addresses are
-/// deliberately NOT compared (operators may remap ports across restarts).
+/// identities must match exactly and the tablet must still be assigned
+/// to the local node. The configured voter set is deliberately NOT
+/// compared: once the replicated control plane owns placement, startup
+/// flags go stale (new members join without restarts), and restarts
+/// must recover durable membership — never refuse it, never
+/// re-initialize over it. Removed-while-down replicas are fenced
+/// earlier at open (tombstoned through the control-plane desired
+/// oracle), so this check stays permissive by design. Endpoint
+/// addresses are likewise NOT compared (operators may remap ports
+/// across restarts).
 ///
 /// # Errors
 ///
-/// Returns [`BootstrapError`] on any identity or membership conflict —
-/// startup fails loudly instead of forking history.
+/// Returns [`BootstrapError`] on any identity conflict, when the local
+/// node is unknown to the static topology, or when the tablet is no
+/// longer assigned to it.
 pub fn verify_against_durable(
     topology: &ClusterTopology,
     tablet: TabletId,
@@ -332,18 +331,19 @@ pub fn verify_against_durable(
             node: local.as_u64(),
         });
     }
-    let (voters, _) = topology
+    // The tablet must still be assigned (a shrunk static config never
+    // silently drops a durable group), but its voter SET comes from
+    // durable state: the control plane may have moved it since boot. A
+    // late joiner (durable state predating its own addition) and a
+    // removed-while-down replica look identical from the log alone;
+    // both recover here, and the open-time control oracle tombstones
+    // the removed ones before they can serve stale state.
+    topology
         .membership_for(tablet)
+        .map(|_| ())
         .map_err(|_| Fault::NotAMember {
             node: local.as_u64(),
-        })?;
-    if voters != durable.voters {
-        return Err(Fault::MembershipMismatch {
-            configured: voters,
-            durable: durable.voters.clone(),
-        });
-    }
-    Ok(())
+        })
 }
 
 #[cfg(test)]
@@ -433,7 +433,6 @@ mod tests {
         let durable = DurableClusterView {
             cluster: topology.cluster,
             node: NodeId::from_u64(1),
-            voters: BTreeSet::from([1, 2, 3]),
         };
         verify_against_durable(
             &topology,
@@ -443,8 +442,10 @@ mod tests {
         )
         .expect("matching restart verifies");
         // Foreign cluster fails.
-        let mut foreign = durable.clone();
-        foreign.cluster = ClusterId::from_u128(0xDEAD);
+        let foreign = DurableClusterView {
+            cluster: ClusterId::from_u128(0xDEAD),
+            node: NodeId::from_u64(1),
+        };
         assert!(matches!(
             verify_against_durable(
                 &topology,
@@ -454,18 +455,8 @@ mod tests {
             ),
             Err(BootstrapError::ClusterMismatch { .. })
         ));
-        // Reconfigured voters fail (would fork history).
-        let mut forked = durable.clone();
-        forked.voters = BTreeSet::from([1, 2, 4]);
-        assert!(matches!(
-            verify_against_durable(
-                &topology,
-                TabletId::from_u64(9),
-                NodeId::from_u64(1),
-                &forked
-            ),
-            Err(BootstrapError::MembershipMismatch { .. })
-        ));
+        // Voter evolution is invisible here by design (the open-time
+        // desired oracle, not this view, fences removed replicas).
         // A node outside the configured set fails.
         assert!(matches!(
             verify_against_durable(

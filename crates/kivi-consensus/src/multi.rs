@@ -30,18 +30,22 @@
 //! assignment, the group registry, the shared mesh thread, worker
 //! threads, lifecycle, and fan-out diagnostics.
 //!
-//! ## Static placement
+//! ## Dynamic placement
 //!
-//! Every configured tablet lists its replicas in the static topology; in
-//! this stage all nodes host one replica of every tablet with independent
-//! Raft leadership per tablet. APIs never assume equal replica sets: votes
-//! and gates resolve per tablet from the topology.
+//! The static topology seeds first-boot formation (initial members and
+//! their tablet assignments, usually all-nodes-host-all-tablets);
+//! afterwards the replicated control plane owns desired placement and
+//! each tablet's Raft membership owns actual voters, with independent
+//! Raft leadership per tablet. Replicas come and go at runtime through
+//! learner replication plus joint-consensus membership changes; APIs
+//! never assume equal replica sets.
 
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use kivi_state::{Operation, OperationResult};
 use kivi_types::{
@@ -49,11 +53,13 @@ use kivi_types::{
     TabletAuthority, TabletEpoch, TabletId, UnixMicros, WriteGuardGeneration,
 };
 
+use crate::cluster::Bootstrap;
 use crate::cluster::ClusterTopology;
 use crate::gate::SidecarGate;
 use crate::node::{
     BootstrapInputs, NodeOpenError, NodeStatus, OwnerCtx, OwnerRequest, ProposeError, ReadError,
-    bootstrap_group, owner_call_on, propose_caller_side, read_caller_side, spawn_raft,
+    bootstrap_group, classify_from_store, owner_call_on, propose_caller_side, read_caller_side,
+    spawn_raft,
 };
 use crate::peer::{PeerRequest, PeerResponse, PeerRpcError};
 use crate::router::PeerRouter;
@@ -87,8 +93,11 @@ pub struct MultiNodeConfig {
     pub data_dir: PathBuf,
     /// Namespace served.
     pub namespace: NamespaceId,
-    /// Tablets replicated by this node (nonempty, unique, nonzero; the
-    /// local node must replicate every one in this static stage).
+    /// Tablets to serve at open (unique, nonzero; empty is valid for a
+    /// joining node that gains replicas through migration). The local
+    /// node must be assigned every listed tablet in the static
+    /// topology; tombstoned and traceless tablets are skipped at open
+    /// and arrive later through the control plane.
     pub tablets: Vec<TabletId>,
     /// This process's node identity (operator-declared; verified against
     /// the data directory, adopted when fresh).
@@ -118,6 +127,28 @@ pub struct MultiNodeConfig {
     pub worker_count: usize,
     /// Shared-writer batching bounds.
     pub durability: SharedDurabilityConfig,
+    /// System control group participation. `None` means this node hosts
+    /// no control replica (pure data host); `Some` joins the replicated
+    /// control plane either by forming it (fresh directories with no
+    /// seeds) or by waiting for the control leader to add it as learner
+    /// (fresh directories with seeds, or any restart recovering durable
+    /// control state — restarts never re-initialize).
+    pub control: Option<ControlGroupConfig>,
+}
+
+/// How this node participates in the system control group.
+#[derive(Debug, Clone)]
+pub struct ControlGroupConfig {
+    /// Control voter set at formation (seed membership for fresh
+    /// formation; ignored on restart, which recovers durable state).
+    pub voters: BTreeSet<u64>,
+    /// Dialable peer address per control voter.
+    pub peer_addrs: std::collections::BTreeMap<u64, String>,
+    /// Control endpoints that prove the cluster already exists. Empty on
+    /// the founding voters (fresh directories initialize); set on a
+    /// joining node (fresh directories wait for `add_learner` instead of
+    /// forking history with a second initialize).
+    pub seeds: Vec<std::net::SocketAddr>,
 }
 
 /// Multi-tablet consensus node: a `Send + Sync` front over fixed Compio
@@ -125,17 +156,31 @@ pub struct MultiNodeConfig {
 /// `Send` future on any runtime.
 pub struct ConsensusNode {
     workers: Vec<async_channel::Sender<OwnerRequest>>,
-    group_to_worker: HashMap<ConsensusGroupId, usize>,
-    machines: HashMap<TabletId, ReplicatedStateMachine>,
-    authorities: HashMap<TabletId, TabletAuthority>,
+    /// Group-to-worker routing. Mutated when dynamic replicas are
+    /// created or retired; the deterministic
+    /// [`worker_for_tablet`](crate::worker::worker_for_tablet) mapping
+    /// stays the assignment rule, this map is its materialization.
+    group_to_worker: Mutex<HashMap<ConsensusGroupId, usize>>,
+    /// Local state machines per hosted tablet. Mutated on dynamic
+    /// replica creation/retirement (the caller-side propose/read path
+    /// needs the machine without hopping to the worker).
+    machines: Mutex<HashMap<TabletId, ReplicatedStateMachine>>,
+    /// Replica authorities per hosted tablet (same lifecycle as
+    /// [`machines`](Self::machines)).
+    authorities: Mutex<HashMap<TabletId, TabletAuthority>>,
     sidecar: SidecarStore,
     preflight: Arc<crate::preflight::PreflightMetrics>,
     durability: SharedRaftDurability,
+    /// Shared H3 mesh handle: dynamic peer admission (`add_peer_dial`)
+    /// and trust (`trust_peer`) run synchronously from any thread.
+    mesh: PeerTransport,
     namespace: NamespaceId,
     local: NodeId,
     cluster: ClusterId,
     incarnation: kivi_types::NodeIncarnation,
-    tablets: Vec<TabletId>,
+    /// User tablets hosted (excludes the system control group, which is
+    /// tracked in the maps above under its reserved id).
+    tablets: Mutex<Vec<TabletId>>,
     worker_count: usize,
     peer_addr: std::net::SocketAddr,
     data_dir: PathBuf,
@@ -147,10 +192,14 @@ pub struct ConsensusNode {
 
 impl std::fmt::Debug for ConsensusNode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let tablets = self
+            .tablets
+            .lock()
+            .map_or(usize::MAX, |tablets| tablets.len());
         f.debug_struct("ConsensusNode")
             .field("node", &self.local)
             .field("cluster", &self.cluster)
-            .field("tablets", &self.tablets.len())
+            .field("tablets", &tablets)
             .field("workers", &self.worker_count)
             .field("peer", &self.peer_addr)
             .finish_non_exhaustive()
@@ -169,9 +218,20 @@ struct GroupWiring {
 /// inbound Raft RPCs directly to the owning worker by group; the network
 /// layer knows only target group, RPC type, and binary body — never
 /// tablet state-machine semantics.
+///
+/// Dynamically created replicas (migration targets) have no entry in the
+/// snapshot `routes` map taken at open. The fallback computes the same
+/// deterministic [`worker_for_tablet`](crate::worker::worker_for_tablet)
+/// assignment the front uses, so learner replication reaches the owning
+/// worker even before any map update propagates.
 #[derive(Clone)]
 struct GroupRegistry {
     routes: Arc<HashMap<ConsensusGroupId, async_channel::Sender<OwnerRequest>>>,
+    /// All worker ingress channels in worker order (deterministic
+    /// fallback for groups created after open).
+    fallback: Vec<async_channel::Sender<OwnerRequest>>,
+    /// Worker count for the deterministic fallback mapping.
+    worker_count: usize,
     /// Worker serving group-independent bulk sidecars (manifest/chunk
     /// decode with a zero tablet): owns the smallest tablet, so it always
     /// hosts at least one replica serving the shared sidecar store.
@@ -188,6 +248,8 @@ impl PeerHandler for GroupRegistry {
         Box<dyn std::future::Future<Output = Result<PeerResponse, PeerRpcError>> + Send + '_>,
     > {
         let routes = Arc::clone(&self.routes);
+        let fallback = self.fallback.clone();
+        let worker_count = self.worker_count;
         let bulk = self.bulk.clone();
         Box::pin(async move {
             let tx = if group == ConsensusGroupId::of_tablet(TabletId::from_u64(0)) {
@@ -195,8 +257,17 @@ impl PeerHandler for GroupRegistry {
                     PeerRequest::Manifest(_) | PeerRequest::Chunk(_) => Some(bulk),
                     _ => None,
                 }
+            } else if let Some(tx) = routes.get(&group).cloned() {
+                Some(tx)
             } else {
-                routes.get(&group).cloned()
+                // Dynamically created group: deterministic owner.
+                let tablet = group.tablet();
+                (tablet.as_u64() != 0)
+                    .then(|| {
+                        let worker = worker_for_tablet(tablet, worker_count);
+                        fallback.get(worker).cloned()
+                    })
+                    .flatten()
             };
             let tx = tx.ok_or_else(|| PeerRpcError {
                 detail: format!("group {group} not served here"),
@@ -234,6 +305,70 @@ impl ConsensusNode {
     /// identity/membership/tablets fails loudly; a fresh directory forms
     /// every group exactly once.
     ///
+    /// Name of the tombstone file marking a retired local replica
+    /// (`<data_dir>/consensus-sm/<tablet>/TOMBSTONE`, content: fencing
+    /// placement generation `u64` little-endian).
+    pub const TOMBSTONE_FILE: &'static str = "TOMBSTONE";
+
+    /// Reads the tombstone generation for one tablet, if retired.
+    #[must_use]
+    pub fn tombstone_generation(data_dir: &std::path::Path, tablet: TabletId) -> Option<u64> {
+        let bytes = std::fs::read(
+            data_dir
+                .join("consensus-sm")
+                .join(tablet.as_u64().to_string())
+                .join(Self::TOMBSTONE_FILE),
+        )
+        .ok()?;
+        if bytes.len() < 8 {
+            return None;
+        }
+        Some(u64::from_le_bytes(bytes[..8].try_into().unwrap_or([0; 8])))
+    }
+
+    /// Returns the tablets retired locally (tombstone present).
+    fn tombstoned_tablets(data_dir: &std::path::Path) -> BTreeSet<TabletId> {
+        let mut out = BTreeSet::new();
+        let Ok(entries) = std::fs::read_dir(data_dir.join("consensus-sm")) else {
+            return out;
+        };
+        for entry in entries.flatten() {
+            if !entry.path().is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_str().unwrap_or_default().to_owned();
+            let Ok(id) = name.parse::<u64>() else {
+                continue;
+            };
+            if id == 0 || id == crate::types::CONTROL_TABLET_RAW {
+                continue;
+            }
+            let tablet = TabletId::from_u64(id);
+            if Self::tombstone_generation(data_dir, tablet).is_some() {
+                out.insert(tablet);
+            }
+        }
+        out
+    }
+
+    /// Opens the node: validates topology and tablet set, opens the data
+    /// directory, recovers every group through the shared WAL in one pass,
+    /// opens per-tablet state machines and the node-wide sidecar store,
+    /// starts the shared mesh plus one worker reactor per configured
+    /// worker, bootstraps every group (fresh formation installs membership
+    /// exactly once; restarts recover and never re-bootstrap), and serves.
+    ///
+    /// Tombstoned (retired) tablets are skipped, never resurrected; the
+    /// system control replica opens alongside tablet groups when
+    /// [`MultiNodeConfig::control`] participates.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeOpenError`] on topology, identity, tablet-set, mesh,
+    /// or storage failures. Restarting with conflicting durable
+    /// identity/membership/tablets fails loudly; a fresh directory forms
+    /// every group exactly once.
+    ///
     /// # Panics
     ///
     /// Panics when an owner-handle lock is poisoned (a lifecycle bug,
@@ -242,6 +377,17 @@ impl ConsensusNode {
     pub async fn open(config: MultiNodeConfig) -> Result<Self, NodeOpenError> {
         use NodeOpenError as Fault;
         let tablets = validated_tablets(&config)?;
+        // Retired replicas stay retired across restarts: tombstoned
+        // tablets are skipped (never resurrected from durable state),
+        // and exempted from the tablet-set/WAL agreement checks below
+        // (their records linger conservatively in the shared WAL until
+        // rotation, which is retention — not resurrection).
+        let tombstoned = Self::tombstoned_tablets(&config.data_dir);
+        let live_tablets: Vec<TabletId> = tablets
+            .iter()
+            .copied()
+            .filter(|tablet| !tombstoned.contains(tablet))
+            .collect();
         // Data-directory identity: adopt the static topology identity on
         // first formation, advance the incarnation on every restart.
         let opened = kivi_durability::open_data_dir_with(
@@ -271,8 +417,10 @@ impl ConsensusNode {
         // so fresh formation stays coherent.
         let durable_tablets = existing_sm_tablets(&config.data_dir);
         let configured: BTreeSet<TabletId> = tablets.iter().copied().collect();
+        let control_tablet = ConsensusGroupId::control().tablet();
         let mut extra: Vec<u64> = durable_tablets
             .difference(&configured)
+            .filter(|tablet| **tablet != control_tablet && !tombstoned.contains(*tablet))
             .map(|tablet| tablet.as_u64())
             .collect();
         extra.sort_unstable();
@@ -299,10 +447,23 @@ impl ConsensusNode {
         .map_err(|error| Fault::LogStore {
             reason: error.to_string(),
         })?;
+        // First boot ever (no durable trace anywhere — no state
+        // machines, not even tombstoned or control ones, and no WAL
+        // records): the only boot that may initialize data groups.
+        // Every later boot is a rejoin — it recovers groups with
+        // durable traces and NEVER initializes (initializing a group
+        // the live cluster already runs would fork its history;
+        // unknown groups arrive later through learner replication,
+        // never a second initialize). Wiping a member's directory
+        // defeats this (it looks like first boot): never wipe a live
+        // member's directory.
+        let first_boot = durable_tablets.is_empty() && recovered.is_empty();
         let mut wal_extra: Vec<u64> = recovered
             .iter()
             .map(kivi_durability::RaftRecord::group)
-            .filter(|group| !tablets.contains(group))
+            .filter(|group| {
+                *group != control_tablet && !tablets.contains(group) && !tombstoned.contains(group)
+            })
             .map(TabletId::as_u64)
             .collect::<BTreeSet<_>>()
             .into_iter()
@@ -315,21 +476,58 @@ impl ConsensusNode {
                 ),
             });
         }
-        let groups: Vec<ConsensusGroupId> = tablets
+        let mut groups: Vec<ConsensusGroupId> = live_tablets
             .iter()
             .map(|tablet| ConsensusGroupId::of_tablet(*tablet))
             .collect();
+        // The control group shares the same recovery pass when this node
+        // participates in the control plane.
+        let control_group = config.control.is_some().then(ConsensusGroupId::control);
+        if let Some(control) = control_group {
+            groups.push(control);
+        }
         let by_group = dispatch_by_group(&recovered, &groups);
+        // Tablets served this boot: on first boot every configured
+        // tablet initializes; on rejoin only tablets with a durable
+        // trace recover (traceless tablets are skipped, never
+        // initialized: the live cluster owns them, and this replica
+        // joins later through learner replication).
+        let served_tablets: Vec<TabletId> = live_tablets
+            .iter()
+            .copied()
+            .filter(|tablet| {
+                if first_boot
+                    || durable_tablets.contains(tablet)
+                    || recovered
+                        .iter()
+                        .any(|record| kivi_durability::RaftRecord::group(record) == *tablet)
+                {
+                    return true;
+                }
+                tracing::info!(
+                    tablet = tablet.as_u64(),
+                    "rejoin skips traceless tablet (joins later through learner replication)"
+                );
+                false
+            })
+            .collect();
         // Per-tablet logical views: group stores plus state machines plus
         // authorities plus per-group wiring from the static topology.
         let mut stores = HashMap::new();
         let mut machines = HashMap::new();
         let mut authorities = HashMap::new();
         let mut wirings = HashMap::new();
-        for tablet in &tablets {
-            let group = ConsensusGroupId::of_tablet(*tablet);
+        // System control replica first: its snapshot-loaded image is the
+        // desired-placement oracle fencing removed-while-down data
+        // replicas below. Same stores, machines, and wiring as every
+        // tablet group — one dedicated Raft group committing typed
+        // control mutations through the shared envelope, mesh, and WAL.
+        // The control tablet id is reserved and never a user tablet.
+        if let Some(control_cfg) = &config.control {
+            let group = ConsensusGroupId::control();
+            let tablet = group.tablet();
             let authority =
-                TabletAuthority::new(*tablet, TabletEpoch::INITIAL, WriteGuardGeneration::INITIAL);
+                TabletAuthority::new(tablet, TabletEpoch::INITIAL, WriteGuardGeneration::INITIAL);
             let store = GroupRaftStore::from_recovered(
                 config.namespace,
                 group,
@@ -339,26 +537,97 @@ impl ConsensusNode {
             .map_err(|error| Fault::LogStore {
                 reason: error.to_string(),
             })?;
-            let machine = ReplicatedStateMachine::open(
-                &config.data_dir,
+            let machine =
+                ReplicatedStateMachine::open(&config.data_dir, config.namespace, tablet, authority)
+                    .map_err(|error| Fault::StateMachine {
+                        reason: error.to_string(),
+                    })?;
+            stores.insert(tablet, store);
+            machines.insert(tablet, machine);
+            authorities.insert(tablet, authority);
+            wirings.insert(
+                tablet,
+                GroupWiring {
+                    voters: control_cfg.voters.clone(),
+                    peer_addrs: control_cfg.peer_addrs.clone(),
+                },
+            );
+        }
+        // Snapshot-loaded control image for the removal oracle below
+        // (committed-but-unapplied tails lag by milliseconds; desired
+        // sets only move through plans, so staleness fails closed
+        // toward recovery, never toward serving stale state — except a
+        // concurrently-removed node, which the reconciler retires
+        // within a pass).
+        let control_image: Option<kivi_control::ControlState> = match config.control.as_ref() {
+            Some(_) => match machines.get(&ConsensusGroupId::control().tablet()) {
+                Some(machine) => Some(machine.tablet_control().await),
+                None => None,
+            },
+            None => None,
+        };
+        let fence_generation = control_image
+            .as_ref()
+            .map_or(0, |state| state.placement_version().as_u64());
+        let mut served_tablets = served_tablets;
+        for tablet in served_tablets.clone() {
+            let group = ConsensusGroupId::of_tablet(tablet);
+            let authority =
+                TabletAuthority::new(tablet, TabletEpoch::INITIAL, WriteGuardGeneration::INITIAL);
+            let store = GroupRaftStore::from_recovered(
                 config.namespace,
-                *tablet,
-                authority,
+                group,
+                &durability,
+                &by_group[&group],
             )
-            .map_err(|error| Fault::StateMachine {
+            .map_err(|error| Fault::LogStore {
                 reason: error.to_string(),
             })?;
+            let machine =
+                ReplicatedStateMachine::open(&config.data_dir, config.namespace, tablet, authority)
+                    .map_err(|error| Fault::StateMachine {
+                        reason: error.to_string(),
+                    })?;
+            // Removed-while-down fencing: durable voters excluding the
+            // local node mean the cluster moved on without it. The
+            // control desired set distinguishes a late joiner (desired
+            // names it: recover, replication brings it in) from a
+            // removal (desired dropped it: tombstone and skip, never
+            // serve the stale copy). Empty durable state always
+            // recovers (nothing stale to serve).
+            if !first_boot && !durable_includes(&store, &machine, config.local).await {
+                let wanted = control_image
+                    .as_ref()
+                    .and_then(|state| state.desired(tablet));
+                let keep = match wanted {
+                    Some(desired) => desired.contains(config.local),
+                    // No desired set (pre-genesis or unknown tablet):
+                    // recover — nothing could have removed it through
+                    // the control plane yet.
+                    None => true,
+                };
+                if !keep {
+                    tracing::warn!(
+                        tablet = tablet.as_u64(),
+                        node = config.local.as_u64(),
+                        "rejoin tombstones removed replica (desired placement dropped it)"
+                    );
+                    write_tombstone(&config.data_dir, tablet, fence_generation);
+                    served_tablets.retain(|served| *served != tablet);
+                    continue;
+                }
+            }
             let (voters, peer_addrs) =
                 config
                     .topology
-                    .membership_for(*tablet)
+                    .membership_for(tablet)
                     .map_err(|error| Fault::Topology {
                         reason: error.to_string(),
                     })?;
-            stores.insert(*tablet, store);
-            machines.insert(*tablet, machine);
-            authorities.insert(*tablet, authority);
-            wirings.insert(*tablet, GroupWiring { voters, peer_addrs });
+            stores.insert(tablet, store);
+            machines.insert(tablet, machine);
+            authorities.insert(tablet, authority);
+            wirings.insert(tablet, GroupWiring { voters, peer_addrs });
         }
         // Node-wide immutable sidecar store (content-addressed chunks plus
         // manifests; one blocking thread, shared by every replica).
@@ -377,6 +646,7 @@ impl ConsensusNode {
         let tls = TlsMaterial {
             cert: peer_tls_cert,
             peer_certs: config.peer_certs.clone(),
+            trust: Some(crate::tls::empty_trust()),
             insecure_skip_verify: config.insecure_peer_tls,
         };
         let peers: HashMap<NodeId, std::net::SocketAddr> = config
@@ -401,15 +671,29 @@ impl ConsensusNode {
             senders.push(tx);
             receivers.push(rx);
         }
+        // All served groups: recovered user tablets plus the control
+        // group when participating. Tombstoned tablets stay unassigned
+        // until an explicit newer creation overrides the tombstone, as
+        // do traceless tablets on rejoin (they arrive through learner
+        // replication, never a second initialize).
+        let mut served: Vec<TabletId> = served_tablets.clone();
+        if config.control.is_some() {
+            served.push(ConsensusGroupId::control().tablet());
+        }
         let mut group_to_worker = HashMap::new();
-        for tablet in &tablets {
+        for tablet in &served {
             group_to_worker.insert(
                 ConsensusGroupId::of_tablet(*tablet),
                 worker_for_tablet(*tablet, worker_count),
             );
         }
-        let smallest = tablets.iter().min().expect("tablets nonempty");
-        let bulk_worker = worker_for_tablet(*smallest, worker_count);
+        // Bulk sidecars serve from the smallest served tablet's worker;
+        // a fully drained node (no served groups) falls back to worker
+        // 0, whose empty replica set refuses bulk loudly.
+        let bulk_worker = served
+            .iter()
+            .min()
+            .map_or(0, |smallest| worker_for_tablet(*smallest, worker_count));
         let registry = GroupRegistry {
             routes: Arc::new(
                 group_to_worker
@@ -417,6 +701,8 @@ impl ConsensusNode {
                     .map(|(group, worker)| (*group, senders[*worker].clone()))
                     .collect(),
             ),
+            fallback: senders.clone(),
+            worker_count,
             bulk: senders[bulk_worker].clone(),
         };
         let preflight = Arc::new(crate::preflight::PreflightMetrics::default());
@@ -487,7 +773,7 @@ impl ConsensusNode {
         let mut mesh_down_tx = Some(mesh_down_tx);
         let mut mesh_thread = Some(mesh_thread);
         for (index, rx) in receivers.into_iter().enumerate() {
-            let owned: Vec<TabletId> = tablets
+            let owned: Vec<TabletId> = served
                 .iter()
                 .copied()
                 .filter(|tablet| worker_for_tablet(*tablet, worker_count) == index)
@@ -522,6 +808,14 @@ impl ConsensusNode {
                 cluster: opened.meta.cluster,
                 preflight: Arc::clone(&preflight),
                 preflight_enabled: config.preflight_enabled,
+                data_dir: config.data_dir.clone(),
+                durability: durability.clone(),
+                control_seeds: config
+                    .control
+                    .as_ref()
+                    .map(|control| control.seeds.clone())
+                    .unwrap_or_default(),
+                founding: first_boot,
                 requests: rx,
                 ready: Some(ready_tx),
             };
@@ -590,8 +884,8 @@ impl ConsensusNode {
         // Startup verification per tablet: every applied chunked root must
         // resolve locally before serving reads (same fail-closed poison as
         // the single-group node; repair arrives via sidecar fetch or a
-        // snapshot install).
-        for tablet in &tablets {
+        // snapshot install). The control group holds no chunked roots.
+        for tablet in &served_tablets {
             let machine = &machines[tablet];
             for (manifest, logical_len) in machine.chunked_roots().await {
                 match sidecar.check_root(manifest, logical_len).await {
@@ -615,17 +909,18 @@ impl ConsensusNode {
         }
         Ok(Self {
             workers: senders,
-            group_to_worker,
-            machines,
-            authorities,
+            group_to_worker: Mutex::new(group_to_worker),
+            machines: Mutex::new(machines),
+            authorities: Mutex::new(authorities),
             sidecar,
             preflight,
             durability,
+            mesh: transport.clone(),
             namespace: config.namespace,
             local: opened.meta.node,
             cluster: opened.meta.cluster,
             incarnation: opened.meta.incarnation,
-            tablets,
+            tablets: Mutex::new(served_tablets),
             worker_count,
             peer_addr,
             data_dir: config.data_dir,
@@ -660,10 +955,37 @@ impl ConsensusNode {
         self.incarnation
     }
 
-    /// Returns the tablets this node replicates, in sorted order.
+    /// Returns the user tablets this node replicates, in sorted order
+    /// (excludes the system control group).
     #[must_use]
-    pub fn tablets(&self) -> &[TabletId] {
-        &self.tablets
+    pub fn tablets(&self) -> Vec<TabletId> {
+        self.tablets
+            .lock()
+            .map(|tablets| tablets.clone())
+            .unwrap_or_default()
+    }
+
+    /// Whether this node hosts a control replica.
+    #[must_use]
+    pub fn hosts_control(&self) -> bool {
+        let group = ConsensusGroupId::control();
+        self.group_to_worker
+            .lock()
+            .is_ok_and(|map| map.contains_key(&group))
+    }
+
+    /// Reads the locally replicated control image, if this node hosts a
+    /// control replica. Used by routing (leader hints), the admin plane,
+    /// and the reconciler — all read-only observers, never writers.
+    pub async fn control_state(&self) -> Option<kivi_control::ControlState> {
+        let machine = {
+            self.machines
+                .lock()
+                .ok()?
+                .get(&ConsensusGroupId::control().tablet())
+                .cloned()
+        }?;
+        Some(machine.tablet_control().await)
     }
 
     /// Returns the worker count.
@@ -705,6 +1027,12 @@ impl ConsensusNode {
     ) -> Result<async_channel::Sender<OwnerRequest>, ProposeError> {
         let group = ConsensusGroupId::of_tablet(tablet);
         self.group_to_worker
+            .lock()
+            .map_err(|_| {
+                ProposeError::Consensus(ConsensusError::Unavailable {
+                    reason: "consensus routing lock poisoned".to_owned(),
+                })
+            })?
             .get(&group)
             .map(|index| self.workers[*index].clone())
             .ok_or_else(|| {
@@ -730,22 +1058,39 @@ impl ConsensusNode {
         idempotency: Option<IdempotencyKey>,
         now: UnixMicros,
     ) -> Result<crate::node::ProposeOutcome, ProposeError> {
-        let Some(machine) = self.machines.get(&tablet) else {
-            return Err(ProposeError::Consensus(ConsensusError::Unavailable {
+        let unavailable = || {
+            ProposeError::Consensus(ConsensusError::Unavailable {
                 reason: format!("tablet {} not served by this node", tablet.as_u64()),
-            }));
+            })
         };
-        let Some(authority) = self.authorities.get(&tablet) else {
-            return Err(ProposeError::Consensus(ConsensusError::Unavailable {
-                reason: format!("tablet {} has no local authority", tablet.as_u64()),
-            }));
-        };
+        let machine = self
+            .machines
+            .lock()
+            .map_err(|_| unavailable())?
+            .get(&tablet)
+            .cloned()
+            .ok_or_else(unavailable)?;
+        let authority = self
+            .authorities
+            .lock()
+            .map_err(|_| {
+                ProposeError::Consensus(ConsensusError::Unavailable {
+                    reason: format!("tablet {} has no local authority", tablet.as_u64()),
+                })
+            })?
+            .get(&tablet)
+            .copied()
+            .ok_or_else(|| {
+                ProposeError::Consensus(ConsensusError::Unavailable {
+                    reason: format!("tablet {} has no local authority", tablet.as_u64()),
+                })
+            })?;
         let worker = self.worker_for(tablet)?;
         propose_caller_side(
-            machine,
+            &machine,
             &self.sidecar,
             self.namespace,
-            *authority,
+            authority,
             &worker,
             ConsensusGroupId::of_tablet(tablet),
             op,
@@ -769,11 +1114,21 @@ impl ConsensusNode {
         contract: ReadContract,
         now: UnixMicros,
     ) -> Result<OperationResult, ReadError> {
-        let Some(machine) = self.machines.get(&tablet) else {
-            return Err(ReadError::Consensus(ConsensusError::Unavailable {
-                reason: format!("tablet {} not served by this node", tablet.as_u64()),
-            }));
-        };
+        let machine = self
+            .machines
+            .lock()
+            .map_err(|_| {
+                ReadError::Consensus(ConsensusError::Unavailable {
+                    reason: "consensus machine lock poisoned".to_owned(),
+                })
+            })?
+            .get(&tablet)
+            .cloned()
+            .ok_or_else(|| {
+                ReadError::Consensus(ConsensusError::Unavailable {
+                    reason: format!("tablet {} not served by this node", tablet.as_u64()),
+                })
+            })?;
         let worker = self.worker_for(tablet).map_err(|error| match error {
             ProposeError::Consensus(consensus) => ReadError::Consensus(consensus),
             _ => ReadError::Consensus(ConsensusError::Unavailable {
@@ -781,7 +1136,7 @@ impl ConsensusNode {
             }),
         })?;
         read_caller_side(
-            machine,
+            &machine,
             &worker,
             ConsensusGroupId::of_tablet(tablet),
             op,
@@ -795,15 +1150,15 @@ impl ConsensusNode {
     /// owning workers concurrently; a dead worker reports closed statuses
     /// rather than hanging the admin plane).
     pub async fn status_all(&self) -> Vec<NodeStatus> {
-        let calls: Vec<_> = self
-            .tablets
+        let tablets = self.tablets();
+        let routing = self.group_to_worker.lock().ok().map(|map| map.clone());
+        let calls: Vec<_> = tablets
             .iter()
             .map(|tablet| {
                 let group = ConsensusGroupId::of_tablet(*tablet);
-                let worker = self
-                    .group_to_worker
-                    .get(&group)
-                    .map(|index| self.workers[*index].clone());
+                let worker = routing
+                    .as_ref()
+                    .and_then(|map| map.get(&group).map(|index| self.workers[*index].clone()));
                 let local = self.local;
                 let sidecar = self.sidecar.metrics().snapshot();
                 let preflight = self.preflight.snapshot();
@@ -820,15 +1175,20 @@ impl ConsensusNode {
         futures::future::join_all(calls).await
     }
 
+    /// Resolves the worker channel for one group, if served locally.
+    fn channel_for(&self, group: ConsensusGroupId) -> Option<async_channel::Sender<OwnerRequest>> {
+        self.group_to_worker
+            .lock()
+            .ok()?
+            .get(&group)
+            .map(|index| self.workers[*index].clone())
+    }
+
     /// Gathers diagnostics for one group.
     pub async fn status_for(&self, group: ConsensusGroupId) -> NodeStatus {
         let sidecar = self.sidecar.metrics().snapshot();
         let preflight = self.preflight.snapshot();
-        let Some(worker) = self
-            .group_to_worker
-            .get(&group)
-            .map(|index| self.workers[*index].clone())
-        else {
+        let Some(worker) = self.channel_for(group) else {
             return closed_status(group, self.local, sidecar, preflight);
         };
         owner_call_on(&worker, |reply| OwnerRequest::Status { group, reply })
@@ -846,11 +1206,7 @@ impl ConsensusNode {
         &self,
         group: ConsensusGroupId,
     ) -> Result<ConsensusLogIndex, String> {
-        let Some(worker) = self
-            .group_to_worker
-            .get(&group)
-            .map(|index| self.workers[*index].clone())
-        else {
+        let Some(worker) = self.channel_for(group) else {
             return Err(format!("group {group} not served by this node"));
         };
         let (reply, rx) = futures::channel::oneshot::channel();
@@ -860,6 +1216,265 @@ impl ConsensusNode {
             .map_err(|_| "consensus worker shut down".to_owned())?;
         rx.await
             .map_err(|_| "consensus worker shut down".to_owned())?
+    }
+
+    /// Registers a learner on one group's leader (`add_learner`). The
+    /// reconciler calls this with `blocking=true` so it returns once the
+    /// learner is line-rate; promoting earlier can stall quorum progress.
+    /// Callers must address the tablet leader: a follower answers with a
+    /// not-leader reason and the reconciler retries at the leader.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable reason for unknown groups, worker
+    /// shutdown, or membership failures.
+    pub async fn add_learner(
+        &self,
+        tablet: TabletId,
+        node: NodeId,
+        addr: String,
+        blocking: bool,
+    ) -> Result<(), String> {
+        let group = ConsensusGroupId::of_tablet(tablet);
+        let Some(worker) = self.channel_for(group) else {
+            return Err(format!("group {group} not served by this node"));
+        };
+        let (reply, rx) = futures::channel::oneshot::channel();
+        worker
+            .send(OwnerRequest::AddLearner {
+                group,
+                node,
+                addr,
+                blocking,
+                reply,
+            })
+            .await
+            .map_err(|_| "consensus worker shut down".to_owned())?;
+        rx.await
+            .map_err(|_| "consensus worker shut down".to_owned())?
+    }
+
+    /// Replaces one group's voter set through joint consensus (handled
+    /// internally by `OpenRaft`). New voters must already be learners;
+    /// removed voters leave or linger per `retain`. Planned migration
+    /// uses `retain=false` so the retired source leaves the cluster.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable reason for unknown groups, worker
+    /// shutdown, or membership failures.
+    pub async fn change_membership(
+        &self,
+        tablet: TabletId,
+        voters: std::collections::BTreeSet<u64>,
+        retain: bool,
+    ) -> Result<(), String> {
+        let group = ConsensusGroupId::of_tablet(tablet);
+        let Some(worker) = self.channel_for(group) else {
+            return Err(format!("group {group} not served by this node"));
+        };
+        let (reply, rx) = futures::channel::oneshot::channel();
+        worker
+            .send(OwnerRequest::ChangeMembership {
+                group,
+                voters,
+                retain,
+                reply,
+            })
+            .await
+            .map_err(|_| "consensus worker shut down".to_owned())?;
+        rx.await
+            .map_err(|_| "consensus worker shut down".to_owned())?
+    }
+
+    /// Asks one group's leader to hand leadership to `to`
+    /// (`Trigger::transfer_leader`). Fire-and-forget: a non-leader
+    /// ignores it and the reconciler re-observes and continues.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable reason for unknown groups or worker
+    /// shutdown.
+    pub async fn transfer_leader(&self, tablet: TabletId, to: NodeId) -> Result<(), String> {
+        let group = ConsensusGroupId::of_tablet(tablet);
+        let Some(worker) = self.channel_for(group) else {
+            return Err(format!("group {group} not served by this node"));
+        };
+        let (reply, rx) = futures::channel::oneshot::channel();
+        worker
+            .send(OwnerRequest::TransferLeader { group, to, reply })
+            .await
+            .map_err(|_| "consensus worker shut down".to_owned())?;
+        rx.await
+            .map_err(|_| "consensus worker shut down".to_owned())?
+    }
+
+    /// Observes one group's actual voter/learner/leader state for the
+    /// migration reconciler.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable reason for unknown groups or worker
+    /// shutdown.
+    pub async fn observe_membership(
+        &self,
+        tablet: TabletId,
+    ) -> Result<crate::control::ObservedMembership, String> {
+        let group = ConsensusGroupId::of_tablet(tablet);
+        let Some(worker) = self.channel_for(group) else {
+            return Err(format!("group {group} not served by this node"));
+        };
+        let (reply, rx) = futures::channel::oneshot::channel();
+        worker
+            .send(OwnerRequest::ObserveMembership { group, reply })
+            .await
+            .map_err(|_| "consensus worker shut down".to_owned())?;
+        rx.await
+            .map_err(|_| "consensus worker shut down".to_owned())?
+    }
+
+    /// Creates an empty local replica for a tablet this node has never
+    /// hosted (migration target). Idempotent: an existing replica
+    /// answers success. The front maps update so caller-side propose,
+    /// read, and diagnostics cover the new group without a restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable reason for reserved tablets, worker
+    /// shutdown, stale fenced creates, or storage failures.
+    pub async fn ensure_group(
+        &self,
+        tablet: TabletId,
+        voters: std::collections::BTreeSet<u64>,
+        generation: u64,
+    ) -> Result<(), String> {
+        let group = ConsensusGroupId::of_tablet(tablet);
+        if group.is_control() || tablet.as_u64() == 0 {
+            return Err(format!("tablet {} is reserved", tablet.as_u64()));
+        }
+        let worker_index = worker_for_tablet(tablet, self.worker_count);
+        let Some(worker) = self.workers.get(worker_index).cloned() else {
+            return Err("no consensus worker exists".to_owned());
+        };
+        let (reply, rx) = futures::channel::oneshot::channel();
+        worker
+            .send(OwnerRequest::EnsureGroup {
+                group,
+                tablet,
+                voters,
+                generation,
+                reply,
+            })
+            .await
+            .map_err(|_| "consensus worker shut down".to_owned())?;
+        let info = rx
+            .await
+            .map_err(|_| "consensus worker shut down".to_owned())??;
+        if let Ok(mut machines) = self.machines.lock() {
+            machines.insert(tablet, info.machine);
+        }
+        if let Ok(mut authorities) = self.authorities.lock() {
+            authorities.insert(tablet, info.authority);
+        }
+        if let Ok(mut routing) = self.group_to_worker.lock() {
+            routing.insert(group, worker_index);
+        }
+        if let Ok(mut tablets) = self.tablets.lock()
+            && !tablets.contains(&tablet)
+        {
+            tablets.push(tablet);
+            tablets.sort_by_key(|tablet| tablet.as_u64());
+        }
+        Ok(())
+    }
+
+    /// Retires the local replica after committed membership no longer
+    /// requires it: stops its `Raft`, unregisters the group, and writes
+    /// a tombstone (durable data retained conservatively). Idempotent:
+    /// an already-retired source answers success.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable reason for reserved tablets, worker
+    /// shutdown, or storage failures.
+    pub async fn retire_group(&self, tablet: TabletId, generation: u64) -> Result<(), String> {
+        let group = ConsensusGroupId::of_tablet(tablet);
+        if group.is_control() || tablet.as_u64() == 0 {
+            return Err(format!("tablet {} is reserved", tablet.as_u64()));
+        }
+        let worker_index = worker_for_tablet(tablet, self.worker_count);
+        let Some(worker) = self.workers.get(worker_index).cloned() else {
+            return Err("no consensus worker exists".to_owned());
+        };
+        let (reply, rx) = futures::channel::oneshot::channel();
+        worker
+            .send(OwnerRequest::RetireGroup {
+                group,
+                tablet,
+                generation,
+                reply,
+            })
+            .await
+            .map_err(|_| "consensus worker shut down".to_owned())?;
+        rx.await
+            .map_err(|_| "consensus worker shut down".to_owned())??;
+        if let Ok(mut machines) = self.machines.lock() {
+            machines.remove(&tablet);
+        }
+        if let Ok(mut authorities) = self.authorities.lock() {
+            authorities.remove(&tablet);
+        }
+        if let Ok(mut routing) = self.group_to_worker.lock() {
+            routing.remove(&group);
+        }
+        if let Ok(mut tablets) = self.tablets.lock() {
+            tablets.retain(|served| *served != tablet);
+        }
+        Ok(())
+    }
+
+    /// Proposes one typed control-plane mutation against the system
+    /// control group.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable reason when this node serves no control
+    /// replica or the commit fails.
+    pub async fn propose_control(
+        &self,
+        mutation: kivi_control::ControlMutation,
+    ) -> Result<ConsensusLogIndex, String> {
+        let group = ConsensusGroupId::control();
+        let Some(worker) = self.channel_for(group) else {
+            return Err(format!("control group {group} not served by this node"));
+        };
+        let (reply, rx) = futures::channel::oneshot::channel();
+        worker
+            .send(OwnerRequest::ProposeControl {
+                group,
+                mutation,
+                reply,
+            })
+            .await
+            .map_err(|_| "consensus worker shut down".to_owned())?;
+        rx.await
+            .map_err(|_| "consensus worker shut down".to_owned())?
+    }
+
+    /// Adds a dialable peer link for a dynamically admitted node
+    /// (replicated registry commit observed locally). Returns whether
+    /// the link is new. The mesh dials it on demand; existing links
+    /// are never replaced. Callable from any thread.
+    #[must_use]
+    pub fn add_peer_dial(&self, peer: NodeId, addr: std::net::SocketAddr) -> bool {
+        self.mesh.add_peer(peer, addr)
+    }
+
+    /// Pins a dynamically admitted peer's certificate DER for TLS
+    /// verification (dials and incoming connections). Static anchors
+    /// keep precedence. Callable from any thread.
+    pub fn trust_peer(&self, peer: NodeId, cert_der: Vec<u8>) {
+        self.mesh.trust_peer(peer, cert_der);
     }
 
     /// Suspends one peer link (partition test hook, drain tooling). Hops
@@ -903,6 +1518,10 @@ impl ConsensusNode {
     /// Panics when an owner-handle lock is poisoned (a lifecycle bug,
     /// never a runtime condition).
     pub async fn shutdown(&self) {
+        tracing::info!(
+            node = self.local.as_u64(),
+            "consensus node shutdown started"
+        );
         for worker in &self.workers {
             let _ = worker.send(OwnerRequest::Shutdown).await;
         }
@@ -951,19 +1570,110 @@ fn closed_status(
     }
 }
 
-/// Validates the configured tablet set: nonempty, unique, nonzero, and
-/// every tablet assigned to the local node in the static topology.
-/// Returns the sorted tablets.
+/// Serves one dynamic replica creation inline (rare, local-only):
+/// idempotent re-create answers the existing handles; fresh tablets
+/// build an uninitialized replica that joins through learner
+/// replication (never a second initialize).
+async fn serve_ensure(
+    build: &WorkerBuildCtx,
+    replicas: &mut HashMap<ConsensusGroupId, OwnerCtx<GroupRaftStore>>,
+    group: ConsensusGroupId,
+    tablet: TabletId,
+    voters: &BTreeSet<u64>,
+    generation: u64,
+    reply: futures::channel::oneshot::Sender<Result<crate::node::NewReplica, String>>,
+) {
+    if group != ConsensusGroupId::of_tablet(tablet) {
+        let _ = reply.send(Err(format!("group {group} names a foreign tablet")));
+        return;
+    }
+    if let Some(ctx) = replicas.get(&group) {
+        let _ = reply.send(Ok(crate::node::NewReplica {
+            machine: ctx.machine.clone(),
+            authority: ctx.authority,
+        }));
+        return;
+    }
+    match build_dynamic_replica(build, tablet, voters, generation).await {
+        Ok((built_group, ctx, info)) => {
+            replicas.insert(built_group, ctx);
+            let _ = reply.send(Ok(info));
+        }
+        Err(reason) => {
+            let _ = reply.send(Err(reason));
+        }
+    }
+}
+
+/// Serves one dynamic replica retirement inline (rare, local-only):
+/// stops the `Raft`, unregisters the group, and tombstones it.
+/// Idempotent: already-retired sources bump the tombstone (or answer
+/// success when never hosted, which needs no fencing).
+async fn serve_retire(
+    build: &WorkerBuildCtx,
+    replicas: &mut HashMap<ConsensusGroupId, OwnerCtx<GroupRaftStore>>,
+    group: ConsensusGroupId,
+    tablet: TabletId,
+    generation: u64,
+    reply: futures::channel::oneshot::Sender<Result<(), String>>,
+) {
+    if group != ConsensusGroupId::of_tablet(tablet) {
+        let _ = reply.send(Err(format!("group {group} names a foreign tablet")));
+        return;
+    }
+    if let Some(ctx) = replicas.remove(&group) {
+        ctx.shutdown_raft().await;
+        write_tombstone(&build.data_dir, tablet, generation);
+        let _ = reply.send(Ok(()));
+        return;
+    }
+    // Idempotent: already retired or never hosted. Bump an existing
+    // tombstone so a newer retirement still fences older creates;
+    // write nothing when no tombstone exists (a future create is
+    // fresh, not a resurrection).
+    bump_tombstone(&build.data_dir, tablet, generation);
+    let _ = reply.send(Ok(()));
+}
+
+/// Writes a retirement tombstone (`generation` little-endian).
+fn write_tombstone(data_dir: &std::path::Path, tablet: TabletId, generation: u64) {
+    let dir = data_dir
+        .join("consensus-sm")
+        .join(tablet.as_u64().to_string());
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let _ = std::fs::write(
+        dir.join(ConsensusNode::TOMBSTONE_FILE),
+        generation.to_le_bytes(),
+    );
+}
+
+/// Bumps an existing tombstone to `generation` when older; writes
+/// nothing when no tombstone exists.
+fn bump_tombstone(data_dir: &std::path::Path, tablet: TabletId, generation: u64) {
+    let path = data_dir
+        .join("consensus-sm")
+        .join(tablet.as_u64().to_string())
+        .join(ConsensusNode::TOMBSTONE_FILE);
+    let Ok(bytes) = std::fs::read(&path) else {
+        return;
+    };
+    let retired = u64::from_le_bytes(bytes[..8.min(bytes.len())].try_into().unwrap_or([0; 8]));
+    if generation > retired {
+        let _ = std::fs::write(path, generation.to_le_bytes());
+    }
+}
+
+/// Validates the configured tablet set: unique, nonzero, and every
+/// tablet assigned to the local node in the static topology. Empty is
+/// valid: a joining data node starts empty and gains replicas through
+/// control-plane migration (§9, §47). Returns the sorted tablets.
 fn validated_tablets(config: &MultiNodeConfig) -> Result<Vec<TabletId>, NodeOpenError> {
     use NodeOpenError as Fault;
     if config.worker_count == 0 {
         return Err(Fault::Topology {
             reason: "worker count must be nonzero".to_owned(),
-        });
-    }
-    if config.tablets.is_empty() {
-        return Err(Fault::Topology {
-            reason: "cluster topology has no tablet assignment".to_owned(),
         });
     }
     let mut tablets = config.tablets.clone();
@@ -1070,11 +1780,15 @@ async fn mesh_main(params: MeshParams) {
         }
     };
     if ready.send(Ok((transport.clone(), peer_addr))).is_err() {
+        tracing::warn!("mesh opener gone; shutting down mesh");
         transport.shutdown().await;
         return;
     }
+    tracing::info!(peer = %peer_addr, "peer mesh open");
     let _ = shutdown.await;
+    tracing::info!("mesh shutdown signaled; stopping transport");
     transport.shutdown().await;
+    tracing::info!("peer mesh stopped");
 }
 
 /// Parameters crossing into one worker thread at spawn. Everything is
@@ -1096,8 +1810,40 @@ struct WorkerParams {
     cluster: ClusterId,
     preflight: Arc<crate::preflight::PreflightMetrics>,
     preflight_enabled: bool,
+    /// Data-directory root (dynamic replica creation opens new group
+    /// stores and state machines beneath it).
+    data_dir: PathBuf,
+    /// Shared WAL durability (dynamic replicas attach fresh logical
+    /// views to the same physical lane).
+    durability: SharedRaftDurability,
+    /// Control seeds proving the cluster already exists. Only read for
+    /// the control group on a fresh directory: empty means this node
+    /// founds the control plane (initialize), set means it joins
+    /// (waits for `add_learner`, never forks history).
+    control_seeds: Vec<std::net::SocketAddr>,
+    /// True only on a brand-new data directory: the sole boot that may
+    /// initialize data groups. Rejoins recover or wait for learner
+    /// replication, never initialize (that would fork live history).
+    founding: bool,
     requests: async_channel::Receiver<OwnerRequest>,
     ready: Option<futures::channel::oneshot::Sender<Result<(), NodeOpenError>>>,
+}
+
+/// Owned context a worker keeps for building replicas after open
+/// (migration targets). Everything is worker-local owned or shared
+/// handles; the `!Send` Raft handles are built on this reactor.
+#[derive(Clone)]
+struct WorkerBuildCtx {
+    data_dir: PathBuf,
+    namespace: NamespaceId,
+    local: NodeId,
+    sidecar: SidecarStore,
+    transport: PeerTransport,
+    router: PeerRouter,
+    preflight: Arc<crate::preflight::PreflightMetrics>,
+    preflight_enabled: bool,
+    bulk_timeout: Duration,
+    durability: SharedRaftDurability,
 }
 
 /// Worker thread main: builds one replica per owned tablet (gate, `Raft`,
@@ -1140,7 +1886,31 @@ async fn worker_main(mut params: WorkerParams) {
         }
         return;
     }
-    worker_loop(replicas, params.local, params.transport, params.requests).await;
+    tracing::info!(
+        worker = params.index,
+        groups = replicas.len(),
+        "consensus worker serving"
+    );
+    let build = WorkerBuildCtx {
+        data_dir: params.data_dir.clone(),
+        namespace: params.namespace,
+        local: params.local,
+        sidecar: params.sidecar.clone(),
+        transport: params.transport.clone(),
+        router: router.clone(),
+        preflight: Arc::clone(&params.preflight),
+        preflight_enabled: params.preflight_enabled,
+        bulk_timeout: params.transport_config.bulk_timeout,
+        durability: params.durability.clone(),
+    };
+    worker_loop(
+        replicas,
+        params.local,
+        params.transport,
+        build,
+        params.requests,
+    )
+    .await;
 }
 
 /// Reports worker startup failure exactly once (first failure wins; later
@@ -1218,64 +1988,306 @@ async fn build_replica(
     );
     store.set_gate(gate.clone());
     let raft = spawn_raft(params.local, group, router.clone(), &store, &machine).await?;
-    bootstrap_group(
-        &BootstrapInputs {
-            topology: &params.topology,
-            tablet,
-            local: params.local,
-            cluster: params.cluster,
-            node: params.local,
-            voters: &wiring.voters,
-            peer_addrs: &wiring.peer_addrs,
-        },
-        &mut store,
-        &machine,
-        &raft,
-    )
-    .await?;
-    let mut voter_list: Vec<NodeId> = wiring
-        .voters
-        .iter()
-        .map(|voter| NodeId::from_u64(*voter))
-        .collect();
-    voter_list.sort_by_key(|node| node.as_u64());
+    if tablet == ConsensusGroupId::control().tablet() {
+        bootstrap_control(
+            &wiring.voters,
+            &wiring.peer_addrs,
+            &params.control_seeds,
+            params.founding,
+            &mut store,
+            &machine,
+            &raft,
+        )
+        .await?;
+    } else {
+        bootstrap_group(
+            &BootstrapInputs {
+                topology: &params.topology,
+                tablet,
+                local: params.local,
+                cluster: params.cluster,
+                node: params.local,
+                voters: &wiring.voters,
+                peer_addrs: &wiring.peer_addrs,
+            },
+            params.founding,
+            &mut store,
+            &machine,
+            &raft,
+        )
+        .await?;
+    }
+    let voter_list = sorted_voters(&wiring.voters);
     Ok((
         group,
-        OwnerCtx {
+        assemble_ctx(
             raft,
             store,
             machine,
-            sidecar: params.sidecar.clone(),
+            params.sidecar.clone(),
             gate,
-            transport: params.transport.clone(),
+            params.transport.clone(),
             group,
-            namespace: params.namespace,
+            params.namespace,
             authority,
             tablet,
-            local: params.local,
-            voters: voter_list,
-            bulk_timeout: params.transport_config.bulk_timeout,
-            preflight: Arc::clone(&params.preflight),
-            preflight_enabled: params.preflight_enabled,
-            transfers: Rc::new(RefCell::new(HashMap::new())),
-        },
+            params.local,
+            voter_list,
+            params.transport_config.bulk_timeout,
+            Arc::clone(&params.preflight),
+            params.preflight_enabled,
+        ),
     ))
+}
+
+/// Sorts voter ids into deterministic quorum order.
+fn sorted_voters(voters: &BTreeSet<u64>) -> Vec<NodeId> {
+    let mut list: Vec<NodeId> = voters
+        .iter()
+        .map(|voter| NodeId::from_u64(*voter))
+        .collect();
+    list.sort_by_key(|node| node.as_u64());
+    list
+}
+
+/// Whether the local node may serve a recovered group: true when no
+/// durable voter set survives (nothing stale to serve) or the durable
+/// set still names it. A set excluding it means either a late joiner
+/// (resolved through the control desired oracle by the caller) or a
+/// removal (tombstoned by the caller).
+async fn durable_includes(
+    store: &GroupRaftStore,
+    machine: &ReplicatedStateMachine,
+    local: NodeId,
+) -> bool {
+    let mut voters = store.membership_voters().await;
+    if voters.is_empty() {
+        voters = machine.member_voters().await;
+    }
+    voters.is_empty() || voters.contains(&local.as_u64())
+}
+
+/// Installs or recovers control-group membership.
+///
+/// Unlike tablet groups, control membership evolves: startup flags are
+/// seeds, never truth. First formation (fresh directory, no seeds)
+/// installs the seed membership exactly once; joins (fresh directory
+/// with seeds) skip initialization and wait for the control leader's
+/// `add_learner`; restarts recover durable state and never
+/// re-initialize or verify against stale flags.
+///
+/// # Errors
+///
+/// Returns [`NodeOpenError::Initialize`] when first formation fails.
+async fn bootstrap_control(
+    voters: &BTreeSet<u64>,
+    peer_addrs: &BTreeMap<u64, String>,
+    seeds: &[std::net::SocketAddr],
+    founding: bool,
+    store: &mut GroupRaftStore,
+    machine: &ReplicatedStateMachine,
+    raft: &crate::node::OwnerRaft,
+) -> Result<(), NodeOpenError> {
+    use NodeOpenError as Fault;
+    match classify_from_store(store, machine).await {
+        Bootstrap::Existing => Ok(()),
+        // A fresh control store joins (never initializes) unless this
+        // is a founding boot with no seeds proving otherwise.
+        Bootstrap::Fresh if !founding || !seeds.is_empty() => Ok(()),
+        Bootstrap::Fresh => {
+            let members: BTreeMap<u64, openraft::BasicNode> = voters
+                .iter()
+                .map(|voter| {
+                    (
+                        *voter,
+                        openraft::BasicNode::new(
+                            peer_addrs.get(voter).cloned().unwrap_or_default(),
+                        ),
+                    )
+                })
+                .collect();
+            raft.initialize(members)
+                .await
+                .map_err(|error| Fault::Initialize {
+                    reason: error.to_string(),
+                })?;
+            Ok(())
+        }
+    }
+}
+
+/// Assembles one replica owner context: the single construction site
+/// for initial and dynamic replica builds.
+#[allow(clippy::too_many_arguments)]
+fn assemble_ctx(
+    raft: crate::node::OwnerRaft,
+    store: GroupRaftStore,
+    machine: ReplicatedStateMachine,
+    sidecar: SidecarStore,
+    gate: SidecarGate,
+    transport: PeerTransport,
+    group: ConsensusGroupId,
+    namespace: NamespaceId,
+    authority: TabletAuthority,
+    tablet: TabletId,
+    local: NodeId,
+    voters: Vec<NodeId>,
+    bulk_timeout: Duration,
+    preflight: Arc<crate::preflight::PreflightMetrics>,
+    preflight_enabled: bool,
+) -> OwnerCtx<GroupRaftStore> {
+    OwnerCtx {
+        raft,
+        store,
+        machine,
+        sidecar,
+        gate,
+        transport,
+        group,
+        namespace,
+        authority,
+        tablet,
+        local,
+        voters,
+        bulk_timeout,
+        preflight,
+        preflight_enabled,
+        transfers: Rc::new(RefCell::new(HashMap::new())),
+    }
+}
+
+/// Builds one dynamic replica on a running worker (migration target):
+/// fresh group store and state machine, gate, and an uninitialized
+/// `Raft` that the tablet leader feeds via learner replication. Never
+/// initializes membership (that would fork the group).
+async fn build_dynamic_replica(
+    build: &WorkerBuildCtx,
+    tablet: TabletId,
+    voters: &BTreeSet<u64>,
+    generation: u64,
+) -> Result<
+    (
+        ConsensusGroupId,
+        OwnerCtx<GroupRaftStore>,
+        crate::node::NewReplica,
+    ),
+    String,
+> {
+    let group = ConsensusGroupId::of_tablet(tablet);
+    if group.is_control() || tablet.as_u64() == 0 {
+        return Err(format!("tablet {} is reserved", tablet.as_u64()));
+    }
+    // Fencing: a stale create never resurrects a newer retirement.
+    let tomb_path = build
+        .data_dir
+        .join("consensus-sm")
+        .join(tablet.as_u64().to_string())
+        .join(ConsensusNode::TOMBSTONE_FILE);
+    if let Ok(bytes) = std::fs::read(&tomb_path) {
+        let retired = u64::from_le_bytes(bytes[..8.min(bytes.len())].try_into().unwrap_or([0; 8]));
+        if generation <= retired {
+            return Err(format!(
+                "stale create for tablet {} (generation {generation} <= retired {retired})",
+                tablet.as_u64(),
+            ));
+        }
+        let _ = std::fs::remove_file(&tomb_path);
+    }
+    let authority =
+        TabletAuthority::new(tablet, TabletEpoch::INITIAL, WriteGuardGeneration::INITIAL);
+    let mut store = GroupRaftStore::from_recovered(build.namespace, group, &build.durability, &[])
+        .map_err(|error| format!("dynamic group store failed: {error}"))?;
+    let machine = ReplicatedStateMachine::open(&build.data_dir, build.namespace, tablet, authority)
+        .map_err(|error| format!("dynamic state machine failed: {error}"))?;
+    let mut sources: Vec<NodeId> = voters
+        .iter()
+        .map(|voter| NodeId::from_u64(*voter))
+        .filter(|peer| *peer != build.local)
+        .collect();
+    sources.sort_by_key(|peer| peer.as_u64());
+    let domain = kivi_types::SecurityDomainId::from_u64(build.namespace.as_u64());
+    let gate = SidecarGate::new(
+        build.sidecar.clone(),
+        build.transport.clone(),
+        sources,
+        group,
+        domain,
+        build.bulk_timeout,
+    );
+    store.set_gate(gate.clone());
+    let raft = spawn_raft(build.local, group, build.router.clone(), &store, &machine)
+        .await
+        .map_err(|error| format!("dynamic raft spawn failed: {error}"))?;
+    let voter_list = sorted_voters(voters);
+    let info = crate::node::NewReplica {
+        machine: machine.clone(),
+        authority,
+    };
+    let ctx = assemble_ctx(
+        raft,
+        store,
+        machine,
+        build.sidecar.clone(),
+        gate,
+        build.transport.clone(),
+        group,
+        build.namespace,
+        authority,
+        tablet,
+        build.local,
+        voter_list,
+        build.bulk_timeout,
+        Arc::clone(&build.preflight),
+        build.preflight_enabled,
+    );
+    Ok((group, ctx, info))
 }
 
 /// Serves one worker's ingress until `Shutdown`: group-scoped requests
 /// dispatch to the owning replica's [`OwnerCtx`] (each on its own task —
 /// a pending large-write preflight never blocks small writes or peer
 /// RPCs); node-wide suspend/resume run against the shared transport;
+/// dynamic [`EnsureGroup`](OwnerRequest::EnsureGroup) /
+/// [`RetireGroup`](OwnerRequest::RetireGroup) run inline (rare,
+/// local-only, never network: a brief ingress pause while a replica
+/// builds or stops, never a data-path stall);
 /// `Shutdown` breaks the loop and stops every local `Raft`.
 async fn worker_loop(
-    replicas: HashMap<ConsensusGroupId, OwnerCtx<GroupRaftStore>>,
+    mut replicas: HashMap<ConsensusGroupId, OwnerCtx<GroupRaftStore>>,
     local: NodeId,
     transport: PeerTransport,
+    build: WorkerBuildCtx,
     requests: async_channel::Receiver<OwnerRequest>,
 ) {
     while let Ok(request) = requests.recv().await {
         match request {
             OwnerRequest::Shutdown => break,
+            OwnerRequest::EnsureGroup {
+                group,
+                tablet,
+                voters,
+                generation,
+                reply,
+            } => {
+                serve_ensure(
+                    &build,
+                    &mut replicas,
+                    group,
+                    tablet,
+                    &voters,
+                    generation,
+                    reply,
+                )
+                .await;
+            }
+            OwnerRequest::RetireGroup {
+                group,
+                tablet,
+                generation,
+                reply,
+            } => {
+                serve_retire(&build, &mut replicas, group, tablet, generation, reply).await;
+            }
             OwnerRequest::SuspendPeer { peer, reply } => {
                 let transport = transport.clone();
                 compio::runtime::spawn(async move {
@@ -1427,10 +2439,11 @@ mod tests {
                 preflight_enabled: true,
                 worker_count: 2,
                 durability: SharedDurabilityConfig::default(),
+                control: None,
             })
             .await
             .expect("multi opens");
-            assert_eq!(node.tablets(), tablets.as_slice());
+            assert_eq!(node.tablets(), tablets);
             assert_eq!(node.worker_count(), 2);
             // Deterministic worker striping: tablet 1 on worker 0.
             assert_eq!(crate::worker::worker_for_tablet(tablets[0], 2), 0);
@@ -1484,6 +2497,135 @@ mod tests {
         });
     }
 
+    /// Control plane plus dynamic lifecycle on one node: the system
+    /// control group commits typed mutations, a new tablet replica is
+    /// created without restart, observed, retired with a tombstone, and
+    /// stays retired across reopen while control state recovers.
+    ///
+    /// Long because it walks the whole lifecycle in one scenario (each
+    /// phase builds on the last); splitting it would re-pay open/boot
+    /// costs per phase for no isolation gain.
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn control_plane_propose_observe_and_dynamic_lifecycle() {
+        block_on(async {
+            let dir = tempfile::tempdir().expect("scratch");
+            let addr = probe_udp();
+            let tablets = vec![TabletId::from_u64(1)];
+            let topology = single_topology(addr, &tablets);
+            let voters = BTreeSet::from([1u64]);
+            let peer_addrs = BTreeMap::from([(1u64, addr.to_string())]);
+            let config = || MultiNodeConfig {
+                data_dir: dir.path().to_owned(),
+                namespace: NS,
+                tablets: tablets.clone(),
+                local: NodeId::from_u64(1),
+                topology: topology.clone(),
+                segment_target_bytes: 1024 * 1024,
+                transport: TransportConfig::default(),
+                peer_certs: HashMap::new(),
+                insecure_peer_tls: true,
+                preflight_enabled: true,
+                worker_count: 1,
+                durability: SharedDurabilityConfig::default(),
+                control: Some(ControlGroupConfig {
+                    voters: voters.clone(),
+                    peer_addrs: peer_addrs.clone(),
+                    seeds: Vec::new(),
+                }),
+            };
+            let node = ConsensusNode::open(config())
+                .await
+                .expect("multi with control opens");
+            assert!(node.hosts_control());
+            // Single voter self-elects; control proposals commit.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let record = kivi_control::NodeRecord {
+                    node: NodeId::from_u64(1),
+                    peer: addr,
+                    native: "127.0.0.1:9001".parse().expect("addr"),
+                    admin: "127.0.0.1:19001".parse().expect("addr"),
+                    cert_fingerprint: [3u8; 32],
+                    failure_domain: String::new(),
+                    weight: 1,
+                    state: kivi_control::NodeState::Joining,
+                };
+                if node
+                    .propose_control(kivi_control::ControlMutation::RegisterNode { record })
+                    .await
+                    .is_ok()
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "control never elected"
+                );
+                compio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            node.propose_control(kivi_control::ControlMutation::SetNodeState {
+                node: NodeId::from_u64(1),
+                state: kivi_control::NodeState::Active,
+            })
+            .await
+            .expect("activate commits");
+            let state = node.control_state().await.expect("control image");
+            assert_eq!(
+                state.node(NodeId::from_u64(1)).expect("registered").state,
+                kivi_control::NodeState::Active
+            );
+            // Dynamic target creation without restart.
+            let fresh = TabletId::from_u64(2);
+            node.ensure_group(fresh, BTreeSet::from([1u64]), 7)
+                .await
+                .expect("ensure creates");
+            assert!(node.tablets().contains(&fresh));
+            // A fresh replica is uninitialized by design (it must join
+            // through learner replication, never fork with a second
+            // initialize), so it observes empty membership until the
+            // tablet leader replicates to it.
+            let observed = node.observe_membership(fresh).await.expect("observed");
+            assert!(observed.voters.is_empty());
+            // Idempotent re-create answers success.
+            node.ensure_group(fresh, BTreeSet::from([1u64]), 7)
+                .await
+                .expect("re-ensure succeeds");
+            // Retirement tombstones; a stale create refuses resurrection.
+            node.retire_group(fresh, 7).await.expect("retire succeeds");
+            assert!(!node.tablets().contains(&fresh));
+            assert!(node.observe_membership(fresh).await.is_err());
+            assert_eq!(
+                ConsensusNode::tombstone_generation(dir.path(), fresh),
+                Some(7)
+            );
+            assert!(
+                node.ensure_group(fresh, BTreeSet::from([1u64]), 6)
+                    .await
+                    .is_err()
+            );
+            node.shutdown().await;
+            // Release the directory lock before reopening (shutdown
+            // stops threads; drop releases the guard).
+            drop(node);
+            // Reopen: tombstoned tablet stays skipped, control state and
+            // tablet 1 recover.
+            let node = ConsensusNode::open(config())
+                .await
+                .expect("reopen skips tombstones");
+            assert_eq!(node.tablets(), tablets);
+            let state = node.control_state().await.expect("control recovers");
+            assert_eq!(
+                state
+                    .node(NodeId::from_u64(1))
+                    .expect("node recovers")
+                    .state,
+                kivi_control::NodeState::Active
+            );
+            node.shutdown().await;
+        });
+    }
+
     /// Unknown tablets fail loudly (never route to a wrong group).
     #[test]
     fn unknown_tablet_is_rejected() {
@@ -1505,6 +2647,7 @@ mod tests {
                 preflight_enabled: true,
                 worker_count: 1,
                 durability: SharedDurabilityConfig::default(),
+                control: None,
             })
             .await
             .expect("multi opens");
@@ -1550,6 +2693,7 @@ mod tests {
                 preflight_enabled: true,
                 worker_count: 1,
                 durability: SharedDurabilityConfig::default(),
+                control: None,
             };
             assert!(ConsensusNode::open(bad).await.is_err(), "tablet 0 refused");
             node.shutdown().await;

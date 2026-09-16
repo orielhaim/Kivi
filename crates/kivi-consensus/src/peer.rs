@@ -1273,7 +1273,7 @@ mod tests {
             }
             assert_eq!(&decoded.request, request);
             // Truncated bodies fail the decode (backoff), never apply.
-            // Command-level validation (undecodable `ReplicatedMutation`)
+            // Command-level validation (undecodable `ConsensusCommand`)
             // lives in the router codec, tested there.
             if body.len() > 4 {
                 assert!(decode_h3_request(&path, &body[..body.len() - 1]).is_err());

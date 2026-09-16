@@ -29,9 +29,23 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use kivi_types::NodeId;
+
+/// Dynamically admitted peer certificate pins (`node → certificate
+/// DER`): the replicated node registry admits nodes at runtime, so peer
+/// trust cannot stay purely static. Static pins (startup flags) seed
+/// verification; this registry extends it as the control plane commits
+/// admissions. Consulted on every dial and for every incoming
+/// connection — no restart, no flag edits.
+pub type TrustRegistry = Arc<RwLock<HashMap<NodeId, Vec<u8>>>>;
+
+/// Creates an empty dynamic trust registry.
+#[must_use]
+pub fn empty_trust() -> TrustRegistry {
+    Arc::new(RwLock::new(HashMap::new()))
+}
 
 /// Fingerprint of a peer certificate: `BLAKE3(cert DER)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

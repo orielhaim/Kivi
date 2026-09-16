@@ -108,10 +108,89 @@ enum Command {
         #[arg(long, default_value = "clear")]
         expiry: String,
     },
+    /// Cluster control-plane operations (node admission, placement,
+    /// migration) against a node's admin endpoint.
+    Cluster {
+        /// Admin endpoint of any cluster node.
+        #[arg(long, default_value = "127.0.0.1:19080")]
+        admin: String,
+        #[command(subcommand)]
+        command: ClusterCommand,
+    },
+}
+
+/// Cluster operator actions. These speak to the admin plane (typed
+/// control-plane API), never raw Raft messages.
+#[derive(Debug, Subcommand)]
+enum ClusterCommand {
+    /// Show cluster readiness, nodes, and migration progress.
+    Status,
+    /// List admitted nodes and their lifecycle states.
+    NodeList,
+    /// Admit a node (`Joining` then `Active` after commit).
+    NodeAdd {
+        /// New node id.
+        id: u64,
+        /// Its consensus (H3 peer) endpoint.
+        #[arg(long)]
+        peer: String,
+        /// Its native client endpoint.
+        #[arg(long)]
+        native: String,
+        /// Its admin endpoint.
+        #[arg(long)]
+        admin_node: String,
+        /// Certificate fingerprint (64 hex chars); absent means
+        /// unenforced (lab-insecure only).
+        #[arg(long)]
+        fingerprint: Option<String>,
+        /// Failure-domain label (zone/rack/host-group).
+        #[arg(long, default_value = "")]
+        domain: String,
+    },
+    /// Drain a node: migrate every replica away, then mark `Drained`.
+    NodeDrain {
+        /// Node id.
+        id: u64,
+    },
+    /// Remove a safely drained node (fails loudly otherwise).
+    NodeRemove {
+        /// Node id.
+        id: u64,
+    },
+    /// List tablets with desired vs actual placement.
+    TabletList,
+    /// Show one tablet's membership and desired placement.
+    TabletShow {
+        /// Tablet id.
+        id: u64,
+    },
+    /// Move one tablet replica through the persisted plan pathway.
+    TabletMove {
+        /// Tablet id.
+        #[arg(long)]
+        tablet: u64,
+        /// Replica leaving.
+        #[arg(long)]
+        from: u64,
+        /// Replica joining (must be `Active`).
+        #[arg(long)]
+        to: u64,
+    },
+    /// Compute desired placements and create bounded migration plans.
+    Rebalance,
+    /// Rebalance tablet leadership with graceful handoffs (explicit,
+    /// never continuous).
+    Leadership,
+    /// List migration plans.
+    Migrations,
 }
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    if let Command::Cluster { admin, command } = &cli.command {
+        return run_cluster(admin, command);
+    }
     let mut seeds = vec![cli.server.clone()];
     seeds.extend(cli.seed.iter().cloned());
     let client = NativeClient::new(ClientConfig {
@@ -123,8 +202,371 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Minimal synchronous admin HTTP client (Content-Length framing both
+/// ways; the admin plane always replies with one JSON body).
+fn admin_roundtrip(
+    admin: &str,
+    method: &str,
+    path: &str,
+    body: Option<&[u8]>,
+) -> anyhow::Result<serde_json::Value> {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(admin)?;
+    let len = body.map_or(0, <[u8]>::len);
+    let head = format!(
+        "{method} {path} HTTP/1.1\r\nhost: {admin}\r\ncontent-type: application/json\r\ncontent-length: {len}\r\nconnection: close\r\n\r\n"
+    );
+    stream.write_all(head.as_bytes())?;
+    if let Some(body) = body {
+        stream.write_all(body)?;
+    }
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw)?;
+    let header_end = raw
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| anyhow::anyhow!("admin reply without headers"))?;
+    let body = &raw[header_end + 4..];
+    Ok(serde_json::from_slice(body)?)
+}
+
+/// Runs one cluster operator command against the admin plane.
+#[allow(clippy::too_many_lines)]
+fn run_cluster(admin: &str, command: &ClusterCommand) -> anyhow::Result<()> {
+    match command {
+        ClusterCommand::Status => {
+            let ready: serde_json::Value = admin_roundtrip(admin, "GET", "/ready", None)?;
+            let control: serde_json::Value = admin_roundtrip(admin, "GET", "/v1/control", None)?;
+            println!(
+                "ready: {}",
+                ready
+                    .get("ready")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            );
+            println!(
+                "tablets: {}/{} healthy, {} leaders known",
+                ready
+                    .get("tablets_healthy")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                ready
+                    .get("tablets_total")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                ready
+                    .get("leaders_known")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+            );
+            if control
+                .get("present")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                println!(
+                    "placement version: {}",
+                    control
+                        .get("placement_version")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0)
+                );
+                let nodes = control
+                    .get("nodes")
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let mut active = 0;
+                let mut draining = 0;
+                for node in &nodes {
+                    match node
+                        .get("state")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("?")
+                    {
+                        "Active" => active += 1,
+                        "Draining" | "Drained" => draining += 1,
+                        _ => {}
+                    }
+                }
+                println!(
+                    "nodes: {} active, {} draining/drained ({} total)",
+                    active,
+                    draining,
+                    nodes.len()
+                );
+                let live = control
+                    .get("migrations")
+                    .and_then(serde_json::Value::as_array)
+                    .map_or(0, |plans| {
+                        plans
+                            .iter()
+                            .filter(|plan| {
+                                !matches!(
+                                    plan.get("phase").and_then(serde_json::Value::as_str),
+                                    Some("Completed" | "Failed")
+                                )
+                            })
+                            .count()
+                    });
+                println!("migrations live: {live}");
+            } else {
+                println!("control plane: not present on this node");
+            }
+            Ok(())
+        }
+        ClusterCommand::NodeList => {
+            let control: serde_json::Value = admin_roundtrip(admin, "GET", "/v1/control", None)?;
+            let nodes = control
+                .get("nodes")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            println!(
+                "{:<6} {:<21} {:<21} {:<10} domain",
+                "node", "peer", "native", "state"
+            );
+            for node in nodes {
+                println!(
+                    "{:<6} {:<21} {:<21} {:<10} {}",
+                    node.get("node")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
+                    node.get("peer")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("?"),
+                    node.get("native")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("?"),
+                    node.get("state")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("?"),
+                    node.get("domain")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or(""),
+                );
+            }
+            Ok(())
+        }
+        ClusterCommand::NodeAdd {
+            id,
+            peer,
+            native,
+            admin_node,
+            fingerprint,
+            domain,
+        } => {
+            let mut body = serde_json::json!({
+                "node": id,
+                "peer": peer,
+                "native": native,
+                "admin": admin_node,
+                "domain": domain,
+            });
+            if let Some(fingerprint) = fingerprint {
+                body["fingerprint"] = serde_json::Value::String(fingerprint.clone());
+            }
+            let raw = serde_json::to_vec(&body)?;
+            let reply = admin_roundtrip(admin, "POST", "/v1/control/nodes", Some(&raw))?;
+            if reply
+                .get("ok")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                println!("admitted node {id}");
+                Ok(())
+            } else {
+                anyhow::bail!("node add refused: {reply}");
+            }
+        }
+        ClusterCommand::NodeDrain { id } => {
+            let reply = admin_roundtrip(
+                admin,
+                "POST",
+                &format!("/v1/control/nodes/{id}/drain"),
+                Some(b"{}"),
+            )?;
+            if reply
+                .get("ok")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                println!(
+                    "draining node {id}; plans: {}",
+                    reply
+                        .get("plans")
+                        .map_or_else(String::new, ToString::to_string)
+                );
+                Ok(())
+            } else {
+                anyhow::bail!("node drain refused: {reply}");
+            }
+        }
+        ClusterCommand::NodeRemove { id } => {
+            let reply = admin_roundtrip(
+                admin,
+                "POST",
+                &format!("/v1/control/nodes/{id}/remove"),
+                Some(b"{}"),
+            )?;
+            if reply
+                .get("ok")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                println!("removed node {id}");
+                Ok(())
+            } else {
+                anyhow::bail!("node remove refused: {reply}");
+            }
+        }
+        ClusterCommand::TabletList => {
+            let tablets: serde_json::Value = admin_roundtrip(admin, "GET", "/v1/tablets", None)?;
+            let tablets = tablets.as_array().cloned().unwrap_or_default();
+            println!(
+                "{:<8} {:<8} {:<10} {:<24} voters",
+                "tablet", "role", "placement", "desired"
+            );
+            for tablet in tablets {
+                println!(
+                    "{:<8} {:<8} {:<10} {:<24} {}",
+                    tablet
+                        .get("group")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
+                    tablet
+                        .get("role")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("?"),
+                    tablet
+                        .get("placement")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("?"),
+                    tablet
+                        .get("desired")
+                        .map_or_else(|| String::from("-"), ToString::to_string),
+                    tablet
+                        .get("voters")
+                        .map_or_else(|| String::from("-"), ToString::to_string),
+                );
+            }
+            Ok(())
+        }
+        ClusterCommand::TabletShow { id } => {
+            let membership: serde_json::Value =
+                admin_roundtrip(admin, "GET", &format!("/v1/tablets/{id}/membership"), None)?;
+            println!("membership: {membership}");
+            let control: serde_json::Value = admin_roundtrip(admin, "GET", "/v1/control", None)?;
+            if let Some(placements) = control
+                .get("placements")
+                .and_then(serde_json::Value::as_array)
+            {
+                for placement in placements {
+                    if placement.get("tablet").and_then(serde_json::Value::as_u64) == Some(*id) {
+                        println!("desired: {placement}");
+                    }
+                }
+            }
+            Ok(())
+        }
+        ClusterCommand::TabletMove { tablet, from, to } => {
+            let body = serde_json::json!({ "tablet": tablet, "from": from, "to": to });
+            let raw = serde_json::to_vec(&body)?;
+            let reply =
+                admin_roundtrip(admin, "POST", "/v1/control/migrations/create", Some(&raw))?;
+            if reply
+                .get("ok")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                println!(
+                    "plan created: {}",
+                    reply
+                        .get("plans")
+                        .map_or_else(String::new, ToString::to_string)
+                );
+                Ok(())
+            } else {
+                anyhow::bail!("tablet move refused: {reply}");
+            }
+        }
+        ClusterCommand::Rebalance => {
+            let reply = admin_roundtrip(admin, "POST", "/v1/control/rebalance", Some(b"{}"))?;
+            if reply
+                .get("ok")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                println!(
+                    "plans: {}",
+                    reply
+                        .get("plans")
+                        .map_or_else(String::new, ToString::to_string)
+                );
+                Ok(())
+            } else {
+                anyhow::bail!("rebalance refused: {reply}");
+            }
+        }
+        ClusterCommand::Leadership => {
+            let reply = admin_roundtrip(admin, "POST", "/v1/control/leadership", Some(b"{}"))?;
+            if reply
+                .get("ok")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                println!(
+                    "transfers: {}",
+                    reply
+                        .get("leadership_transfers")
+                        .map_or_else(|| String::from("0"), ToString::to_string)
+                );
+                Ok(())
+            } else {
+                anyhow::bail!("leadership rebalance refused: {reply}");
+            }
+        }
+        ClusterCommand::Migrations => {
+            let reply: serde_json::Value =
+                admin_roundtrip(admin, "GET", "/v1/control/migrations", None)?;
+            let plans = reply
+                .get("migrations")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            println!(
+                "{:<6} {:<8} {:<6} {:<6} phase",
+                "id", "tablet", "from", "to"
+            );
+            for plan in plans {
+                println!(
+                    "{:<6} {:<8} {:<6} {:<6} {}",
+                    plan.get("id")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
+                    plan.get("tablet")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
+                    plan.get("from")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
+                    plan.get("to")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
+                    plan.get("phase")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("?"),
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
 fn run(client: &NativeClient, command: &Command) -> Result<(), kivi_client::ClientError> {
     match command {
+        // Diverted in `main` before any client connects; unreachable here.
+        Command::Cluster { .. } => return Err(kivi_client::ClientError::InvalidRequest),
         Command::Get { key } => match client.get(&Key::from(key.clone()))? {
             Some(value) => println!("{}", String::from_utf8_lossy(&value)),
             None => println!("(nil)"),
@@ -254,5 +696,65 @@ mod tests {
         assert!(Cli::try_parse_from(["kivi-cli", "frobnicate"]).is_err());
         assert!(Cli::try_parse_from(["kivi-cli", "get"]).is_err());
         assert!(Cli::try_parse_from(["kivi-cli", "counter-add", "k", "lots"]).is_err());
+    }
+
+    #[test]
+    fn cluster_operator_commands_parse() {
+        let cli = Cli::try_parse_from(["kivi-cli", "cluster", "status"]).expect("parses");
+        assert!(matches!(
+            cli.command,
+            Command::Cluster { ref command, .. } if matches!(command, ClusterCommand::Status)
+        ));
+        let cli = Cli::try_parse_from([
+            "kivi-cli",
+            "--admin",
+            "10.0.0.9:19080",
+            "cluster",
+            "node",
+            "drain",
+            "3",
+        ]);
+        // `node drain` is `cluster node-drain` style: two words fail, the
+        // hyphenated subcommand parses.
+        assert!(cli.is_err());
+        let cli = Cli::try_parse_from([
+            "kivi-cli",
+            "cluster",
+            "--admin",
+            "10.0.0.9:19080",
+            "node-drain",
+            "3",
+        ])
+        .expect("parses");
+        match cli.command {
+            Command::Cluster { admin, command } => {
+                assert_eq!(admin, "10.0.0.9:19080");
+                assert!(matches!(command, ClusterCommand::NodeDrain { id: 3 }));
+            }
+            _ => panic!("cluster command parses"),
+        }
+        let cli = Cli::try_parse_from([
+            "kivi-cli",
+            "cluster",
+            "tablet-move",
+            "--tablet",
+            "7",
+            "--from",
+            "1",
+            "--to",
+            "4",
+        ])
+        .expect("parses");
+        assert!(matches!(
+            cli.command,
+            Command::Cluster {
+                command: ClusterCommand::TabletMove {
+                    tablet: 7,
+                    from: 1,
+                    to: 4
+                },
+                ..
+            }
+        ));
     }
 }

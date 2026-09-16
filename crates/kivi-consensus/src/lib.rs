@@ -47,7 +47,9 @@
 //! group.
 
 pub mod cluster;
+pub mod command;
 pub mod config;
+pub mod control;
 pub mod gate;
 pub mod multi;
 pub mod mutation;
@@ -69,8 +71,12 @@ pub use cluster::{
     Bootstrap, BootstrapError, ClusterTopology, DurableClusterView, NodeDescriptor,
     TabletAssignment, TopologyError, classify_bootstrap, verify_against_durable,
 };
+pub use command::{CONSENSUS_COMMAND_VERSION, ConsensusCommand, ConsensusCommandError};
+pub use control::{
+    CATCH_UP_LAG_THRESHOLD, ObservedMembership, ReconcileStep, caught_up, next_step,
+};
 pub use gate::{SidecarGate, sidecar_io_error};
-pub use multi::{ConsensusNode, MultiNodeConfig};
+pub use multi::{ConsensusNode, ControlGroupConfig, MultiNodeConfig};
 pub use mutation::{
     REPLICATED_MUTATION_VERSION, ReplicatedMutation, ReplicatedMutationError, ReplicatedOutcome,
 };
@@ -115,10 +121,10 @@ pub use state_machine::{
 pub use store::{
     CONSENSUS_LANE, ConsensusLogStore, DurableLogReader, DurableRaftStore, StoreOpenError,
 };
-pub use tls::{CertFingerprint, NodeCert, TlsError};
+pub use tls::{CertFingerprint, NodeCert, TlsError, TrustRegistry, empty_trust};
 pub use transport::{PeerHandler, PeerStats, PeerTransport, TransportConfig, TransportError};
 pub use types::{
-    ConsensusError, ConsensusGroupId, ConsensusLogIndex, ConsensusTerm, LeaderHint, ReadBarrier,
-    ReplicaId, ReplicaRole,
+    CONTROL_TABLET_RAW, ConsensusError, ConsensusGroupId, ConsensusLogIndex, ConsensusTerm,
+    LeaderHint, ReadBarrier, ReplicaId, ReplicaRole,
 };
 pub use worker::{tablets_for_worker, worker_for_tablet};

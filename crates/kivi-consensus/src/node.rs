@@ -103,6 +103,7 @@ use openraft::storage::RaftStateMachine as _;
 use openraft::type_config::async_runtime::watch::WatchReceiver as _;
 
 use crate::cluster::{Bootstrap, ClusterTopology, DurableClusterView, classify_bootstrap};
+use crate::command::ConsensusCommand;
 use crate::config::{KiviTypeConfig, cluster_config};
 use crate::gate::SidecarGate;
 use crate::mutation::ReplicatedMutation;
@@ -346,6 +347,16 @@ pub struct NodeStatus {
 
 type Reply<T> = futures::channel::oneshot::Sender<T>;
 
+/// Handles a dynamically created replica: the worker-built state
+/// machine and authority the front inserts into its caller-side maps.
+#[derive(Debug, Clone)]
+pub(crate) struct NewReplica {
+    /// Local state machine for the new tablet.
+    pub(crate) machine: ReplicatedStateMachine,
+    /// Replica authority.
+    pub(crate) authority: TabletAuthority,
+}
+
 /// One unit of work for the owner thread. Every variant carries its reply
 /// channel; dropping the reply (owner shutdown race) surfaces as
 /// `ShuttingDown` on the caller, never a hang.
@@ -355,9 +366,21 @@ pub(crate) enum OwnerRequest {
         /// Addressed group.
         group: ConsensusGroupId,
         /// Deterministic command plus expectation.
-        command: ReplicatedMutation,
+        command: ConsensusCommand,
         /// Mapped proposal outcome.
         reply: Reply<Result<ProposeOutcome, ProposeError>>,
+    },
+    /// Quorum-commit one typed control-plane mutation. Control entries
+    /// install no client outcome (like barriers and membership), so
+    /// this answers the committed index directly instead of forcing a
+    /// phantom outcome through the tablet proposal contract.
+    ProposeControl {
+        /// Addressed group (always the system control group).
+        group: ConsensusGroupId,
+        /// Typed control mutation.
+        mutation: kivi_control::ControlMutation,
+        /// Committed index or human-readable reason.
+        reply: Reply<Result<ConsensusLogIndex, String>>,
     },
     /// Quorum-commit one chunked operation with preflight: the owner
     /// pre-distributes sidecars to a write quorum, then prepares the
@@ -423,6 +446,91 @@ pub(crate) enum OwnerRequest {
         /// Sealed base or human-readable reason.
         reply: Reply<Result<ConsensusLogIndex, String>>,
     },
+    /// Register a learner on the group leader (`add_learner`). The
+    /// reconciler calls this on the tablet leader with `blocking=true`
+    /// so it returns once the learner is line-rate; promoting earlier
+    /// can stall quorum progress.
+    AddLearner {
+        /// Addressed group.
+        group: ConsensusGroupId,
+        /// Joining node.
+        node: NodeId,
+        /// Dialable peer address for the joining node (rides as the
+        /// node's `BasicNode::addr` in replicated membership).
+        addr: String,
+        /// Whether to block until the learner catches up.
+        blocking: bool,
+        /// Completion or human-readable reason (not-leader, lost
+        /// leadership, storage).
+        reply: Reply<Result<(), String>>,
+    },
+    /// Replace the voter set (`change_membership` with joint consensus
+    /// handled internally by `OpenRaft`). New voters must already be
+    /// learners; removed voters leave or linger per `retain`.
+    ChangeMembership {
+        /// Addressed group.
+        group: ConsensusGroupId,
+        /// Desired voters after the move.
+        voters: std::collections::BTreeSet<u64>,
+        /// Whether removed voters linger as learners (`true`) or leave
+        /// the cluster (`false`). Planned migration uses `false`.
+        retain: bool,
+        /// Completion or human-readable reason.
+        reply: Reply<Result<(), String>>,
+    },
+    /// Ask the leader to hand leadership to `to` (`Trigger::transfer_
+    /// leader`). Fire-and-forget: ignored when the local replica is not
+    /// the leader; the reconciler re-observes and continues.
+    TransferLeader {
+        /// Addressed group.
+        group: ConsensusGroupId,
+        /// Preferred successor (a retained, caught-up voter).
+        to: NodeId,
+        /// Dispatch result (not election outcome).
+        reply: Reply<Result<(), String>>,
+    },
+    /// Observe actual voter/learner/leader state for the reconciler.
+    ObserveMembership {
+        /// Addressed group.
+        group: ConsensusGroupId,
+        /// Current observation.
+        reply: Reply<Result<crate::control::ObservedMembership, String>>,
+    },
+    /// Create an empty local replica for a tablet this node has never
+    /// hosted (target-side migration step). Opens the group store and
+    /// state machine, spawns its `Raft` **without** initializing
+    /// membership (the leader brings it via learner replication), and
+    /// starts serving peer RPCs. Idempotent: an existing replica
+    /// answers success without rebuilding.
+    EnsureGroup {
+        /// Addressed group.
+        group: ConsensusGroupId,
+        /// Tablet to host.
+        tablet: TabletId,
+        /// Current voter set (sidecar-gate sources).
+        voters: std::collections::BTreeSet<u64>,
+        /// Placement generation fencing this creation (persisted in the
+        /// tombstone check: a stale create never resurrects a newer
+        /// retirement).
+        generation: u64,
+        /// New replica handles (machine + authority for the front maps)
+        /// or human-readable reason.
+        reply: Reply<Result<NewReplica, String>>,
+    },
+    /// Retire the local replica after committed membership no longer
+    /// requires it. Shuts down its `Raft`, unregisters the group,
+    /// stops serving it, and writes a tombstone — durable data is
+    /// retained conservatively for future GC. Idempotent.
+    RetireGroup {
+        /// Addressed group.
+        group: ConsensusGroupId,
+        /// Tablet retiring.
+        tablet: TabletId,
+        /// Placement generation fencing this retirement.
+        generation: u64,
+        /// Completion or human-readable reason.
+        reply: Reply<Result<(), String>>,
+    },
     /// Suspend one peer link (partition test hook, drain tooling).
     SuspendPeer {
         /// Suspended peer.
@@ -448,12 +556,19 @@ impl OwnerRequest {
     pub(crate) fn group(&self) -> Option<ConsensusGroupId> {
         match self {
             Self::Propose { group, .. }
+            | Self::ProposeControl { group, .. }
             | Self::ProposeChunked { group, .. }
             | Self::Barrier { group, .. }
             | Self::WaitApplied { group, .. }
             | Self::Status { group, .. }
             | Self::Serve { group, .. }
-            | Self::SnapshotPurge { group, .. } => Some(*group),
+            | Self::SnapshotPurge { group, .. }
+            | Self::AddLearner { group, .. }
+            | Self::ChangeMembership { group, .. }
+            | Self::TransferLeader { group, .. }
+            | Self::ObserveMembership { group, .. }
+            | Self::EnsureGroup { group, .. }
+            | Self::RetireGroup { group, .. } => Some(*group),
             Self::SuspendPeer { .. } | Self::ResumePeer { .. } | Self::Shutdown => None,
         }
     }
@@ -525,15 +640,31 @@ impl OwnerRequest {
                     detail: format!("group not served by node {}", local.as_u64()),
                 }));
             }
-            Self::SnapshotPurge { group, reply } => {
-                let _ = reply.send(Err(format!(
-                    "group {group} not served by node {}",
-                    local.as_u64()
-                )));
+            Self::SnapshotPurge { group, reply, .. }
+            | Self::ProposeControl { group, reply, .. } => {
+                let _ = reply.send(Err(unroutable(group, local)));
+            }
+            Self::AddLearner { group, reply, .. }
+            | Self::ChangeMembership { group, reply, .. }
+            | Self::TransferLeader { group, reply, .. }
+            | Self::RetireGroup { group, reply, .. } => {
+                let _ = reply.send(Err(unroutable(group, local)));
+            }
+            Self::EnsureGroup { group, reply, .. } => {
+                let _ = reply.send(Err(unroutable(group, local)));
+            }
+            Self::ObserveMembership { group, reply } => {
+                let _ = reply.send(Err(unroutable(group, local)));
             }
             Self::SuspendPeer { .. } | Self::ResumePeer { .. } | Self::Shutdown => {}
         }
     }
+}
+
+/// Loud "no local replica owns this group" reason for requests that
+/// reached a worker without a matching replica.
+fn unroutable(group: ConsensusGroupId, local: NodeId) -> String {
+    format!("group {group} not served by node {}", local.as_u64())
 }
 
 /// One replicated Kivi node: a `Send + Sync` front over the Compio owner
@@ -729,6 +860,7 @@ fn open_recovered_parts(config: &NodeConfig) -> Result<RecoveredParts, NodeOpenE
     let tls = crate::transport::TlsMaterial {
         cert: peer_tls_cert,
         peer_certs: config.peer_certs.clone(),
+        trust: Some(crate::tls::empty_trust()),
         insecure_skip_verify: config.insecure_peer_tls,
     };
     Ok(RecoveredParts {
@@ -1157,14 +1289,14 @@ pub(crate) async fn propose_caller_side(
     );
     let envelope =
         kivi_state::MutationEnvelope::new(namespace, authority, client, idempotency, mutation);
-    let command = ReplicatedMutation::new(
+    let command = ConsensusCommand::Tablet(ReplicatedMutation::new(
         envelope,
         expected,
         now,
         identity.map_or(kivi_types::RequestSeq::from_u64(0), |marker| {
             marker.ack_floor
         }),
-    );
+    ));
     owner_call_on(owner_tx, |reply| OwnerRequest::Propose {
         group,
         command,
@@ -1416,6 +1548,9 @@ where
             return;
         }
     };
+    // The single-group node keeps legacy static semantics: a fresh
+    // directory always founds (it serves exactly one fixed group, so
+    // there is no join path here to confuse with formation).
     if let Err(error) = bootstrap_group(
         &BootstrapInputs {
             topology: &topology,
@@ -1426,6 +1561,7 @@ where
             voters: &voters,
             peer_addrs: &peer_addrs,
         },
+        true,
         &mut store,
         &machine,
         &raft,
@@ -1693,6 +1829,18 @@ where
                 let outcome = self.propose(command).await;
                 let _ = reply.send(outcome);
             }
+            OwnerRequest::ProposeControl {
+                group,
+                mutation,
+                reply,
+            } => {
+                if group != self.group {
+                    let _ = reply.send(Err(format!("group {group} not served here")));
+                    return;
+                }
+                let outcome = self.propose_control(mutation).await;
+                let _ = reply.send(outcome);
+            }
             OwnerRequest::ProposeChunked {
                 group,
                 op,
@@ -1777,6 +1925,60 @@ where
                 }
                 let sealed = self.snapshot_purge().await;
                 let _ = reply.send(sealed);
+            }
+            OwnerRequest::AddLearner {
+                group,
+                node,
+                addr,
+                blocking,
+                reply,
+            } => {
+                if group != self.group {
+                    let _ = reply.send(Err(format!("group {group} not served here")));
+                    return;
+                }
+                let outcome = self.add_learner(node, addr, blocking).await;
+                let _ = reply.send(outcome);
+            }
+            OwnerRequest::ChangeMembership {
+                group,
+                voters,
+                retain,
+                reply,
+            } => {
+                if group != self.group {
+                    let _ = reply.send(Err(format!("group {group} not served here")));
+                    return;
+                }
+                let outcome = self.change_membership(voters, retain).await;
+                let _ = reply.send(outcome);
+            }
+            OwnerRequest::TransferLeader { group, to, reply } => {
+                if group != self.group {
+                    let _ = reply.send(Err(format!("group {group} not served here")));
+                    return;
+                }
+                let outcome = self.transfer_leader(to).await;
+                let _ = reply.send(outcome);
+            }
+            OwnerRequest::ObserveMembership { group, reply } => {
+                if group != self.group {
+                    let _ = reply.send(Err(format!("group {group} not served here")));
+                    return;
+                }
+                let _ = reply.send(Ok(self.observe_membership()));
+            }
+            OwnerRequest::EnsureGroup { group, reply, .. } => {
+                // The single-group node serves exactly one fixed group:
+                // dynamic lifecycle lives on the multi-tablet worker loop.
+                let _ = reply.send(Err(format!(
+                    "group {group} dynamic creation unsupported on a single-group node"
+                )));
+            }
+            OwnerRequest::RetireGroup { group, reply, .. } => {
+                let _ = reply.send(Err(format!(
+                    "group {group} dynamic retirement unsupported on a single-group node"
+                )));
             }
             OwnerRequest::SuspendPeer { peer, reply } => {
                 self.transport.suspend_peer(peer).await;
@@ -1884,20 +2086,35 @@ where
             idempotency,
             mutation,
         );
-        let command = ReplicatedMutation::new(
+        let command = ConsensusCommand::Tablet(ReplicatedMutation::new(
             envelope,
             expected,
             now,
             identity.map_or(kivi_types::RequestSeq::from_u64(0), |marker| {
                 marker.ack_floor
             }),
-        );
+        ));
         self.propose(command).await
+    }
+
+    /// Quorum-commits one typed control-plane mutation and answers the
+    /// committed index (control entries carry no client outcome). Runs
+    /// on the owner thread.
+    async fn propose_control(
+        &self,
+        mutation: kivi_control::ControlMutation,
+    ) -> Result<ConsensusLogIndex, String> {
+        let response = self
+            .raft
+            .client_write(ConsensusCommand::Control(mutation))
+            .await
+            .map_err(|error| format!("control write failed: {error}"))?;
+        Ok(ConsensusLogIndex::new(response.log_id.index))
     }
 
     /// Quorum-commits one deterministic command and maps the result onto
     /// the Kivi-owned proposal contract. Runs on the owner thread.
-    async fn propose(&self, command: ReplicatedMutation) -> Result<ProposeOutcome, ProposeError> {
+    async fn propose(&self, command: ConsensusCommand) -> Result<ProposeOutcome, ProposeError> {
         let response = self
             .raft
             .client_write(command)
@@ -1912,6 +2129,79 @@ where
             index: ConsensusLogIndex::new(response.log_id.index),
             outcome,
         })
+    }
+
+    /// Registers a learner on the group leader. Must run on the owner
+    /// thread (the `Raft` handle is `!Send`). With `blocking=true` this
+    /// returns once the leader observes the learner line-rate
+    /// (replication lag within threshold), which is the promotion gate:
+    /// never promote a learner that has not caught up.
+    async fn add_learner(&self, node: NodeId, addr: String, blocking: bool) -> Result<(), String> {
+        self.raft
+            .add_learner(node.as_u64(), openraft::BasicNode::new(addr), blocking)
+            .await
+            .map(|_| ())
+            .map_err(|error| format!("add_learner failed: {error}"))
+    }
+
+    /// Replaces the voter set through joint consensus (handled
+    /// internally by `OpenRaft`: joint config commit, then the uniform
+    /// successor). New voters must already be learners. Must run on the
+    /// owner thread.
+    async fn change_membership(
+        &self,
+        voters: std::collections::BTreeSet<u64>,
+        retain: bool,
+    ) -> Result<(), String> {
+        self.raft
+            .change_membership(voters, retain)
+            .await
+            .map(|_| ())
+            .map_err(|error| format!("change_membership failed: {error}"))
+    }
+
+    /// Asks the leader to hand leadership to `to`. Fire-and-forget: a
+    /// non-leader ignores it, and a changed leadership races safely —
+    /// the reconciler re-observes and continues. Must run on the owner
+    /// thread.
+    async fn transfer_leader(&self, to: NodeId) -> Result<(), String> {
+        self.raft
+            .trigger()
+            .transfer_leader(to.as_u64())
+            .await
+            .map_err(|error| format!("transfer_leader dispatch failed: {error}"))
+    }
+
+    /// Observes actual voter/learner/leader state from metrics. Runs on
+    /// the owner thread (metrics handles are `!Send`).
+    fn observe_membership(&self) -> crate::control::ObservedMembership {
+        let metrics = self.raft.metrics().borrow_watched().clone();
+        let stored = metrics.membership_config;
+        let membership = stored.membership();
+        let voters = membership.voter_ids().collect();
+        let learners = membership.learner_ids().collect();
+        // Replication lag per node from the leader's match indexes
+        // (followers report unknown: only the leader's view gates
+        // promotion).
+        let mut lag = std::collections::BTreeMap::new();
+        if let Some(replication) = metrics.replication.as_ref() {
+            let last = metrics.last_log_index.unwrap_or(0);
+            for (node, matched) in replication {
+                let matched_index = matched.as_ref().map_or(0, |id| id.index);
+                lag.insert(*node, last.saturating_sub(matched_index));
+            }
+        }
+        crate::control::ObservedMembership::with_lag(
+            self.group,
+            voters,
+            learners,
+            metrics
+                .current_leader
+                .map(|node| ReplicaId::of_node(NodeId::from_u64(node))),
+            ConsensusTerm::new(metrics.current_term),
+            membership.get_joint_config().len() > 1,
+            lag,
+        )
     }
 
     /// Establishes a `ReadIndex` linearizable barrier: the leader proves
@@ -2350,9 +2640,11 @@ pub(crate) struct BootstrapInputs<'a> {
 }
 
 /// Installs or verifies group membership: first formation installs the
-/// joint membership exactly once; restarts recover existing Raft state
-/// and fail loudly on identity/membership conflicts instead of
-/// initializing a new group.
+/// joint membership exactly once; rejoins recover existing Raft state
+/// (or wait for learner replication when the group is locally fresh)
+/// and fail loudly on identity conflicts instead of initializing a new
+/// group. Initializing on rejoin would fork a live group's history —
+/// `founding` (true only on a brand-new data directory) gates it.
 ///
 /// Runs on the owner thread (Raft futures are `!Send`).
 ///
@@ -2363,6 +2655,7 @@ pub(crate) struct BootstrapInputs<'a> {
 /// durable state.
 pub(crate) async fn bootstrap_group<S>(
     inputs: &BootstrapInputs<'_>,
+    founding: bool,
     store: &mut S,
     machine: &ReplicatedStateMachine,
     raft: &OwnerRaft,
@@ -2382,8 +2675,9 @@ where
     } = *inputs;
     // Any trace of vote, log, or snapshot base means existing — recover
     // it, never re-initialize.
-    match classify_from_store(store, machine).await {
-        Bootstrap::Fresh => {
+    let bootstrap = classify_from_store(store, machine).await;
+    match bootstrap {
+        Bootstrap::Fresh if founding => {
             let members: std::collections::BTreeMap<u64, openraft::BasicNode> = voters
                 .iter()
                 .map(|voter| {
@@ -2402,42 +2696,33 @@ where
                 })?;
             Ok(())
         }
+        // Locally fresh on rejoin: wait for learner replication (the
+        // leader brings state); initializing here would fork history.
+        Bootstrap::Fresh => Ok(()),
         Bootstrap::Existing => {
-            // Durable voters come from storage, not from fresh metrics
-            // (which start default until `RaftCore` loads): newest
-            // retained membership entry first, snapshot membership when
-            // the log was purged past it (every purge grounds in a
-            // snapshot). An empty set means no membership evidence
-            // survives (e.g. a bare granted vote): membership adopts via
-            // replication — refusing here would brick a legitimate
-            // rejoin with no conflicting evidence.
-            let mut durable_voters = store.membership_voters().await;
-            if durable_voters.is_empty() {
-                durable_voters = machine.member_voters().await;
-            }
-            if !durable_voters.is_empty() {
-                crate::cluster::verify_against_durable(
-                    topology,
-                    tablet,
-                    local,
-                    &DurableClusterView {
-                        cluster,
-                        node,
-                        voters: durable_voters,
-                    },
-                )
-                .map_err(|error| Fault::Bootstrap {
-                    reason: error.to_string(),
-                })?;
-            }
-            Ok(())
+            // Recover durable state, never re-initialize. Voter sets
+            // are not compared (control-plane moves outlive restarts);
+            // removed-while-down replicas were tombstoned at open
+            // through the desired oracle before reaching this worker.
+            crate::cluster::verify_against_durable(
+                topology,
+                tablet,
+                local,
+                &DurableClusterView { cluster, node },
+            )
+            .map_err(|error| Fault::Bootstrap {
+                reason: error.to_string(),
+            })
         }
     }
 }
 
 /// Decides fresh vs. existing from durable signals: any vote, any log
 /// entry, or any snapshot base means existing.
-async fn classify_from_store<S>(store: &mut S, machine: &ReplicatedStateMachine) -> Bootstrap
+pub(crate) async fn classify_from_store<S>(
+    store: &mut S,
+    machine: &ReplicatedStateMachine,
+) -> Bootstrap
 where
     S: ConsensusLogStore,
 {

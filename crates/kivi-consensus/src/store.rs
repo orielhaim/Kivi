@@ -402,7 +402,7 @@ mod tests {
 
     /// Builds one deterministic test command: counter `n += value` with
     /// its exact expected outcome.
-    pub(crate) fn test_command(value: i64) -> crate::mutation::ReplicatedMutation {
+    pub(crate) fn test_command(value: i64) -> crate::command::ConsensusCommand {
         use kivi_state::{Key, Mutation, MutationEnvelope, ObjectVersion, OperationResult};
         use kivi_types::{
             RequestIdentity, RequestSeq, SessionId, TabletAuthority, TabletEpoch, UnixMicros,
@@ -413,7 +413,7 @@ mod tests {
             TabletEpoch::INITIAL,
             WriteGuardGeneration::INITIAL,
         );
-        crate::mutation::ReplicatedMutation::new(
+        crate::command::ConsensusCommand::Tablet(crate::mutation::ReplicatedMutation::new(
             MutationEnvelope::new(
                 NS,
                 authority,
@@ -433,7 +433,7 @@ mod tests {
             },
             UnixMicros::from_micros(1_000_000),
             RequestSeq::from_u64(0),
-        )
+        ))
     }
 
     /// Full framework path: a live single-voter group on the durable

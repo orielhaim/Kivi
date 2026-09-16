@@ -11,6 +11,7 @@
 
 mod admin;
 mod cluster;
+mod control;
 #[cfg(feature = "redis-compat")]
 mod resp;
 #[cfg(feature = "redis-compat")]
@@ -181,12 +182,46 @@ struct Args {
     /// Native client listen address in cluster mode (`:0` ephemeral).
     #[arg(long, default_value = "127.0.0.1:9000")]
     pub(crate) cluster_native: SocketAddr,
+    /// Admin endpoints `node=host:port,...` for cluster mode
+    /// (reconciler forwarding targets; required, and distinct per
+    /// node — the registry records each node's own admin endpoint,
+    /// never the local flag).
+    #[arg(long, value_delimiter = ',', value_parser = parse_node_endpoint)]
+    pub(crate) cluster_admins: Vec<(u64, SocketAddr)>,
     /// Static peer TLS certificates `node=path/to/cert.der,...` for
     /// cluster mode (each file the peer's DER certificate as printed by
     /// `print-peer-cert`). Absent means `KIVI_INSECURE_PEER_TLS=1` must be
     /// set (lab tests only, never production).
     #[arg(long, value_delimiter = ',', value_parser = parse_node_cert_path)]
     pub(crate) cluster_peer_certs: Vec<(u64, PathBuf)>,
+    /// Control-plane voter ids for cluster mode (comma-separated).
+    /// Absent means the three lowest `--cluster-peers` ids: the initial
+    /// product keeps the first three nodes as control voters while added
+    /// data nodes join the control group as learners (control state for
+    /// routing, no vote). Restarting nodes ignore this (durable control
+    /// membership is truth, flags are seeds).
+    #[arg(long, value_delimiter = ',', value_parser = parse_node_u64)]
+    pub(crate) control_voters: Vec<u64>,
+    /// Control-plane seed endpoints (`host:port,...`) proving the
+    /// cluster already exists. Absent on founding voters (a fresh
+    /// directory initializes the control group); REQUIRED on a joining
+    /// node (a fresh directory waits for `add_learner` instead of
+    /// forking history with a second initialize). Ignored on restart
+    /// (durable control state is truth).
+    #[arg(long, value_delimiter = ',')]
+    pub(crate) control_seeds: Vec<SocketAddr>,
+}
+
+/// Parses one control-voter node id.
+fn parse_node_u64(spec: &str) -> Result<u64, String> {
+    let node: u64 = spec
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid node id in {spec:?}"))?;
+    if node == 0 {
+        return Err(format!("node id 0 is reserved, got {spec:?}"));
+    }
+    Ok(node)
 }
 
 /// Parses one `node=path/to/cert.der` peer certificate mapping.

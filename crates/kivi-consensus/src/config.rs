@@ -62,14 +62,15 @@ use openraft::BasicNode;
 openraft::declare_raft_types!(
     /// Project-owned OpenRaft type configuration.
     ///
-    /// `D` is the Kivi-owned [`ReplicatedMutation`](crate::mutation::ReplicatedMutation)
-    /// (deterministic command plus the outcome apply must reproduce); `R` is its
-    /// installed [`ReplicatedOutcome`](crate::mutation::ReplicatedOutcome).
+    /// `D` is the Kivi-owned [`ConsensusCommand`](crate::command::ConsensusCommand)
+    /// envelope (deterministic tablet commands plus typed control-plane
+    /// mutations over one shared log implementation); `R` is its installed
+    /// [`ReplicatedOutcome`](crate::mutation::ReplicatedOutcome).
     /// `AsyncRuntime` is the official Compio runtime: consensus tasks run on
     /// Kivi's Compio reactors. Every other associated type takes the official
     /// default (see the module docs for why each default stands).
     pub KiviTypeConfig:
-        D = crate::mutation::ReplicatedMutation,
+        D = crate::command::ConsensusCommand,
         R = crate::mutation::ReplicatedOutcome,
         NodeId = u64,
         Node = BasicNode,

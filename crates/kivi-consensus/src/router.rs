@@ -165,7 +165,7 @@ fn decode_opt_log(id: Option<&PeerLogId>) -> Option<LogIdOf<KiviTypeConfig>> {
 }
 
 /// Converts one `OpenRaft` entry into its owned wire form. Command bytes
-/// are the canonical [`ReplicatedMutation`](crate::mutation::ReplicatedMutation)
+/// are the canonical [`ConsensusCommand`](crate::command::ConsensusCommand)
 /// encoding (never `OpenRaft` memory layout).
 #[must_use]
 pub fn encode_wire_entry(entry: &EntryOf<KiviTypeConfig>) -> PeerEntry {
@@ -205,13 +205,13 @@ pub fn decode_wire_entry(entry: &PeerEntry) -> Result<EntryOf<KiviTypeConfig>, R
             if command.is_empty() {
                 return Err(RpcCodecError::EmptyCommand);
             }
-            let mutation =
-                crate::mutation::ReplicatedMutation::decode_exact(command).map_err(|error| {
+            let mantra =
+                crate::command::ConsensusCommand::decode_exact(command).map_err(|error| {
                     RpcCodecError::BadCommand {
                         detail: error.to_string(),
                     }
                 })?;
-            EntryPayload::Normal(mutation)
+            EntryPayload::Normal(mantra)
         }
         PeerEntryPayload::Membership { voters, nodes } => {
             let voter_set: std::collections::BTreeSet<u64> = voters.iter().copied().collect();
@@ -662,10 +662,11 @@ mod tests {
         decode_append_request, decode_snapshot_meta, decode_vote_request, decode_wire_entry,
         encode_append_request, encode_snapshot_meta, encode_vote_request, encode_wire_entry,
     };
+    use crate::command::ConsensusCommand;
     use crate::mutation::ReplicatedMutation;
 
     /// Builds one deterministic test command for codec round-trips.
-    fn test_command() -> ReplicatedMutation {
+    fn test_command() -> ConsensusCommand {
         use kivi_state::{Key, Mutation, MutationEnvelope, ObjectVersion, OperationResult};
         use kivi_types::{
             NamespaceId, RequestIdentity, RequestSeq, SessionId, TabletAuthority, TabletEpoch,
@@ -676,7 +677,7 @@ mod tests {
             TabletEpoch::INITIAL,
             WriteGuardGeneration::INITIAL,
         );
-        ReplicatedMutation::new(
+        ConsensusCommand::Tablet(ReplicatedMutation::new(
             MutationEnvelope::new(
                 NamespaceId::from_u64(1),
                 authority,
@@ -693,7 +694,7 @@ mod tests {
             },
             UnixMicros::from_micros(5),
             RequestSeq::from_u64(0),
-        )
+        ))
     }
 
     /// The full RPC surface round-trips through owned structs: encode on

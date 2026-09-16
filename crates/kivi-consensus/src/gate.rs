@@ -119,10 +119,12 @@ impl SidecarGate {
 
     /// Extracts immutable dependencies from one replicated command's bytes.
     ///
-    /// Returns `None` for small/state-local mutations (no sidecars).
+    /// Returns `None` for small/state-local mutations (no sidecars) and
+    /// for control-plane commands (never chunked).
     #[must_use]
     pub fn dependencies_of(command: &[u8]) -> Option<ImmutableDependencies> {
-        let mutation = crate::mutation::ReplicatedMutation::decode_exact(command).ok()?;
+        let envelope_command = crate::command::ConsensusCommand::decode_exact(command).ok()?;
+        let mutation = envelope_command.as_tablet()?;
         let envelope = mutation.envelope();
         match envelope.operation() {
             kivi_state::Mutation::ReplaceChunkedRoot {
@@ -649,6 +651,7 @@ mod tests {
             cert: crate::tls::NodeCert::load_or_generate(dir, NodeId::from_u64(node))
                 .expect("test cert generates"),
             peer_certs: HashMap::new(),
+            trust: None,
             insecure_skip_verify: true,
         }
     }

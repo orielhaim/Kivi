@@ -100,6 +100,22 @@ impl TabletLeaderCache {
             .find_map(|(id, endpoint)| (*id == tablet).then(|| endpoint.clone()))
     }
 
+    /// Drops every hint dialing a dead endpoint (connection refused or
+    /// reset): the next request re-discovers through seeds and fresh
+    /// redirects instead of hammering a grave.
+    pub fn evict_endpoint(&self, endpoint: &str) {
+        let current = self.inner.load();
+        if !current.iter().any(|(_, known)| known == endpoint) {
+            return;
+        }
+        let next: Vec<(TabletId, String)> = current
+            .iter()
+            .filter(|(_, known)| *known != endpoint)
+            .cloned()
+            .collect();
+        self.inner.store(Arc::new(next));
+    }
+
     /// Returns any cached leader endpoint (single-tablet fast path: the
     /// only entry when exactly one tablet is replicated).
     #[must_use]
@@ -163,6 +179,23 @@ impl RouteCache {
             .cloned()
             .collect();
         next.push(entry);
+        self.entries.store(Arc::new(next));
+    }
+
+    /// Drops every route dialing a dead endpoint (connection refused or
+    /// reset): placement moves and killed members converge through
+    /// seeds and fresh redirects instead of a cached grave. Only the
+    /// affected tablets re-discover (§34); the rest of the cache stays.
+    pub fn evict_endpoint(&self, endpoint: &str) {
+        let current = self.entries.load();
+        if !current.iter().any(|entry| entry.endpoint == endpoint) {
+            return;
+        }
+        let next: Vec<RouteEntry> = current
+            .iter()
+            .filter(|entry| entry.endpoint != endpoint)
+            .cloned()
+            .collect();
         self.entries.store(Arc::new(next));
     }
 

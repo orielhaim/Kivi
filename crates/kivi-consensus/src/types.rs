@@ -16,11 +16,27 @@ use kivi_types::{NodeId, TabletId};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ConsensusGroupId(TabletId);
 
+/// Reserved tablet id naming the system control group. Never a user tablet:
+/// real tablet counts are small, so `u64::MAX` can never collide with one.
+pub const CONTROL_TABLET_RAW: u64 = u64::MAX;
+
 impl ConsensusGroupId {
     /// Wraps the tablet this group replicates.
     #[must_use]
     pub const fn of_tablet(tablet: TabletId) -> Self {
         Self(tablet)
+    }
+
+    /// Returns the system control group (the replicated control plane).
+    #[must_use]
+    pub const fn control() -> Self {
+        Self(TabletId::from_u64(CONTROL_TABLET_RAW))
+    }
+
+    /// Whether this is the system control group.
+    #[must_use]
+    pub const fn is_control(self) -> bool {
+        self.0.as_u64() == CONTROL_TABLET_RAW
     }
 
     /// Returns the replicated tablet.

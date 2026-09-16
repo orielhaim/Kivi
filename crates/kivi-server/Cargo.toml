@@ -35,6 +35,7 @@ kivi-durability.workspace = true
 kivi-checkpoint.workspace = true
 kivi-chunk.workspace = true
 kivi-codec.workspace = true
+kivi-control = { path = "../kivi-control", version = "0.1.0" }
 kivi-resp = { workspace = true, optional = true }
 bytes.workspace = true
 clap.workspace = true

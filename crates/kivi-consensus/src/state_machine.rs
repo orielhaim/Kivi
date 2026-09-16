@@ -126,6 +126,7 @@ use openraft::type_config::alias::{
 use openraft::vote::RaftLeaderId as _;
 use openraft::{BasicNode, EntryPayload, Membership};
 
+use crate::command::ConsensusCommand;
 use crate::config::KiviTypeConfig;
 use crate::mutation::{ReplicatedMutation, ReplicatedOutcome};
 
@@ -145,6 +146,10 @@ pub const ANONYMOUS_SESSION: u128 = 0;
 
 /// Snapshot framing magic (`KVSM`: Kivi state machine), little-endian.
 const SNAPSHOT_MAGIC: u32 = 0x4D53_564B;
+/// Control snapshot framing magic (`KVSC`: Kivi control), little-endian.
+const CONTROL_SNAPSHOT_MAGIC: u32 = 0x4353_564B;
+/// Control snapshot framing version.
+const CONTROL_SNAPSHOT_VERSION: u16 = 1;
 /// Applied-file framing magic (`KVSA`: Kivi state-machine applied).
 const APPLIED_MAGIC: u32 = 0x4153_564B;
 /// Snapshot framing version.
@@ -399,6 +404,25 @@ pub enum StateMachineFault {
     /// The local-read path was asked to serve a mutating operation.
     #[error("local read path cannot serve a mutating operation")]
     NotARead,
+    /// A control-plane mutation was rejected at apply time (illegal
+    /// lifecycle transition, unknown node/plan, or stale fenced
+    /// generation). Stale generations are safe rejections, never
+    /// corruption — but they still fail the entry loudly so the
+    /// divergence cannot commit silently.
+    #[error("control mutation rejected at index {index}: {detail}")]
+    ControlRejected {
+        /// Raft log index of the rejected entry.
+        index: u64,
+        /// Human-readable cause.
+        detail: String,
+    },
+    /// A command reached the wrong group kind (tablet command on the
+    /// control group, or control mutation on a tablet group).
+    #[error("command misrouted to wrong group kind: {detail}")]
+    WrongGroup {
+        /// Human-readable cause.
+        detail: String,
+    },
 }
 
 /// Maps a persisted mutation back to its originating opcode discriminant,
@@ -443,6 +467,10 @@ pub struct ReplicatedTablet {
     sessions: HashMap<SessionId, SessionState>,
     applied: Option<AppliedPointer>,
     membership: StoredMembershipOf<KiviTypeConfig>,
+    /// Replicated control image. Meaningful only on the system control
+    /// group ([`is_control`](Self::is_control)); tablet groups leave it
+    /// empty forever.
+    control: kivi_control::ControlState,
 }
 
 impl ReplicatedTablet {
@@ -457,7 +485,22 @@ impl ReplicatedTablet {
             sessions: HashMap::new(),
             applied: None,
             membership: openraft::StoredMembership::default(),
+            control: kivi_control::ControlState::empty(),
         }
+    }
+
+    /// Whether this is the system control group (applies control-plane
+    /// mutations instead of tablet writes).
+    #[must_use]
+    pub fn is_control(&self) -> bool {
+        self.tablet.as_u64() == crate::types::CONTROL_TABLET_RAW
+    }
+
+    /// Returns the replicated control image (meaningful on the control
+    /// group; empty elsewhere).
+    #[must_use]
+    pub const fn control(&self) -> &kivi_control::ControlState {
+        &self.control
     }
 
     /// Returns the tablet identity.
@@ -604,13 +647,15 @@ impl ReplicatedTablet {
         }
     }
 
-    /// Applies one committed log entry: blank/membership bookkeeping or a
-    /// full deterministic command with dedup and verification.
+    /// Applies one committed log entry: blank/membership bookkeeping, a
+    /// full deterministic tablet command with dedup and verification, or
+    /// a typed control-plane mutation on the control group.
     ///
     /// # Errors
     ///
-    /// Returns [`StateMachineFault`] on divergence, misrouting, expiry, or
-    /// apply failure — all fail-loudly classes, never client errors.
+    /// Returns [`StateMachineFault`] on divergence, misrouting, expiry,
+    /// control rejection, or apply failure — all fail-loudly classes,
+    /// never client errors.
     pub fn apply_entry(
         &mut self,
         log_id: LogIdOf<KiviTypeConfig>,
@@ -628,9 +673,53 @@ impl ReplicatedTablet {
                 Ok(ReplicatedOutcome::none())
             }
             EntryPayload::Normal(command) => {
-                let outcome = self.apply_command(index, command)?;
+                let outcome = self.apply_envelope(index, log_id, command)?;
                 self.applied = Some(AppliedPointer::of_log_id(log_id));
                 Ok(outcome)
+            }
+        }
+    }
+
+    /// Dispatches one committed envelope by group kind: tablet commands
+    /// apply through the deterministic tablet path, control mutations
+    /// through replicated control state. Cross-kind commands fail as
+    /// [`WrongGroup`](StateMachineFault::WrongGroup), never silently.
+    fn apply_envelope(
+        &mut self,
+        index: u64,
+        log_id: LogIdOf<KiviTypeConfig>,
+        command: &ConsensusCommand,
+    ) -> Result<ReplicatedOutcome, StateMachineFault> {
+        use StateMachineFault as Fault;
+        match command {
+            ConsensusCommand::Tablet(mutation) => {
+                if self.is_control() {
+                    return Err(Fault::WrongGroup {
+                        detail: format!(
+                            "tablet command for tablet {} reached the control group at index {index}",
+                            mutation.envelope().tablet().as_u64(),
+                        ),
+                    });
+                }
+                self.apply_command(index, mutation)
+            }
+            ConsensusCommand::Control(mutation) => {
+                if !self.is_control() {
+                    return Err(Fault::WrongGroup {
+                        detail: format!(
+                            "control mutation reached tablet {} at index {index}",
+                            self.tablet.as_u64(),
+                        ),
+                    });
+                }
+                self.control
+                    .apply(mutation)
+                    .map_err(|error| Fault::ControlRejected {
+                        index,
+                        detail: error.to_string(),
+                    })?;
+                let _ = log_id;
+                Ok(ReplicatedOutcome::none())
             }
         }
     }
@@ -1070,13 +1159,51 @@ impl ReplicatedTablet {
     }
 
     /// Encodes the framed snapshot image (transport + file bytes).
+    ///
+    /// The control group encodes replicated control state under its own
+    /// magic; tablet groups encode objects/sessions as before. The branch
+    /// is by group kind, so neither format ever aliases the other.
     #[must_use]
     pub fn encode_snapshot(&self) -> Vec<u8> {
+        if self.is_control() {
+            return frame_image(
+                CONTROL_SNAPSHOT_MAGIC,
+                CONTROL_SNAPSHOT_VERSION,
+                &self.encode_control_body(),
+            );
+        }
         frame_image(
             SNAPSHOT_MAGIC,
             SNAPSHOT_VERSION,
             &self.encode_snapshot_body(),
         )
+    }
+
+    /// Encodes the control snapshot body: identity, applied pointer,
+    /// membership log id, membership, plus the canonical control image.
+    #[must_use]
+    pub fn encode_control_body(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        push_u64(&mut out, self.namespace.as_u64());
+        push_u64(&mut out, self.tablet.as_u64());
+        let applied = self.applied.unwrap_or(AppliedPointer::new(0, 0, 0));
+        push_u64(&mut out, applied.term);
+        push_u64(&mut out, applied.leader);
+        push_u64(&mut out, applied.index);
+        match self.membership.log_id() {
+            None => out.push(0),
+            Some(id) => {
+                out.push(1);
+                push_u64(&mut out, id.leader_id.term);
+                push_u64(&mut out, id.leader_id.node_id);
+                push_u64(&mut out, id.index);
+            }
+        }
+        encode_membership(&mut out, &self.membership);
+        let control = self.control.encode_snapshot();
+        push_u64(&mut out, control.len() as u64);
+        out.extend_from_slice(&control);
+        out
     }
 
     /// Decodes a framed snapshot image into tablet state, validating
@@ -1093,6 +1220,9 @@ impl ReplicatedTablet {
         tablet: TabletId,
     ) -> Result<DecodedSnapshot, StateMachineFault> {
         use StateMachineFault as Fault;
+        if tablet.as_u64() == crate::types::CONTROL_TABLET_RAW {
+            return Self::decode_control_snapshot(bytes, namespace, tablet);
+        }
         let body = unframe_image(bytes, SNAPSHOT_MAGIC, SNAPSHOT_VERSION).map_err(|fault| {
             Fault::CorruptImage {
                 detail: format!("snapshot framing invalid: {fault:?}"),
@@ -1125,12 +1255,89 @@ impl ReplicatedTablet {
             membership,
             objects,
             sessions,
+            control: None,
+        })
+    }
+
+    /// Decodes a framed control snapshot image into control state.
+    fn decode_control_snapshot(
+        bytes: &[u8],
+        namespace: NamespaceId,
+        tablet: TabletId,
+    ) -> Result<DecodedSnapshot, StateMachineFault> {
+        use StateMachineFault as Fault;
+        let body = unframe_image(bytes, CONTROL_SNAPSHOT_MAGIC, CONTROL_SNAPSHOT_VERSION).map_err(
+            |fault| Fault::CorruptImage {
+                detail: format!("control snapshot framing invalid: {fault:?}"),
+            },
+        )?;
+        let mut at = 0;
+        let found_namespace = snap_take_u64(body, &mut at)?;
+        let found_tablet = snap_take_u64(body, &mut at)?;
+        if found_namespace != namespace.as_u64() || found_tablet != tablet.as_u64() {
+            return Err(Fault::Misrouted {
+                namespace: found_namespace,
+                tablet: found_tablet,
+                expected_namespace: namespace.as_u64(),
+                expected_tablet: tablet.as_u64(),
+            });
+        }
+        let term = snap_take_u64(body, &mut at)?;
+        let leader = snap_take_u64(body, &mut at)?;
+        let index = snap_take_u64(body, &mut at)?;
+        let membership_flag = snap_take(body, &mut at, 1)?[0];
+        let membership_log = if membership_flag == 0 {
+            None
+        } else {
+            use openraft::impls::leader_id_adv::LeaderId;
+            let term = snap_take_u64(body, &mut at)?;
+            let node = snap_take_u64(body, &mut at)?;
+            let index = snap_take_u64(body, &mut at)?;
+            Some(openraft::LogId::new(LeaderId::new(term, node), index))
+        };
+        let (membership, used) =
+            decode_membership(&body[at..], membership_log).map_err(|fault| {
+                Fault::CorruptImage {
+                    detail: format!("control snapshot membership invalid: {fault:?}"),
+                }
+            })?;
+        at += used;
+        let len = snap_take_count(body, &mut at, "control image")?;
+        let image = snap_take(body, &mut at, len)?;
+        if at != body.len() {
+            return Err(Fault::CorruptImage {
+                detail: "control snapshot body has trailing bytes".to_owned(),
+            });
+        }
+        let control = kivi_control::ControlState::decode_snapshot(image).map_err(|detail| {
+            Fault::CorruptImage {
+                detail: format!("control image invalid: {detail}"),
+            }
+        })?;
+        Ok(DecodedSnapshot {
+            epoch: kivi_types::TabletEpoch::INITIAL,
+            guard: kivi_types::WriteGuardGeneration::INITIAL,
+            applied: if index == 0 && term == 0 && leader == 0 {
+                None
+            } else {
+                Some(AppliedPointer::new(term, leader, index))
+            },
+            membership,
+            objects: Vec::new(),
+            sessions: Vec::new(),
+            control: Some(control),
         })
     }
 
     /// Installs decoded snapshot state wholesale (install path only: the
     /// caller proves durability before and after).
     fn install_decoded(&mut self, decoded: DecodedSnapshot) {
+        if let Some(control) = decoded.control {
+            self.control = control;
+            self.applied = decoded.applied;
+            self.membership = decoded.membership;
+            return;
+        }
         self.store = ObjectStore::new();
         for (key, object) in decoded.objects {
             self.store.put_stored(key, object);
@@ -1142,6 +1349,13 @@ impl ReplicatedTablet {
         }
         self.applied = decoded.applied;
         self.membership = decoded.membership;
+    }
+
+    /// Installs replicated control state directly (control-group open
+    /// path shares this with snapshot install).
+    #[allow(dead_code)]
+    fn install_control(&mut self, control: kivi_control::ControlState) {
+        self.control = control;
     }
 }
 
@@ -1311,6 +1525,9 @@ pub struct DecodedSnapshot {
     pub objects: Vec<(Key, StoredObject)>,
     /// Sessions with floors and retained outcomes.
     pub sessions: DecodedSessions,
+    /// Replicated control image (control snapshots only; `None` for
+    /// tablet snapshots).
+    pub control: Option<kivi_control::ControlState>,
 }
 
 /// Encodes the applied-file body: applied pointer plus membership (so
@@ -1564,6 +1781,14 @@ impl ReplicatedStateMachine {
         now: UnixMicros,
     ) -> Result<kivi_state::StorePrepared, kivi_state::OpError> {
         self.shared.lock().await.tablet.prepare_operation(op, now)
+    }
+
+    /// Returns a clone of the replicated control image (meaningful on
+    /// the control group; empty elsewhere). Read-only observers —
+    /// routing, admin, reconciler — use this; only committed control
+    /// entries mutate it.
+    pub async fn tablet_control(&self) -> kivi_control::ControlState {
+        self.shared.lock().await.tablet.control().clone()
     }
 
     /// Peeks the representation class of one key's live base (the node
@@ -2167,8 +2392,8 @@ mod tests {
         seq: u64,
         mutation: Mutation,
         expected: OperationResult,
-    ) -> ReplicatedMutation {
-        ReplicatedMutation::new(
+    ) -> crate::command::ConsensusCommand {
+        crate::command::ConsensusCommand::Tablet(ReplicatedMutation::new(
             MutationEnvelope::new(
                 NS,
                 authority(),
@@ -2179,7 +2404,7 @@ mod tests {
             expected,
             NOW,
             RequestSeq::from_u64(0),
-        )
+        ))
     }
 
     fn log_id(index: u64) -> openraft::type_config::alias::LogIdOf<crate::config::KiviTypeConfig> {
@@ -2220,7 +2445,7 @@ mod tests {
     fn apply(
         tablet: &mut ReplicatedTablet,
         index: u64,
-        cmd: ReplicatedMutation,
+        cmd: crate::command::ConsensusCommand,
     ) -> ReplicatedOutcome {
         tablet
             .apply_entry(log_id(index), &openraft::EntryPayload::Normal(cmd))
@@ -2510,12 +2735,13 @@ mod tests {
             },
             OperationResult::Deleted { existed: false },
         );
-        let fresh = ReplicatedMutation::new(
-            fresh.envelope().clone(),
-            fresh.expected().clone(),
-            fresh.now(),
+        let fresh_inner = fresh.as_tablet().expect("tablet command").clone();
+        let fresh = crate::command::ConsensusCommand::Tablet(ReplicatedMutation::new(
+            fresh_inner.envelope().clone(),
+            fresh_inner.expected().clone(),
+            fresh_inner.now(),
             RequestSeq::from_u64(1),
-        );
+        ));
         tablet
             .apply_entry(log_id(0), &openraft::EntryPayload::Normal(fresh))
             .expect("unknown session admits");
@@ -2530,12 +2756,13 @@ mod tests {
             },
             OperationResult::Deleted { existed: false },
         );
-        let advance = ReplicatedMutation::new(
-            advance.envelope().clone(),
-            advance.expected().clone(),
-            advance.now(),
+        let advance_inner = advance.as_tablet().expect("tablet command").clone();
+        let advance = crate::command::ConsensusCommand::Tablet(ReplicatedMutation::new(
+            advance_inner.envelope().clone(),
+            advance_inner.expected().clone(),
+            advance_inner.now(),
             RequestSeq::from_u64(4),
-        );
+        ));
         tablet
             .apply_entry(log_id(1), &openraft::EntryPayload::Normal(advance))
             .expect("floor advances");
@@ -2565,7 +2792,7 @@ mod tests {
             TabletEpoch::INITIAL,
             WriteGuardGeneration::INITIAL,
         );
-        let foreign = ReplicatedMutation::new(
+        let foreign = crate::command::ConsensusCommand::Tablet(ReplicatedMutation::new(
             MutationEnvelope::new(
                 NS,
                 foreign_authority,
@@ -2578,7 +2805,7 @@ mod tests {
             OperationResult::Deleted { existed: false },
             NOW,
             RequestSeq::from_u64(0),
-        );
+        ));
         assert!(matches!(
             tablet.apply_entry(log_id(0), &openraft::EntryPayload::Normal(foreign)),
             Err(StateMachineFault::Misrouted { .. })
@@ -2589,7 +2816,7 @@ mod tests {
             TabletEpoch::from_u64(999),
             WriteGuardGeneration::INITIAL,
         );
-        let stale = ReplicatedMutation::new(
+        let stale = crate::command::ConsensusCommand::Tablet(ReplicatedMutation::new(
             MutationEnvelope::new(
                 NS,
                 stale_authority,
@@ -2602,7 +2829,7 @@ mod tests {
             OperationResult::Deleted { existed: false },
             NOW,
             RequestSeq::from_u64(0),
-        );
+        ));
         assert!(matches!(
             tablet.apply_entry(log_id(1), &openraft::EntryPayload::Normal(stale)),
             Err(StateMachineFault::AuthorityMismatch { .. })
