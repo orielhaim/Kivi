@@ -119,6 +119,63 @@ impl ObservedMembership {
     }
 }
 
+/// Authority of one tablet-group observation: an actual member's view
+/// always outranks a non-member local placeholder.
+///
+/// An embryonic local Raft group (created by `ensure_group` before
+/// `add_learner`, with empty membership and no leader, where the local
+/// node is neither voter nor learner) must NEVER shadow an authoritative
+/// observation from actual members. A local process existing is not
+/// evidence that its group view is authoritative. Centralize that rule
+/// here instead of scattering `membership.is_empty()` checks through the
+/// reconciler; migration, repair, split-child, and merge-target creation
+/// all share this path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObservationAuthority {
+    /// The observer is a voter or learner: its view is authoritative.
+    Member,
+    /// The observer is not a member: usable only when no member answers.
+    NonMemberFallback,
+}
+
+/// Classifies a local observation's authority for `local` node.
+///
+/// A missing local group has no authority at all (`None`); a present
+/// group where `local` votes or learns is authoritative; any other
+/// present group (including embryonic empty-membership leaderless
+/// placeholders) is a last-resort fallback only.
+#[must_use]
+pub fn observation_authority(
+    observed: Option<&ObservedMembership>,
+    local: NodeId,
+) -> Option<ObservationAuthority> {
+    let observed = observed?;
+    if observed.is_voter(local) || observed.is_learner(local) {
+        Some(ObservationAuthority::Member)
+    } else {
+        Some(ObservationAuthority::NonMemberFallback)
+    }
+}
+
+/// Selects the authoritative observation: a member-local view wins
+/// immediately; otherwise the caller-provided remote view wins when
+/// present; otherwise the non-member local fallback is returned (which
+/// may still be `None` when nothing hosts the group).
+#[must_use]
+pub fn select_authoritative(
+    local: Option<ObservedMembership>,
+    local_node: NodeId,
+    remote: Option<ObservedMembership>,
+) -> Option<ObservedMembership> {
+    if matches!(
+        observation_authority(local.as_ref(), local_node),
+        Some(ObservationAuthority::Member)
+    ) {
+        return local;
+    }
+    remote.or(local)
+}
+
 /// Whether `target` is sufficiently caught up to promote: present as a
 /// learner (or already a voter) with replication lag within
 /// [`CATCH_UP_LAG_THRESHOLD`]. Unknown lag never promotes — promoting a
@@ -489,5 +546,68 @@ mod tests {
             &observed(&[1, 2, 3], &[], Some(1)),
         );
         assert_eq!(step, ReconcileStep::Done);
+    }
+
+    #[test]
+    fn embryonic_local_never_shadows_member() {
+        // Regression for the drain stall: the control leader is also the
+        // migration target, `ensure_group` created an embryonic local
+        // group (empty membership, no leader, not voter/learner), while
+        // the real group still lives on members. The embryonic view must
+        // lose to the member view.
+        let embryonic = ObservedMembership::new(
+            ConsensusGroupId::of_tablet(TabletId::from_u64(17)),
+            BTreeSet::new(),
+            BTreeSet::new(),
+            None,
+            ConsensusTerm::new(0),
+            false,
+        );
+        let member = observed(&[1, 2, 3], &[], Some(1));
+        // Embryonic local is a non-member fallback, not authoritative.
+        assert_eq!(
+            observation_authority(Some(&embryonic), NodeId::from_u64(4)),
+            Some(ObservationAuthority::NonMemberFallback)
+        );
+        // Member local is authoritative.
+        assert_eq!(
+            observation_authority(Some(&member), NodeId::from_u64(1)),
+            Some(ObservationAuthority::Member)
+        );
+        // Selection prefers the remote member over the embryonic local.
+        let picked = select_authoritative(
+            Some(embryonic.clone()),
+            NodeId::from_u64(4),
+            Some(member.clone()),
+        );
+        assert_eq!(picked, Some(member.clone()));
+        // Without any remote, the embryonic fallback is returned (caller
+        // defers on leaderless), never mistaken for authority.
+        let fallback = select_authoritative(Some(embryonic), NodeId::from_u64(4), None);
+        assert!(fallback.is_some());
+        assert_eq!(
+            observation_authority(fallback.as_ref(), NodeId::from_u64(4)),
+            Some(ObservationAuthority::NonMemberFallback)
+        );
+        // Missing local yields the remote member directly.
+        let picked = select_authoritative(None, NodeId::from_u64(4), Some(member.clone()));
+        assert_eq!(picked, Some(member));
+    }
+
+    #[test]
+    fn learner_local_is_authoritative() {
+        // A learner (catching-up target) observes authoritatively: it is a
+        // real group participant, unlike an embryonic placeholder.
+        let learner = observed(&[1, 2, 3], &[4], Some(1));
+        assert_eq!(
+            observation_authority(Some(&learner), NodeId::from_u64(4)),
+            Some(ObservationAuthority::Member)
+        );
+        let picked = select_authoritative(
+            Some(learner.clone()),
+            NodeId::from_u64(4),
+            Some(observed(&[1, 2, 3], &[], Some(2))),
+        );
+        assert_eq!(picked, Some(learner));
     }
 }

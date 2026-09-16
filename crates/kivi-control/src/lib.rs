@@ -17,18 +17,27 @@
 //! little-endian encoding. `OpenRaft` Rust structs are never persisted
 //! as canonical control state.
 
+pub mod failure;
+pub mod merge;
 pub mod migration;
 pub mod mutation;
 pub mod node;
 pub mod placement;
 pub mod planner;
+pub mod split;
 pub mod state;
+pub mod topology;
 
+pub use failure::{FailureDetector, FailureDetectorConfig, TabletHealth, classify_tablet};
+pub use merge::{MergeError, MergePhase, MergePlan, MergePlanId};
 pub use migration::{MigrationError, MigrationPhase, MigrationPlan, MigrationPlanId};
 pub use mutation::{CONTROL_MUTATION_VERSION, ControlMutation, ControlMutationError};
 pub use node::{NodeError, NodeRecord, NodeState};
 pub use placement::{DesiredReplicaSet, PlacementError, PlacementVersion};
 pub use planner::{
     MigrationIntent, PlannerConfig, PlannerError, intents_to_plans, plan_drain, plan_rebalance,
+    plan_repair,
 };
+pub use split::{SplitError, SplitPhase, SplitPlan, SplitPlanId};
 pub use state::{ClusterGeneration, ControlSnapshotError, ControlState};
+pub use topology::{PlanId, PlanKind, PlanPriority, PlanSchedulerConfig, tablet_sets_conflict};

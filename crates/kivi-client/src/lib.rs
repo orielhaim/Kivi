@@ -48,6 +48,13 @@ pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Route retry budget default (redirects before surfacing).
 pub const DEFAULT_MAX_REDIRECTS: usize = 8;
+/// Zero-progress redirect streak before failing over: consecutive
+/// `StaleRoute` hops carrying already-seen (tablet, endpoint, generation)
+/// triples back off without spending redirect budget (they wait out an
+/// election/observation window); past this many repeats the call evicts
+/// the endpoint, spends one redirect, and fails over. Bounds every call
+/// while riding out ordinary elections (which land in ~1-5 hops).
+pub const MAX_STALE_REPEATS: u32 = 12;
 /// In-flight requests per connection default (fast `Overloaded` past this).
 pub const DEFAULT_MAX_PENDING: usize = 128;
 /// Dial attempts per connection (handshake validation failures fail fast;
@@ -737,7 +744,10 @@ enum GetOutcome {
     /// Terminal: the value (`None` when absent).
     Done(Option<Bytes>),
     /// The route moved: re-resolve and re-request (reads are side-effect free).
-    Reroute,
+    /// Carries the redirect triple when the server named one, so the loop
+    /// can tell fresh information from a stale repeat (same patience rules
+    /// as `execute_with_seq`; `None` spends budget like before).
+    Reroute(Option<(u64, String, u64)>),
     /// The server is saturated: back off and re-request.
     Overloaded,
     /// The transport died: drop the connection, redial, re-request.
@@ -1115,7 +1125,20 @@ impl NativeClient {
         // instead of stranding the request on a grave (§34). Rotation
         // terminates: every seed is tried at most once per call, and
         // the redirect budget backstops everything else.
+        // Redirect convergence guard: (tablet, endpoint, dir_version)
+        // triples already followed this call. A redirect carrying no
+        // genuinely new information (same endpoint/generation for the
+        // same tablet) is usually an election/observation window, not a
+        // dead end: back off and retry WITHOUT spending redirect budget
+        // (the retried hop re-reads fresh state and converges when the
+        // election lands). Only a long streak of zero-progress hops
+        // fails over to an untried seed. This structurally fixes the
+        // `TooManyRedirects` ping-pong seen under severe concurrent
+        // load: stale hints wait out the window instead of burning the
+        // budget on identical information.
         let mut tried: Vec<String> = Vec::new();
+        let mut visited_redirects: Vec<(u64, String, u64)> = Vec::new();
+        let mut stale_repeats: u32 = 0;
         let mut seed_cursor = 0usize;
         self.shared.requests.fetch_add(1, Ordering::Relaxed);
         let outcome: Result<Response, ClientError> = loop {
@@ -1269,20 +1292,76 @@ impl NativeClient {
                 Status::Ok | Status::NotFound => break Ok(response),
                 Status::StaleRoute | Status::NotLocal => {
                     if let ResponseBody::Redirect(info) = &response.body {
-                        self.shared
-                            .tablet_leaders
-                            .insert(info.tablet, info.endpoint.clone());
-                        self.shared.routes.insert(RouteEntry::from_redirect(info));
+                        let triple = (
+                            info.tablet.as_u64(),
+                            info.endpoint.clone(),
+                            info.dir_version.as_u64(),
+                        );
+                        if visited_redirects.contains(&triple) {
+                            // No forward progress: the same authority
+                            // answered the same generation again. That is
+                            // normally an election/observation window (all
+                            // members agree on a stale hint until the new
+                            // leader emerges), NOT a dead end: back off
+                            // and retry without spending redirect budget,
+                            // so the call waits out the window instead of
+                            // burning budget on identical information.
+                            // Only a long zero-progress streak fails over
+                            // (the cluster is genuinely wedged, not
+                            // electing): evict, mark tried, spend one
+                            // redirect, and continue elsewhere. Retries
+                            // stay bounded: the streak cap times the
+                            // redirect budget bounds every call.
+                            stale_repeats += 1;
+                            overloaded_streak = 0;
+                            if stale_repeats > MAX_STALE_REPEATS {
+                                stale_repeats = 0;
+                                self.drop_connection(&endpoint);
+                                self.shared.routes.evict_endpoint(&endpoint);
+                                self.shared.tablet_leaders.evict_endpoint(&endpoint);
+                                if !tried.contains(&endpoint) {
+                                    tried.push(endpoint);
+                                }
+                                redirects += 1;
+                                self.shared.redirects.fetch_add(1, Ordering::Relaxed);
+                                backoff(
+                                    self.shared.dial_backoff,
+                                    u32::try_from(redirects).unwrap_or(u32::MAX).min(6),
+                                );
+                            } else {
+                                backoff(self.shared.dial_backoff, stale_repeats.min(6));
+                            }
+                        } else {
+                            visited_redirects.push(triple);
+                            stale_repeats = 0;
+                            // Invalidate only the affected range/leader:
+                            // `insert` evicts overlapping ranges for this
+                            // tablet kind, and the leader cache is
+                            // per-tablet. No global cache flush.
+                            self.shared
+                                .tablet_leaders
+                                .insert(info.tablet, info.endpoint.clone());
+                            self.shared.routes.insert(RouteEntry::from_redirect(info));
+                            overloaded_streak = 0;
+                            redirects += 1;
+                            self.shared.redirects.fetch_add(1, Ordering::Relaxed);
+                            // Bounded backoff on redirects: stale hints during
+                            // election churn retry safely without spinning.
+                            backoff(
+                                self.shared.dial_backoff,
+                                u32::try_from(redirects).unwrap_or(u32::MAX).min(6),
+                            );
+                        }
+                    } else {
+                        overloaded_streak = 0;
+                        stale_repeats = 0;
+                        redirects += 1;
+                        self.shared.redirects.fetch_add(1, Ordering::Relaxed);
+                        backoff(
+                            self.shared.dial_backoff,
+                            u32::try_from(redirects).unwrap_or(u32::MAX).min(6),
+                        );
                     }
-                    overloaded_streak = 0;
-                    redirects += 1;
-                    self.shared.redirects.fetch_add(1, Ordering::Relaxed);
-                    // Bounded backoff on redirects: stale hints during
-                    // election churn retry safely without spinning.
-                    backoff(
-                        self.shared.dial_backoff,
-                        u32::try_from(redirects).unwrap_or(u32::MAX).min(6),
-                    );
                 }
                 Status::Overloaded => {
                     // Election or migration churn: back off (like
@@ -1511,8 +1590,13 @@ impl NativeClient {
         let mut reconnects = 0usize;
         // Same dead-member failover as `execute_with_seq` (reads
         // re-run safely, so rotation never risks duplication): failed
-        // endpoints are tried at most once per call.
+        // endpoints are tried at most once per call. Same stale-repeat
+        // patience: zero-progress redirect triples back off without
+        // spending budget (election windows), failing over only after a
+        // long streak.
         let mut tried: Vec<String> = Vec::new();
+        let mut visited_redirects: Vec<(u64, String, u64)> = Vec::new();
+        let mut stale_repeats: u32 = 0;
         let mut seed_cursor = 0usize;
         self.shared.requests.fetch_add(1, Ordering::Relaxed);
         loop {
@@ -1559,9 +1643,15 @@ impl NativeClient {
             }
             match self.get_stream_attempt(&conn, key, hint) {
                 GetOutcome::Done(value) => return Ok(value),
-                GetOutcome::Reroute => {
-                    redirects += 1;
-                    self.shared.redirects.fetch_add(1, Ordering::Relaxed);
+                GetOutcome::Reroute(triple) => {
+                    self.note_stream_reroute(
+                        triple,
+                        &endpoint,
+                        &mut visited_redirects,
+                        &mut stale_repeats,
+                        &mut tried,
+                        &mut redirects,
+                    );
                 }
                 GetOutcome::Overloaded => {
                     redirects += 1;
@@ -1593,6 +1683,44 @@ impl NativeClient {
                     return Err(error);
                 }
             }
+        }
+    }
+
+    /// Records one stream reroute: fresh triples spend redirect budget;
+    /// zero-progress repeats back off without spending it (election
+    /// windows), failing over only after [`MAX_STALE_REPEATS`].
+    fn note_stream_reroute(
+        &self,
+        triple: Option<(u64, String, u64)>,
+        endpoint: &str,
+        visited_redirects: &mut Vec<(u64, String, u64)>,
+        stale_repeats: &mut u32,
+        tried: &mut Vec<String>,
+        redirects: &mut usize,
+    ) {
+        let repeat = triple
+            .as_ref()
+            .is_some_and(|triple| visited_redirects.contains(triple));
+        if repeat {
+            *stale_repeats += 1;
+        } else {
+            if let Some(triple) = triple {
+                visited_redirects.push(triple);
+            }
+            *stale_repeats = 0;
+        }
+        if repeat && *stale_repeats <= MAX_STALE_REPEATS {
+            backoff(self.shared.dial_backoff, (*stale_repeats).min(10));
+        } else {
+            if repeat {
+                *stale_repeats = 0;
+                self.drop_connection(endpoint);
+                self.shared.routes.evict_endpoint(endpoint);
+                self.shared.tablet_leaders.evict_endpoint(endpoint);
+                tried.push(endpoint.to_owned());
+            }
+            *redirects += 1;
+            self.shared.redirects.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1857,8 +1985,14 @@ impl NativeClient {
                                 .tablet_leaders
                                 .insert(info.tablet, info.endpoint.clone());
                             self.shared.routes.insert(RouteEntry::from_redirect(info));
+                            GetOutcome::Reroute(Some((
+                                info.tablet.as_u64(),
+                                info.endpoint.clone(),
+                                info.dir_version.as_u64(),
+                            )))
+                        } else {
+                            GetOutcome::Reroute(None)
                         }
-                        GetOutcome::Reroute
                     }
                     Status::Overloaded => GetOutcome::Overloaded,
                     other => GetOutcome::Fail(status_error(other, &response.body)),

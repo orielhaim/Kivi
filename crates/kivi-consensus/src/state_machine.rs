@@ -239,6 +239,14 @@ pub struct RetainedOutcome {
     pub outcome: DurableOutcome,
 }
 
+/// Exported topology copy: live objects plus all dedup sessions
+/// `(session, floor, outcomes-by-seq)`. Objects are cheap clones;
+/// sessions copy wholesale to every child for exactly-once retries.
+pub type TopologyCopy = (
+    Vec<(kivi_state::Key, kivi_state::StoredObject)>,
+    Vec<(SessionId, RequestSeq, BTreeMap<RequestSeq, RetainedOutcome>)>,
+);
+
 /// One session's replicated dedup state: the durable floor plus retained
 /// outcomes above it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -264,6 +272,23 @@ impl SessionState {
             self.floor = ack;
             self.outcomes.retain(|seq, _| seq.as_u64() > ack.as_u64());
         }
+    }
+
+    /// Returns the acknowledgement floor.
+    #[must_use]
+    pub const fn floor(&self) -> RequestSeq {
+        self.floor
+    }
+
+    /// Iterates retained outcomes in sequence order.
+    pub fn outcomes(&self) -> impl Iterator<Item = (&RequestSeq, &RetainedOutcome)> {
+        self.outcomes.iter()
+    }
+
+    /// Rebuilds a session from exported parts (split/merge topology copy).
+    #[must_use]
+    pub fn from_parts(floor: RequestSeq, outcomes: BTreeMap<RequestSeq, RetainedOutcome>) -> Self {
+        Self { floor, outcomes }
     }
 }
 
@@ -541,6 +566,53 @@ impl ReplicatedTablet {
     #[must_use]
     pub fn session(&self, session: SessionId) -> Option<&SessionState> {
         self.sessions.get(&session)
+    }
+
+    /// Exports a full copy of live objects plus all dedup sessions for
+    /// topology copy (split/merge base). Objects are cheap clones
+    /// (`Bytes` refcounts; chunked roots reference the same immutable
+    /// `ManifestId` — never a chunk copy). Callers partition objects by
+    /// [`PartitionHasher`](kivi_state::PartitionHasher); sessions copy
+    /// wholesale to every child (bounded, and required for exactly-once
+    /// retries across the cutover).
+    #[must_use]
+    pub fn export_topology_copy(&self) -> TopologyCopy {
+        let objects = self.store.snapshot_entries();
+        let sessions = self
+            .sessions
+            .iter()
+            .map(|(session, state)| {
+                (
+                    *session,
+                    state.floor(),
+                    state
+                        .outcomes()
+                        .map(|(seq, entry)| (*seq, entry.clone()))
+                        .collect(),
+                )
+            })
+            .collect();
+        (objects, sessions)
+    }
+
+    /// Installs a topology copy into an inactive (not yet serving) child
+    /// or merge target: replaces all objects and the full session set.
+    /// Safe only before the target activates (it serves nothing yet, so
+    /// overwrite cannot lose acknowledged writes); after cutover the
+    /// target is an ordinary tablet and this is never called again.
+    pub fn install_topology_copy(&mut self, copy: TopologyCopy) {
+        let (objects, sessions) = copy;
+        for (key, _) in self.store.snapshot_entries() {
+            self.store.remove_stored(&key);
+        }
+        for (key, object) in objects {
+            self.store.put_stored(key, object);
+        }
+        self.sessions.clear();
+        for (session, floor, outcomes) in sessions {
+            self.sessions
+                .insert(session, SessionState::from_parts(floor, outcomes));
+        }
     }
 
     /// Returns the voter set of the currently held membership.
@@ -1640,6 +1712,12 @@ struct StateMachineInner {
     healthy: bool,
     last_error: Option<String>,
     inject_snapshot_write_failure: bool,
+    /// Split/merge cutover fence: while set, mutating proposes fail with
+    /// `Fenced` (shaped as retryable `Overloaded`) so a bounded final
+    /// tail can install without losing writes. Reads still serve (parent
+    /// state is final during the fence). Ephemeral: re-applied from the
+    /// persisted split/merge plan phase after a restart.
+    fenced: bool,
 }
 
 impl ReplicatedStateMachine {
@@ -1748,8 +1826,39 @@ impl ReplicatedStateMachine {
                 healthy: true,
                 last_error: None,
                 inject_snapshot_write_failure: false,
+                fenced: false,
             })),
         })
+    }
+
+    /// Live object count of this replica (best-effort sizing signal for
+    /// automatic split/merge policy).
+    pub async fn object_count(&self) -> usize {
+        self.shared.lock().await.tablet.store().len()
+    }
+
+    /// Whether this replica is fenced for split/merge cutover (mutating
+    /// proposes fail; reads still serve).
+    pub async fn is_fenced(&self) -> bool {
+        self.shared.lock().await.fenced
+    }
+
+    /// Sets or clears the cutover fence (idempotent; reconciler-driven).
+    pub async fn set_fenced(&self, fenced: bool) {
+        self.shared.lock().await.fenced = fenced;
+    }
+
+    /// Exports a topology copy of this replica's live state (split/merge
+    /// base): all objects plus all dedup sessions.
+    pub async fn export_topology_copy(&self) -> TopologyCopy {
+        self.shared.lock().await.tablet.export_topology_copy()
+    }
+
+    /// Installs a topology copy into this (inactive) replica, replacing
+    /// all objects and sessions. Caller must ensure the target serves
+    /// nothing yet.
+    pub async fn install_topology_copy(&self, copy: TopologyCopy) {
+        self.shared.lock().await.tablet.install_topology_copy(copy);
     }
 
     /// Read-only leader-side proposal gate: the dedup verdict without

@@ -408,13 +408,15 @@ impl ConsensusNode {
                 ),
             });
         }
-        // Tablet-set disagreement fails loudly before any state opens:
-        // state-machine tablets outside the configured set, or shared-WAL
-        // groups outside it, mean a shrunk or foreign topology — never a
-        // silent partial cluster. Configured tablets missing from durable
-        // state bootstrap fresh per group (new tablets or interrupted
-        // first open); every node in a static cluster shares the config,
-        // so fresh formation stays coherent.
+        // Tablet-set disagreement fails loudly before any state opens —
+        // except dynamic topology tablets (split children / merge targets
+        // created via `ensure_group` after boot): state-machine tablets or
+        // shared-WAL groups outside the static configured set recover as
+        // served replicas (tombstoned groups stay excluded). A shrunk or
+        // foreign static topology still fails: configured tablets missing
+        // from durable state bootstrap fresh per group, and every node in
+        // a static cluster shares the config, so fresh formation stays
+        // coherent.
         let durable_tablets = existing_sm_tablets(&config.data_dir);
         let configured: BTreeSet<TabletId> = tablets.iter().copied().collect();
         let control_tablet = ConsensusGroupId::control().tablet();
@@ -425,11 +427,10 @@ impl ConsensusNode {
             .collect();
         extra.sort_unstable();
         if !extra.is_empty() {
-            return Err(Fault::Bootstrap {
-                reason: format!(
-                    "data directory holds tablets {extra:?} outside the configured set"
-                ),
-            });
+            tracing::info!(
+                tablets = ?extra,
+                "rejoin recovers dynamic topology tablets outside the static set"
+            );
         }
         // Shared physical durability: one WAL lane recovered once; records
         // dispatch by group so N groups rebuild in a single recovery pass.
@@ -458,24 +459,32 @@ impl ConsensusNode {
         // defeats this (it looks like first boot): never wipe a live
         // member's directory.
         let first_boot = durable_tablets.is_empty() && recovered.is_empty();
-        let mut wal_extra: Vec<u64> = recovered
+        // Dynamic topology tablets (split children / merge targets created
+        // via `ensure_group` after boot) leave durable WAL traces outside
+        // the static configured set: recover them as served replicas
+        // instead of refusing to open. Tombstoned groups stay excluded
+        // (retired parents never resurrect); the removal oracle below
+        // still fences anything the control plane dropped while down.
+        let wal_extra: Vec<TabletId> = recovered
             .iter()
             .map(kivi_durability::RaftRecord::group)
             .filter(|group| {
                 *group != control_tablet && !tablets.contains(group) && !tombstoned.contains(group)
             })
-            .map(TabletId::as_u64)
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
-        wal_extra.sort_unstable();
-        if !wal_extra.is_empty() {
-            return Err(Fault::Bootstrap {
-                reason: format!(
-                    "shared WAL holds groups {wal_extra:?} outside the configured tablet set"
-                ),
-            });
+        let mut live_tablets = live_tablets;
+        for tablet in &wal_extra {
+            if !live_tablets.contains(tablet) {
+                tracing::info!(
+                    tablet = tablet.as_u64(),
+                    "rejoin recovers dynamic topology tablet outside the static set"
+                );
+                live_tablets.push(*tablet);
+            }
         }
+        live_tablets.sort_by_key(|tablet| tablet.as_u64());
         let mut groups: Vec<ConsensusGroupId> = live_tablets
             .iter()
             .map(|tablet| ConsensusGroupId::of_tablet(*tablet))
@@ -617,13 +626,62 @@ impl ConsensusNode {
                     continue;
                 }
             }
-            let (voters, peer_addrs) =
-                config
-                    .topology
-                    .membership_for(tablet)
-                    .map_err(|error| Fault::Topology {
-                        reason: error.to_string(),
-                    })?;
+            let (voters, peer_addrs) = match config.topology.membership_for(tablet) {
+                Ok(wiring) => wiring,
+                Err(_) => {
+                    // Dynamic topology tablet (split child / merge target):
+                    // the static topology predates it. Resolve voters from
+                    // the replicated control desired set and dial addrs
+                    // from the control registry (static flags second).
+                    // Lacking both, fall back to the durable member voters
+                    // with best-effort addrs (replication heals the mesh
+                    // through the restarted member's outbound dials).
+                    if let Some(desired) = control_image
+                        .as_ref()
+                        .and_then(|state| state.desired(tablet))
+                    {
+                        let voters: BTreeSet<u64> =
+                            desired.replicas.iter().map(|node| node.as_u64()).collect();
+                        let peer_addrs: BTreeMap<u64, String> = desired
+                            .replicas
+                            .iter()
+                            .map(|node| {
+                                let addr = control_image
+                                    .as_ref()
+                                    .and_then(|state| state.node(*node))
+                                    .map(|record| record.peer.to_string())
+                                    .or_else(|| {
+                                        config
+                                            .topology
+                                            .nodes
+                                            .iter()
+                                            .find(|descriptor| descriptor.node == *node)
+                                            .map(|descriptor| descriptor.peer.to_string())
+                                    })
+                                    .unwrap_or_default();
+                                (node.as_u64(), addr)
+                            })
+                            .collect();
+                        (voters, peer_addrs)
+                    } else {
+                        let voters = machine.member_voters().await;
+                        let peer_addrs: BTreeMap<u64, String> = voters
+                            .iter()
+                            .map(|voter| {
+                                let addr = config
+                                    .topology
+                                    .nodes
+                                    .iter()
+                                    .find(|descriptor| descriptor.node.as_u64() == *voter)
+                                    .map(|descriptor| descriptor.peer.to_string())
+                                    .unwrap_or_default();
+                                (*voter, addr)
+                            })
+                            .collect();
+                        (voters, peer_addrs)
+                    }
+                }
+            };
             stores.insert(tablet, store);
             machines.insert(tablet, machine);
             authorities.insert(tablet, authority);
@@ -1433,6 +1491,44 @@ impl ConsensusNode {
         Ok(())
     }
 
+    /// Initializes one new tablet group exactly once on this replica
+    /// (split-child / merge-target founder). Other replicas join through
+    /// learner replication, never a second initialize. Idempotent: an
+    /// already-initialized group answers success.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable reason for reserved tablets, unknown
+    /// groups, worker shutdown, or initialization failures.
+    pub async fn initialize_group(
+        &self,
+        tablet: TabletId,
+        voters: std::collections::BTreeSet<u64>,
+        peer_addrs: std::collections::BTreeMap<u64, String>,
+    ) -> Result<(), String> {
+        let group = ConsensusGroupId::of_tablet(tablet);
+        if group.is_control() || tablet.as_u64() == 0 {
+            return Err(format!("tablet {} is reserved", tablet.as_u64()));
+        }
+        let worker_index = worker_for_tablet(tablet, self.worker_count);
+        let Some(worker) = self.workers.get(worker_index).cloned() else {
+            return Err("no consensus worker exists".to_owned());
+        };
+        let (reply, rx) = futures::channel::oneshot::channel();
+        worker
+            .send(OwnerRequest::InitializeGroup {
+                group,
+                tablet,
+                voters,
+                peer_addrs,
+                reply,
+            })
+            .await
+            .map_err(|_| "consensus worker shut down".to_owned())?;
+        rx.await
+            .map_err(|_| "consensus worker shut down".to_owned())?
+    }
+
     /// Proposes one typed control-plane mutation against the system
     /// control group.
     ///
@@ -1459,6 +1555,135 @@ impl ConsensusNode {
             .map_err(|_| "consensus worker shut down".to_owned())?;
         rx.await
             .map_err(|_| "consensus worker shut down".to_owned())?
+    }
+
+    /// Sets the split/merge cutover fence on one local replica
+    /// (idempotent). While fenced, fresh mutating proposes fail with
+    /// `Fenced` (retryable); reads still serve and dedup hits still
+    /// answer. The reconciler fences every parent replica before the
+    /// final tail install and re-applies the fence from the persisted
+    /// plan phase after any restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable reason when this node hosts no such
+    /// replica.
+    pub async fn set_tablet_fenced(&self, tablet: TabletId, fenced: bool) -> Result<(), String> {
+        let machine = self
+            .machines
+            .lock()
+            .map_err(|_| "machine map poisoned".to_owned())?
+            .get(&tablet)
+            .cloned()
+            .ok_or_else(|| format!("tablet {} not served by this node", tablet.as_u64()))?;
+        machine.set_fenced(fenced).await;
+        Ok(())
+    }
+
+    /// Seeds one split child from the local parent replica: partitions
+    /// the parent's live objects by `split_hash` (`hash < split_hash`
+    /// goes left, else right) and installs the child's half plus the full
+    /// parent session set (both children keep every session for
+    /// exactly-once retries). Chunked roots reference the same immutable
+    /// `ManifestId`s — no chunk bytes are copied or retransferred.
+    ///
+    /// Colocated by design (children inherit the parent replica set), so
+    /// no bulk network transfer is needed: every replica seeds locally.
+    /// Idempotent: re-seeding overwrites the inactive target.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable reason when either replica is not hosted
+    /// locally.
+    pub async fn seed_split_child(
+        &self,
+        parent: TabletId,
+        child: TabletId,
+        split_hash: u128,
+        left: bool,
+    ) -> Result<(usize, usize), String> {
+        let (parent_machine, child_machine) = self
+            .machines
+            .lock()
+            .map_err(|_| "machine map poisoned".to_owned())
+            .and_then(|machines| {
+                let parent = machines.get(&parent).cloned().ok_or_else(|| {
+                    format!("parent tablet {} not served by this node", parent.as_u64())
+                })?;
+                let child = machines.get(&child).cloned().ok_or_else(|| {
+                    format!("child tablet {} not served by this node", child.as_u64())
+                })?;
+                Ok((parent, child))
+            })?;
+        let (objects, sessions) = parent_machine.export_topology_copy().await;
+        let mut half = Vec::new();
+        for (key, object) in objects {
+            let hash = kivi_state::PartitionHasher::V1
+                .hash(self.namespace, key.as_bytes())
+                .map(kivi_types::PartitionHash::as_u128);
+            let is_left = hash.is_some_and(|hash| hash < split_hash);
+            if is_left == left {
+                half.push((key, object));
+            }
+        }
+        let object_count = half.len();
+        let session_count = sessions.len();
+        child_machine.install_topology_copy((half, sessions)).await;
+        Ok((object_count, session_count))
+    }
+
+    /// Seeds a merge target from two local parents: unions both object
+    /// sets (ranges are disjoint, so keys cannot collide) and unions both
+    /// session sets (per-session sequences are globally unique; a
+    /// conflicting duplicate keeps the higher commit and never
+    /// re-executes). Idempotent: re-seeding overwrites the inactive
+    /// target.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable reason when any replica is not hosted
+    /// locally.
+    pub async fn seed_merge_target(
+        &self,
+        left: TabletId,
+        right: TabletId,
+        merged: TabletId,
+    ) -> Result<(usize, usize), String> {
+        let (left_machine, right_machine, merged_machine) = self
+            .machines
+            .lock()
+            .map_err(|_| "machine map poisoned".to_owned())
+            .and_then(|machines| {
+                let left = machines.get(&left).cloned().ok_or_else(|| {
+                    format!("left tablet {} not served by this node", left.as_u64())
+                })?;
+                let right = machines.get(&right).cloned().ok_or_else(|| {
+                    format!("right tablet {} not served by this node", right.as_u64())
+                })?;
+                let merged = machines.get(&merged).cloned().ok_or_else(|| {
+                    format!("merged tablet {} not served by this node", merged.as_u64())
+                })?;
+                Ok((left, right, merged))
+            })?;
+        let (mut objects, left_sessions) = left_machine.export_topology_copy().await;
+        let (right_objects, right_sessions) = right_machine.export_topology_copy().await;
+        objects.extend(right_objects);
+        let sessions = union_sessions(left_sessions, right_sessions);
+        let object_count = objects.len();
+        let session_count = sessions.len();
+        merged_machine
+            .install_topology_copy((objects, sessions))
+            .await;
+        Ok((object_count, session_count))
+    }
+
+    /// Returns the live object count of one local replica, if hosted.
+    /// Best-effort sizing signal for automatic split/merge policy (exact
+    /// count, cheap). Logical bytes and load estimates refine this in a
+    /// later stage; the policy architecture already carries them.
+    pub async fn tablet_object_count(&self, tablet: TabletId) -> Option<usize> {
+        let machine = self.machines.lock().ok()?.get(&tablet).cloned()?;
+        Some(machine.object_count().await)
     }
 
     /// Adds a dialable peer link for a dynamically admitted node
@@ -1635,6 +1860,57 @@ async fn serve_retire(
     let _ = reply.send(Ok(()));
 }
 
+/// Serves one group initialization inline (rare, local-only): the founder
+/// replica commits the initial membership for a split child or merge
+/// target. Idempotent: an already-initialized group answers success
+/// (`OpenRaft` reports the existing state; we treat any
+/// already-initialized signal as success, never a fork).
+async fn serve_initialize(
+    replicas: &mut HashMap<ConsensusGroupId, OwnerCtx<GroupRaftStore>>,
+    group: ConsensusGroupId,
+    tablet: TabletId,
+    voters: &BTreeSet<u64>,
+    peer_addrs: &BTreeMap<u64, String>,
+    reply: futures::channel::oneshot::Sender<Result<(), String>>,
+) {
+    if group != ConsensusGroupId::of_tablet(tablet) {
+        let _ = reply.send(Err(format!("group {group} names a foreign tablet")));
+        return;
+    }
+    let Some(ctx) = replicas.get(&group) else {
+        let _ = reply.send(Err(format!("group {group} not served by this node")));
+        return;
+    };
+    let members: BTreeMap<u64, openraft::BasicNode> = voters
+        .iter()
+        .map(|voter| {
+            (
+                *voter,
+                openraft::BasicNode::new(peer_addrs.get(voter).cloned().unwrap_or_default()),
+            )
+        })
+        .collect();
+    match ctx.raft.initialize(members).await {
+        Ok(()) => {
+            let _ = reply.send(Ok(()));
+        }
+        Err(error) => {
+            let detail = error.to_string();
+            // Idempotent: a second initialize (after a retry or a
+            // failover where the first already committed) is success.
+            if detail.contains("already")
+                || detail.contains("initialized")
+                || detail.contains("exists")
+                || detail.contains("NotAllowed")
+            {
+                let _ = reply.send(Ok(()));
+            } else {
+                let _ = reply.send(Err(detail));
+            }
+        }
+    }
+}
+
 /// Writes a retirement tombstone (`generation` little-endian).
 fn write_tombstone(data_dir: &std::path::Path, tablet: TabletId, generation: u64) {
     let dir = data_dir
@@ -1647,6 +1923,59 @@ fn write_tombstone(data_dir: &std::path::Path, tablet: TabletId, generation: u64
         dir.join(ConsensusNode::TOMBSTONE_FILE),
         generation.to_le_bytes(),
     );
+}
+
+/// Unions two parent session sets for a merge target: sessions keyed by
+/// id, outcomes keyed by sequence (globally unique per session, so no
+/// collision in practice). A conflicting duplicate keeps the higher
+/// commit and never re-executes — ordinary key state cannot conflict
+/// because the parent ranges are disjoint.
+fn union_sessions(
+    left: Vec<(
+        kivi_types::SessionId,
+        kivi_types::RequestSeq,
+        BTreeMap<kivi_types::RequestSeq, crate::state_machine::RetainedOutcome>,
+    )>,
+    right: Vec<(
+        kivi_types::SessionId,
+        kivi_types::RequestSeq,
+        BTreeMap<kivi_types::RequestSeq, crate::state_machine::RetainedOutcome>,
+    )>,
+) -> Vec<(
+    kivi_types::SessionId,
+    kivi_types::RequestSeq,
+    BTreeMap<kivi_types::RequestSeq, crate::state_machine::RetainedOutcome>,
+)> {
+    let mut merged: BTreeMap<
+        u128,
+        (
+            kivi_types::SessionId,
+            kivi_types::RequestSeq,
+            BTreeMap<kivi_types::RequestSeq, crate::state_machine::RetainedOutcome>,
+        ),
+    > = BTreeMap::new();
+    for (session, floor, outcomes) in left.into_iter().chain(right) {
+        merged
+            .entry(session.as_u128())
+            .and_modify(|existing| {
+                if floor.as_u64() > existing.1.as_u64() {
+                    existing.1 = floor;
+                }
+                for (seq, entry) in &outcomes {
+                    match existing.2.get(seq) {
+                        Some(kept) if kept.commit.as_u64() >= entry.commit.as_u64() => {}
+                        _ => {
+                            existing.2.insert(*seq, entry.clone());
+                        }
+                    }
+                }
+                existing
+                    .2
+                    .retain(|seq, _| seq.as_u64() > existing.1.as_u64());
+            })
+            .or_insert((session, floor, outcomes));
+    }
+    merged.into_values().collect()
 }
 
 /// Bumps an existing tombstone to `generation` when older; writes
@@ -2287,6 +2616,15 @@ async fn worker_loop(
                 reply,
             } => {
                 serve_retire(&build, &mut replicas, group, tablet, generation, reply).await;
+            }
+            OwnerRequest::InitializeGroup {
+                group,
+                tablet,
+                voters,
+                peer_addrs,
+                reply,
+            } => {
+                serve_initialize(&mut replicas, group, tablet, &voters, &peer_addrs, reply).await;
             }
             OwnerRequest::SuspendPeer { peer, reply } => {
                 let transport = transport.clone();

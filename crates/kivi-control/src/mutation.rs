@@ -7,9 +7,11 @@
 
 use kivi_types::{NodeId, TabletId};
 
+use crate::merge::MergePlan;
 use crate::migration::MigrationPlan;
 use crate::node::NodeRecord;
 use crate::placement::{DesiredReplicaSet, PlacementVersion};
+use crate::split::SplitPlan;
 
 /// Framing version of [`ControlMutation`].
 pub const CONTROL_MUTATION_VERSION: u16 = 1;
@@ -55,14 +57,85 @@ pub enum ControlMutation {
         /// Affected plan.
         plan: MigrationPlanIdAlias,
     },
+    /// Persist a new split plan (phase `Planned`).
+    CreateSplit {
+        /// Plan to persist.
+        plan: SplitPlan,
+    },
+    /// Advance a split plan's phase (generation-fenced).
+    AdvanceSplit {
+        /// Affected plan.
+        plan: SplitPlanIdAlias,
+        /// New phase.
+        phase: crate::split::SplitPhase,
+        /// Fencing generation the writer observed.
+        generation: PlacementVersion,
+    },
+    /// Remove a terminal split plan.
+    RemoveSplit {
+        /// Affected plan.
+        plan: SplitPlanIdAlias,
+    },
+    /// Persist a new merge plan (phase `Planned`).
+    CreateMerge {
+        /// Plan to persist.
+        plan: MergePlan,
+    },
+    /// Advance a merge plan's phase (generation-fenced).
+    AdvanceMerge {
+        /// Affected plan.
+        plan: MergePlanIdAlias,
+        /// New phase.
+        phase: crate::merge::MergePhase,
+        /// Fencing generation the writer observed.
+        generation: PlacementVersion,
+    },
+    /// Remove a terminal merge plan.
+    RemoveMerge {
+        /// Affected plan.
+        plan: MergePlanIdAlias,
+    },
 }
 
-/// Identity of one migration plan (field-level alias avoiding a circular
-/// module import in this enum's docs).
+/// Identity aliases avoiding circular module imports in this enum's docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MigrationPlanIdAlias(pub u64);
+/// Identity of one split plan (alias; see above).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SplitPlanIdAlias(pub u64);
+/// Identity of one merge plan (alias; see above).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MergePlanIdAlias(pub u64);
 
 impl MigrationPlanIdAlias {
+    /// Wraps a raw plan id.
+    #[must_use]
+    pub const fn from_u64(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the raw value.
+    #[must_use]
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+impl SplitPlanIdAlias {
+    /// Wraps a raw plan id.
+    #[must_use]
+    pub const fn from_u64(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the raw value.
+    #[must_use]
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+impl MergePlanIdAlias {
     /// Wraps a raw plan id.
     #[must_use]
     pub const fn from_u64(value: u64) -> Self {
@@ -84,6 +157,30 @@ impl From<crate::migration::MigrationPlanId> for MigrationPlanIdAlias {
 
 impl From<MigrationPlanIdAlias> for crate::migration::MigrationPlanId {
     fn from(id: MigrationPlanIdAlias) -> Self {
+        Self::from_u64(id.0)
+    }
+}
+
+impl From<crate::split::SplitPlanId> for SplitPlanIdAlias {
+    fn from(id: crate::split::SplitPlanId) -> Self {
+        Self(id.as_u64())
+    }
+}
+
+impl From<SplitPlanIdAlias> for crate::split::SplitPlanId {
+    fn from(id: SplitPlanIdAlias) -> Self {
+        Self::from_u64(id.0)
+    }
+}
+
+impl From<crate::merge::MergePlanId> for MergePlanIdAlias {
+    fn from(id: crate::merge::MergePlanId) -> Self {
+        Self(id.as_u64())
+    }
+}
+
+impl From<MergePlanIdAlias> for crate::merge::MergePlanId {
+    fn from(id: MergePlanIdAlias) -> Self {
         Self::from_u64(id.0)
     }
 }
@@ -157,6 +254,40 @@ impl ControlMutation {
                 body.extend_from_slice(&plan.as_u64().to_le_bytes());
                 (5u8, body)
             }
+            Self::CreateSplit { plan } => (6u8, plan.encode_to_vec()),
+            Self::AdvanceSplit {
+                plan,
+                phase,
+                generation,
+            } => {
+                let mut body = Vec::with_capacity(8 + 1 + 8);
+                body.extend_from_slice(&plan.as_u64().to_le_bytes());
+                body.push(phase.encode_byte());
+                body.extend_from_slice(&generation.as_u64().to_le_bytes());
+                (7u8, body)
+            }
+            Self::RemoveSplit { plan } => {
+                let mut body = Vec::with_capacity(8);
+                body.extend_from_slice(&plan.as_u64().to_le_bytes());
+                (8u8, body)
+            }
+            Self::CreateMerge { plan } => (9u8, plan.encode_to_vec()),
+            Self::AdvanceMerge {
+                plan,
+                phase,
+                generation,
+            } => {
+                let mut body = Vec::with_capacity(8 + 1 + 8);
+                body.extend_from_slice(&plan.as_u64().to_le_bytes());
+                body.push(phase.encode_byte());
+                body.extend_from_slice(&generation.as_u64().to_le_bytes());
+                (10u8, body)
+            }
+            Self::RemoveMerge { plan } => {
+                let mut body = Vec::with_capacity(8);
+                body.extend_from_slice(&plan.as_u64().to_le_bytes());
+                (11u8, body)
+            }
         };
         let mut out = Vec::with_capacity(2 + 1 + 4 + body.len());
         out.extend_from_slice(&CONTROL_MUTATION_VERSION.to_le_bytes());
@@ -173,6 +304,7 @@ impl ControlMutation {
     ///
     /// Returns [`ControlMutationError`] on version mismatch, truncation,
     /// unknown tags, undecodable bodies, or trailing bytes.
+    #[allow(clippy::too_many_lines)]
     pub fn decode_exact(input: &[u8]) -> Result<Self, ControlMutationError> {
         use ControlMutationError as Fault;
         if input.len() < 2 + 1 + 4 {
@@ -259,21 +391,99 @@ impl ControlMutation {
                 ));
                 Ok(Self::RemoveMigration { plan })
             }
+            6 => {
+                let plan = SplitPlan::decode_exact(body).map_err(|error| Fault::BadBody {
+                    detail: error.to_string(),
+                })?;
+                Ok(Self::CreateSplit { plan })
+            }
+            7 => {
+                if body.len() != 8 + 1 + 8 {
+                    return Err(Fault::Truncated);
+                }
+                let plan = SplitPlanIdAlias::from_u64(u64::from_le_bytes(
+                    body[..8].try_into().unwrap_or([0; 8]),
+                ));
+                let phase = crate::split::SplitPhase::decode_byte(body[8]).map_err(|error| {
+                    Fault::BadBody {
+                        detail: error.to_string(),
+                    }
+                })?;
+                let generation = PlacementVersion::from_u64(u64::from_le_bytes(
+                    body[9..17].try_into().unwrap_or([0; 8]),
+                ));
+                Ok(Self::AdvanceSplit {
+                    plan,
+                    phase,
+                    generation,
+                })
+            }
+            8 => {
+                if body.len() != 8 {
+                    return Err(Fault::Truncated);
+                }
+                let plan = SplitPlanIdAlias::from_u64(u64::from_le_bytes(
+                    body[..8].try_into().unwrap_or([0; 8]),
+                ));
+                Ok(Self::RemoveSplit { plan })
+            }
+            9 => {
+                let plan = MergePlan::decode_exact(body).map_err(|error| Fault::BadBody {
+                    detail: error.to_string(),
+                })?;
+                Ok(Self::CreateMerge { plan })
+            }
+            10 => {
+                if body.len() != 8 + 1 + 8 {
+                    return Err(Fault::Truncated);
+                }
+                let plan = MergePlanIdAlias::from_u64(u64::from_le_bytes(
+                    body[..8].try_into().unwrap_or([0; 8]),
+                ));
+                let phase = crate::merge::MergePhase::decode_byte(body[8]).map_err(|error| {
+                    Fault::BadBody {
+                        detail: error.to_string(),
+                    }
+                })?;
+                let generation = PlacementVersion::from_u64(u64::from_le_bytes(
+                    body[9..17].try_into().unwrap_or([0; 8]),
+                ));
+                Ok(Self::AdvanceMerge {
+                    plan,
+                    phase,
+                    generation,
+                })
+            }
+            11 => {
+                if body.len() != 8 {
+                    return Err(Fault::Truncated);
+                }
+                let plan = MergePlanIdAlias::from_u64(u64::from_le_bytes(
+                    body[..8].try_into().unwrap_or([0; 8]),
+                ));
+                Ok(Self::RemoveMerge { plan })
+            }
             _ => Err(Fault::BadTag { tag }),
         }
     }
 
     /// Returns the tablet this mutation's fencing generation binds to, if
-    /// any (migration advances fence on the plan's generation).
+    /// any (plan advances fence on the plan's generation).
     #[must_use]
     pub const fn generation(&self) -> Option<PlacementVersion> {
         match self {
-            Self::AdvanceMigration { generation, .. } => Some(*generation),
+            Self::AdvanceMigration { generation, .. }
+            | Self::AdvanceSplit { generation, .. }
+            | Self::AdvanceMerge { generation, .. } => Some(*generation),
             Self::RegisterNode { .. }
             | Self::SetNodeState { .. }
             | Self::SetDesiredPlacement { .. }
             | Self::CreateMigration { .. }
-            | Self::RemoveMigration { .. } => None,
+            | Self::RemoveMigration { .. }
+            | Self::CreateSplit { .. }
+            | Self::RemoveSplit { .. }
+            | Self::CreateMerge { .. }
+            | Self::RemoveMerge { .. } => None,
         }
     }
 }

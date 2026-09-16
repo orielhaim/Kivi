@@ -73,7 +73,8 @@ pub use cluster::{
 };
 pub use command::{CONSENSUS_COMMAND_VERSION, ConsensusCommand, ConsensusCommandError};
 pub use control::{
-    CATCH_UP_LAG_THRESHOLD, ObservedMembership, ReconcileStep, caught_up, next_step,
+    CATCH_UP_LAG_THRESHOLD, ObservationAuthority, ObservedMembership, ReconcileStep, caught_up,
+    next_step, observation_authority, select_authoritative,
 };
 pub use gate::{SidecarGate, sidecar_io_error};
 pub use multi::{ConsensusNode, ControlGroupConfig, MultiNodeConfig};

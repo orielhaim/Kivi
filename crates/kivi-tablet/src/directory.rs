@@ -275,6 +275,126 @@ impl DirectorySnapshot {
         )
     }
 
+    /// Atomically cuts over a split: fenced parent `Inactive` children
+    /// become tombstone + active in ONE version bump.
+    ///
+    /// Clients never observe `parent inactive and children not active` nor
+    /// `parent and both children simultaneously authoritative`: the single
+    /// validated snapshot contains exactly the new authorities. The parent
+    /// carries a redirect to both children so stale routes resolve forward
+    /// (multi-route successor set, not one ambiguous endpoint).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DirectoryError`] unless the parent is `Fenced` and both
+    /// children are `Inactive`.
+    pub fn cutover_split(
+        &self,
+        parent: TabletId,
+        left: TabletId,
+        right: TabletId,
+    ) -> Result<Self, DirectoryError> {
+        let parent_index = self.index_of(parent)?;
+        let left_index = self.index_of(left)?;
+        let right_index = self.index_of(right)?;
+        if self.tablets[parent_index].state() != TabletState::Fenced {
+            return Err(DirectoryError::IllegalTransition {
+                tablet: parent,
+                from: self.tablets[parent_index].state(),
+                action: "cutover_split (parent must be fenced)",
+            });
+        }
+        for (child, index) in [(left, left_index), (right, right_index)] {
+            if self.tablets[index].state() != TabletState::Inactive {
+                return Err(DirectoryError::IllegalTransition {
+                    tablet: child,
+                    from: self.tablets[index].state(),
+                    action: "cutover_split (children must be inactive)",
+                });
+            }
+        }
+        let mut tablets = self.tablets.clone();
+        let current = &tablets[parent_index];
+        tablets[parent_index] = TabletDescriptor::new(
+            current.id(),
+            current.range().clone(),
+            TabletState::Tombstone,
+            current.epoch(),
+            current.guard(),
+            Some(Redirect::new(vec![left, right])),
+        );
+        for index in [left_index, right_index] {
+            let current = &tablets[index];
+            tablets[index] = TabletDescriptor::new(
+                current.id(),
+                current.range().clone(),
+                TabletState::Active,
+                current.epoch(),
+                current.guard(),
+                None,
+            );
+        }
+        self.advance(tablets)
+    }
+
+    /// Atomically cuts over a merge: two fenced parents and one inactive
+    /// merged target become tombstones + active in ONE version bump.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DirectoryError`] unless both parents are `Fenced` and the
+    /// merged tablet is `Inactive`.
+    pub fn cutover_merge(
+        &self,
+        left: TabletId,
+        right: TabletId,
+        merged: TabletId,
+    ) -> Result<Self, DirectoryError> {
+        let left_index = self.index_of(left)?;
+        let right_index = self.index_of(right)?;
+        let merged_index = self.index_of(merged)?;
+        for (parent, index) in [(left, left_index), (right, right_index)] {
+            if self.tablets[index].state() != TabletState::Fenced {
+                return Err(DirectoryError::IllegalTransition {
+                    tablet: parent,
+                    from: self.tablets[index].state(),
+                    action: "cutover_merge (parents must be fenced)",
+                });
+            }
+        }
+        if self.tablets[merged_index].state() != TabletState::Inactive {
+            return Err(DirectoryError::IllegalTransition {
+                tablet: merged,
+                from: self.tablets[merged_index].state(),
+                action: "cutover_merge (merged must be inactive)",
+            });
+        }
+        let mut tablets = self.tablets.clone();
+        for index in [left_index, right_index] {
+            let current = &tablets[index];
+            tablets[index] = TabletDescriptor::new(
+                current.id(),
+                current.range().clone(),
+                TabletState::Tombstone,
+                current.epoch(),
+                current.guard(),
+                Some(Redirect::new(vec![merged])),
+            );
+        }
+        {
+            let current = &tablets[merged_index];
+            tablets[merged_index] = TabletDescriptor::new(
+                current.id(),
+                current.range().clone(),
+                TabletState::Active,
+                current.epoch(),
+                current.guard(),
+                None,
+            );
+        }
+        self.advance(tablets)
+    }
+
     /// Builds a static directory tiling the entire `u128` hash space with
     /// exactly `count` active tablets, using only validated transitions
     /// (recursive halving through allocate/stage/seal/activate/retire).
@@ -810,6 +930,57 @@ mod tests {
                 0x1000_0000_0000_0000_0000_0000_0000_0000
             )),
             Some(TabletId::from_u64(2))
+        );
+        assert_eq!(dir.validate(), Ok(()));
+    }
+
+    #[test]
+    fn atomic_split_cutover_never_shows_gap_or_double_authority() {
+        // Same setup as `full_split_replacement_flow` but through the
+        // single-version `cutover_split`: no intermediate snapshot routes
+        // a gap or two authorities.
+        let mut dir = activate_all(&bootstrap_root(), TabletId::from_u64(1));
+        dir = dir
+            .allocate(TabletId::from_u64(2), hash_range(0, 1), EPOCH, GUARD)
+            .expect("child 0*");
+        dir = dir
+            .allocate(
+                TabletId::from_u64(3),
+                hash_range(0x8000_0000_0000_0000_0000_0000_0000_0000, 1),
+                EPOCH,
+                GUARD,
+            )
+            .expect("child 1*");
+        dir = dir.stage(TabletId::from_u64(2)).expect("stage 2");
+        dir = dir.stage(TabletId::from_u64(3)).expect("stage 3");
+        dir = dir.seal(TabletId::from_u64(1)).expect("seal parent");
+        let version_before = dir.version();
+        dir = dir
+            .cutover_split(
+                TabletId::from_u64(1),
+                TabletId::from_u64(2),
+                TabletId::from_u64(3),
+            )
+            .expect("atomic cutover");
+        // Exactly one version bump for the whole logical cutover.
+        assert_eq!(dir.version().as_u64(), version_before.as_u64() + 1);
+        assert_eq!(
+            dir.lookup_by_hash(PartitionHash::from_u128(
+                0x1000_0000_0000_0000_0000_0000_0000_0000
+            )),
+            Some(TabletId::from_u64(2))
+        );
+        assert_eq!(
+            dir.lookup_by_hash(PartitionHash::from_u128(
+                0x9000_0000_0000_0000_0000_0000_0000_0000
+            )),
+            Some(TabletId::from_u64(3))
+        );
+        assert_eq!(
+            dir.redirect_of(TabletId::from_u64(1))
+                .expect("redirect")
+                .successors(),
+            &[TabletId::from_u64(2), TabletId::from_u64(3)]
         );
         assert_eq!(dir.validate(), Ok(()));
     }

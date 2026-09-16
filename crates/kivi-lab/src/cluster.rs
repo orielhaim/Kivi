@@ -1506,6 +1506,224 @@ impl Cluster {
         json
     }
 
+    /// Splits one tablet through the persisted reconciler pathway.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the endpoint refuses.
+    #[must_use]
+    pub fn split_tablet(&self, tablet: u64) -> Value {
+        self.post_control(
+            "/v1/control/splits/create",
+            &serde_json::json!({ "tablet": tablet }),
+            &format!("split tablet {tablet}"),
+            Duration::from_secs(120),
+        )
+    }
+
+    /// Merges two adjacent tablets through the persisted pathway.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the endpoint refuses.
+    #[must_use]
+    pub fn merge_tablets(&self, left: u64, right: u64) -> Value {
+        self.post_control(
+            "/v1/control/merges/create",
+            &serde_json::json!({ "left": left, "right": right }),
+            &format!("merge tablets {left}+{right}"),
+            Duration::from_secs(120),
+        )
+    }
+
+    /// Fetches split plans from one member.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the endpoint errors.
+    #[must_use]
+    pub fn splits(&self, index: usize) -> Value {
+        let (status, json) = self.admin_get(index, "/v1/control/splits");
+        assert_eq!(status, 200, "splits on node {index}: {json}");
+        json
+    }
+
+    /// Fetches merge plans from one member.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the endpoint errors.
+    #[must_use]
+    pub fn merges(&self, index: usize) -> Value {
+        let (status, json) = self.admin_get(index, "/v1/control/merges");
+        assert_eq!(status, 200, "merges on node {index}: {json}");
+        json
+    }
+
+    /// Waits until no live split plans remain and none failed.
+    ///
+    /// # Panics
+    ///
+    /// Panics past the deadline or when a plan fails.
+    pub fn wait_splits_done(&self, timeout: Duration) {
+        self.wait_plans_done("/v1/control/splits", "split", timeout);
+    }
+
+    /// Waits until no live merge plans remain and none failed.
+    ///
+    /// # Panics
+    ///
+    /// Panics past the deadline or when a plan fails.
+    pub fn wait_merges_done(&self, timeout: Duration) {
+        self.wait_plans_done("/v1/control/merges", "merge", timeout);
+    }
+
+    /// Shared waiter for split/merge plan lists (`key` selects the array:
+    /// `"splits"` or `"merges"`).
+    ///
+    /// # Panics
+    ///
+    /// Panics past the deadline or when a plan fails.
+    fn wait_plans_done(&self, path: &str, what: &str, timeout: Duration) {
+        let key = path.rsplit('/').next().unwrap_or(what);
+        let deadline = Instant::now() + timeout;
+        loop {
+            let mut live = usize::MAX;
+            let mut failed = 0;
+            let mut probed = false;
+            let mut detail = String::new();
+            for index in 0..self.nodes.len() {
+                if self.nodes[index].child.is_none() {
+                    continue;
+                }
+                let (_, json) = self.admin_get(index, path);
+                let Some(plans) = json.get(key).and_then(Value::as_array) else {
+                    continue;
+                };
+                probed = true;
+                detail = format!("{json}");
+                let node_live = plans
+                    .iter()
+                    .filter(|plan| {
+                        !matches!(
+                            plan.get("phase").and_then(Value::as_str),
+                            Some("Completed" | "Failed")
+                        )
+                    })
+                    .count();
+                failed += plans
+                    .iter()
+                    .filter(|plan| {
+                        matches!(plan.get("phase").and_then(Value::as_str), Some("Failed"))
+                    })
+                    .count();
+                live = live.min(node_live);
+            }
+            assert!(probed, "no live member serves {what} plans");
+            assert_eq!(failed, 0, "{what} plans failed");
+            if live == 0 {
+                return;
+            }
+            eprintln!("wait {what}: {detail}");
+            assert!(Instant::now() < deadline, "{what} plans never completed");
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    /// Fetches repair status from one member.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the endpoint errors.
+    #[must_use]
+    pub fn repair_status(&self, index: usize) -> Value {
+        let (status, json) = self.admin_get(index, "/v1/control/repair");
+        assert_eq!(status, 200, "repair on node {index}: {json}");
+        json
+    }
+
+    /// Fetches topology overview from one member.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the endpoint errors.
+    #[must_use]
+    pub fn topology(&self, index: usize) -> Value {
+        let (status, json) = self.admin_get(index, "/v1/control/topology");
+        assert_eq!(status, 200, "topology on node {index}: {json}");
+        json
+    }
+
+    /// Fetches the live reconciler policy from one member.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the endpoint errors.
+    #[must_use]
+    pub fn policy(&self, index: usize) -> Value {
+        let (status, json) = self.admin_get(index, "/v1/control/policy");
+        assert_eq!(status, 200, "policy on node {index}: {json}");
+        json
+    }
+
+    /// Retunes the live reconciler policy on every live member (e.g.,
+    /// enable auto-split). Broadcast (not leader-only): the policy is a
+    /// local live control, and leadership may move — every member holds
+    /// the same tuning so whoever leads acts on it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no live member accepts the update.
+    #[must_use]
+    pub fn set_policy(&self, body: &Value) -> Value {
+        let mut last = serde_json::json!({});
+        let mut accepted = false;
+        for index in 0..self.nodes.len() {
+            if self.nodes[index].child.is_none() {
+                continue;
+            }
+            let (status, json) = self.admin_post(index, "/v1/control/policy/update", body);
+            if status == 200 {
+                accepted = true;
+                last = json;
+            }
+        }
+        assert!(accepted, "no live member accepted the policy update");
+        last
+    }
+
+    /// Waits until the directory version on every live member reaches at
+    /// least `version` (split/merge cutover convergence).
+    ///
+    /// # Panics
+    ///
+    /// Panics past the deadline.
+    pub fn wait_dir_version(&self, version: u64, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let mut ready = true;
+            for index in 0..self.nodes.len() {
+                if self.nodes[index].child.is_none() {
+                    continue;
+                }
+                let info = self.node_info(index);
+                let current = info.get("dir_version").and_then(Value::as_u64).unwrap_or(0);
+                if current < version {
+                    ready = false;
+                    break;
+                }
+            }
+            if ready {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "directory never reached version {version}"
+            );
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+
     /// Waits until no live (non-terminal) migration plans remain and
     /// none failed.
     ///
@@ -1940,6 +2158,12 @@ fn flag_list(addrs: &[(u64, String)]) -> String {
 /// (appended across restarts): pipes would need continuous draining and
 /// truncation would lose the failure story, while files keep every
 /// member's full story beside its data for post-mortems.
+///
+/// Tracing itself is bounded inside the server (`KIVI_LOG_DIR` with
+/// size rotation): the stderr redirect here only carries `KIVI_READY`
+/// plus panics, so kept directories (`KIVI_LAB_KEEP_DIRS=1`, including
+/// the `disable_cleanup` path on `drop_node`) stay bounded during long
+/// stress tests instead of growing forever.
 fn spawn_member(
     binary: &PathBuf,
     args: &[String],
@@ -1967,6 +2191,24 @@ fn spawn_member(
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file));
+    // Bounded server tracing per member (size-rotated, retained beside
+    // the data dir for post-mortems). Explicit `extra_env` wins so tests
+    // can tighten limits (e.g., the rotation test) or raise verbosity
+    // (`KIVI_LOG_LEVEL`) without changing the harness.
+    let has_log_dir = extra_env.iter().any(|(key, _)| *key == "KIVI_LOG_DIR");
+    if !has_log_dir {
+        command.env("KIVI_LOG_DIR", data_dir.join("logs"));
+    }
+    let has_log_files = extra_env.iter().any(|(key, _)| *key == "KIVI_LOG_FILES");
+    if !has_log_files {
+        command.env("KIVI_LOG_FILES", "8");
+    }
+    let has_log_bytes = extra_env
+        .iter()
+        .any(|(key, _)| *key == "KIVI_LOG_MAX_BYTES");
+    if !has_log_bytes {
+        command.env("KIVI_LOG_MAX_BYTES", "8388608");
+    }
     for (key, value) in extra_env {
         command.env(key, value);
     }

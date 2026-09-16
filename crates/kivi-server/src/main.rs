@@ -12,6 +12,7 @@
 mod admin;
 mod cluster;
 mod control;
+mod logging;
 #[cfg(feature = "redis-compat")]
 mod resp;
 #[cfg(feature = "redis-compat")]
@@ -34,7 +35,7 @@ use kivi_types::{
     ClusterId, NamespaceId, NodeId, NodeIncarnation, TabletEpoch, TabletId, WorkerId,
     WriteGuardGeneration,
 };
-use tracing_subscriber::EnvFilter;
+use logging::{LogConfig, LogGuard};
 
 const NS: NamespaceId = NamespaceId::from_u64(1);
 
@@ -555,18 +556,12 @@ fn startup_mode(args: &Args) -> anyhow::Result<StartupMode> {
 
 #[allow(clippy::too_many_lines)]
 fn main() -> anyhow::Result<()> {
-    // Default verbosity keeps Kivi's own `info` narration but quiets
-    // `openraft` (per-election/per-tick `info` spam: ~300k lines in two
-    // minutes at 1000 groups — pure overhead at scale, still fully
-    // visible with `RUST_LOG=info`, which overrides this default
-    // entirely). One obvious tuning from multi-tablet density runs; the
-    // Raft task engine itself is untouched.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info,openraft=warn")),
-        )
-        .init();
+    // Bounded production logging: size-rotated files behind a non-blocking
+    // worker (see `logging.rs` for the crate decision). Default keeps
+    // Kivi's own `info` narration but quiets `openraft` election/tick spam
+    // (`openraft=warn`; ~300k lines/2min at 1000 groups otherwise).
+    // The guard lives for the full process so shutdown flushes.
+    let _log_guard = LogGuard::init(&LogConfig::from_env());
     let args = Args::parse();
     // Replicated cluster mode bypasses the single-node engine entirely:
     // one tablet group, peer mesh, native/admin/RESP edges on Tokio.

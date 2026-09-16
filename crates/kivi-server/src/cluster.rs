@@ -132,22 +132,57 @@ pub struct ClusterServeConfig {
     pub control_seeds: Vec<SocketAddr>,
 }
 
-/// Shared cluster serving state: the multi-tablet node, its static
+/// Shared cluster serving state: the multi-tablet node, its dynamic
 /// directory for key → tablet routing, plus the static address maps
 /// redirects resolve through.
+///
+/// The directory starts as the static genesis tiling and evolves through
+/// online split/merge cutovers: each cutover publishes one validated
+/// snapshot atomically (RCU via `ArcSwap`), so readers never observe a
+/// gap or double authority. Restarts rebuild the same directory by
+/// replaying completed topology plans from the replicated control image
+/// over the genesis tiling.
 #[derive(Debug, Clone)]
 pub struct ClusterShared {
     /// The multi-tablet consensus node.
     pub node: Arc<ConsensusNode>,
-    /// Static tablet directory: every key deterministically maps to
-    /// exactly one active tablet (no gaps, no overlaps).
-    pub directory: DirectorySnapshot,
+    /// Dynamic tablet directory: every key deterministically maps to
+    /// exactly one active tablet (no gaps, no overlaps) at every
+    /// published version.
+    pub directory: Arc<arc_swap::ArcSwap<DirectorySnapshot>>,
     /// Native endpoint per node id (redirect targets).
     pub natives: Arc<std::collections::HashMap<NodeId, SocketAddr>>,
     /// This node's native endpoint (advertised in hellos).
     pub native: SocketAddr,
     /// Namespace served.
     pub namespace: NamespaceId,
+    /// Live reconciler policy (operator-tunable via
+    /// `POST /v1/control/policy`; the reconciler clones it every pass).
+    pub policy: Arc<std::sync::Mutex<super::control::ReconcilePolicy>>,
+}
+
+impl ClusterShared {
+    /// Loads the current directory snapshot (lock-free RCU read).
+    pub fn directory_snapshot(&self) -> arc_swap::Guard<Arc<DirectorySnapshot>> {
+        self.directory.load()
+    }
+
+    /// Publishes a new directory snapshot after validation. Returns the
+    /// published version. Retries are safe (same snapshot publishes
+    /// idempotently when versions match).
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable reason when the snapshot fails
+    /// [`DirectorySnapshot::validate`].
+    pub fn publish_directory(&self, snapshot: DirectorySnapshot) -> Result<u64, String> {
+        snapshot
+            .validate()
+            .map_err(|error| format!("invalid directory snapshot: {error}"))?;
+        let version = snapshot.version().as_u64();
+        self.directory.store(Arc::new(snapshot));
+        Ok(version)
+    }
 }
 
 /// Why key → tablet routing failed (small error enum: the wire
@@ -161,16 +196,16 @@ enum RouteError {
     NoTablet,
 }
 
-/// Routes key bytes to their tablet through the static directory.
+/// Routes key bytes to their tablet through the current directory.
 /// Every key maps to exactly one active tablet (the tiling covers the
-/// whole hash space).
+/// whole hash space at every published version).
 fn route_key(shared: &ClusterShared, key: &[u8]) -> Result<TabletId, RouteError> {
     use kivi_state::PartitionHasher;
     let hash = PartitionHasher::V1
         .hash(shared.namespace, key)
         .ok_or(RouteError::UnsupportedHash)?;
     shared
-        .directory
+        .directory_snapshot()
         .lookup_by_hash(hash)
         .ok_or(RouteError::NoTablet)
 }
@@ -311,6 +346,405 @@ fn build_directory(config: &ClusterServeConfig) -> anyhow::Result<DirectorySnaps
         WriteGuardGeneration::INITIAL,
     )
     .context("static tablet directory failed to build")
+}
+
+/// Replays completed topology cutovers over the genesis tiling so a full
+/// cluster restart recovers the post-split/merge directory. Only plans at
+/// or past `CutoverCommitted` affect the directory (earlier phases keep
+/// children inactive and the parent authoritative); replay applies them in
+/// plan-id order, deterministically rebuilding the same ranges. Old
+/// parents stay retired with redirects — they never reappear as active.
+async fn replay_topology_from_control(shared: &ClusterShared) {
+    let Some(state) = shared.node.control_state().await else {
+        return;
+    };
+    let mut splits: Vec<kivi_control::SplitPlan> = state.splits().cloned().collect();
+    splits.sort_by_key(|plan| plan.id.as_u64());
+    let mut merges: Vec<kivi_control::MergePlan> = state.merges().cloned().collect();
+    merges.sort_by_key(|plan| plan.id.as_u64());
+    let mut directory = shared.directory_snapshot().as_ref().clone();
+    let mut changed = false;
+    for plan in splits {
+        if !matches!(
+            plan.phase,
+            kivi_control::SplitPhase::CutoverCommitted
+                | kivi_control::SplitPhase::ParentRetiring
+                | kivi_control::SplitPhase::Completed
+        ) {
+            continue;
+        }
+        match apply_completed_split(&directory, &plan) {
+            Ok(next) => {
+                directory = next;
+                changed = true;
+            }
+            Err(reason) => {
+                tracing::warn!(
+                    plan = plan.id.as_u64(),
+                    parent = plan.parent.as_u64(),
+                    %reason,
+                    "topology replay skipped split cutover"
+                );
+            }
+        }
+    }
+    for plan in merges {
+        if !matches!(
+            plan.phase,
+            kivi_control::MergePhase::CutoverCommitted
+                | kivi_control::MergePhase::ParentsRetiring
+                | kivi_control::MergePhase::Completed
+        ) {
+            continue;
+        }
+        match apply_completed_merge(&directory, &plan) {
+            Ok(next) => {
+                directory = next;
+                changed = true;
+            }
+            Err(reason) => {
+                tracing::warn!(
+                    plan = plan.id.as_u64(),
+                    merged = plan.merged.as_u64(),
+                    %reason,
+                    "topology replay skipped merge cutover"
+                );
+            }
+        }
+    }
+    if changed {
+        match shared.publish_directory(directory) {
+            Ok(version) => {
+                tracing::info!(dir_version = version, "topology replay published directory");
+            }
+            Err(reason) => {
+                tracing::warn!(%reason, "topology replay publish failed");
+            }
+        }
+    }
+}
+
+/// Applies one completed split cutover to `directory`: derives the
+/// midpoint children from the parent range (verifying the persisted
+/// `split_hash`), then allocate → stage → seal → atomic cutover.
+fn apply_completed_split(
+    directory: &DirectorySnapshot,
+    plan: &kivi_control::SplitPlan,
+) -> Result<DirectorySnapshot, String> {
+    use kivi_tablet::PartitionRange;
+    // Idempotent: already cut over (parent tombstoned, children active).
+    let parent_done = directory
+        .get(plan.parent)
+        .is_some_and(|descriptor| descriptor.state() == kivi_tablet::TabletState::Tombstone);
+    let children_active = [plan.left, plan.right].iter().all(|child| {
+        directory
+            .get(*child)
+            .is_some_and(|descriptor| descriptor.state() == kivi_tablet::TabletState::Active)
+    });
+    if parent_done && children_active {
+        return Ok(directory.clone());
+    }
+    let parent_range = directory
+        .get(plan.parent)
+        .map(|descriptor| descriptor.range().clone())
+        .ok_or_else(|| format!("split parent {} unknown", plan.parent.as_u64()))?;
+    let PartitionRange::Hash(prefix) = parent_range else {
+        return Err("split parent is not a hash range".to_owned());
+    };
+    let (left_prefix, right_prefix, split_hash) =
+        prefix.split_midpoint().map_err(|error| error.to_string())?;
+    if split_hash != plan.split_hash {
+        return Err(format!(
+            "split boundary mismatch: plan {:x} != range {:x}",
+            plan.split_hash, split_hash
+        ));
+    }
+    let mut next = directory
+        .allocate(
+            plan.left,
+            PartitionRange::Hash(left_prefix),
+            TabletEpoch::INITIAL,
+            WriteGuardGeneration::INITIAL,
+        )
+        .or_else(|error| {
+            // Already allocated (replay after partial progress): continue.
+            if directory.get(plan.left).is_some() {
+                Ok(directory.clone())
+            } else {
+                Err(error)
+            }
+        })
+        .map_err(|error| error.to_string())?;
+    if next.get(plan.right).is_none() {
+        next = next
+            .allocate(
+                plan.right,
+                PartitionRange::Hash(right_prefix),
+                TabletEpoch::INITIAL,
+                WriteGuardGeneration::INITIAL,
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    for child in [plan.left, plan.right] {
+        if next
+            .get(child)
+            .is_some_and(|descriptor| descriptor.state() == kivi_tablet::TabletState::Allocated)
+        {
+            next = next.stage(child).map_err(|error| error.to_string())?;
+        }
+    }
+    if next
+        .get(plan.parent)
+        .is_some_and(|descriptor| descriptor.state() == kivi_tablet::TabletState::Active)
+    {
+        next = next.seal(plan.parent).map_err(|error| error.to_string())?;
+    }
+    next = next
+        .cutover_split(plan.parent, plan.left, plan.right)
+        .map_err(|error| error.to_string())?;
+    Ok(next)
+}
+
+/// Applies one split cutover to a local directory snapshot from explicit
+/// plan fields (admin endpoint path): idempotent, deterministic, one
+/// validated atomic transition. Used by the reconciler on every node and
+/// by restart replay (via [`apply_completed_split`]).
+pub(crate) fn apply_cutover_split_for_reconciler(
+    directory: &DirectorySnapshot,
+    parent: TabletId,
+    left: TabletId,
+    right: TabletId,
+    split_hash: u128,
+) -> Result<DirectorySnapshot, String> {
+    apply_cutover_split_local(directory, parent, left, right, split_hash)
+}
+
+/// Applies one split cutover to a local directory snapshot from explicit
+/// plan fields (admin endpoint path): idempotent, deterministic, one
+/// validated atomic transition. Used by the reconciler on every node and
+/// by restart replay (via [`apply_completed_split`]).
+fn apply_cutover_split_local(
+    directory: &DirectorySnapshot,
+    parent: TabletId,
+    left: TabletId,
+    right: TabletId,
+    split_hash: u128,
+) -> Result<DirectorySnapshot, String> {
+    use kivi_tablet::PartitionRange;
+    let parent_done = directory
+        .get(parent)
+        .is_some_and(|descriptor| descriptor.state() == kivi_tablet::TabletState::Tombstone);
+    let children_active = [left, right].iter().all(|child| {
+        directory
+            .get(*child)
+            .is_some_and(|descriptor| descriptor.state() == kivi_tablet::TabletState::Active)
+    });
+    if parent_done && children_active {
+        return Ok(directory.clone());
+    }
+    let parent_range = directory
+        .get(parent)
+        .map(|descriptor| descriptor.range().clone())
+        .ok_or_else(|| format!("split parent {} unknown", parent.as_u64()))?;
+    let PartitionRange::Hash(prefix) = parent_range else {
+        return Err("split parent is not a hash range".to_owned());
+    };
+    let (left_prefix, right_prefix, expect_hash) =
+        prefix.split_midpoint().map_err(|error| error.to_string())?;
+    if expect_hash != split_hash {
+        return Err(format!(
+            "split boundary mismatch: plan {split_hash:x} != range {expect_hash:x}"
+        ));
+    }
+    let mut next = if directory.get(left).is_none() {
+        directory
+            .allocate(
+                left,
+                PartitionRange::Hash(left_prefix),
+                TabletEpoch::INITIAL,
+                WriteGuardGeneration::INITIAL,
+            )
+            .map_err(|error| error.to_string())?
+    } else {
+        directory.clone()
+    };
+    if next.get(right).is_none() {
+        next = next
+            .allocate(
+                right,
+                PartitionRange::Hash(right_prefix),
+                TabletEpoch::INITIAL,
+                WriteGuardGeneration::INITIAL,
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    for child in [left, right] {
+        if next
+            .get(child)
+            .is_some_and(|descriptor| descriptor.state() == kivi_tablet::TabletState::Allocated)
+        {
+            next = next.stage(child).map_err(|error| error.to_string())?;
+        }
+    }
+    if next
+        .get(parent)
+        .is_some_and(|descriptor| descriptor.state() == kivi_tablet::TabletState::Active)
+    {
+        next = next.seal(parent).map_err(|error| error.to_string())?;
+    }
+    next.cutover_split(parent, left, right)
+        .map_err(|error| error.to_string())
+}
+
+/// Applies one merge cutover to a local directory snapshot from explicit
+/// plan fields (admin endpoint path): idempotent, deterministic, one
+/// validated atomic transition.
+pub(crate) fn apply_cutover_merge_for_reconciler(
+    directory: &DirectorySnapshot,
+    left: TabletId,
+    right: TabletId,
+    merged: TabletId,
+) -> Result<DirectorySnapshot, String> {
+    apply_cutover_merge_local(directory, left, right, merged)
+}
+
+/// Applies one merge cutover to a local directory snapshot from explicit
+/// plan fields (admin endpoint path): idempotent, deterministic, one
+/// validated atomic transition.
+fn apply_cutover_merge_local(
+    directory: &DirectorySnapshot,
+    left: TabletId,
+    right: TabletId,
+    merged: TabletId,
+) -> Result<DirectorySnapshot, String> {
+    use kivi_tablet::{HashPrefix, PartitionRange};
+    if directory
+        .get(merged)
+        .is_some_and(|descriptor| descriptor.state() == kivi_tablet::TabletState::Active)
+    {
+        return Ok(directory.clone());
+    }
+    let left_range = directory
+        .get(left)
+        .map(|descriptor| descriptor.range().clone())
+        .ok_or_else(|| format!("merge left {} unknown", left.as_u64()))?;
+    let right_range = directory
+        .get(right)
+        .map(|descriptor| descriptor.range().clone())
+        .ok_or_else(|| format!("merge right {} unknown", right.as_u64()))?;
+    let (PartitionRange::Hash(left_prefix), PartitionRange::Hash(right_prefix)) =
+        (left_range, right_range)
+    else {
+        return Err("merge parents are not hash ranges".to_owned());
+    };
+    if left_prefix.prefix_len() != right_prefix.prefix_len() || left_prefix.prefix_len() == 0 {
+        return Err("merge parents are not siblings".to_owned());
+    }
+    let len = left_prefix.prefix_len();
+    let half = 1u128 << (128 - len);
+    if left_prefix.bits() | half != right_prefix.bits() || left_prefix.bits() & half != 0 {
+        return Err("merge parents are not adjacent siblings".to_owned());
+    }
+    let merged_prefix =
+        HashPrefix::new(left_prefix.bits(), len - 1).map_err(|error| error.to_string())?;
+    let mut next = if directory.get(merged).is_none() {
+        directory
+            .allocate(
+                merged,
+                PartitionRange::Hash(merged_prefix),
+                TabletEpoch::INITIAL,
+                WriteGuardGeneration::INITIAL,
+            )
+            .map_err(|error| error.to_string())?
+    } else {
+        directory.clone()
+    };
+    if next
+        .get(merged)
+        .is_some_and(|descriptor| descriptor.state() == kivi_tablet::TabletState::Allocated)
+    {
+        next = next.stage(merged).map_err(|error| error.to_string())?;
+    }
+    for parent in [left, right] {
+        if next
+            .get(parent)
+            .is_some_and(|descriptor| descriptor.state() == kivi_tablet::TabletState::Active)
+        {
+            next = next.seal(parent).map_err(|error| error.to_string())?;
+        }
+    }
+    next.cutover_merge(left, right, merged)
+        .map_err(|error| error.to_string())
+}
+
+/// Applies one completed merge cutover to `directory`: derives the union
+/// range from the sibling parents, then allocate → stage → seal →
+/// atomic cutover.
+fn apply_completed_merge(
+    directory: &DirectorySnapshot,
+    plan: &kivi_control::MergePlan,
+) -> Result<DirectorySnapshot, String> {
+    use kivi_tablet::{HashPrefix, PartitionRange};
+    let merged_done = directory
+        .get(plan.merged)
+        .is_some_and(|descriptor| descriptor.state() == kivi_tablet::TabletState::Active);
+    if merged_done {
+        return Ok(directory.clone());
+    }
+    let left_range = directory
+        .get(plan.left)
+        .map(|descriptor| descriptor.range().clone())
+        .ok_or_else(|| format!("merge left {} unknown", plan.left.as_u64()))?;
+    let right_range = directory
+        .get(plan.right)
+        .map(|descriptor| descriptor.range().clone())
+        .ok_or_else(|| format!("merge right {} unknown", plan.right.as_u64()))?;
+    let (PartitionRange::Hash(left_prefix), PartitionRange::Hash(right_prefix)) =
+        (left_range, right_range)
+    else {
+        return Err("merge parents are not hash ranges".to_owned());
+    };
+    if left_prefix.prefix_len() != right_prefix.prefix_len() || left_prefix.prefix_len() == 0 {
+        return Err("merge parents are not siblings".to_owned());
+    }
+    let len = left_prefix.prefix_len();
+    let half = 1u128 << (128 - len);
+    // Siblings: same parent bits, left's split bit 0, right's 1.
+    if left_prefix.bits() | half != right_prefix.bits() || left_prefix.bits() & half != 0 {
+        return Err("merge parents are not adjacent siblings".to_owned());
+    }
+    let merged_prefix =
+        HashPrefix::new(left_prefix.bits(), len - 1).map_err(|error| error.to_string())?;
+    let mut next = if directory.get(plan.merged).is_none() {
+        directory
+            .allocate(
+                plan.merged,
+                PartitionRange::Hash(merged_prefix),
+                TabletEpoch::INITIAL,
+                WriteGuardGeneration::INITIAL,
+            )
+            .map_err(|error| error.to_string())?
+    } else {
+        directory.clone()
+    };
+    if next
+        .get(plan.merged)
+        .is_some_and(|descriptor| descriptor.state() == kivi_tablet::TabletState::Allocated)
+    {
+        next = next.stage(plan.merged).map_err(|error| error.to_string())?;
+    }
+    for parent in [plan.left, plan.right] {
+        if next
+            .get(parent)
+            .is_some_and(|descriptor| descriptor.state() == kivi_tablet::TabletState::Active)
+        {
+            next = next.seal(parent).map_err(|error| error.to_string())?;
+        }
+    }
+    next = next
+        .cutover_merge(plan.left, plan.right, plan.merged)
+        .map_err(|error| error.to_string())?;
+    Ok(next)
 }
 
 /// Builds the static topology: every configured peer with its native
@@ -468,17 +902,28 @@ pub async fn run(config: ClusterServeConfig) -> anyhow::Result<()> {
         .context("admin listener address")?;
     let natives: std::collections::HashMap<NodeId, SocketAddr> =
         config.natives.iter().copied().collect();
+    let policy = Arc::new(std::sync::Mutex::new(policy_from_env()));
     let shared = ClusterShared {
         node: Arc::clone(&node),
-        directory,
+        directory: Arc::new(arc_swap::ArcSwap::from_pointee(directory)),
         natives: Arc::new(natives),
         native: native_addr,
         namespace: config.namespace,
+        policy: Arc::clone(&policy),
     };
-    // Control-plane genesis + migration reconciler (background Tokio
-    // tasks; both idle on non-leaders and exit with the server).
-    let seed = genesis_seed(&config, &shared.directory);
-    let (genesis, reconciler) = spawn_control_loops(&node, seed);
+    // Replay completed topology plans over the genesis tiling so a full
+    // cluster restart recovers the post-split/merge directory (old parents
+    // stay retired with redirects; they never reappear as active).
+    replay_topology_from_control(&shared).await;
+    // Control-plane genesis + reconciler (background Tokio tasks; both
+    // idle on non-leaders and exit with the server).
+    let seed = genesis_seed(&config, &shared.directory_snapshot());
+    let (genesis, reconciler) = spawn_control_loops(
+        &node,
+        seed,
+        Arc::clone(&shared.directory),
+        Arc::clone(&policy),
+    );
     // Native serving (Tokio tasks per connection).
     let native = {
         let shared = shared.clone();
@@ -511,7 +956,7 @@ pub async fn run(config: ClusterServeConfig) -> anyhow::Result<()> {
         node.incarnation().as_u64(),
         node.tablets().len(),
         node.worker_count(),
-        shared.directory.version().as_u64(),
+        shared.directory_snapshot().version().as_u64(),
     );
     let _ = std::io::Write::flush(&mut std::io::stdout());
     if let Err(error) = tokio::signal::ctrl_c().await {
@@ -553,7 +998,7 @@ async fn start_resp_edge(
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(super::resp::serve_with(
         listener,
-        ClusterExecutor::new(Arc::clone(node), shared.directory.clone(), namespace),
+        ClusterExecutor::new(Arc::clone(node), Arc::clone(&shared.directory), namespace),
         Arc::clone(&stats),
         shutdown_rx,
     ));
@@ -567,11 +1012,46 @@ async fn start_resp_edge(
     ))
 }
 
-/// Spawns control-plane genesis plus the migration reconciler (both
-/// idle on non-leaders; both abort with the server).
+/// Resolves the reconciler policy from the environment:
+///
+/// * `KIVI_AUTO_SPLIT=1` enables automatic splits (default off).
+/// * `KIVI_AUTO_MERGE=1` enables automatic merges (default off).
+/// * `KIVI_SPLIT_OBJECTS` overrides the split object-count threshold.
+/// * `KIVI_MERGE_OBJECTS` overrides the merge object-count threshold.
+fn policy_from_env() -> super::control::ReconcilePolicy {
+    let mut policy = super::control::ReconcilePolicy::default();
+    if std::env::var("KIVI_AUTO_SPLIT").is_ok_and(|value| value == "1") {
+        policy.auto_split = true;
+    }
+    if std::env::var("KIVI_AUTO_MERGE").is_ok_and(|value| value == "1") {
+        policy.auto_merge = true;
+    }
+    if let Some(threshold) = std::env::var("KIVI_SPLIT_OBJECTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|threshold| *threshold >= 10)
+    {
+        policy.split_object_threshold = threshold;
+    }
+    if let Some(threshold) = std::env::var("KIVI_MERGE_OBJECTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|threshold| *threshold >= 2)
+    {
+        policy.merge_object_threshold = threshold;
+    }
+    policy
+}
+
+/// Spawns control-plane genesis plus the reconciler (migrations,
+/// repairs, splits, merges; idle on non-leaders; both abort with the
+/// server). The reconciler clones the shared policy every pass so
+/// `POST /v1/control/policy` retunes the live loop without a restart.
 fn spawn_control_loops(
     node: &Arc<ConsensusNode>,
     seed: super::control::GenesisSeed,
+    directory: Arc<arc_swap::ArcSwap<DirectorySnapshot>>,
+    policy: Arc<std::sync::Mutex<super::control::ReconcilePolicy>>,
 ) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
     let genesis = {
         let node = Arc::clone(node);
@@ -580,7 +1060,7 @@ fn spawn_control_loops(
     let reconciler = {
         let node = Arc::clone(node);
         tokio::spawn(async move {
-            super::control::reconcile_loop(node, super::control::ReconcilePolicy::default()).await;
+            super::control::reconcile_loop_shared(node, policy, directory).await;
         })
     };
     (genesis, reconciler)
@@ -687,7 +1167,7 @@ async fn serve_native_conn(socket: tokio::net::TcpStream, shared: ClusterShared,
         node: shared.node.node(),
         incarnation: shared.node.incarnation(),
         worker: WorkerId::from_u64(CLUSTER_WORKER),
-        dir_version: shared.directory.version(),
+        dir_version: shared.directory_snapshot().version(),
         max_frame: u32::try_from(negotiated).unwrap_or(u32::MAX),
         endpoints: vec![(
             WorkerId::from_u64(CLUSTER_WORKER),
@@ -1573,14 +2053,14 @@ async fn desired_redirect(shared: &ClusterShared, tablet: TabletId) -> Option<Re
             .node(*voter)
             .map(|record| record.native)
             .or_else(|| shared.natives.get(voter).copied())?;
-        let range = shared
-            .directory
+        let directory = shared.directory_snapshot();
+        let range = directory
             .get(tablet)
             .map(|descriptor| descriptor.range().clone())?;
         Some(Response {
             status: Status::StaleRoute,
             body: ResponseBody::Redirect(RedirectInfo {
-                dir_version: shared.directory.version(),
+                dir_version: directory.version(),
                 tablet,
                 epoch: TabletEpoch::INITIAL,
                 worker: WorkerId::from_u64(CLUSTER_WORKER),
@@ -1648,6 +2128,10 @@ async fn shape_propose_error(
         ProposeError::Op(OpError::StaleRangeBase) => Response {
             status: Status::InvalidRequest,
             body: ResponseBody::Diagnostic("range base changed; retry".to_owned()),
+        },
+        ProposeError::Fenced { .. } => Response {
+            status: Status::Overloaded,
+            body: ResponseBody::Diagnostic("tablet fenced for topology cutover; retry".to_owned()),
         },
         // Forward-compatibility: future proposal failures fail closed as
         // internal rather than mis-shaping on the wire.
@@ -1724,15 +2208,15 @@ fn redirect_or_overloaded(
     leader: Option<kivi_types::NodeId>,
 ) -> Response {
     let endpoint = leader.and_then(|node| shared.natives.get(&node).copied());
-    let range = shared
-        .directory
+    let directory = shared.directory_snapshot();
+    let range = directory
         .get(tablet)
         .map(|descriptor| descriptor.range().clone());
     match (endpoint, range) {
         (Some(addr), Some(range)) => Response {
             status: Status::StaleRoute,
             body: ResponseBody::Redirect(RedirectInfo {
-                dir_version: shared.directory.version(),
+                dir_version: directory.version(),
                 tablet,
                 epoch: TabletEpoch::INITIAL,
                 worker: WorkerId::from_u64(CLUSTER_WORKER),
@@ -1872,12 +2356,16 @@ async fn ready(State(shared): State<ClusterShared>) -> Json<serde_json::Value> {
     let control = shared.node.control_state().await.map(|state| {
         let mut active = 0u64;
         let mut joining = 0u64;
+        let mut suspect = 0u64;
+        let mut unavailable = 0u64;
         let mut draining = 0u64;
         let mut drained = 0u64;
         for record in state.nodes() {
             match record.state {
                 kivi_control::NodeState::Active => active += 1,
                 kivi_control::NodeState::Joining => joining += 1,
+                kivi_control::NodeState::Suspect => suspect += 1,
+                kivi_control::NodeState::Unavailable => unavailable += 1,
                 kivi_control::NodeState::Draining => draining += 1,
                 kivi_control::NodeState::Drained => drained += 1,
                 kivi_control::NodeState::Removed => {}
@@ -1896,6 +2384,8 @@ async fn ready(State(shared): State<ClusterShared>) -> Json<serde_json::Value> {
             "placement_version": state.placement_version().as_u64(),
             "nodes_active": active,
             "nodes_joining": joining,
+            "nodes_suspect": suspect,
+            "nodes_unavailable": unavailable,
             "nodes_draining": draining,
             "nodes_drained": drained,
             "migrations_live": live,
@@ -1933,7 +2423,7 @@ async fn node_info(State(shared): State<ClusterShared>) -> Json<serde_json::Valu
         "tablets": shared.node.tablets().iter().map(|tablet| tablet.as_u64()).collect::<Vec<_>>(),
         "tablet_count": shared.node.tablets().len(),
         "workers": shared.node.worker_count(),
-        "dir_version": shared.directory.version().as_u64(),
+        "dir_version": shared.directory_snapshot().version().as_u64(),
         "mode": "replicated",
         "cluster_mode": "replicated",
         "peer": shared.node.peer_addr().to_string(),
@@ -1970,8 +2460,9 @@ async fn tablets(State(shared): State<ClusterShared>) -> Json<Vec<serde_json::Va
     for status in &statuses {
         let id = status.group.tablet().as_u64();
         let item = health.get(&id);
-        let mut value = serde_json::to_value(tablet_dto(status, &shared.directory))
-            .unwrap_or(serde_json::Value::Null);
+        let directory = shared.directory_snapshot();
+        let mut value =
+            serde_json::to_value(tablet_dto(status, &directory)).unwrap_or(serde_json::Value::Null);
         if let serde_json::Value::Object(ref mut map) = value {
             map.insert(
                 "voters".to_owned(),
@@ -2009,17 +2500,23 @@ async fn tablets(State(shared): State<ClusterShared>) -> Json<Vec<serde_json::Va
             map.insert(
                 "placement".to_owned(),
                 serde_json::Value::String(
-                    item.map_or("unknown", |item| {
-                        if item.healthy {
-                            "healthy"
-                        } else if item.migrating || item.actual.is_some() {
-                            "converging"
-                        } else {
-                            "unobserved"
-                        }
+                    item.map_or("unknown", |item| match item.status {
+                        kivi_control::TabletHealth::Healthy => "healthy",
+                        kivi_control::TabletHealth::Converging => "converging",
+                        kivi_control::TabletHealth::UnderReplicated => "under-replicated",
+                        kivi_control::TabletHealth::Unavailable => "unavailable",
+                        kivi_control::TabletHealth::OverReplicated => "over-replicated",
                     })
                     .to_owned(),
                 ),
+            );
+            map.insert(
+                "healthy".to_owned(),
+                serde_json::Value::Bool(item.is_some_and(|item| item.healthy)),
+            );
+            map.insert(
+                "migrating".to_owned(),
+                serde_json::Value::Bool(item.is_some_and(|item| item.migrating)),
             );
         }
         out.push(value);
@@ -2045,7 +2542,8 @@ async fn tablet(State(shared): State<ClusterShared>) -> (StatusCode, Json<serde_
         );
     }
     let status = statuses.pop().expect("exactly one status");
-    match serde_json::to_value(tablet_dto(&status, &shared.directory)) {
+    let directory = shared.directory_snapshot();
+    match serde_json::to_value(tablet_dto(&status, &directory)) {
         Ok(value) => (StatusCode::OK, Json(value)),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2416,6 +2914,337 @@ async fn migrations(State(shared): State<ClusterShared>) -> Json<serde_json::Val
     }))
 }
 
+/// Split plans with phases, ranges, and replicas (operator visibility).
+async fn control_splits(State(shared): State<ClusterShared>) -> Json<serde_json::Value> {
+    let Some(state) = shared.node.control_state().await else {
+        return Json(serde_json::json!({ "present": false, "splits": [] }));
+    };
+    let directory = shared.directory_snapshot();
+    Json(serde_json::json!({
+        "present": true,
+        "splits": state.splits().map(|plan| {
+            let parent_range = directory.get(plan.parent).map(|descriptor| descriptor.range().to_string());
+            serde_json::json!({
+                "id": plan.id.as_u64(),
+                "parent": plan.parent.as_u64(),
+                "parent_range": parent_range,
+                "split_hash": format!("{:x}", plan.split_hash),
+                "left": plan.left.as_u64(),
+                "right": plan.right.as_u64(),
+                "replicas": plan.replicas.iter().map(|node| node.as_u64()).collect::<Vec<_>>(),
+                "generation": plan.generation.as_u64(),
+                "phase": format!("{:?}", plan.phase),
+            })
+        }).collect::<Vec<_>>(),
+    }))
+}
+
+/// Creates a split plan for one populated tablet through the persisted
+/// reconciler pathway (never a metadata-only edit). Body:
+/// `{ "tablet": <u64> }`. The boundary is the parent midpoint; children
+/// inherit the parent replica set; the reconciler seeds, fences, cuts
+/// over, and retires.
+async fn control_splits_create(
+    State(shared): State<ClusterShared>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(tablet) = body.get("tablet").and_then(serde_json::Value::as_u64) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "body must be {\"tablet\": <u64>}" })),
+        );
+    };
+    let parent = TabletId::from_u64(tablet);
+    let Some(state) = shared.node.control_state().await else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "no local control image" })),
+        );
+    };
+    let directory = shared.directory_snapshot();
+    let Some(descriptor) = directory.get(parent) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "unknown tablet" })),
+        );
+    };
+    if descriptor.state() != kivi_tablet::TabletState::Active {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "only active tablets split" })),
+        );
+    }
+    let kivi_tablet::PartitionRange::Hash(prefix) = descriptor.range().clone() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "only hash tablets split in this stage" })),
+        );
+    };
+    let Ok((_, _, split_hash)) = prefix.split_midpoint() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "tablet range unsplittable" })),
+        );
+    };
+    let fresh = state.fresh_tablet_ids(2);
+    let (Some(left), Some(right)) = (fresh.first().copied(), fresh.get(1).copied()) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "tablet allocator exhausted" })),
+        );
+    };
+    match super::control::create_split_plan_at(&shared.node, parent, split_hash, left, right).await
+    {
+        Ok(id) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "plan": id.as_u64(),
+                "parent": parent.as_u64(),
+                "left": left.as_u64(),
+                "right": right.as_u64(),
+                "split_hash": format!("{:x}", split_hash),
+            })),
+        ),
+        Err(reason) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": reason })),
+        ),
+    }
+}
+
+/// Merge plans with phases (operator visibility).
+async fn control_merges(State(shared): State<ClusterShared>) -> Json<serde_json::Value> {
+    let Some(state) = shared.node.control_state().await else {
+        return Json(serde_json::json!({ "present": false, "merges": [] }));
+    };
+    Json(serde_json::json!({
+        "present": true,
+        "merges": state.merges().map(|plan| serde_json::json!({
+            "id": plan.id.as_u64(),
+            "left": plan.left.as_u64(),
+            "right": plan.right.as_u64(),
+            "merged": plan.merged.as_u64(),
+            "replicas": plan.replicas.iter().map(|node| node.as_u64()).collect::<Vec<_>>(),
+            "generation": plan.generation.as_u64(),
+            "phase": format!("{:?}", plan.phase),
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+/// Creates a merge plan for two adjacent tablets. Body:
+/// `{ "left": <u64>, "right": <u64> }`. Requires adjacency, compatible
+/// placement (equal desired voters), and healthy parents.
+async fn control_merges_create(
+    State(shared): State<ClusterShared>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let (Some(left), Some(right)) = (
+        body.get("left").and_then(serde_json::Value::as_u64),
+        body.get("right").and_then(serde_json::Value::as_u64),
+    ) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::json!({ "error": "body must be {\"left\": <u64>, \"right\": <u64>}" }),
+            ),
+        );
+    };
+    match super::control::create_merge_plan(
+        &shared.node,
+        TabletId::from_u64(left),
+        TabletId::from_u64(right),
+    )
+    .await
+    {
+        Ok(id) => (
+            StatusCode::OK,
+            Json(
+                serde_json::json!({ "ok": true, "plan": id.as_u64(), "left": left, "right": right }),
+            ),
+        ),
+        Err(reason) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": reason })),
+        ),
+    }
+}
+
+/// Repair status: under-replicated / unavailable tablets plus active
+/// repair-aged migration plans (same pathway as manual moves).
+async fn control_repair(State(shared): State<ClusterShared>) -> Json<serde_json::Value> {
+    let Some(state) = shared.node.control_state().await else {
+        return Json(serde_json::json!({ "present": false }));
+    };
+    let policy = shared.policy.lock().map_or_else(
+        |_| super::control::ReconcilePolicy::default(),
+        |policy| policy.clone(),
+    );
+    let intents = super::control::repair_intents(&state, &policy);
+    let mut under_replicated = Vec::new();
+    let mut unavailable = Vec::new();
+    for desired in state.placements() {
+        let usable = desired
+            .replicas
+            .iter()
+            .filter(|node| {
+                state.node(**node).is_some_and(|record| {
+                    matches!(
+                        record.state,
+                        kivi_control::NodeState::Active
+                            | kivi_control::NodeState::Suspect
+                            | kivi_control::NodeState::Draining
+                    )
+                })
+            })
+            .count();
+        let health = kivi_control::classify_tablet(
+            desired.replicas.len(),
+            usable,
+            !state.live_plans_for(desired.tablet).is_empty(),
+            policy.planner.replication_factor,
+        );
+        match health {
+            kivi_control::TabletHealth::UnderReplicated => {
+                under_replicated.push(desired.tablet.as_u64());
+            }
+            kivi_control::TabletHealth::Unavailable => {
+                unavailable.push(desired.tablet.as_u64());
+            }
+            kivi_control::TabletHealth::Healthy
+            | kivi_control::TabletHealth::Converging
+            | kivi_control::TabletHealth::OverReplicated => {}
+        }
+    }
+    under_replicated.sort_unstable();
+    unavailable.sort_unstable();
+    Json(serde_json::json!({
+        "present": true,
+        "under_replicated": under_replicated,
+        "unavailable": unavailable,
+        "planned_repairs": intents.len(),
+        "repairs": intents.iter().map(|intent| serde_json::json!({
+            "tablet": intent.tablet.as_u64(),
+            "from": intent.from.as_u64(),
+            "to": intent.to.as_u64(),
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+/// Topology overview: tablet count, split/merge plans, directory version,
+/// placement summary, and node liveness.
+async fn control_topology(State(shared): State<ClusterShared>) -> Json<serde_json::Value> {
+    let directory = shared.directory_snapshot();
+    let active_tablets = directory
+        .tablets()
+        .iter()
+        .filter(|descriptor| descriptor.state() == kivi_tablet::TabletState::Active)
+        .count();
+    let Some(state) = shared.node.control_state().await else {
+        return Json(serde_json::json!({
+            "present": false,
+            "tablets": active_tablets,
+            "dir_version": directory.version().as_u64(),
+        }));
+    };
+    let mut suspect = 0u64;
+    let mut unavailable = 0u64;
+    for record in state.nodes() {
+        match record.state {
+            kivi_control::NodeState::Suspect => suspect += 1,
+            kivi_control::NodeState::Unavailable => unavailable += 1,
+            kivi_control::NodeState::Joining
+            | kivi_control::NodeState::Active
+            | kivi_control::NodeState::Draining
+            | kivi_control::NodeState::Drained
+            | kivi_control::NodeState::Removed => {}
+        }
+    }
+    Json(serde_json::json!({
+        "present": true,
+        "tablets": active_tablets,
+        "dir_version": directory.version().as_u64(),
+        "placement_version": state.placement_version().as_u64(),
+        "splits_live": state.splits().filter(|plan| !plan.phase.is_terminal()).count(),
+        "splits_total": state.splits().count(),
+        "merges_live": state.merges().filter(|plan| !plan.phase.is_terminal()).count(),
+        "merges_total": state.merges().count(),
+        "migrations_live": state.migrations().filter(|plan| !plan.phase.is_terminal()).count(),
+        "nodes_suspect": suspect,
+        "nodes_unavailable": unavailable,
+    }))
+}
+
+/// Live reconciler policy (operator visibility).
+async fn control_policy(State(shared): State<ClusterShared>) -> Json<serde_json::Value> {
+    let policy = shared.policy.lock().map_or_else(
+        |_| super::control::ReconcilePolicy::default(),
+        |policy| policy.clone(),
+    );
+    Json(serde_json::json!({
+        "auto_repair": policy.auto_repair,
+        "auto_split": policy.auto_split,
+        "auto_merge": policy.auto_merge,
+        "split_object_threshold": policy.split_object_threshold,
+        "merge_object_threshold": policy.merge_object_threshold,
+        "max_live_plans": policy.max_live_plans,
+        "max_live_splits": policy.scheduler.max_live_splits,
+        "max_live_merges": policy.scheduler.max_live_merges,
+        "replication_factor": policy.planner.replication_factor,
+        "suspicion_threshold": policy.failure.suspicion_threshold,
+        "repair_grace_misses": policy.failure.repair_grace_misses,
+    }))
+}
+
+/// Retunes the live reconciler policy without a restart. Body accepts any
+/// subset of `{ "auto_split": <bool>, "auto_merge": <bool>,
+/// "split_object_threshold": <u64>, "merge_object_threshold": <u64> }`.
+async fn control_policy_update(
+    State(shared): State<ClusterShared>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Ok(mut policy) = shared.policy.lock() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "policy lock poisoned" })),
+        );
+    };
+    if let Some(auto_split) = body.get("auto_split").and_then(serde_json::Value::as_bool) {
+        policy.auto_split = auto_split;
+    }
+    if let Some(auto_merge) = body.get("auto_merge").and_then(serde_json::Value::as_bool) {
+        policy.auto_merge = auto_merge;
+    }
+    // Lab floors admit tiny demonstration thresholds; production stays
+    // conservative through the defaults (200k/20k). Hysteresis
+    // (`merge << split`) is the operator's duty here; the merge path
+    // independently refuses above-threshold tablets.
+    if let Some(threshold) = body
+        .get("split_object_threshold")
+        .and_then(serde_json::Value::as_u64)
+        && threshold >= 10
+    {
+        policy.split_object_threshold = usize::try_from(threshold).unwrap_or(usize::MAX);
+    }
+    if let Some(threshold) = body
+        .get("merge_object_threshold")
+        .and_then(serde_json::Value::as_u64)
+        && threshold >= 2
+    {
+        policy.merge_object_threshold = usize::try_from(threshold).unwrap_or(usize::MAX);
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "auto_split": policy.auto_split,
+            "auto_merge": policy.auto_merge,
+            "split_object_threshold": policy.split_object_threshold,
+            "merge_object_threshold": policy.merge_object_threshold,
+        })),
+    )
+}
+
 /// Observed membership for one tablet group: actual voters, learners,
 /// leader, term, joint flag, and replication lag. Powers reconciler
 /// forwarding and operator inspection (§43).
@@ -2668,6 +3497,255 @@ async fn tablet_retire(
         .await
     {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))),
+        Err(reason) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": reason })),
+        ),
+    }
+}
+
+/// Initializes one new tablet group on this replica (split-child /
+/// merge-target founder). Body: `{ "voters": [<u64>], "peer_addrs":
+/// { "<u64>": "<addr>" } }`. Idempotent: an already-initialized group
+/// answers `{ "ok": true }`.
+async fn tablet_initialize(
+    State(shared): State<ClusterShared>,
+    axum::extract::Path(id): axum::extract::Path<u64>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(voters) = body.get("voters").and_then(serde_json::Value::as_array) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::json!({ "error": "body must be {\"voters\": [<u64>], \"peer_addrs\": {...}}" }),
+            ),
+        );
+    };
+    let voters: std::collections::BTreeSet<u64> = voters
+        .iter()
+        .filter_map(serde_json::Value::as_u64)
+        .collect();
+    let mut peer_addrs = std::collections::BTreeMap::new();
+    if let Some(map) = body
+        .get("peer_addrs")
+        .and_then(serde_json::Value::as_object)
+    {
+        for (key, value) in map {
+            if let (Ok(node), Some(addr)) = (key.parse::<u64>(), value.as_str()) {
+                peer_addrs.insert(node, addr.to_owned());
+            }
+        }
+    }
+    match shared
+        .node
+        .initialize_group(TabletId::from_u64(id), voters, peer_addrs)
+        .await
+    {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))),
+        Err(reason) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": reason })),
+        ),
+    }
+}
+
+/// Sets or clears the split/merge cutover fence on the local replica.
+/// Body: `{ "fenced": <bool> }`. Idempotent.
+async fn tablet_fence(
+    State(shared): State<ClusterShared>,
+    axum::extract::Path(id): axum::extract::Path<u64>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(fenced) = body.get("fenced").and_then(serde_json::Value::as_bool) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "body must be {\"fenced\": <bool>}" })),
+        );
+    };
+    match shared
+        .node
+        .set_tablet_fenced(TabletId::from_u64(id), fenced)
+        .await
+    {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))),
+        Err(reason) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": reason })),
+        ),
+    }
+}
+
+/// Seeds one split child from the local parent replica (colocated base,
+/// no bulk network copy). Path id is the child; body:
+/// `{ "parent": <u64>, "split_hash": "<u128 decimal>", "left": <bool> }`.
+/// Installs the child's half plus the full parent session set (chunked
+/// roots reference the same immutable manifests). Idempotent.
+async fn tablet_seed_split(
+    State(shared): State<ClusterShared>,
+    axum::extract::Path(id): axum::extract::Path<u64>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let (Some(parent), Some(split_hash), Some(left)) = (
+        body.get("parent").and_then(serde_json::Value::as_u64),
+        body.get("split_hash").and_then(|value| {
+            value
+                .as_str()
+                .and_then(|text| text.parse::<u128>().ok())
+                .or_else(|| {
+                    // Accept raw JSON numbers when they fit (small test hashes).
+                    value.as_u64().map(u128::from)
+                })
+        }),
+        body.get("left").and_then(serde_json::Value::as_bool),
+    ) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::json!({ "error": "body must be {\"parent\": <u64>, \"split_hash\": \"<u128>\", \"left\": <bool>}" }),
+            ),
+        );
+    };
+    match shared
+        .node
+        .seed_split_child(
+            TabletId::from_u64(parent),
+            TabletId::from_u64(id),
+            split_hash,
+            left,
+        )
+        .await
+    {
+        Ok((objects, sessions)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": true, "objects": objects, "sessions": sessions })),
+        ),
+        Err(reason) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": reason })),
+        ),
+    }
+}
+
+/// Seeds a merge target from two local parents (union, ranges disjoint).
+/// Path id is the merged tablet; body: `{ "left": <u64>, "right": <u64> }`.
+/// Idempotent.
+async fn tablet_seed_merge(
+    State(shared): State<ClusterShared>,
+    axum::extract::Path(id): axum::extract::Path<u64>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let (Some(left), Some(right)) = (
+        body.get("left").and_then(serde_json::Value::as_u64),
+        body.get("right").and_then(serde_json::Value::as_u64),
+    ) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::json!({ "error": "body must be {\"left\": <u64>, \"right\": <u64>}" }),
+            ),
+        );
+    };
+    match shared
+        .node
+        .seed_merge_target(
+            TabletId::from_u64(left),
+            TabletId::from_u64(right),
+            TabletId::from_u64(id),
+        )
+        .await
+    {
+        Ok((objects, sessions)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": true, "objects": objects, "sessions": sessions })),
+        ),
+        Err(reason) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": reason })),
+        ),
+    }
+}
+
+/// Applies one deterministic topology cutover to the local directory
+/// (idempotent). Split body:
+/// `{ "kind": "split", "parent": <u64>, "left": <u64>, "right": <u64>,
+/// "split_hash": "<u128>" }`; merge body:
+/// `{ "kind": "merge", "left": <u64>, "right": <u64>, "merged": <u64> }`.
+/// The control reconciler calls this on every node after fencing and the
+/// final tail install; the single validated snapshot transition keeps
+/// clients from ever observing a gap or double authority.
+async fn directory_cutover(
+    State(shared): State<ClusterShared>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let kind = body
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let current = shared.directory_snapshot().as_ref().clone();
+    let next: Result<DirectorySnapshot, String> = match kind {
+        "split" => {
+            let (Some(parent), Some(left), Some(right), Some(split_hash)) = (
+                body.get("parent").and_then(serde_json::Value::as_u64),
+                body.get("left").and_then(serde_json::Value::as_u64),
+                body.get("right").and_then(serde_json::Value::as_u64),
+                body.get("split_hash").and_then(|value| {
+                    value
+                        .as_str()
+                        .and_then(|text| text.parse::<u128>().ok())
+                        .or_else(|| value.as_u64().map(u128::from))
+                }),
+            ) else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(
+                        serde_json::json!({ "error": "split cutover needs parent/left/right/split_hash" }),
+                    ),
+                );
+            };
+            apply_cutover_split_local(
+                &current,
+                TabletId::from_u64(parent),
+                TabletId::from_u64(left),
+                TabletId::from_u64(right),
+                split_hash,
+            )
+        }
+        "merge" => {
+            let (Some(left), Some(right), Some(merged)) = (
+                body.get("left").and_then(serde_json::Value::as_u64),
+                body.get("right").and_then(serde_json::Value::as_u64),
+                body.get("merged").and_then(serde_json::Value::as_u64),
+            ) else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": "merge cutover needs left/right/merged" })),
+                );
+            };
+            apply_cutover_merge_local(
+                &current,
+                TabletId::from_u64(left),
+                TabletId::from_u64(right),
+                TabletId::from_u64(merged),
+            )
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "body kind must be \"split\" or \"merge\"" })),
+            );
+        }
+    };
+    match next {
+        Ok(next) => match shared.publish_directory(next) {
+            Ok(version) => (
+                StatusCode::OK,
+                Json(serde_json::json!({ "ok": true, "dir_version": version })),
+            ),
+            Err(reason) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": reason })),
+            ),
+        },
         Err(reason) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({ "error": reason })),
@@ -3038,6 +4116,14 @@ async fn serve_admin(listener: tokio::net::TcpListener, shared: ClusterShared) {
             "/v1/control/migrations/create",
             post(control_migrations_create),
         )
+        .route("/v1/control/splits", get(control_splits))
+        .route("/v1/control/splits/create", post(control_splits_create))
+        .route("/v1/control/merges", get(control_merges))
+        .route("/v1/control/merges/create", post(control_merges_create))
+        .route("/v1/control/repair", get(control_repair))
+        .route("/v1/control/topology", get(control_topology))
+        .route("/v1/control/policy", get(control_policy))
+        .route("/v1/control/policy/update", post(control_policy_update))
         .route("/v1/control/nodes", post(control_node_add))
         .route("/v1/control/nodes/{id}/drain", post(control_node_drain))
         .route("/v1/control/nodes/{id}/remove", post(control_node_remove))
@@ -3049,6 +4135,11 @@ async fn serve_admin(listener: tokio::net::TcpListener, shared: ClusterShared) {
         .route("/v1/tablets/{id}/leader", post(tablet_leader))
         .route("/v1/tablets/{id}/ensure", post(tablet_ensure))
         .route("/v1/tablets/{id}/retire", post(tablet_retire))
+        .route("/v1/tablets/{id}/initialize", post(tablet_initialize))
+        .route("/v1/tablets/{id}/fence", post(tablet_fence))
+        .route("/v1/tablets/{id}/seed-split", post(tablet_seed_split))
+        .route("/v1/tablets/{id}/seed-merge", post(tablet_seed_merge))
+        .route("/v1/directory/cutover", post(directory_cutover))
         .layer(
             tower::ServiceBuilder::new()
                 .layer(TraceLayer::new_for_http())
@@ -3077,7 +4168,7 @@ async fn serve_admin(listener: tokio::net::TcpListener, shared: ClusterShared) {
 #[derive(Debug, Clone)]
 pub struct ClusterExecutor {
     node: Arc<ConsensusNode>,
-    directory: DirectorySnapshot,
+    directory: Arc<arc_swap::ArcSwap<DirectorySnapshot>>,
     namespace: NamespaceId,
     handle: tokio::runtime::Handle,
 }
@@ -3089,7 +4180,7 @@ impl ClusterExecutor {
     #[must_use]
     pub fn new(
         node: Arc<ConsensusNode>,
-        directory: DirectorySnapshot,
+        directory: Arc<arc_swap::ArcSwap<DirectorySnapshot>>,
         namespace: NamespaceId,
     ) -> Self {
         Self {
@@ -3100,7 +4191,7 @@ impl ClusterExecutor {
         }
     }
 
-    /// Routes one operation to its tablet through the static directory
+    /// Routes one operation to its tablet through the current directory
     /// (same key → tablet mapping as the native edge).
     fn route(&self, op: &Operation) -> Result<TabletId, kivi_resp::ExecuteError> {
         use kivi_resp::ExecuteError as E;
@@ -3108,7 +4199,10 @@ impl ClusterExecutor {
         let hash = PartitionHasher::V1
             .hash(self.namespace, op.key().as_bytes())
             .ok_or(E::Internal)?;
-        self.directory.lookup_by_hash(hash).ok_or(E::Internal)
+        self.directory
+            .load()
+            .lookup_by_hash(hash)
+            .ok_or(E::Internal)
     }
 
     /// Executes one typed operation against its tablet's replica:

@@ -114,6 +114,38 @@ impl HashPrefix {
         let shift = MAX_PREFIX_LEN - common;
         (self.bits >> shift) == (other.bits >> shift)
     }
+
+    /// Splits this prefix at its midpoint into `(left, right, split_hash)`:
+    /// `left = [bits, split_hash)`, `right = [split_hash, bits+2*half)`.
+    /// `split_hash` is the first hash of the right half (also
+    /// `right.bits()`), the deterministic boundary persisted in
+    /// control-plane split-plan flows. The architecture permits arbitrary
+    /// future split points; this stage supports midpoint only.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RangeError::PrefixTooLong`] when the prefix is already a
+    /// single address (`len == 128`, unsplittable).
+    pub fn split_midpoint(self) -> Result<(Self, Self, u128), RangeError> {
+        if self.len >= MAX_PREFIX_LEN {
+            return Err(RangeError::PrefixTooLong { len: self.len });
+        }
+        let len = self.len + 1;
+        let half = 1u128 << (MAX_PREFIX_LEN - len);
+        let left = Self::new(self.bits, len)?;
+        let right = Self::new(self.bits | half, len)?;
+        Ok((left, right, self.bits | half))
+    }
+
+    /// Whether `left` and `right` are the midpoint children of `self`
+    /// (adjacency for merge validation).
+    #[must_use]
+    pub fn is_midpoint_split_of(self, left: Self, right: Self) -> bool {
+        self.split_midpoint()
+            .is_ok_and(|(expect_left, expect_right, _)| {
+                expect_left == left && expect_right == right
+            })
+    }
 }
 
 impl fmt::Display for HashPrefix {

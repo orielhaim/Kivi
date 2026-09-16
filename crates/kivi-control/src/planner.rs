@@ -16,6 +16,13 @@ use crate::placement::PlacementVersion;
 use crate::state::ControlState;
 
 /// Planner tuning: replication and concurrency bounds.
+///
+/// Repair concurrency is bounded independently from cosmetic rebalance so
+/// a rack/node loss cannot create a repair disaster: `max_repairs_per_round`
+/// caps global repair churn per planning round, and per-source/per-target
+/// caps spread catch-up load. Safety (repair) always outranks optimization
+/// (rebalance); the reconciler plans repairs first and only rebalances
+/// with leftover budget.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannerConfig {
     /// Desired voter count per tablet.
@@ -24,6 +31,12 @@ pub struct PlannerConfig {
     pub max_plans_per_round: usize,
     /// Maximum concurrent live plans touching one node (source or target).
     pub max_plans_per_node: usize,
+    /// Maximum repair intents created in one planning round.
+    pub max_repairs_per_round: usize,
+    /// Maximum repair intents sourced from one failed node per round.
+    pub max_repairs_per_source: usize,
+    /// Maximum repair intents targeted at one healthy node per round.
+    pub max_repairs_per_target: usize,
 }
 
 impl PlannerConfig {
@@ -34,6 +47,9 @@ impl PlannerConfig {
             replication_factor: 3,
             max_plans_per_round: 16,
             max_plans_per_node: 4,
+            max_repairs_per_round: 16,
+            max_repairs_per_source: 8,
+            max_repairs_per_target: 4,
         }
     }
 }
@@ -210,6 +226,167 @@ pub fn plan_drain(
     intents
 }
 
+/// Computes automatic repair intents for tablets whose desired voters
+/// include repair-worthy nodes (`Unavailable`; `Draining` is handled by
+/// [`plan_drain`]).
+///
+/// Safety-first ordering: tablets with zero usable replicas
+/// (`Unavailable` health) come before merely under-replicated ones, then
+/// tablet-id order (deterministic). Each intent replaces one failed
+/// source with the healthiest eligible target through the SAME
+/// [`MigrationPlan`] path as manual moves (add learner, catch up,
+/// `change_membership`, retire — never delete-first).
+///
+/// Bounds: global `max_repairs_per_round` plus per-source/per-target caps
+/// so a rack/node loss cannot stampede the cluster. When no eligible
+/// target exists the tablet is left degraded (exposed via health) rather
+/// than blocking recovery forever waiting for a perfect placement.
+#[allow(clippy::too_many_lines)]
+#[must_use]
+pub fn plan_repair(state: &ControlState, config: &PlannerConfig) -> Vec<MigrationIntent> {
+    use crate::failure::{TabletHealth, classify_tablet};
+
+    let eligible = eligible_nodes(state);
+    if eligible.is_empty() {
+        return Vec::new();
+    }
+    // Failed sources in deterministic order.
+    let mut failed: Vec<NodeId> = state
+        .nodes()
+        .filter(|record| record.state == NodeState::Unavailable)
+        .map(|record| record.node)
+        .collect();
+    failed.sort_by_key(|node| node.as_u64());
+    if failed.is_empty() {
+        return Vec::new();
+    }
+    // Candidate tablets: desired names a failed node, no live plan.
+    let mut candidates: Vec<(TabletHealth, usize, TabletId, NodeId)> = Vec::new();
+    let mut tablets: Vec<TabletId> = state.placements().map(|desired| desired.tablet).collect();
+    tablets.sort_by_key(|tablet| tablet.as_u64());
+    for tablet in tablets {
+        if !state.live_plans_for(tablet).is_empty() {
+            continue;
+        }
+        let Some(desired) = state.desired(tablet) else {
+            continue;
+        };
+        let source = failed.iter().copied().find(|node| desired.contains(*node));
+        let Some(source) = source else {
+            continue;
+        };
+        let usable = desired
+            .replicas
+            .iter()
+            .copied()
+            .filter(|node| {
+                state.node(*node).is_some_and(|record| {
+                    matches!(
+                        record.state,
+                        NodeState::Active | NodeState::Suspect | NodeState::Draining
+                    )
+                })
+            })
+            .count();
+        let health = classify_tablet(
+            desired.replicas.len(),
+            usable,
+            false,
+            config.replication_factor,
+        );
+        if !health.needs_repair() {
+            continue;
+        }
+        candidates.push((health, usable, tablet, source));
+    }
+    // Safety first: Unavailable (usable 0 sorts first via health order
+    // Unavailable < UnderReplicated? ensure explicit rank), then lowest
+    // usable count, then tablet id.
+    candidates.sort_by(|a, b| {
+        fn rank(health: TabletHealth) -> u8 {
+            match health {
+                TabletHealth::Unavailable => 0,
+                TabletHealth::UnderReplicated => 1,
+                TabletHealth::Converging => 2,
+                TabletHealth::Healthy => 3,
+                TabletHealth::OverReplicated => 4,
+            }
+        }
+        rank(a.0)
+            .cmp(&rank(b.0))
+            .then(a.1.cmp(&b.1))
+            .then(a.2.as_u64().cmp(&b.2.as_u64()))
+    });
+    let mut intents = Vec::new();
+    let mut load = replica_load(state);
+    let mut planned_touch: BTreeMap<u64, usize> = BTreeMap::new();
+    let mut per_source: BTreeMap<u64, usize> = BTreeMap::new();
+    let mut per_target: BTreeMap<u64, usize> = BTreeMap::new();
+    for (_, _, tablet, source) in candidates {
+        if intents.len() >= config.max_repairs_per_round {
+            break;
+        }
+        if per_source.get(&source.as_u64()).copied().unwrap_or(0) >= config.max_repairs_per_source {
+            continue;
+        }
+        let Some(desired) = state.desired(tablet) else {
+            continue;
+        };
+        let current: Vec<NodeId> = desired.replicas.clone();
+        let outsiders: Vec<NodeId> = eligible
+            .iter()
+            .copied()
+            .filter(|node| !current.contains(node))
+            .collect();
+        if outsiders.is_empty() {
+            continue;
+        }
+        // Per-target cap pre-filter: skip candidates already saturated
+        // this round before scoring.
+        let outsiders: Vec<NodeId> = outsiders
+            .into_iter()
+            .filter(|node| {
+                per_target.get(&node.as_u64()).copied().unwrap_or(0) < config.max_repairs_per_target
+            })
+            .collect();
+        if outsiders.is_empty() {
+            continue;
+        }
+        if let Some(target) = pick_add_target(
+            &current,
+            &outsiders,
+            state,
+            tablet,
+            &load,
+            &planned_touch,
+            config,
+        ) {
+            if per_target.get(&target.as_u64()).copied().unwrap_or(0)
+                >= config.max_repairs_per_target
+            {
+                continue;
+            }
+            let mut voters: Vec<NodeId> =
+                current.into_iter().filter(|node| *node != source).collect();
+            voters.push(target);
+            voters.sort_by_key(|node| node.as_u64());
+            touch(&mut planned_touch, source);
+            touch(&mut planned_touch, target);
+            bump_load(&mut load, target);
+            lower_load(&mut load, source);
+            *per_source.entry(source.as_u64()).or_default() += 1;
+            *per_target.entry(target.as_u64()).or_default() += 1;
+            intents.push(MigrationIntent {
+                tablet,
+                from: source,
+                to: target,
+                desired_voters: voters,
+            });
+        }
+    }
+    intents
+}
+
 /// Materializes intents into persisted [`MigrationPlan`]s at one placement
 /// generation. Pure constructor: no policy inside, so manual moves and
 /// auto-rebalance share this exact pathway.
@@ -264,6 +441,12 @@ fn replica_load(state: &ControlState) -> BTreeMap<u64, usize> {
 
 /// Picks the least-loaded candidate missing from `current`, preferring a
 /// failure domain the tablet does not yet cover.
+///
+/// Capacity-aware: load is weighted by node `weight` (effective load
+/// `load / weight`), so a weight-2 node holds ~2x the tablets of a
+/// weight-1 node instead of equal counts. Tablet-count is the current
+/// capacity signal; estimated logical bytes will refine the score once
+/// per-tablet size estimates flow through the control plane.
 fn pick_add_target(
     current: &[NodeId],
     candidates: &[NodeId],
@@ -278,7 +461,8 @@ fn pick_add_target(
         .filter_map(|node| state.node(*node))
         .map(|record| record.failure_domain.clone())
         .collect();
-    let mut ranked: Vec<(bool, usize, usize, NodeId)> = Vec::new();
+    // (fresh_domain desc, effective load asc, id asc, node).
+    let mut ranked: Vec<(bool, u64, u64, u64, NodeId)> = Vec::new();
     for candidate in candidates {
         if current.contains(candidate) {
             continue;
@@ -290,16 +474,24 @@ fn pick_add_target(
             !record.failure_domain.is_empty() && !covered.contains(&record.failure_domain)
         });
         let _ = tablet;
-        ranked.push((
-            fresh_domain,
-            load.get(&candidate.as_u64()).copied().unwrap_or(0),
-            usize::try_from(candidate.as_u64()).unwrap_or(usize::MAX),
-            *candidate,
-        ));
+        let weight = u64::from(
+            state
+                .node(*candidate)
+                .map_or(1, |record| record.weight.max(1)),
+        );
+        let raw = load.get(&candidate.as_u64()).copied().unwrap_or(0) as u64;
+        // Effective load scaled to permille for integer ordering:
+        // `raw * 1000 / weight`. Deterministic, no float.
+        let effective = raw.saturating_mul(1000).saturating_add(weight - 1) / weight.max(1);
+        ranked.push((fresh_domain, effective, raw, candidate.as_u64(), *candidate));
     }
-    // Fresh domain first, then lowest load, then lowest id (deterministic).
-    ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
-    ranked.into_iter().map(|(_, _, _, node)| node).next()
+    ranked.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then(a.1.cmp(&b.1))
+            .then(a.2.cmp(&b.2))
+            .then(a.3.cmp(&b.3))
+    });
+    ranked.into_iter().map(|(_, _, _, _, node)| node).next()
 }
 
 /// Picks the most-loaded current holder to shed (deterministic by load
@@ -461,12 +653,134 @@ mod tests {
             replication_factor: 3,
             max_plans_per_round: 16,
             max_plans_per_node: 16,
+            max_repairs_per_round: 16,
+            max_repairs_per_source: 16,
+            max_repairs_per_target: 16,
         };
         let intents = plan_drain(&state, NodeId::from_u64(1), &config);
         assert_eq!(intents.len(), 6);
         for intent in &intents {
             assert_eq!(intent.from, NodeId::from_u64(1));
             assert!(!intent.desired_voters.contains(&NodeId::from_u64(1)));
+        }
+    }
+
+    #[test]
+    fn repair_replaces_unavailable_without_delete_first() {
+        let mut state = balanced_three();
+        // Node 3 suffers a repair-worthy outage.
+        state
+            .apply(&ControlMutation::SetNodeState {
+                node: NodeId::from_u64(3),
+                state: NodeState::Unavailable,
+            })
+            .expect("mark unavailable");
+        let config = PlannerConfig::default_rf3();
+        let intents = plan_repair(&state, &config);
+        assert!(!intents.is_empty(), "unavailable node must be repaired");
+        for intent in &intents {
+            // Add-before-remove: desired keeps RF=3 with the replacement.
+            assert_eq!(intent.from, NodeId::from_u64(3));
+            assert_eq!(intent.to, NodeId::from_u64(4));
+            assert_eq!(intent.desired_voters.len(), 3);
+            assert!(intent.desired_voters.contains(&NodeId::from_u64(4)));
+            assert!(!intent.desired_voters.contains(&NodeId::from_u64(3)));
+        }
+        // Deterministic.
+        assert_eq!(intents, plan_repair(&state, &config));
+    }
+
+    #[test]
+    fn suspect_never_triggers_repair() {
+        let mut state = balanced_three();
+        state
+            .apply(&ControlMutation::SetNodeState {
+                node: NodeId::from_u64(3),
+                state: NodeState::Suspect,
+            })
+            .expect("mark suspect");
+        // Short transient miss: no mass re-replication.
+        assert!(plan_repair(&state, &PlannerConfig::default_rf3()).is_empty());
+    }
+
+    #[test]
+    fn repair_prefers_failure_domain_spread() {
+        let mut state = ControlState::bootstrap(
+            vec![
+                record(1, "a"),
+                record(2, "a"),
+                record(3, "b"),
+                record(4, "c"),
+            ],
+            vec![],
+        );
+        let desired = DesiredReplicaSet::new(
+            TabletId::from_u64(1),
+            vec![
+                NodeId::from_u64(1),
+                NodeId::from_u64(2),
+                NodeId::from_u64(3),
+            ],
+            PlacementVersion::INITIAL,
+        )
+        .expect("desired");
+        state
+            .apply(&ControlMutation::SetDesiredPlacement { desired })
+            .expect("apply");
+        state
+            .apply(&ControlMutation::SetNodeState {
+                node: NodeId::from_u64(2),
+                state: NodeState::Unavailable,
+            })
+            .expect("mark unavailable");
+        let intents = plan_repair(&state, &PlannerConfig::default_rf3());
+        assert_eq!(intents.len(), 1);
+        // Node 4 (domain c, uncovered) beats any same-domain choice.
+        assert_eq!(intents[0].to, NodeId::from_u64(4));
+    }
+
+    #[test]
+    fn weight_skews_target_choice_to_heavier_nodes() {
+        fn weighted(id: u64, domain: &str, weight: u32) -> NodeRecord {
+            let mut record = record(id, domain);
+            record.weight = weight;
+            record
+        }
+        let mut state = ControlState::bootstrap(
+            vec![
+                weighted(1, "a", 1),
+                weighted(2, "b", 1),
+                weighted(3, "c", 1),
+                weighted(4, "d", 8),
+            ],
+            vec![],
+        );
+        for tablet in 1..=3u64 {
+            let desired = DesiredReplicaSet::new(
+                TabletId::from_u64(tablet),
+                vec![
+                    NodeId::from_u64(1),
+                    NodeId::from_u64(2),
+                    NodeId::from_u64(3),
+                ],
+                PlacementVersion::INITIAL,
+            )
+            .expect("desired");
+            state
+                .apply(&ControlMutation::SetDesiredPlacement { desired })
+                .expect("apply");
+        }
+        state
+            .apply(&ControlMutation::SetNodeState {
+                node: NodeId::from_u64(1),
+                state: NodeState::Unavailable,
+            })
+            .expect("mark unavailable");
+        let intents = plan_repair(&state, &PlannerConfig::default_rf3());
+        assert!(!intents.is_empty());
+        // Heavy node 4 absorbs repairs despite starting empty.
+        for intent in &intents {
+            assert_eq!(intent.to, NodeId::from_u64(4));
         }
     }
 }

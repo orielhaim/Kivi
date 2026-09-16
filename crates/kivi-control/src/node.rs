@@ -10,14 +10,33 @@ use kivi_types::NodeId;
 
 /// Lifecycle of one cluster node.
 ///
-/// The states form a linear progression; arbitrary boolean combinations
-/// are unrepresentable by construction.
+/// Liveness distinguishes a short transient miss (`Suspect`) from a
+/// repair-worthy outage (`Unavailable`): a few seconds of packet loss
+/// must not trigger hundreds of migrations. Only `Unavailable` (and
+/// `Draining`) nodes lose desired replicas through automatic repair.
+///
+/// ```text
+/// Joining -> Active <-> Suspect -> Unavailable -> Active (return)
+/// Active -> Draining -> Drained -> Removed
+/// Unavailable -> Draining (operator drain of a dead node)
+/// Any non-Removed -> Removed (operator removal)
+/// Drained -> Active (re-admit)
+/// Unavailable -> Active (return, fenced: old memberships never resurrect)
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum NodeState {
     /// Admitted by the control plane but not yet serving data.
     Joining,
     /// Serving data and eligible for new placements.
     Active,
+    /// Transient heartbeat misses; still serves and keeps placements.
+    /// Never triggers repair by itself (anti-flap).
+    Suspect,
+    /// Repair-worthy outage (suspicion + grace both expired). Excluded
+    /// from new placements; automatic repair migrates replicas away.
+    /// A returning node transitions back to `Active` but never resurrects
+    /// obsolete memberships (generation/tombstone fencing at open).
+    Unavailable,
     /// Excluded from new placements; existing replicas migrate away.
     Draining,
     /// No desired or actual data replicas remain; safe to remove.
@@ -36,7 +55,19 @@ impl NodeState {
     /// Whether the node is expected to serve data traffic.
     #[must_use]
     pub const fn serves_data(self) -> bool {
-        matches!(self, Self::Active | Self::Draining)
+        matches!(self, Self::Active | Self::Draining | Self::Suspect)
+    }
+
+    /// Whether the node is placement-eligible (healthy) for repair targets.
+    #[must_use]
+    pub const fn is_repair_target(self) -> bool {
+        matches!(self, Self::Active)
+    }
+
+    /// Whether the node's replicas need replacement (repair source).
+    #[must_use]
+    pub const fn needs_repair(self) -> bool {
+        matches!(self, Self::Unavailable | Self::Draining)
     }
 
     /// Whether drain has fully completed.
@@ -46,6 +77,9 @@ impl NodeState {
     }
 
     /// Encodes the state as a canonical discriminant byte.
+    ///
+    /// Discriminants `0..=4` are frozen (Joining/Active/Draining/Drained/
+    /// Removed); `Suspect = 5` and `Unavailable = 6` extend the encoding.
     #[must_use]
     pub const fn encode_byte(self) -> u8 {
         match self {
@@ -54,6 +88,8 @@ impl NodeState {
             Self::Draining => 2,
             Self::Drained => 3,
             Self::Removed => 4,
+            Self::Suspect => 5,
+            Self::Unavailable => 6,
         }
     }
 
@@ -69,6 +105,8 @@ impl NodeState {
             2 => Ok(Self::Draining),
             3 => Ok(Self::Drained),
             4 => Ok(Self::Removed),
+            5 => Ok(Self::Suspect),
+            6 => Ok(Self::Unavailable),
             _ => Err(NodeError::BadState { found: byte }),
         }
     }
@@ -319,10 +357,19 @@ mod tests {
     fn lifecycle_predicates_are_exclusive() {
         assert!(!NodeState::Joining.accepts_new_replicas());
         assert!(!NodeState::Draining.accepts_new_replicas());
+        assert!(!NodeState::Suspect.accepts_new_replicas());
+        assert!(!NodeState::Unavailable.accepts_new_replicas());
         assert!(NodeState::Draining.serves_data());
+        assert!(NodeState::Suspect.serves_data());
+        assert!(!NodeState::Unavailable.serves_data());
         assert!(!NodeState::Drained.serves_data());
         assert!(NodeState::Drained.is_drained());
         assert!(!NodeState::Active.is_drained());
+        assert!(NodeState::Active.is_repair_target());
+        assert!(!NodeState::Suspect.is_repair_target());
+        assert!(NodeState::Unavailable.needs_repair());
+        assert!(NodeState::Draining.needs_repair());
+        assert!(!NodeState::Suspect.needs_repair());
     }
 
     #[test]

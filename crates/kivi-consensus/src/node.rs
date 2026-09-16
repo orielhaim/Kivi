@@ -288,6 +288,14 @@ pub enum ProposeError {
     /// Read-only opcode validation failure.
     #[error("operation rejected: {0}")]
     Op(#[from] OpError),
+    /// The tablet is fenced for split/merge cutover: mutating proposes
+    /// fail so a bounded final tail installs without loss. Retryable
+    /// (shaped as `Overloaded` on the wire); reads still serve.
+    #[error("tablet {tablet} fenced for topology cutover")]
+    Fenced {
+        /// Fenced tablet.
+        tablet: TabletId,
+    },
 }
 
 /// Why a strong read failed.
@@ -531,6 +539,23 @@ pub(crate) enum OwnerRequest {
         /// Completion or human-readable reason.
         reply: Reply<Result<(), String>>,
     },
+    /// Initialize one new tablet group exactly once (split child or merge
+    /// target): the designated founder replica commits the initial
+    /// membership; other replicas join through learner replication, never
+    /// a second initialize (that would fork history). Idempotent: an
+    /// already-initialized group answers success.
+    InitializeGroup {
+        /// Addressed group.
+        group: ConsensusGroupId,
+        /// Tablet initializing.
+        tablet: TabletId,
+        /// Initial voter set.
+        voters: std::collections::BTreeSet<u64>,
+        /// Dialable peer address per voter (rides as `BasicNode::addr`).
+        peer_addrs: std::collections::BTreeMap<u64, String>,
+        /// Completion or human-readable reason.
+        reply: Reply<Result<(), String>>,
+    },
     /// Suspend one peer link (partition test hook, drain tooling).
     SuspendPeer {
         /// Suspended peer.
@@ -568,7 +593,8 @@ impl OwnerRequest {
             | Self::TransferLeader { group, .. }
             | Self::ObserveMembership { group, .. }
             | Self::EnsureGroup { group, .. }
-            | Self::RetireGroup { group, .. } => Some(*group),
+            | Self::RetireGroup { group, .. }
+            | Self::InitializeGroup { group, .. } => Some(*group),
             Self::SuspendPeer { .. } | Self::ResumePeer { .. } | Self::Shutdown => None,
         }
     }
@@ -647,6 +673,7 @@ impl OwnerRequest {
             Self::AddLearner { group, reply, .. }
             | Self::ChangeMembership { group, reply, .. }
             | Self::TransferLeader { group, reply, .. }
+            | Self::InitializeGroup { group, reply, .. }
             | Self::RetireGroup { group, reply, .. } => {
                 let _ = reply.send(Err(unroutable(group, local)));
             }
@@ -1220,7 +1247,9 @@ pub(crate) async fn propose_caller_side(
     use kivi_state::StorePrepared;
     // Leader dedup check first: retries answer from any replica's
     // retained state without proposing (lost-response failover). This
-    // precedes sidecar work so a retry never stages a second root.
+    // precedes sidecar work so a retry never stages a second root. Hits
+    // answer even on a fenced tablet (the outcome already committed
+    // before the fence); only fresh admits fence below.
     if let Some(marker) = identity {
         match machine.check_proposal(&marker).await.map_err(|error| {
             ProposeError::Consensus(ConsensusError::Unavailable {
@@ -1234,6 +1263,14 @@ pub(crate) async fn propose_caller_side(
             ProposalGate::Expired => return Err(ProposeError::Expired),
             ProposalGate::Overloaded => return Err(ProposeError::Overloaded),
         }
+    }
+    // Split/merge cutover fence: fresh mutating proposes fail so the
+    // bounded final tail installs without loss. Reads never reach here
+    // (they use the read path and still serve during the fence).
+    if machine.is_fenced().await {
+        return Err(ProposeError::Fenced {
+            tablet: group.tablet(),
+        });
     }
     // Sidecar staging: chunked roots must already be durable locally
     // (cluster server stages before proposing); chunked-base range patches
@@ -1978,6 +2015,11 @@ where
             OwnerRequest::RetireGroup { group, reply, .. } => {
                 let _ = reply.send(Err(format!(
                     "group {group} dynamic retirement unsupported on a single-group node"
+                )));
+            }
+            OwnerRequest::InitializeGroup { group, reply, .. } => {
+                let _ = reply.send(Err(format!(
+                    "group {group} dynamic initialization unsupported on a single-group node"
                 )));
             }
             OwnerRequest::SuspendPeer { peer, reply } => {

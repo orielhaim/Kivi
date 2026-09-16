@@ -20,9 +20,10 @@ use std::time::Duration;
 
 use kivi_consensus::{ConsensusGroupId, ConsensusNode};
 use kivi_control::{
-    ControlMutation, ControlState, DesiredReplicaSet, MigrationIntent, MigrationPhase,
-    MigrationPlan, MigrationPlanId, NodeRecord, NodeState, PlacementVersion, PlannerConfig,
-    intents_to_plans, plan_drain, plan_rebalance,
+    ControlMutation, ControlState, DesiredReplicaSet, MergePhase, MergePlan, MigrationIntent,
+    MigrationPhase, MigrationPlan, MigrationPlanId, NodeRecord, NodeState, PlacementVersion,
+    PlanSchedulerConfig, PlannerConfig, SplitPhase, SplitPlan, intents_to_plans, plan_drain,
+    plan_rebalance,
 };
 use kivi_types::{NodeId, TabletId};
 
@@ -162,28 +163,85 @@ pub struct ReconcilePolicy {
     /// Maximum live (non-terminal) plans cluster-wide. New plans wait
     /// while catch-up moves gigabytes.
     pub max_live_plans: usize,
+    /// Failure-detector thresholds (suspicion, repair grace, cooldown).
+    pub failure: kivi_control::FailureDetectorConfig,
+    /// Whether the control leader automatically plans repairs for
+    /// `Unavailable` nodes. Defaults on: thresholds are conservative, so
+    /// short outages never re-replicate, and repair reuses the standard
+    /// migration path.
+    pub auto_repair: bool,
+    /// Cross-plan scheduler bounds (migrations vs splits vs merges).
+    pub scheduler: PlanSchedulerConfig,
+    /// Whether the control leader automatically plans splits for hot /
+    /// large tablets. Defaults off for manual-testing conservatism;
+    /// enabling it is a supported feature (see `SplitPolicy`).
+    pub auto_split: bool,
+    /// Whether the control leader automatically plans merges for small /
+    /// cold adjacent tablets. Defaults off; enabling it is supported.
+    pub auto_merge: bool,
+    /// Object-count threshold that triggers an automatic split (with
+    /// hysteresis: merge threshold must stay far below this).
+    pub split_object_threshold: usize,
+    /// Object-count threshold below which BOTH adjacent tablets must sit
+    /// before an automatic merge is planned.
+    pub merge_object_threshold: usize,
 }
 
 impl Default for ReconcilePolicy {
-    /// Production shaping: brisk passes, RF=3, bounded churn.
+    /// Production shaping: brisk passes, RF=3, bounded churn, conservative
+    /// failure detection with automatic repair. Automatic topology
+    /// adaptation defaults off (manual split/merge supported); enabling
+    /// it is a real feature with hysteresis (`split >> merge`).
     fn default() -> Self {
         Self {
             poll_interval: Duration::from_millis(500),
             planner: PlannerConfig::default_rf3(),
             max_live_plans: 32,
+            failure: kivi_control::FailureDetectorConfig::conservative(),
+            auto_repair: true,
+            scheduler: PlanSchedulerConfig::conservative(),
+            auto_split: false,
+            auto_merge: false,
+            split_object_threshold: 200_000,
+            merge_object_threshold: 20_000,
         }
     }
 }
 
-/// Runs the migration reconciler until aborted: every pass syncs the
-/// peer mesh from the replicated registry (all nodes), then — only on
-/// the control leader — reads persisted plans, observes actual
-/// membership, and advances one idempotent step per live plan.
-pub async fn reconcile_loop(node: Arc<ConsensusNode>, policy: ReconcilePolicy) {
+/// Runs the reconciler until aborted: every pass syncs the peer mesh
+/// from the replicated registry (all nodes), then — only on the control
+/// leader — drives migrations, repairs, splits, and merges: reads
+/// persisted plans, observes actual membership through
+/// [`kivi_consensus::select_authoritative`], and advances one idempotent
+/// step per live plan.
+///
+/// One source of desired-state reconciliation: no second topology
+/// controller races this loop. Plan kinds serialize per tablet (one live
+/// plan per tablet) and globally for topology (one live split, one live
+/// merge) via [`PlanSchedulerConfig`].
+///
+/// The policy is re-read every pass from `policy` (updated live via
+/// `POST /v1/control/policy`), while the failure detector keeps its
+/// counters across passes: a new control leader starts empty (failover
+/// never inherits stale suspicion), but a policy retune never wipes
+/// live suspicion history (only thresholds update).
+pub async fn reconcile_loop_shared(
+    node: Arc<ConsensusNode>,
+    policy: Arc<std::sync::Mutex<ReconcilePolicy>>,
+    directory: Arc<arc_swap::ArcSwap<kivi_tablet::DirectorySnapshot>>,
+) {
+    let initial = policy
+        .lock()
+        .map_or_else(|_| ReconcilePolicy::default(), |policy| policy.clone());
+    let mut detector = kivi_control::FailureDetector::new(initial.failure.clone());
     loop {
-        tokio::time::sleep(policy.poll_interval).await;
+        let snapshot = policy
+            .lock()
+            .map_or_else(|_| ReconcilePolicy::default(), |policy| policy.clone());
+        detector.set_config(snapshot.failure.clone());
+        tokio::time::sleep(snapshot.poll_interval).await;
         mesh_sync(&node).await;
-        if let Err(reason) = reconcile_once(&node, &policy).await {
+        if let Err(reason) = reconcile_once(&node, &snapshot, &mut detector, &directory).await {
             tracing::debug!(%reason, "reconciler pass skipped");
         }
     }
@@ -201,9 +259,12 @@ async fn mesh_sync(node: &Arc<ConsensusNode>) {
         if record.node == node.node() {
             continue;
         }
+        // Suspect nodes stay meshed (a transient miss must not partition
+        // them); Unavailable nodes stay known but are not re-admitted
+        // (their links go dormant, no traffic, until they return).
         if matches!(
             record.state,
-            NodeState::Joining | NodeState::Active | NodeState::Draining
+            NodeState::Joining | NodeState::Active | NodeState::Suspect | NodeState::Draining
         ) && node.add_peer_dial(record.node, record.peer)
         {
             tracing::info!(node = record.node.as_u64(), peer = %record.peer, "mesh admitted peer");
@@ -214,7 +275,12 @@ async fn mesh_sync(node: &Arc<ConsensusNode>) {
 /// One reconciler pass. `Ok` means the pass completed (plans may still
 /// be in flight); `Err` is a skip reason (not leader, no control
 /// replica, transient observation failure).
-async fn reconcile_once(node: &Arc<ConsensusNode>, policy: &ReconcilePolicy) -> Result<(), String> {
+async fn reconcile_once(
+    node: &Arc<ConsensusNode>,
+    policy: &ReconcilePolicy,
+    detector: &mut kivi_control::FailureDetector,
+    directory: &Arc<arc_swap::ArcSwap<kivi_tablet::DirectorySnapshot>>,
+) -> Result<(), String> {
     // Only the control leader orchestrates.
     let status = node.status_for(ConsensusGroupId::control()).await;
     if status.role != kivi_consensus::ReplicaRole::Leader {
@@ -226,6 +292,14 @@ async fn reconcile_once(node: &Arc<ConsensusNode>, policy: &ReconcilePolicy) -> 
     // Admit Active data nodes to control as learners so they observe
     // placement for routing (votes stay with the control voters).
     ensure_control_learners(node, &state, &control_voters_of(node).await).await;
+    // Liveness first (ephemeral probes -> replicated transitions), then
+    // existing plans, then new automated work. New topology actions
+    // (liveness transitions, drain top-ups, repairs) require control-plane
+    // quorum: the leader role alone proves a quorum elected us, but a
+    // partition could have since isolated us — gate on reachable control
+    // voters so a lone leader never re-replicates the cluster alone.
+    let liveness = probe_liveness(node, &state).await;
+    let quorum = control_quorum(node, &state, &liveness).await;
     // Drive every live plan one step, concurrently: plans touch
     // independent tablet groups, so sequential passes would serialize
     // dozens of migrations behind one slow step. Each task owns its
@@ -254,15 +328,1279 @@ async fn reconcile_once(node: &Arc<ConsensusNode>, policy: &ReconcilePolicy) -> 
         });
     }
     while set.join_next().await.is_some() {}
-    // Top up drain plans as capacity frees: draining nodes need EVERY
-    // tablet moved, but plan creation stays bounded per round, so the
-    // reconciler refills until nothing desires the draining node.
-    // (Rebalance stays operator-driven per round; drain completion is
-    // operator-initiated and reconciler-finished.)
-    topup_drains(node, &state, policy).await;
-    // Complete drains whose migrations all finished.
-    complete_drains(node, &state).await;
+    // Drive live topology plans (splits/merges) one step each,
+    // sequentially: at most one live split and one live merge exist
+    // cluster-wide, so concurrency buys nothing and serialization keeps
+    // the directory cutover easy to reason about.
+    {
+        let splits: Vec<SplitPlan> = state
+            .splits()
+            .filter(|plan| !plan.phase.is_terminal())
+            .cloned()
+            .collect();
+        for plan in splits {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(60),
+                drive_split(node, &state, &plan, directory),
+            )
+            .await;
+        }
+        let merges: Vec<MergePlan> = state
+            .merges()
+            .filter(|plan| !plan.phase.is_terminal())
+            .cloned()
+            .collect();
+        for plan in merges {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(60),
+                drive_merge(node, &state, &plan, directory),
+            )
+            .await;
+        }
+    }
+    if quorum {
+        drive_liveness(node, &state, detector, &liveness).await;
+        // Re-read: liveness transitions may have changed node states that
+        // repair planning reads (a fresh Unavailable must repair now).
+        let fresh = node.control_state().await.unwrap_or(state);
+        // Top up drain plans as capacity frees: draining nodes need EVERY
+        // tablet moved, but plan creation stays bounded per round, so the
+        // reconciler refills until nothing desires the draining node.
+        // (Rebalance stays operator-driven per round; drain completion is
+        // operator-initiated and reconciler-finished.)
+        topup_drains(node, &fresh, policy).await;
+        // Automatic repair (safety before optimization): under-replicated
+        // tablets gain replacements through the same migration path.
+        drive_repairs(node, &fresh, policy).await;
+        // Automatic topology optimization (hysteresis-guarded, off by
+        // default): split hot/large tablets, merge small/cold siblings.
+        let planned = node.control_state().await.unwrap_or(fresh);
+        drive_topology_auto(node, &planned, policy, directory).await;
+        // Complete drains whose migrations all finished.
+        let done = node.control_state().await.unwrap_or(planned);
+        complete_drains(node, &done).await;
+        // Bound tombstone/history growth: keep only the newest terminal
+        // plans per kind (retention for fencing/debug), removing older
+        // ones. Tombstones needed for fencing/restart stay (retired
+        // tablet tombstones live in `consensus-sm`, not here); removed
+        // plans are terminal, unreferenced by the directory (cutover
+        // already published), and past any reconciler retry.
+        let pruned = node.control_state().await.unwrap_or(done);
+        prune_terminal_plans(node, &pruned).await;
+    } else {
+        tracing::debug!("control quorum unreachable; deferring automated topology actions");
+    }
     Ok(())
+}
+
+/// Probes liveness for every registry node (ephemeral, never persisted):
+/// self is always alive; peers get one bounded TCP dial to their admin
+/// plane per pass, in parallel. Any successful control/tablet admin RPC
+/// later in the pass also counts as alive implicitly (the detector only
+/// needs a best-effort signal; thresholds absorb the noise).
+async fn probe_liveness(node: &Arc<ConsensusNode>, state: &ControlState) -> BTreeMap<u64, bool> {
+    use tokio::task::JoinSet;
+    let mut out = BTreeMap::new();
+    let mut set = JoinSet::new();
+    for record in state.nodes() {
+        if record.node == node.node() {
+            out.insert(record.node.as_u64(), true);
+            continue;
+        }
+        // Removed nodes are gone (forget below); only probe live lifecycle
+        // states. Probing keeps no connections: one dial, immediate close.
+        if !matches!(
+            record.state,
+            NodeState::Joining
+                | NodeState::Active
+                | NodeState::Suspect
+                | NodeState::Unavailable
+                | NodeState::Draining
+        ) {
+            continue;
+        }
+        let admin = record.admin;
+        let id = record.node.as_u64();
+        set.spawn(async move {
+            let dial = tokio::net::TcpStream::connect(admin);
+            let alive = tokio::time::timeout(Duration::from_millis(800), dial)
+                .await
+                .is_ok_and(|result| result.is_ok());
+            (id, alive)
+        });
+    }
+    while let Some(joined) = set.join_next().await {
+        if let Ok((id, alive)) = joined {
+            out.insert(id, alive);
+        }
+    }
+    out
+}
+
+/// Whether the control leader currently holds quorum among reachable
+/// control voters (self + probed-alive voters >= majority). Automated
+/// topology actions require this; driving already-persisted plans does
+/// not (their Raft proposals fail safely without quorum anyway).
+async fn control_quorum(
+    node: &Arc<ConsensusNode>,
+    _state: &ControlState,
+    liveness: &BTreeMap<u64, bool>,
+) -> bool {
+    let voters = control_voters_of(node).await;
+    if voters.is_empty() {
+        // No control replica locally (should not happen on the leader):
+        // fail closed, take no automated actions.
+        return false;
+    }
+    let reachable = voters
+        .iter()
+        .filter(|id| **id == node.node().as_u64() || liveness.get(*id).copied().unwrap_or(false))
+        .count();
+    reachable * 2 > voters.len()
+}
+
+/// Drives replicated liveness transitions from ephemeral probe results.
+/// One transition per node per pass at most (Active -> Suspect ->
+/// Unavailable, either -> Active on recovery). Failures only defer to
+/// the next pass; the detector counters persist in memory across passes.
+async fn drive_liveness(
+    node: &Arc<ConsensusNode>,
+    state: &ControlState,
+    detector: &mut kivi_control::FailureDetector,
+    liveness: &BTreeMap<u64, bool>,
+) {
+    for record in state.nodes() {
+        if record.node == node.node() {
+            continue;
+        }
+        if record.state == NodeState::Removed || record.state == NodeState::Drained {
+            detector.forget(record.node);
+            continue;
+        }
+        // Operator-driven states are never auto-transitioned out from
+        // under the operator, except the documented Unavailable paths.
+        if matches!(record.state, NodeState::Joining | NodeState::Draining) {
+            continue;
+        }
+        let alive = liveness
+            .get(&record.node.as_u64())
+            .copied()
+            .unwrap_or(false);
+        if let Some(next) = detector.observe(record.node, alive, record.state) {
+            tracing::info!(
+                node_id = record.node.as_u64(),
+                from = ?record.state,
+                to = ?next,
+                alive,
+                "node liveness transition"
+            );
+            if let Err(reason) = node
+                .propose_control(ControlMutation::SetNodeState {
+                    node: record.node,
+                    state: next,
+                })
+                .await
+            {
+                tracing::debug!(node = record.node.as_u64(), %reason, "liveness transition deferred");
+            }
+        }
+    }
+}
+
+/// Plans automatic repairs for `Unavailable` nodes through the same
+/// `create_plans` pathway as manual moves (one mechanism, same learner /
+/// membership / retirement steps). Honors the global live-plan cap and
+/// the planner's per-source/per-target repair bounds.
+async fn drive_repairs(node: &Arc<ConsensusNode>, state: &ControlState, policy: &ReconcilePolicy) {
+    if !policy.auto_repair {
+        return;
+    }
+    let live = state
+        .migrations()
+        .filter(|plan| !plan.phase.is_terminal())
+        .count();
+    if live >= policy.max_live_plans {
+        return;
+    }
+    let intents = kivi_control::plan_repair(state, &policy.planner);
+    if intents.is_empty() {
+        return;
+    }
+    let budget = policy.max_live_plans.saturating_sub(live);
+    let intents: Vec<MigrationIntent> = intents.into_iter().take(budget.max(1)).collect();
+    let Some(fresh) = node.control_state().await else {
+        return;
+    };
+    match create_plans(node, &fresh, &intents).await {
+        Ok(ids) => {
+            tracing::info!(plans = ids.len(), "automatic repair round created");
+        }
+        Err(reason) => {
+            tracing::debug!(%reason, "automatic repair deferred");
+        }
+    }
+}
+
+/// Advances one split plan's persisted phase (generation-fenced).
+async fn advance_split(node: &Arc<ConsensusNode>, plan: &SplitPlan, phase: SplitPhase) {
+    tracing::info!(
+        node_id = node.node().as_u64(),
+        plan_id = plan.id.as_u64(),
+        parent = plan.parent.as_u64(),
+        left = plan.left.as_u64(),
+        right = plan.right.as_u64(),
+        ?phase,
+        "split plan advanced"
+    );
+    let generation = node
+        .control_state()
+        .await
+        .and_then(|state| state.split(plan.id).map(|plan| plan.generation))
+        .unwrap_or(PlacementVersion::INITIAL);
+    if let Err(reason) = node
+        .propose_control(ControlMutation::AdvanceSplit {
+            plan: plan.id.into(),
+            phase,
+            generation,
+        })
+        .await
+    {
+        tracing::debug!(plan = plan.id.as_u64(), %reason, "split advance deferred");
+    }
+}
+
+/// Advances one merge plan's persisted phase (generation-fenced).
+async fn advance_merge(
+    node: &Arc<ConsensusNode>,
+    plan: &kivi_control::MergePlan,
+    phase: MergePhase,
+) {
+    tracing::info!(
+        node_id = node.node().as_u64(),
+        plan_id = plan.id.as_u64(),
+        left = plan.left.as_u64(),
+        right = plan.right.as_u64(),
+        merged = plan.merged.as_u64(),
+        ?phase,
+        "merge plan advanced"
+    );
+    let generation = node
+        .control_state()
+        .await
+        .and_then(|state| state.merge(plan.id).map(|plan| plan.generation))
+        .unwrap_or(PlacementVersion::INITIAL);
+    if let Err(reason) = node
+        .propose_control(ControlMutation::AdvanceMerge {
+            plan: plan.id.into(),
+            phase,
+            generation,
+        })
+        .await
+    {
+        tracing::debug!(plan = plan.id.as_u64(), %reason, "merge advance deferred");
+    }
+}
+
+/// Drives one split plan a single idempotent step.
+///
+/// Repair wins over split: a parent with a live migration plan (repair,
+/// drain, or rebalance) defers the split until redundancy is healthy.
+async fn drive_split(
+    node: &Arc<ConsensusNode>,
+    state: &ControlState,
+    plan: &SplitPlan,
+    directory: &Arc<arc_swap::ArcSwap<kivi_tablet::DirectorySnapshot>>,
+) {
+    if plan.phase.is_terminal() {
+        return;
+    }
+    if !state.live_plans_for(plan.parent).is_empty() {
+        tracing::debug!(
+            plan = plan.id.as_u64(),
+            parent = plan.parent.as_u64(),
+            "split deferred: parent has a live migration (repair wins)"
+        );
+        return;
+    }
+    // A degraded parent never splits: safety before optimization.
+    if state.desired(plan.parent).is_some_and(|desired| {
+        desired.replicas.iter().any(|replica| {
+            state.node(*replica).is_some_and(|record| {
+                matches!(record.state, NodeState::Unavailable | NodeState::Removed)
+            })
+        })
+    }) {
+        tracing::debug!(
+            plan = plan.id.as_u64(),
+            parent = plan.parent.as_u64(),
+            "split deferred: parent under-replicated"
+        );
+        return;
+    }
+    match plan.phase {
+        SplitPhase::Planned => {
+            if ensure_split_children(node, state, plan).await
+                && initialize_split_children(node, state, plan).await
+            {
+                advance_split(node, plan, SplitPhase::ChildrenAllocated).await;
+            }
+        }
+        SplitPhase::ChildrenAllocated => {
+            if seed_split_children(node, state, plan).await {
+                advance_split(node, plan, SplitPhase::BaseSeeded).await;
+            }
+        }
+        SplitPhase::BaseSeeded => {
+            let fenced_at = std::time::Instant::now();
+            if fence_tablets(node, state, &[plan.parent], true).await
+                && seed_split_children(node, state, plan).await
+            {
+                tracing::info!(
+                    plan = plan.id.as_u64(),
+                    parent = plan.parent.as_u64(),
+                    fence_ms = u64::try_from(fenced_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    "split final tail installed under fence"
+                );
+                advance_split(node, plan, SplitPhase::Fenced).await;
+            } else {
+                let _ = fence_tablets(node, state, &[plan.parent], false).await;
+            }
+        }
+        SplitPhase::Fenced => {
+            if publish_split_cutover(node, state, plan, directory).await {
+                advance_split(node, plan, SplitPhase::CutoverCommitted).await;
+            }
+        }
+        SplitPhase::CutoverCommitted => {
+            if retire_tablets(node, state, &[plan.parent], plan.generation.as_u64()).await {
+                advance_split(node, plan, SplitPhase::ParentRetiring).await;
+            }
+        }
+        SplitPhase::ParentRetiring => {
+            advance_split(node, plan, SplitPhase::Completed).await;
+        }
+        SplitPhase::Completed | SplitPhase::Failed => {}
+    }
+}
+
+/// Drives one merge plan a single idempotent step (inverse of split).
+async fn drive_merge(
+    node: &Arc<ConsensusNode>,
+    state: &ControlState,
+    plan: &kivi_control::MergePlan,
+    directory: &Arc<arc_swap::ArcSwap<kivi_tablet::DirectorySnapshot>>,
+) {
+    if plan.phase.is_terminal() {
+        return;
+    }
+    if !state.live_plans_for(plan.left).is_empty() || !state.live_plans_for(plan.right).is_empty() {
+        tracing::debug!(
+            plan = plan.id.as_u64(),
+            "merge deferred: parent has a live migration (repair wins)"
+        );
+        return;
+    }
+    for parent in [plan.left, plan.right] {
+        if state.desired(parent).is_some_and(|desired| {
+            desired.replicas.iter().any(|replica| {
+                state.node(*replica).is_some_and(|record| {
+                    matches!(record.state, NodeState::Unavailable | NodeState::Removed)
+                })
+            })
+        }) {
+            tracing::debug!(
+                plan = plan.id.as_u64(),
+                parent = parent.as_u64(),
+                "merge deferred: parent under-replicated"
+            );
+            return;
+        }
+    }
+    match plan.phase {
+        MergePhase::Planned => {
+            if ensure_merge_target(node, state, plan).await
+                && initialize_merge_target(node, state, plan).await
+            {
+                advance_merge(node, plan, MergePhase::TargetAllocated).await;
+            }
+        }
+        MergePhase::TargetAllocated => {
+            if seed_merge_target_nodes(node, state, plan).await {
+                advance_merge(node, plan, MergePhase::BaseSeeded).await;
+            }
+        }
+        MergePhase::BaseSeeded => {
+            let fenced_at = std::time::Instant::now();
+            if fence_tablets(node, state, &[plan.left, plan.right], true).await
+                && seed_merge_target_nodes(node, state, plan).await
+            {
+                tracing::info!(
+                    plan = plan.id.as_u64(),
+                    fence_ms = u64::try_from(fenced_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    "merge final tail installed under fence"
+                );
+                advance_merge(node, plan, MergePhase::Fenced).await;
+            } else {
+                let _ = fence_tablets(node, state, &[plan.left, plan.right], false).await;
+            }
+        }
+        MergePhase::Fenced => {
+            if publish_merge_cutover(node, state, plan, directory).await {
+                advance_merge(node, plan, MergePhase::CutoverCommitted).await;
+            }
+        }
+        MergePhase::CutoverCommitted => {
+            if retire_tablets(
+                node,
+                state,
+                &[plan.left, plan.right],
+                plan.generation.as_u64(),
+            )
+            .await
+            {
+                advance_merge(node, plan, MergePhase::ParentsRetiring).await;
+            }
+        }
+        MergePhase::ParentsRetiring => {
+            advance_merge(node, plan, MergePhase::Completed).await;
+        }
+        MergePhase::Completed | MergePhase::Failed => {}
+    }
+}
+
+/// Replicas eligible for topology steps right now: skips repair-worthy
+/// (`Unavailable`) and tombstoned (`Removed`) nodes. A killed-then-marked
+/// replica stops blocking splits/merges once the detector marks it; it
+/// heals through the standard learner path after it restarts (post-cutover
+/// the children are ordinary tablets).
+fn live_replicas(state: &ControlState, replicas: &[NodeId]) -> Vec<NodeId> {
+    replicas
+        .iter()
+        .copied()
+        .filter(|replica| {
+            state.node(*replica).is_none_or(|record| {
+                !matches!(record.state, NodeState::Unavailable | NodeState::Removed)
+            })
+        })
+        .collect()
+}
+
+/// Ensures both split children on every live replica node.
+async fn ensure_split_children(
+    node: &Arc<ConsensusNode>,
+    state: &ControlState,
+    plan: &SplitPlan,
+) -> bool {
+    for child in [plan.left, plan.right] {
+        for replica in live_replicas(state, &plan.replicas) {
+            if !ensure_one(node, state, child, replica, &plan.replicas, plan.generation).await {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Initializes both split children on the founder (lowest replica id).
+/// Other replicas join through learner replication, never a second
+/// initialize (that would fork history). Idempotent: re-initialize
+/// answers success. Defers while the founder is repair-worthy: only the
+/// deterministic founder may initialize.
+async fn initialize_split_children(
+    node: &Arc<ConsensusNode>,
+    state: &ControlState,
+    plan: &SplitPlan,
+) -> bool {
+    let Some(founder) = plan
+        .replicas
+        .iter()
+        .min_by_key(|node| node.as_u64())
+        .copied()
+    else {
+        return false;
+    };
+    if !live_replicas(state, std::slice::from_ref(&founder)).contains(&founder) {
+        tracing::debug!(
+            plan = plan.id.as_u64(),
+            founder = founder.as_u64(),
+            "split initialize deferred: founder repair-worthy"
+        );
+        return false;
+    }
+    for child in [plan.left, plan.right] {
+        if !initialize_one(node, state, child, founder, &plan.replicas).await {
+            return false;
+        }
+    }
+    true
+}
+
+/// Seeds both children from the local parent replica on every live
+/// replica node (colocated base, chunk roots referenced, never copied).
+async fn seed_split_children(
+    node: &Arc<ConsensusNode>,
+    state: &ControlState,
+    plan: &SplitPlan,
+) -> bool {
+    for replica in live_replicas(state, &plan.replicas) {
+        for (child, left) in [(plan.left, true), (plan.right, false)] {
+            if !seed_split_one(
+                node,
+                state,
+                replica,
+                plan.parent,
+                child,
+                plan.split_hash,
+                left,
+            )
+            .await
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Ensures the merge target on every replica node.
+async fn ensure_merge_target(
+    node: &Arc<ConsensusNode>,
+    state: &ControlState,
+    plan: &kivi_control::MergePlan,
+) -> bool {
+    for replica in live_replicas(state, &plan.replicas) {
+        if !ensure_one(
+            node,
+            state,
+            plan.merged,
+            replica,
+            &plan.replicas,
+            plan.generation,
+        )
+        .await
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Initializes the merge target on the founder replica (founder-only,
+/// defers while the founder is repair-worthy).
+async fn initialize_merge_target(
+    node: &Arc<ConsensusNode>,
+    state: &ControlState,
+    plan: &kivi_control::MergePlan,
+) -> bool {
+    let Some(founder) = plan
+        .replicas
+        .iter()
+        .min_by_key(|node| node.as_u64())
+        .copied()
+    else {
+        return false;
+    };
+    if !live_replicas(state, std::slice::from_ref(&founder)).contains(&founder) {
+        return false;
+    }
+    initialize_one(node, state, plan.merged, founder, &plan.replicas).await
+}
+
+/// Seeds the merge target from both local parents on every live replica.
+async fn seed_merge_target_nodes(
+    node: &Arc<ConsensusNode>,
+    state: &ControlState,
+    plan: &kivi_control::MergePlan,
+) -> bool {
+    for replica in live_replicas(state, &plan.replicas) {
+        if !seed_merge_one(node, state, replica, plan.left, plan.right, plan.merged).await {
+            return false;
+        }
+    }
+    true
+}
+
+/// Ensures one tablet replica on one node (local front or admin plane).
+async fn ensure_one(
+    node: &Arc<ConsensusNode>,
+    state: &ControlState,
+    tablet: TabletId,
+    target: NodeId,
+    voters: &[NodeId],
+    generation: PlacementVersion,
+) -> bool {
+    let voter_set: BTreeSet<u64> = voters.iter().map(|node| node.as_u64()).collect();
+    if target == node.node() {
+        return node
+            .ensure_group(tablet, voter_set, generation.as_u64())
+            .await
+            .is_ok();
+    }
+    let Some(admin) = state.node(target).map(|record| record.admin) else {
+        return false;
+    };
+    admin_post_ensure(admin, tablet, target, &voter_set, generation.as_u64()).await
+}
+
+/// Initializes one tablet group on the founder node.
+async fn initialize_one(
+    node: &Arc<ConsensusNode>,
+    state: &ControlState,
+    tablet: TabletId,
+    founder: NodeId,
+    voters: &[NodeId],
+) -> bool {
+    let voter_set: BTreeSet<u64> = voters.iter().map(|node| node.as_u64()).collect();
+    let peer_addrs: BTreeMap<u64, String> = voters
+        .iter()
+        .filter_map(|replica| {
+            state
+                .node(*replica)
+                .map(|record| (replica.as_u64(), record.peer.to_string()))
+        })
+        .collect();
+    if founder == node.node() {
+        return node
+            .initialize_group(tablet, voter_set, peer_addrs)
+            .await
+            .is_ok();
+    }
+    let Some(admin) = state.node(founder).map(|record| record.admin) else {
+        return false;
+    };
+    admin_post_initialize(admin, tablet, &voter_set, &peer_addrs).await
+}
+
+/// Seeds one split child on one replica node.
+async fn seed_split_one(
+    node: &Arc<ConsensusNode>,
+    state: &ControlState,
+    target: NodeId,
+    parent: TabletId,
+    child: TabletId,
+    split_hash: u128,
+    left: bool,
+) -> bool {
+    if target == node.node() {
+        return node
+            .seed_split_child(parent, child, split_hash, left)
+            .await
+            .is_ok();
+    }
+    let Some(admin) = state.node(target).map(|record| record.admin) else {
+        return false;
+    };
+    admin_post_seed_split(admin, child, parent, split_hash, left).await
+}
+
+/// Seeds the merge target on one replica node.
+async fn seed_merge_one(
+    node: &Arc<ConsensusNode>,
+    state: &ControlState,
+    target: NodeId,
+    left: TabletId,
+    right: TabletId,
+    merged: TabletId,
+) -> bool {
+    if target == node.node() {
+        return node.seed_merge_target(left, right, merged).await.is_ok();
+    }
+    let Some(admin) = state.node(target).map(|record| record.admin) else {
+        return false;
+    };
+    admin_post_seed_merge(admin, merged, left, right).await
+}
+
+/// Sets or clears the cutover fence on every live replica of `tablets`.
+/// Repair-worthy hosts are skipped (they stop blocking the cutover once
+/// marked; they heal as ordinary tablets afterwards). Returns false when
+/// any live replica refuses (next pass retries).
+async fn fence_tablets(
+    node: &Arc<ConsensusNode>,
+    state: &ControlState,
+    tablets: &[TabletId],
+    fenced: bool,
+) -> bool {
+    let mut hosts: BTreeSet<NodeId> = BTreeSet::new();
+    for tablet in tablets {
+        if let Some(desired) = state.desired(*tablet) {
+            hosts.extend(live_replicas(state, &desired.replicas));
+        }
+    }
+    for host in &hosts {
+        for tablet in tablets {
+            let ok = if *host == node.node() {
+                node.set_tablet_fenced(*tablet, fenced).await.is_ok()
+            } else {
+                let Some(admin) = state.node(*host).map(|record| record.admin) else {
+                    return false;
+                };
+                admin_post_fence(admin, *tablet, fenced).await
+            };
+            if !ok {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Retires every tablet replica in `tablets` on all of its live desired
+/// hosts (repair-worthy hosts are skipped; see `live_replicas`).
+async fn retire_tablets(
+    node: &Arc<ConsensusNode>,
+    state: &ControlState,
+    tablets: &[TabletId],
+    generation: u64,
+) -> bool {
+    for tablet in tablets {
+        let hosts: Vec<NodeId> = state
+            .desired(*tablet)
+            .map(|desired| live_replicas(state, &desired.replicas))
+            .unwrap_or_default();
+        for host in hosts {
+            let ok = if host == node.node() {
+                node.retire_group(*tablet, generation).await.is_ok()
+            } else {
+                let Some(admin) = state.node(host).map(|record| record.admin) else {
+                    return false;
+                };
+                admin_post_retire(admin, *tablet, host, generation).await
+            };
+            if !ok {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Publishes the split directory cutover locally and on every serving
+/// node (idempotent, one validated atomic transition per node).
+async fn publish_split_cutover(
+    node: &Arc<ConsensusNode>,
+    state: &ControlState,
+    plan: &SplitPlan,
+    directory: &Arc<arc_swap::ArcSwap<kivi_tablet::DirectorySnapshot>>,
+) -> bool {
+    let body = serde_json::json!({
+        "kind": "split",
+        "parent": plan.parent.as_u64(),
+        "left": plan.left.as_u64(),
+        "right": plan.right.as_u64(),
+        "split_hash": plan.split_hash.to_string(),
+    });
+    // Local publish first (the control leader routes correctly even
+    // before peers converge).
+    if !publish_cutover_local(directory, &body) {
+        return false;
+    }
+    for record in state.nodes() {
+        if record.node == node.node() {
+            continue;
+        }
+        if !matches!(
+            record.state,
+            NodeState::Active | NodeState::Suspect | NodeState::Draining
+        ) {
+            continue;
+        }
+        if !admin_post_cutover(record.admin, &body).await {
+            return false;
+        }
+    }
+    true
+}
+
+/// Publishes the merge directory cutover locally and on every serving node.
+async fn publish_merge_cutover(
+    node: &Arc<ConsensusNode>,
+    state: &ControlState,
+    plan: &kivi_control::MergePlan,
+    directory: &Arc<arc_swap::ArcSwap<kivi_tablet::DirectorySnapshot>>,
+) -> bool {
+    let body = serde_json::json!({
+        "kind": "merge",
+        "left": plan.left.as_u64(),
+        "right": plan.right.as_u64(),
+        "merged": plan.merged.as_u64(),
+    });
+    if !publish_cutover_local(directory, &body) {
+        return false;
+    }
+    for record in state.nodes() {
+        if record.node == node.node() {
+            continue;
+        }
+        if !matches!(
+            record.state,
+            NodeState::Active | NodeState::Suspect | NodeState::Draining
+        ) {
+            continue;
+        }
+        if !admin_post_cutover(record.admin, &body).await {
+            return false;
+        }
+    }
+    true
+}
+
+/// Applies a cutover body to the local directory snapshot.
+fn publish_cutover_local(
+    directory: &Arc<arc_swap::ArcSwap<kivi_tablet::DirectorySnapshot>>,
+    body: &serde_json::Value,
+) -> bool {
+    let current = directory.load();
+    let next: Result<kivi_tablet::DirectorySnapshot, String> = (|| {
+        let kind = body
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        match kind {
+            "split" => {
+                let parent = TabletId::from_u64(
+                    body.get("parent")
+                        .and_then(serde_json::Value::as_u64)
+                        .ok_or("missing parent")?,
+                );
+                let left = TabletId::from_u64(
+                    body.get("left")
+                        .and_then(serde_json::Value::as_u64)
+                        .ok_or("missing left")?,
+                );
+                let right = TabletId::from_u64(
+                    body.get("right")
+                        .and_then(serde_json::Value::as_u64)
+                        .ok_or("missing right")?,
+                );
+                let split_hash = body
+                    .get("split_hash")
+                    .and_then(|value| {
+                        value
+                            .as_str()
+                            .and_then(|text| text.parse::<u128>().ok())
+                            .or_else(|| value.as_u64().map(u128::from))
+                    })
+                    .ok_or("missing split_hash")?;
+                crate::cluster::apply_cutover_split_for_reconciler(
+                    &current, parent, left, right, split_hash,
+                )
+            }
+            "merge" => {
+                let left = TabletId::from_u64(
+                    body.get("left")
+                        .and_then(serde_json::Value::as_u64)
+                        .ok_or("missing left")?,
+                );
+                let right = TabletId::from_u64(
+                    body.get("right")
+                        .and_then(serde_json::Value::as_u64)
+                        .ok_or("missing right")?,
+                );
+                let merged = TabletId::from_u64(
+                    body.get("merged")
+                        .and_then(serde_json::Value::as_u64)
+                        .ok_or("missing merged")?,
+                );
+                crate::cluster::apply_cutover_merge_for_reconciler(&current, left, right, merged)
+            }
+            _ => Err("unknown cutover kind".to_owned()),
+        }
+    })();
+    match next {
+        Ok(next) => {
+            if let Err(reason) = next.validate() {
+                tracing::warn!(%reason, "cutover snapshot invalid");
+                return false;
+            }
+            directory.store(Arc::new(next));
+            true
+        }
+        Err(reason) => {
+            tracing::debug!(%reason, "cutover deferred");
+            false
+        }
+    }
+}
+
+/// Automatic split/merge planning (conservative, hysteresis-guarded).
+/// Splits fire when a healthy tablet exceeds `split_object_threshold`;
+/// merges fire when BOTH adjacent siblings sit below
+/// `merge_object_threshold` (`split >> merge`, no flapping). Degraded
+/// tablets never split or merge (repair wins). At most one live split
+/// and one live merge exist cluster-wide.
+async fn drive_topology_auto(
+    node: &Arc<ConsensusNode>,
+    state: &ControlState,
+    policy: &ReconcilePolicy,
+    directory: &Arc<arc_swap::ArcSwap<kivi_tablet::DirectorySnapshot>>,
+) {
+    if policy.auto_split {
+        drive_auto_split(node, state, policy, directory).await;
+    }
+    if policy.auto_merge {
+        let fresh = node.control_state().await.unwrap_or_else(|| state.clone());
+        drive_auto_merge(node, &fresh, policy, directory).await;
+    }
+}
+
+/// Plans at most one automatic split per pass for the largest eligible
+/// tablet above threshold.
+async fn drive_auto_split(
+    node: &Arc<ConsensusNode>,
+    state: &ControlState,
+    policy: &ReconcilePolicy,
+    directory: &Arc<arc_swap::ArcSwap<kivi_tablet::DirectorySnapshot>>,
+) {
+    let live_splits = state
+        .splits()
+        .filter(|plan| !plan.phase.is_terminal())
+        .count();
+    if live_splits >= policy.scheduler.max_live_splits {
+        return;
+    }
+    let snapshot = directory.load();
+    let mut best: Option<(usize, TabletId)> = None;
+    for desired in state.placements() {
+        let tablet = desired.tablet;
+        if state.has_live_topology(tablet) {
+            continue;
+        }
+        if is_degraded(state, &desired.replicas) {
+            continue;
+        }
+        let Some(descriptor) = snapshot.get(tablet) else {
+            continue;
+        };
+        if descriptor.state() != kivi_tablet::TabletState::Active {
+            continue;
+        }
+        let kivi_tablet::PartitionRange::Hash(prefix) = descriptor.range().clone() else {
+            continue;
+        };
+        if prefix.prefix_len() >= kivi_tablet::range::MAX_PREFIX_LEN {
+            continue;
+        }
+        let count = node.tablet_object_count(tablet).await.unwrap_or(0);
+        if count < policy.split_object_threshold {
+            continue;
+        }
+        if best.is_none_or(|(best_count, _)| count > best_count) {
+            best = Some((count, tablet));
+        }
+    }
+    if let Some((count, tablet)) = best {
+        tracing::info!(
+            tablet = tablet.as_u64(),
+            objects = count,
+            "automatic split triggered"
+        );
+        // Derive the midpoint boundary and fresh children from the same
+        // directory view + persisted allocator the manual path uses.
+        let state = node.control_state().await;
+        let snapshot = directory.load();
+        let Some((split_hash, left, right)) = state.as_ref().and_then(|state| {
+            snapshot
+                .get(tablet)
+                .and_then(|descriptor| match descriptor.range() {
+                    kivi_tablet::PartitionRange::Hash(prefix) => {
+                        prefix.split_midpoint().ok().map(|(_, _, split_hash)| {
+                            let fresh = state.fresh_tablet_ids(2);
+                            (
+                                split_hash,
+                                fresh
+                                    .first()
+                                    .copied()
+                                    .unwrap_or(TabletId::from_u64(u64::MAX)),
+                                fresh
+                                    .get(1)
+                                    .copied()
+                                    .unwrap_or(TabletId::from_u64(u64::MAX)),
+                            )
+                        })
+                    }
+                    kivi_tablet::PartitionRange::Ordered(_) => None,
+                })
+        }) else {
+            return;
+        };
+        let _ = create_split_plan_at(node, tablet, split_hash, left, right).await;
+    }
+}
+
+/// Plans at most one automatic merge per pass for the smallest eligible
+/// adjacent sibling pair below threshold.
+async fn drive_auto_merge(
+    node: &Arc<ConsensusNode>,
+    state: &ControlState,
+    policy: &ReconcilePolicy,
+    directory: &Arc<arc_swap::ArcSwap<kivi_tablet::DirectorySnapshot>>,
+) {
+    let live_merges = state
+        .merges()
+        .filter(|plan| !plan.phase.is_terminal())
+        .count();
+    if live_merges >= policy.scheduler.max_live_merges {
+        return;
+    }
+    let snapshot = directory.load();
+    // Adjacent siblings share a parent prefix of len-1; collect active
+    // hash tablets sorted by (len desc, bits) so siblings neighbor.
+    let mut tablets: Vec<(u128, u8, TabletId)> = Vec::new();
+    for desired in state.placements() {
+        let tablet = desired.tablet;
+        if state.has_live_topology(tablet) {
+            continue;
+        }
+        if is_degraded(state, &desired.replicas) {
+            continue;
+        }
+        let Some(descriptor) = snapshot.get(tablet) else {
+            continue;
+        };
+        if descriptor.state() != kivi_tablet::TabletState::Active {
+            continue;
+        }
+        let kivi_tablet::PartitionRange::Hash(prefix) = descriptor.range().clone() else {
+            continue;
+        };
+        tablets.push((prefix.bits(), prefix.prefix_len(), tablet));
+    }
+    tablets.sort();
+    for window in tablets.windows(2) {
+        let [(left_bits, left_len, left), (right_bits, right_len, right)] = window else {
+            continue;
+        };
+        if left_len != right_len || *left_len == 0 {
+            continue;
+        }
+        let half = 1u128 << (128 - left_len);
+        if left_bits | half != *right_bits || left_bits & half != 0 {
+            continue;
+        }
+        let left_count = node.tablet_object_count(*left).await.unwrap_or(usize::MAX);
+        let right_count = node.tablet_object_count(*right).await.unwrap_or(usize::MAX);
+        if left_count > policy.merge_object_threshold || right_count > policy.merge_object_threshold
+        {
+            continue;
+        }
+        tracing::info!(
+            left = left.as_u64(),
+            right = right.as_u64(),
+            "automatic merge triggered"
+        );
+        let _ = create_merge_plan(node, *left, *right).await;
+        return;
+    }
+}
+
+/// Whether any desired replica is repair-worthy (split/merge ineligible).
+fn is_degraded(state: &ControlState, replicas: &[NodeId]) -> bool {
+    replicas.iter().any(|replica| {
+        state.node(*replica).is_none_or(|record| {
+            matches!(
+                record.state,
+                NodeState::Unavailable | NodeState::Removed | NodeState::Joining
+            )
+        })
+    })
+}
+
+/// Creates a split plan for `parent` at an explicit midpoint boundary
+/// with explicit children: midpoint boundary, fresh child ids from the
+/// persisted allocator, replicas inherited from the parent. One shared
+/// pathway for manual splits (admin/CLI, which reads the directory) and
+/// automatic splits (the reconciler, which owns a directory view).
+pub async fn create_split_plan_at(
+    node: &Arc<ConsensusNode>,
+    parent: TabletId,
+    split_hash: u128,
+    left: TabletId,
+    right: TabletId,
+) -> Result<kivi_control::SplitPlanId, String> {
+    let state = node
+        .control_state()
+        .await
+        .ok_or_else(|| "no local control image".to_owned())?;
+    if state.has_live_topology(parent)
+        || state.has_live_topology(left)
+        || state.has_live_topology(right)
+    {
+        return Err(format!(
+            "tablet {} (or its children) already has a live topology plan",
+            parent.as_u64()
+        ));
+    }
+    let desired = state
+        .desired(parent)
+        .ok_or_else(|| format!("tablet {} has no desired placement", parent.as_u64()))?
+        .clone();
+    if desired.replicas.iter().any(|replica| {
+        state.node(*replica).is_some_and(|record| {
+            matches!(record.state, NodeState::Unavailable | NodeState::Removed)
+        })
+    }) {
+        return Err("parent under-replicated; repair first".to_owned());
+    }
+    let generation = state
+        .placement_version()
+        .next()
+        .map_err(|error| error.to_string())?;
+    let plan = SplitPlan::new(
+        kivi_control::SplitPlanId::from_u64(state.next_plan_id().as_u64()),
+        parent,
+        split_hash,
+        left,
+        right,
+        desired.replicas.clone(),
+        generation,
+    )
+    .map_err(|error| error.to_string())?;
+    let id = plan.id;
+    node.propose_control(ControlMutation::CreateSplit { plan })
+        .await?;
+    tracing::info!(
+        plan = id.as_u64(),
+        parent = parent.as_u64(),
+        left = left.as_u64(),
+        right = right.as_u64(),
+        "split plan created"
+    );
+    Ok(id)
+}
+
+/// Creates a merge plan for adjacent `left` + `right` into a fresh merged
+/// tablet: replicas default to the left parent's desired voters (callers
+/// may rebalance the merged tablet afterwards as an ordinary tablet).
+/// Requires compatible placement (equal desired voter sets); otherwise
+/// the operator must first migrate one parent onto the other's nodes.
+pub async fn create_merge_plan(
+    node: &Arc<ConsensusNode>,
+    left: TabletId,
+    right: TabletId,
+) -> Result<kivi_control::MergePlanId, String> {
+    let state = node
+        .control_state()
+        .await
+        .ok_or_else(|| "no local control image".to_owned())?;
+    if state.has_live_topology(left) || state.has_live_topology(right) {
+        return Err("a parent already has a live topology plan".to_owned());
+    }
+    let left_desired = state
+        .desired(left)
+        .ok_or_else(|| format!("tablet {} has no desired placement", left.as_u64()))?
+        .clone();
+    let right_desired = state
+        .desired(right)
+        .ok_or_else(|| format!("tablet {} has no desired placement", right.as_u64()))?
+        .clone();
+    if left_desired.replicas != right_desired.replicas {
+        return Err(
+            "parents have different desired voters; migrate to a common set first".to_owned(),
+        );
+    }
+    for replica in &left_desired.replicas {
+        if state.node(*replica).is_some_and(|record| {
+            matches!(record.state, NodeState::Unavailable | NodeState::Removed)
+        }) {
+            return Err("parent under-replicated; repair first".to_owned());
+        }
+    }
+    let generation = state
+        .placement_version()
+        .next()
+        .map_err(|error| error.to_string())?;
+    let merged = state
+        .fresh_tablet_ids(1)
+        .into_iter()
+        .next()
+        .unwrap_or(TabletId::from_u64(u64::MAX));
+    let plan = kivi_control::MergePlan::new(
+        kivi_control::MergePlanId::from_u64(state.next_plan_id().as_u64()),
+        left,
+        right,
+        merged,
+        left_desired.replicas.clone(),
+        generation,
+    )
+    .map_err(|error| error.to_string())?;
+    let id = plan.id;
+    node.propose_control(ControlMutation::CreateMerge { plan })
+        .await?;
+    tracing::info!(
+        plan = id.as_u64(),
+        left = left.as_u64(),
+        right = right.as_u64(),
+        merged = merged.as_u64(),
+        "merge plan created"
+    );
+    Ok(id)
+}
+
+/// Maximum retained terminal plans per kind (migrations, splits,
+/// merges). Bounds control-state and snapshot growth on long-running
+/// clusters with frequent topology changes; live plans are never
+/// touched.
+const MAX_RETAINED_TERMINAL_PLANS: usize = 128;
+
+/// Removes terminal plans beyond the retention cap (oldest first).
+/// Idempotent: `Remove*` only accepts terminal plans, and a concurrent
+/// pass proposing the same removal is a safe duplicate.
+async fn prune_terminal_plans(node: &Arc<ConsensusNode>, state: &ControlState) {
+    let mut migrations: Vec<u64> = state
+        .migrations()
+        .filter(|plan| plan.phase.is_terminal())
+        .map(|plan| plan.id.as_u64())
+        .collect();
+    migrations.sort_unstable();
+    if let Some(drop) = migrations.len().checked_sub(MAX_RETAINED_TERMINAL_PLANS)
+        && drop > 0
+    {
+        for id in migrations.into_iter().take(drop) {
+            let mutation = ControlMutation::RemoveMigration {
+                plan: MigrationPlanId::from_u64(id).into(),
+            };
+            if node.propose_control(mutation).await.is_err() {
+                return;
+            }
+        }
+    }
+    let mut splits: Vec<u64> = state
+        .splits()
+        .filter(|plan| plan.phase.is_terminal())
+        .map(|plan| plan.id.as_u64())
+        .collect();
+    splits.sort_unstable();
+    if let Some(drop) = splits.len().checked_sub(MAX_RETAINED_TERMINAL_PLANS)
+        && drop > 0
+    {
+        for id in splits.into_iter().take(drop) {
+            let mutation = ControlMutation::RemoveSplit {
+                plan: kivi_control::SplitPlanId::from_u64(id).into(),
+            };
+            if node.propose_control(mutation).await.is_err() {
+                return;
+            }
+        }
+    }
+    let mut merges: Vec<u64> = state
+        .merges()
+        .filter(|plan| plan.phase.is_terminal())
+        .map(|plan| plan.id.as_u64())
+        .collect();
+    merges.sort_unstable();
+    if let Some(drop) = merges.len().checked_sub(MAX_RETAINED_TERMINAL_PLANS)
+        && drop > 0
+    {
+        for id in merges.into_iter().take(drop) {
+            let mutation = ControlMutation::RemoveMerge {
+                plan: kivi_control::MergePlanId::from_u64(id).into(),
+            };
+            if node.propose_control(mutation).await.is_err() {
+                return;
+            }
+        }
+    }
 }
 
 /// Creates bounded top-up migration rounds for draining nodes that
@@ -431,8 +1769,9 @@ async fn drive_plan(node: &Arc<ConsensusNode>, state: &ControlState, plan: &Migr
             // two steps, or a lost second step): re-proposing the same
             // desired set is safe (the joint is committed, so
             // propose-after-commit holds) and converges directly to
-            // the uniform config. Never wait passively.
-            tracing::info!(
+            // the uniform config. Never wait passively. Repetitive
+            // per-pass state (not a transition): `debug`, not `info`.
+            tracing::debug!(
                 plan = plan.id.as_u64(),
                 tablet = tablet.as_u64(),
                 "joint pending; re-proposing uniform membership"
@@ -447,10 +1786,23 @@ async fn drive_plan(node: &Arc<ConsensusNode>, state: &ControlState, plan: &Migr
             // unregistered plus tombstone, awaited; a remote 200
             // likewise answers only after completion), and this step
             // only fires once membership converged — so success
-            // completes the plan. The open-time desired oracle
-            // backstops the corner where the source never answers
-            // again (it tombstones on return).
-            if exec_retire(node, state, tablet, source, plan).await {
+            // completes the plan. A repair-worthy dead source
+            // (`Unavailable`/`Removed`) never answers again: skip its
+            // retirement RPC and complete — the open-time desired oracle
+            // tombstones its stale replica when (if) it returns, so no
+            // zombie replica can resurrect.
+            let source_gone = state.node(source).is_some_and(|record| {
+                matches!(record.state, NodeState::Unavailable | NodeState::Removed)
+            });
+            if source_gone {
+                tracing::info!(
+                    plan = plan.id.as_u64(),
+                    tablet = tablet.as_u64(),
+                    source = source.as_u64(),
+                    "source repair-worthy dead; completing without retirement RPC"
+                );
+                advance(node, plan, MigrationPhase::Completed).await;
+            } else if exec_retire(node, state, tablet, source, plan).await {
                 advance(node, plan, MigrationPhase::Completed).await;
             }
         }
@@ -531,8 +1883,9 @@ async fn exec_retire(
 /// Advances one plan's persisted phase (generation-fenced).
 async fn advance(node: &Arc<ConsensusNode>, plan: &MigrationPlan, phase: MigrationPhase) {
     tracing::info!(
-        plan = plan.id.as_u64(),
-        tablet = plan.tablet.as_u64(),
+        node_id = node.node().as_u64(),
+        plan_id = plan.id.as_u64(),
+        tablet_id = plan.tablet.as_u64(),
         from = plan.from.as_u64(),
         to = plan.to.as_u64(),
         ?phase,
@@ -560,25 +1913,26 @@ async fn advance_by_id(node: &Arc<ConsensusNode>, id: MigrationPlanId, phase: Mi
     }
 }
 
-/// Observes one tablet's actual membership: locally when this node is a
-/// real member (voter or learner), else through a hosting peer's admin
-/// plane (desired voters first, then the migration source).
+/// Observes one tablet's actual membership through
+/// [`kivi_consensus::select_authoritative`]: a member-local view wins,
+/// else the first answering member peer wins, else the non-member local
+/// placeholder is a last resort.
 ///
-/// A locally-ensured but not-yet-admitted worker (migration target
-/// before `add_learner`) runs an embryonic Raft with empty membership
-/// and no leader: trusting that view shadows the real cluster view and
-/// wedges the plan (every pass sees "no leader" and defers). A
-/// non-member local view is therefore only a last-resort fallback when
-/// no member answers.
+/// See [`kivi_consensus::ObservationAuthority`]: an embryonic local group
+/// (empty membership, no leader, not yet voter/learner) must never shadow
+/// an authoritative member observation. All reconciler paths (migration,
+/// repair, split-child, merge-target creation) share this function.
 async fn observe_tablet(
     node: &Arc<ConsensusNode>,
     state: &ControlState,
     tablet: TabletId,
 ) -> Option<kivi_consensus::ObservedMembership> {
     let local = node.observe_membership(tablet).await.ok();
-    if let Some(ref observed) = local
-        && (observed.is_voter(node.node()) || observed.is_learner(node.node()))
-    {
+    // Fast path: authoritative member-local view, no network.
+    if matches!(
+        kivi_consensus::observation_authority(local.as_ref(), node.node()),
+        Some(kivi_consensus::ObservationAuthority::Member)
+    ) {
         return local;
     }
     // Remote observation through hosting peers' admin planes.
@@ -594,6 +1948,23 @@ async fn observe_tablet(
             candidates.push(plan.to);
         }
     }
+    // Split/merge/repair plans name additional hosts; consult them so
+    // child/target groups observe through their real members, never an
+    // embryonic local placeholder (see `ObservationAuthority`).
+    for plan in state.splits_for(tablet) {
+        for host in plan.hosts() {
+            if !candidates.contains(&host) {
+                candidates.push(host);
+            }
+        }
+    }
+    for plan in state.merges_for(tablet) {
+        for host in plan.hosts() {
+            if !candidates.contains(&host) {
+                candidates.push(host);
+            }
+        }
+    }
     for candidate in candidates {
         if candidate == node.node() {
             continue;
@@ -601,11 +1972,11 @@ async fn observe_tablet(
         let Some(admin) = state.node(candidate).map(|record| record.admin) else {
             continue;
         };
-        if let Ok(observed) = admin_get_membership(admin, tablet).await {
-            return Some(observed);
+        if let Ok(remote) = admin_get_membership(admin, tablet).await {
+            return kivi_consensus::select_authoritative(local, node.node(), Some(remote));
         }
     }
-    local
+    kivi_consensus::select_authoritative(local, node.node(), None)
 }
 
 /// Refreshes an observation from the tablet leader's own metrics when
@@ -687,7 +2058,7 @@ async fn exec_learner(
             if attempt == 0 {
                 continue;
             }
-            tracing::info!(
+            tracing::debug!(
                 tablet = tablet.as_u64(),
                 target = target.as_u64(),
                 "migration step waits: tablet has no leader"
@@ -713,7 +2084,7 @@ async fn exec_learner(
         if ok {
             return true;
         }
-        tracing::info!(
+        tracing::debug!(
             tablet = tablet.as_u64(),
             target = target.as_u64(),
             leader = leader.as_u64(),
@@ -780,7 +2151,7 @@ async fn exec_members(
         if ok {
             return true;
         }
-        tracing::info!(
+        tracing::debug!(
             tablet = tablet.as_u64(),
             leader = leader.as_u64(),
             attempt,
@@ -906,6 +2277,23 @@ pub fn drain_intents(
     plan_drain(state, draining, &policy.planner)
 }
 
+/// Computes automatic repair intents honoring the live-plan cap.
+/// Safety outranks optimization: callers plan repairs before rebalances.
+#[must_use]
+pub fn repair_intents(state: &ControlState, policy: &ReconcilePolicy) -> Vec<MigrationIntent> {
+    if !policy.auto_repair {
+        return Vec::new();
+    }
+    let live = state
+        .migrations()
+        .filter(|plan| !plan.phase.is_terminal())
+        .count();
+    if live >= policy.max_live_plans {
+        return Vec::new();
+    }
+    kivi_control::plan_repair(state, &policy.planner)
+}
+
 /// Rebalances tablet leadership (explicit operator action, never
 /// continuous: no flapping). When one node leads materially more
 /// tablets than another (beyond an eighth of the tablets), hands half
@@ -999,7 +2387,8 @@ pub async fn rebalance_leadership(node: &Arc<ConsensusNode>, state: &ControlStat
 }
 
 /// Placement health for one tablet: desired voters, actual voters (when
-/// observed), and whether the two converged with no live plan.
+/// observed), usability against node liveness, and the classified
+/// [`kivi_control::TabletHealth`].
 #[derive(Debug, Clone)]
 pub struct PlacementHealth {
     /// Tablet assessed.
@@ -1014,9 +2403,17 @@ pub struct PlacementHealth {
     pub migrating: bool,
     /// Converged (desired == actual, no live plan).
     pub healthy: bool,
+    /// Classified health (healthy/converging/under-replicated/unavailable/
+    /// over-replicated) from usable desired voters and liveness.
+    pub status: kivi_control::TabletHealth,
 }
 
 /// Assesses placement health for every desired tablet.
+///
+/// Usability counts desired voters whose registry state is
+/// `Active`/`Suspect`/`Draining` (expected to serve); `Unavailable`
+/// /`Removed`/`Joining`/unknown desired voters are unusable. Unobserved
+/// tablets report by desired usability alone (no actual view to confirm).
 #[must_use]
 pub fn placement_health(
     state: &ControlState,
@@ -1043,6 +2440,21 @@ pub fn placement_health(
                 )
             });
         let healthy = !migrating && actual.as_ref().is_some_and(|voters| *voters == desired);
+        let usable = desired
+            .iter()
+            .copied()
+            .filter(|node| {
+                state.node(*node).is_some_and(|record| {
+                    matches!(
+                        record.state,
+                        NodeState::Active | NodeState::Suspect | NodeState::Draining
+                    )
+                })
+            })
+            .count();
+        let replication_factor = 3;
+        let status =
+            kivi_control::classify_tablet(desired.len(), usable, migrating, replication_factor);
         out.push(PlacementHealth {
             tablet,
             desired,
@@ -1050,6 +2462,7 @@ pub fn placement_health(
             learners,
             migrating,
             healthy,
+            status,
         });
     }
     out
@@ -1292,4 +2705,102 @@ async fn admin_post_transfer(admin: SocketAddr, tablet: TabletId, to: NodeId) {
         &serde_json::json!({ "to": to.as_u64() }),
     )
     .await;
+}
+
+/// Forwards group initialization to the founder replica's admin plane.
+async fn admin_post_initialize(
+    admin: SocketAddr,
+    tablet: TabletId,
+    voters: &BTreeSet<u64>,
+    peer_addrs: &BTreeMap<u64, String>,
+) -> bool {
+    let voters: Vec<u64> = voters.iter().copied().collect();
+    admin_post(
+        admin,
+        &format!("/v1/tablets/{}/initialize", tablet.as_u64()),
+        &serde_json::json!({ "voters": voters, "peer_addrs": peer_addrs }),
+    )
+    .await
+    .is_ok_and(|value| {
+        value
+            .get("ok")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    })
+}
+
+/// Forwards the cutover fence to one replica's admin plane.
+async fn admin_post_fence(admin: SocketAddr, tablet: TabletId, fenced: bool) -> bool {
+    admin_post(
+        admin,
+        &format!("/v1/tablets/{}/fence", tablet.as_u64()),
+        &serde_json::json!({ "fenced": fenced }),
+    )
+    .await
+    .is_ok_and(|value| {
+        value
+            .get("ok")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    })
+}
+
+/// Forwards one split-child seed to the replica's admin plane (colocated
+/// base, no bulk network copy).
+async fn admin_post_seed_split(
+    admin: SocketAddr,
+    child: TabletId,
+    parent: TabletId,
+    split_hash: u128,
+    left: bool,
+) -> bool {
+    admin_post(
+        admin,
+        &format!("/v1/tablets/{}/seed-split", child.as_u64()),
+        &serde_json::json!({
+            "parent": parent.as_u64(),
+            "split_hash": split_hash.to_string(),
+            "left": left,
+        }),
+    )
+    .await
+    .is_ok_and(|value| {
+        value
+            .get("ok")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    })
+}
+
+/// Forwards one merge-target seed to the replica's admin plane.
+async fn admin_post_seed_merge(
+    admin: SocketAddr,
+    merged: TabletId,
+    left: TabletId,
+    right: TabletId,
+) -> bool {
+    admin_post(
+        admin,
+        &format!("/v1/tablets/{}/seed-merge", merged.as_u64()),
+        &serde_json::json!({ "left": left.as_u64(), "right": right.as_u64() }),
+    )
+    .await
+    .is_ok_and(|value| {
+        value
+            .get("ok")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    })
+}
+
+/// Forwards one directory cutover to a peer's admin plane (idempotent).
+async fn admin_post_cutover(admin: SocketAddr, body: &serde_json::Value) -> bool {
+    admin_post(admin, "/v1/directory/cutover", body)
+        .await
+        .is_ok_and(|value| {
+            value
+                .get("ok")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        })
 }

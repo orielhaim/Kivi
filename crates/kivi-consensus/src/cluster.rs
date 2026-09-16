@@ -337,7 +337,13 @@ pub fn verify_against_durable(
     // late joiner (durable state predating its own addition) and a
     // removed-while-down replica look identical from the log alone;
     // both recover here, and the open-time control oracle tombstones
-    // the removed ones before they can serve stale state.
+    // the removed ones before they can serve stale state. Tablets
+    // unknown to the static topology are dynamic topology tablets
+    // (split children / merge targets): they always pass here; the
+    // control desired set at open decides their fate.
+    if topology.assignment(tablet).is_none() {
+        return Ok(());
+    }
     topology
         .membership_for(tablet)
         .map(|_| ())

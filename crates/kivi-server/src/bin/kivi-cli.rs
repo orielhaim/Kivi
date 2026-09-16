@@ -184,6 +184,45 @@ enum ClusterCommand {
     Leadership,
     /// List migration plans.
     Migrations,
+    /// Show repair status: under-replicated / unavailable tablets plus
+    /// planned repairs (same pathway as manual moves).
+    RepairStatus,
+    /// Split one tablet at its midpoint through the persisted reconciler
+    /// pathway (online: traffic continues, children become normal tablets,
+    /// parent retires with a redirect).
+    TabletSplit {
+        /// Parent tablet id.
+        id: u64,
+    },
+    /// Merge two adjacent tablets back into one (online, state preserved,
+    /// parents fenced/retired with redirects).
+    TabletMerge {
+        /// Left parent tablet id.
+        left: u64,
+        /// Right parent tablet id.
+        right: u64,
+    },
+    /// Show topology: tablet count, split/merge plans, directory version,
+    /// placement and liveness summary.
+    Topology,
+    /// Show the live reconciler policy (auto-split/merge, thresholds,
+    /// repair bounds, failure-detector timings).
+    Policy,
+    /// Retune the live reconciler policy without a restart.
+    PolicySet {
+        /// Enable (`true`) or disable (`false`) automatic splits.
+        #[arg(long)]
+        auto_split: Option<bool>,
+        /// Enable (`true`) or disable (`false`) automatic merges.
+        #[arg(long)]
+        auto_merge: Option<bool>,
+        /// Split object-count threshold.
+        #[arg(long)]
+        split_objects: Option<u64>,
+        /// Merge object-count threshold (must stay far below split).
+        #[arg(long)]
+        merge_objects: Option<u64>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -559,6 +598,134 @@ fn run_cluster(admin: &str, command: &ClusterCommand) -> anyhow::Result<()> {
                 );
             }
             Ok(())
+        }
+        ClusterCommand::RepairStatus => {
+            let reply: serde_json::Value =
+                admin_roundtrip(admin, "GET", "/v1/control/repair", None)?;
+            println!(
+                "unavailable: {:?}",
+                reply.get("unavailable").unwrap_or(&serde_json::Value::Null)
+            );
+            println!(
+                "under-replicated: {:?}",
+                reply
+                    .get("under_replicated")
+                    .unwrap_or(&serde_json::Value::Null)
+            );
+            println!(
+                "planned repairs: {}",
+                reply
+                    .get("planned_repairs")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0)
+            );
+            Ok(())
+        }
+        ClusterCommand::TabletSplit { id } => {
+            let body = serde_json::json!({ "tablet": id });
+            let raw = serde_json::to_vec(&body).unwrap_or_default();
+            let reply = admin_roundtrip(admin, "POST", "/v1/control/splits/create", Some(&raw))?;
+            if reply
+                .get("ok")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                println!(
+                    "split plan {}: {} -> {} + {}",
+                    reply
+                        .get("plan")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
+                    reply
+                        .get("parent")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
+                    reply
+                        .get("left")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
+                    reply
+                        .get("right")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
+                );
+                Ok(())
+            } else {
+                anyhow::bail!("tablet split refused: {reply}");
+            }
+        }
+        ClusterCommand::TabletMerge { left, right } => {
+            let body = serde_json::json!({ "left": left, "right": right });
+            let raw = serde_json::to_vec(&body).unwrap_or_default();
+            let reply = admin_roundtrip(admin, "POST", "/v1/control/merges/create", Some(&raw))?;
+            if reply
+                .get("ok")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                println!(
+                    "merge plan {}: {} + {}",
+                    reply
+                        .get("plan")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
+                    left,
+                    right,
+                );
+                Ok(())
+            } else {
+                anyhow::bail!("tablet merge refused: {reply}");
+            }
+        }
+        ClusterCommand::Topology => {
+            let reply: serde_json::Value =
+                admin_roundtrip(admin, "GET", "/v1/control/topology", None)?;
+            println!("{reply:#}");
+            Ok(())
+        }
+        ClusterCommand::Policy => {
+            let reply: serde_json::Value =
+                admin_roundtrip(admin, "GET", "/v1/control/policy", None)?;
+            println!("{reply:#}");
+            Ok(())
+        }
+        ClusterCommand::PolicySet {
+            auto_split,
+            auto_merge,
+            split_objects,
+            merge_objects,
+        } => {
+            let mut body = serde_json::Map::new();
+            if let Some(value) = auto_split.as_ref().copied() {
+                body.insert("auto_split".to_owned(), serde_json::Value::Bool(value));
+            }
+            if let Some(value) = auto_merge.as_ref().copied() {
+                body.insert("auto_merge".to_owned(), serde_json::Value::Bool(value));
+            }
+            if let Some(value) = split_objects.as_ref().copied() {
+                body.insert(
+                    "split_object_threshold".to_owned(),
+                    serde_json::Value::from(value),
+                );
+            }
+            if let Some(value) = merge_objects.as_ref().copied() {
+                body.insert(
+                    "merge_object_threshold".to_owned(),
+                    serde_json::Value::from(value),
+                );
+            }
+            let raw = serde_json::to_vec(&serde_json::Value::Object(body)).unwrap_or_default();
+            let reply = admin_roundtrip(admin, "POST", "/v1/control/policy/update", Some(&raw))?;
+            if reply
+                .get("ok")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                println!("{reply:#}");
+                Ok(())
+            } else {
+                anyhow::bail!("policy update refused: {reply}");
+            }
         }
     }
 }
