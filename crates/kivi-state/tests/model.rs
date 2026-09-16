@@ -370,8 +370,17 @@ fn norm_result(result: &OperationResult, registry: &BTreeMap<[u8; 32], Vec<u8>>)
             },
         }),
         OperationResult::Length(value) => Out::Len(*value),
+        // The model generates no version reads; reaching one is a bug.
+        OperationResult::Version(_) => panic!("model driver generated no version reads"),
         OperationResult::ConditionalSet { applied, version } => {
             Out::Cond(*applied, version.map(kivi_state::ObjectVersion::as_u64))
+        }
+        // Transaction outcomes never arise from the model's single-key
+        // operation generator; reaching one is a model bug.
+        OperationResult::TxnPrepared
+        | OperationResult::TxnConflict
+        | OperationResult::TxnFinalized { .. } => {
+            panic!("model driver generated no transaction operations")
         }
     }
 }
@@ -384,6 +393,9 @@ fn norm_error(error: &OpError) -> RefErr {
         // `SetRange` ever reaches `prepare` (mirroring the engine's lane
         // restage), so a stale base here is a model bug, not a case.
         OpError::StaleRangeBase => panic!("model driver leaked a chunked base into SetRange"),
+        // Unreachable: the model generates no transaction operations, so
+        // no intent can block a key.
+        OpError::TxnConflict => panic!("model driver generated no transaction operations"),
     }
 }
 

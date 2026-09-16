@@ -1756,6 +1756,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "clap",
+ "divan",
  "hdrhistogram",
  "kivi-checkpoint",
  "kivi-client",

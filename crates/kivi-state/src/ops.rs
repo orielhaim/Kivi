@@ -7,10 +7,11 @@
 
 use bytes::Bytes;
 use kivi_codec::{CodecError, Decode, Encode, decode_byte_vec, encode_bytes};
-use kivi_types::{Expiry, ManifestId, UnixMicros};
+use kivi_types::{Expiry, ManifestId, TabletId, UnixMicros};
 
 use crate::mutation::{ApplyOutcome, Mutation};
 use crate::object::{Key, ObjectType, ObjectVersion};
+use crate::txn::{TxnId, TxnWrite};
 
 /// One typed native operation against a single key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +123,15 @@ pub enum Operation {
         /// Key to measure.
         key: Key,
     },
+    /// Report the logical version of a live key (`None` when absent).
+    /// Metadata only, like [`BytesLength`](Self::BytesLength): chunked
+    /// roots answer from the root, counters answer like any other type.
+    /// Index maintenance and OCC planning read versions without fetching
+    /// (possibly huge) values.
+    GetVersion {
+        /// Key to inspect.
+        key: Key,
+    },
     /// Conditionally store bytes, atomically at the owning tablet. The
     /// condition is evaluated against live state (present and unexpired)
     /// and the write applies only when it holds; the expiry policy selects
@@ -157,6 +167,28 @@ pub enum Operation {
         condition: SetCondition,
         /// Expiry policy for the stored object.
         expiry: ExpiryPolicy,
+    },
+    /// Reserve one key for a distributed transaction (2PC prepare): OCC
+    /// version validation plus durable intent recording, with no
+    /// user-visible mutation yet. Driven by the transaction coordinator
+    /// through the normal propose path, never by end users directly.
+    TxnPrepare {
+        /// Transaction identity.
+        txn: TxnId,
+        /// Coordinator tablet owning the decision record.
+        coordinator: TabletId,
+        /// Prepared write (key, kind, OCC expectation).
+        write: TxnWrite,
+    },
+    /// Resolve one key's transaction intent: commit applies the prepared
+    /// write, abort discards it. Idempotent by `TxnId`.
+    TxnFinalize {
+        /// Transaction identity.
+        txn: TxnId,
+        /// Key whose intent resolves.
+        key: Key,
+        /// Whether to apply (`true`) or discard (`false`) the intent.
+        commit: bool,
     },
 }
 
@@ -205,8 +237,11 @@ impl Operation {
             | Self::GetExpiry { key }
             | Self::GetRange { key, .. }
             | Self::BytesLength { key }
+            | Self::GetVersion { key }
             | Self::SetConditional { key, .. }
-            | Self::SetConditionalChunked { key, .. } => key,
+            | Self::SetConditionalChunked { key, .. }
+            | Self::TxnFinalize { key, .. } => key,
+            Self::TxnPrepare { write, .. } => &write.key,
         }
     }
 
@@ -225,12 +260,15 @@ impl Operation {
             | Self::ExpireAt { .. }
             | Self::PersistExpiry { .. }
             | Self::SetConditional { .. }
-            | Self::SetConditionalChunked { .. } => true,
+            | Self::SetConditionalChunked { .. }
+            | Self::TxnPrepare { .. }
+            | Self::TxnFinalize { .. } => true,
             Self::Get { .. }
             | Self::Exists { .. }
             | Self::CounterGet { .. }
             | Self::GetExpiry { .. }
             | Self::GetRange { .. }
+            | Self::GetVersion { .. }
             | Self::BytesLength { .. } => false,
         }
     }
@@ -292,12 +330,27 @@ pub enum OperationResult {
     Expiry(Option<Expiry>),
     /// `BytesLength` answer (`None` when the key is absent).
     Length(Option<u64>),
+    /// `GetVersion` answer: the live version (`None` when absent).
+    Version(Option<crate::object::ObjectVersion>),
     /// `SetConditional` outcome: whether the condition held and the store
     /// applied. `applied: false` carries no version and mutated nothing.
     ConditionalSet {
         /// Whether the condition held and the value was stored.
         applied: bool,
         /// Version after the store (`None` when not applied).
+        version: Option<crate::object::ObjectVersion>,
+    },
+    /// `TxnPrepare` outcome: the intent is durably reserved.
+    TxnPrepared,
+    /// A transactional prepare or conflicting write met OCC/intent
+    /// contention (deterministic outcome, safe to persist and retry).
+    TxnConflict,
+    /// `TxnFinalize` outcome: whether an intent was applied.
+    TxnFinalized {
+        /// Whether a prepared write was applied (`false` for aborts and
+        /// idempotent replays with no intent left).
+        applied: bool,
+        /// Version after the applied write (`None` when nothing applied).
         version: Option<crate::object::ObjectVersion>,
     },
 }
@@ -328,6 +381,12 @@ pub enum OpError {
     /// turn), kept total for future replica proposals.
     #[error("range base changed representation during admission; retry")]
     StaleRangeBase,
+    /// A transactional prepare failed OCC validation (expected version
+    /// moved) or a prepared intent from another transaction blocks the key.
+    /// Nothing was mutated; the coordinator aborts or retries with a fresh
+    /// attempt.
+    #[error("transaction conflict: expected version moved or key reserved")]
+    TxnConflict,
 }
 
 /// Canonical wire tags. Fixed forever within framing version 1.
@@ -335,12 +394,14 @@ const TAG_OP_WRONG_TYPE: u8 = 1;
 const TAG_OP_OVERFLOW: u8 = 2;
 /// Stale range-base tag. New tags never reuse old ones.
 const TAG_OP_STALE_RANGE_BASE: u8 = 3;
+/// Transaction-conflict tag. New tags never reuse old ones.
+const TAG_OP_TXN_CONFLICT: u8 = 4;
 
 impl Encode for OpError {
     fn encoded_len(&self) -> usize {
         match self {
             Self::WrongType { .. } => 1 + 1 + 1,
-            Self::CounterOverflow | Self::StaleRangeBase => 1,
+            Self::CounterOverflow | Self::StaleRangeBase | Self::TxnConflict => 1,
         }
     }
 
@@ -353,6 +414,7 @@ impl Encode for OpError {
             }
             Self::CounterOverflow => out.push(TAG_OP_OVERFLOW),
             Self::StaleRangeBase => out.push(TAG_OP_STALE_RANGE_BASE),
+            Self::TxnConflict => out.push(TAG_OP_TXN_CONFLICT),
         }
     }
 }
@@ -368,6 +430,7 @@ impl Decode for OpError {
             }
             TAG_OP_OVERFLOW => Ok((Self::CounterOverflow, first)),
             TAG_OP_STALE_RANGE_BASE => Ok((Self::StaleRangeBase, first)),
+            TAG_OP_TXN_CONFLICT => Ok((Self::TxnConflict, first)),
             other => Err(CodecError::InvalidTag {
                 kind: "op-error",
                 tag: other,
@@ -392,8 +455,16 @@ const TAG_RES_EXPIRY: u8 = 9;
 const TAG_RES_CHUNKED: u8 = 10;
 /// Logical byte-length answer tag. New tags never reuse old ones.
 const TAG_RES_LENGTH: u8 = 11;
+/// Version answer tag. New tags never reuse old ones.
+const TAG_RES_VERSION: u8 = 16;
 /// Conditional-set outcome tag. New tags never reuse old ones.
 const TAG_RES_CONDITIONAL_SET: u8 = 12;
+/// Transaction-prepared outcome tag. New tags never reuse old ones.
+const TAG_RES_TXN_PREPARED: u8 = 13;
+/// Transaction-conflict outcome tag. New tags never reuse old ones.
+const TAG_RES_TXN_CONFLICT: u8 = 14;
+/// Transaction-finalized outcome tag. New tags never reuse old ones.
+const TAG_RES_TXN_FINALIZED: u8 = 15;
 
 impl Encode for OperationResult {
     fn encoded_len(&self) -> usize {
@@ -409,10 +480,14 @@ impl Encode for OperationResult {
             Self::CounterUpdated { .. } => 1 + 8 + 8,
             Self::Expiry(value) => 1 + 1 + value.as_ref().map_or(0, Expiry::encoded_len),
             Self::Length(value) => 1 + 1 + usize::from(value.is_some()) * 8,
+            Self::Version(value) => 1 + 1 + usize::from(value.is_some()) * 8,
             Self::ConditionalSet { version, .. } => 1 + 1 + 1 + version.as_ref().map_or(0, |_| 8),
+            Self::TxnPrepared | Self::TxnConflict => 1,
+            Self::TxnFinalized { version, .. } => 1 + 1 + 1 + version.as_ref().map_or(0, |_| 8),
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn encode(&self, out: &mut Vec<u8>) {
         match self {
             Self::Value(value) => {
@@ -488,8 +563,31 @@ impl Encode for OperationResult {
                     }
                 }
             }
+            Self::Version(value) => {
+                out.push(TAG_RES_VERSION);
+                match value {
+                    None => out.push(0),
+                    Some(version) => {
+                        out.push(1);
+                        version.encode(out);
+                    }
+                }
+            }
             Self::ConditionalSet { applied, version } => {
                 out.push(TAG_RES_CONDITIONAL_SET);
+                applied.encode(out);
+                match version {
+                    None => out.push(0),
+                    Some(version) => {
+                        out.push(1);
+                        version.encode(out);
+                    }
+                }
+            }
+            Self::TxnPrepared => out.push(TAG_RES_TXN_PREPARED),
+            Self::TxnConflict => out.push(TAG_RES_TXN_CONFLICT),
+            Self::TxnFinalized { applied, version } => {
+                out.push(TAG_RES_TXN_FINALIZED);
                 applied.encode(out);
                 match version {
                     None => out.push(0),
@@ -588,6 +686,14 @@ impl Decode for OperationResult {
                 let (len, third) = u64::decode(&input[first + second..])?;
                 Ok((Self::Length(Some(len)), first + second + third))
             }
+            TAG_RES_VERSION => {
+                let (present, second) = bool::decode(&input[first..])?;
+                if !present {
+                    return Ok((Self::Version(None), first + second));
+                }
+                let (version, third) = ObjectVersion::decode(&input[first + second..])?;
+                Ok((Self::Version(Some(version)), first + second + third))
+            }
             TAG_RES_CONDITIONAL_SET => {
                 let (applied, second) = bool::decode(&input[first..])?;
                 let (present, third) = bool::decode(&input[first + second..])?;
@@ -603,6 +709,29 @@ impl Decode for OperationResult {
                 let (version, fourth) = ObjectVersion::decode(&input[first + second + third..])?;
                 Ok((
                     Self::ConditionalSet {
+                        applied,
+                        version: Some(version),
+                    },
+                    first + second + third + fourth,
+                ))
+            }
+            TAG_RES_TXN_PREPARED => Ok((Self::TxnPrepared, first)),
+            TAG_RES_TXN_CONFLICT => Ok((Self::TxnConflict, first)),
+            TAG_RES_TXN_FINALIZED => {
+                let (applied, second) = bool::decode(&input[first..])?;
+                let (present, third) = bool::decode(&input[first + second..])?;
+                if !present {
+                    return Ok((
+                        Self::TxnFinalized {
+                            applied,
+                            version: None,
+                        },
+                        first + second + third,
+                    ));
+                }
+                let (version, fourth) = ObjectVersion::decode(&input[first + second + third..])?;
+                Ok((
+                    Self::TxnFinalized {
                         applied,
                         version: Some(version),
                     },
@@ -736,6 +865,31 @@ pub fn outcome_for(
                 OperationResult::ExpirySet { applied: *applied }
             }
         }
+        (Mutation::TxnPrepare { .. }, ApplyOutcome::TxnPrepared) => OperationResult::TxnPrepared,
+        (Mutation::TxnPrepare { .. }, ApplyOutcome::TxnConflict) => OperationResult::TxnConflict,
+        (Mutation::TxnFinalize { .. }, ApplyOutcome::TxnFinalized { applied, version }) => {
+            OperationResult::TxnFinalized {
+                applied: *applied,
+                version: *version,
+            }
+        }
+        // A commit-finalize applies its prepared write inline: the inner
+        // outcome surfaces with the finalize shape (applied + version).
+        // `apply` maps these before returning, so these arms only serve
+        // callers that pair outcomes manually (tests, replay tools).
+        (Mutation::TxnFinalize { .. }, ApplyOutcome::Put { version })
+        | (Mutation::TxnFinalize { .. }, ApplyOutcome::Counter { version, .. }) => {
+            OperationResult::TxnFinalized {
+                applied: true,
+                version: Some(*version),
+            }
+        }
+        (Mutation::TxnFinalize { .. }, ApplyOutcome::Deleted { .. }) => {
+            OperationResult::TxnFinalized {
+                applied: true,
+                version: None,
+            }
+        }
         (mutation, outcome) => {
             panic!("prepare/apply contract violated: {mutation:?} -> {outcome:?}")
         }
@@ -785,6 +939,8 @@ mod tests {
         round_trip(&OperationResult::Expiry(Some(Expiry::NEVER)));
         round_trip(&OperationResult::Length(None));
         round_trip(&OperationResult::Length(Some(41)));
+        round_trip(&OperationResult::Version(None));
+        round_trip(&OperationResult::Version(Some(version)));
         round_trip(&OperationResult::ConditionalSet {
             applied: false,
             version: None,
@@ -792,6 +948,16 @@ mod tests {
         round_trip(&OperationResult::ConditionalSet {
             applied: true,
             version: Some(version),
+        });
+        round_trip(&OperationResult::TxnPrepared);
+        round_trip(&OperationResult::TxnConflict);
+        round_trip(&OperationResult::TxnFinalized {
+            applied: true,
+            version: Some(version),
+        });
+        round_trip(&OperationResult::TxnFinalized {
+            applied: false,
+            version: None,
         });
     }
 
@@ -802,6 +968,7 @@ mod tests {
             found: ObjectType::StrictCounter,
         });
         round_trip(&OpError::CounterOverflow);
+        round_trip(&OpError::TxnConflict);
         round_trip(&DurableOutcome::Completed(OperationResult::Stored {
             version: ObjectVersion::FIRST,
         }));

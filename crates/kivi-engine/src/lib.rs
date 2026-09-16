@@ -16,6 +16,7 @@ pub mod checkpoint;
 pub mod chunk_lane;
 pub mod clock;
 pub mod commit;
+pub mod compound;
 pub mod engine;
 pub mod net;
 pub mod routing;

@@ -15,6 +15,7 @@ use kivi_codec::{CodecError, Decode, Encode, decode_byte_vec, encode_bytes};
 use kivi_types::{Expiry, ManifestId};
 
 use crate::object::{Key, ObjectType, ObjectVersion};
+use crate::txn::{TxnExpect, TxnId, TxnWriteKind};
 
 /// One deterministic state transition.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +104,33 @@ pub enum Mutation {
         /// Resolved expiry to attach.
         expiry: Expiry,
     },
+    /// Reserve `key` for transaction `txn`: validates the OCC expectation
+    /// and records a durable intent without touching user-visible state.
+    /// Single-key like every other variant (`key` is the reserved key), so
+    /// overlays, dirty bands, and sweeps need no multi-key contract.
+    TxnPrepare {
+        /// Transaction identity (idempotency key for the reservation).
+        txn: TxnId,
+        /// Coordinator tablet owning the decision record.
+        coordinator: u64,
+        /// Reserved key.
+        key: Key,
+        /// OCC version expectation.
+        expect: TxnExpect,
+        /// Prepared write (applied at finalize-commit).
+        write: TxnWriteKind,
+    },
+    /// Resolve one key's intent for `txn`: commit applies the prepared
+    /// write, abort discards it. Idempotent: a missing intent (already
+    /// finalized or never prepared here) answers finalized-not-applied.
+    TxnFinalize {
+        /// Transaction identity.
+        txn: TxnId,
+        /// Key whose intent resolves.
+        key: Key,
+        /// Whether to apply (`true`) or discard (`false`) the intent.
+        commit: bool,
+    },
 }
 
 /// Canonical wire tags. Fixed forever within framing version 1; new
@@ -119,12 +147,17 @@ const TAG_SPLICE_BYTES: u8 = 6;
 const TAG_PUT_BYTES_WITH_EXPIRY: u8 = 7;
 /// Conditional chunked-root mutation tag. New tags never reuse old ones.
 const TAG_REPLACE_CHUNKED_ROOT_WITH_EXPIRY: u8 = 8;
+/// Transaction prepare (durable intent reservation) tag.
+const TAG_TXN_PREPARE: u8 = 9;
+/// Transaction per-key finalize tag.
+const TAG_TXN_FINALIZE: u8 = 10;
 
 impl Mutation {
     /// Returns the single key this mutation touches. Every mutation in
     /// this stage is single-key; dirty-band tracking and overlays rely on
     /// that (a future multi-key mutation must extend this contract, not
-    /// silently bypass it).
+    /// silently bypass it). Transaction variants reserve/resolve exactly
+    /// one key each, so the contract holds for 2PC as well.
     #[must_use]
     pub fn key(&self) -> &Key {
         match self {
@@ -135,7 +168,9 @@ impl Mutation {
             | Self::ReplaceChunkedRoot { key, .. }
             | Self::SpliceBytes { key, .. }
             | Self::PutBytesWithExpiry { key, .. }
-            | Self::ReplaceChunkedRootWithExpiry { key, .. } => key,
+            | Self::ReplaceChunkedRootWithExpiry { key, .. }
+            | Self::TxnPrepare { key, .. }
+            | Self::TxnFinalize { key, .. } => key,
         }
     }
 
@@ -225,6 +260,26 @@ impl Mutation {
                     expiry: policy,
                 }
             }
+            Self::TxnPrepare {
+                txn,
+                coordinator,
+                key,
+                expect,
+                write,
+            } => Operation::TxnPrepare {
+                txn: *txn,
+                coordinator: kivi_types::TabletId::from_u64(*coordinator),
+                write: crate::txn::TxnWrite {
+                    key: key.clone(),
+                    kind: write.clone(),
+                    expect: *expect,
+                },
+            },
+            Self::TxnFinalize { txn, key, commit } => Operation::TxnFinalize {
+                txn: *txn,
+                key: key.clone(),
+                commit: *commit,
+            },
         }
     }
 }
@@ -244,6 +299,10 @@ impl Encode for Mutation {
             Self::ReplaceChunkedRootWithExpiry { key, expiry, .. } => {
                 1 + (4 + key.len()) + 32 + 8 + expiry.encoded_len()
             }
+            Self::TxnPrepare {
+                key, expect, write, ..
+            } => 1 + 16 + 8 + (4 + key.len()) + expect.encoded_len() + write.encoded_len(),
+            Self::TxnFinalize { key, .. } => 1 + 16 + (4 + key.len()) + 1,
         }
     }
 
@@ -301,6 +360,26 @@ impl Encode for Mutation {
                 out.extend_from_slice(manifest.as_bytes());
                 logical_len.encode(out);
                 expiry.encode(out);
+            }
+            Self::TxnPrepare {
+                txn,
+                coordinator,
+                key,
+                expect,
+                write,
+            } => {
+                out.push(TAG_TXN_PREPARE);
+                txn.encode(out);
+                coordinator.encode(out);
+                encode_bytes(out, key.as_bytes());
+                expect.encode(out);
+                write.encode(out);
+            }
+            Self::TxnFinalize { txn, key, commit } => {
+                out.push(TAG_TXN_FINALIZE);
+                txn.encode(out);
+                encode_bytes(out, key.as_bytes());
+                commit.encode(out);
             }
         }
     }
@@ -407,6 +486,37 @@ impl Decode for Mutation {
                     first + second + third + fourth + fifth,
                 ))
             }
+            TAG_TXN_PREPARE => {
+                let (txn, second) = TxnId::decode(&input[first..])?;
+                let (coordinator, third) = u64::decode(&input[first + second..])?;
+                let (key, fourth) = decode_byte_vec(&input[first + second + third..])?;
+                let (expect, fifth) = TxnExpect::decode(&input[first + second + third + fourth..])?;
+                let (write, sixth) =
+                    TxnWriteKind::decode(&input[first + second + third + fourth + fifth..])?;
+                Ok((
+                    Self::TxnPrepare {
+                        txn,
+                        coordinator,
+                        key: Key::from(key),
+                        expect,
+                        write,
+                    },
+                    first + second + third + fourth + fifth + sixth,
+                ))
+            }
+            TAG_TXN_FINALIZE => {
+                let (txn, second) = TxnId::decode(&input[first..])?;
+                let (key, third) = decode_byte_vec(&input[first + second..])?;
+                let (commit, fourth) = bool::decode(&input[first + second + third..])?;
+                Ok((
+                    Self::TxnFinalize {
+                        txn,
+                        key: Key::from(key),
+                        commit,
+                    },
+                    first + second + third + fourth,
+                ))
+            }
             other => Err(CodecError::InvalidTag {
                 kind: "mutation",
                 tag: other,
@@ -445,6 +555,22 @@ pub enum ApplyOutcome {
         /// Version after the change (`None` when untouched).
         version: Option<ObjectVersion>,
     },
+    /// Transaction intent reserved (prepare validated and recorded).
+    TxnPrepared,
+    /// Transaction prepare evaluated to a conflict (OCC mismatch or a live
+    /// intent from another transaction blocks the key). Deterministic: same
+    /// log on same state always agrees, so this is a normal outcome, never
+    /// divergence.
+    TxnConflict,
+    /// One key's intent resolved: commit applied the prepared write (or the
+    /// intent was already gone), abort discarded it.
+    TxnFinalized {
+        /// Whether a prepared write was applied (`false` for aborts and for
+        /// idempotent replays with no intent left).
+        applied: bool,
+        /// Version after the applied write (`None` when nothing applied).
+        version: Option<ObjectVersion>,
+    },
 }
 
 /// Deterministic apply failure. Same state plus same mutation always agrees,
@@ -474,6 +600,12 @@ pub enum ApplyError {
     /// bases through the lane and validates arithmetic before the WAL.
     #[error("byte-range splice cannot apply to stored state")]
     UnresolvableSplice,
+    /// A transactional prepare or finalize diverged from its validated
+    /// prediction (same log on same state never produces this): either a
+    /// driver bug replaying a different write under one `TxnId`, or state
+    /// divergence. Fail closed, never partial intent state.
+    #[error("transaction mutation diverged from its prepared prediction")]
+    TxnDiverged,
 }
 
 #[cfg(test)]
@@ -532,6 +664,25 @@ mod tests {
                 manifest: ManifestId::from_bytes([0x33; 32]),
                 logical_len: 11,
                 expiry: Expiry::NEVER,
+            },
+            Mutation::TxnPrepare {
+                txn: crate::txn::TxnId::derive(3, 4, 0),
+                coordinator: 9,
+                key: key.clone(),
+                expect: crate::txn::TxnExpect::Version(ObjectVersion::from_u64(2)),
+                write: crate::txn::TxnWriteKind::Put(bytes::Bytes::from_static(b"v")),
+            },
+            Mutation::TxnPrepare {
+                txn: crate::txn::TxnId::derive(3, 5, 0),
+                coordinator: 9,
+                key: key.clone(),
+                expect: crate::txn::TxnExpect::Absent,
+                write: crate::txn::TxnWriteKind::CounterAdd(-3),
+            },
+            Mutation::TxnFinalize {
+                txn: crate::txn::TxnId::derive(3, 4, 0),
+                key: key.clone(),
+                commit: true,
             },
         ];
         for mutation in cases {

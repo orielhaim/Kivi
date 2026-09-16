@@ -136,11 +136,15 @@ pub enum SplitError {
 
 /// One persisted tablet split: parent into left/right children.
 ///
-/// `split_hash` is the deterministic midpoint boundary (u128) of the
-/// parent hash-prefix range; the architecture permits arbitrary future
-/// split points by replacing this field. Child replica sets initially
-/// inherit the parent's desired voters (logical split first, physical
-/// rebalance follows as ordinary tablets).
+/// `split_hash` is the deterministic midpoint boundary (u128) of a hash
+/// parent range; `split_key` is the real-key boundary of an ordered parent
+/// range (`[start, split_key)` + `[split_key, end)`, strictly interior).
+/// Exactly one is set: hash splits use the midpoint, ordered splits use a
+/// data-driven pivot (approximately balancing logical bytes). The
+/// architecture permits arbitrary future split points by replacing the
+/// boundary computation, never the plan shape. Child replica sets
+/// initially inherit the parent's desired voters (logical split first,
+/// physical rebalance follows as ordinary tablets).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SplitPlan {
     /// Plan identity (shares the control `next_plan_id` sequence with
@@ -148,11 +152,14 @@ pub struct SplitPlan {
     pub id: SplitPlanId,
     /// Parent tablet subdividing.
     pub parent: TabletId,
-    /// Deterministic split boundary (midpoint of parent range).
+    /// Deterministic split boundary for hash parents (midpoint of parent
+    /// range); zero for ordered splits.
     pub split_hash: u128,
-    /// Left child (`[parent.start, split_hash)`).
+    /// Real-key split boundary for ordered parents (`None` for hash).
+    pub split_key: Option<Vec<u8>>,
+    /// Left child (`[parent.start, boundary)`).
     pub left: TabletId,
-    /// Right child (`[split_hash, parent.end)`).
+    /// Right child (`[boundary, parent.end)`).
     pub right: TabletId,
     /// Child replica set (inherited from parent at allocation).
     pub replicas: Vec<NodeId>,
@@ -169,10 +176,12 @@ impl SplitPlan {
     /// # Errors
     ///
     /// Returns [`SplitError::BadChildren`] on degenerate identities.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: SplitPlanId,
         parent: TabletId,
         split_hash: u128,
+        split_key: Option<Vec<u8>>,
         left: TabletId,
         right: TabletId,
         replicas: Vec<NodeId>,
@@ -188,12 +197,19 @@ impl SplitPlan {
             id,
             parent,
             split_hash,
+            split_key,
             left,
             right,
             replicas,
             generation,
             phase: SplitPhase::Planned,
         })
+    }
+
+    /// Whether this is an ordered (real-key) split.
+    #[must_use]
+    pub fn is_ordered(&self) -> bool {
+        self.split_key.is_some()
     }
 
     /// Moves the plan to a new phase.
@@ -203,6 +219,7 @@ impl SplitPlan {
             id: self.id,
             parent: self.parent,
             split_hash: self.split_hash,
+            split_key: self.split_key.clone(),
             left: self.left,
             right: self.right,
             replicas: self.replicas.clone(),
@@ -227,10 +244,12 @@ impl SplitPlan {
     /// Encodes the canonical bytes.
     ///
     /// Layout: `id u64, parent u64, split_hash u128, left u64, right u64,
-    /// generation u64, phase u8, count u32, replicas[count] u64`.
+    /// generation u64, phase u8, count u32, replicas[count] u64, key_flag
+    /// u8, [key_len u32, key bytes]` (key section present iff the flag is
+    /// 1; v2 appends the ordered boundary, never reuses tags).
     #[must_use]
     pub fn encode_to_vec(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(8 * 5 + 16 + 1 + 4 + 8 * self.replicas.len());
+        let mut out = Vec::with_capacity(8 * 5 + 16 + 1 + 4 + 8 * self.replicas.len() + 5);
         out.extend_from_slice(&self.id.as_u64().to_le_bytes());
         out.extend_from_slice(&self.parent.as_u64().to_le_bytes());
         out.extend_from_slice(&self.split_hash.to_le_bytes());
@@ -243,6 +262,15 @@ impl SplitPlan {
         for replica in &self.replicas {
             out.extend_from_slice(&replica.as_u64().to_le_bytes());
         }
+        match &self.split_key {
+            None => out.push(0),
+            Some(key) => {
+                out.push(1);
+                let len = u32::try_from(key.len()).unwrap_or(u32::MAX);
+                out.extend_from_slice(&len.to_le_bytes());
+                out.extend_from_slice(key);
+            }
+        }
         out
     }
 
@@ -254,7 +282,7 @@ impl SplitPlan {
     /// bytes, or degenerate identities.
     pub fn decode_exact(input: &[u8]) -> Result<Self, SplitError> {
         use SplitError as Fault;
-        if input.len() < 8 + 8 + 16 + 8 + 8 + 8 + 1 + 4 {
+        if input.len() < 8 + 8 + 16 + 8 + 8 + 8 + 1 + 4 + 1 {
             return Err(Fault::Truncated);
         }
         let id = SplitPlanId::from_u64(u64::from_le_bytes(input[..8].try_into().unwrap_or([0; 8])));
@@ -273,21 +301,50 @@ impl SplitPlan {
         ));
         let phase = SplitPhase::decode_byte(input[56])?;
         let count = u32::from_le_bytes(input[57..61].try_into().unwrap_or([0; 4])) as usize;
-        if input.len() != 61 + 8 * count {
-            return Err(if input.len() < 61 + 8 * count {
+        let mut at = 61 + 8 * count;
+        if input.len() < at + 1 {
+            return Err(Fault::Truncated);
+        }
+        let mut replicas = Vec::with_capacity(count);
+        for index in 0..count {
+            let base = 61 + 8 * index;
+            replicas.push(NodeId::from_u64(u64::from_le_bytes(
+                input[base..base + 8].try_into().unwrap_or([0; 8]),
+            )));
+        }
+        let split_key = match input[at] {
+            0 => {
+                at += 1;
+                None
+            }
+            1 => {
+                at += 1;
+                if input.len() < at + 4 {
+                    return Err(Fault::Truncated);
+                }
+                let len =
+                    u32::from_le_bytes(input[at..at + 4].try_into().unwrap_or([0; 4])) as usize;
+                at += 4;
+                if input.len() < at + len {
+                    return Err(Fault::Truncated);
+                }
+                let key = input[at..at + len].to_vec();
+                at += len;
+                Some(key)
+            }
+            _ => return Err(Fault::Truncated),
+        };
+        if input.len() != at {
+            return Err(if input.len() < at {
                 Fault::Truncated
             } else {
                 Fault::TrailingBytes
             });
         }
-        let mut replicas = Vec::with_capacity(count);
-        for index in 0..count {
-            let at = 61 + 8 * index;
-            replicas.push(NodeId::from_u64(u64::from_le_bytes(
-                input[at..at + 8].try_into().unwrap_or([0; 8]),
-            )));
-        }
-        Self::new(id, parent, split_hash, left, right, replicas, generation).map(|mut plan| {
+        Self::new(
+            id, parent, split_hash, split_key, left, right, replicas, generation,
+        )
+        .map(|mut plan| {
             plan.phase = phase;
             plan
         })
@@ -303,6 +360,7 @@ mod tests {
             SplitPlanId::from_u64(1),
             TabletId::from_u64(7),
             1u128 << 127,
+            None,
             TabletId::from_u64(101),
             TabletId::from_u64(102),
             vec![
@@ -315,13 +373,32 @@ mod tests {
         .expect("valid")
     }
 
+    fn ordered_sample() -> SplitPlan {
+        SplitPlan::new(
+            SplitPlanId::from_u64(2),
+            TabletId::from_u64(8),
+            0,
+            Some(b"m".to_vec()),
+            TabletId::from_u64(103),
+            TabletId::from_u64(104),
+            vec![NodeId::from_u64(1)],
+            PlacementVersion::from_u64(5),
+        )
+        .expect("valid")
+    }
+
     #[test]
     fn split_round_trips() {
         let plan = sample();
         let back = SplitPlan::decode_exact(&plan.encode_to_vec()).expect("decodes");
         assert_eq!(back, plan);
         assert!(!plan.phase.is_terminal());
+        assert!(!plan.is_ordered());
         assert!(SplitPhase::Completed.is_terminal());
+        let ordered = ordered_sample();
+        assert!(ordered.is_ordered());
+        let back = SplitPlan::decode_exact(&ordered.encode_to_vec()).expect("decodes");
+        assert_eq!(back, ordered);
     }
 
     #[test]
@@ -331,6 +408,7 @@ mod tests {
                 SplitPlanId::from_u64(1),
                 TabletId::from_u64(7),
                 0,
+                None,
                 TabletId::from_u64(7),
                 TabletId::from_u64(8),
                 vec![NodeId::from_u64(1)],

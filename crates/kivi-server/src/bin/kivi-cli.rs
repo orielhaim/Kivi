@@ -117,6 +117,38 @@ enum Command {
         #[command(subcommand)]
         command: ClusterCommand,
     },
+    /// Stream a bounded ordered range in key order (keys only by
+    /// default; values never exceed the page budget inline).
+    Scan {
+        /// Inclusive lower bound (default: first key).
+        #[arg(long)]
+        start: Option<String>,
+        /// Exclusive upper bound (default: last key).
+        #[arg(long)]
+        end: Option<String>,
+        /// Maximum entries to print (default 100).
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Reverse key order.
+        #[arg(long, default_value_t = false)]
+        reverse: bool,
+        /// Print values as well as keys (large values print by
+        /// reference, never inline).
+        #[arg(long, default_value_t = false)]
+        values: bool,
+    },
+    /// Execute an atomic batch: `key=value` puts, `key=` deletes
+    /// (repeatable flags). All commit or none does.
+    AtomicBatch {
+        /// Writes as `key=value` (put) or `key` (delete).
+        #[arg(long = "write", value_delimiter = ',')]
+        writes: Vec<String>,
+    },
+    /// Fetch one key's logical version (`(nil)` when absent).
+    GetVersion {
+        /// Key to inspect.
+        key: String,
+    },
 }
 
 /// Cluster operator actions. These speak to the admin plane (typed
@@ -223,6 +255,40 @@ enum ClusterCommand {
         #[arg(long)]
         merge_objects: Option<u64>,
     },
+    /// List registered namespaces with their physical layouts.
+    NamespaceList,
+    /// Register a namespace (`hash` or `ordered` layout).
+    NamespaceCreate {
+        /// Namespace id.
+        id: u64,
+        /// Physical layout: `hash` or `ordered`.
+        #[arg(long, default_value = "hash")]
+        layout: String,
+    },
+    /// List secondary index definitions with lifecycle states.
+    IndexList,
+    /// Create a secondary index definition (starts `Building`).
+    IndexCreate {
+        /// Primary namespace id.
+        #[arg(long)]
+        primary: u64,
+        /// Uniqueness: `unique` or `non-unique`.
+        #[arg(long, default_value = "non-unique")]
+        kind: String,
+    },
+    /// Advance an index lifecycle state (`ready` or `dropping`).
+    IndexAdvance {
+        /// Index id.
+        id: u64,
+        /// New state.
+        #[arg(long)]
+        state: String,
+    },
+    /// Drop an index definition (must be `dropping` first).
+    IndexDrop {
+        /// Index id.
+        id: u64,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -237,7 +303,7 @@ fn main() -> anyhow::Result<()> {
         namespace: NamespaceId::from_u64(cli.namespace),
         ..ClientConfig::default()
     })?;
-    run(&client, &cli.command)?;
+    run(&client, cli.namespace, &cli.command)?;
     Ok(())
 }
 
@@ -727,10 +793,105 @@ fn run_cluster(admin: &str, command: &ClusterCommand) -> anyhow::Result<()> {
                 anyhow::bail!("policy update refused: {reply}");
             }
         }
+        ClusterCommand::NamespaceList => {
+            let reply: serde_json::Value =
+                admin_roundtrip(admin, "GET", "/v1/control/namespaces", None)?;
+            println!("{reply:#}");
+            Ok(())
+        }
+        ClusterCommand::NamespaceCreate { id, layout } => {
+            let body = serde_json::json!({ "id": id, "layout": layout });
+            let raw = serde_json::to_vec(&body)?;
+            let reply =
+                admin_roundtrip(admin, "POST", "/v1/control/namespaces/register", Some(&raw))?;
+            if reply
+                .get("ok")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                println!("registered namespace {id} ({layout})");
+                Ok(())
+            } else {
+                anyhow::bail!("namespace register refused: {reply}");
+            }
+        }
+        ClusterCommand::IndexList => {
+            let reply: serde_json::Value =
+                admin_roundtrip(admin, "GET", "/v1/control/indexes", None)?;
+            println!("{reply:#}");
+            Ok(())
+        }
+        ClusterCommand::IndexCreate { primary, kind } => {
+            let body = serde_json::json!({ "primary": primary, "kind": kind });
+            let raw = serde_json::to_vec(&body)?;
+            let reply = admin_roundtrip(admin, "POST", "/v1/control/indexes/create", Some(&raw))?;
+            if reply
+                .get("ok")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                println!(
+                    "index {} created (building)",
+                    reply
+                        .get("id")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0)
+                );
+                Ok(())
+            } else {
+                anyhow::bail!("index create refused: {reply}");
+            }
+        }
+        ClusterCommand::IndexAdvance { id, state } => {
+            let body = serde_json::json!({ "state": state });
+            let raw = serde_json::to_vec(&body)?;
+            let reply = admin_roundtrip(
+                admin,
+                "POST",
+                &format!("/v1/control/indexes/{id}/advance"),
+                Some(&raw),
+            )?;
+            if reply
+                .get("ok")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                println!("index {id} advanced to {state}");
+                Ok(())
+            } else {
+                anyhow::bail!("index advance refused: {reply}");
+            }
+        }
+        ClusterCommand::IndexDrop { id } => {
+            let reply = admin_roundtrip(
+                admin,
+                "POST",
+                &format!("/v1/control/indexes/{id}/drop"),
+                Some(b"{}"),
+            )?;
+            if reply
+                .get("ok")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                println!("index {id} dropped");
+                Ok(())
+            } else {
+                anyhow::bail!("index drop refused: {reply}");
+            }
+        }
     }
 }
 
-fn run(client: &NativeClient, command: &Command) -> Result<(), kivi_client::ClientError> {
+/// Dispatches one CLI command (large by nature: one arm per command;
+/// splitting would scatter the command table).
+#[allow(clippy::too_many_lines)]
+fn run(
+    client: &NativeClient,
+    namespace: u64,
+    command: &Command,
+) -> Result<(), kivi_client::ClientError> {
+    let ns = NamespaceId::from_u64(namespace);
     match command {
         // Diverted in `main` before any client connects; unreachable here.
         Command::Cluster { .. } => return Err(kivi_client::ClientError::InvalidRequest),
@@ -828,6 +989,99 @@ fn run(client: &NativeClient, command: &Command) -> Result<(), kivi_client::Clie
             )?;
             println!("{}", if applied { "OK" } else { "(nil)" });
         }
+        Command::Scan {
+            start,
+            end,
+            limit,
+            reverse,
+            values,
+        } => {
+            use kivi_client::ordered::{
+                ScanConsistency, ScanDirection, ScanOptions, ScanProjection,
+            };
+            let options = ScanOptions {
+                start: start.clone().map(String::into_bytes),
+                end: end.clone().map(String::into_bytes),
+                direction: if *reverse {
+                    ScanDirection::Reverse
+                } else {
+                    ScanDirection::Forward
+                },
+                consistency: ScanConsistency::LatestPerTablet,
+                projection: if *values {
+                    ScanProjection::KeysAndValues
+                } else {
+                    ScanProjection::KeysOnly
+                },
+                max_items_per_page: 1000,
+                max_bytes_per_page: 1 << 20,
+                limit: Some(*limit),
+            };
+            let entries = client.scan(ns, &options)?;
+            for entry in entries {
+                match &entry.value {
+                    kivi_client::ordered::ClientScanValue::Absent => {
+                        println!("{}", String::from_utf8_lossy(&entry.key));
+                    }
+                    kivi_client::ordered::ClientScanValue::Inline(bytes) => {
+                        println!(
+                            "{}\t{}",
+                            String::from_utf8_lossy(&entry.key),
+                            String::from_utf8_lossy(bytes)
+                        );
+                    }
+                    kivi_client::ordered::ClientScanValue::Counter(counter) => {
+                        println!(
+                            "{}\t(counter {counter})",
+                            String::from_utf8_lossy(&entry.key)
+                        );
+                    }
+                    kivi_client::ordered::ClientScanValue::Chunked { logical_len, .. } => {
+                        println!(
+                            "{}\t(chunked {logical_len} bytes; use get-stream)",
+                            String::from_utf8_lossy(&entry.key)
+                        );
+                    }
+                    kivi_client::ordered::ClientScanValue::Oversize { logical_len } => {
+                        println!(
+                            "{}\t(oversize {logical_len} bytes; use get)",
+                            String::from_utf8_lossy(&entry.key)
+                        );
+                    }
+                }
+            }
+        }
+        Command::AtomicBatch { writes } => {
+            use kivi_client::ordered::{BatchExpect, BatchWriteKind, BatchWriteSpec};
+            let mut specs = Vec::with_capacity(writes.len());
+            for write in writes {
+                match write.split_once('=') {
+                    Some((key, value)) if !value.is_empty() => specs.push(BatchWriteSpec {
+                        key: key.as_bytes().to_vec(),
+                        kind: BatchWriteKind::Put(value.as_bytes().to_vec()),
+                        expect: BatchExpect::Any,
+                    }),
+                    _ => {
+                        let key = write.trim_end_matches('=');
+                        specs.push(BatchWriteSpec {
+                            key: key.as_bytes().to_vec(),
+                            kind: BatchWriteKind::Delete,
+                            expect: BatchExpect::Any,
+                        });
+                    }
+                }
+            }
+            let result = client.atomic_batch(ns, &specs)?;
+            println!(
+                "committed txn {} ({} writes)",
+                result.txn,
+                result.versions.len()
+            );
+        }
+        Command::GetVersion { key } => match client.get_version(ns, key.as_bytes())? {
+            Some(version) => println!("{version}"),
+            None => println!("(nil)"),
+        },
     }
     Ok(())
 }

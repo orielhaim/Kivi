@@ -21,8 +21,11 @@ pub use frame::{
     PROTOCOL_MAGIC, PROTOCOL_MAJOR, PROTOCOL_MINOR, ProtocolError, encode_frame,
 };
 pub use message::{
-    COND_ALWAYS, COND_IF_ABSENT, COND_IF_PRESENT, Capabilities, ClientHello, EXPIRY_AT,
-    EXPIRY_CLEAR, EXPIRY_KEEP, MAX_STREAM_UPLOAD_BYTES, Opcode, RedirectInfo, Request, RequestId,
-    Response, ResponseBody, RouteHint, ServerHello, Status, StreamAbort, StreamBegin, StreamReady,
-    ValueStreamBegin, operation_opcode,
+    BATCH_COUNTER_ADD, BATCH_DELETE, BATCH_EXPECT_ABSENT, BATCH_EXPECT_ANY, BATCH_EXPECT_VERSION,
+    BATCH_PUT, BatchWrite, COND_ALWAYS, COND_IF_ABSENT, COND_IF_PRESENT, Capabilities, ClientHello,
+    EXPIRY_AT, EXPIRY_CLEAR, EXPIRY_KEEP, MAX_STREAM_UPLOAD_BYTES, Opcode, RedirectInfo, Request,
+    RequestId, Response, ResponseBody, RouteHint, SCAN_ANY, SCAN_FORWARD, SCAN_KEYS_AND_VALUES,
+    SCAN_KEYS_ONLY, SCAN_LATEST_PER_TABLET, SCAN_REVERSE, SCAN_VALUE_CHUNKED, SCAN_VALUE_COUNTER,
+    SCAN_VALUE_INLINE, SCAN_VALUE_NONE, SCAN_VALUE_OVERSIZE, ScanEntryBody, ScanValueBody,
+    ServerHello, Status, StreamAbort, StreamBegin, StreamReady, ValueStreamBegin, operation_opcode,
 };

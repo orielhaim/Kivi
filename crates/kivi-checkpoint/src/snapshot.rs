@@ -5,7 +5,7 @@
 //! builder. Everything here is owned plain data with no locks, no threads,
 //! and no engine types: the checkpoint crate never depends on the engine.
 
-use kivi_state::{Key, StoredObject};
+use kivi_state::{Key, StoredObject, TxnIntent};
 use kivi_types::{CommitPosition, NamespaceId, TabletEpoch, TabletId, WriteGuardGeneration};
 
 use crate::dedup::SessionCheckpoint;
@@ -29,6 +29,8 @@ pub struct TabletSnapshot {
     pub objects: Vec<(Key, StoredObject)>,
     /// All session dedup states (floors plus retained outcomes).
     pub sessions: Vec<SessionCheckpoint>,
+    /// All prepared transaction intents (never discarded on restart).
+    pub intents: Vec<TxnIntent>,
     /// Dirty bands taken at capture (cleared on the live tablet).
     pub dirty: BandDirty,
 }

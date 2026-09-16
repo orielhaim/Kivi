@@ -220,6 +220,55 @@ impl OrderedRange {
     pub fn overlaps(&self, other: &Self) -> bool {
         below_end(&self.start, other.end.as_deref()) && below_end(&other.start, self.end.as_deref())
     }
+
+    /// Splits `[start, end)` at `key` into `([start, key), [key, end))`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RangeError::InvalidSplitKey`] when `key` is not strictly
+    /// interior (`start < key < end`, with `+∞` treated as unbounded above).
+    pub fn split_at(&self, key: &[u8]) -> Result<(Self, Self), RangeError> {
+        if key <= self.start.as_slice() {
+            return Err(RangeError::InvalidSplitKey);
+        }
+        if let Some(bound) = self.end.as_deref()
+            && key >= bound
+        {
+            return Err(RangeError::InvalidSplitKey);
+        }
+        Ok((
+            Self {
+                start: self.start.clone(),
+                end: Some(key.to_vec()),
+            },
+            Self {
+                start: key.to_vec(),
+                end: self.end.clone(),
+            },
+        ))
+    }
+
+    /// Whether `self` ends exactly where `other` starts (mergeable pair).
+    #[must_use]
+    pub fn is_adjacent_to(&self, other: &Self) -> bool {
+        self.end.as_deref() == Some(other.start.as_slice())
+    }
+
+    /// Merges two adjacent intervals `[a, b) + [b, c) = [a, c)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RangeError::NotAdjacent`] unless `self` ends exactly where
+    /// `other` starts.
+    pub fn merge_with(&self, other: &Self) -> Result<Self, RangeError> {
+        if !self.is_adjacent_to(other) {
+            return Err(RangeError::NotAdjacent);
+        }
+        Ok(Self {
+            start: self.start.clone(),
+            end: other.end.clone(),
+        })
+    }
 }
 
 /// Whether `start` lies strictly below `end`, treating `None` as `+∞`.
@@ -372,6 +421,12 @@ pub enum RangeError {
     /// Ordered range end does not strictly exceed its start.
     #[error("ordered range end must strictly exceed start")]
     EmptyOrderedRange,
+    /// Split key is not strictly interior to the ordered range.
+    #[error("ordered split key must satisfy start < key < end")]
+    InvalidSplitKey,
+    /// Two ordered ranges are not adjacent and cannot merge.
+    #[error("ordered ranges are not adjacent (left.end must equal right.start)")]
+    NotAdjacent,
 }
 
 #[cfg(test)]
@@ -570,5 +625,32 @@ mod tests {
         assert!(!hash.overlaps(&ordered));
         assert_eq!(hash.kind(), PartitionKind::Hash);
         assert_eq!(ordered.kind(), PartitionKind::Ordered);
+    }
+
+    #[test]
+    fn ordered_split_at_real_key_boundary() {
+        let whole = OrderedRange::new(b"a".to_vec(), Some(b"z".to_vec())).expect("whole");
+        let (left, right) = whole.split_at(b"m").expect("split at m");
+        assert_eq!(left.start(), b"a");
+        assert_eq!(left.end(), Some(b"m".as_slice()));
+        assert_eq!(right.start(), b"m");
+        assert_eq!(right.end(), Some(b"z".as_slice()));
+        assert!(left.is_adjacent_to(&right));
+        assert!(!left.overlaps(&right));
+        assert_eq!(left.merge_with(&right).expect("merge"), whole);
+        // Non-interior keys rejected: at/before start, at/past end.
+        assert_eq!(whole.split_at(b"a"), Err(RangeError::InvalidSplitKey));
+        assert_eq!(whole.split_at(b"z"), Err(RangeError::InvalidSplitKey));
+        assert_eq!(whole.split_at(b"0"), Err(RangeError::InvalidSplitKey));
+        assert_eq!(whole.split_at(b"zz"), Err(RangeError::InvalidSplitKey));
+        // Unbounded tail splits at any key past start.
+        let tail = OrderedRange::new(b"p".to_vec(), None).expect("tail");
+        let (l, r) = tail.split_at(b"q").expect("split tail");
+        assert_eq!(l.end(), Some(b"q".as_slice()));
+        assert_eq!(r.end(), None);
+        assert!(l.is_adjacent_to(&r));
+        // Non-adjacent merge rejected.
+        let far = OrderedRange::new(b"q".to_vec(), None).expect("far");
+        assert_eq!(left.merge_with(&far), Err(RangeError::NotAdjacent));
     }
 }

@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use kivi_types::{NodeId, TabletId};
 
+use crate::catalog::{CatalogIndexState, IndexRecord, NamespaceRecord};
 use crate::merge::{MergePlan, MergePlanId};
 use crate::migration::{MigrationPlan, MigrationPlanId};
 use crate::mutation::{ControlMutation, MergePlanIdAlias, MigrationPlanIdAlias, SplitPlanIdAlias};
@@ -85,6 +86,12 @@ pub enum ControlApplyError {
         /// Missing plan.
         plan: u64,
     },
+    /// The named index is unknown.
+    #[error("unknown index {index}")]
+    UnknownIndex {
+        /// Missing index.
+        index: u64,
+    },
     /// A topology plan conflicts with a live plan on the same tablet
     /// (one tablet, one live plan).
     #[error("topology conflict on tablet {tablet}: {detail}")]
@@ -124,6 +131,9 @@ pub enum ControlSnapshotError {
     /// An embedded merge plan failed to decode.
     #[error("undecodable merge plan: {0}")]
     BadMerge(#[from] crate::merge::MergeError),
+    /// An embedded namespace/index record failed to decode.
+    #[error("undecodable catalog record: {0}")]
+    BadCatalog(#[from] crate::catalog::CatalogError),
 }
 
 /// Authoritative replicated control image.
@@ -139,6 +149,10 @@ pub struct ControlState {
     splits: BTreeMap<u64, SplitPlan>,
     /// Merge plans by id (shares the plan-id sequence with migrations).
     merges: BTreeMap<u64, MergePlan>,
+    /// Registered namespaces by id.
+    namespaces: BTreeMap<u64, NamespaceRecord>,
+    /// Secondary index definitions by id.
+    indexes: BTreeMap<u64, IndexRecord>,
     /// Current placement version (advanced by every desired-placement
     /// change and every plan creation).
     placement_version: PlacementVersion,
@@ -162,6 +176,8 @@ impl ControlState {
             migrations: BTreeMap::new(),
             splits: BTreeMap::new(),
             merges: BTreeMap::new(),
+            namespaces: BTreeMap::new(),
+            indexes: BTreeMap::new(),
             placement_version: PlacementVersion::INITIAL,
             generation: ClusterGeneration::INITIAL,
             next_plan_id: 1,
@@ -317,6 +333,28 @@ impl ControlState {
             .values()
             .filter(|plan| !plan.phase.is_terminal() && plan.tablets().contains(&tablet))
             .collect()
+    }
+
+    /// Looks up one namespace record.
+    #[must_use]
+    pub fn namespace(&self, id: kivi_types::NamespaceId) -> Option<&NamespaceRecord> {
+        self.namespaces.get(&id.as_u64())
+    }
+
+    /// Iterates all namespace records in id order.
+    pub fn namespaces(&self) -> impl Iterator<Item = &NamespaceRecord> {
+        self.namespaces.values()
+    }
+
+    /// Looks up one index definition.
+    #[must_use]
+    pub fn index(&self, id: u64) -> Option<&IndexRecord> {
+        self.indexes.get(&id)
+    }
+
+    /// Iterates all index definitions in id order.
+    pub fn indexes(&self) -> impl Iterator<Item = &IndexRecord> {
+        self.indexes.values()
     }
 
     /// Whether any live topology plan (migration, split, or merge)
@@ -551,6 +589,53 @@ impl ControlState {
                 self.merges.remove(&id.as_u64());
                 Ok(())
             }
+            ControlMutation::RegisterNamespace { record } => {
+                match self.namespaces.get(&record.id.as_u64()) {
+                    None => {
+                        self.namespaces.insert(record.id.as_u64(), *record);
+                        Ok(())
+                    }
+                    Some(existing) if *existing == *record => Ok(()),
+                    Some(_) => Err(Fault::IllegalTransition {
+                        node: record.id.as_u64(),
+                        detail: "namespace already registered with a different layout".to_owned(),
+                    }),
+                }
+            }
+            ControlMutation::CreateIndex { record } => {
+                if self.indexes.contains_key(&record.id) {
+                    return Err(Fault::IllegalTransition {
+                        node: record.id,
+                        detail: "index already exists".to_owned(),
+                    });
+                }
+                self.indexes.insert(record.id, *record);
+                Ok(())
+            }
+            ControlMutation::AdvanceIndex { id, state } => {
+                let Some(existing) = self.indexes.get(id).copied() else {
+                    return Err(Fault::UnknownIndex { index: *id });
+                };
+                let state = CatalogIndexState::decode_byte(*state)
+                    .map_err(|_| Fault::UnknownIndex { index: *id })?;
+                let mut advanced = existing;
+                advanced.state = state;
+                self.indexes.insert(*id, advanced);
+                Ok(())
+            }
+            ControlMutation::RemoveIndex { id } => {
+                let Some(existing) = self.indexes.get(id) else {
+                    return Err(Fault::UnknownIndex { index: *id });
+                };
+                if existing.state != CatalogIndexState::Dropping {
+                    return Err(Fault::IllegalTransition {
+                        node: *id,
+                        detail: "only dropping indexes may be removed".to_owned(),
+                    });
+                }
+                self.indexes.remove(id);
+                Ok(())
+            }
         }
     }
 
@@ -607,6 +692,14 @@ impl ControlState {
         );
         push_map(&mut out, self.splits.values().map(SplitPlan::encode_to_vec));
         push_map(&mut out, self.merges.values().map(MergePlan::encode_to_vec));
+        push_map(
+            &mut out,
+            self.namespaces.values().map(NamespaceRecord::encode_to_vec),
+        );
+        push_map(
+            &mut out,
+            self.indexes.values().map(IndexRecord::encode_to_vec),
+        );
         out
     }
 
@@ -633,6 +726,8 @@ impl ControlState {
         let mut migrations = BTreeMap::new();
         let mut splits = BTreeMap::new();
         let mut merges = BTreeMap::new();
+        let mut namespaces = BTreeMap::new();
+        let mut indexes = BTreeMap::new();
         let node_blobs = take_map(rest).map_err(|detail| Fault::Truncated { detail })?;
         rest = node_blobs.1;
         for blob in node_blobs.0 {
@@ -663,6 +758,18 @@ impl ControlState {
             let plan = MergePlan::decode_exact(blob)?;
             merges.insert(plan.id.as_u64(), plan);
         }
+        let namespace_blobs = take_map(rest).map_err(|detail| Fault::Truncated { detail })?;
+        rest = namespace_blobs.1;
+        for blob in namespace_blobs.0 {
+            let record = NamespaceRecord::decode_exact(blob)?;
+            namespaces.insert(record.id.as_u64(), record);
+        }
+        let index_blobs = take_map(rest).map_err(|detail| Fault::Truncated { detail })?;
+        rest = index_blobs.1;
+        for blob in index_blobs.0 {
+            let record = IndexRecord::decode_exact(blob)?;
+            indexes.insert(record.id, record);
+        }
         if !rest.is_empty() {
             return Err(Fault::TrailingBytes);
         }
@@ -672,6 +779,8 @@ impl ControlState {
             splits,
             merges,
             migrations,
+            namespaces,
+            indexes,
             placement_version,
             generation,
             next_plan_id: next_plan_id.max(1),

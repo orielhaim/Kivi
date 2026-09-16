@@ -96,6 +96,25 @@ pub enum Opcode {
     /// Conditionally store bytes with a Kivi-owned presence condition and
     /// expiry policy (atomic at the owning tablet).
     SetConditional = 14,
+    /// Bounded single-tablet ordered scan (see the `scan_*` fields on
+    /// [`Request`]): reads `[start, end)` in key order, never unbounded.
+    /// Cross-tablet scans fan out from the client; the server answers only
+    /// the slice owned by the routed tablet.
+    Scan = 15,
+    /// Atomic multi-key batch against ONE tablet (single-tablet fast path;
+    /// multi-tablet batches use client-driven 2PC over `TxnPrepare` /
+    /// `TxnFinalize`). See the `batch_*` fields on [`Request`].
+    AtomicBatch = 16,
+    /// Reserve one key for a transaction (2PC prepare): OCC validation
+    /// plus a durable intent, no user-visible mutation yet.
+    TxnPrepare = 17,
+    /// Resolve one key's transaction intent: commit applies the prepared
+    /// write, abort discards it. Idempotent by `TxnId`.
+    TxnFinalize = 18,
+    /// Read a key's logical version without fetching its value
+    /// (`None` when absent; works for chunked values without resolving
+    /// any bytes). Index maintenance and OCC planning use this.
+    GetVersion = 19,
 }
 
 impl Opcode {
@@ -117,6 +136,11 @@ impl Opcode {
             12 => Some(Self::GetRange),
             13 => Some(Self::BytesLength),
             14 => Some(Self::SetConditional),
+            15 => Some(Self::Scan),
+            16 => Some(Self::AtomicBatch),
+            17 => Some(Self::TxnPrepare),
+            18 => Some(Self::TxnFinalize),
+            19 => Some(Self::GetVersion),
             _ => None,
         }
     }
@@ -140,6 +164,9 @@ impl Opcode {
                 | Self::PersistExpiry
                 | Self::SetRange
                 | Self::SetConditional
+                | Self::AtomicBatch
+                | Self::TxnPrepare
+                | Self::TxnFinalize
         )
     }
 }
@@ -161,6 +188,11 @@ impl core::fmt::Display for Opcode {
             Self::GetRange => write!(f, "get-range"),
             Self::BytesLength => write!(f, "bytes-length"),
             Self::SetConditional => write!(f, "set-conditional"),
+            Self::Scan => write!(f, "scan"),
+            Self::AtomicBatch => write!(f, "atomic-batch"),
+            Self::TxnPrepare => write!(f, "txn-prepare"),
+            Self::TxnFinalize => write!(f, "txn-finalize"),
+            Self::GetVersion => write!(f, "get-version"),
         }
     }
 }
@@ -203,6 +235,23 @@ pub enum Status {
     /// acknowledge older mutations before sending new ones. Deterministic
     /// for the same state, so retrying is harmless but pointless.
     SessionOverloaded = 14,
+    /// A transactional prepare failed OCC validation or met a prepared
+    /// intent. Not a transport retry: the batch API decides (new attempt).
+    TxnConflict = 15,
+    /// The transaction was aborted (prepare rejected or coordinator
+    /// decided abort). Retrying the identical batch replays the abort;
+    /// start a new attempt instead.
+    TxnAborted = 16,
+    /// The transaction exceeds participant/key/byte bounds. Split it.
+    TxnTooLarge = 17,
+    /// A participant cannot reach the coordinator record yet. Safe to
+    /// re-drive the identical batch (same `TxnId`).
+    TxnCoordinatorUnavailable = 18,
+    /// A unique index term is already owned by another primary.
+    UniqueViolation = 19,
+    /// A scan cursor no longer resolves (namespace dropped or cursor
+    /// predates retention). Re-issue the scan from the start.
+    ScanCursorStale = 20,
 }
 
 impl Status {
@@ -225,6 +274,12 @@ impl Status {
             12 => Some(Self::Internal),
             13 => Some(Self::DedupExpired),
             14 => Some(Self::SessionOverloaded),
+            15 => Some(Self::TxnConflict),
+            16 => Some(Self::TxnAborted),
+            17 => Some(Self::TxnTooLarge),
+            18 => Some(Self::TxnCoordinatorUnavailable),
+            19 => Some(Self::UniqueViolation),
+            20 => Some(Self::ScanCursorStale),
             _ => None,
         }
     }
@@ -237,10 +292,20 @@ impl Status {
 
     /// Whether retrying the identical request (after any attached redirect)
     /// can usefully succeed. Redirects and overload are retriable by design;
-    /// semantic rejections are not.
+    /// semantic rejections are not. `TxnConflict` is deliberately NOT
+    /// retriable at transport: the identical 2PC re-drive would replay the
+    /// same contention, so the batch API mints a fresh attempt instead
+    /// (transport retry vs transaction retry stay distinct).
     #[must_use]
     pub const fn is_retriable(self) -> bool {
-        matches!(self, Self::StaleRoute | Self::NotLocal | Self::Overloaded)
+        matches!(
+            self,
+            Self::StaleRoute
+                | Self::NotLocal
+                | Self::Overloaded
+                | Self::TxnCoordinatorUnavailable
+                | Self::ScanCursorStale
+        )
     }
 }
 
@@ -262,6 +327,12 @@ impl core::fmt::Display for Status {
             Self::Internal => write!(f, "internal"),
             Self::DedupExpired => write!(f, "dedup-expired"),
             Self::SessionOverloaded => write!(f, "session-overloaded"),
+            Self::TxnConflict => write!(f, "txn-conflict"),
+            Self::TxnAborted => write!(f, "txn-aborted"),
+            Self::TxnTooLarge => write!(f, "txn-too-large"),
+            Self::TxnCoordinatorUnavailable => write!(f, "txn-coordinator-unavailable"),
+            Self::UniqueViolation => write!(f, "unique-violation"),
+            Self::ScanCursorStale => write!(f, "scan-cursor-stale"),
         }
     }
 }
@@ -410,6 +481,102 @@ pub const EXPIRY_KEEP: u8 = 1;
 /// Wire values for [`kivi_state::ExpiryPolicy`] on `SetConditional`.
 pub const EXPIRY_AT: u8 = 2;
 
+/// Wire values for scan direction on `Scan`: ascending key order.
+pub const SCAN_FORWARD: u8 = 0;
+/// Wire values for scan direction on `Scan`: descending key order.
+pub const SCAN_REVERSE: u8 = 1;
+
+/// Wire values for scan projection on `Scan`: keys only.
+pub const SCAN_KEYS_ONLY: u8 = 0;
+/// Wire values for scan projection on `Scan`: keys with bounded values.
+pub const SCAN_KEYS_AND_VALUES: u8 = 1;
+
+/// Wire values for scan consistency on `Scan`: strong `Latest` per tablet.
+/// The full multi-tablet scan is NOT one global snapshot (documented).
+pub const SCAN_LATEST_PER_TABLET: u8 = 0;
+/// Wire values for scan consistency on `Scan`: weakest local read per the
+/// tablet's existing read contracts.
+pub const SCAN_ANY: u8 = 1;
+
+/// Wire values for batch write kinds on `AtomicBatch`.
+pub const BATCH_PUT: u8 = 1;
+/// Wire values for batch write kinds on `AtomicBatch`.
+pub const BATCH_DELETE: u8 = 2;
+/// Wire values for batch write kinds on `AtomicBatch`.
+pub const BATCH_COUNTER_ADD: u8 = 3;
+
+/// Wire values for batch OCC expectations on `AtomicBatch`: blind write.
+pub const BATCH_EXPECT_ANY: u8 = 0;
+/// Wire values for batch OCC expectations on `AtomicBatch`: key must be absent.
+pub const BATCH_EXPECT_ABSENT: u8 = 1;
+/// Wire values for batch OCC expectations on `AtomicBatch`: live version
+/// must equal the carried `expect_version`.
+pub const BATCH_EXPECT_VERSION: u8 = 2;
+
+/// One write inside an `AtomicBatch` request: a point key, kind, payload,
+/// and OCC expectation. The coordinator translates each into a
+/// `TxnPrepare` against its owning tablet; all commit or none does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchWrite {
+    /// Target key.
+    pub key: Vec<u8>,
+    /// One of [`BATCH_PUT`], [`BATCH_DELETE`], [`BATCH_COUNTER_ADD`].
+    pub kind: u8,
+    /// Put payload (meaningful for `BATCH_PUT` only).
+    pub value: Vec<u8>,
+    /// Addend (meaningful for `BATCH_COUNTER_ADD` only).
+    pub delta: i64,
+    /// One of [`BATCH_EXPECT_ANY`], [`BATCH_EXPECT_ABSENT`],
+    /// [`BATCH_EXPECT_VERSION`].
+    pub expect: u8,
+    /// Expected live version (meaningful for `BATCH_EXPECT_VERSION` only).
+    pub expect_version: u64,
+}
+
+/// One scanned entry in a `Scan` response page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanEntryBody {
+    /// Scanned key.
+    pub key: Vec<u8>,
+    /// Projected value shape (see tags below).
+    pub value: ScanValueBody,
+}
+
+/// Value payload of [`ScanEntryBody`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScanValueBody {
+    /// No value (`KeysOnly` projection).
+    None,
+    /// Resident bytes (fit the page budget).
+    Inline(Vec<u8>),
+    /// Exact counter value.
+    Counter(i64),
+    /// Chunked bytes by reference (resolve via `get_stream`).
+    Chunked {
+        /// Manifest addressing the immutable chunk sequence.
+        manifest: [u8; 32],
+        /// Total logical bytes across the manifest.
+        logical_len: u64,
+    },
+    /// Resident bytes exceeding the page budget on an otherwise empty
+    /// page: length only, fetch via point `get`/`get_stream`.
+    Oversize {
+        /// Logical length of the value.
+        logical_len: u64,
+    },
+}
+
+/// Wire tags for [`ScanValueBody`]. Fixed, never reused.
+pub const SCAN_VALUE_NONE: u8 = 0;
+/// Wire tags for [`ScanValueBody`]. Fixed, never reused.
+pub const SCAN_VALUE_INLINE: u8 = 1;
+/// Wire tags for [`ScanValueBody`]. Fixed, never reused.
+pub const SCAN_VALUE_COUNTER: u8 = 2;
+/// Wire tags for [`ScanValueBody`]. Fixed, never reused.
+pub const SCAN_VALUE_CHUNKED: u8 = 3;
+/// Wire tags for [`ScanValueBody`]. Fixed, never reused.
+pub const SCAN_VALUE_OVERSIZE: u8 = 4;
+
 /// One typed native request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
@@ -448,17 +615,45 @@ pub struct Request {
     /// Client acknowledgement watermark for the identity's session
     /// (meaningful only alongside `identity`; zero otherwise).
     pub ack_floor: RequestSeq,
+    /// Scan start, inclusive (`None` = first key; `Scan` only).
+    pub scan_start: Option<Vec<u8>>,
+    /// Scan end, exclusive (`None` = last key; `Scan` only).
+    pub scan_end: Option<Vec<u8>>,
+    /// Scan direction ([`SCAN_FORWARD`] / [`SCAN_REVERSE`]; `Scan` only).
+    pub scan_direction: u8,
+    /// Maximum entries per page (`Scan` only).
+    pub scan_max_items: u32,
+    /// Budget for inline value bytes per page (`Scan` only).
+    pub scan_max_bytes: u32,
+    /// Projection ([`SCAN_KEYS_ONLY`] / [`SCAN_KEYS_AND_VALUES`]).
+    pub scan_projection: u8,
+    /// Consistency ([`SCAN_LATEST_PER_TABLET`] / [`SCAN_ANY`]).
+    pub scan_consistency: u8,
+    /// Client-minted transaction id (stable across transport retries;
+    /// fresh per OCC attempt; `AtomicBatch` only).
+    pub batch_txn: [u8; 16],
+    /// Writes in the batch (`AtomicBatch` only, bound enforced server-side).
+    pub batch_writes: Vec<BatchWrite>,
+    /// Coordinator tablet for one prepare (`TxnPrepare` only).
+    pub txn_coordinator: u64,
+    /// Whether to apply (`true`) or discard (`false`) the intent
+    /// (`TxnFinalize` only).
+    pub txn_commit: bool,
 }
 
 impl Request {
-    /// Translates into the project-owned typed operation. Total: every
+    /// Translates into the project-owned typed operation. Returns `None`
+    /// for [`Scan`](Opcode::Scan) and [`AtomicBatch`](Opcode::AtomicBatch):
+    /// those dispatch on their dedicated payloads before operation
+    /// translation (a scan has no single key; a batch has many), so forcing
+    /// them through a single-key operation would misroute. Every other
     /// decodable request maps to exactly one operation.
     #[must_use]
     #[allow(clippy::too_many_lines)]
-    pub fn into_operation(self) -> Operation {
+    pub fn into_operation(self) -> Option<Operation> {
         use kivi_state::{ExpiryPolicy, SetCondition};
         let key = Key::from(self.key);
-        match self.opcode {
+        let operation = match self.opcode {
             // A stream read executes the same read as `Get`; the opcode
             // only changes the delivery shape (`ValueStream*` frames
             // instead of one response frame), so translation stays total
@@ -492,6 +687,7 @@ impl Request {
                 len: self.len,
             },
             Opcode::BytesLength => Operation::BytesLength { key },
+            Opcode::GetVersion => Operation::GetVersion { key },
             Opcode::SetConditional => {
                 let condition = match self.condition {
                     COND_IF_ABSENT => SetCondition::IfAbsent,
@@ -510,7 +706,46 @@ impl Request {
                     expiry,
                 }
             }
-        }
+            Opcode::Scan | Opcode::AtomicBatch => return None,
+            Opcode::TxnPrepare => {
+                if self.batch_writes.len() != 1 {
+                    return None;
+                }
+                let write = &self.batch_writes[0];
+                let kind = match write.kind {
+                    BATCH_PUT => {
+                        kivi_state::TxnWriteKind::Put(bytes::Bytes::from(write.value.clone()))
+                    }
+                    BATCH_DELETE => kivi_state::TxnWriteKind::Delete,
+                    BATCH_COUNTER_ADD => kivi_state::TxnWriteKind::CounterAdd(write.delta),
+                    _ => return None,
+                };
+                let expect = match write.expect {
+                    BATCH_EXPECT_ABSENT => kivi_state::TxnExpect::Absent,
+                    BATCH_EXPECT_VERSION => kivi_state::TxnExpect::Version(
+                        kivi_state::ObjectVersion::from_u64(write.expect_version),
+                    ),
+                    _ => kivi_state::TxnExpect::Any,
+                };
+                return Some(Operation::TxnPrepare {
+                    txn: kivi_state::TxnId::from_bytes(self.batch_txn),
+                    coordinator: TabletId::from_u64(self.txn_coordinator),
+                    write: kivi_state::TxnWrite {
+                        key: Key::from(write.key.clone()),
+                        kind,
+                        expect,
+                    },
+                });
+            }
+            Opcode::TxnFinalize => {
+                return Some(Operation::TxnFinalize {
+                    txn: kivi_state::TxnId::from_bytes(self.batch_txn),
+                    key,
+                    commit: self.txn_commit,
+                });
+            }
+        };
+        Some(operation)
     }
 }
 
@@ -536,9 +771,14 @@ pub fn operation_opcode(operation: &Operation) -> Opcode {
         Operation::SetRange { .. } => Opcode::SetRange,
         Operation::GetRange { .. } => Opcode::GetRange,
         Operation::BytesLength { .. } => Opcode::BytesLength,
+        Operation::GetVersion { .. } => Opcode::GetVersion,
         Operation::SetConditional { .. } | Operation::SetConditionalChunked { .. } => {
             Opcode::SetConditional
         }
+        // Transaction steps ride the normal propose path with dedup and
+        // response shaping; each shapes as its own opcode.
+        Operation::TxnPrepare { .. } => Opcode::TxnPrepare,
+        Operation::TxnFinalize { .. } => Opcode::TxnFinalize,
     }
 }
 
@@ -586,11 +826,54 @@ pub enum ResponseBody {
     ExpiryNever,
     /// Logical byte length (pairs with `BytesLength`).
     Length(u64),
+    /// Logical version (pairs with `GetVersion`).
+    Version(u64),
     /// Conditional-store outcome (pairs with `SetConditional`).
     ConditionalSet {
         /// Whether the condition held and the value was stored.
         applied: bool,
         /// Version after the store (zero when not applied).
+        version: u64,
+    },
+    /// One bounded scan page (pairs with `Scan`).
+    ScanPage {
+        /// Entries in scan order.
+        entries: Vec<ScanEntryBody>,
+        /// Whether no further keys remain in the range in scan order.
+        exhausted: bool,
+        /// Last emitted key, if any (cursor resume point).
+        last_key: Option<Vec<u8>>,
+        /// Serving tablet (route hint for the next page; hints never
+        /// authorize, the server re-routes every page by key).
+        tablet: u64,
+        /// Serving tablet's range start (inclusive).
+        range_start: Vec<u8>,
+        /// Serving tablet's range end (exclusive; `None` = `+∞`).
+        range_end: Option<Vec<u8>>,
+        /// Serving directory version (staleness hint only).
+        dir_version: u64,
+    },
+    /// Atomic batch committed (pairs with `AtomicBatch`): one version per
+    /// write in request order (`None` for deletes, which carry no version).
+    AtomicCommitted {
+        /// Resulting versions in request order.
+        versions: Vec<Option<u64>>,
+    },
+    /// Transaction intent reserved (pairs with `TxnPrepare`). Carries the
+    /// serving tablet so drivers learn key → tablet placement without
+    /// extra probes.
+    TxnPrepared {
+        /// Serving tablet that reserved the intent.
+        tablet: u64,
+        /// Serving directory version (staleness hint only).
+        dir_version: u64,
+    },
+    /// One key's transaction intent resolved (pairs with `TxnFinalize`).
+    TxnFinalized {
+        /// Whether a prepared write was applied (`false` for aborts and
+        /// idempotent replays with no intent left).
+        applied: bool,
+        /// Version after the applied write (zero when nothing applied).
         version: u64,
     },
     /// Retry directly at the attached authority.
@@ -935,6 +1218,7 @@ impl RedirectInfo {
 impl Request {
     /// Encodes one request payload (framing header added by the caller).
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(32 + self.key.len());
         push_u64(&mut out, self.namespace.as_u64());
@@ -971,6 +1255,64 @@ impl Request {
                 }
                 push_blob(&mut out, self.value.as_deref().unwrap_or_default());
             }
+            Opcode::Scan => {
+                match &self.scan_start {
+                    None => push_u8(&mut out, 0),
+                    Some(start) => {
+                        push_u8(&mut out, 1);
+                        push_blob(&mut out, start);
+                    }
+                }
+                match &self.scan_end {
+                    None => push_u8(&mut out, 0),
+                    Some(end) => {
+                        push_u8(&mut out, 1);
+                        push_blob(&mut out, end);
+                    }
+                }
+                push_u8(&mut out, self.scan_direction);
+                push_u32(&mut out, self.scan_max_items);
+                push_u32(&mut out, self.scan_max_bytes);
+                push_u8(&mut out, self.scan_projection);
+                push_u8(&mut out, self.scan_consistency);
+            }
+            Opcode::AtomicBatch => {
+                out.extend_from_slice(&self.batch_txn);
+                push_u16(
+                    &mut out,
+                    u16::try_from(self.batch_writes.len()).unwrap_or(u16::MAX),
+                );
+                for write in &self.batch_writes {
+                    push_blob(&mut out, &write.key);
+                    push_u8(&mut out, write.kind);
+                    push_blob(&mut out, &write.value);
+                    push_i64(&mut out, write.delta);
+                    push_u8(&mut out, write.expect);
+                    push_u64(&mut out, write.expect_version);
+                }
+            }
+            Opcode::TxnPrepare => {
+                // One prepare carries exactly one write: the batch tail
+                // with a single entry plus the coordinator.
+                out.extend_from_slice(&self.batch_txn);
+                push_u64(&mut out, self.txn_coordinator);
+                push_u16(
+                    &mut out,
+                    u16::try_from(self.batch_writes.len()).unwrap_or(u16::MAX),
+                );
+                for write in &self.batch_writes {
+                    push_blob(&mut out, &write.key);
+                    push_u8(&mut out, write.kind);
+                    push_blob(&mut out, &write.value);
+                    push_i64(&mut out, write.delta);
+                    push_u8(&mut out, write.expect);
+                    push_u64(&mut out, write.expect_version);
+                }
+            }
+            Opcode::TxnFinalize => {
+                out.extend_from_slice(&self.batch_txn);
+                push_u8(&mut out, u8::from(self.txn_commit));
+            }
             Opcode::Get
             | Opcode::Delete
             | Opcode::Exists
@@ -978,6 +1320,7 @@ impl Request {
             | Opcode::PersistExpiry
             | Opcode::GetExpiry
             | Opcode::GetStream
+            | Opcode::GetVersion
             | Opcode::BytesLength => {}
         }
         // Retry identity rides last so pre-identity decoders fail cleanly on
@@ -1002,6 +1345,7 @@ impl Request {
     /// Returns [`ProtocolError`] on unknown opcodes, truncation, trailing
     /// bytes, or non-UTF-8 where strings are required (none here — keys
     /// stay byte-exact).
+    #[allow(clippy::too_many_lines)]
     pub fn decode(input: &[u8]) -> Result<Self, ProtocolError> {
         const CONTEXT: &str = "request";
         let mut cursor = Cursor::new(input);
@@ -1033,6 +1377,17 @@ impl Request {
             expiry_policy: EXPIRY_CLEAR,
             identity: None,
             ack_floor: RequestSeq::from_u64(0),
+            scan_start: None,
+            scan_end: None,
+            scan_direction: SCAN_FORWARD,
+            scan_max_items: 0,
+            scan_max_bytes: 0,
+            scan_projection: SCAN_KEYS_ONLY,
+            scan_consistency: SCAN_LATEST_PER_TABLET,
+            batch_txn: [0u8; 16],
+            batch_writes: Vec::new(),
+            txn_coordinator: 0,
+            txn_commit: false,
         };
         match opcode {
             Opcode::Set => {
@@ -1072,6 +1427,67 @@ impl Request {
                 }
                 request.value = Some(cursor.blob(CONTEXT)?.to_vec());
             }
+            Opcode::Scan => {
+                request.scan_start = match cursor.u8(CONTEXT)? {
+                    0 => None,
+                    1 => Some(cursor.blob(CONTEXT)?.to_vec()),
+                    _ => return Err(ProtocolError::Malformed { context: CONTEXT }),
+                };
+                request.scan_end = match cursor.u8(CONTEXT)? {
+                    0 => None,
+                    1 => Some(cursor.blob(CONTEXT)?.to_vec()),
+                    _ => return Err(ProtocolError::Malformed { context: CONTEXT }),
+                };
+                request.scan_direction = cursor.u8(CONTEXT)?;
+                if !matches!(request.scan_direction, SCAN_FORWARD | SCAN_REVERSE) {
+                    return Err(ProtocolError::Malformed { context: CONTEXT });
+                }
+                request.scan_max_items = cursor.u32(CONTEXT)?;
+                request.scan_max_bytes = cursor.u32(CONTEXT)?;
+                request.scan_projection = cursor.u8(CONTEXT)?;
+                if !matches!(
+                    request.scan_projection,
+                    SCAN_KEYS_ONLY | SCAN_KEYS_AND_VALUES
+                ) {
+                    return Err(ProtocolError::Malformed { context: CONTEXT });
+                }
+                request.scan_consistency = cursor.u8(CONTEXT)?;
+                if !matches!(request.scan_consistency, SCAN_LATEST_PER_TABLET | SCAN_ANY) {
+                    return Err(ProtocolError::Malformed { context: CONTEXT });
+                }
+            }
+            Opcode::AtomicBatch => {
+                let raw = cursor.take(16, CONTEXT)?;
+                request.batch_txn = raw
+                    .try_into()
+                    .map_err(|_| ProtocolError::Malformed { context: CONTEXT })?;
+                request.batch_writes = decode_batch_writes(&mut cursor, 4096)?;
+            }
+            Opcode::TxnPrepare => {
+                let raw = cursor.take(16, CONTEXT)?;
+                request.batch_txn = raw
+                    .try_into()
+                    .map_err(|_| ProtocolError::Malformed { context: CONTEXT })?;
+                request.txn_coordinator = cursor.u64(CONTEXT)?;
+                // One prepare reserves exactly one key: the batch tail
+                // carries a single entry, never a set.
+                let writes = decode_batch_writes(&mut cursor, 1)?;
+                if writes.len() != 1 {
+                    return Err(ProtocolError::Malformed { context: CONTEXT });
+                }
+                request.batch_writes = writes;
+            }
+            Opcode::TxnFinalize => {
+                let raw = cursor.take(16, CONTEXT)?;
+                request.batch_txn = raw
+                    .try_into()
+                    .map_err(|_| ProtocolError::Malformed { context: CONTEXT })?;
+                request.txn_commit = match cursor.u8(CONTEXT)? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(ProtocolError::Malformed { context: CONTEXT }),
+                };
+            }
             Opcode::Get
             | Opcode::Delete
             | Opcode::Exists
@@ -1079,6 +1495,7 @@ impl Request {
             | Opcode::PersistExpiry
             | Opcode::GetExpiry
             | Opcode::GetStream
+            | Opcode::GetVersion
             | Opcode::BytesLength => {}
         }
         // Identity suffix: absent on pre-identity encodings (exact end),
@@ -1105,13 +1522,16 @@ impl Response {
     /// Encodes one response payload. The opcode travels alongside the status
     /// so decoders never guess the body shape from connection state.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn encode(&self, opcode: Opcode) -> Vec<u8> {
         let mut out = Vec::with_capacity(32);
         push_u16(&mut out, self.status.as_u16());
         push_u8(&mut out, opcode.as_u8());
         match &self.body {
             ResponseBody::Value(value) => push_blob(&mut out, value),
-            ResponseBody::Stored { version } => push_u64(&mut out, *version),
+            ResponseBody::Stored { version } | ResponseBody::Version(version) => {
+                push_u64(&mut out, *version);
+            }
             ResponseBody::Deleted { existed } => push_u8(&mut out, u8::from(*existed)),
             ResponseBody::Exists(present) => push_u8(&mut out, u8::from(*present)),
             ResponseBody::Counter(value) => push_i64(&mut out, *value),
@@ -1129,9 +1549,84 @@ impl Response {
                 push_u8(&mut out, 0);
             }
             ResponseBody::Length(len) => push_u64(&mut out, *len),
-            ResponseBody::ConditionalSet { applied, version } => {
+            ResponseBody::ConditionalSet { applied, version }
+            | ResponseBody::TxnFinalized { applied, version } => {
                 push_u8(&mut out, u8::from(*applied));
                 push_u64(&mut out, *version);
+            }
+            ResponseBody::ScanPage {
+                entries,
+                exhausted,
+                last_key,
+                tablet,
+                range_start,
+                range_end,
+                dir_version,
+            } => {
+                push_u32(&mut out, u32::try_from(entries.len()).unwrap_or(u32::MAX));
+                for entry in entries {
+                    push_blob(&mut out, &entry.key);
+                    match &entry.value {
+                        ScanValueBody::None => push_u8(&mut out, SCAN_VALUE_NONE),
+                        ScanValueBody::Inline(bytes) => {
+                            push_u8(&mut out, SCAN_VALUE_INLINE);
+                            push_blob(&mut out, bytes);
+                        }
+                        ScanValueBody::Counter(counter) => {
+                            push_u8(&mut out, SCAN_VALUE_COUNTER);
+                            push_i64(&mut out, *counter);
+                        }
+                        ScanValueBody::Chunked {
+                            manifest,
+                            logical_len,
+                        } => {
+                            push_u8(&mut out, SCAN_VALUE_CHUNKED);
+                            out.extend_from_slice(manifest);
+                            push_u64(&mut out, *logical_len);
+                        }
+                        ScanValueBody::Oversize { logical_len } => {
+                            push_u8(&mut out, SCAN_VALUE_OVERSIZE);
+                            push_u64(&mut out, *logical_len);
+                        }
+                    }
+                }
+                push_u8(&mut out, u8::from(*exhausted));
+                match last_key {
+                    None => push_u8(&mut out, 0),
+                    Some(key) => {
+                        push_u8(&mut out, 1);
+                        push_blob(&mut out, key);
+                    }
+                }
+                push_u64(&mut out, *tablet);
+                push_blob(&mut out, range_start);
+                match range_end {
+                    None => push_u8(&mut out, 0),
+                    Some(end) => {
+                        push_u8(&mut out, 1);
+                        push_blob(&mut out, end);
+                    }
+                }
+                push_u64(&mut out, *dir_version);
+            }
+            ResponseBody::AtomicCommitted { versions } => {
+                push_u16(&mut out, u16::try_from(versions.len()).unwrap_or(u16::MAX));
+                for version in versions {
+                    match version {
+                        None => push_u8(&mut out, 0),
+                        Some(version) => {
+                            push_u8(&mut out, 1);
+                            push_u64(&mut out, *version);
+                        }
+                    }
+                }
+            }
+            ResponseBody::TxnPrepared {
+                tablet,
+                dir_version,
+            } => {
+                push_u64(&mut out, *tablet);
+                push_u64(&mut out, *dir_version);
             }
             ResponseBody::Redirect(info) => out.extend_from_slice(&info.encode()),
             ResponseBody::Diagnostic(message) => {
@@ -1148,6 +1643,7 @@ impl Response {
     ///
     /// Returns [`ProtocolError`] on unknown statuses/opcodes, truncation,
     /// trailing bytes, or shapes inconsistent with the status/opcode pair.
+    #[allow(clippy::too_many_lines)]
     pub fn decode(input: &[u8]) -> Result<(Self, Opcode), ProtocolError> {
         const CONTEXT: &str = "response";
         let mut cursor = Cursor::new(input);
@@ -1164,6 +1660,7 @@ impl Response {
                     version: cursor.u64(CONTEXT)?,
                 },
                 Opcode::BytesLength => ResponseBody::Length(cursor.u64(CONTEXT)?),
+                Opcode::GetVersion => ResponseBody::Version(cursor.u64(CONTEXT)?),
                 Opcode::SetConditional => ResponseBody::ConditionalSet {
                     applied: flag(&mut cursor)?,
                     version: cursor.u64(CONTEXT)?,
@@ -1195,6 +1692,85 @@ impl Response {
                     1 => ResponseBody::ExpiryAt(cursor.u64(CONTEXT)?),
                     _ => return Err(ProtocolError::Malformed { context: CONTEXT }),
                 },
+                Opcode::Scan => {
+                    let count = cursor.u32(CONTEXT)? as usize;
+                    if count > 100_000 {
+                        return Err(ProtocolError::Malformed { context: CONTEXT });
+                    }
+                    let mut entries = Vec::with_capacity(count.min(1024));
+                    for _ in 0..count {
+                        let key = cursor.blob(CONTEXT)?.to_vec();
+                        let value = match cursor.u8(CONTEXT)? {
+                            SCAN_VALUE_NONE => ScanValueBody::None,
+                            SCAN_VALUE_INLINE => {
+                                ScanValueBody::Inline(cursor.blob(CONTEXT)?.to_vec())
+                            }
+                            SCAN_VALUE_COUNTER => ScanValueBody::Counter(cursor.i64(CONTEXT)?),
+                            SCAN_VALUE_CHUNKED => {
+                                let raw = cursor.take(32, CONTEXT)?;
+                                let manifest: [u8; 32] = raw
+                                    .try_into()
+                                    .map_err(|_| ProtocolError::Malformed { context: CONTEXT })?;
+                                let logical_len = cursor.u64(CONTEXT)?;
+                                ScanValueBody::Chunked {
+                                    manifest,
+                                    logical_len,
+                                }
+                            }
+                            SCAN_VALUE_OVERSIZE => ScanValueBody::Oversize {
+                                logical_len: cursor.u64(CONTEXT)?,
+                            },
+                            _ => return Err(ProtocolError::Malformed { context: CONTEXT }),
+                        };
+                        entries.push(ScanEntryBody { key, value });
+                    }
+                    let exhausted = flag(&mut cursor)?;
+                    let last_key = match cursor.u8(CONTEXT)? {
+                        0 => None,
+                        1 => Some(cursor.blob(CONTEXT)?.to_vec()),
+                        _ => return Err(ProtocolError::Malformed { context: CONTEXT }),
+                    };
+                    let tablet = cursor.u64(CONTEXT)?;
+                    let range_start = cursor.blob(CONTEXT)?.to_vec();
+                    let range_end = match cursor.u8(CONTEXT)? {
+                        0 => None,
+                        1 => Some(cursor.blob(CONTEXT)?.to_vec()),
+                        _ => return Err(ProtocolError::Malformed { context: CONTEXT }),
+                    };
+                    let dir_version = cursor.u64(CONTEXT)?;
+                    ResponseBody::ScanPage {
+                        entries,
+                        exhausted,
+                        last_key,
+                        tablet,
+                        range_start,
+                        range_end,
+                        dir_version,
+                    }
+                }
+                Opcode::AtomicBatch => {
+                    let count = cursor.u16(CONTEXT)? as usize;
+                    if count > 4096 {
+                        return Err(ProtocolError::Malformed { context: CONTEXT });
+                    }
+                    let mut versions = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        versions.push(match cursor.u8(CONTEXT)? {
+                            0 => None,
+                            1 => Some(cursor.u64(CONTEXT)?),
+                            _ => return Err(ProtocolError::Malformed { context: CONTEXT }),
+                        });
+                    }
+                    ResponseBody::AtomicCommitted { versions }
+                }
+                Opcode::TxnPrepare => ResponseBody::TxnPrepared {
+                    tablet: cursor.u64(CONTEXT)?,
+                    dir_version: cursor.u64(CONTEXT)?,
+                },
+                Opcode::TxnFinalize => ResponseBody::TxnFinalized {
+                    applied: flag(&mut cursor)?,
+                    version: cursor.u64(CONTEXT)?,
+                },
             },
             Status::NotFound => match opcode {
                 Opcode::Get
@@ -1202,6 +1778,7 @@ impl Response {
                 | Opcode::GetExpiry
                 | Opcode::GetStream
                 | Opcode::GetRange
+                | Opcode::GetVersion
                 | Opcode::BytesLength => {
                     let len = cursor.u16(CONTEXT)? as usize;
                     let bytes = cursor.take(len, CONTEXT)?;
@@ -1232,6 +1809,48 @@ fn flag(cursor: &mut Cursor<'_>) -> Result<bool, ProtocolError> {
         1 => Ok(true),
         _ => Err(ProtocolError::Malformed { context: "flag" }),
     }
+}
+
+/// Decodes one batch write list: `u16` count plus per-write
+/// `(key, kind, value, delta, expect, expect_version)`. The count is capped
+/// at `max` (framing-level allocation bound; servers enforce the tighter
+/// transaction bound), so decoders never allocate blindly.
+fn decode_batch_writes(
+    cursor: &mut Cursor<'_>,
+    max: usize,
+) -> Result<Vec<BatchWrite>, ProtocolError> {
+    const CONTEXT: &str = "request";
+    let count = cursor.u16(CONTEXT)? as usize;
+    if count > max {
+        return Err(ProtocolError::Malformed { context: CONTEXT });
+    }
+    let mut writes = Vec::with_capacity(count);
+    for _ in 0..count {
+        let key = cursor.blob(CONTEXT)?.to_vec();
+        let kind = cursor.u8(CONTEXT)?;
+        if !matches!(kind, BATCH_PUT | BATCH_DELETE | BATCH_COUNTER_ADD) {
+            return Err(ProtocolError::Malformed { context: CONTEXT });
+        }
+        let value = cursor.blob(CONTEXT)?.to_vec();
+        let delta = cursor.i64(CONTEXT)?;
+        let expect = cursor.u8(CONTEXT)?;
+        if !matches!(
+            expect,
+            BATCH_EXPECT_ANY | BATCH_EXPECT_ABSENT | BATCH_EXPECT_VERSION
+        ) {
+            return Err(ProtocolError::Malformed { context: CONTEXT });
+        }
+        let expect_version = cursor.u64(CONTEXT)?;
+        writes.push(BatchWrite {
+            key,
+            kind,
+            value,
+            delta,
+            expect,
+            expect_version,
+        });
+    }
+    Ok(writes)
 }
 
 /// V1 streaming-upload bound: 1 GiB per stream (1024 chunks at the
@@ -1483,6 +2102,81 @@ mod tests {
                 RequestSeq::from_u64(41),
             )),
             ack_floor: RequestSeq::from_u64(40),
+            scan_start: Some(b"a".to_vec()),
+            scan_end: Some(b"z".to_vec()),
+            scan_direction: SCAN_FORWARD,
+            scan_max_items: 100,
+            scan_max_bytes: 65536,
+            scan_projection: SCAN_KEYS_AND_VALUES,
+            scan_consistency: SCAN_LATEST_PER_TABLET,
+            batch_txn: [0xAB; 16],
+            batch_writes: vec![BatchWrite {
+                key: b"k1".to_vec(),
+                kind: BATCH_PUT,
+                value: b"v1".to_vec(),
+                delta: 0,
+                expect: BATCH_EXPECT_ANY,
+                expect_version: 0,
+            }],
+            txn_coordinator: 0,
+            txn_commit: false,
+        }
+    }
+
+    #[test]
+    fn txn_prepare_finalize_round_trip() {
+        let mut prepare = request(Opcode::TxnPrepare);
+        prepare.txn_coordinator = 9;
+        let encoded = prepare.encode();
+        let decoded = Request::decode(&encoded).expect("round trip");
+        assert_eq!(decoded.opcode, Opcode::TxnPrepare);
+        assert_eq!(decoded.batch_txn, [0xAB; 16]);
+        assert_eq!(decoded.txn_coordinator, 9);
+        assert_eq!(decoded.batch_writes.len(), 1);
+        let op = decoded.into_operation().expect("translatable");
+        assert!(matches!(op, Operation::TxnPrepare { .. }));
+        // A prepare carrying zero or two writes is malformed (exactly one).
+        let mut multi = request(Opcode::TxnPrepare);
+        multi.batch_writes.push(BatchWrite {
+            key: b"k2".to_vec(),
+            kind: BATCH_DELETE,
+            value: Vec::new(),
+            delta: 0,
+            expect: BATCH_EXPECT_ANY,
+            expect_version: 0,
+        });
+        assert!(Request::decode(&multi.encode()).is_err());
+        // Finalize carries key + commit flag.
+        let mut finalize = request(Opcode::TxnFinalize);
+        finalize.txn_commit = true;
+        let decoded = Request::decode(&finalize.encode()).expect("round trip");
+        assert!(decoded.txn_commit);
+        let op = decoded.into_operation().expect("translatable");
+        assert!(matches!(op, Operation::TxnFinalize { commit: true, .. }));
+        // Txn responses shape as their own opcodes.
+        for (opcode, body) in [
+            (
+                Opcode::TxnPrepare,
+                ResponseBody::TxnPrepared {
+                    tablet: 4,
+                    dir_version: 12,
+                },
+            ),
+            (
+                Opcode::TxnFinalize,
+                ResponseBody::TxnFinalized {
+                    applied: true,
+                    version: 5,
+                },
+            ),
+        ] {
+            let response = Response {
+                status: Status::Ok,
+                body,
+            };
+            let (decoded, back) = Response::decode(&response.encode(opcode)).expect("round trip");
+            assert_eq!(back, opcode);
+            assert_eq!(decoded, response);
         }
     }
 
@@ -1500,7 +2194,10 @@ mod tests {
     #[case(Opcode::GetStream)]
     #[case(Opcode::GetRange)]
     #[case(Opcode::BytesLength)]
+    #[case(Opcode::GetVersion)]
     #[case(Opcode::SetConditional)]
+    #[case(Opcode::Scan)]
+    #[case(Opcode::AtomicBatch)]
     fn every_operation_round_trips(#[case] opcode: Opcode) {
         let encoded = request(opcode).encode();
         let decoded = Request::decode(&encoded).expect("round trip");
@@ -1513,8 +2210,27 @@ mod tests {
             RequestSeq::from_u64(41)
         );
         assert_eq!(decoded.ack_floor, RequestSeq::from_u64(40));
-        // Operation translation is total and typed.
-        let op = decoded.into_operation();
+        // Operation translation is total and typed for single-key opcodes;
+        // Scan and AtomicBatch dispatch on dedicated payloads instead.
+        if matches!(opcode, Opcode::Scan | Opcode::AtomicBatch) {
+            assert_eq!(decoded.clone().into_operation(), None);
+            if opcode == Opcode::Scan {
+                assert_eq!(decoded.scan_start, Some(b"a".to_vec()));
+                assert_eq!(decoded.scan_end, Some(b"z".to_vec()));
+                assert_eq!(decoded.scan_direction, SCAN_FORWARD);
+                assert_eq!(decoded.scan_max_items, 100);
+                assert_eq!(decoded.scan_max_bytes, 65536);
+                assert_eq!(decoded.scan_projection, SCAN_KEYS_AND_VALUES);
+                assert_eq!(decoded.scan_consistency, SCAN_LATEST_PER_TABLET);
+            } else {
+                assert_eq!(decoded.batch_txn, [0xAB; 16]);
+                assert_eq!(decoded.batch_writes.len(), 1);
+                assert_eq!(decoded.batch_writes[0].key, b"k1");
+                assert_eq!(decoded.batch_writes[0].kind, BATCH_PUT);
+            }
+            return;
+        }
+        let op = decoded.into_operation().expect("translatable");
         match opcode {
             Opcode::Get => assert!(matches!(op, Operation::Get { .. })),
             Opcode::Set => assert!(matches!(op, Operation::Set { .. })),
@@ -1539,6 +2255,7 @@ mod tests {
                 assert_eq!(len, 19);
             }
             Opcode::BytesLength => assert!(matches!(op, Operation::BytesLength { .. })),
+            Opcode::GetVersion => assert!(matches!(op, Operation::GetVersion { .. })),
             Opcode::SetConditional => {
                 let Operation::SetConditional {
                     condition, expiry, ..
@@ -1551,6 +2268,12 @@ mod tests {
             }
             // GetStream executes the same read as Get; only delivery differs.
             Opcode::GetStream => assert!(matches!(op, Operation::Get { .. })),
+            Opcode::TxnPrepare => assert!(matches!(op, Operation::TxnPrepare { .. })),
+            Opcode::TxnFinalize => assert!(matches!(op, Operation::TxnFinalize { .. })),
+            // Scan and AtomicBatch return early above (no Operation).
+            Opcode::Scan | Opcode::AtomicBatch => {
+                panic!("scan/batch translate to no operation")
+            }
         }
     }
 
@@ -1600,13 +2323,23 @@ mod tests {
     #[case(Status::Internal)]
     #[case(Status::DedupExpired)]
     #[case(Status::SessionOverloaded)]
+    #[case(Status::TxnConflict)]
+    #[case(Status::TxnAborted)]
+    #[case(Status::TxnTooLarge)]
+    #[case(Status::TxnCoordinatorUnavailable)]
+    #[case(Status::UniqueViolation)]
+    #[case(Status::ScanCursorStale)]
     fn every_status_round_trips(#[case] status: Status) {
         assert_eq!(Status::from_u16(status.as_u16()), Some(status));
         assert_eq!(
             status.is_retriable(),
             matches!(
                 status,
-                Status::StaleRoute | Status::NotLocal | Status::Overloaded
+                Status::StaleRoute
+                    | Status::NotLocal
+                    | Status::Overloaded
+                    | Status::TxnCoordinatorUnavailable
+                    | Status::ScanCursorStale
             )
         );
     }
@@ -1718,6 +2451,27 @@ mod tests {
                 ResponseBody::ExpiryPersisted { removed: false },
             ),
             (Opcode::GetExpiry, ResponseBody::ExpiryAt(99)),
+            (
+                Opcode::Scan,
+                ResponseBody::ScanPage {
+                    entries: vec![ScanEntryBody {
+                        key: b"k".to_vec(),
+                        value: ScanValueBody::Inline(b"v".to_vec()),
+                    }],
+                    exhausted: true,
+                    last_key: Some(b"k".to_vec()),
+                    tablet: 3,
+                    range_start: b"a".to_vec(),
+                    range_end: Some(b"z".to_vec()),
+                    dir_version: 11,
+                },
+            ),
+            (
+                Opcode::AtomicBatch,
+                ResponseBody::AtomicCommitted {
+                    versions: vec![Some(3), None],
+                },
+            ),
         ];
         for (opcode, body) in bodies {
             let response = Response {
@@ -1750,6 +2504,18 @@ mod tests {
         let (decoded, opcode) = Response::decode(&missing.encode(Opcode::CounterGet)).expect("404");
         assert_eq!(decoded.status, Status::NotFound);
         assert_eq!(opcode, Opcode::CounterGet);
+        // Versions share the missing shape (absent keys read no version).
+        let (decoded, opcode) = Response::decode(&missing.encode(Opcode::GetVersion)).expect("404");
+        assert_eq!(decoded.status, Status::NotFound);
+        assert_eq!(opcode, Opcode::GetVersion);
+        let versioned = Response {
+            status: Status::Ok,
+            body: ResponseBody::Version(41),
+        };
+        let (decoded, opcode) =
+            Response::decode(&versioned.encode(Opcode::GetVersion)).expect("ok");
+        assert_eq!(decoded, versioned);
+        assert_eq!(opcode, Opcode::GetVersion);
     }
 
     #[test]

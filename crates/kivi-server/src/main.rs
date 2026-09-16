@@ -11,6 +11,7 @@
 
 mod admin;
 mod cluster;
+mod compound;
 mod control;
 mod logging;
 #[cfg(feature = "redis-compat")]
@@ -30,7 +31,7 @@ use kivi_engine::{
     LocalEngine, Placement, TurnBudget,
 };
 use kivi_state::PartitionHasher;
-use kivi_tablet::{DirectorySnapshot, HashPrefix, PartitionRange};
+use kivi_tablet::DirectorySnapshot;
 use kivi_types::{
     ClusterId, NamespaceId, NodeId, NodeIncarnation, TabletEpoch, TabletId, WorkerId,
     WriteGuardGeneration,
@@ -60,6 +61,11 @@ struct Args {
     /// Tablet count: 1 (root) or a power of two for even top-bit splits.
     #[arg(long, default_value_t = 1, value_parser = parse_tablets)]
     tablets: usize,
+    /// Namespace physical layout: `hash` (point-lookup partitioning) or
+    /// `ordered` (range scans, secondary indexes). Applies to single-node
+    /// `--tablets` and cluster `--cluster-tablets` alike.
+    #[arg(long, default_value = "hash", value_parser = parse_layout)]
+    layout: String,
     /// CPU pinning: auto, none, or explicit cores like "0,2-4,7".
     #[arg(long, default_value = "auto", value_parser = parse_affinity)]
     pin: AffinityMode,
@@ -321,16 +327,17 @@ fn parse_cluster_workers(spec: &str) -> Result<usize, String> {
     Ok(count)
 }
 
-/// Parses the tablet count: 1 (root) or a power of two for even splits.
+/// Parses the tablet count: any nonzero count (hash tilings mix prefix
+/// lengths for non-powers of two; ordered tilings spread first-byte
+/// boundaries uniformly).
 fn parse_tablets(spec: &str) -> Result<usize, String> {
     let count: usize = spec
         .parse()
         .map_err(|_| format!("invalid tablet count {spec:?}"))?;
-    if count == 1 || (count.is_power_of_two() && count.trailing_zeros() > 0) {
-        Ok(count)
-    } else {
-        Err(format!("tablets must be 1 or a power of two, got {count}"))
+    if count == 0 {
+        return Err("tablet count must be nonzero".to_owned());
     }
+    Ok(count)
 }
 
 /// Parses the frame bound against the 64 MiB protocol ceiling.
@@ -349,71 +356,44 @@ fn parse_max_frame(spec: &str) -> Result<usize, String> {
     Ok(bound)
 }
 
-/// Builds an evenly split directory with `2^levels` active leaves plus a
-/// round-robin placement, using only validated directory transitions.
-fn even_split(levels: u32, workers: usize) -> (DirectorySnapshot, Placement) {
-    let mut next_id = 1u64;
-    let mut new_tablet = || {
-        next_id += 1;
-        TabletId::from_u64(next_id)
-    };
-    let genesis = DirectorySnapshot::bootstrap(
-        NS,
-        TabletId::from_u64(1),
-        PartitionRange::Hash(HashPrefix::new(0, 0).expect("root")),
-        TabletEpoch::INITIAL,
-        WriteGuardGeneration::INITIAL,
-    )
-    .expect("genesis");
-    let mut active = vec![TabletId::from_u64(1)];
-    let mut directory = genesis
-        .stage(TabletId::from_u64(1))
-        .and_then(|s| s.activate(TabletId::from_u64(1)))
-        .expect("root active");
-    for _ in 0..levels {
-        let mut next_active = Vec::with_capacity(active.len() * 2);
-        for parent in active {
-            let parent_range = match directory.get(parent).expect("parent").range() {
-                PartitionRange::Hash(prefix) => *prefix,
-                PartitionRange::Ordered(_) => panic!("even splits need the hash layout"),
-            };
-            let len = parent_range.prefix_len() + 1;
-            let left = new_tablet();
-            let right = new_tablet();
-            // The children differ in bit (len-1) from the top: left clears
-            // it, right sets it. Both stay canonical (low bits zero).
-            let half = 1u128 << (128 - len);
-            directory = directory
-                .allocate(
-                    left,
-                    PartitionRange::Hash(HashPrefix::new(parent_range.bits(), len).expect("left")),
-                    TabletEpoch::INITIAL,
-                    WriteGuardGeneration::INITIAL,
-                )
-                .and_then(|s| s.stage(left))
-                .expect("left staged");
-            directory = directory
-                .allocate(
-                    right,
-                    PartitionRange::Hash(
-                        HashPrefix::new(parent_range.bits() | half, len).expect("right"),
-                    ),
-                    TabletEpoch::INITIAL,
-                    WriteGuardGeneration::INITIAL,
-                )
-                .and_then(|s| s.stage(right))
-                .expect("right staged");
-            directory = directory.seal(parent).expect("seal parent");
-            directory = directory.activate(left).expect("activate left");
-            directory = directory.activate(right).expect("activate right");
-            directory = directory
-                .retire(parent, kivi_tablet::Redirect::new(vec![left, right]))
-                .expect("retire parent");
-            next_active.push(left);
-            next_active.push(right);
-        }
-        active = next_active;
+/// Parses the namespace layout flag.
+fn parse_layout(spec: &str) -> Result<String, String> {
+    match spec {
+        "hash" | "ordered" => Ok(spec.to_owned()),
+        _ => Err(format!(
+            "layout must be \"hash\" or \"ordered\", got {spec:?}"
+        )),
     }
+}
+
+/// Builds an ordered directory with `count` active tablets plus a
+/// round-robin placement. Initial boundaries spread the first key byte
+/// uniformly (`count` tablets → boundaries at `i * 256 / count`); the
+/// auto-split policy refines by data from there.
+fn even_split_ordered(count: usize, workers: usize) -> (DirectorySnapshot, Placement) {
+    assert!(count >= 1, "ordered tiling needs at least one tablet");
+    let mut split_keys = Vec::new();
+    for index in 1..count {
+        #[allow(clippy::cast_possible_truncation)]
+        let boundary = (index * 256 / count) as u8;
+        // Boundaries must be strictly increasing and nonzero (the first
+        // tile starts at empty): dedup guards degenerate counts.
+        if boundary != 0
+            && split_keys
+                .last()
+                .is_none_or(|last: &Vec<u8>| *last != vec![boundary])
+        {
+            split_keys.push(vec![boundary]);
+        }
+    }
+    let directory =
+        DirectorySnapshot::static_ordered_tiles(NS, &split_keys).expect("ordered tiling builds");
+    let active: Vec<TabletId> = directory
+        .tablets()
+        .iter()
+        .filter(|tablet| tablet.state().is_writable())
+        .map(kivi_tablet::TabletDescriptor::id)
+        .collect();
     let placement = Placement::new(
         active
             .iter()
@@ -587,8 +567,28 @@ fn main() -> anyhow::Result<()> {
     // The lock guard lives for the whole process: dropping it would
     // release the data directory to a second process mid-run.
     let (node, cluster, incarnation, durability, _data_dir_guard) = open_durability(&args)?;
-    let levels = args.tablets.trailing_zeros();
-    let (directory, placement) = even_split(levels, args.workers);
+    let (directory, placement) = if args.layout == "ordered" {
+        even_split_ordered(args.tablets.max(1), args.workers)
+    } else {
+        let directory = DirectorySnapshot::static_tiles(
+            NS,
+            args.tablets.max(1),
+            TabletEpoch::INITIAL,
+            WriteGuardGeneration::INITIAL,
+        )
+        .expect("hash tiling builds");
+        let active: Vec<TabletId> = directory
+            .tablets()
+            .iter()
+            .filter(|tablet| tablet.state().is_writable())
+            .map(kivi_tablet::TabletDescriptor::id)
+            .collect();
+        let placement =
+            Placement::new(active.iter().enumerate().map(|(index, tablet)| {
+                (*tablet, WorkerId::from_u64((index % args.workers) as u64))
+            }));
+        (directory, placement)
+    };
     let tablet_count = directory
         .tablets()
         .iter()
@@ -758,11 +758,11 @@ mod tests {
     }
 
     #[test]
-    fn tablet_count_parser_enforces_power_of_two() {
+    fn tablet_count_parser_accepts_any_nonzero_count() {
         assert_eq!(parse_tablets("1"), Ok(1));
         assert_eq!(parse_tablets("4"), Ok(4));
+        assert_eq!(parse_tablets("3"), Ok(3));
         assert!(parse_tablets("0").is_err());
-        assert!(parse_tablets("3").is_err());
         assert!(parse_tablets("lots").is_err());
     }
 
@@ -796,7 +796,19 @@ mod tests {
     #[test]
     fn server_args_reject_bad_input_without_panicking() {
         assert!(Args::try_parse_from(["kivi-server", "--pin", "banana"]).is_err());
-        assert!(Args::try_parse_from(["kivi-server", "--tablets", "6"]).is_err());
+        assert!(Args::try_parse_from(["kivi-server", "--tablets", "0"]).is_err());
+        assert!(Args::try_parse_from(["kivi-server", "--layout", "b-tree"]).is_err());
+    }
+
+    #[test]
+    fn layout_flag_selects_ordered_tiling() {
+        let args = Args::try_parse_from(["kivi-server", "--layout", "ordered", "--tablets", "4"])
+            .expect("args parse");
+        assert_eq!(args.layout, "ordered");
+        let (directory, _) = even_split_ordered(4, 2);
+        assert!(directory.ordered_coverage_complete());
+        assert_eq!(parse_layout("hash").expect("hash"), "hash");
+        assert_eq!(parse_layout("ordered").expect("ordered"), "ordered");
     }
 
     #[test]

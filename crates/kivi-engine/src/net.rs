@@ -50,7 +50,7 @@ use kivi_protocol::{
     Request, Response, ServerHello, StreamAbort, StreamBegin, StreamReady, ValueStreamBegin,
     encode_frame,
 };
-use kivi_state::{ExpiryPolicy, Key, Operation, OperationResult, PartitionHasher, SetCondition};
+use kivi_state::{ExpiryPolicy, Key, Operation, OperationResult, SetCondition};
 use kivi_types::{ClusterId, MutationIdentity, NodeId, NodeIncarnation, TabletId, WorkerId};
 
 use crate::affinity::{AffinityError, AffinityMode, pin_current_thread};
@@ -987,6 +987,9 @@ struct UploadState {
 struct OutboxEntry {
     request_id: u64,
     opcode: kivi_protocol::Opcode,
+    /// Owning tablet (response shaping for tablet-naming bodies such as
+    /// `TxnPrepared`, which drivers use for route learning).
+    tablet: TabletId,
     /// Whether this was a `GetStream` read: completions answer with
     /// `ValueStream*` frames instead of a single `Response`.
     streamed: bool,
@@ -1270,10 +1273,13 @@ impl Conn {
         if self.uploads.contains_key(&stream) {
             return self.abort_upload(stream, "stream id already in use").await;
         }
-        let hash = PartitionHasher::V1
-            .hash(begin.namespace, &begin.key)
-            .ok_or(ConnExit::Io)?;
-        let tablet = match self.route(hash) {
+        let routing = self.routing.load();
+        let Some(tablet) =
+            crate::compound::route_point_key(routing.directory(), begin.namespace, &begin.key)
+        else {
+            return self.abort_upload(stream, "no tablet covers key").await;
+        };
+        let tablet = match self.route_tablet(tablet) {
             Route::Execute(tablet) => tablet,
             Route::Redirect(info) => {
                 let endpoint = self
@@ -1483,8 +1489,15 @@ impl Conn {
                 .await
             }
             Some(Ok(result)) => {
-                self.respond_result(stream, kivi_protocol::Opcode::Set, &result, false, None)
-                    .await
+                self.respond_result(
+                    stream,
+                    kivi_protocol::Opcode::Set,
+                    tablet,
+                    &result,
+                    false,
+                    None,
+                )
+                .await
             }
             Some(Err(error)) => {
                 self.respond_op_error(stream, kivi_protocol::Opcode::Set, &error)
@@ -1494,6 +1507,7 @@ impl Conn {
     }
 
     /// Routes, executes, and answers one request directly on this worker.
+    #[allow(clippy::too_many_lines)]
     async fn handle_request(&mut self, request_id: u64, payload: &[u8]) -> Result<(), ConnExit> {
         use kivi_protocol::{Response, ResponseBody, Status};
         let request =
@@ -1511,10 +1525,66 @@ impl Conn {
                 )
                 .await;
         }
-        let hash = PartitionHasher::V1
-            .hash(namespace, &request.key)
-            .ok_or(ConnExit::Io)?;
-        let (tablet, owner) = match self.route(hash) {
+        // Compound requests (multi-key scans and batches) route by their
+        // dedicated payloads, never by hashing a single key.
+        if matches!(
+            request.opcode,
+            kivi_protocol::Opcode::Scan | kivi_protocol::Opcode::AtomicBatch
+        ) {
+            let routing = self.routing.load();
+            let endpoint_of = |worker: WorkerId| {
+                self.endpoints
+                    .load()
+                    .get(&worker)
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            let (response, opcode) = crate::compound::handle_compound(
+                &self.tablets,
+                &routing,
+                self.worker,
+                endpoint_of,
+                self.durability.as_ref(),
+                &request,
+            )
+            .await;
+            return self.respond(request_id, opcode, response).await;
+        }
+        // Index entries are maintained transactionally: direct single-key
+        // writes to the reserved index prefix are rejected (the coherent
+        // paths — `AtomicBatch` and `TxnPrepare` — bypass this check).
+        // Reads and scans still serve them (index queries are scans).
+        if is_direct_single_key_write(request.opcode) && kivi_state::is_index_key(&request.key) {
+            return self
+                .respond(
+                    request_id,
+                    request.opcode,
+                    Response {
+                        status: Status::InvalidRequest,
+                        body: ResponseBody::Diagnostic(
+                            "direct writes to index entries are forbidden; use indexed writes"
+                                .to_owned(),
+                        ),
+                    },
+                )
+                .await;
+        }
+        let routing = self.routing.load();
+        let Some(tablet) =
+            crate::compound::route_point_key(routing.directory(), namespace, &request.key)
+        else {
+            return self
+                .respond(
+                    request_id,
+                    request.opcode,
+                    Response {
+                        status: Status::NotLocal,
+                        body: ResponseBody::Diagnostic("no tablet covers key".to_owned()),
+                    },
+                )
+                .await;
+        };
+        let (tablet, owner) = match self.route_tablet(tablet) {
             Route::Execute(tablet) => (tablet, self.worker),
             Route::Redirect(info) => {
                 let status = if info.worker == self.worker {
@@ -1592,7 +1662,23 @@ impl Conn {
         // though it executes the same read as `Get`.
         let requested = request.opcode;
         let streamed = requested == kivi_protocol::Opcode::GetStream;
-        let operation = request.into_operation();
+        // Scan and AtomicBatch never reach single-key translation (no
+        // single key to route); the connection-level dispatcher handles
+        // them before routing, so reaching here is a peer bug.
+        let Some(operation) = request.into_operation() else {
+            return self
+                .respond(
+                    request_id,
+                    requested,
+                    kivi_protocol::Response {
+                        status: kivi_protocol::Status::InvalidRequest,
+                        body: kivi_protocol::ResponseBody::Diagnostic(
+                            "untranslatable operation".to_owned(),
+                        ),
+                    },
+                )
+                .await;
+        };
         // Representation split on the owner: values over the threshold
         // stage (chunks, manifest, one sync barrier) before admission, so
         // the WAL only ever carries the small root. Range patches plan
@@ -1717,7 +1803,7 @@ impl Conn {
                     Operation::GetRange { offset, len, .. } => Some((*offset, *len)),
                     _ => None,
                 };
-                self.respond_result(request_id, requested, &result, streamed, range)
+                self.respond_result(request_id, requested, tablet, &result, streamed, range)
                     .await
             }
             Some(Err(error)) => self.respond_op_error(request_id, requested, &error).await,
@@ -1825,6 +1911,7 @@ impl Conn {
         &mut self,
         request_id: u64,
         opcode: kivi_protocol::Opcode,
+        tablet: TabletId,
         result: &OperationResult,
         streamed: bool,
         range: Option<(u64, u64)>,
@@ -1848,12 +1935,17 @@ impl Conn {
                         None => bytes,
                         Some((offset, len)) => kivi_state::slice_range(&bytes, offset, len),
                     };
-                    self.respond_ok(request_id, opcode, &OperationResult::Value(Some(value)))
-                        .await
+                    self.respond_ok(
+                        request_id,
+                        opcode,
+                        tablet,
+                        &OperationResult::Value(Some(value)),
+                    )
+                    .await
                 }
                 Err(error) => self.respond_chunk_error(request_id, opcode, &error).await,
             },
-            other => self.respond_ok(request_id, opcode, other).await,
+            other => self.respond_ok(request_id, opcode, tablet, other).await,
         }
     }
 
@@ -2078,6 +2170,7 @@ impl Conn {
                     ready.push((
                         entry.request_id,
                         entry.opcode,
+                        entry.tablet,
                         entry.streamed,
                         entry.range,
                         outcome,
@@ -2094,13 +2187,13 @@ impl Conn {
                 }
             }
         }
-        for (request_id, opcode, streamed, range, outcome) in ready {
+        for (request_id, opcode, tablet, streamed, range, outcome) in ready {
             match outcome {
                 // `respond_result` resolves chunked reads (bumping itself)
                 // and fans `GetStream` completions into value streams;
                 // every other outcome answers inline as before.
                 Ok(result) => {
-                    self.respond_result(request_id, opcode, &result, streamed, range)
+                    self.respond_result(request_id, opcode, tablet, &result, streamed, range)
                         .await?;
                 }
                 Err(error) => {
@@ -2277,6 +2370,7 @@ impl Conn {
         self.outbox.push_back(OutboxEntry {
             request_id,
             opcode,
+            tablet,
             streamed,
             range,
             receive,
@@ -2342,12 +2436,13 @@ impl Conn {
             .map(|live| live.execute(operation, now))
     }
 
-    /// Evaluates the current routing snapshot for one hash.
-    fn route(&self, hash: kivi_types::PartitionHash) -> Route {
+    /// Evaluates the current routing snapshot for one tablet: local
+    /// ownership executes, remote ownership redirects, missing placement
+    /// answers nowhere. Key → tablet resolution happens before this
+    /// (unified rule in `compound::route_point_key`); this only checks
+    /// placement of an already-resolved tablet.
+    fn route_tablet(&self, tablet: TabletId) -> Route {
         let routing = self.routing.load();
-        let Some(tablet) = routing.directory().lookup_by_hash(hash) else {
-            return Route::Nowhere;
-        };
         let Some(owner) = routing.placement().worker_of(tablet) else {
             return Route::Nowhere;
         };
@@ -2423,10 +2518,14 @@ impl Conn {
     }
 
     /// Answers with an operation outcome mapped onto the status taxonomy.
+    /// `tablet` names the serving tablet for tablet-naming bodies (drivers
+    /// learn placement from `TxnPrepared` without extra probes).
+    #[allow(clippy::too_many_lines)]
     async fn respond_ok(
         &mut self,
         request_id: u64,
         opcode: kivi_protocol::Opcode,
+        tablet: TabletId,
         outcome: &kivi_state::OperationResult,
     ) -> Result<(), ConnExit> {
         use kivi_protocol::{Response, ResponseBody, Status};
@@ -2436,9 +2535,17 @@ impl Conn {
                 status: Status::Ok,
                 body: ResponseBody::Value(value.to_vec()),
             },
-            R::Value(None) | R::Counter(None) | R::Expiry(None) | R::Length(None) => Response {
+            R::Value(None)
+            | R::Counter(None)
+            | R::Expiry(None)
+            | R::Length(None)
+            | R::Version(None) => Response {
                 status: Status::NotFound,
                 body: ResponseBody::Diagnostic(String::new()),
+            },
+            R::Version(Some(version)) => Response {
+                status: Status::Ok,
+                body: ResponseBody::Version(version.as_u64()),
             },
             R::Length(Some(len)) => Response {
                 status: Status::Ok,
@@ -2517,6 +2624,24 @@ impl Conn {
                     Some(stamp) => ResponseBody::ExpiryAt(stamp.as_micros()),
                 },
             },
+            R::TxnPrepared => Response {
+                status: Status::Ok,
+                body: ResponseBody::TxnPrepared {
+                    tablet: tablet.as_u64(),
+                    dir_version: self.routing.load().version().as_u64(),
+                },
+            },
+            R::TxnConflict => Response {
+                status: Status::TxnConflict,
+                body: ResponseBody::Diagnostic("transaction conflict".to_owned()),
+            },
+            R::TxnFinalized { applied, version } => Response {
+                status: Status::Ok,
+                body: ResponseBody::TxnFinalized {
+                    applied: *applied,
+                    version: version.map_or(0, kivi_state::ObjectVersion::as_u64),
+                },
+            },
             // Unreachable by construction: the engine resolves chunked
             // reads through the chunk lane before responding, so a
             // `ChunkedValue` here is a missed resolution path. Answer
@@ -2550,6 +2675,9 @@ impl Conn {
             E::Op(kivi_state::OpError::StaleRangeBase) => {
                 (Status::InvalidRequest, "range base changed; retry")
             }
+            E::Op(kivi_state::OpError::TxnConflict) => {
+                (Status::TxnConflict, "transaction conflict")
+            }
             E::Apply(kivi_state::ApplyError::VersionExhausted) => {
                 (Status::VersionExhausted, "version exhausted")
             }
@@ -2564,6 +2692,13 @@ impl Conn {
             E::Apply(kivi_state::ApplyError::UnresolvableSplice) => {
                 (Status::Internal, "splice cannot apply")
             }
+            // Transaction divergence: prepare-time validation passed but
+            // apply disagreed (same log on same state never does this).
+            // Fail closed as internal, never partial intent state.
+            E::Apply(kivi_state::ApplyError::TxnDiverged) => {
+                (Status::Internal, "transaction diverged")
+            }
+            E::OpScan(_) => (Status::InvalidRequest, "scan rejected"),
             E::AuthorityMismatch { .. } => (Status::Internal, "authority mismatch"),
             E::CommitExhausted { .. } => (Status::VersionExhausted, "commit space exhausted"),
         };
@@ -2594,14 +2729,32 @@ impl Conn {
     }
 }
 
-/// Routing verdict for one hash under the current snapshot.
+/// Routing verdict for one tablet under the current snapshot.
 enum Route {
     /// Execute on the named local tablet.
     Execute(TabletId),
     /// Answer with this redirect (owner elsewhere, or stale hint).
     Redirect(RedirectInfo),
-    /// No authority covers the hash.
+    /// No authority covers the tablet.
     Nowhere,
+}
+
+/// Whether `opcode` is a direct single-key mutating write (the only shapes
+/// subject to the index-prefix admission rule). Reads, scans, batches, and
+/// transaction steps bypass it: batches and transaction steps are the
+/// coherent index-maintenance paths, reads never mutate.
+fn is_direct_single_key_write(opcode: kivi_protocol::Opcode) -> bool {
+    use kivi_protocol::Opcode as O;
+    matches!(
+        opcode,
+        O::Set
+            | O::Delete
+            | O::CounterAdd
+            | O::ExpireAt
+            | O::PersistExpiry
+            | O::SetRange
+            | O::SetConditional
+    )
 }
 
 /// Maps an operation back to its opcode for response encoding.

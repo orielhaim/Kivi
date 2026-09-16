@@ -95,6 +95,29 @@ pub enum ControlMutation {
         /// Affected plan.
         plan: MergePlanIdAlias,
     },
+    /// Register a namespace (idempotent: re-registering the identical
+    /// record is a no-op; a conflicting layout is rejected).
+    RegisterNamespace {
+        /// Namespace record.
+        record: crate::catalog::NamespaceRecord,
+    },
+    /// Persist a new secondary index definition (starts `Building`).
+    CreateIndex {
+        /// Index record.
+        record: crate::catalog::IndexRecord,
+    },
+    /// Advance an index lifecycle state (`Building → Ready → Dropping`).
+    AdvanceIndex {
+        /// Affected index.
+        id: u64,
+        /// New state discriminant.
+        state: u8,
+    },
+    /// Remove a `Dropping` index definition.
+    RemoveIndex {
+        /// Affected index.
+        id: u64,
+    },
 }
 
 /// Identity aliases avoiding circular module imports in this enum's docs.
@@ -288,6 +311,19 @@ impl ControlMutation {
                 body.extend_from_slice(&plan.as_u64().to_le_bytes());
                 (11u8, body)
             }
+            Self::RegisterNamespace { record } => (12u8, record.encode_to_vec()),
+            Self::CreateIndex { record } => (13u8, record.encode_to_vec()),
+            Self::AdvanceIndex { id, state } => {
+                let mut body = Vec::with_capacity(9);
+                body.extend_from_slice(&id.to_le_bytes());
+                body.push(*state);
+                (14u8, body)
+            }
+            Self::RemoveIndex { id } => {
+                let mut body = Vec::with_capacity(8);
+                body.extend_from_slice(&id.to_le_bytes());
+                (15u8, body)
+            }
         };
         let mut out = Vec::with_capacity(2 + 1 + 4 + body.len());
         out.extend_from_slice(&CONTROL_MUTATION_VERSION.to_le_bytes());
@@ -463,6 +499,37 @@ impl ControlMutation {
                 ));
                 Ok(Self::RemoveMerge { plan })
             }
+            12 => {
+                let record =
+                    crate::catalog::NamespaceRecord::decode_exact(body).map_err(|error| {
+                        Fault::BadBody {
+                            detail: error.to_string(),
+                        }
+                    })?;
+                Ok(Self::RegisterNamespace { record })
+            }
+            13 => {
+                let record = crate::catalog::IndexRecord::decode_exact(body).map_err(|error| {
+                    Fault::BadBody {
+                        detail: error.to_string(),
+                    }
+                })?;
+                Ok(Self::CreateIndex { record })
+            }
+            14 => {
+                if body.len() != 9 {
+                    return Err(Fault::Truncated);
+                }
+                let id = u64::from_le_bytes(body[..8].try_into().unwrap_or([0; 8]));
+                Ok(Self::AdvanceIndex { id, state: body[8] })
+            }
+            15 => {
+                if body.len() != 8 {
+                    return Err(Fault::Truncated);
+                }
+                let id = u64::from_le_bytes(body[..8].try_into().unwrap_or([0; 8]));
+                Ok(Self::RemoveIndex { id })
+            }
             _ => Err(Fault::BadTag { tag }),
         }
     }
@@ -483,7 +550,11 @@ impl ControlMutation {
             | Self::CreateSplit { .. }
             | Self::RemoveSplit { .. }
             | Self::CreateMerge { .. }
-            | Self::RemoveMerge { .. } => None,
+            | Self::RemoveMerge { .. }
+            | Self::RegisterNamespace { .. }
+            | Self::CreateIndex { .. }
+            | Self::AdvanceIndex { .. }
+            | Self::RemoveIndex { .. } => None,
         }
     }
 }

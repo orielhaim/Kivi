@@ -1,17 +1,18 @@
 //! Dedup-component format: the session state a checkpoint must carry so
-//! safe retry survives WAL reclamation.
+//! safe retry survives WAL reclamation, plus prepared transaction intents
+//! (deterministic state that must survive restart exactly like sessions).
 //!
 //! The component persists exactly the logically necessary state per
 //! session: the acknowledged floor plus retained outcomes above it, in
-//! deterministic sorted order. It is a separate immutable artifact (not
-//! mixed into object bands) because dedup state has different growth and
-//! lifecycle characteristics than objects — and it must scale to large
-//! session counts without disturbing band reuse.
+//! deterministic sorted order; then prepared intents in key order. It is a
+//! separate immutable artifact (not mixed into object bands) because dedup
+//! and intent state have different growth and lifecycle characteristics
+//! than objects — and they must scale without disturbing band reuse.
 //!
 //! ```text
 //! header (32 bytes, fixed):
 //!   0   4  magic "KVCD"
-//!   4   2  major = 1
+//!   4   2  major = 2
 //!   6   2  minor = 0
 //!   8   8  tablet (u64)
 //!   16  8  cut commit position (u64)
@@ -21,6 +22,11 @@
 //!   session u128, floor u64, entry_count u32,
 //!   entries sorted by seq: seq u64, commit u64, opcode u8,
 //!     outcome_len u32, outcome[..] (DurableOutcome codec)
+//! then intents sorted by key:
+//!   intent_count u32,
+//!   txn16, coordinator u64, key (Key codec), expect (TxnExpect codec),
+//!     write (TxnWriteKind codec), observed flag u8 (+ version u64),
+//!     prepared_at u64
 //! footer (40 bytes): body CRC32C, BLAKE3 of header[0..28] + body
 //! (content identity covers artifact identity), footer CRC32C
 //! (same uniform footer as bands)
@@ -29,6 +35,12 @@
 //! Recovery restores floors verbatim and reinstalls retained outcomes, so
 //! a retry of an above-floor identity hits exactly as before the
 //! checkpoint, while a below-floor identity expires exactly as before.
+//! Intents restore verbatim: unresolved transactions are never discarded
+//! on restart.
+//!
+//! Format v1 (sessions only, no intents) is rejected: breaking prototype
+//! formats is allowed, and silently dropping intents would violate the
+//! durability contract.
 
 use kivi_codec::integrity::crc32c_checksum;
 use kivi_codec::{Decode as _, Encode as _};
@@ -40,8 +52,8 @@ use crate::error::CheckpointError;
 
 /// Magic word: ASCII `"KVCD"` read as a little-endian `u32`.
 pub const DEDUP_MAGIC: u32 = 0x4443_564B;
-/// Current dedup-component major version.
-pub const DEDUP_MAJOR: u16 = 1;
+/// Current dedup-component major version (v2 appends the intent section).
+pub const DEDUP_MAJOR: u16 = 2;
 /// Current dedup-component minor version.
 pub const DEDUP_MINOR: u16 = 0;
 /// Encoded header length in bytes.
@@ -95,9 +107,12 @@ pub struct LoadedDedup {
     pub cut: u64,
     /// Sessions sorted by session id.
     pub sessions: Vec<SessionCheckpoint>,
+    /// Prepared intents sorted by key.
+    pub intents: Vec<kivi_state::TxnIntent>,
 }
 
-/// Builds one immutable dedup component from unsorted session snapshots.
+/// Builds one immutable dedup component from unsorted session snapshots
+/// plus prepared intents.
 ///
 /// # Errors
 ///
@@ -107,6 +122,7 @@ pub fn build_dedup(
     tablet: TabletId,
     cut: u64,
     mut sessions: Vec<SessionCheckpoint>,
+    mut intents: Vec<kivi_state::TxnIntent>,
 ) -> Result<BuiltDedup, CheckpointError> {
     sessions.sort_by_key(|session| session.session.as_u128());
     for pair in sessions.windows(2) {
@@ -159,6 +175,7 @@ pub fn build_dedup(
     let session_total = u32::try_from(sessions.len()).map_err(|_| CheckpointError::Format {
         detail: "dedup component exceeds u32 sessions".to_owned(),
     })?;
+    encode_intents(&mut body, &mut intents)?;
     let mut header = [0u8; DEDUP_HEADER_LEN];
     header[0..4].copy_from_slice(&DEDUP_MAGIC.to_le_bytes());
     header[4..6].copy_from_slice(&DEDUP_MAJOR.to_le_bytes());
@@ -187,7 +204,123 @@ pub fn build_dedup(
     })
 }
 
-/// Loads and fully verifies one dedup component: filename identity,
+/// Encodes the intent section: count plus key-ordered intents (duplicate
+/// keys rejected — one intent per key by construction).
+fn encode_intents(
+    body: &mut Vec<u8>,
+    intents: &mut [kivi_state::TxnIntent],
+) -> Result<(), CheckpointError> {
+    intents.sort_by(|left, right| left.key.as_bytes().cmp(right.key.as_bytes()));
+    for pair in intents.windows(2) {
+        if pair[0].key == pair[1].key {
+            return Err(CheckpointError::Format {
+                detail: "duplicate intent key in dedup component".to_owned(),
+            });
+        }
+    }
+    let count = u32::try_from(intents.len()).map_err(|_| CheckpointError::Format {
+        detail: "dedup component exceeds u32 intents".to_owned(),
+    })?;
+    body.extend_from_slice(&count.to_le_bytes());
+    for intent in intents.iter() {
+        body.extend_from_slice(&intent.id.as_bytes());
+        body.extend_from_slice(&intent.coordinator.as_u64().to_le_bytes());
+        intent.key.encode(body);
+        intent.write.expect.encode(body);
+        intent.write.kind.encode(body);
+        match intent.observed {
+            None => body.push(0),
+            Some(version) => {
+                body.push(1);
+                version.encode(body);
+            }
+        }
+        body.extend_from_slice(&intent.prepared_at.to_le_bytes());
+    }
+    Ok(())
+}
+
+/// Takes `n` bytes at the cursor (intent-section walker).
+fn intent_take<'a>(input: &'a [u8], at: &mut usize, n: usize) -> Result<&'a [u8], CheckpointError> {
+    if input.len() < *at + n {
+        return Err(CheckpointError::Corrupt {
+            detail: "dedup intent section truncated".to_owned(),
+        });
+    }
+    let slice = &input[*at..*at + n];
+    *at += n;
+    Ok(slice)
+}
+
+/// Decodes the intent section at the cursor (exactly `count` entries,
+/// key-ordered, then end of section).
+fn decode_intents(cursor: &[u8]) -> Result<(Vec<kivi_state::TxnIntent>, usize), CheckpointError> {
+    let corrupt = |detail: String| CheckpointError::Corrupt { detail };
+    let mut at = 0usize;
+    let count = u32::from_le_bytes(
+        intent_take(cursor, &mut at, 4)?
+            .try_into()
+            .map_err(|_| corrupt("dedup intent count unreadable".to_owned()))?,
+    ) as usize;
+    if count > 1_000_000 {
+        return Err(corrupt("dedup intent count absurd".to_owned()));
+    }
+    let mut intents = Vec::with_capacity(count.min(1024));
+    let mut previous: Option<Vec<u8>> = None;
+    for _ in 0..count {
+        let raw = intent_take(cursor, &mut at, 16)?;
+        let id = kivi_state::TxnId::from_bytes(raw.try_into().unwrap_or([0; 16]));
+        let coordinator = kivi_types::TabletId::from_u64(u64::from_le_bytes(
+            intent_take(cursor, &mut at, 8)?
+                .try_into()
+                .map_err(|_| corrupt("dedup intent coordinator unreadable".to_owned()))?,
+        ));
+        let (key, used) = kivi_state::Key::decode(&cursor[at..])
+            .map_err(|_| corrupt("dedup intent key undecodable".to_owned()))?;
+        at += used;
+        let (expect, used) = kivi_state::TxnExpect::decode(&cursor[at..])
+            .map_err(|_| corrupt("dedup intent expectation undecodable".to_owned()))?;
+        at += used;
+        let (kind, used) = kivi_state::TxnWriteKind::decode(&cursor[at..])
+            .map_err(|_| corrupt("dedup intent write undecodable".to_owned()))?;
+        at += used;
+        let observed = match intent_take(cursor, &mut at, 1)?[0] {
+            0 => None,
+            1 => {
+                let (version, used) = kivi_state::ObjectVersion::decode(&cursor[at..])
+                    .map_err(|_| corrupt("dedup intent version undecodable".to_owned()))?;
+                at += used;
+                Some(version)
+            }
+            _ => {
+                return Err(corrupt("dedup intent observed tag invalid".to_owned()));
+            }
+        };
+        let prepared_at = u64::from_le_bytes(
+            intent_take(cursor, &mut at, 8)?
+                .try_into()
+                .map_err(|_| corrupt("dedup intent timestamp unreadable".to_owned()))?,
+        );
+        if previous
+            .as_ref()
+            .is_some_and(|prev| prev >= &key.as_bytes().to_vec())
+        {
+            return Err(corrupt(
+                "dedup intents out of order or duplicated".to_owned(),
+            ));
+        }
+        previous = Some(key.as_bytes().to_vec());
+        intents.push(kivi_state::TxnIntent {
+            id,
+            coordinator,
+            key: key.clone(),
+            write: kivi_state::TxnWrite { key, kind, expect },
+            observed,
+            prepared_at,
+        });
+    }
+    Ok((intents, at))
+}
 /// header CRC and provenance, body CRC and content hash, session/sequence
 /// ordering, floor invariants, and outcome decoding.
 ///
@@ -287,7 +420,12 @@ pub fn load_dedup(
     let mut sessions = Vec::with_capacity(session_count.min(1_000_000));
     let mut cursor = body;
     let mut previous_session: Option<u128> = None;
-    while !cursor.is_empty() {
+    for _ in 0..session_count {
+        if cursor.is_empty() {
+            return Err(corrupt(
+                "dedup session count exceeds encoded sessions".to_owned(),
+            ));
+        }
         let (session, consumed) = decode_session(cursor)
             .map_err(|error| corrupt(format!("dedup session undecodable: {error:?}")))?;
         if previous_session.is_some_and(|previous| previous >= session.session.as_u128()) {
@@ -299,16 +437,16 @@ pub fn load_dedup(
         sessions.push(session);
         cursor = &cursor[consumed..];
     }
-    if sessions.len() != session_count {
-        return Err(corrupt(format!(
-            "dedup session count {session_count} disagrees with decoded {}",
-            sessions.len()
-        )));
+    let (intents, used) = decode_intents(cursor)?;
+    cursor = &cursor[used..];
+    if !cursor.is_empty() {
+        return Err(corrupt("dedup body has trailing bytes".to_owned()));
     }
     Ok(LoadedDedup {
         tablet,
         cut,
         sessions,
+        intents,
     })
 }
 
@@ -397,6 +535,7 @@ mod tests {
             TabletId::from_u64(1),
             12,
             vec![session(9, 4, &[5, 7]), session(3, 0, &[1])],
+            Vec::new(),
         )
         .expect("builds");
         assert_eq!(built.sessions, 2);
@@ -406,33 +545,82 @@ mod tests {
         // Sorted by session regardless of input order.
         assert_eq!(loaded.sessions[0].session, SessionId::from_u128(3));
         assert_eq!(loaded.sessions[1].outcomes.len(), 2);
+        assert!(loaded.intents.is_empty());
     }
 
     #[test]
     fn empty_dedup_is_valid() {
-        let built = build_dedup(TabletId::from_u64(1), 1, Vec::new()).expect("builds");
+        let built = build_dedup(TabletId::from_u64(1), 1, Vec::new(), Vec::new()).expect("builds");
         let loaded = load_dedup(TabletId::from_u64(1), built.hash, &built.bytes).expect("loads");
         assert!(loaded.sessions.is_empty());
+        assert!(loaded.intents.is_empty());
     }
 
     #[test]
     fn outcomes_at_or_below_floor_are_rejected() {
         assert!(
-            build_dedup(TabletId::from_u64(1), 1, vec![session(1, 5, &[5])]).is_err(),
+            build_dedup(
+                TabletId::from_u64(1),
+                1,
+                vec![session(1, 5, &[5])],
+                Vec::new()
+            )
+            .is_err(),
             "outcome at the floor is not retained state"
         );
         assert!(
-            build_dedup(TabletId::from_u64(1), 1, vec![session(1, 9, &[5])]).is_err(),
+            build_dedup(
+                TabletId::from_u64(1),
+                1,
+                vec![session(1, 9, &[5])],
+                Vec::new()
+            )
+            .is_err(),
             "outcome below the floor is not retained state"
         );
     }
 
     #[test]
     fn corruption_is_detected() {
-        let built =
-            build_dedup(TabletId::from_u64(1), 1, vec![session(1, 0, &[1, 2])]).expect("builds");
+        let built = build_dedup(
+            TabletId::from_u64(1),
+            1,
+            vec![session(1, 0, &[1, 2])],
+            Vec::new(),
+        )
+        .expect("builds");
         let mut damaged = built.bytes.clone();
         damaged[DEDUP_HEADER_LEN + 3] ^= 0xFF;
         assert!(load_dedup(TabletId::from_u64(1), built.hash, &damaged).is_err());
+    }
+
+    #[test]
+    fn intents_round_trip_sorted_and_restore_verbatim() {
+        use kivi_state::{Key, TxnExpect, TxnId, TxnIntent, TxnWrite, TxnWriteKind};
+        let intent = |key: &str| TxnIntent {
+            id: TxnId::derive(7, 1, 0),
+            coordinator: TabletId::from_u64(9),
+            key: Key::from(key),
+            write: TxnWrite {
+                key: Key::from(key),
+                kind: TxnWriteKind::Put(bytes::Bytes::from_static(b"v")),
+                expect: TxnExpect::Any,
+            },
+            observed: None,
+            prepared_at: 99,
+        };
+        let built = build_dedup(
+            TabletId::from_u64(1),
+            12,
+            Vec::new(),
+            vec![intent("b"), intent("a")],
+        )
+        .expect("builds");
+        let loaded = load_dedup(TabletId::from_u64(1), built.hash, &built.bytes).expect("loads");
+        assert_eq!(loaded.intents.len(), 2);
+        // Sorted by key regardless of input order.
+        assert_eq!(loaded.intents[0].key, Key::from("a"));
+        assert_eq!(loaded.intents[1].key, Key::from("b"));
+        assert_eq!(loaded.intents[0].prepared_at, 99);
     }
 }

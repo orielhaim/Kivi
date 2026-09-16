@@ -17,6 +17,7 @@
 //! little-endian encoding. `OpenRaft` Rust structs are never persisted
 //! as canonical control state.
 
+pub mod catalog;
 pub mod failure;
 pub mod merge;
 pub mod migration;
@@ -28,6 +29,9 @@ pub mod split;
 pub mod state;
 pub mod topology;
 
+pub use catalog::{
+    CatalogError, CatalogIndexKind, CatalogIndexState, CatalogLayout, IndexRecord, NamespaceRecord,
+};
 pub use failure::{FailureDetector, FailureDetectorConfig, TabletHealth, classify_tablet};
 pub use merge::{MergeError, MergePhase, MergePlan, MergePlanId};
 pub use migration::{MigrationError, MigrationPhase, MigrationPlan, MigrationPlanId};

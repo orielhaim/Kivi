@@ -23,9 +23,11 @@
 //! snapshot's contents, never on timing, caches, or execution context.
 
 pub mod directory;
+pub mod namespace;
 pub mod range;
 pub mod tablet;
 
-pub use directory::{DirectoryError, DirectorySnapshot, DirectoryVersion};
+pub use directory::{DirectoryError, DirectorySnapshot, DirectoryVersion, MultiDirectory};
+pub use namespace::{NamespaceDescriptor, NamespaceLayout};
 pub use range::{HashPrefix, OrderedRange, PartitionKind, PartitionRange, RangeError};
 pub use tablet::{Redirect, TabletDescriptor, TabletState};

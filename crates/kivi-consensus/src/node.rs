@@ -1417,6 +1417,53 @@ pub(crate) async fn read_applied_on(
         })
 }
 
+/// Caller-side scan shared by the single-group node and every multi-tablet
+/// replica: contract dispatch over one group's machine and owner queue.
+/// `Latest` (the primary product path) proves leadership with a quorum
+/// barrier; `Any` reads local applied state. Either way each tablet read
+/// is strong — the full multi-tablet scan is still not one global snapshot
+/// (see `ScanConsistency`).
+///
+/// # Errors
+///
+/// Returns [`ReadError`] for routing, validation, or coverage failures.
+pub(crate) async fn scan_caller_side(
+    machine: &ReplicatedStateMachine,
+    owner_tx: &async_channel::Sender<OwnerRequest>,
+    group: ConsensusGroupId,
+    spec: &kivi_state::ScanSpec,
+    contract: ReadContract,
+    now: UnixMicros,
+) -> Result<kivi_state::ScanPage, ReadError> {
+    match contract {
+        ReadContract::Latest => {
+            owner_call_on(owner_tx, |reply| OwnerRequest::Barrier { group, reply })
+                .await
+                .map_err(ReadError::Consensus)?
+                .map_err(ReadError::Consensus)?;
+            Ok(scan_applied_on(machine, spec, now).await?)
+        }
+        ReadContract::Any | ReadContract::BoundedStale { .. } | ReadContract::AtLeast(_) => {
+            // Weak/token reads serve local applied state; scans never
+            // claim a global snapshot, so token coverage adds nothing.
+            Ok(scan_applied_on(machine, spec, now).await?)
+        }
+    }
+}
+
+/// Scans local applied state, mapping machine faults honestly.
+pub(crate) async fn scan_applied_on(
+    machine: &ReplicatedStateMachine,
+    spec: &kivi_state::ScanSpec,
+    now: UnixMicros,
+) -> Result<kivi_state::ScanPage, ReadError> {
+    machine.scan_local(spec, now).await.map_err(|error| {
+        ReadError::Consensus(ConsensusError::Unavailable {
+            reason: error.to_string(),
+        })
+    })
+}
+
 /// Spawns the Compio owner thread driving one node's consensus work.
 /// Returns the thread handle; readiness (bound peer address or startup
 /// failure) arrives separately over the params' `ready` channel so a

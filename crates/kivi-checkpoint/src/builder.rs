@@ -235,6 +235,7 @@ pub fn build_tablet(
         snapshot.tablet,
         snapshot.cut.as_u64(),
         snapshot.sessions.clone(),
+        snapshot.intents.clone(),
     )?;
     let descriptors: Vec<BandDescriptor> = bands
         .iter()
@@ -323,6 +324,7 @@ mod tests {
                 .map(|(key, object)| (Key::from(key), object))
                 .collect(),
             sessions: Vec::new(),
+            intents: Vec::new(),
             dirty,
         }
     }
@@ -526,6 +528,7 @@ mod tests {
             cut: CommitPosition::from_u64(cut),
             objects,
             sessions: Vec::new(),
+            intents: Vec::new(),
             dirty: BandDirty::clean(),
         }
     }
@@ -753,6 +756,7 @@ mod tests {
                 cut: CommitPosition::from_u64(cut),
                 objects,
                 sessions: Vec::new(),
+                intents: Vec::new(),
                 dirty,
             };
             let previous = (

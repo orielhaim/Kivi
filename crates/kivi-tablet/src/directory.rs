@@ -509,6 +509,148 @@ impl DirectorySnapshot {
             .map(TabletDescriptor::id)
     }
 
+    /// Active tablets intersecting `[start, end)` in key order (ordered
+    /// layouts only; empty for hash snapshots).
+    ///
+    /// `start` is inclusive, `end` exclusive (`None` = `+∞`). Used by
+    /// cross-tablet range scans to fan out in key order without a central
+    /// coordinator. Deterministic for a given snapshot.
+    #[must_use]
+    pub fn tablets_covering_range(&self, start: &[u8], end: Option<&[u8]>) -> Vec<TabletId> {
+        let mut covering: Vec<(&[u8], TabletId)> = self
+            .tablets
+            .iter()
+            .filter(|t| t.state() == TabletState::Active)
+            .filter_map(|t| match t.range() {
+                // Half-open intersection: [rs, re) ∩ [start, end) ≠ ∅
+                // iff rs < end and start < re.
+                PartitionRange::Ordered(range) => {
+                    let below_query_end = end.is_none_or(|bound| range.start() < bound);
+                    let above_query_start = match range.end() {
+                        None => true,
+                        Some(tablet_end) => start < tablet_end,
+                    };
+                    (below_query_end && above_query_start).then(|| (t.id(), t.range()))
+                }
+                PartitionRange::Hash(_) => None,
+            })
+            .map(|(id, range)| {
+                let start_bound: &[u8] = match range {
+                    PartitionRange::Ordered(r) => r.start(),
+                    PartitionRange::Hash(_) => &[],
+                };
+                (start_bound, id)
+            })
+            .collect();
+        covering.sort_by(|left, right| left.0.cmp(right.0));
+        covering.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// Successor-set routing for a retired tablet: each recorded successor
+    /// paired with its current active range.
+    ///
+    /// A split redirect names two ranges (`[start, K)`, `[K, end)`); a merge
+    /// names one. Entries whose successor is no longer active are omitted —
+    /// the caller re-resolves through a newer snapshot instead of guessing.
+    #[must_use]
+    pub fn successor_ranges(&self, tablet: TabletId) -> Vec<(TabletId, PartitionRange)> {
+        let Some(redirect) = self.redirect_of(tablet) else {
+            return Vec::new();
+        };
+        redirect
+            .successors()
+            .iter()
+            .filter_map(|successor| {
+                self.get(*successor)
+                    .filter(|t| t.state() == TabletState::Active)
+                    .map(|descriptor| (*successor, descriptor.range().clone()))
+            })
+            .collect()
+    }
+
+    /// Whether the active ordered ranges tile `[empty, +∞)` exactly: sorted
+    /// by start, first starts at empty, each ends where the next starts,
+    /// last is unbounded. Hash snapshots report `true` (coverage is defined
+    /// by the hash-space tiling instead).
+    #[must_use]
+    pub fn ordered_coverage_complete(&self) -> bool {
+        use crate::range::OrderedRange;
+        let has_hash_active = self.tablets.iter().any(|t| {
+            t.state() == TabletState::Active && matches!(t.range(), PartitionRange::Hash(_))
+        });
+        if has_hash_active {
+            return true;
+        }
+        let mut ranges: Vec<&OrderedRange> = self
+            .tablets
+            .iter()
+            .filter(|t| t.state() == TabletState::Active)
+            .filter_map(|t| match t.range() {
+                PartitionRange::Ordered(range) => Some(range),
+                PartitionRange::Hash(_) => None,
+            })
+            .collect();
+        if ranges.is_empty() {
+            return false;
+        }
+        ranges.sort_by(|left, right| left.start().cmp(right.start()));
+        if !ranges[0].start().is_empty() {
+            return false;
+        }
+        for pair in ranges.windows(2) {
+            if !pair[0].is_adjacent_to(pair[1]) {
+                return false;
+            }
+        }
+        ranges.last().is_some_and(|last| last.end().is_none())
+    }
+
+    /// Builds an ordered tiling from sorted split keys: `N` keys yield
+    /// `N+1` active tablets (`1..=N+1`) covering `[empty, +∞)` with no gaps.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DirectoryError::InvalidSplitKeys`] when keys are not
+    /// strictly increasing.
+    pub fn static_ordered_tiles(
+        namespace: NamespaceId,
+        split_keys: &[Vec<u8>],
+    ) -> Result<Self, DirectoryError> {
+        use crate::range::OrderedRange;
+        for pair in split_keys.windows(2) {
+            if pair[0] >= pair[1] {
+                return Err(DirectoryError::InvalidSplitKeys);
+            }
+        }
+        // Tiles: [empty, s0), [s0, s1), ..., [sN-1, +inf).
+        let first_end: Option<Vec<u8>> = split_keys.first().cloned();
+        let mut directory = Self::bootstrap(
+            namespace,
+            TabletId::from_u64(1),
+            PartitionRange::Ordered(OrderedRange::new(Vec::new(), first_end)?),
+            TabletEpoch::INITIAL,
+            WriteGuardGeneration::INITIAL,
+        )?
+        .stage(TabletId::from_u64(1))
+        .and_then(|snapshot| snapshot.activate(TabletId::from_u64(1)))?;
+        for (index, start) in split_keys.iter().enumerate() {
+            let end: Option<Vec<u8>> = split_keys.get(index + 1).cloned();
+            let id = TabletId::from_u64(u64::try_from(index + 2).unwrap_or(u64::MAX));
+            let range = PartitionRange::Ordered(OrderedRange::new(start.clone(), end)?);
+            directory = directory
+                .allocate(
+                    id,
+                    range,
+                    TabletEpoch::INITIAL,
+                    WriteGuardGeneration::INITIAL,
+                )
+                .and_then(|snapshot| snapshot.stage(id))
+                .and_then(|snapshot| snapshot.activate(id))?;
+        }
+        debug_assert!(directory.ordered_coverage_complete());
+        Ok(directory)
+    }
+
     /// Returns the tombstone redirect for a retired tablet, if any.
     ///
     /// This is the hook future stale-route handling builds on: a router
@@ -682,6 +824,90 @@ fn check_generations(
     Ok(())
 }
 
+/// Namespace-aware routing table: one [`DirectorySnapshot`] per namespace.
+///
+/// A snapshot routes a single namespace; a cluster serves many namespaces
+/// with mixed layouts (hash namespace A, ordered namespace B, secondary
+/// index namespace C) simultaneously. `MultiDirectory` holds the current
+/// snapshot per namespace and routes by `(NamespaceId, layout key)` without
+/// a second directory system: hash namespaces route by [`PartitionHash`],
+/// ordered namespaces by raw key bytes.
+#[derive(Debug, Clone, Default)]
+pub struct MultiDirectory {
+    /// Current snapshot per namespace.
+    snapshots: std::collections::BTreeMap<
+        NamespaceId,
+        (crate::namespace::NamespaceDescriptor, DirectorySnapshot),
+    >,
+}
+
+impl MultiDirectory {
+    /// Creates an empty routing table.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            snapshots: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Publishes the snapshot for one namespace, replacing any prior
+    /// snapshot for the same namespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DirectoryError`] when the snapshot fails validation or
+    /// names a different namespace than the descriptor.
+    pub fn publish(
+        &mut self,
+        descriptor: crate::namespace::NamespaceDescriptor,
+        snapshot: DirectorySnapshot,
+    ) -> Result<(), DirectoryError> {
+        snapshot.validate()?;
+        if snapshot.namespace() != descriptor.id {
+            return Err(DirectoryError::UnknownTablet {
+                tablet: TabletId::from_u64(u64::MAX),
+            });
+        }
+        self.snapshots.insert(descriptor.id, (descriptor, snapshot));
+        Ok(())
+    }
+
+    /// Returns the snapshot for one namespace, if published.
+    #[must_use]
+    pub fn snapshot(&self, namespace: NamespaceId) -> Option<&DirectorySnapshot> {
+        self.snapshots.get(&namespace).map(|(_, snapshot)| snapshot)
+    }
+
+    /// Returns the descriptor for one namespace, if published.
+    #[must_use]
+    pub fn descriptor(
+        &self,
+        namespace: NamespaceId,
+    ) -> Option<crate::namespace::NamespaceDescriptor> {
+        self.snapshots
+            .get(&namespace)
+            .map(|(descriptor, _)| *descriptor)
+    }
+
+    /// Routes a hash-namespace point to its active tablet.
+    #[must_use]
+    pub fn lookup_hash(&self, namespace: NamespaceId, hash: PartitionHash) -> Option<TabletId> {
+        self.snapshot(namespace)?.lookup_by_hash(hash)
+    }
+
+    /// Routes an ordered-namespace key to its active tablet.
+    #[must_use]
+    pub fn lookup_key(&self, namespace: NamespaceId, key: &[u8]) -> Option<TabletId> {
+        self.snapshot(namespace)?.lookup_by_key(key)
+    }
+
+    /// Namespaces currently published (introspection for tests).
+    #[must_use]
+    pub fn namespaces(&self) -> Vec<NamespaceId> {
+        self.snapshots.keys().copied().collect()
+    }
+}
+
 /// Directory transition or validation failure.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
@@ -768,6 +994,9 @@ pub enum DirectoryError {
         /// Requested count (must be nonzero).
         count: usize,
     },
+    /// Ordered split keys for a static tiling are not strictly increasing.
+    #[error("ordered split keys must be strictly increasing")]
+    InvalidSplitKeys,
 }
 
 #[cfg(test)]
@@ -1161,6 +1390,154 @@ mod tests {
         assert_eq!(dir.lookup_by_key(b"z"), Some(TabletId::from_u64(2)));
         assert_eq!(dir.lookup_by_key(b"b"), Some(TabletId::from_u64(1)));
         assert_eq!(dir.validate(), Ok(()));
+    }
+
+    #[test]
+    fn static_ordered_tiles_cover_everything_with_no_gaps() {
+        let splits = [b"g".to_vec(), b"p".to_vec()];
+        let dir = DirectorySnapshot::static_ordered_tiles(NS, &splits).expect("tiles build");
+        assert!(dir.ordered_coverage_complete());
+        assert_eq!(dir.lookup_by_key(b"a"), Some(TabletId::from_u64(1)));
+        assert_eq!(dir.lookup_by_key(b"g"), Some(TabletId::from_u64(2)));
+        assert_eq!(dir.lookup_by_key(b"o"), Some(TabletId::from_u64(2)));
+        assert_eq!(dir.lookup_by_key(b"p"), Some(TabletId::from_u64(3)));
+        assert_eq!(dir.lookup_by_key(b"zzz"), Some(TabletId::from_u64(3)));
+        assert_eq!(dir.validate(), Ok(()));
+        // Single tile covers everything.
+        let single = DirectorySnapshot::static_ordered_tiles(NS, &[]).expect("single");
+        assert!(single.ordered_coverage_complete());
+        assert_eq!(
+            single.lookup_by_key(b"anything"),
+            Some(TabletId::from_u64(1))
+        );
+        // Unsorted split keys rejected.
+        assert_eq!(
+            DirectorySnapshot::static_ordered_tiles(NS, &[b"p".to_vec(), b"g".to_vec()]),
+            Err(DirectoryError::InvalidSplitKeys)
+        );
+        assert_eq!(
+            DirectorySnapshot::static_ordered_tiles(NS, &[b"g".to_vec(), b"g".to_vec()]),
+            Err(DirectoryError::InvalidSplitKeys)
+        );
+    }
+
+    #[test]
+    fn tablets_covering_range_returns_key_ordered_tablets() {
+        let splits = [b"g".to_vec(), b"p".to_vec()];
+        let dir = DirectorySnapshot::static_ordered_tiles(NS, &splits).expect("tiles");
+        // Full scan touches all three in order.
+        assert_eq!(
+            dir.tablets_covering_range(b"", None),
+            vec![
+                TabletId::from_u64(1),
+                TabletId::from_u64(2),
+                TabletId::from_u64(3)
+            ]
+        );
+        // Sub-range inside one tablet.
+        assert_eq!(
+            dir.tablets_covering_range(b"h", Some(b"o")),
+            vec![TabletId::from_u64(2)]
+        );
+        // Range spanning a boundary returns both sides in order.
+        assert_eq!(
+            dir.tablets_covering_range(b"f", Some(b"h")),
+            vec![TabletId::from_u64(1), TabletId::from_u64(2)]
+        );
+        // Boundary-exact start lands on the right tablet only.
+        assert_eq!(
+            dir.tablets_covering_range(b"g", Some(b"h")),
+            vec![TabletId::from_u64(2)]
+        );
+    }
+
+    #[test]
+    fn successor_ranges_name_live_ranges_after_split() {
+        use crate::range::OrderedRange;
+        let mut dir = DirectorySnapshot::bootstrap(
+            NS,
+            TabletId::from_u64(1),
+            PartitionRange::Ordered(OrderedRange::new(Vec::new(), None).expect("all")),
+            EPOCH,
+            GUARD,
+        )
+        .expect("genesis");
+        dir = activate_all(&dir, TabletId::from_u64(1));
+        dir = dir
+            .allocate(
+                TabletId::from_u64(2),
+                ordered_range(b"", Some(b"m")),
+                EPOCH,
+                GUARD,
+            )
+            .expect("left");
+        dir = dir
+            .allocate(
+                TabletId::from_u64(3),
+                ordered_range(b"m", None),
+                EPOCH,
+                GUARD,
+            )
+            .expect("right");
+        dir = dir.stage(TabletId::from_u64(2)).expect("stage left");
+        dir = dir.stage(TabletId::from_u64(3)).expect("stage right");
+        dir = dir.seal(TabletId::from_u64(1)).expect("seal parent");
+        dir = dir
+            .cutover_split(
+                TabletId::from_u64(1),
+                TabletId::from_u64(2),
+                TabletId::from_u64(3),
+            )
+            .expect("cutover");
+        let successors = dir.successor_ranges(TabletId::from_u64(1));
+        assert_eq!(successors.len(), 2);
+        assert_eq!(successors[0].0, TabletId::from_u64(2));
+        assert_eq!(successors[1].0, TabletId::from_u64(3));
+        // Ranges are the live children ranges, usable for re-routing a scan.
+        assert!(successors[0].1.contains_key(b"a"));
+        assert!(successors[1].1.contains_key(b"z"));
+        // Unknown tablets have no successors.
+        assert!(dir.successor_ranges(TabletId::from_u64(99)).is_empty());
+    }
+
+    #[test]
+    fn multi_directory_routes_mixed_layouts_simultaneously() {
+        use crate::namespace::{NamespaceDescriptor, NamespaceLayout};
+        let hash_ns = NamespaceId::from_u64(11);
+        let ordered_ns = NamespaceId::from_u64(12);
+        let hash_dir =
+            DirectorySnapshot::static_tiles(hash_ns, 2, EPOCH, GUARD).expect("hash tiles");
+        let ordered_dir = DirectorySnapshot::static_ordered_tiles(ordered_ns, &[b"m".to_vec()])
+            .expect("ordered tiles");
+        let mut multi = MultiDirectory::new();
+        multi
+            .publish(
+                NamespaceDescriptor::new(hash_ns, NamespaceLayout::Hash),
+                hash_dir,
+            )
+            .expect("publish hash");
+        multi
+            .publish(
+                NamespaceDescriptor::new(ordered_ns, NamespaceLayout::Ordered),
+                ordered_dir,
+            )
+            .expect("publish ordered");
+        assert_eq!(multi.namespaces().len(), 2);
+        assert!(
+            multi
+                .lookup_hash(hash_ns, PartitionHash::from_u128(0))
+                .is_some()
+        );
+        assert_eq!(
+            multi.lookup_key(ordered_ns, b"a"),
+            Some(TabletId::from_u64(1))
+        );
+        assert_eq!(
+            multi.lookup_key(ordered_ns, b"z"),
+            Some(TabletId::from_u64(2))
+        );
+        // Cross-namespace lookups route nothing.
+        assert_eq!(multi.snapshot(NamespaceId::from_u64(99)), None);
     }
 
     #[test]

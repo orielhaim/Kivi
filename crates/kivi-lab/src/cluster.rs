@@ -84,6 +84,7 @@ pub struct Cluster {
     binary: PathBuf,
     tablet_count: usize,
     worker_count: usize,
+    layout: String,
     extra_env: Vec<(String, String)>,
     ready_timeout: Duration,
 }
@@ -177,6 +178,38 @@ impl Cluster {
         Self::spawn_full(tablet_count, worker_count, want_resp, &[])
     }
 
+    /// Spawns a fresh 3-node ORDERED cluster (`--layout ordered`) with
+    /// `tablet_count` ordered tablets, waiting for every tablet to elect
+    /// exactly one leader. Range scans, transactions, and secondary
+    /// indexes run against these clusters.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpawnError`] like [`Cluster::spawn`].
+    pub fn spawn_ordered(tablet_count: usize) -> Result<Self, SpawnError> {
+        Self::spawn_with_layout(tablet_count, TEST_WORKERS, "ordered")
+    }
+
+    /// Spawns a fresh 3-node cluster with an explicit namespace layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpawnError`] like [`Cluster::spawn`].
+    pub fn spawn_with_layout(
+        tablet_count: usize,
+        worker_count: usize,
+        layout: &str,
+    ) -> Result<Self, SpawnError> {
+        Self::spawn_full_timeout_layout(
+            tablet_count,
+            worker_count,
+            false,
+            &[],
+            READY_TIMEOUT,
+            layout,
+        )
+    }
+
     /// Spawns like [`Cluster::spawn_with_tablets`] with an explicit
     /// readiness window per member (large formations open hundreds of
     /// groups per process; the default 20 s window suits small ones).
@@ -230,12 +263,37 @@ impl Cluster {
         extra_env: &[(&str, &str)],
         ready_timeout: Duration,
     ) -> Result<Self, SpawnError> {
-        let cluster = Self::spawn_bare(
+        Self::spawn_full_timeout_layout(
             tablet_count,
             worker_count,
             want_resp,
             extra_env,
             ready_timeout,
+            "hash",
+        )
+    }
+
+    /// Spawns like [`Cluster::spawn_full_timeout`] with an explicit
+    /// namespace layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpawnError`] like [`Cluster::spawn`].
+    pub fn spawn_full_timeout_layout(
+        tablet_count: usize,
+        worker_count: usize,
+        want_resp: bool,
+        extra_env: &[(&str, &str)],
+        ready_timeout: Duration,
+        layout: &str,
+    ) -> Result<Self, SpawnError> {
+        let cluster = Self::spawn_bare_layout(
+            tablet_count,
+            worker_count,
+            want_resp,
+            extra_env,
+            ready_timeout,
+            layout,
         )?;
         // Single-tablet clusters keep the legacy single-leader wait;
         // multi-tablet formations wait for every tablet to elect.
@@ -262,6 +320,30 @@ impl Cluster {
         extra_env: &[(&str, &str)],
         ready_timeout: Duration,
     ) -> Result<Self, SpawnError> {
+        Self::spawn_bare_layout(
+            tablet_count,
+            worker_count,
+            want_resp,
+            extra_env,
+            ready_timeout,
+            "hash",
+        )
+    }
+
+    /// Spawns like [`Cluster::spawn_bare`] with an explicit namespace
+    /// layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpawnError`] like [`Cluster::spawn`].
+    pub fn spawn_bare_layout(
+        tablet_count: usize,
+        worker_count: usize,
+        want_resp: bool,
+        extra_env: &[(&str, &str)],
+        ready_timeout: Duration,
+        layout: &str,
+    ) -> Result<Self, SpawnError> {
         let binary = server_binary_path()?;
         let mut last = SpawnError::Io("no spawn attempt ran".to_owned());
         for _ in 0..SPAWN_ATTEMPTS {
@@ -272,6 +354,7 @@ impl Cluster {
                 want_resp,
                 extra_env,
                 ready_timeout,
+                layout,
             ) {
                 Ok(cluster) => return Ok(cluster),
                 Err(error) => {
@@ -829,6 +912,8 @@ impl Cluster {
             self.tablet_count.to_string(),
             "--cluster-workers".to_owned(),
             self.worker_count.to_string(),
+            "--layout".to_owned(),
+            self.layout.clone(),
             "--data-dir".to_owned(),
             data_dir.display().to_string(),
         ]
@@ -866,6 +951,7 @@ impl Cluster {
         want_resp: bool,
         extra_env: &[(&str, &str)],
         ready_timeout: Duration,
+        layout: &str,
     ) -> Result<Self, SpawnError> {
         let peers = [free_udp_addr(), free_udp_addr(), free_udp_addr()];
         let natives = [free_addr(), free_addr(), free_addr()];
@@ -886,6 +972,8 @@ impl Cluster {
                 tablet_count.to_string(),
                 "--cluster-workers".to_owned(),
                 worker_count.to_string(),
+                "--layout".to_owned(),
+                layout.to_owned(),
                 "--data-dir".to_owned(),
                 data_dir.path().display().to_string(),
                 "--cluster-peers".to_owned(),
@@ -937,6 +1025,7 @@ impl Cluster {
             binary: binary.clone(),
             tablet_count,
             worker_count,
+            layout: layout.to_owned(),
             extra_env: extra_env
                 .iter()
                 .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
@@ -1534,6 +1623,76 @@ impl Cluster {
             &format!("merge tablets {left}+{right}"),
             Duration::from_secs(120),
         )
+    }
+
+    /// Splits one ORDERED tablet at an explicit key through the persisted
+    /// pathway (hash parents split at their midpoint without a key).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the endpoint refuses.
+    #[must_use]
+    pub fn split_ordered_tablet(&self, tablet: u64, split_key: &[u8]) -> Value {
+        self.post_control(
+            "/v1/control/splits/create",
+            &serde_json::json!({ "tablet": tablet, "split_key": split_key }),
+            &format!("split ordered tablet {tablet}"),
+            Duration::from_secs(120),
+        )
+    }
+
+    /// Ordered tablet ranges of one member: `(tablet, start, end)` with
+    /// hex-decoded bounds (`None` end = `+∞`). Only `Active` tablets are
+    /// returned (tombstones overlap successors by design and never route).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the endpoint errors.
+    #[must_use]
+    pub fn ordered_ranges(&self, index: usize) -> Vec<(u64, Vec<u8>, Option<Vec<u8>>)> {
+        fn unhex(text: &str) -> Vec<u8> {
+            (0..text.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&text[i..i + 2], 16).expect("hex range bound"))
+                .collect()
+        }
+        self.tablets_status(index)
+            .as_array()
+            .expect("tablets array")
+            .iter()
+            .filter(|tablet| tablet["state"].as_str() == Some("Active"))
+            .filter_map(|tablet| {
+                let group = tablet["group"].as_u64().expect("tablet group");
+                let start = tablet["range_start"].as_str().map(unhex)?;
+                let end = tablet["range_end"].as_str().map(unhex);
+                Some((group, start, end))
+            })
+            .collect()
+    }
+
+    /// Total prepared transaction intents across all live members (stuck
+    /// intent detection: quiescent clusters must report zero).
+    ///
+    /// # Panics
+    ///
+    /// Panics when an endpoint errors.
+    #[must_use]
+    pub fn total_intents(&self) -> usize {
+        let mut total = 0;
+        for index in 0..self.nodes.len() {
+            if self.nodes[index].child.is_none() {
+                continue;
+            }
+            for tablet in self
+                .tablets_status(index)
+                .as_array()
+                .expect("tablets array")
+            {
+                total += usize::try_from(tablet["intent_count"].as_u64().unwrap_or(0))
+                    .unwrap_or(usize::MAX);
+            }
+        }
+        total
     }
 
     /// Fetches split plans from one member.

@@ -166,6 +166,41 @@ impl RouteCache {
         })
     }
 
+    /// Finds the first cached route covering `key`, if any (ordered
+    /// namespaces). Hash ranges never match a key lookup: those route by
+    /// partition hash, never by raw bytes.
+    #[must_use]
+    pub fn lookup_key(&self, key: &[u8]) -> Option<RouteEntry> {
+        self.entries.load().iter().find_map(|entry| {
+            let covers = match &entry.range {
+                PartitionRange::Ordered(range) => range.contains(key),
+                PartitionRange::Hash(_) => false,
+            };
+            covers.then(|| entry.clone())
+        })
+    }
+
+    /// Inserts a learned tablet range directly (scan pages and prepare
+    /// responses teach full ranges, not just points).
+    pub fn insert_range(
+        &self,
+        range: PartitionRange,
+        tablet: TabletId,
+        epoch: TabletEpoch,
+        worker: WorkerId,
+        endpoint: String,
+        dir_version: u64,
+    ) {
+        self.insert(RouteEntry {
+            range,
+            tablet,
+            epoch,
+            worker,
+            endpoint,
+            dir_version,
+        });
+    }
+
     /// Inserts a learned route, evicting same-kind overlaps first so newer
     /// authority information always wins per range.
     pub fn insert(&self, entry: RouteEntry) {

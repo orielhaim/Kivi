@@ -59,7 +59,7 @@ use crate::gate::SidecarGate;
 use crate::node::{
     BootstrapInputs, NodeOpenError, NodeStatus, OwnerCtx, OwnerRequest, ProposeError, ReadError,
     bootstrap_group, classify_from_store, owner_call_on, propose_caller_side, read_caller_side,
-    spawn_raft,
+    scan_caller_side, spawn_raft,
 };
 use crate::peer::{PeerRequest, PeerResponse, PeerRpcError};
 use crate::router::PeerRouter;
@@ -1023,6 +1023,12 @@ impl ConsensusNode {
             .unwrap_or_default()
     }
 
+    /// Returns the namespace served.
+    #[must_use]
+    pub const fn namespace(&self) -> NamespaceId {
+        self.namespace
+    }
+
     /// Whether this node hosts a control replica.
     #[must_use]
     pub fn hosts_control(&self) -> bool {
@@ -1198,6 +1204,53 @@ impl ConsensusNode {
             &worker,
             ConsensusGroupId::of_tablet(tablet),
             op,
+            contract,
+            now,
+        )
+        .await
+    }
+
+    /// Serves one bounded scan page against `tablet`'s group under its
+    /// contract (`Latest` proves leadership; `Any` reads locally). Each
+    /// tablet read is strong; the multi-tablet scan is not one snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] for unknown tablets, routing, validation, or
+    /// coverage failures.
+    pub async fn scan(
+        &self,
+        tablet: TabletId,
+        spec: &kivi_state::ScanSpec,
+        contract: ReadContract,
+        now: UnixMicros,
+    ) -> Result<kivi_state::ScanPage, ReadError> {
+        let machine = self
+            .machines
+            .lock()
+            .map_err(|_| {
+                ReadError::Consensus(ConsensusError::Unavailable {
+                    reason: "consensus machine lock poisoned".to_owned(),
+                })
+            })?
+            .get(&tablet)
+            .cloned()
+            .ok_or_else(|| {
+                ReadError::Consensus(ConsensusError::Unavailable {
+                    reason: format!("tablet {} not served by this node", tablet.as_u64()),
+                })
+            })?;
+        let worker = self.worker_for(tablet).map_err(|error| match error {
+            ProposeError::Consensus(consensus) => ReadError::Consensus(consensus),
+            _ => ReadError::Consensus(ConsensusError::Unavailable {
+                reason: format!("tablet {} not served by this node", tablet.as_u64()),
+            }),
+        })?;
+        scan_caller_side(
+            &machine,
+            &worker,
+            ConsensusGroupId::of_tablet(tablet),
+            spec,
             contract,
             now,
         )
@@ -1684,6 +1737,195 @@ impl ConsensusNode {
     pub async fn tablet_object_count(&self, tablet: TabletId) -> Option<usize> {
         let machine = self.machines.lock().ok()?.get(&tablet).cloned()?;
         Some(machine.object_count().await)
+    }
+
+    /// Seeds an ordered split child from its local parent: keys strictly
+    /// below `split_key` go left, the rest go right (half-open `[start,
+    /// end)` boundary, never a hash midpoint). Sessions copy wholesale to
+    /// the child; prepared intents are NOT copied (the parent stays fenced
+    /// and the cutover migrates live intents to their new owners — seeding
+    /// a copy would fork the reservation). The child inherits the parent's
+    /// ordered-index flag. Idempotent: re-seeding overwrites the inactive
+    /// target.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable reason when either replica is not hosted
+    /// locally.
+    pub async fn seed_split_child_ordered(
+        &self,
+        parent: TabletId,
+        child: TabletId,
+        split_key: Vec<u8>,
+        left: bool,
+    ) -> Result<(usize, usize), String> {
+        let (parent_machine, child_machine) = self
+            .machines
+            .lock()
+            .map_err(|_| "machine map poisoned".to_owned())
+            .and_then(|machines| {
+                let parent = machines.get(&parent).cloned().ok_or_else(|| {
+                    format!("parent tablet {} not served by this node", parent.as_u64())
+                })?;
+                let child = machines.get(&child).cloned().ok_or_else(|| {
+                    format!("child tablet {} not served by this node", child.as_u64())
+                })?;
+                Ok((parent, child))
+            })?;
+        let ordered = parent_machine.ordered_index_enabled().await;
+        let (objects, sessions) = parent_machine.export_topology_copy().await;
+        let mut half = Vec::new();
+        for (key, object) in objects {
+            let is_left = key.as_bytes() < split_key.as_slice();
+            if is_left == left {
+                half.push((key, object));
+            }
+        }
+        let object_count = half.len();
+        let session_count = sessions.len();
+        child_machine.install_topology_copy((half, sessions)).await;
+        child_machine.set_ordered_indexing(ordered).await;
+        Ok((object_count, session_count))
+    }
+
+    /// Propagates the ordered-index flag from parent to child after a hash
+    /// split seed (hash children of an ordered parent cannot happen —
+    /// layouts never mix — but the flag copy keeps the helper total).
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable reason when either replica is not hosted
+    /// locally.
+    pub async fn inherit_ordered_indexing(
+        &self,
+        parent: TabletId,
+        child: TabletId,
+    ) -> Result<(), String> {
+        let (parent_machine, child_machine) = self
+            .machines
+            .lock()
+            .map_err(|_| "machine map poisoned".to_owned())
+            .and_then(|machines| {
+                let parent = machines.get(&parent).cloned().ok_or_else(|| {
+                    format!("parent tablet {} not served by this node", parent.as_u64())
+                })?;
+                let child = machines.get(&child).cloned().ok_or_else(|| {
+                    format!("child tablet {} not served by this node", child.as_u64())
+                })?;
+                Ok((parent, child))
+            })?;
+        let ordered = parent_machine.ordered_index_enabled().await;
+        child_machine.set_ordered_indexing(ordered).await;
+        Ok(())
+    }
+
+    /// Enables or disables the ordered key index on one local replica
+    /// (topology reconciliation drives this from the namespace layout).
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable reason when the replica is not hosted
+    /// locally.
+    pub async fn set_ordered_indexing(
+        &self,
+        tablet: TabletId,
+        enabled: bool,
+    ) -> Result<(), String> {
+        let machine =
+            self.machines
+                .lock()
+                .map_err(|_| "machine map poisoned".to_owned())
+                .and_then(|machines| {
+                    machines.get(&tablet).cloned().ok_or_else(|| {
+                        format!("tablet {} not served by this node", tablet.as_u64())
+                    })
+                })?;
+        machine.set_ordered_indexing(enabled).await;
+        Ok(())
+    }
+
+    /// Whether one local replica maintains the ordered key index (`None`
+    /// when the replica is not hosted locally).
+    pub async fn ordered_index_enabled(&self, tablet: TabletId) -> Option<bool> {
+        let machine = self.machines.lock().ok()?.get(&tablet).cloned()?;
+        Some(machine.ordered_index_enabled().await)
+    }
+
+    /// Removes and returns every prepared intent on one local replica
+    /// (topology cutover migrates intents to their new owners).
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable reason when the replica is not hosted
+    /// locally.
+    pub async fn drain_intents(
+        &self,
+        tablet: TabletId,
+    ) -> Result<Vec<kivi_state::TxnIntent>, String> {
+        let machine =
+            self.machines
+                .lock()
+                .map_err(|_| "machine map poisoned".to_owned())
+                .and_then(|machines| {
+                    machines.get(&tablet).cloned().ok_or_else(|| {
+                        format!("tablet {} not served by this node", tablet.as_u64())
+                    })
+                })?;
+        Ok(machine.drain_intents().await)
+    }
+
+    /// Installs one migrated intent on one local replica (cutover path).
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable reason when the replica is not hosted
+    /// locally.
+    pub async fn restore_intent(
+        &self,
+        tablet: TabletId,
+        intent: kivi_state::TxnIntent,
+    ) -> Result<(), String> {
+        let machine =
+            self.machines
+                .lock()
+                .map_err(|_| "machine map poisoned".to_owned())
+                .and_then(|machines| {
+                    machines.get(&tablet).cloned().ok_or_else(|| {
+                        format!("tablet {} not served by this node", tablet.as_u64())
+                    })
+                })?;
+        machine.restore_intent(intent).await;
+        Ok(())
+    }
+
+    /// Number of prepared intents on one local replica, if hosted.
+    pub async fn tablet_intent_count(&self, tablet: TabletId) -> Option<usize> {
+        let machine = self.machines.lock().ok()?.get(&tablet).cloned()?;
+        Some(machine.pending_intent_count().await)
+    }
+
+    /// Prepared intents on one local replica, in key order, if hosted
+    /// (transaction resolver consults this; never discards here).
+    pub async fn tablet_intents(&self, tablet: TabletId) -> Option<Vec<kivi_state::TxnIntent>> {
+        let machine = self.machines.lock().ok()?.get(&tablet).cloned()?;
+        Some(machine.snapshot_intents().await)
+    }
+
+    /// Logical telemetry of one local replica, if hosted.
+    pub async fn tablet_stats(
+        &self,
+        tablet: TabletId,
+        now: UnixMicros,
+    ) -> Option<kivi_state::StoreStats> {
+        let machine = self.machines.lock().ok()?.get(&tablet).cloned()?;
+        Some(machine.tablet_stats(now).await)
+    }
+
+    /// Approximate median split key of one local replica, if hosted and
+    /// ordered-indexed (first key past half of stored logical bytes).
+    pub async fn tablet_median_key(&self, tablet: TabletId) -> Option<Vec<u8>> {
+        let machine = self.machines.lock().ok()?.get(&tablet).cloned()?;
+        machine.median_split_key().await
     }
 
     /// Adds a dialable peer link for a dynamically admitted node

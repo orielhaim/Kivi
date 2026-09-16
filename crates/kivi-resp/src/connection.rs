@@ -1464,6 +1464,18 @@ mod fuzz {
                 kivi_state::Operation::GetExpiry { .. } => {
                     kivi_state::OperationResult::Expiry(None)
                 }
+                // The RESP edge never issues transaction steps (no SQL, no
+                // multi-key verbs): the executor names the conflict so the
+                // totality of this match is explicit, never silent.
+                kivi_state::Operation::TxnPrepare { .. }
+                | kivi_state::Operation::TxnFinalize { .. } => {
+                    kivi_state::OperationResult::TxnConflict
+                }
+                // No Redis verb reads bare versions; version checks arrive
+                // through conditional verbs, never this reader.
+                kivi_state::Operation::GetVersion { .. } => {
+                    kivi_state::OperationResult::Version(None)
+                }
             })
         }
 

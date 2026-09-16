@@ -61,6 +61,9 @@ pub enum TabletError {
     /// Mutation application failed; see the variant for what held.
     #[error("mutation failed: {0}")]
     Apply(#[from] ApplyError),
+    /// Local scan rejected (no ordered index, or a malformed scan spec).
+    #[error("scan rejected: {0}")]
+    OpScan(#[from] kivi_state::ScanError),
     /// This tablet's commit positions are exhausted; it can accept no
     /// further durable mutations (practically unreachable: 2^64 slots).
     #[error("tablet {tablet} commit position space exhausted")]
@@ -234,6 +237,8 @@ fn opcode_for(mutation: &Mutation, is_persist_expiry: bool) -> u8 {
                 Opcode::ExpireAt
             }
         }
+        // Transaction steps shape as their parent batch opcode.
+        Mutation::TxnPrepare { .. } | Mutation::TxnFinalize { .. } => Opcode::AtomicBatch,
     }
     .as_u8()
 }
@@ -246,6 +251,8 @@ pub(crate) struct RestoredTablet {
     pub objects: Vec<(Key, kivi_state::StoredObject)>,
     /// Restored sessions: floor plus retained outcomes in sequence order.
     pub sessions: Vec<RestoredSession>,
+    /// Restored prepared intents (never discarded on restart).
+    pub intents: Vec<kivi_state::TxnIntent>,
     /// Checkpoint cut both cursors resume from.
     pub cut: CommitPosition,
 }
@@ -371,6 +378,59 @@ impl LiveTablet {
     #[must_use]
     pub fn store(&self) -> &ObjectStore {
         &self.store
+    }
+
+    /// Enables or disables the ordered key index on this tablet's store
+    /// (ordered namespaces enable it; hash namespaces leave it off).
+    pub fn set_ordered_indexing(&mut self, enabled: bool) {
+        self.store.set_ordered_indexing(enabled);
+    }
+
+    /// Executes one bounded local scan page against this tablet.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScanError`](kivi_state::ScanError) when the tablet keeps
+    /// no ordered index, or [`TabletError::Op`] for malformed specs. Never
+    /// mutates.
+    pub fn scan_local(
+        &mut self,
+        spec: &kivi_state::ScanSpec,
+        now: UnixMicros,
+    ) -> Result<kivi_state::ScanPage, TabletError> {
+        let page = self
+            .store
+            .scan_range(spec, now)
+            .map_err(TabletError::OpScan)?;
+        self.metrics.reads += 1;
+        self.metrics.ops_total += 1;
+        Ok(page)
+    }
+
+    /// Prepared transaction intents currently reserving keys on this
+    /// tablet, in key order (resolver and split/merge fencing consult this:
+    /// tablets with unresolved intents do not cut over).
+    #[must_use]
+    pub fn pending_intents(&self) -> Vec<kivi_state::TxnIntent> {
+        self.store.snapshot_intents()
+    }
+
+    /// Number of prepared intents on this tablet.
+    #[must_use]
+    pub fn pending_intent_count(&self) -> usize {
+        self.store.pending_intent_count()
+    }
+
+    /// Installs a recovered intent verbatim (checkpoint restore never
+    /// discards unresolved intents).
+    pub fn restore_intent(&mut self, intent: kivi_state::TxnIntent) {
+        self.store.restore_intent(intent);
+    }
+
+    /// Logical telemetry at `now` for split/merge policy.
+    #[must_use]
+    pub fn tablet_stats(&self, now: UnixMicros) -> kivi_state::StoreStats {
+        self.store.stats(now)
     }
 
     /// Returns a copy of the local metrics.
@@ -912,14 +972,16 @@ impl LiveTablet {
             cut: self.applied_commit,
             objects: self.store.snapshot_entries(),
             sessions,
+            intents: self.store.snapshot_intents(),
             dirty,
         }
     }
 
-    /// Installs checkpoint-restored state: objects, dedup sessions, and
-    /// both commit cursors at the cut. Recovery calls this before
-    /// replaying the WAL tail; the tail's chain validation resumes from
-    /// the cut exactly as if the tablet had applied it live.
+    /// Installs checkpoint-restored state: objects, dedup sessions,
+    /// prepared intents (never discarded), and both commit cursors at the
+    /// cut. Recovery calls this before replaying the WAL tail; the tail's
+    /// chain validation resumes from the cut exactly as if the tablet had
+    /// applied it live.
     pub(crate) fn restore_checkpoint(&mut self, restored: RestoredTablet) {
         debug_assert!(
             restored.cut.as_u64() >= self.applied_commit.as_u64(),
@@ -933,6 +995,9 @@ impl LiveTablet {
                     .push_back((restored.cut.as_u64(), chunked.manifest));
             }
             self.store.put_stored(key, object);
+        }
+        for intent in restored.intents {
+            self.store.restore_intent(intent);
         }
         for (session, floor, outcomes) in restored.sessions {
             let mut state = SessionDedup::empty();
@@ -977,9 +1042,11 @@ impl LiveTablet {
             if skip.is_some_and(|touched| touched.contains(&key)) {
                 continue;
             }
-            // Delete of a swept key cannot fail (no error paths exist for it);
-            // a hypothetical failure would simply leave the key for the next
-            // sweep, so skipping is the safe direction.
+            // Delete of a swept key cannot fail except on a prepared
+            // transaction intent (which fails closed by design): intent
+            // resolution owns the key until finalize, so the sweep skips
+            // it and reclaims it on a later pass. Skipping is the safe
+            // direction either way.
             if let Ok(outcome) = self
                 .store
                 .apply(&Mutation::Delete { key: key.clone() }, now)

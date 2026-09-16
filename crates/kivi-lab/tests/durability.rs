@@ -107,6 +107,17 @@ impl RawDurable {
             expiry_policy: kivi_protocol::EXPIRY_CLEAR,
             identity: Some(RequestIdentity::new(session, RequestSeq::from_u64(seq))),
             ack_floor: RequestSeq::from_u64(ack),
+            scan_start: None,
+            scan_end: None,
+            scan_direction: kivi_protocol::SCAN_FORWARD,
+            scan_max_items: 0,
+            scan_max_bytes: 0,
+            scan_projection: kivi_protocol::SCAN_KEYS_ONLY,
+            scan_consistency: kivi_protocol::SCAN_LATEST_PER_TABLET,
+            batch_txn: [0u8; 16],
+            batch_writes: Vec::new(),
+            txn_coordinator: 0,
+            txn_commit: false,
         };
         self.socket
             .write_all(&kivi_protocol::encode_frame(

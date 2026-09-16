@@ -308,9 +308,16 @@ struct ApplyData {
 /// Batch-local overlay for one tablet: pending state for touched keys only
 /// (`None` = deleted within the batch), staged over the immutable
 /// committed store. Never cloned wholesale; never visible to reads.
+///
+/// Intents stage the same way as objects: `pending_intents` carries this
+/// key's post-batch intent (`None` = resolved within the batch), layered
+/// over the committed intent table. Scratch preparation for one key always
+/// sees committed-plus-pending intents, so durable predictions match the
+/// later committed apply exactly — the same contract objects already keep.
 #[derive(Debug, Default)]
 struct TabletOverlay {
     pending: HashMap<Key, Option<StoredObject>>,
+    intents: HashMap<Key, Option<kivi_state::TxnIntent>>,
 }
 
 impl TabletOverlay {
@@ -339,6 +346,19 @@ impl TabletOverlay {
                 }
             }
         }
+        // Stage exactly this key's intent view: overlay-staged intents win,
+        // otherwise the committed intent (if any). Single-key operations
+        // read no intent state beyond their key, so this one-entry staging
+        // predicts identically to the full store.
+        match self.intents.get(key) {
+            Some(Some(intent)) => scratch.restore_intent(intent.clone()),
+            Some(None) => {}
+            None => {
+                if let Some(intent) = committed.cloned_intent_for_key(key) {
+                    scratch.restore_intent(intent);
+                }
+            }
+        }
         let prepared = scratch.prepare_durable(op, now)?;
         if let StorePrepared::Write { mutation, .. } = &prepared {
             // Evolve the overlay through the same deterministic apply the
@@ -348,6 +368,8 @@ impl TabletOverlay {
             scratch.apply(mutation, now).map_err(TabletError::Apply)?;
             let staged = scratch.get_stored(mutation.key()).cloned();
             self.pending.insert(key.clone(), staged);
+            self.intents
+                .insert(key.clone(), scratch.cloned_intent_for_key(mutation.key()));
         }
         Ok(prepared)
     }

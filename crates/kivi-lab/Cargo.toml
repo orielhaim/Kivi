@@ -36,6 +36,7 @@ thiserror.workspace = true
 tempfile.workspace = true
 
 [dev-dependencies]
+divan.workspace = true
 # Ecosystem/reference client: conformance cross-checks and the redis-rs →
 # Kivi compatibility test only. Benchmark targets and the harness speak raw
 # RESP so Kivi-vs-Redis comparisons share one identical transport.
@@ -43,3 +44,7 @@ redis = "1.7"
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "ordered"
+harness = false

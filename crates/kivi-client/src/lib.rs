@@ -18,6 +18,7 @@
 //! request id; writers serialize per connection under a mutex. Blocking
 //! calls wait on one-shot rendezvous channels with an explicit timeout.
 
+pub mod ordered;
 pub mod route;
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -38,6 +39,11 @@ use kivi_protocol::{
 use kivi_state::{Key, PartitionHasher};
 use kivi_types::{NamespaceId, RequestIdentity, RequestSeq, SessionId, UnixMicros, WorkerId};
 
+pub use ordered::{
+    AtomicBatchResult, BatchExpect, BatchWriteKind, BatchWriteSpec, ClientScanEntry,
+    ClientScanPage, ClientScanValue, IndexHit, IndexTermSet, ScanConsistency, ScanCursor,
+    ScanDirection, ScanOptions, ScanProjection, key_successor,
+};
 pub use route::{RouteCache, RouteEntry, TabletLeaderCache};
 
 /// Connection establishment timeout default.
@@ -183,6 +189,24 @@ pub enum ClientError {
     /// The session holds too many unacknowledged outcomes on the tablet.
     #[error("session outcome window exhausted")]
     SessionOverloaded,
+    /// A transactional prepare failed OCC validation or met a reservation.
+    #[error("transaction conflict")]
+    TxnConflict,
+    /// The transaction was aborted.
+    #[error("transaction aborted")]
+    TxnAborted,
+    /// The transaction exceeds participant/key/byte bounds.
+    #[error("transaction too large")]
+    TxnTooLarge,
+    /// A participant cannot reach the coordinator record yet.
+    #[error("transaction coordinator unavailable")]
+    TxnCoordinatorUnavailable,
+    /// A unique index term is already owned by another primary.
+    #[error("unique index violation")]
+    UniqueViolation,
+    /// A scan cursor no longer resolves; re-issue the scan.
+    #[error("scan cursor stale")]
+    ScanCursorStale,
 }
 
 /// Maps a response status onto a client error (Ok/NotFound handled by callers).
@@ -206,6 +230,12 @@ fn status_error(status: Status, body: &ResponseBody) -> ClientError {
         Status::Internal => ClientError::Internal(diagnostic),
         Status::DedupExpired => ClientError::DedupExpired,
         Status::SessionOverloaded => ClientError::SessionOverloaded,
+        Status::TxnConflict => ClientError::TxnConflict,
+        Status::TxnAborted => ClientError::TxnAborted,
+        Status::TxnTooLarge => ClientError::TxnTooLarge,
+        Status::TxnCoordinatorUnavailable => ClientError::TxnCoordinatorUnavailable,
+        Status::UniqueViolation => ClientError::UniqueViolation,
+        Status::ScanCursorStale => ClientError::ScanCursorStale,
     }
 }
 
@@ -1090,8 +1120,31 @@ impl NativeClient {
     /// issued under this session before — e.g., sent but unacknowledged
     /// across a crash — so the server dedups it instead of executing
     /// twice). `None` allocates a fresh sequence. Reads ignore `seq`.
-    #[allow(clippy::too_many_lines)]
+    /// Only `Ok`/`NotFound` responses return `Ok`; every other application
+    /// status becomes its [`ClientError`] (transaction/scan drivers use
+    /// [`execute_raw`](Self::execute_raw) to match statuses themselves).
     fn execute_with_seq(
+        &self,
+        key: &Key,
+        opcode: kivi_protocol::Opcode,
+        build: impl Fn() -> kivi_protocol::Request,
+        seq: Option<RequestSeq>,
+    ) -> Result<Response, ClientError> {
+        use kivi_protocol::Status;
+        let response = self.execute_raw(key, opcode, build, seq)?;
+        match response.status {
+            Status::Ok | Status::NotFound => Ok(response),
+            other => Err(status_error(other, &response.body)),
+        }
+    }
+
+    /// Executes one request payload and returns the terminal response
+    /// verbatim (any application status, including error statuses):
+    /// redirects and overload are still followed/retried inside; transport
+    /// failures still error. Scan, batch, and transaction drivers match on
+    /// `(status, body)` themselves.
+    #[allow(clippy::too_many_lines)]
+    fn execute_raw(
         &self,
         key: &Key,
         opcode: kivi_protocol::Opcode,
@@ -1140,47 +1193,63 @@ impl NativeClient {
         let mut visited_redirects: Vec<(u64, String, u64)> = Vec::new();
         let mut stale_repeats: u32 = 0;
         let mut seed_cursor = 0usize;
+        // Fresh-redirect follow: a redirect names the authority directly,
+        // so the next hop goes there instead of re-resolving (re-resolution
+        // can miss at exclusive range boundaries — e.g. reverse-scan
+        // cursors — and ping-pong on the seed forever). Cleared once used;
+        // never overrides dead-endpoint failover.
+        let mut follow: Option<(String, kivi_protocol::RouteHint)> = None;
         self.shared.requests.fetch_add(1, Ordering::Relaxed);
         let outcome: Result<Response, ClientError> = loop {
             if redirects > self.shared.max_redirects {
                 self.shared.errors.fetch_add(1, Ordering::Relaxed);
                 break Err(ClientError::TooManyRedirects);
             }
-            // Route: cached range authority (unless already tried dead
-            // this call), else the next untried seed with no hint. The
+            // Route: a fresh redirect target first (unless tried dead),
+            // then cached range authority (ordered ranges by key, hash
+            // ranges by partition hash — snapshots are single-layout, so
+            // exactly one lookup can hit), unless already tried dead this
+            // call, else the next untried seed with no hint. The
             // per-tablet leader cache (`tablet_leaders`) is updated on
             // every redirect for cluster introspection and future
             // many-tablet routing, but it never overrides range routing:
-            // single-node deployments replicate many tablets per
-            // process, so any single cached leader endpoint would
-            // misroute other tablets (replicated clusters use a root
-            // range covering every key, so the range hit already lands on
-            // the leader). The mutation identity above is preserved
-            // across all hops.
-            let (endpoint, hint) = match self.shared.routes.lookup(hash) {
-                Some(route) if !tried.contains(&route.endpoint) => {
-                    self.shared
-                        .tablet_leaders
-                        .insert(route.tablet, route.endpoint.clone());
-                    (route.endpoint.clone(), Some(route.hint()))
-                }
-                _ => {
-                    let mut pick = None;
-                    for _ in 0..self.shared.seeds.len() {
-                        let candidate =
-                            self.shared.seeds[seed_cursor % self.shared.seeds.len()].clone();
-                        seed_cursor += 1;
-                        if !tried.contains(&candidate) {
-                            pick = Some(candidate);
-                            break;
-                        }
+            // single-node deployments replicate many tablets per process,
+            // so any single cached leader endpoint would misroute other
+            // tablets (replicated clusters use a root range covering every
+            // key, so the range hit already lands on the leader). The
+            // mutation identity above is preserved across all hops.
+            let (endpoint, hint) = match follow.take() {
+                Some((endpoint, hint)) if !tried.contains(&endpoint) => (endpoint, Some(hint)),
+                _ => match self
+                    .shared
+                    .routes
+                    .lookup_key(key.as_bytes())
+                    .or_else(|| self.shared.routes.lookup(hash))
+                {
+                    Some(route) if !tried.contains(&route.endpoint) => {
+                        self.shared
+                            .tablet_leaders
+                            .insert(route.tablet, route.endpoint.clone());
+                        (route.endpoint.clone(), Some(route.hint()))
                     }
-                    let Some(endpoint) = pick else {
-                        self.shared.errors.fetch_add(1, Ordering::Relaxed);
-                        break Err(ClientError::Io("all known endpoints failed".to_owned()));
-                    };
-                    (endpoint, None)
-                }
+                    _ => {
+                        let mut pick = None;
+                        for _ in 0..self.shared.seeds.len() {
+                            let candidate =
+                                self.shared.seeds[seed_cursor % self.shared.seeds.len()].clone();
+                            seed_cursor += 1;
+                            if !tried.contains(&candidate) {
+                                pick = Some(candidate);
+                                break;
+                            }
+                        }
+                        let Some(endpoint) = pick else {
+                            self.shared.errors.fetch_add(1, Ordering::Relaxed);
+                            break Err(ClientError::Io("all known endpoints failed".to_owned()));
+                        };
+                        (endpoint, None)
+                    }
+                },
             };
             let expect = hint.map(|hint| hint.worker);
             let Ok(conn) = self.connection(&endpoint, expect) else {
@@ -1337,11 +1406,23 @@ impl NativeClient {
                             // Invalidate only the affected range/leader:
                             // `insert` evicts overlapping ranges for this
                             // tablet kind, and the leader cache is
-                            // per-tablet. No global cache flush.
+                            // per-tablet. No global cache flush. The next
+                            // hop follows the redirect target directly:
+                            // re-resolution can miss at exclusive range
+                            // boundaries (reverse-scan cursors) and loop
+                            // on the seed forever.
                             self.shared
                                 .tablet_leaders
                                 .insert(info.tablet, info.endpoint.clone());
                             self.shared.routes.insert(RouteEntry::from_redirect(info));
+                            follow = Some((
+                                info.endpoint.clone(),
+                                kivi_protocol::RouteHint {
+                                    tablet: info.tablet,
+                                    epoch: info.epoch,
+                                    worker: info.worker,
+                                },
+                            ));
                             overloaded_streak = 0;
                             redirects += 1;
                             self.shared.redirects.fetch_add(1, Ordering::Relaxed);
@@ -1385,9 +1466,11 @@ impl NativeClient {
                         );
                     }
                 }
-                other => {
+                _ => {
+                    // Raw terminal response: the typed wrappers map
+                    // `Ok`/`NotFound`, drivers match the rest themselves.
                     self.shared.errors.fetch_add(1, Ordering::Relaxed);
-                    break Err(status_error(other, &response.body));
+                    break Ok(response);
                 }
             }
         };
@@ -1431,6 +1514,17 @@ impl NativeClient {
             expiry_policy: kivi_protocol::EXPIRY_CLEAR,
             identity: None,
             ack_floor: RequestSeq::from_u64(0),
+            scan_start: None,
+            scan_end: None,
+            scan_direction: kivi_protocol::SCAN_FORWARD,
+            scan_max_items: 0,
+            scan_max_bytes: 0,
+            scan_projection: kivi_protocol::SCAN_KEYS_ONLY,
+            scan_consistency: kivi_protocol::SCAN_LATEST_PER_TABLET,
+            batch_txn: [0u8; 16],
+            batch_writes: Vec::new(),
+            txn_coordinator: 0,
+            txn_commit: false,
         })?;
         match response.body {
             ResponseBody::Value(value) => Ok(Some(Bytes::from(value))),
@@ -1462,6 +1556,17 @@ impl NativeClient {
             expiry_policy: kivi_protocol::EXPIRY_CLEAR,
             identity: None,
             ack_floor: RequestSeq::from_u64(0),
+            scan_start: None,
+            scan_end: None,
+            scan_direction: kivi_protocol::SCAN_FORWARD,
+            scan_max_items: 0,
+            scan_max_bytes: 0,
+            scan_projection: kivi_protocol::SCAN_KEYS_ONLY,
+            scan_consistency: kivi_protocol::SCAN_LATEST_PER_TABLET,
+            batch_txn: [0u8; 16],
+            batch_writes: Vec::new(),
+            txn_coordinator: 0,
+            txn_commit: false,
         })?;
         match response.body {
             ResponseBody::Stored { .. } => Ok(()),
@@ -1497,6 +1602,17 @@ impl NativeClient {
             expiry_policy: kivi_protocol::EXPIRY_CLEAR,
             identity: None,
             ack_floor: RequestSeq::from_u64(0),
+            scan_start: None,
+            scan_end: None,
+            scan_direction: kivi_protocol::SCAN_FORWARD,
+            scan_max_items: 0,
+            scan_max_bytes: 0,
+            scan_projection: kivi_protocol::SCAN_KEYS_ONLY,
+            scan_consistency: kivi_protocol::SCAN_LATEST_PER_TABLET,
+            batch_txn: [0u8; 16],
+            batch_writes: Vec::new(),
+            txn_coordinator: 0,
+            txn_commit: false,
         })?;
         match response.body {
             ResponseBody::Stored { .. } => Ok(()),
@@ -1962,6 +2078,17 @@ impl NativeClient {
             expiry_policy: kivi_protocol::EXPIRY_CLEAR,
             identity: None,
             ack_floor: RequestSeq::from_u64(0),
+            scan_start: None,
+            scan_end: None,
+            scan_direction: kivi_protocol::SCAN_FORWARD,
+            scan_max_items: 0,
+            scan_max_bytes: 0,
+            scan_projection: kivi_protocol::SCAN_KEYS_ONLY,
+            scan_consistency: kivi_protocol::SCAN_LATEST_PER_TABLET,
+            batch_txn: [0u8; 16],
+            batch_writes: Vec::new(),
+            txn_coordinator: 0,
+            txn_commit: false,
         };
         if let Err(error) =
             Connection::send_frame(conn, FrameKind::Request, stream, &request.encode())
@@ -2131,6 +2258,17 @@ impl NativeClient {
                 expiry_policy: kivi_protocol::EXPIRY_CLEAR,
                 identity: None,
                 ack_floor: RequestSeq::from_u64(0),
+                scan_start: None,
+                scan_end: None,
+                scan_direction: kivi_protocol::SCAN_FORWARD,
+                scan_max_items: 0,
+                scan_max_bytes: 0,
+                scan_projection: kivi_protocol::SCAN_KEYS_ONLY,
+                scan_consistency: kivi_protocol::SCAN_LATEST_PER_TABLET,
+                batch_txn: [0u8; 16],
+                batch_writes: Vec::new(),
+                txn_coordinator: 0,
+                txn_commit: false,
             },
             Some(seq),
         )?;
@@ -2160,6 +2298,17 @@ impl NativeClient {
             expiry_policy: kivi_protocol::EXPIRY_CLEAR,
             identity: None,
             ack_floor: RequestSeq::from_u64(0),
+            scan_start: None,
+            scan_end: None,
+            scan_direction: kivi_protocol::SCAN_FORWARD,
+            scan_max_items: 0,
+            scan_max_bytes: 0,
+            scan_projection: kivi_protocol::SCAN_KEYS_ONLY,
+            scan_consistency: kivi_protocol::SCAN_LATEST_PER_TABLET,
+            batch_txn: [0u8; 16],
+            batch_writes: Vec::new(),
+            txn_coordinator: 0,
+            txn_commit: false,
         })?;
         match response.body {
             ResponseBody::Deleted { existed } => Ok(existed),
@@ -2188,6 +2337,17 @@ impl NativeClient {
             expiry_policy: kivi_protocol::EXPIRY_CLEAR,
             identity: None,
             ack_floor: RequestSeq::from_u64(0),
+            scan_start: None,
+            scan_end: None,
+            scan_direction: kivi_protocol::SCAN_FORWARD,
+            scan_max_items: 0,
+            scan_max_bytes: 0,
+            scan_projection: kivi_protocol::SCAN_KEYS_ONLY,
+            scan_consistency: kivi_protocol::SCAN_LATEST_PER_TABLET,
+            batch_txn: [0u8; 16],
+            batch_writes: Vec::new(),
+            txn_coordinator: 0,
+            txn_commit: false,
         })?;
         match response.body {
             ResponseBody::Exists(present) => Ok(present),
@@ -2216,6 +2376,17 @@ impl NativeClient {
             expiry_policy: kivi_protocol::EXPIRY_CLEAR,
             identity: None,
             ack_floor: RequestSeq::from_u64(0),
+            scan_start: None,
+            scan_end: None,
+            scan_direction: kivi_protocol::SCAN_FORWARD,
+            scan_max_items: 0,
+            scan_max_bytes: 0,
+            scan_projection: kivi_protocol::SCAN_KEYS_ONLY,
+            scan_consistency: kivi_protocol::SCAN_LATEST_PER_TABLET,
+            batch_txn: [0u8; 16],
+            batch_writes: Vec::new(),
+            txn_coordinator: 0,
+            txn_commit: false,
         })?;
         match response.body {
             ResponseBody::Counter(value) => Ok(Some(value)),
@@ -2248,6 +2419,17 @@ impl NativeClient {
             expiry_policy: kivi_protocol::EXPIRY_CLEAR,
             identity: None,
             ack_floor: RequestSeq::from_u64(0),
+            scan_start: None,
+            scan_end: None,
+            scan_direction: kivi_protocol::SCAN_FORWARD,
+            scan_max_items: 0,
+            scan_max_bytes: 0,
+            scan_projection: kivi_protocol::SCAN_KEYS_ONLY,
+            scan_consistency: kivi_protocol::SCAN_LATEST_PER_TABLET,
+            batch_txn: [0u8; 16],
+            batch_writes: Vec::new(),
+            txn_coordinator: 0,
+            txn_commit: false,
         })?;
         match response.body {
             ResponseBody::CounterUpdated { value, .. } => Ok(value),
@@ -2292,6 +2474,17 @@ impl NativeClient {
                 expiry_policy: kivi_protocol::EXPIRY_CLEAR,
                 identity: None,
                 ack_floor: RequestSeq::from_u64(0),
+                scan_start: None,
+                scan_end: None,
+                scan_direction: kivi_protocol::SCAN_FORWARD,
+                scan_max_items: 0,
+                scan_max_bytes: 0,
+                scan_projection: kivi_protocol::SCAN_KEYS_ONLY,
+                scan_consistency: kivi_protocol::SCAN_LATEST_PER_TABLET,
+                batch_txn: [0u8; 16],
+                batch_writes: Vec::new(),
+                txn_coordinator: 0,
+                txn_commit: false,
             },
             Some(seq),
         )?;
@@ -2324,6 +2517,17 @@ impl NativeClient {
             expiry_policy: kivi_protocol::EXPIRY_CLEAR,
             identity: None,
             ack_floor: RequestSeq::from_u64(0),
+            scan_start: None,
+            scan_end: None,
+            scan_direction: kivi_protocol::SCAN_FORWARD,
+            scan_max_items: 0,
+            scan_max_bytes: 0,
+            scan_projection: kivi_protocol::SCAN_KEYS_ONLY,
+            scan_consistency: kivi_protocol::SCAN_LATEST_PER_TABLET,
+            batch_txn: [0u8; 16],
+            batch_writes: Vec::new(),
+            txn_coordinator: 0,
+            txn_commit: false,
         })?;
         match response.body {
             ResponseBody::ExpirySet { applied } => Ok(applied),
@@ -2354,6 +2558,17 @@ impl NativeClient {
             expiry_policy: kivi_protocol::EXPIRY_CLEAR,
             identity: None,
             ack_floor: RequestSeq::from_u64(0),
+            scan_start: None,
+            scan_end: None,
+            scan_direction: kivi_protocol::SCAN_FORWARD,
+            scan_max_items: 0,
+            scan_max_bytes: 0,
+            scan_projection: kivi_protocol::SCAN_KEYS_ONLY,
+            scan_consistency: kivi_protocol::SCAN_LATEST_PER_TABLET,
+            batch_txn: [0u8; 16],
+            batch_writes: Vec::new(),
+            txn_coordinator: 0,
+            txn_commit: false,
         })?;
         match response.body {
             ResponseBody::ExpiryPersisted { removed } => Ok(removed),
@@ -2382,6 +2597,17 @@ impl NativeClient {
             expiry_policy: kivi_protocol::EXPIRY_CLEAR,
             identity: None,
             ack_floor: RequestSeq::from_u64(0),
+            scan_start: None,
+            scan_end: None,
+            scan_direction: kivi_protocol::SCAN_FORWARD,
+            scan_max_items: 0,
+            scan_max_bytes: 0,
+            scan_projection: kivi_protocol::SCAN_KEYS_ONLY,
+            scan_consistency: kivi_protocol::SCAN_LATEST_PER_TABLET,
+            batch_txn: [0u8; 16],
+            batch_writes: Vec::new(),
+            txn_coordinator: 0,
+            txn_commit: false,
         })?;
         match response.body {
             ResponseBody::ExpiryAt(stamp) => Ok(Some(kivi_types::Expiry::at(
@@ -2422,6 +2648,17 @@ impl NativeClient {
             expiry_policy: kivi_protocol::EXPIRY_CLEAR,
             identity: None,
             ack_floor: RequestSeq::from_u64(0),
+            scan_start: None,
+            scan_end: None,
+            scan_direction: kivi_protocol::SCAN_FORWARD,
+            scan_max_items: 0,
+            scan_max_bytes: 0,
+            scan_projection: kivi_protocol::SCAN_KEYS_ONLY,
+            scan_consistency: kivi_protocol::SCAN_LATEST_PER_TABLET,
+            batch_txn: [0u8; 16],
+            batch_writes: Vec::new(),
+            txn_coordinator: 0,
+            txn_commit: false,
         })?;
         match response.body {
             ResponseBody::Value(value) => Ok(Some(Bytes::from(value))),
@@ -2454,6 +2691,17 @@ impl NativeClient {
             expiry_policy: kivi_protocol::EXPIRY_CLEAR,
             identity: None,
             ack_floor: RequestSeq::from_u64(0),
+            scan_start: None,
+            scan_end: None,
+            scan_direction: kivi_protocol::SCAN_FORWARD,
+            scan_max_items: 0,
+            scan_max_bytes: 0,
+            scan_projection: kivi_protocol::SCAN_KEYS_ONLY,
+            scan_consistency: kivi_protocol::SCAN_LATEST_PER_TABLET,
+            batch_txn: [0u8; 16],
+            batch_writes: Vec::new(),
+            txn_coordinator: 0,
+            txn_commit: false,
         })?;
         match response.body {
             ResponseBody::Length(len) => Ok(Some(len)),
@@ -2495,6 +2743,17 @@ impl NativeClient {
             expiry_policy: policy_wire,
             identity: None,
             ack_floor: RequestSeq::from_u64(0),
+            scan_start: None,
+            scan_end: None,
+            scan_direction: kivi_protocol::SCAN_FORWARD,
+            scan_max_items: 0,
+            scan_max_bytes: 0,
+            scan_projection: kivi_protocol::SCAN_KEYS_ONLY,
+            scan_consistency: kivi_protocol::SCAN_LATEST_PER_TABLET,
+            batch_txn: [0u8; 16],
+            batch_writes: Vec::new(),
+            txn_coordinator: 0,
+            txn_commit: false,
         })?;
         match response.body {
             ResponseBody::ConditionalSet { applied, version } => {
@@ -2542,6 +2801,17 @@ impl NativeClient {
                 expiry_policy: policy_wire,
                 identity: None,
                 ack_floor: RequestSeq::from_u64(0),
+                scan_start: None,
+                scan_end: None,
+                scan_direction: kivi_protocol::SCAN_FORWARD,
+                scan_max_items: 0,
+                scan_max_bytes: 0,
+                scan_projection: kivi_protocol::SCAN_KEYS_ONLY,
+                scan_consistency: kivi_protocol::SCAN_LATEST_PER_TABLET,
+                batch_txn: [0u8; 16],
+                batch_writes: Vec::new(),
+                txn_coordinator: 0,
+                txn_commit: false,
             },
             Some(seq),
         )?;

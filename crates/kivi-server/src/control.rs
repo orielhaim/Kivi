@@ -54,6 +54,10 @@ pub struct GenesisSeed {
     pub nodes: Vec<SeedNode>,
     /// Initial tablets with full replication across all seed nodes.
     pub tablets: Vec<TabletId>,
+    /// Namespace served (registered in control state with its layout).
+    pub namespace: kivi_types::NamespaceId,
+    /// Namespace physical layout (`hash` or `ordered`).
+    pub layout: String,
 }
 
 /// Runs genesis bootstrap until the replicated control image holds the
@@ -69,6 +73,23 @@ pub async fn genesis_loop(node: Arc<ConsensusNode>, seed: GenesisSeed) {
         }
         // Best-effort batch; any failure retries next pass.
         let mut ok = true;
+        // The served namespace is registered first (idempotent): the
+        // control plane owns namespace/layout truth from genesis on.
+        {
+            let layout = match seed.layout.as_str() {
+                "ordered" => kivi_control::CatalogLayout::Ordered,
+                _ => kivi_control::CatalogLayout::Hash,
+            };
+            let mutation = ControlMutation::RegisterNamespace {
+                record: kivi_control::NamespaceRecord {
+                    id: seed.namespace,
+                    layout,
+                },
+            };
+            if node.propose_control(mutation).await.is_err() {
+                ok = false;
+            }
+        }
         for record in &seed.nodes {
             let mutation = ControlMutation::RegisterNode {
                 record: NodeRecord {
@@ -132,11 +153,14 @@ pub async fn genesis_loop(node: Arc<ConsensusNode>, seed: GenesisSeed) {
 }
 
 /// Whether the control image already holds every seed node as `Active`
-/// with every seed tablet placed.
+/// with every seed tablet placed and the namespace registered.
 async fn genesis_done(node: &ConsensusNode, seed: &GenesisSeed) -> bool {
     let Some(state) = node.control_state().await else {
         return false;
     };
+    if state.namespace(seed.namespace).is_none() {
+        return false;
+    }
     for record in &seed.nodes {
         if state
             .node(record.node)
@@ -182,6 +206,9 @@ pub struct ReconcilePolicy {
     /// Object-count threshold that triggers an automatic split (with
     /// hysteresis: merge threshold must stay far below this).
     pub split_object_threshold: usize,
+    /// Logical-byte threshold that triggers an automatic ordered split
+    /// (ordered tablets split by bytes, not object count).
+    pub split_bytes_threshold: u64,
     /// Object-count threshold below which BOTH adjacent tablets must sit
     /// before an automatic merge is planned.
     pub merge_object_threshold: usize,
@@ -203,6 +230,7 @@ impl Default for ReconcilePolicy {
             auto_split: false,
             auto_merge: false,
             split_object_threshold: 200_000,
+            split_bytes_threshold: 64 << 20,
             merge_object_threshold: 20_000,
         }
     }
@@ -241,6 +269,13 @@ pub async fn reconcile_loop_shared(
         detector.set_config(snapshot.failure.clone());
         tokio::time::sleep(snapshot.poll_interval).await;
         mesh_sync(&node).await;
+        // Transaction resolution runs on every node (not just the control
+        // leader): each node resolves intents on tablets it leads.
+        // Bounded per pass; failures simply retry next pass.
+        resolve_transactions(&node).await;
+        // Ordered-index enforcement likewise runs everywhere: each replica
+        // maintains its own index, driven from the namespace layout.
+        ensure_ordered_indexing(&node, &directory).await;
         if let Err(reason) = reconcile_once(&node, &snapshot, &mut detector, &directory).await {
             tracing::debug!(%reason, "reconciler pass skipped");
         }
@@ -391,6 +426,272 @@ async fn reconcile_once(
         tracing::debug!("control quorum unreachable; deferring automated topology actions");
     }
     Ok(())
+}
+
+/// Enforces the ordered key index from the namespace layout on every
+/// locally hosted replica: ordered-range tablets maintain it from birth
+/// (scans, median splits, and index maintenance read it); hash tablets
+/// keep the fast path. Late enablement rebuilds deterministically from
+/// committed objects, so this converges tablets hosted before the flag
+/// existed, after restores, and after any layout change. Flag reads make
+/// the steady state free (one lock + bool per tablet per pass).
+async fn ensure_ordered_indexing(
+    node: &Arc<ConsensusNode>,
+    directory: &Arc<arc_swap::ArcSwap<kivi_tablet::DirectorySnapshot>>,
+) {
+    let snapshot = directory.load();
+    for tablet in node.tablets() {
+        let ordered = snapshot.get(tablet).is_some_and(|descriptor| {
+            matches!(descriptor.range(), kivi_tablet::PartitionRange::Ordered(_))
+        });
+        if !ordered {
+            continue;
+        }
+        if node.ordered_index_enabled(tablet).await != Some(true) {
+            let _ = node.set_ordered_indexing(tablet, true).await;
+        }
+    }
+}
+
+/// Resolves abandoned transaction intents on every locally hosted tablet.
+///
+/// Runs on all nodes (not just the control leader): each node resolves
+/// tablets it leads, skipping others via `NotLeader`. Per intent: a durable
+/// Commit/Abort decision finalizes accordingly; undecided records past
+/// the lease CAS-abort through the record (never unilaterally — the CAS
+/// proves no commit won the race); live intents wait. Bounded per pass;
+/// the next pass retries the rest.
+async fn resolve_transactions(node: &Arc<ConsensusNode>) {
+    let namespace = node.namespace();
+    for tablet in node.tablets() {
+        let intents = node.tablet_intents(tablet).await.unwrap_or_default();
+        if intents.is_empty() {
+            continue;
+        }
+        for intent in intents {
+            resolve_one_intent(node, namespace, tablet, &intent).await;
+        }
+    }
+}
+
+/// Resolves one intent: follows the coordinator record's durable
+/// decision, or CAS-aborts an expired undecided transaction. Decided
+/// records converge only intents older than [`kivi_state::RESOLVE_GRACE_MICROS`]:
+/// fresher intents belong to a live driver still waving its finalizes,
+/// and converging them from here races that wave (fatal to the node).
+async fn resolve_one_intent(
+    node: &Arc<ConsensusNode>,
+    namespace: kivi_types::NamespaceId,
+    tablet: TabletId,
+    intent: &kivi_state::TxnIntent,
+) {
+    use kivi_state::{Operation, OperationResult, TxnRecord, TxnState};
+    let _ = namespace;
+    let record_key = kivi_state::txn_record_key(intent.coordinator, intent.id);
+    let now = super::cluster::wall_now();
+    // Read the decision record (fiat-routed to the coordinator tablet;
+    // followers redirect and this pass skips).
+    let record = match node
+        .read(
+            intent.coordinator,
+            &Operation::Get {
+                key: record_key.clone(),
+            },
+            kivi_types::ReadContract::Latest,
+            now,
+        )
+        .await
+    {
+        Ok(OperationResult::Value(Some(bytes))) => match TxnRecord::decode(&bytes) {
+            Ok(record) => Some(record),
+            Err(_) => return,
+        },
+        // Missing record with an expired lease: fence first, then discard.
+        // The fence CASes an Aborted decision on absence; a slow driver
+        // racing to decide CASes the same key, so exactly one wins and
+        // the loser follows the winner on re-read (next pass / re-drive).
+        // Without the fence a slow commit could land after this discard
+        // and report success for a write that never applied.
+        Ok(_) => {
+            if lease_expired(intent.prepared_at, now)
+                && cas_abort_absent_record(node, intent.coordinator, intent.id).await
+            {
+                let _ = node
+                    .propose(
+                        tablet,
+                        &Operation::TxnFinalize {
+                            txn: intent.id,
+                            key: intent.key.clone(),
+                            commit: false,
+                        },
+                        None,
+                        None,
+                        now,
+                    )
+                    .await;
+            }
+            return;
+        }
+        Err(_) => return,
+    };
+    let Some(record) = record else {
+        return;
+    };
+    match record.state {
+        TxnState::Committed => {
+            if intent_fresh(intent.prepared_at, now) {
+                return;
+            }
+            let _ = node
+                .propose(
+                    tablet,
+                    &Operation::TxnFinalize {
+                        txn: intent.id,
+                        key: intent.key.clone(),
+                        commit: true,
+                    },
+                    None,
+                    None,
+                    now,
+                )
+                .await;
+        }
+        TxnState::Aborted => {
+            if intent_fresh(intent.prepared_at, now) {
+                return;
+            }
+            let _ = node
+                .propose(
+                    tablet,
+                    &Operation::TxnFinalize {
+                        txn: intent.id,
+                        key: intent.key.clone(),
+                        commit: false,
+                    },
+                    None,
+                    None,
+                    now,
+                )
+                .await;
+        }
+        TxnState::Begun => {
+            if lease_expired(intent.prepared_at, now) {
+                cas_abort_record(node, &record).await;
+            }
+        }
+    }
+}
+
+/// Whether a prepare lease expired (`prepared_at` micros + max lifetime
+/// below `now`).
+fn lease_expired(prepared_at: u64, now: kivi_types::UnixMicros) -> bool {
+    prepared_at.saturating_add(kivi_state::MAX_TXN_LIFETIME_MICROS) < now.as_micros()
+}
+
+/// Whether an intent is younger than the resolver grace (its driver is
+/// presumably still live: hands off).
+fn intent_fresh(prepared_at: u64, now: kivi_types::UnixMicros) -> bool {
+    now.as_micros().saturating_sub(prepared_at) < kivi_state::RESOLVE_GRACE_MICROS
+}
+
+/// CAS-aborts a record-absent expired transaction: an absence-guarded
+/// prepare + commit-finalize of a skeletal Aborted record on the
+/// coordinator tablet. Wins only when no driver decided concurrently (a
+/// concurrent commit conflicts instead, and the resolver follows that
+/// decision next pass). Readers only match on `state`, so the skeletal
+/// payload (no participants, zero digest) is safe: Aborted carries no
+/// obligations beyond "discard intents", which every pass converges.
+/// Best-effort: any failure simply retries later.
+async fn cas_abort_absent_record(
+    node: &Arc<ConsensusNode>,
+    coordinator: kivi_types::TabletId,
+    txn: kivi_state::TxnId,
+) -> bool {
+    use kivi_consensus::ProposeOutcome;
+    use kivi_state::{
+        Operation, OperationResult, TxnExpect, TxnRecord, TxnState, TxnWrite, TxnWriteKind,
+    };
+    let record_key = kivi_state::txn_record_key(coordinator, txn);
+    let aborted = TxnRecord {
+        id: txn,
+        coordinator,
+        participants: Vec::new(),
+        state: TxnState::Aborted,
+        dir_version: 0,
+        digest: [0u8; 32],
+    };
+    // Resolver salt (2) never aliases driver decide-transactions
+    // (commit 0 / abort 1): distinct intents, genuine OCC on the key.
+    let abort_txn = kivi_state::TxnId::derive(u128::from_le_bytes(txn.as_bytes()), 0, 2);
+    let now = super::cluster::wall_now();
+    let prepare = Operation::TxnPrepare {
+        txn: abort_txn,
+        coordinator,
+        write: TxnWrite {
+            key: record_key.clone(),
+            kind: TxnWriteKind::Put(bytes::Bytes::from(aborted.encode())),
+            expect: TxnExpect::Absent,
+        },
+    };
+    if !matches!(
+        node.propose(coordinator, &prepare, None, None, now).await,
+        Ok(ProposeOutcome::Applied {
+            outcome: OperationResult::TxnPrepared,
+            ..
+        } | ProposeOutcome::Duplicate {
+            outcome: OperationResult::TxnPrepared,
+            ..
+        },)
+    ) {
+        return false;
+    }
+    let finalize = Operation::TxnFinalize {
+        txn: abort_txn,
+        key: record_key,
+        commit: true,
+    };
+    matches!(
+        node.propose(coordinator, &finalize, None, None, now).await,
+        Ok(ProposeOutcome::Applied {
+            outcome: OperationResult::TxnFinalized { applied: true, .. },
+            ..
+        } | ProposeOutcome::Duplicate {
+            outcome: OperationResult::TxnFinalized { applied: true, .. },
+            ..
+        },)
+    )
+}
+
+/// CAS-aborts an expired undecided transaction: a version-guarded record
+/// write wins only when no commit landed concurrently (losers re-read the
+/// decision and follow it next pass). Runs as a guarded single-key batch
+/// on the record tablet (same fast-path machinery, driven internally).
+async fn cas_abort_record(node: &Arc<ConsensusNode>, record: &kivi_state::TxnRecord) {
+    let record_key = kivi_state::txn_record_key(record.coordinator, record.id);
+    let now = super::cluster::wall_now();
+    let Ok(kivi_state::OperationResult::Version(Some(version))) = node
+        .read(
+            record.coordinator,
+            &kivi_state::Operation::GetVersion {
+                key: record_key.clone(),
+            },
+            kivi_types::ReadContract::Latest,
+            now,
+        )
+        .await
+    else {
+        return;
+    };
+    let mut aborted = record.clone();
+    aborted.state = kivi_state::TxnState::Aborted;
+    let () = super::compound::handle_guard_abort(
+        node,
+        record.coordinator,
+        record_key,
+        aborted.encode(),
+        version,
+    )
+    .await;
 }
 
 /// Probes liveness for every registry node (ephemeral, never persisted):
@@ -654,6 +955,7 @@ async fn drive_split(
             let fenced_at = std::time::Instant::now();
             if fence_tablets(node, state, &[plan.parent], true).await
                 && seed_split_children(node, state, plan).await
+                && snapshot_split_children(node, state, plan).await
             {
                 tracing::info!(
                     plan = plan.id.as_u64(),
@@ -733,6 +1035,7 @@ async fn drive_merge(
             let fenced_at = std::time::Instant::now();
             if fence_tablets(node, state, &[plan.left, plan.right], true).await
                 && seed_merge_target_nodes(node, state, plan).await
+                && snapshot_merge_target(node, state, plan).await
             {
                 tracing::info!(
                     plan = plan.id.as_u64(),
@@ -851,6 +1154,7 @@ async fn seed_split_children(
                 plan.parent,
                 child,
                 plan.split_hash,
+                plan.split_key.clone(),
                 left,
             )
             .await
@@ -972,6 +1276,7 @@ async fn initialize_one(
 }
 
 /// Seeds one split child on one replica node.
+#[allow(clippy::too_many_arguments)]
 async fn seed_split_one(
     node: &Arc<ConsensusNode>,
     state: &ControlState,
@@ -979,18 +1284,26 @@ async fn seed_split_one(
     parent: TabletId,
     child: TabletId,
     split_hash: u128,
+    split_key: Option<Vec<u8>>,
     left: bool,
 ) -> bool {
     if target == node.node() {
-        return node
-            .seed_split_child(parent, child, split_hash, left)
-            .await
-            .is_ok();
+        let seeded = match split_key {
+            Some(key) => node
+                .seed_split_child_ordered(parent, child, key, left)
+                .await
+                .is_ok(),
+            None => node
+                .seed_split_child(parent, child, split_hash, left)
+                .await
+                .is_ok(),
+        };
+        return seeded;
     }
     let Some(admin) = state.node(target).map(|record| record.admin) else {
         return false;
     };
-    admin_post_seed_split(admin, child, parent, split_hash, left).await
+    admin_post_seed_split(admin, child, parent, split_hash, split_key.as_deref(), left).await
 }
 
 /// Seeds the merge target on one replica node.
@@ -1009,6 +1322,78 @@ async fn seed_merge_one(
         return false;
     };
     admin_post_seed_merge(admin, merged, left, right).await
+}
+
+/// Snapshots one tablet replica (local front or admin plane): seals its
+/// current state into a snapshot and purges the log through the base.
+/// Split/merge targets hold out-of-band seeded state that exists nowhere
+/// in their Raft log — without this snapshot a hard restart before the
+/// first automatic snapshot would resurrect them empty (seeded base
+/// lost; only post-seed log entries would replay).
+async fn snapshot_one(
+    node: &Arc<ConsensusNode>,
+    state: &ControlState,
+    target: NodeId,
+    tablet: TabletId,
+) -> bool {
+    if target == node.node() {
+        return node
+            .snapshot_and_purge(ConsensusGroupId::of_tablet(tablet))
+            .await
+            .is_ok();
+    }
+    let Some(admin) = state.node(target).map(|record| record.admin) else {
+        return false;
+    };
+    admin_post_snapshot(admin, tablet).await
+}
+
+/// Forwards one per-tablet snapshot+purge to a replica's admin plane.
+async fn admin_post_snapshot(admin: SocketAddr, tablet: TabletId) -> bool {
+    admin_post(
+        admin,
+        "/v1/snapshot",
+        &serde_json::json!({ "tablet": tablet.as_u64() }),
+    )
+    .await
+    .is_ok_and(|value| {
+        value
+            .get("snapshot")
+            .and_then(serde_json::Value::as_u64)
+            .is_some()
+    })
+}
+
+/// Snapshots both split children on every live replica (durable seeding:
+/// the Fenced advance below means every replica can resurrect its child
+/// from disk).
+async fn snapshot_split_children(
+    node: &Arc<ConsensusNode>,
+    state: &ControlState,
+    plan: &SplitPlan,
+) -> bool {
+    for replica in live_replicas(state, &plan.replicas) {
+        for child in [plan.left, plan.right] {
+            if !snapshot_one(node, state, replica, child).await {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Snapshots the merge target on every live replica (durable seeding).
+async fn snapshot_merge_target(
+    node: &Arc<ConsensusNode>,
+    state: &ControlState,
+    plan: &kivi_control::MergePlan,
+) -> bool {
+    for replica in live_replicas(state, &plan.replicas) {
+        if !snapshot_one(node, state, replica, plan.merged).await {
+            return false;
+        }
+    }
+    true
 }
 
 /// Sets or clears the cutover fence on every live replica of `tablets`.
@@ -1089,6 +1474,7 @@ async fn publish_split_cutover(
         "left": plan.left.as_u64(),
         "right": plan.right.as_u64(),
         "split_hash": plan.split_hash.to_string(),
+        "split_key": plan.split_key,
     });
     // Local publish first (the control leader routes correctly even
     // before peers converge).
@@ -1182,8 +1568,25 @@ fn publish_cutover_local(
                             .or_else(|| value.as_u64().map(u128::from))
                     })
                     .ok_or("missing split_hash")?;
+                // Ordered splits carry `split_key` as a byte array;
+                // absence means a hash split (key must be interior —
+                // validated by the range operation, not here).
+                let split_key: Option<Vec<u8>> = body.get("split_key").and_then(|value| {
+                    value.as_array().map(|bytes| {
+                        bytes
+                            .iter()
+                            .filter_map(serde_json::Value::as_u64)
+                            .filter_map(|byte| u8::try_from(byte).ok())
+                            .collect()
+                    })
+                });
                 crate::cluster::apply_cutover_split_for_reconciler(
-                    &current, parent, left, right, split_hash,
+                    &current,
+                    parent,
+                    left,
+                    right,
+                    split_hash,
+                    split_key.as_deref(),
                 )
             }
             "merge" => {
@@ -1245,7 +1648,12 @@ async fn drive_topology_auto(
 }
 
 /// Plans at most one automatic split per pass for the largest eligible
-/// tablet above threshold.
+/// tablet above threshold: hash tablets split by object count at the hash
+/// midpoint; ordered tablets split by logical bytes at the approximate
+/// median key (leader-local, balancing bytes rather than object count).
+/// One straight-line pass over placements; splitting it would obscure the
+/// shared eligibility gating.
+#[allow(clippy::too_many_lines)]
 async fn drive_auto_split(
     node: &Arc<ConsensusNode>,
     state: &ControlState,
@@ -1260,7 +1668,9 @@ async fn drive_auto_split(
         return;
     }
     let snapshot = directory.load();
-    let mut best: Option<(usize, TabletId)> = None;
+    // Best hash candidate by count, best ordered candidate by bytes.
+    let mut best_hash: Option<(usize, TabletId)> = None;
+    let mut best_ordered: Option<(u64, TabletId)> = None;
     for desired in state.placements() {
         let tablet = desired.tablet;
         if state.has_live_topology(tablet) {
@@ -1275,25 +1685,48 @@ async fn drive_auto_split(
         if descriptor.state() != kivi_tablet::TabletState::Active {
             continue;
         }
-        let kivi_tablet::PartitionRange::Hash(prefix) = descriptor.range().clone() else {
-            continue;
-        };
-        if prefix.prefix_len() >= kivi_tablet::range::MAX_PREFIX_LEN {
+        // Tablets with unresolved intents do not split (resolve first,
+        // then cut over — see the intent migration rule).
+        if node
+            .tablet_intent_count(tablet)
+            .await
+            .is_some_and(|count| count > 0)
+        {
             continue;
         }
-        let count = node.tablet_object_count(tablet).await.unwrap_or(0);
-        if count < policy.split_object_threshold {
-            continue;
-        }
-        if best.is_none_or(|(best_count, _)| count > best_count) {
-            best = Some((count, tablet));
+        match descriptor.range() {
+            kivi_tablet::PartitionRange::Hash(prefix) => {
+                if prefix.prefix_len() >= kivi_tablet::range::MAX_PREFIX_LEN {
+                    continue;
+                }
+                let count = node.tablet_object_count(tablet).await.unwrap_or(0);
+                if count < policy.split_object_threshold {
+                    continue;
+                }
+                if best_hash.is_none_or(|(best_count, _)| count > best_count) {
+                    best_hash = Some((count, tablet));
+                }
+            }
+            kivi_tablet::PartitionRange::Ordered(_) => {
+                let now = super::cluster::wall_now();
+                let bytes = node
+                    .tablet_stats(tablet, now)
+                    .await
+                    .map_or(0, |stats| stats.logical_value_bytes);
+                if bytes < policy.split_bytes_threshold {
+                    continue;
+                }
+                if best_ordered.is_none_or(|(best_bytes, _)| bytes > best_bytes) {
+                    best_ordered = Some((bytes, tablet));
+                }
+            }
         }
     }
-    if let Some((count, tablet)) = best {
+    if let Some((count, tablet)) = best_hash {
         tracing::info!(
             tablet = tablet.as_u64(),
             objects = count,
-            "automatic split triggered"
+            "automatic hash split triggered"
         );
         // Derive the midpoint boundary and fresh children from the same
         // directory view + persisted allocator the manual path uses.
@@ -1326,10 +1759,52 @@ async fn drive_auto_split(
         };
         let _ = create_split_plan_at(node, tablet, split_hash, left, right).await;
     }
+    if let Some((bytes, tablet)) = best_ordered {
+        // Median-key pivot from the leader-local ordered index.
+        let Some(split_key) = node.tablet_median_key(tablet).await else {
+            return;
+        };
+        tracing::info!(
+            tablet = tablet.as_u64(),
+            bytes = bytes,
+            "automatic ordered split triggered"
+        );
+        let state = node.control_state().await;
+        let snapshot = directory.load();
+        let Some((left, right)) = state.as_ref().and_then(|state| {
+            snapshot
+                .get(tablet)
+                .and_then(|descriptor| match descriptor.range() {
+                    kivi_tablet::PartitionRange::Ordered(range) => {
+                        range.split_at(&split_key).ok().map(|_| {
+                            let fresh = state.fresh_tablet_ids(2);
+                            (
+                                fresh
+                                    .first()
+                                    .copied()
+                                    .unwrap_or(TabletId::from_u64(u64::MAX)),
+                                fresh
+                                    .get(1)
+                                    .copied()
+                                    .unwrap_or(TabletId::from_u64(u64::MAX)),
+                            )
+                        })
+                    }
+                    kivi_tablet::PartitionRange::Hash(_) => None,
+                })
+        }) else {
+            return;
+        };
+        let _ = create_split_plan_full(node, tablet, 0, Some(split_key), left, right).await;
+    }
 }
 
 /// Plans at most one automatic merge per pass for the smallest eligible
-/// adjacent sibling pair below threshold.
+/// adjacent sibling pair below threshold (hash siblings share a parent
+/// prefix; ordered siblings satisfy `left.end == right.start`). One
+/// straight-line pass per layout; splitting further would obscure the
+/// shared eligibility gating.
+#[allow(clippy::too_many_lines)]
 async fn drive_auto_merge(
     node: &Arc<ConsensusNode>,
     state: &ControlState,
@@ -1392,6 +1867,61 @@ async fn drive_auto_merge(
         let _ = create_merge_plan(node, *left, *right).await;
         return;
     }
+    // Ordered siblings, sorted by range start so siblings neighbor.
+    let mut ordered: Vec<(Vec<u8>, Option<Vec<u8>>, TabletId)> = Vec::new();
+    for desired in state.placements() {
+        let tablet = desired.tablet;
+        if state.has_live_topology(tablet) {
+            continue;
+        }
+        if is_degraded(state, &desired.replicas) {
+            continue;
+        }
+        let Some(descriptor) = snapshot.get(tablet) else {
+            continue;
+        };
+        if descriptor.state() != kivi_tablet::TabletState::Active {
+            continue;
+        }
+        let kivi_tablet::PartitionRange::Ordered(range) = descriptor.range().clone() else {
+            continue;
+        };
+        // Tablets with unresolved intents do not merge (resolve first).
+        if node
+            .tablet_intent_count(tablet)
+            .await
+            .is_some_and(|count| count > 0)
+        {
+            continue;
+        }
+        ordered.push((
+            range.start().to_vec(),
+            range.end().map(<[u8]>::to_vec),
+            tablet,
+        ));
+    }
+    ordered.sort();
+    for window in ordered.windows(2) {
+        let [(_, left_end, left), (right_start, _, right)] = window else {
+            continue;
+        };
+        if left_end.as_deref() != Some(right_start.as_slice()) {
+            continue;
+        }
+        let left_count = node.tablet_object_count(*left).await.unwrap_or(usize::MAX);
+        let right_count = node.tablet_object_count(*right).await.unwrap_or(usize::MAX);
+        if left_count > policy.merge_object_threshold || right_count > policy.merge_object_threshold
+        {
+            continue;
+        }
+        tracing::info!(
+            left = left.as_u64(),
+            right = right.as_u64(),
+            "automatic ordered merge triggered"
+        );
+        let _ = create_merge_plan(node, *left, *right).await;
+        return;
+    }
 }
 
 /// Whether any desired replica is repair-worthy (split/merge ineligible).
@@ -1415,6 +1945,20 @@ pub async fn create_split_plan_at(
     node: &Arc<ConsensusNode>,
     parent: TabletId,
     split_hash: u128,
+    left: TabletId,
+    right: TabletId,
+) -> Result<kivi_control::SplitPlanId, String> {
+    create_split_plan_full(node, parent, split_hash, None, left, right).await
+}
+
+/// Creates a split plan with an explicit boundary: `split_key` set for
+/// ordered parents (real-key boundary), `split_hash` for hash parents
+/// (midpoint). Exactly one boundary style applies per plan.
+pub async fn create_split_plan_full(
+    node: &Arc<ConsensusNode>,
+    parent: TabletId,
+    split_hash: u128,
+    split_key: Option<Vec<u8>>,
     left: TabletId,
     right: TabletId,
 ) -> Result<kivi_control::SplitPlanId, String> {
@@ -1450,6 +1994,7 @@ pub async fn create_split_plan_at(
         kivi_control::SplitPlanId::from_u64(state.next_plan_id().as_u64()),
         parent,
         split_hash,
+        split_key,
         left,
         right,
         desired.replicas.clone(),
@@ -1467,6 +2012,86 @@ pub async fn create_split_plan_at(
         "split plan created"
     );
     Ok(id)
+}
+
+/// Registers a namespace in replicated control state (idempotent for
+/// identical records; conflicting layouts are rejected).
+///
+/// # Errors
+///
+/// Returns a human-readable reason when control is unreachable.
+pub async fn register_namespace(
+    node: &Arc<ConsensusNode>,
+    id: kivi_types::NamespaceId,
+    layout: kivi_control::CatalogLayout,
+) -> Result<(), String> {
+    node.propose_control(ControlMutation::RegisterNamespace {
+        record: kivi_control::NamespaceRecord { id, layout },
+    })
+    .await
+    .map(|_| ())
+}
+
+/// Creates a secondary index definition (starts `Building`).
+///
+/// # Errors
+///
+/// Returns a human-readable reason when control is unreachable or the
+/// allocated id collides (retry: the allocator re-reads).
+pub async fn create_index(
+    node: &Arc<ConsensusNode>,
+    primary: kivi_types::NamespaceId,
+    kind: kivi_control::CatalogIndexKind,
+) -> Result<u64, String> {
+    let state = node
+        .control_state()
+        .await
+        .ok_or_else(|| "no local control image".to_owned())?;
+    if state.namespace(primary).is_none() {
+        return Err(format!("unknown namespace {}", primary.as_u64()));
+    }
+    let id = state.indexes().map(|record| record.id).max().unwrap_or(0) + 1;
+    node.propose_control(ControlMutation::CreateIndex {
+        record: kivi_control::IndexRecord {
+            id,
+            primary,
+            kind,
+            state: kivi_control::CatalogIndexState::Building,
+        },
+    })
+    .await?;
+    Ok(id)
+}
+
+/// Advances an index lifecycle state.
+///
+/// # Errors
+///
+/// Returns a human-readable reason when control is unreachable or the
+/// index is unknown.
+pub async fn advance_index(
+    node: &Arc<ConsensusNode>,
+    id: u64,
+    state: kivi_control::CatalogIndexState,
+) -> Result<(), String> {
+    node.propose_control(ControlMutation::AdvanceIndex {
+        id,
+        state: state.encode_byte(),
+    })
+    .await
+    .map(|_| ())
+}
+
+/// Removes a `Dropping` index definition.
+///
+/// # Errors
+///
+/// Returns a human-readable reason when control is unreachable, the
+/// index is unknown, or it is not `Dropping`.
+pub async fn drop_index(node: &Arc<ConsensusNode>, id: u64) -> Result<(), String> {
+    node.propose_control(ControlMutation::RemoveIndex { id })
+        .await
+        .map(|_| ())
 }
 
 /// Creates a merge plan for adjacent `left` + `right` into a fresh merged
@@ -2746,12 +3371,14 @@ async fn admin_post_fence(admin: SocketAddr, tablet: TabletId, fenced: bool) -> 
 }
 
 /// Forwards one split-child seed to the replica's admin plane (colocated
-/// base, no bulk network copy).
+/// base, no bulk network copy). Ordered splits carry the real-key
+/// boundary; hash splits carry the midpoint hash.
 async fn admin_post_seed_split(
     admin: SocketAddr,
     child: TabletId,
     parent: TabletId,
     split_hash: u128,
+    split_key: Option<&[u8]>,
     left: bool,
 ) -> bool {
     admin_post(
@@ -2760,6 +3387,7 @@ async fn admin_post_seed_split(
         &serde_json::json!({
             "parent": parent.as_u64(),
             "split_hash": split_hash.to_string(),
+            "split_key": split_key,
             "left": left,
         }),
     )

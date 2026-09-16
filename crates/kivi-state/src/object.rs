@@ -30,6 +30,20 @@ impl Key {
         Self(bytes.into())
     }
 
+    /// Reserved system-key prefix: keys starting with `0xFF` hold Kivi
+    /// internals (transaction records, index projections) beside user data
+    /// in the same tablet. Scans skip them; user writes to them are rejected
+    /// at the server boundary (`FoundationDB` reserves `\xff` the same way).
+    pub const SYSTEM_PREFIX: u8 = 0xFF;
+
+    /// Whether this key names reserved system state rather than user data.
+    #[must_use]
+    pub fn is_system(&self) -> bool {
+        self.0
+            .first()
+            .is_some_and(|byte| *byte == Self::SYSTEM_PREFIX)
+    }
+
     /// Returns the key bytes.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {

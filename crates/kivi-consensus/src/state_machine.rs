@@ -469,6 +469,8 @@ fn opcode_for(mutation: &Mutation, is_persist_expiry: bool) -> u8 {
                 Opcode::ExpireAt
             }
         }
+        // Transaction steps shape as their parent batch opcode.
+        Mutation::TxnPrepare { .. } | Mutation::TxnFinalize { .. } => Opcode::AtomicBatch,
     }
     .as_u8()
 }
@@ -560,6 +562,86 @@ impl ReplicatedTablet {
     #[must_use]
     pub const fn store(&self) -> &ObjectStore {
         &self.store
+    }
+
+    /// Enables or disables the ordered key index (ordered namespaces
+    /// enable it; hash namespaces leave it off). Enabling rebuilds the
+    /// index deterministically from current objects, so late enablement is
+    /// still exact.
+    pub fn set_ordered_indexing(&mut self, enabled: bool) {
+        self.store.set_ordered_indexing(enabled);
+    }
+
+    /// Whether the ordered index is currently maintained.
+    #[must_use]
+    pub fn ordered_index_enabled(&self) -> bool {
+        self.store.ordered_index_enabled()
+    }
+
+    /// Approximate median split key of this replica. The ordered index is
+    /// rebuilt first when disabled (same lazy rule as [`scan_local`](Self::scan_local)),
+    /// so a median is available whenever the tablet holds enough keys —
+    /// split planning never observes a permanently unindexed tablet.
+    #[must_use]
+    pub fn median_split_key(&mut self) -> Option<kivi_state::Key> {
+        if !self.store.ordered_index_enabled() {
+            self.store.rebuild_ordered_index();
+        }
+        self.store.median_split_key()
+    }
+
+    /// Serves one bounded local scan page. The ordered index is rebuilt
+    /// first when disabled, so the index always matches logical state
+    /// before serving scans (deterministic state, never a cache).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScanError`](kivi_state::ScanError) for malformed specs.
+    /// The caller must have established its read contract first; this never
+    /// talks to a quorum itself.
+    pub fn scan_local(
+        &mut self,
+        spec: &kivi_state::ScanSpec,
+        now: UnixMicros,
+    ) -> Result<kivi_state::ScanPage, kivi_state::ScanError> {
+        if !self.store.ordered_index_enabled() {
+            self.store.rebuild_ordered_index();
+        }
+        self.store.scan_range(spec, now)
+    }
+
+    /// Prepared transaction intents currently reserving keys, in key order
+    /// (split/merge fencing and the resolver consult this).
+    #[must_use]
+    pub fn pending_intents(&self) -> Vec<kivi_state::TxnIntent> {
+        self.store.snapshot_intents()
+    }
+
+    /// Number of prepared intents on this replica.
+    #[must_use]
+    pub fn pending_intent_count(&self) -> usize {
+        self.store.pending_intent_count()
+    }
+
+    /// Logical telemetry at `now` for split/merge policy.
+    #[must_use]
+    pub fn tablet_stats(&self, now: UnixMicros) -> kivi_state::StoreStats {
+        self.store.stats(now)
+    }
+
+    /// Removes and returns every prepared intent (topology cutover
+    /// migrates intents to the keys' new owners; never discards them).
+    pub fn drain_intents(&mut self) -> Vec<kivi_state::TxnIntent> {
+        let intents = self.store.snapshot_intents();
+        for intent in &intents {
+            self.store.stage_intent_for_key(intent.key.clone(), None);
+        }
+        intents
+    }
+
+    /// Installs one migrated intent verbatim (cutover path only).
+    pub fn restore_intent(&mut self, intent: kivi_state::TxnIntent) {
+        self.store.restore_intent(intent);
     }
 
     /// Returns one session's dedup state, if this replica has seen it.
@@ -984,6 +1066,85 @@ impl From<ImageFault> for StateMachineFault {
     }
 }
 
+/// Encodes one prepared transaction intent for snapshots (deterministic
+/// key-ordered section after sessions).
+fn encode_intent(out: &mut Vec<u8>, intent: &kivi_state::TxnIntent) {
+    use kivi_codec::Encode;
+    out.extend_from_slice(&intent.id.as_bytes());
+    push_u64(out, intent.coordinator.as_u64());
+    intent.key.encode(out);
+    intent.write.expect.encode(out);
+    intent.write.kind.encode(out);
+    match intent.observed {
+        None => out.push(0),
+        Some(version) => {
+            out.push(1);
+            version.encode(out);
+        }
+    }
+    push_u64(out, intent.prepared_at);
+}
+
+/// Decodes one snapshot intent at the cursor.
+fn decode_snapshot_intents(
+    body: &[u8],
+    at: &mut usize,
+) -> Result<Vec<kivi_state::TxnIntent>, StateMachineFault> {
+    use StateMachineFault as Fault;
+    let count = snap_take_count(body, at, "intent")?;
+    if count > 1_000_000 {
+        return Err(Fault::CorruptImage {
+            detail: "snapshot intent count absurd".to_owned(),
+        });
+    }
+    let mut intents = Vec::with_capacity(count.min(1024));
+    for _ in 0..count {
+        let raw = snap_take(body, at, 16)?;
+        let id = kivi_state::TxnId::from_bytes(raw.try_into().unwrap_or([0; 16]));
+        let coordinator = kivi_types::TabletId::from_u64(snap_take_u64(body, at)?);
+        let (key, used) = Key::decode(&body[*at..]).map_err(|_| Fault::CorruptImage {
+            detail: "snapshot intent key invalid".to_owned(),
+        })?;
+        *at += used;
+        let (expect, used) =
+            kivi_state::TxnExpect::decode(&body[*at..]).map_err(|_| Fault::CorruptImage {
+                detail: "snapshot intent expectation invalid".to_owned(),
+            })?;
+        *at += used;
+        let (kind, used) =
+            kivi_state::TxnWriteKind::decode(&body[*at..]).map_err(|_| Fault::CorruptImage {
+                detail: "snapshot intent write invalid".to_owned(),
+            })?;
+        *at += used;
+        let observed = match snap_take(body, at, 1)?[0] {
+            0 => None,
+            1 => {
+                let (version, used) =
+                    ObjectVersion::decode(&body[*at..]).map_err(|_| Fault::CorruptImage {
+                        detail: "snapshot intent version invalid".to_owned(),
+                    })?;
+                *at += used;
+                Some(version)
+            }
+            _ => {
+                return Err(Fault::CorruptImage {
+                    detail: "snapshot intent observed tag invalid".to_owned(),
+                });
+            }
+        };
+        let prepared_at = snap_take_u64(body, at)?;
+        intents.push(kivi_state::TxnIntent {
+            id,
+            coordinator,
+            key: key.clone(),
+            write: kivi_state::TxnWrite { key, kind, expect },
+            observed,
+            prepared_at,
+        });
+    }
+    Ok(intents)
+}
+
 /// Encodes one stored object value with its version and expiry.
 fn encode_object(out: &mut Vec<u8>, object: &StoredObject) {
     match object.value() {
@@ -1227,6 +1388,15 @@ impl ReplicatedTablet {
                 encode_bytes(&mut out, &outcome_bytes);
             }
         }
+        // Ordered-index flag plus prepared transaction intents (key order):
+        // intents are deterministic state and must survive snapshot
+        // transfer and restart; the index itself rebuilds from objects.
+        out.push(u8::from(self.store.ordered_index_enabled()));
+        let intents = self.store.snapshot_intents();
+        push_u64(&mut out, intents.len() as u64);
+        for intent in &intents {
+            encode_intent(&mut out, intent);
+        }
         out
     }
 
@@ -1311,6 +1481,16 @@ impl ReplicatedTablet {
         at += used;
         let objects = decode_snapshot_objects(body, &mut at)?;
         let sessions = decode_snapshot_sessions(body, &mut at)?;
+        let ordered_index = match snap_take(body, &mut at, 1)?[0] {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(Fault::CorruptImage {
+                    detail: "snapshot ordered-index tag invalid".to_owned(),
+                });
+            }
+        };
+        let intents = decode_snapshot_intents(body, &mut at)?;
         if at != body.len() {
             return Err(Fault::CorruptImage {
                 detail: "snapshot body has trailing bytes".to_owned(),
@@ -1327,6 +1507,8 @@ impl ReplicatedTablet {
             membership,
             objects,
             sessions,
+            ordered_index,
+            intents,
             control: None,
         })
     }
@@ -1397,6 +1579,8 @@ impl ReplicatedTablet {
             membership,
             objects: Vec::new(),
             sessions: Vec::new(),
+            ordered_index: false,
+            intents: Vec::new(),
             control: Some(control),
         })
     }
@@ -1413,6 +1597,14 @@ impl ReplicatedTablet {
         self.store = ObjectStore::new();
         for (key, object) in decoded.objects {
             self.store.put_stored(key, object);
+        }
+        // Unresolved intents are never discarded on restore; the ordered
+        // index rebuilds deterministically when enabled.
+        for intent in decoded.intents {
+            self.store.restore_intent(intent);
+        }
+        if decoded.ordered_index {
+            self.store.rebuild_ordered_index();
         }
         self.sessions.clear();
         for (session, floor, outcomes) in decoded.sessions {
@@ -1597,6 +1789,10 @@ pub struct DecodedSnapshot {
     pub objects: Vec<(Key, StoredObject)>,
     /// Sessions with floors and retained outcomes.
     pub sessions: DecodedSessions,
+    /// Whether the ordered index was enabled at capture.
+    pub ordered_index: bool,
+    /// Prepared transaction intents at capture (never discarded).
+    pub intents: Vec<kivi_state::TxnIntent>,
     /// Replicated control image (control snapshots only; `None` for
     /// tablet snapshots).
     pub control: Option<kivi_control::ControlState>,
@@ -1835,6 +2031,84 @@ impl ReplicatedStateMachine {
     /// automatic split/merge policy).
     pub async fn object_count(&self) -> usize {
         self.shared.lock().await.tablet.store().len()
+    }
+
+    /// Logical telemetry of this replica for split/merge policy.
+    pub async fn tablet_stats(&self, now: UnixMicros) -> kivi_state::StoreStats {
+        self.shared.lock().await.tablet.tablet_stats(now)
+    }
+
+    /// Approximate median split key of this replica (self-healing: the
+    /// ordered index rebuilds on demand, so medians work on tablets that
+    /// were never scanned).
+    pub async fn median_split_key(&self) -> Option<Vec<u8>> {
+        self.shared
+            .lock()
+            .await
+            .tablet
+            .median_split_key()
+            .map(|key| key.as_bytes().to_vec())
+    }
+
+    /// Number of prepared transaction intents on this replica.
+    pub async fn pending_intent_count(&self) -> usize {
+        self.shared.lock().await.tablet.pending_intent_count()
+    }
+
+    /// Prepared transaction intents on this replica, in key order
+    /// (resolver consults this; never discards here).
+    pub async fn snapshot_intents(&self) -> Vec<kivi_state::TxnIntent> {
+        self.shared.lock().await.tablet.pending_intents()
+    }
+
+    /// Removes and returns every prepared intent (cutover migration).
+    pub async fn drain_intents(&self) -> Vec<kivi_state::TxnIntent> {
+        self.shared.lock().await.tablet.drain_intents()
+    }
+
+    /// Installs one migrated intent verbatim (cutover path only).
+    pub async fn restore_intent(&self, intent: kivi_state::TxnIntent) {
+        self.shared.lock().await.tablet.restore_intent(intent);
+    }
+
+    /// Whether this replica maintains the ordered index.
+    pub async fn ordered_index_enabled(&self) -> bool {
+        self.shared.lock().await.tablet.ordered_index_enabled()
+    }
+
+    /// Enables or disables the ordered key index on this replica.
+    pub async fn set_ordered_indexing(&self, enabled: bool) {
+        self.shared
+            .lock()
+            .await
+            .tablet
+            .set_ordered_indexing(enabled);
+    }
+
+    /// Serves one bounded local scan page (rebuilding the ordered index
+    /// first when disabled, so scans always meet exact state).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateMachineFault`] when unhealthy, or the store's
+    /// [`ScanError`](kivi_state::ScanError) for malformed specs.
+    pub async fn scan_local(
+        &self,
+        spec: &kivi_state::ScanSpec,
+        now: UnixMicros,
+    ) -> Result<kivi_state::ScanPage, StateMachineFault> {
+        let mut inner = self.shared.lock().await;
+        if !inner.healthy {
+            return Err(StateMachineFault::CorruptState {
+                detail: "state machine unhealthy".to_owned(),
+            });
+        }
+        inner
+            .tablet
+            .scan_local(spec, now)
+            .map_err(|error| StateMachineFault::CorruptState {
+                detail: format!("local scan failed: {error}"),
+            })
     }
 
     /// Whether this replica is fenced for split/merge cutover (mutating
@@ -2559,6 +2833,149 @@ mod tests {
         tablet
             .apply_entry(log_id(index), &openraft::EntryPayload::Normal(cmd))
             .expect("test history applies")
+    }
+
+    #[test]
+    fn apply_serves_transaction_prepare_and_finalize() {
+        use kivi_state::{TxnExpect, TxnId, TxnWriteKind};
+        let mut tablet = tablet();
+        let txn = TxnId::derive(7, 1, 0);
+        // Prepare reserves without touching user state.
+        let prepare = Mutation::TxnPrepare {
+            txn,
+            coordinator: TABLET.as_u64(),
+            key: Key::from("k"),
+            expect: TxnExpect::Absent,
+            write: TxnWriteKind::Put(bytes::Bytes::from_static(b"v")),
+        };
+        let outcome = apply(
+            &mut tablet,
+            0,
+            command(1, 1, prepare, OperationResult::TxnPrepared),
+        );
+        let _ = outcome;
+        assert_eq!(tablet.pending_intent_count(), 1);
+        assert!(tablet.store().get(&Key::from("k"), NOW).is_none());
+        // A normal mutation against the reserved key diverges loudly at
+        // apply (prepare blocks it first on every honest path).
+        assert!(
+            tablet
+                .store
+                .apply(
+                    &Mutation::PutBytes {
+                        key: Key::from("k"),
+                        value: bytes::Bytes::from_static(b"race"),
+                    },
+                    NOW,
+                )
+                .is_err()
+        );
+        // Finalize-commit applies the prepared write.
+        let finalize = Mutation::TxnFinalize {
+            txn,
+            key: Key::from("k"),
+            commit: true,
+        };
+        apply(
+            &mut tablet,
+            1,
+            command(
+                1,
+                2,
+                finalize,
+                OperationResult::TxnFinalized {
+                    applied: true,
+                    version: Some(ObjectVersion::FIRST),
+                },
+            ),
+        );
+        assert_eq!(tablet.pending_intent_count(), 0);
+        assert!(tablet.store().get(&Key::from("k"), NOW).is_some());
+    }
+
+    #[test]
+    fn snapshot_round_trips_intents_and_ordered_flag() {
+        use kivi_state::{TxnExpect, TxnId, TxnWriteKind};
+        let mut tablet = tablet();
+        tablet.set_ordered_indexing(true);
+        let txn = TxnId::derive(3, 1, 0);
+        apply(
+            &mut tablet,
+            0,
+            command(
+                1,
+                1,
+                Mutation::TxnPrepare {
+                    txn,
+                    coordinator: TABLET.as_u64(),
+                    key: Key::from("k"),
+                    expect: TxnExpect::Any,
+                    write: TxnWriteKind::Put(bytes::Bytes::from_static(b"v")),
+                },
+                OperationResult::TxnPrepared,
+            ),
+        );
+        let image = tablet.encode_snapshot();
+        let decoded = ReplicatedTablet::decode_snapshot(&image, NS, TABLET).expect("decodes");
+        assert!(decoded.ordered_index);
+        assert_eq!(decoded.intents.len(), 1);
+        assert_eq!(decoded.intents[0].id, txn);
+        // Install restores intents verbatim and rebuilds the index.
+        let mut rebuilt = ReplicatedTablet::new(NS, TABLET, authority());
+        rebuilt.install_decoded(decoded);
+        assert!(rebuilt.ordered_index_enabled());
+        assert_eq!(rebuilt.pending_intent_count(), 1);
+        assert!(rebuilt.store.verify_ordered_index());
+    }
+
+    #[test]
+    fn scan_serves_ordered_pages_locally() {
+        use kivi_state::{ScanDirection, ScanProjection, ScanSpec};
+        let mut tablet = tablet();
+        apply(
+            &mut tablet,
+            0,
+            command(
+                1,
+                1,
+                Mutation::PutBytes {
+                    key: Key::from("b"),
+                    value: bytes::Bytes::from_static(b"2"),
+                },
+                OperationResult::Stored {
+                    version: ObjectVersion::FIRST,
+                },
+            ),
+        );
+        apply(
+            &mut tablet,
+            1,
+            command(
+                1,
+                2,
+                Mutation::PutBytes {
+                    key: Key::from("a"),
+                    value: bytes::Bytes::from_static(b"1"),
+                },
+                OperationResult::Stored {
+                    version: ObjectVersion::FIRST,
+                },
+            ),
+        );
+        let spec = ScanSpec::new(
+            None,
+            None,
+            ScanDirection::Forward,
+            100,
+            1 << 20,
+            ScanProjection::KeysOnly,
+        )
+        .expect("spec");
+        let page = tablet.scan_local(&spec, NOW).expect("scan");
+        assert!(page.exhausted);
+        assert_eq!(page.entries.len(), 2);
+        assert_eq!(page.entries[0].key, Key::from("a"));
+        assert!(tablet.store.verify_ordered_index());
     }
 
     #[test]
