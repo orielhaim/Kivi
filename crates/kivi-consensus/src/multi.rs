@@ -58,7 +58,8 @@ use crate::cluster::ClusterTopology;
 use crate::gate::SidecarGate;
 use crate::node::{
     BootstrapInputs, NodeOpenError, NodeStatus, OwnerCtx, OwnerRequest, ProposeError, ReadError,
-    bootstrap_group, classify_from_store, owner_call_on, propose_caller_side, spawn_raft,
+    bootstrap_group, classify_from_store, owner_call_on, process_ticks, propose_caller_side,
+    spawn_raft,
 };
 use crate::peer::{PeerRequest, PeerResponse, PeerRpcError};
 use crate::router::PeerRouter;
@@ -121,6 +122,11 @@ pub struct MultiNodeConfig {
     /// the tiny root (`true` in production; `false` forces the
     /// append-gate fallback path).
     pub preflight_enabled: bool,
+    /// Deployment lease-timing contract (bounded clock-rate drift plus
+    /// guard/lease/renew durations). The `RosterLease` backend is
+    /// unavailable unless these validate; reads then use Lazy-ALR or the
+    /// conservative barrier.
+    pub lease_params: kivi_types::LeaseParams,
     /// Compio worker (reactor) count: tablet groups stripe across these
     /// deterministically ([`worker_for_tablet`]).
     pub worker_count: usize,
@@ -177,10 +183,13 @@ pub struct ConsensusNode {
     local: NodeId,
     cluster: ClusterId,
     incarnation: kivi_types::NodeIncarnation,
-    /// Caller-side consistency hub: evidence, strong cache, providers,
-    /// metrics shared by every tablet group on this node. Memory-held by
-    /// construction — a restart starts empty.
-    hub: crate::consistency::ConsistencyHub,
+    /// Caller-side consistency hub: evidence, lease engines, strong
+    /// cache, providers, metrics shared by every tablet group on this
+    /// node. Shared with the workers (which drive lease engines through
+    /// it). Memory-held by construction — a restart starts empty.
+    hub: std::sync::Arc<crate::consistency::ConsistencyHub>,
+    /// Lazy-ALR batch coordinators per hosted tablet.
+    alr: Mutex<HashMap<TabletId, std::sync::Arc<crate::alr::AlrCoordinator>>>,
     /// User tablets hosted (excludes the system control group, which is
     /// tracked in the maps above under its reserved id).
     tablets: Mutex<Vec<TabletId>>,
@@ -767,6 +776,15 @@ impl ConsensusNode {
             bulk: senders[bulk_worker].clone(),
         };
         let preflight = Arc::new(crate::preflight::PreflightMetrics::default());
+        // Caller-side consistency hub, shared with every worker (which
+        // drive lease engines through it). Memory-held: a restart starts
+        // empty, so incarnation handling fails closed by construction.
+        let hub = std::sync::Arc::new(crate::consistency::ConsistencyHub::new(
+            opened.meta.node,
+            opened.meta.incarnation,
+            kivi_types::ReadAuthorityProvider::ConservativeLeader,
+            config.lease_params,
+        ));
         // Shared mesh thread: one UDP endpoint plus one dial/serve pump per
         // lane serving every group. Paused until every worker bootstrapped
         // its groups (static-bootstrap race discipline, same as the
@@ -869,6 +887,9 @@ impl ConsensusNode {
                 cluster: opened.meta.cluster,
                 preflight: Arc::clone(&preflight),
                 preflight_enabled: config.preflight_enabled,
+                hub: std::sync::Arc::clone(&hub),
+                incarnation: opened.meta.incarnation,
+                tick_tx: senders[index].clone(),
                 data_dir: config.data_dir.clone(),
                 durability: durability.clone(),
                 control_seeds: config
@@ -981,11 +1002,8 @@ impl ConsensusNode {
             local: opened.meta.node,
             cluster: opened.meta.cluster,
             incarnation: opened.meta.incarnation,
-            hub: crate::consistency::ConsistencyHub::new(
-                opened.meta.node,
-                opened.meta.incarnation,
-                kivi_types::ReadAuthorityProvider::ConservativeLeader,
-            ),
+            hub: std::sync::Arc::clone(&hub),
+            alr: Mutex::new(HashMap::new()),
             tablets: Mutex::new(served_tablets),
             worker_count,
             peer_addr,
@@ -1176,6 +1194,9 @@ impl ConsensusNode {
     /// Serves one read against `tablet`'s group under its contract,
     /// returning the outcome with its proof triple.
     ///
+    /// `eligibility` gates the roster fast path (point reads eligible;
+    /// transactions, batches, and scans conservative-only).
+    ///
     /// # Errors
     ///
     /// Returns [`ReadError`] for unknown tablets, routing, lineage,
@@ -1186,24 +1207,26 @@ impl ConsensusNode {
         op: &Operation,
         contract: ReadContract,
         ctx: kivi_types::ReadContext,
+        eligibility: kivi_types::LeaseEligibility,
     ) -> Result<crate::consistency::ServedRead, ReadError> {
-        let (machine, authority, worker) = self.read_front(tablet)?;
+        let (machine, authority, worker, alr) = self.read_front(tablet)?;
         crate::node::ReadFront::bind(
             &machine,
             &worker,
             &self.hub,
+            &alr,
             ConsensusGroupId::of_tablet(tablet),
             tablet,
             authority,
             self.incarnation,
         )
-        .read(op, contract, ctx)
+        .read(op, contract, ctx, eligibility)
         .await
     }
 
     /// Serves one bounded scan page against `tablet`'s group under its
     /// contract (each tablet read individually strong; the multi-tablet
-    /// scan is not one snapshot).
+    /// scan is not one snapshot). Scans are always lease-ineligible.
     ///
     /// # Errors
     ///
@@ -1216,22 +1239,29 @@ impl ConsensusNode {
         contract: ReadContract,
         ctx: kivi_types::ReadContext,
     ) -> Result<crate::consistency::ServedScan, ReadError> {
-        let (machine, authority, worker) = self.read_front(tablet)?;
+        let (machine, authority, worker, alr) = self.read_front(tablet)?;
         crate::node::ReadFront::bind(
             &machine,
             &worker,
             &self.hub,
+            &alr,
             ConsensusGroupId::of_tablet(tablet),
             tablet,
             authority,
             self.incarnation,
         )
-        .scan(spec, contract, ctx)
+        .scan(
+            spec,
+            contract,
+            ctx,
+            kivi_types::LeaseEligibility::ConservativeOnly,
+        )
         .await
     }
 
-    /// Resolves the machine, authority, and owner channel for one tablet's
-    /// read path.
+    /// Resolves the machine, authority, owner channel, and ALR
+    /// coordinator for one tablet's read path (creating the coordinator
+    /// lazily on first read).
     fn read_front(
         &self,
         tablet: TabletId,
@@ -1240,38 +1270,30 @@ impl ConsensusNode {
             ReplicatedStateMachine,
             TabletAuthority,
             async_channel::Sender<OwnerRequest>,
+            std::sync::Arc<crate::alr::AlrCoordinator>,
         ),
         ReadError,
     > {
+        let unavailable = || {
+            ReadError::Consensus(ConsensusError::Unavailable {
+                reason: format!("tablet {} not served by this node", tablet.as_u64()),
+            })
+        };
         let machine = self
             .machines
             .lock()
-            .map_err(|_| {
-                ReadError::Consensus(ConsensusError::Unavailable {
-                    reason: "consensus machine lock poisoned".to_owned(),
-                })
-            })?
+            .map_err(|_| unavailable())?
             .get(&tablet)
             .cloned()
-            .ok_or_else(|| {
-                ReadError::Consensus(ConsensusError::Unavailable {
-                    reason: format!("tablet {} not served by this node", tablet.as_u64()),
-                })
-            })?;
+            .ok_or_else(unavailable)?;
         let worker = self.worker_for(tablet).map_err(|error| match error {
             ProposeError::Consensus(consensus) => ReadError::Consensus(consensus),
-            _ => ReadError::Consensus(ConsensusError::Unavailable {
-                reason: format!("tablet {} not served by this node", tablet.as_u64()),
-            }),
+            _ => unavailable(),
         })?;
         let authority = self
             .authorities
             .lock()
-            .map_err(|_| {
-                ReadError::Consensus(ConsensusError::Unavailable {
-                    reason: "consensus authority lock poisoned".to_owned(),
-                })
-            })?
+            .map_err(|_| unavailable())?
             .get(&tablet)
             .copied()
             .ok_or_else(|| {
@@ -1279,7 +1301,25 @@ impl ConsensusNode {
                     reason: format!("tablet {} has no local authority", tablet.as_u64()),
                 })
             })?;
-        Ok((machine, authority, worker))
+        let alr = self
+            .alr
+            .lock()
+            .map_err(|_| unavailable())?
+            .entry(tablet)
+            .or_insert_with(|| {
+                std::sync::Arc::new(crate::alr::AlrCoordinator::bind(
+                    machine.clone(),
+                    worker.clone(),
+                    std::sync::Arc::clone(&self.hub),
+                    ConsensusGroupId::of_tablet(tablet),
+                    tablet,
+                    authority,
+                    self.incarnation,
+                    self.local,
+                ))
+            })
+            .clone();
+        Ok((machine, authority, worker, alr))
     }
 
     /// Returns this node's serving authority for `tablet`, if hosted.
@@ -1292,72 +1332,10 @@ impl ConsensusNode {
     }
 
     /// Switches the read-authority mode for every tablet on this node
-    /// (operator/test control for the Almost-Local and roster-lease
-    /// prototypes).
+    /// (operator/test control for the Lazy-ALR and roster-lease
+    /// accelerators).
     pub fn set_read_provider(&self, provider: kivi_types::ReadAuthorityProvider) {
         self.hub.set_provider(provider);
-    }
-
-    /// Grants a roster lease for `tablet`: only the current leader may
-    /// issue (verified against the owner); the floor is the leader's
-    /// current applied position.
-    ///
-    /// # Errors
-    ///
-    /// Returns a human-readable reason for unknown tablets, worker
-    /// shutdown, or when this replica is not the leader.
-    pub async fn grant_read_lease(
-        &self,
-        tablet: TabletId,
-        members: Vec<NodeId>,
-        now: kivi_types::Ticks,
-        ttl: std::time::Duration,
-        generation: u64,
-    ) -> Result<(), String> {
-        let group = ConsensusGroupId::of_tablet(tablet);
-        let worker = self
-            .channel_for(group)
-            .ok_or_else(|| format!("tablet {} not served by this node", tablet.as_u64()))?;
-        let leader =
-            crate::node::owner_call_on(&worker, |reply| OwnerRequest::IsLeader { group, reply })
-                .await
-                .map_err(|_| "consensus worker shut down".to_owned())?;
-        if !leader {
-            return Err("not the leader; only the leader issues roster leases".to_owned());
-        }
-        let (machine, authority) =
-            {
-                let machines = self
-                    .machines
-                    .lock()
-                    .map_err(|_| "consensus machine lock poisoned".to_owned())?;
-                let authorities = self
-                    .authorities
-                    .lock()
-                    .map_err(|_| "consensus authority lock poisoned".to_owned())?;
-                (
-                    machines.get(&tablet).cloned().ok_or_else(|| {
-                        format!("tablet {} not served by this node", tablet.as_u64())
-                    })?,
-                    authorities.get(&tablet).copied().ok_or_else(|| {
-                        format!("tablet {} has no local authority", tablet.as_u64())
-                    })?,
-                )
-            };
-        let applied = machine.status().await.applied_commit;
-        let lease = kivi_types::RosterLease::new(
-            authority,
-            generation,
-            members,
-            applied,
-            now.advance_by(ttl),
-            self.incarnation,
-        );
-        if self.hub.grant_lease(tablet, lease) {
-            Ok(())
-        } else {
-            Err("lease refused for a foreign authority".to_owned())
-        }
     }
 
     /// Gathers per-group diagnostics for every local group (fans out to
@@ -1387,7 +1365,7 @@ impl ConsensusNode {
                             .unwrap_or_else(|_| closed_status(group, local, sidecar, preflight))
                     };
                     status.consistency = hub
-                        .snapshot(group.tablet())
+                        .snapshot(group.tablet(), process_ticks())
                         .map_or_else(kivi_types::ConsistencySnapshot::default, |(_, snapshot)| {
                             snapshot
                         });
@@ -1420,7 +1398,7 @@ impl ConsensusNode {
             .unwrap_or_else(|_| closed_status(group, self.local, sidecar, preflight));
         status.consistency = self
             .hub
-            .snapshot(group.tablet())
+            .snapshot(group.tablet(), process_ticks())
             .map_or_else(kivi_types::ConsistencySnapshot::default, |(_, snapshot)| {
                 snapshot
             });
@@ -2507,6 +2485,12 @@ struct WorkerParams {
     cluster: ClusterId,
     preflight: Arc<crate::preflight::PreflightMetrics>,
     preflight_enabled: bool,
+    /// Shared consistency hub (lease engines, evidence, metrics).
+    hub: std::sync::Arc<crate::consistency::ConsistencyHub>,
+    /// This process's incarnation (lease/proof binding).
+    incarnation: kivi_types::NodeIncarnation,
+    /// Own ingress channel for the lease-tick timer task.
+    tick_tx: async_channel::Sender<OwnerRequest>,
     /// Data-directory root (dynamic replica creation opens new group
     /// stores and state machines beneath it).
     data_dir: PathBuf,
@@ -2534,6 +2518,7 @@ struct WorkerBuildCtx {
     data_dir: PathBuf,
     namespace: NamespaceId,
     local: NodeId,
+    incarnation: kivi_types::NodeIncarnation,
     sidecar: SidecarStore,
     transport: PeerTransport,
     router: PeerRouter,
@@ -2541,6 +2526,7 @@ struct WorkerBuildCtx {
     preflight_enabled: bool,
     bulk_timeout: Duration,
     durability: SharedRaftDurability,
+    hub: std::sync::Arc<crate::consistency::ConsistencyHub>,
 }
 
 /// Worker thread main: builds one replica per owned tablet (gate, `Raft`,
@@ -2592,6 +2578,7 @@ async fn worker_main(mut params: WorkerParams) {
         data_dir: params.data_dir.clone(),
         namespace: params.namespace,
         local: params.local,
+        incarnation: params.incarnation,
         sidecar: params.sidecar.clone(),
         transport: params.transport.clone(),
         router: router.clone(),
@@ -2599,7 +2586,36 @@ async fn worker_main(mut params: WorkerParams) {
         preflight_enabled: params.preflight_enabled,
         bulk_timeout: params.transport_config.bulk_timeout,
         durability: params.durability.clone(),
+        hub: std::sync::Arc::clone(&params.hub),
     };
+    // Lease-driver ticker: one tick per renew quarter per owned group.
+    // The loop dies with the reactor on shutdown; a full queue (shutting
+    // down) ends it.
+    {
+        let tick_tx = params.tick_tx.clone();
+        let tick_interval = crate::node::lease_tick_interval(params.hub.lease_params());
+        let tick_groups: Vec<ConsensusGroupId> = replicas.keys().copied().collect();
+        compio::runtime::spawn(async move {
+            loop {
+                compio::time::sleep(tick_interval).await;
+                let mut live = true;
+                for group in &tick_groups {
+                    if tick_tx
+                        .send(OwnerRequest::LeaseTick { group: *group })
+                        .await
+                        .is_err()
+                    {
+                        live = false;
+                        break;
+                    }
+                }
+                if !live {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
     worker_loop(
         replicas,
         params.local,
@@ -2729,10 +2745,12 @@ async fn build_replica(
             authority,
             tablet,
             params.local,
+            params.incarnation,
             voter_list,
             params.transport_config.bulk_timeout,
             Arc::clone(&params.preflight),
             params.preflight_enabled,
+            std::sync::Arc::clone(&params.hub),
         ),
     ))
 }
@@ -2828,10 +2846,12 @@ fn assemble_ctx(
     authority: TabletAuthority,
     tablet: TabletId,
     local: NodeId,
+    incarnation: kivi_types::NodeIncarnation,
     voters: Vec<NodeId>,
     bulk_timeout: Duration,
     preflight: Arc<crate::preflight::PreflightMetrics>,
     preflight_enabled: bool,
+    hub: std::sync::Arc<crate::consistency::ConsistencyHub>,
 ) -> OwnerCtx<GroupRaftStore> {
     OwnerCtx {
         raft,
@@ -2845,11 +2865,13 @@ fn assemble_ctx(
         authority,
         tablet,
         local,
+        incarnation,
         voters,
         bulk_timeout,
         preflight,
         preflight_enabled,
         transfers: Rc::new(RefCell::new(HashMap::new())),
+        hub,
     }
 }
 
@@ -2932,10 +2954,12 @@ async fn build_dynamic_replica(
         authority,
         tablet,
         build.local,
+        build.incarnation,
         voter_list,
         build.bulk_timeout,
         Arc::clone(&build.preflight),
         build.preflight_enabled,
+        std::sync::Arc::clone(&build.hub),
     );
     Ok((group, ctx, info))
 }
@@ -3148,6 +3172,7 @@ mod tests {
                 peer_certs: HashMap::new(),
                 insecure_peer_tls: true,
                 preflight_enabled: true,
+                lease_params: kivi_types::LeaseParams::default(),
                 worker_count: 2,
                 durability: SharedDurabilityConfig::default(),
                 control: None,
@@ -3186,6 +3211,7 @@ mod tests {
                         },
                         ReadContract::Latest,
                         CTX,
+                        kivi_types::LeaseEligibility::Eligible,
                     )
                     .await
                     .expect("tablet serves its key");
@@ -3237,6 +3263,7 @@ mod tests {
                 peer_certs: HashMap::new(),
                 insecure_peer_tls: true,
                 preflight_enabled: true,
+                lease_params: kivi_types::LeaseParams::default(),
                 worker_count: 1,
                 durability: SharedDurabilityConfig::default(),
                 control: Some(ControlGroupConfig {
@@ -3356,6 +3383,7 @@ mod tests {
                 peer_certs: HashMap::new(),
                 insecure_peer_tls: true,
                 preflight_enabled: true,
+                lease_params: kivi_types::LeaseParams::default(),
                 worker_count: 1,
                 durability: SharedDurabilityConfig::default(),
                 control: None,
@@ -3384,7 +3412,8 @@ mod tests {
                         key: Key::from("x")
                     },
                     ReadContract::Any,
-                    CTX
+                    CTX,
+                    kivi_types::LeaseEligibility::Eligible,
                 )
                 .await
                 .is_err(),
@@ -3402,6 +3431,7 @@ mod tests {
                 peer_certs: HashMap::new(),
                 insecure_peer_tls: true,
                 preflight_enabled: true,
+                lease_params: kivi_types::LeaseParams::default(),
                 worker_count: 1,
                 durability: SharedDurabilityConfig::default(),
                 control: None,

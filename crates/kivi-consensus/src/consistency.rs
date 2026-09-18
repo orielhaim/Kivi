@@ -1,27 +1,43 @@
 //! Phase 7 consistency execution layer: one hub per node binding authority,
-//! freshness evidence, the strong cache, and the read-authority providers.
+//! freshness evidence, the strong cache, the roster-lease engines, and the
+//! read-authority providers.
 //!
 //! The hub owns no I/O, no clocks, and no networking. It stores the pure
-//! values defined in [`kivi_types::consistency`] (receipts, leases, cache
-//! entries, metrics) and answers one deterministic question per read —
-//! [`ConsistencyHub::plan`] — while the caller executes the plan (barriers
-//! and waits still hop to the owner thread, which alone may touch the Raft
-//! handle). Clocks always arrive inside [`ReadContext`];
+//! values defined in [`kivi_types::consistency`] (receipts, cache entries,
+//! metrics) plus one pure [`RosterEngine`](kivi_types::RosterEngine) per
+//! tablet, and answers one deterministic question per read —
+//! [`ConsistencyHub::plan`] — while the caller executes the plan (barriers,
+//! fence syncs, and waits still hop to the owner thread, which alone may
+//! touch the Raft handle). Clocks always arrive inside [`ReadContext`];
 //! nothing here reads one.
 //!
 //! ```text
 //! authority ──► freshness ──► cached read ──► validation ──► serve OR fallback
 //!
 //! missing / stale / ambiguous / invalidated / old-generation evidence
-//!   ⇒ fall back to the authoritative path, never manufacture freshness.
+//!   ⇒ fall back toward the conservative baseline, never manufacture freshness.
+//! ```
+//!
+//! Strong-read fallback chain (same `Latest` semantics at every layer):
+//!
+//! ```text
+//! RosterLease (stable roster + floor coverage)
+//!      │ no stable roster / behind floor / ineligible / drift untrusted
+//!      ▼
+//! Lazy-ALR (opportunistic batch + ordered fence, no timing assumption)
+//!      │ sync unavailable / boundary timeout
+//!      ▼
+//! ConservativeLeader barrier
 //! ```
 //!
 //! Topology rule: per-tablet state is keyed by tablet and reconciled against
 //! the serving authority on every plan. Any authority movement drops
-//! receipts, leases, and cache entries for that tablet before the plan
-//! runs, so split/merge/migration evidence can never leak across lineages.
-//! A process restart drops the whole hub (memory-held), so incarnation
-//! handling fails closed by construction.
+//! receipts, lease engines, and cache entries for that tablet before the
+//! plan runs, so split/merge/migration evidence can never leak across
+//! lineages. A process restart drops the whole hub (memory-held), so
+//! incarnation handling fails closed by construction; recreated lease
+//! engines start quarantined and grant nothing until forgotten grants are
+//! unusable.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
@@ -30,9 +46,10 @@ use std::time::Duration;
 use kivi_state::{Operation, OperationResult};
 use kivi_types::{
     CommitPosition, ConsistencyMetrics, ConsistencySnapshot, FreshnessReceipt, FreshnessReject,
-    NodeId, NodeIncarnation, ReadAuthorityProvider, ReadContext, ReadContract, ReadReceipt,
-    ReplicaFreshness, RosterLease, STRONG_CACHE_CAP, STRONG_CACHE_VALUE_CAP, ServePath,
-    TabletAuthority, TabletId,
+    LeaseEligibility, LeaseEvent, LeaseMessage, LeaseOutbound, LeaseParams, NodeId,
+    NodeIncarnation, ReadAuthorityProvider, ReadContext, ReadContract, ReadReceipt,
+    ReplicaFreshness, RosterEngine, RosterEvidence, RosterSummary, RosterTerm, STRONG_CACHE_CAP,
+    STRONG_CACHE_VALUE_CAP, ServePath, TabletAuthority, TabletId, Ticks,
 };
 
 /// A read the hub already holds a validated answer for, plus how to execute
@@ -76,6 +93,11 @@ pub enum ReadPlan {
         /// Whether this barrier is a bounded-stale escalation.
         escalated: bool,
     },
+    /// Join (or form) the tablet's Lazy-ALR batch: order a fence past
+    /// batch formation — or accept a subsuming write boundary — wait for
+    /// local apply of the boundary, then serve. The caller executes the
+    /// batch protocol; any failure falls back to [`ReadPlan::BarrierThenServe`].
+    AlrThenServe,
     /// Wait (bounded, deadline-aware) for local applied coverage of a
     /// Raft log index, then serve. Only for `AtLeast` tokens behind the
     /// replica but valid for its lineage.
@@ -209,16 +231,28 @@ impl CacheEntry {
 }
 
 /// Per-tablet consistency state: current authority, held evidence, the
-/// strong cache, and worker-local metrics.
+/// lease engine, the strong cache, and worker-local metrics.
 #[derive(Debug)]
 struct TabletConsistency {
     /// Authority this entry reconciled against.
     authority: TabletAuthority,
-    /// Last quorum-barrier proof (Almost-Local and bounded-stale evidence).
+    /// Last quorum-barrier proof (bounded-stale evidence).
     receipt: Option<FreshnessReceipt>,
-    /// Active roster lease, if the issuer granted one.
-    lease: Option<RosterLease>,
+    /// Directional roster-lease engine (`None` until the lease driver
+    /// observes term/voters and creates it; dropped on authority move).
+    engine: Option<RosterEngine>,
+    /// Last term driven into the engine (`None` before the first drive).
+    term: Option<RosterTerm>,
+    /// Monotonic time before which strong writes must wait out forgotten
+    /// old-term authority (takeover fence; `None` when no wait is owed).
+    /// Set when an engine is (re)created mid-stream or the observed term
+    /// rises without full old-roster coverage; always bounded by the
+    /// protocol-derived quarantine.
+    takeover_until: Option<Ticks>,
     /// Strong cache: replayable fills under the current authority.
+    /// `Latest` never replays from here — only live applied state under
+    /// evidence serves strong reads, so no cache entry can bypass the
+    /// roster/ALR checks.
     cache: BTreeMap<CacheKey, CacheEntry>,
     /// Read-authority mode for this tablet.
     provider: ReadAuthorityProvider,
@@ -232,7 +266,9 @@ impl TabletConsistency {
         Self {
             authority,
             receipt: None,
-            lease: None,
+            engine: None,
+            term: None,
+            takeover_until: None,
             cache: BTreeMap::new(),
             provider,
             metrics: ConsistencyMetrics::default(),
@@ -242,10 +278,13 @@ impl TabletConsistency {
     /// Drops every evidence kind held. Called whenever the serving
     /// authority moves: cached freshness dies with its authority.
     fn drop_evidence(&mut self) {
-        let held = self.receipt.is_some() || self.lease.is_some() || !self.cache.is_empty();
+        let held = self.receipt.is_some() || self.engine.is_some() || !self.cache.is_empty();
         self.receipt = None;
-        self.lease = None;
+        self.engine = None;
+        self.term = None;
+        self.takeover_until = None;
         self.cache.clear();
+        self.metrics.roster = None;
         if held {
             self.metrics.strong_cache_invalidations += 1;
         }
@@ -254,7 +293,9 @@ impl TabletConsistency {
 
 /// Node-wide consistency hub: per-tablet evidence plus this replica's
 /// identity. `Send + Sync` over a plain mutex — plans hold the lock only
-/// for map lookup and counter updates, never across I/O.
+/// for map lookup and counter updates, never across I/O. The owner thread
+/// drives lease engines through the same lock (engine steps are pure and
+/// fast); planning never blocks on transport.
 #[derive(Debug)]
 pub struct ConsistencyHub {
     /// Per-tablet state, created lazily on first read.
@@ -265,28 +306,94 @@ pub struct ConsistencyHub {
     local: NodeId,
     /// This process's incarnation (lease/proof binding).
     incarnation: NodeIncarnation,
+    /// Deployment lease-timing contract for every tablet engine.
+    params: LeaseParams,
+    /// Whether the contract validated: an untrusted drift bound disables
+    /// the `RosterLease` backend (reads use Lazy-ALR or the barrier)
+    /// instead of silently weakening it.
+    lease_available: bool,
+}
+
+/// Outbound lease traffic of one driver step, grouped by addressee.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseDriveOut {
+    /// Addressee.
+    pub target: NodeId,
+    /// Messages for that addressee, in emission order.
+    pub messages: Vec<LeaseMessage>,
+}
+
+impl LeaseDriveOut {
+    /// Groups flat engine outbound by addressee in deterministic
+    /// (node-id) order.
+    #[must_use]
+    pub fn group(outbound: Vec<LeaseOutbound>) -> Vec<Self> {
+        let mut grouped: BTreeMap<NodeId, Vec<LeaseMessage>> = BTreeMap::new();
+        for message in outbound {
+            grouped
+                .entry(message.target)
+                .or_default()
+                .push(message.message);
+        }
+        grouped
+            .into_iter()
+            .map(|(target, messages)| Self { target, messages })
+            .collect()
+    }
 }
 
 impl ConsistencyHub {
     /// Builds a hub for one replica. `provider` is the initial
     /// read-authority mode for every tablet (the conservative leader path
-    /// in production; fast modes opt in per deployment or test).
+    /// in production; accelerators opt in per deployment or test).
+    /// `params` is the deployment lease-timing contract: when it fails
+    /// validation the `RosterLease` backend reports unavailable on every
+    /// plan and reads fall back to Lazy-ALR or the barrier.
     #[must_use]
     pub fn new(
         local: NodeId,
         incarnation: NodeIncarnation,
         provider: ReadAuthorityProvider,
+        params: LeaseParams,
     ) -> Self {
+        let lease_available = params.validate().is_ok();
         Self {
             tablets: Mutex::new(HashMap::new()),
             default_provider: Mutex::new(provider),
             local,
             incarnation,
+            params,
+            lease_available,
         }
     }
 
+    /// This replica's node identity.
+    #[must_use]
+    pub const fn local(&self) -> NodeId {
+        self.local
+    }
+
+    /// This process's incarnation.
+    #[must_use]
+    pub const fn incarnation(&self) -> NodeIncarnation {
+        self.incarnation
+    }
+
+    /// Deployment lease-timing contract.
+    #[must_use]
+    pub const fn lease_params(&self) -> LeaseParams {
+        self.params
+    }
+
+    /// Whether the `RosterLease` backend may serve: the drift contract
+    /// validated. Otherwise plans skip roster evidence entirely.
+    #[must_use]
+    pub const fn lease_available(&self) -> bool {
+        self.lease_available
+    }
+
     /// Switches the read-authority mode for all tablets (operator/test
-    /// control for the Almost-Local and roster-lease prototypes). Held
+    /// control for the Lazy-ALR and roster-lease accelerators). Held
     /// evidence is kept: it revalidates under its own authority checks on
     /// the next plan, and any mode still falls back when evidence is
     /// insufficient — switching modes changes latency, never safety.
@@ -303,6 +410,9 @@ impl ConsistencyHub {
 
     /// Deterministic read plan for one operation under its contract. Locks
     /// only for lookup, reconcile, cache probe, and counters.
+    /// `eligibility` gates the roster fast path: transactions, batches,
+    /// and scans pass [`LeaseEligibility::ConservativeOnly`] until
+    /// responder coverage integrates with their commit outcome.
     pub fn plan(
         &self,
         tablet: TabletId,
@@ -310,6 +420,7 @@ impl ConsistencyHub {
         contract: ReadContract,
         fresh: ReplicaFreshness,
         ctx: ReadContext,
+        eligibility: LeaseEligibility,
     ) -> PlannedRead {
         // Poisoned hub lock: fail closed to the authority path rather
         // than serving from unvalidated state.
@@ -336,7 +447,14 @@ impl ConsistencyHub {
             entry.authority = fresh.authority;
         }
         match contract {
-            ReadContract::Latest => Self::plan_latest(entry, fresh, ctx, self.local),
+            ReadContract::Latest => Self::plan_latest(
+                entry,
+                fresh,
+                ctx,
+                self.local,
+                self.lease_available,
+                eligibility,
+            ),
             ReadContract::AtLeast(token) => {
                 Self::plan_at_least(entry, Some(operation), token, fresh)
             }
@@ -365,8 +483,9 @@ impl ConsistencyHub {
         contract: ReadContract,
         fresh: ReplicaFreshness,
         ctx: ReadContext,
+        eligibility: LeaseEligibility,
     ) -> PlannedRead {
-        let planned = self.plan_scan_inner(tablet, contract, fresh, ctx);
+        let planned = self.plan_scan_inner(tablet, contract, fresh, ctx, eligibility);
         debug_assert!(
             planned.cached.is_none(),
             "scans never hit the point-read cache"
@@ -382,6 +501,7 @@ impl ConsistencyHub {
         contract: ReadContract,
         fresh: ReplicaFreshness,
         ctx: ReadContext,
+        eligibility: LeaseEligibility,
     ) -> PlannedRead {
         let Ok(mut tablets) = self.tablets.lock() else {
             return PlannedRead {
@@ -404,7 +524,14 @@ impl ConsistencyHub {
             entry.authority = fresh.authority;
         }
         match contract {
-            ReadContract::Latest => Self::plan_latest(entry, fresh, ctx, self.local),
+            ReadContract::Latest => Self::plan_latest(
+                entry,
+                fresh,
+                ctx,
+                self.local,
+                self.lease_available,
+                eligibility,
+            ),
             ReadContract::AtLeast(token) => Self::plan_at_least(entry, None, token, fresh),
             ReadContract::BoundedStale { max_staleness } => {
                 Self::plan_bounded_stale(entry, None, max_staleness, fresh, ctx, self.incarnation)
@@ -413,50 +540,52 @@ impl ConsistencyHub {
         }
     }
 
-    /// Plans a `Latest` read under the tablet's provider mode.
+    /// Plans a `Latest` read under the tablet's provider mode. No layer
+    /// weakens the contract: the roster path serves only on full evidence,
+    /// everything uncertain plans the Lazy-ALR batch, whose own failure
+    /// plans the barrier at execution time.
     fn plan_latest(
         entry: &mut TabletConsistency,
         fresh: ReplicaFreshness,
         ctx: ReadContext,
         local: NodeId,
+        lease_available: bool,
+        eligibility: LeaseEligibility,
     ) -> PlannedRead {
+        let _ = ctx;
+        let _ = local;
         match entry.provider {
             ReadAuthorityProvider::ConservativeLeader => PlannedRead {
                 plan: ReadPlan::BarrierThenServe { escalated: false },
                 cached: None,
             },
-            ReadAuthorityProvider::AlmostLocal { max_proof_age } => {
-                let usable = entry.receipt.is_some_and(|receipt| {
-                    receipt
-                        .usable_against(&fresh.authority, fresh.applied, fresh.incarnation)
-                        .is_ok()
-                        && receipt.age(ctx.ticks) <= max_proof_age
-                });
-                if usable {
-                    entry.metrics.almost_local_hits += 1;
-                    PlannedRead {
-                        plan: ReadPlan::ServeLocal {
-                            path: ServePath::AlmostLocalProof,
-                        },
-                        cached: None,
-                    }
-                } else {
-                    entry.metrics.almost_local_fallbacks += 1;
-                    PlannedRead {
-                        plan: ReadPlan::BarrierThenServe { escalated: false },
-                        cached: None,
-                    }
-                }
-            }
+            ReadAuthorityProvider::AlmostLocal => PlannedRead {
+                plan: ReadPlan::AlrThenServe,
+                cached: None,
+            },
             ReadAuthorityProvider::RosterLease => {
-                let usable = entry.lease.as_ref().is_some_and(|lease| {
-                    lease
-                        .authorizes(local, fresh.incarnation, &fresh.authority, ctx.ticks)
-                        .is_ok()
-                        && fresh.applied.as_u64() >= lease.floor.as_u64()
-                });
-                if usable {
+                // The roster path needs all of: an eligible read, a
+                // trusted drift contract, and full engine evidence. Any
+                // gap plans the ALR batch — same semantics, no timing
+                // assumption — and counts why, so operators can tell
+                // "no stable roster" from "behind the floor" at a glance.
+                if !eligibility.lease_may_serve() || !lease_available {
+                    entry.metrics.roster_fallbacks += 1;
+                    return PlannedRead {
+                        plan: ReadPlan::AlrThenServe,
+                        cached: None,
+                    };
+                }
+                let Some(engine) = entry.engine.as_ref() else {
+                    entry.metrics.roster_fallbacks += 1;
+                    return PlannedRead {
+                        plan: ReadPlan::AlrThenServe,
+                        cached: None,
+                    };
+                };
+                if let Some(proof) = engine.evidence(fresh.applied, ctx.ticks) {
                     entry.metrics.roster_hits += 1;
+                    entry.metrics.roster = Some(summarize(&proof, engine, fresh.applied));
                     PlannedRead {
                         plan: ReadPlan::ServeLocal {
                             path: ServePath::RosterLease,
@@ -464,9 +593,16 @@ impl ConsistencyHub {
                         cached: None,
                     }
                 } else {
-                    entry.metrics.roster_fallbacks += 1;
+                    // Stable but behind the floor holds (or falls
+                    // back at execution); no stable roster falls back
+                    // now. Neither serves thin state.
+                    if engine.stable(ctx.ticks).is_some() {
+                        entry.metrics.roster_holds += 1;
+                    } else {
+                        entry.metrics.roster_fallbacks += 1;
+                    }
                     PlannedRead {
-                        plan: ReadPlan::BarrierThenServe { escalated: false },
+                        plan: ReadPlan::AlrThenServe,
                         cached: None,
                     }
                 }
@@ -772,35 +908,347 @@ impl ConsistencyHub {
             .and_then(|tablets| tablets.get(&tablet).and_then(|entry| entry.receipt))
     }
 
-    /// Installs a roster lease granted by the read authority (leader after
-    /// quorum agreement). Renewals install by generation order; delayed
-    /// duplicates die. A lease for a foreign authority is refused.
-    pub fn grant_lease(&self, tablet: TabletId, lease: RosterLease) -> bool {
-        let mut installed = false;
-        if let Ok(mut tablets) = self.tablets.lock() {
-            let default = self
-                .default_provider
-                .lock()
-                .map_or(ReadAuthorityProvider::ConservativeLeader, |mode| *mode);
-            let entry = tablets
-                .entry(tablet)
-                .or_insert_with(|| TabletConsistency::fresh(lease.authority, default));
-            if entry.authority.tablet() != lease.authority.tablet()
-                || entry.authority.epoch() != lease.authority.epoch()
-                || entry.authority.guard() != lease.authority.guard()
+    /// One owner-tick of the lease driver for `tablet`: reconciles observed
+    /// world state (authority, term, voters) into the tablet's engine,
+    /// advances timers (renewals, Guard retries, lapses), and announces or
+    /// grants when designated. Returns grouped outbound traffic (loopback
+    /// to self already drained internally); the owner sends the rest over
+    /// the peer mesh.
+    ///
+    /// Engines exist only while the tablet's provider is
+    /// [`ReadAuthorityProvider::RosterLease`] with a trusted contract:
+    /// otherwise any engine is dropped and no traffic emits, so the lease
+    /// layer is silent unless reads can use it. `accepted` is this
+    /// replica's highest appended log position (Guard-threshold input);
+    /// `committed` is its highest committed position (Renew floor input).
+    /// Neither is merely applied: the floor must vouch for ordering, not
+    /// for local apply progress.
+    #[allow(clippy::too_many_arguments)]
+    pub fn lease_drive(
+        &self,
+        tablet: TabletId,
+        authority: TabletAuthority,
+        term: RosterTerm,
+        voters: Vec<NodeId>,
+        is_leader: bool,
+        accepted: CommitPosition,
+        committed: CommitPosition,
+        now: Ticks,
+    ) -> Vec<LeaseDriveOut> {
+        let Ok(mut tablets) = self.tablets.lock() else {
+            return Vec::new();
+        };
+        let default = self
+            .default_provider
+            .lock()
+            .map_or(ReadAuthorityProvider::ConservativeLeader, |mode| *mode);
+        let entry = tablets
+            .entry(tablet)
+            .or_insert_with(|| TabletConsistency::fresh(authority, default));
+        if entry.authority != authority {
+            entry.drop_evidence();
+            entry.authority = authority;
+        }
+        if entry.provider != ReadAuthorityProvider::RosterLease || !self.lease_available {
+            entry.engine = None;
+            entry.metrics.roster = None;
+            return Vec::new();
+        }
+        let local = self.local;
+        let incarnation = self.incarnation;
+        let params = self.params;
+        if let Some(until) = takeover_fence(
+            entry.engine.as_ref(),
+            entry.term,
+            term,
+            authority,
+            local,
+            incarnation,
+            params.quarantine(),
+            now,
+        ) {
+            entry.takeover_until = Some(until);
+        }
+        entry.term = Some(term);
+        let engine = entry.engine.get_or_insert_with(|| {
+            RosterEngine::new(
+                local,
+                incarnation,
+                authority,
+                term,
+                voters.clone(),
+                params,
+                now,
+            )
+        });
+        let (mut outbound, mut events) = engine.reconcile(authority, term, voters, now);
+        let (ticked, ticked_events) = engine.tick(accepted, committed, now);
+        outbound.extend(ticked);
+        events.extend(ticked_events);
+        if !engine.quarantined(now) {
+            if is_leader {
+                if engine.current_roster_for_term(term).is_none() {
+                    if let Ok((_, announced)) =
+                        engine.announce(local, engine.voters(), accepted, now)
+                    {
+                        outbound.extend(announced);
+                    }
+                    // Quarantined (checked), NotLeader (checked), or
+                    // InvalidId (degenerate voter set): skip this tick and
+                    // retry; never half-announce.
+                } else if let Some(current) = engine.current_roster_for_term(term) {
+                    outbound.extend(engine.grant_for(current.id, accepted, now));
+                }
+            } else if let Some(current) = engine.current_roster_for_term(term)
+                && current.covers(local)
             {
-                return false;
-            }
-            let replace = entry
-                .lease
-                .as_ref()
-                .is_none_or(|current| current.superseded_by(&lease));
-            if replace {
-                entry.lease = Some(lease);
-                installed = true;
+                outbound.extend(engine.grant_for(current.id, accepted, now));
             }
         }
-        installed
+        for event in events {
+            match event {
+                LeaseEvent::Expired => entry.metrics.roster_expiries += 1,
+                LeaseEvent::Fenced => entry.metrics.fencing_rejects += 1,
+                // Renew/revoke traffic and duplicate/stale observations
+                // carry no counter on their own; batch and serve notes
+                // account the outcomes.
+                _ => {}
+            }
+        }
+        // Refresh the status summary: stable roster plus this tick's
+        // applied view is unknown owner-side, so record the floor with a
+        // placeholder applied — plans overwrite it with the live applied
+        // position on every roster hit.
+        if let Some(stable) = engine.stable(now) {
+            let required = kivi_types::majority_of(engine.voters().len()).unwrap_or(0);
+            entry.metrics.roster = Some(RosterSummary {
+                generation: stable.roster.id.generation.as_u64(),
+                term: stable.roster.id.term.as_u64(),
+                responders: stable.roster.designated().len() as u64,
+                grants: stable.grants.len() as u64,
+                required,
+                floor: stable.floor,
+                applied: entry
+                    .metrics
+                    .roster
+                    .map_or(stable.floor, |summary| summary.applied),
+                quarantined: engine.quarantined(now),
+            });
+        } else {
+            entry.metrics.roster = None;
+        }
+        let remote: Vec<LeaseOutbound> = Self::drain_loopback(engine, outbound, local, now);
+        LeaseDriveOut::group(remote)
+    }
+
+    /// Drains loopback traffic (addressed to self) through the engine
+    /// directly, bounded: self-pairings converge in a fixed small number
+    /// of steps, and anything beyond the bound rides the next tick.
+    fn drain_loopback(
+        engine: &mut RosterEngine,
+        mut outbound: Vec<LeaseOutbound>,
+        local: NodeId,
+        now: Ticks,
+    ) -> Vec<LeaseOutbound> {
+        let mut remote = Vec::new();
+        for _ in 0..8 {
+            let mut pending = Vec::new();
+            for message in outbound {
+                if message.target == local {
+                    pending.push(message.message);
+                } else {
+                    remote.push(message);
+                }
+            }
+            if pending.is_empty() {
+                break;
+            }
+            outbound = Vec::new();
+            for message in pending {
+                let (replies, _) = engine.receive(message.sender(), message, now);
+                outbound.extend(replies);
+            }
+        }
+        remote
+    }
+
+    /// Feeds one inbound lease batch from `from` into the tablet's engine.
+    /// Unknown tablets, foreign providers, and missing engines ignore the
+    /// batch (never create state on inbound traffic). Returns grouped
+    /// replies for the owner to send back.
+    pub fn lease_receive(
+        &self,
+        tablet: TabletId,
+        from: NodeId,
+        messages: Vec<LeaseMessage>,
+        now: Ticks,
+    ) -> Vec<LeaseDriveOut> {
+        let Ok(mut tablets) = self.tablets.lock() else {
+            return Vec::new();
+        };
+        let Some(entry) = tablets.get_mut(&tablet) else {
+            return Vec::new();
+        };
+        if entry.provider != ReadAuthorityProvider::RosterLease || !self.lease_available {
+            return Vec::new();
+        }
+        let Some(engine) = entry.engine.as_mut() else {
+            return Vec::new();
+        };
+        // Defensive authority gate: engine checks per message anyway, but
+        // a batch for a retired lineage dies here without touching state.
+        if engine.authority() != entry.authority {
+            return Vec::new();
+        }
+        let local = self.local;
+        let mut outbound = Vec::new();
+        for message in messages {
+            let (replies, events) = engine.receive(from, message, now);
+            for event in events {
+                if matches!(event, LeaseEvent::Expired) {
+                    entry.metrics.roster_expiries += 1;
+                }
+            }
+            outbound.extend(replies);
+        }
+        let remote = Self::drain_loopback(engine, outbound, local, now);
+        LeaseDriveOut::group(remote)
+    }
+
+    /// Full fast-path evidence for one serve: a stable roster plus local
+    /// applied state covering its floor. `None` means "fall back" — never
+    /// "serve thin". The read path revalidates at serve time (after the
+    /// plan, before touching state), so a roster that destabilized in
+    /// between cannot authorize. `now` fail-closes every hold deadline:
+    /// pass the serve-time clock, never a stale one.
+    #[must_use]
+    pub fn evidence(
+        &self,
+        tablet: TabletId,
+        applied: CommitPosition,
+        now: Ticks,
+    ) -> Option<RosterEvidence> {
+        self.tablets
+            .lock()
+            .ok()?
+            .get(&tablet)?
+            .engine
+            .as_ref()?
+            .evidence(applied, now)
+    }
+
+    /// Outgoing pairings whose grantees may still serve local reads: a
+    /// successful strong write must cover every responder named here
+    /// before it may complete externally. Empty unless the roster backend
+    /// is engaged on this tablet. `now` fail-closes every exclusion
+    /// deadline: pass the completion-time clock, never a stale one.
+    #[must_use]
+    pub fn covered_grantees(
+        &self,
+        tablet: TabletId,
+        now: Ticks,
+    ) -> Vec<(NodeId, kivi_types::RosterId)> {
+        let Ok(tablets) = self.tablets.lock() else {
+            return Vec::new();
+        };
+        let Some(entry) = tablets.get(&tablet) else {
+            return Vec::new();
+        };
+        if entry.provider != ReadAuthorityProvider::RosterLease || !self.lease_available {
+            return Vec::new();
+        }
+        entry
+            .engine
+            .as_ref()
+            .map_or_else(Vec::new, |engine| engine.covered_grantees(now))
+    }
+
+    /// Remaining takeover-fence wait for `tablet`, if any: a leader that
+    /// sat out the previous term (or just created its engine) must wait
+    /// out forgotten old-term holds before completing writes externally.
+    /// Always bounded by the protocol-derived quarantine; `None` means no
+    /// wait is owed (fenced window passed, first boot, or backend
+    /// disengaged).
+    #[must_use]
+    pub fn takeover_hold(&self, tablet: TabletId, now: Ticks) -> Option<Duration> {
+        let tablets = self.tablets.lock().ok()?;
+        let entry = tablets.get(&tablet)?;
+        if entry.provider != ReadAuthorityProvider::RosterLease || !self.lease_available {
+            return None;
+        }
+        let until = entry.takeover_until?;
+        if now.as_micros() >= until.as_micros() {
+            return None;
+        }
+        Some(until.saturating_since(now))
+    }
+
+    /// Forces one live outgoing grant into revocation (coverage-timeout
+    /// fence). Returns grouped Revoke traffic for the owner to send. The
+    /// grantee stays covered until it answers or the exclusion lapses.
+    pub fn lease_revoke_peer(
+        &self,
+        tablet: TabletId,
+        peer: NodeId,
+        now: Ticks,
+    ) -> Vec<LeaseDriveOut> {
+        let Ok(mut tablets) = self.tablets.lock() else {
+            return Vec::new();
+        };
+        let Some(entry) = tablets.get_mut(&tablet) else {
+            return Vec::new();
+        };
+        let Some(engine) = entry.engine.as_mut() else {
+            return Vec::new();
+        };
+        LeaseDriveOut::group(engine.revoke_peer(peer, now))
+    }
+
+    /// Operator/debug explanation of what the next `Latest` read on
+    /// `tablet` would do and why: full evidence on the fast path, or the
+    /// exact missing piece on fallback. Never just "lease valid = true".
+    #[must_use]
+    pub fn explain_latest(&self, tablet: TabletId, applied: CommitPosition, now: Ticks) -> String {
+        let Ok(tablets) = self.tablets.lock() else {
+            return "hub lock poisoned: barrier".to_owned();
+        };
+        let Some(entry) = tablets.get(&tablet) else {
+            return "no tablet state: barrier".to_owned();
+        };
+        match entry.provider {
+            ReadAuthorityProvider::ConservativeLeader => {
+                "barrier: conservative provider".to_owned()
+            }
+            ReadAuthorityProvider::AlmostLocal => {
+                "lazy-alr batch: no timing assumption, fence orders past formation".to_owned()
+            }
+            ReadAuthorityProvider::RosterLease => {
+                if !self.lease_available {
+                    return "fallback to lazy-alr: drift contract untrusted".to_owned();
+                }
+                let Some(engine) = entry.engine.as_ref() else {
+                    return "fallback to lazy-alr: lease driver has not run yet".to_owned();
+                };
+                if engine.quarantined(now) {
+                    return format!(
+                        "fallback to lazy-alr: lease engine quarantined until {}",
+                        engine.quarantine_until()
+                    );
+                }
+                match engine.evidence(applied, now) {
+                    Some(proof) => proof.explain(),
+                    None => match engine.stable(now) {
+                        Some(stable) => format!(
+                            "fallback to lazy-alr: stable roster {} but applied {} below floor {}",
+                            stable.roster.id,
+                            applied.as_u64(),
+                            stable.floor.as_u64(),
+                        ),
+                        None => "fallback to lazy-alr: no stable roster (grants below majority, expired, or fenced)".to_owned(),
+                    },
+                }
+            }
+        }
     }
 
     /// Records one finished serve for the contract mix and path split.
@@ -833,24 +1281,60 @@ impl ConsistencyHub {
         }
     }
 
-    /// Records an Almost-Local fast path abandoned during execution (the
-    /// owner no longer believes it leads): the read falls back to a fresh
-    /// barrier.
-    pub fn note_almost_local_fallback(&self, tablet: TabletId) {
+    /// Records a finished Lazy-ALR batch: one fence (or subsumption)
+    /// covering `reads` reads.
+    pub fn note_alr_batch(&self, tablet: TabletId, reads: u64, subsumed: bool) {
         if let Ok(mut tablets) = self.tablets.lock()
             && let Some(entry) = tablets.get_mut(&tablet)
         {
-            entry.metrics.almost_local_fallbacks += 1;
+            entry.metrics.alr_batches += 1;
+            entry.metrics.alr_reads += reads;
+            if subsumed {
+                entry.metrics.alr_subsumed += 1;
+            } else {
+                entry.metrics.alr_syncs += 1;
+            }
         }
     }
 
-    /// Records a roster-lease fast path abandoned during execution
-    /// (coverage gap against the lease floor at serve time).
+    /// Records a Lazy-ALR batch abandoned to the conservative barrier
+    /// (sync unavailable, boundary timeout, lost leadership).
+    pub fn note_alr_fallback(&self, tablet: TabletId) {
+        if let Ok(mut tablets) = self.tablets.lock()
+            && let Some(entry) = tablets.get_mut(&tablet)
+        {
+            entry.metrics.alr_fallbacks += 1;
+        }
+    }
+
+    /// Records a roster-lease fast path abandoned during execution (the
+    /// serve-time revalidation found no evidence): the read falls back to
+    /// Lazy-ALR or the barrier, never to a thin serve.
     pub fn note_roster_fallback(&self, tablet: TabletId) {
         if let Ok(mut tablets) = self.tablets.lock()
             && let Some(entry) = tablets.get_mut(&tablet)
         {
             entry.metrics.roster_fallbacks += 1;
+        }
+    }
+
+    /// Records a strong write gated on explicit responder coverage.
+    pub fn note_coverage_wait(&self, tablet: TabletId) {
+        if let Ok(mut tablets) = self.tablets.lock()
+            && let Some(entry) = tablets.get_mut(&tablet)
+        {
+            entry.metrics.coverage_waits += 1;
+        }
+    }
+
+    /// Records a coverage gate that timed out: the write failed retryable
+    /// and the uncovered responder was fenced, instead of acknowledging an
+    /// uncovered write.
+    pub fn note_coverage_timeout(&self, tablet: TabletId) {
+        if let Ok(mut tablets) = self.tablets.lock()
+            && let Some(entry) = tablets.get_mut(&tablet)
+        {
+            entry.metrics.coverage_timeouts += 1;
         }
     }
 
@@ -871,7 +1355,7 @@ impl ConsistencyHub {
         if let Ok(mut tablets) = self.tablets.lock()
             && let Some(entry) = tablets.get_mut(&tablet)
         {
-            let held = entry.receipt.is_some() || entry.lease.is_some() || !entry.cache.is_empty();
+            let held = entry.receipt.is_some() || entry.engine.is_some() || !entry.cache.is_empty();
             entry.drop_evidence();
             return held;
         }
@@ -879,13 +1363,95 @@ impl ConsistencyHub {
     }
 
     /// Freezes this tablet's authority plus metrics for status surfaces.
+    /// `now` fail-closes the covered-responder gauge: expired exclusions
+    /// are not part of the write-gate set.
     #[must_use]
-    pub fn snapshot(&self, tablet: TabletId) -> Option<(TabletAuthority, ConsistencySnapshot)> {
+    pub fn snapshot(
+        &self,
+        tablet: TabletId,
+        now: Ticks,
+    ) -> Option<(TabletAuthority, ConsistencySnapshot)> {
         self.tablets.lock().ok().and_then(|tablets| {
-            tablets
-                .get(&tablet)
-                .map(|entry| (entry.authority, entry.metrics.snapshot()))
+            tablets.get(&tablet).map(|entry| {
+                let mut snapshot = entry.metrics.snapshot();
+                // Gauge, not a counter: refresh from live engine state on
+                // every snapshot so operators see the exact write-gate set.
+                snapshot.covered_responders = entry
+                    .engine
+                    .as_ref()
+                    .map_or(0, |engine| engine.covered_grantees(now).len() as u64);
+                (entry.authority, snapshot)
+            })
         })
+    }
+}
+
+/// Decides the takeover fence owed by this drive (`None` = no wait).
+/// A node that sat out the previous term — or created its engine
+/// mid-stream — cannot prove no forgotten responder still authorizes
+/// reads, so strong writes wait out the worst forgotten hold (bounded by
+/// `quarantine`). First boot is exempt (no forgotten holders can exist).
+/// A term rise with full old-roster coverage needs no fence: revocation
+/// preserves the exclusions the normal coverage gate already waits out.
+#[allow(clippy::too_many_arguments)]
+fn takeover_fence(
+    engine: Option<&RosterEngine>,
+    driven_term: Option<RosterTerm>,
+    term: RosterTerm,
+    authority: TabletAuthority,
+    local: NodeId,
+    incarnation: NodeIncarnation,
+    quarantine: Duration,
+    now: Ticks,
+) -> Option<Ticks> {
+    if incarnation == NodeIncarnation::INITIAL {
+        return None;
+    }
+    let Some(engine) = engine else {
+        return Some(now.advance_by(quarantine));
+    };
+    if driven_term.is_some_and(|driven| driven == term) {
+        return None;
+    }
+    let covered: Vec<NodeId> = engine
+        .covered_grantees(now)
+        .into_iter()
+        .map(|(peer, _)| peer)
+        .collect();
+    let mut designated: Vec<NodeId> = engine
+        .known_rosters()
+        .into_iter()
+        .filter(|roster| roster.id.authority == authority && roster.id.term != term)
+        .flat_map(|roster| roster.designated())
+        .collect();
+    designated.sort_by_key(|node| node.as_u64());
+    designated.dedup_by_key(|node| node.as_u64());
+    designated
+        .into_iter()
+        .any(|node| node != local && !covered.contains(&node))
+        .then(|| now.advance_by(quarantine))
+}
+
+/// Builds the status summary for full fast-path evidence: every number
+/// that made one local serve safe.
+fn summarize(
+    proof: &RosterEvidence,
+    engine: &RosterEngine,
+    applied: CommitPosition,
+) -> RosterSummary {
+    RosterSummary {
+        generation: proof.roster.generation.as_u64(),
+        term: proof.roster.term.as_u64(),
+        responders: engine
+            .roster_content(proof.roster)
+            .map_or(proof.grants.len() as u64, |roster| {
+                roster.designated().len() as u64
+            }),
+        grants: proof.grants.len() as u64,
+        required: proof.required,
+        floor: proof.safety_floor,
+        applied,
+        quarantined: false,
     }
 }
 
@@ -918,12 +1484,13 @@ mod tests {
     use super::*;
     use kivi_state::Key;
     use kivi_types::{
-        CommitPosition, ReadContract, Ticks, UnixMicros,
-        consistency::{AT_LEAST_WAIT_CAP, DEFAULT_PROOF_TTL},
+        CommitPosition, ReadContract, Ticks, UnixMicros, consistency::AT_LEAST_WAIT_CAP,
     };
     use std::time::Duration;
 
     const TABLET: TabletId = TabletId::from_u64(3);
+    const ELIGIBLE: LeaseEligibility = LeaseEligibility::Eligible;
+    const INELIGIBLE: LeaseEligibility = LeaseEligibility::ConservativeOnly;
 
     fn authority() -> TabletAuthority {
         use kivi_types::{TabletEpoch, WriteGuardGeneration};
@@ -974,18 +1541,79 @@ mod tests {
         }
     }
 
+    fn lease_params() -> LeaseParams {
+        LeaseParams {
+            guard_duration: Duration::from_millis(2_500),
+            lease_duration: Duration::from_millis(2_500),
+            renew_interval: Duration::from_millis(250),
+            max_drift_ppm: 1_000,
+        }
+    }
+
     fn hub() -> ConsistencyHub {
         ConsistencyHub::new(
             NodeId::from_u64(1),
             NodeIncarnation::from_u64(7),
             ReadAuthorityProvider::ConservativeLeader,
+            lease_params(),
+        )
+    }
+
+    fn lease_hub() -> ConsistencyHub {
+        ConsistencyHub::new(
+            NodeId::from_u64(1),
+            NodeIncarnation::from_u64(7),
+            ReadAuthorityProvider::RosterLease,
+            lease_params(),
+        )
+    }
+
+    /// Eligible point-read plan shorthand: the common test shape.
+    fn plan(hub: &ConsistencyHub, contract: ReadContract, applied: u64, ticks: u64) -> ReadPlan {
+        hub.plan(
+            TABLET,
+            &get_op(),
+            contract,
+            fresh(applied),
+            ctx(ticks),
+            ELIGIBLE,
+        )
+        .plan
+    }
+
+    /// Drives one hub's engine as the term leader of a single-voter
+    /// group at `now` with `accepted` appended and committed.
+    /// Single-voter loopback converges inside the drive, so one call
+    /// stabilizes.
+    fn drive_leader(
+        hub: &ConsistencyHub,
+        term: u64,
+        accepted: u64,
+        now: u64,
+    ) -> Vec<LeaseDriveOut> {
+        hub.lease_drive(
+            TABLET,
+            authority(),
+            RosterTerm::from_u64(term),
+            vec![NodeId::from_u64(1)],
+            true,
+            CommitPosition::from_u64(accepted),
+            CommitPosition::from_u64(accepted),
+            Ticks::from_micros(now),
         )
     }
 
     #[test]
     fn latest_always_barriers_under_the_conservative_mode() {
         let hub = hub();
-        let planned = hub.plan(TABLET, &get_op(), ReadContract::Latest, fresh(10), ctx(0));
+        let planned = hub.plan(
+            TABLET,
+            &get_op(),
+            ReadContract::Latest,
+            fresh(10),
+            ctx(0),
+            ELIGIBLE,
+        );
         assert_eq!(
             planned.plan,
             ReadPlan::BarrierThenServe { escalated: false }
@@ -996,15 +1624,8 @@ mod tests {
     #[test]
     fn at_least_covered_serves_without_leader_contact() {
         let hub = hub();
-        let planned = hub.plan(
-            TABLET,
-            &get_op(),
-            ReadContract::AtLeast(token(9)),
-            fresh(10),
-            ctx(0),
-        );
         assert_eq!(
-            planned.plan,
+            plan(&hub, ReadContract::AtLeast(token(9)), 10, 0),
             ReadPlan::ServeLocal {
                 path: ServePath::AtLeastCovered
             }
@@ -1014,15 +1635,11 @@ mod tests {
     #[test]
     fn at_least_behind_waits_with_the_log_index() {
         let hub = hub();
-        let planned = hub.plan(
-            TABLET,
-            &get_op(),
-            ReadContract::AtLeast(token(11)),
-            fresh(10),
-            ctx(0),
-        );
         // position 11 ⇔ Raft index 10.
-        assert_eq!(planned.plan, ReadPlan::WaitThenServe { index: 10 });
+        assert_eq!(
+            plan(&hub, ReadContract::AtLeast(token(11)), 10, 0),
+            ReadPlan::WaitThenServe { index: 10 }
+        );
     }
 
     #[test]
@@ -1040,6 +1657,7 @@ mod tests {
             ReadContract::AtLeast(foreign),
             fresh(10),
             ctx(0),
+            ELIGIBLE,
         );
         assert!(matches!(planned.plan, ReadPlan::Reject { .. }));
         // A token from a superseded epoch rejects too, even when its
@@ -1055,6 +1673,7 @@ mod tests {
             ReadContract::AtLeast(old_epoch),
             fresh(10),
             ctx(0),
+            ELIGIBLE,
         );
         assert!(matches!(planned.plan, ReadPlan::Reject { .. }));
     }
@@ -1063,16 +1682,17 @@ mod tests {
     fn bounded_stale_without_evidence_escalates_never_serves_weak() {
         let hub = hub();
         // No receipt held: must escalate, never ServeLocal.
-        let planned = hub.plan(
-            TABLET,
-            &get_op(),
-            ReadContract::BoundedStale {
-                max_staleness: Duration::from_secs(60),
-            },
-            fresh(10),
-            ctx(0),
+        assert_eq!(
+            plan(
+                &hub,
+                ReadContract::BoundedStale {
+                    max_staleness: Duration::from_secs(60),
+                },
+                10,
+                0,
+            ),
+            ReadPlan::BarrierThenServe { escalated: true }
         );
-        assert_eq!(planned.plan, ReadPlan::BarrierThenServe { escalated: true });
     }
 
     #[test]
@@ -1095,6 +1715,7 @@ mod tests {
             },
             fresh(10),
             ctx(50_000),
+            ELIGIBLE,
         );
         assert_eq!(
             planned.plan,
@@ -1111,12 +1732,13 @@ mod tests {
             },
             fresh(10),
             ctx(100_001),
+            ELIGIBLE,
         );
         assert_eq!(planned.plan, ReadPlan::BarrierThenServe { escalated: true });
     }
 
     #[test]
-    fn authority_movement_drops_receipts_leases_and_cache() {
+    fn authority_movement_drops_receipts_engines_and_cache() {
         let hub = hub();
         hub.note_barrier(
             TABLET,
@@ -1136,7 +1758,14 @@ mod tests {
             None,
         );
         // Same authority: Any replays from cache.
-        let planned = hub.plan(TABLET, &get_op(), ReadContract::Any, fresh(10), ctx(0));
+        let planned = hub.plan(
+            TABLET,
+            &get_op(),
+            ReadContract::Any,
+            fresh(10),
+            ctx(0),
+            ELIGIBLE,
+        );
         assert_eq!(
             planned.plan,
             ReadPlan::ServeLocal {
@@ -1158,9 +1787,17 @@ mod tests {
             },
             moved,
             ctx(1),
+            ELIGIBLE,
         );
         assert_eq!(planned.plan, ReadPlan::BarrierThenServe { escalated: true });
-        let planned = hub.plan(TABLET, &get_op(), ReadContract::Any, moved, ctx(1));
+        let planned = hub.plan(
+            TABLET,
+            &get_op(),
+            ReadContract::Any,
+            moved,
+            ctx(1),
+            ELIGIBLE,
+        );
         assert_eq!(
             planned.plan,
             ReadPlan::ServeLocal {
@@ -1187,6 +1824,7 @@ mod tests {
             ReadContract::AtLeast(token(9)),
             fresh(10),
             ctx(0),
+            ELIGIBLE,
         );
         assert_eq!(
             planned.plan,
@@ -1206,6 +1844,7 @@ mod tests {
             ReadContract::AtLeast(token(10)),
             fresh(10),
             ctx(0),
+            ELIGIBLE,
         );
         assert_eq!(
             planned.plan,
@@ -1214,7 +1853,14 @@ mod tests {
             }
         );
         // Latest never replays cache under the conservative mode.
-        let planned = hub.plan(TABLET, &get_op(), ReadContract::Latest, fresh(10), ctx(0));
+        let planned = hub.plan(
+            TABLET,
+            &get_op(),
+            ReadContract::Latest,
+            fresh(10),
+            ctx(0),
+            ELIGIBLE,
+        );
         assert_eq!(
             planned.plan,
             ReadPlan::BarrierThenServe { escalated: false }
@@ -1228,6 +1874,7 @@ mod tests {
             },
             fresh(10),
             ctx(0),
+            ELIGIBLE,
         );
         assert_eq!(planned.plan, ReadPlan::BarrierThenServe { escalated: true });
     }
@@ -1257,6 +1904,7 @@ mod tests {
             },
             fresh(10),
             ctx(50_000),
+            ELIGIBLE,
         );
         assert_eq!(
             planned.plan,
@@ -1283,7 +1931,14 @@ mod tests {
             CommitPosition::from_u64(9),
             None,
         );
-        let planned = hub.plan(TABLET, &get_op(), ReadContract::Any, fresh(10), ctx(0));
+        let planned = hub.plan(
+            TABLET,
+            &get_op(),
+            ReadContract::Any,
+            fresh(10),
+            ctx(0),
+            ELIGIBLE,
+        );
         assert_eq!(
             planned.plan,
             ReadPlan::ServeLocal {
@@ -1293,19 +1948,20 @@ mod tests {
     }
 
     #[test]
-    fn almost_local_serves_on_fresh_proof_and_falls_back_otherwise() {
+    fn almost_local_plans_lazy_alr_batches_without_timing() {
         let hub = ConsistencyHub::new(
             NodeId::from_u64(1),
             NodeIncarnation::from_u64(7),
-            ReadAuthorityProvider::AlmostLocal {
-                max_proof_age: Duration::from_millis(50),
-            },
+            ReadAuthorityProvider::AlmostLocal,
+            lease_params(),
         );
-        // No receipt yet: fall back to the barrier.
-        let planned = hub.plan(TABLET, &get_op(), ReadContract::Latest, fresh(10), ctx(0));
+        // Every Latest read joins the Lazy-ALR batch: no receipt, no
+        // barrier, no clock bound consulted — the fence orders the batch.
+        // A fresh barrier receipt changes nothing: ALR never consults
+        // receipt age (the old timing-based pseudo path is gone).
         assert_eq!(
-            planned.plan,
-            ReadPlan::BarrierThenServe { escalated: false }
+            plan(&hub, ReadContract::Latest, 10, 0),
+            ReadPlan::AlrThenServe
         );
         hub.note_barrier(
             TABLET,
@@ -1316,139 +1972,243 @@ mod tests {
                 NodeIncarnation::from_u64(7),
             ),
         );
-        // Fresh proof: serve without a new barrier.
-        let planned = hub.plan(
-            TABLET,
-            &get_op(),
-            ReadContract::Latest,
-            fresh(10),
-            ctx(49_999),
-        );
         assert_eq!(
-            planned.plan,
+            plan(&hub, ReadContract::Latest, 10, 10_000_000),
+            ReadPlan::AlrThenServe
+        );
+        // An aged receipt still serves BoundedStale while fresh; ALR and
+        // bounded-stale evidence stay independent mechanisms.
+        assert_eq!(
+            plan(
+                &hub,
+                ReadContract::BoundedStale {
+                    max_staleness: Duration::from_secs(60),
+                },
+                10,
+                10_000_000,
+            ),
             ReadPlan::ServeLocal {
-                path: ServePath::AlmostLocalProof
+                path: ServePath::BoundedStaleProof
             }
-        );
-        // Aged proof, lagging replica, moved authority: all fall back.
-        let planned = hub.plan(
-            TABLET,
-            &get_op(),
-            ReadContract::Latest,
-            fresh(10),
-            ctx(50_001),
-        );
-        assert_eq!(
-            planned.plan,
-            ReadPlan::BarrierThenServe { escalated: false }
-        );
-        let planned = hub.plan(
-            TABLET,
-            &get_op(),
-            ReadContract::Latest,
-            fresh(9),
-            ctx(10_000),
-        );
-        assert_eq!(
-            planned.plan,
-            ReadPlan::BarrierThenServe { escalated: false }
         );
     }
 
     #[test]
-    fn roster_lease_serves_members_and_rejects_everyone_else() {
-        use kivi_types::TabletEpoch;
-        let hub = ConsistencyHub::new(
-            NodeId::from_u64(1),
-            NodeIncarnation::from_u64(7),
-            ReadAuthorityProvider::RosterLease,
-        );
-        // No lease: fall back.
-        let planned = hub.plan(TABLET, &get_op(), ReadContract::Latest, fresh(10), ctx(0));
+    #[allow(clippy::too_many_lines)]
+    fn roster_lease_serves_on_engine_evidence_and_falls_back_otherwise() {
+        let hub = lease_hub();
+        // Cold engine (driver has not run): no evidence, ALR fallback —
+        // never a barrier skip, never a thin serve.
         assert_eq!(
-            planned.plan,
-            ReadPlan::BarrierThenServe { escalated: false }
+            plan(&hub, ReadContract::Latest, 10, 0),
+            ReadPlan::AlrThenServe
         );
-        let lease = RosterLease::new(
-            authority(),
-            1,
-            vec![NodeId::from_u64(1)],
-            CommitPosition::from_u64(9),
-            Ticks::from_micros(100_000),
-            NodeIncarnation::from_u64(7),
-        );
-        assert!(hub.grant_lease(TABLET, lease));
-        // Member with coverage serves the fast path.
-        let planned = hub.plan(
-            TABLET,
-            &get_op(),
-            ReadContract::Latest,
-            fresh(10),
-            ctx(50_000),
-        );
+        // Drive as leader past the restart quarantine: single-voter
+        // loopback converges inside the drive, floor 41.
+        let quarantine = lease_params().quarantine();
+        let awakened = u64::try_from(quarantine.as_micros())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        let out = drive_leader(&hub, 5, 41, 0);
+        assert!(out.is_empty(), "loopback drains inside the drive");
+        // Still quarantined (engine was created at t=0): no evidence.
         assert_eq!(
-            planned.plan,
+            plan(&hub, ReadContract::Latest, 41, 1_000),
+            ReadPlan::AlrThenServe
+        );
+        assert!(
+            hub.explain_latest(
+                TABLET,
+                CommitPosition::from_u64(41),
+                Ticks::from_micros(1_000)
+            )
+            .contains("quarantined"),
+            "explain names the fence"
+        );
+        // Past the quarantine the same drive announces and stabilizes.
+        let out = drive_leader(&hub, 5, 41, awakened);
+        assert!(out.is_empty(), "single voter needs no network");
+        assert_eq!(
+            plan(&hub, ReadContract::Latest, 41, awakened + 1),
             ReadPlan::ServeLocal {
                 path: ServePath::RosterLease
             }
         );
-        // Behind the lease floor: fall back (never serve thin state).
-        let planned = hub.plan(
-            TABLET,
-            &get_op(),
-            ReadContract::Latest,
-            fresh(8),
-            ctx(50_000),
-        );
-        assert_eq!(
-            planned.plan,
-            ReadPlan::BarrierThenServe { escalated: false }
-        );
-        // Past expiry: fall back.
-        let planned = hub.plan(
-            TABLET,
-            &get_op(),
-            ReadContract::Latest,
-            fresh(10),
-            ctx(100_000),
-        );
-        assert_eq!(
-            planned.plan,
-            ReadPlan::BarrierThenServe { escalated: false }
-        );
-        // Renewal by generation; delayed duplicates die.
-        let stale = RosterLease::new(
-            authority(),
-            1,
-            vec![NodeId::from_u64(1)],
-            CommitPosition::from_u64(9),
-            Ticks::from_micros(200_000),
-            NodeIncarnation::from_u64(7),
-        );
-        assert!(!hub.grant_lease(TABLET, stale));
-        let renewed = RosterLease::new(
-            authority(),
-            2,
-            vec![NodeId::from_u64(1), NodeId::from_u64(2)],
-            CommitPosition::from_u64(10),
-            Ticks::from_micros(200_000),
-            NodeIncarnation::from_u64(7),
-        );
-        assert!(hub.grant_lease(TABLET, renewed));
-        // A lease for a foreign authority is refused, never installed.
-        let foreign = RosterLease::new(
-            TabletAuthority::new(
+        // Serve-time evidence revalidates: the proof carries the floor.
+        let proof = hub
+            .evidence(
                 TABLET,
-                TabletEpoch::from_u64(2),
-                kivi_types::WriteGuardGeneration::from_u64(1),
-            ),
-            3,
+                CommitPosition::from_u64(41),
+                Ticks::from_micros(awakened + 1),
+            )
+            .expect("evidence");
+        assert_eq!(proof.safety_floor, CommitPosition::from_u64(41));
+        assert!(
+            hub.explain_latest(
+                TABLET,
+                CommitPosition::from_u64(41),
+                Ticks::from_micros(awakened + 1)
+            )
+            .contains("grants=1/1")
+        );
+        // Behind the floor: hold-classified ALR fallback, never a serve.
+        assert_eq!(
+            plan(&hub, ReadContract::Latest, 40, awakened + 1),
+            ReadPlan::AlrThenServe
+        );
+        assert!(
+            hub.evidence(
+                TABLET,
+                CommitPosition::from_u64(40),
+                Ticks::from_micros(awakened + 1)
+            )
+            .is_none()
+        );
+        let (_, snapshot) = hub
+            .snapshot(TABLET, Ticks::from_micros(awakened + 1))
+            .expect("snapshot");
+        assert_eq!(snapshot.roster_hits, 1);
+        assert_eq!(snapshot.roster_holds, 1);
+        assert!(
+            snapshot.roster_fallbacks >= 2,
+            "cold + quarantined fall back"
+        );
+        // A term rise (new election) voids the old roster: the first drive
+        // revokes it (the replacement Guard waits out the live exclusion,
+        // per the no-overwrite rule); the second drive grants the
+        // replacement, and single-voter loopback stabilizes it at once —
+        // so evidence exists again, but under the NEW term (no stale
+        // authority ever serves).
+        let _ = drive_leader(&hub, 6, 41, awakened + 2);
+        assert!(
+            hub.evidence(
+                TABLET,
+                CommitPosition::from_u64(41),
+                Ticks::from_micros(awakened + 2)
+            )
+            .is_none()
+        );
+        let _ = drive_leader(&hub, 6, 41, awakened + 3);
+        let proof = hub
+            .evidence(
+                TABLET,
+                CommitPosition::from_u64(41),
+                Ticks::from_micros(awakened + 3),
+            )
+            .expect("new-term evidence");
+        assert_eq!(proof.roster.term.as_u64(), 6);
+        // A term the local node does not lead (and hears nothing for)
+        // forms no replacement: the old evidence is void and the read
+        // plans ALR, never stale.
+        let _ = hub.lease_drive(
+            TABLET,
+            authority(),
+            RosterTerm::from_u64(7),
             vec![NodeId::from_u64(1)],
-            CommitPosition::from_u64(10),
-            Ticks::from_micros(300_000),
+            false,
+            CommitPosition::from_u64(41),
+            CommitPosition::from_u64(41),
+            Ticks::from_micros(awakened + 4),
+        );
+        assert!(
+            hub.evidence(
+                TABLET,
+                CommitPosition::from_u64(41),
+                Ticks::from_micros(awakened + 4)
+            )
+            .is_none()
+        );
+        assert_eq!(
+            plan(&hub, ReadContract::Latest, 41, awakened + 5),
+            ReadPlan::AlrThenServe
+        );
+        // Authority movement drops the engine outright.
+        let moved = ReplicaFreshness::new(
+            moved_authority(),
+            CommitPosition::from_u64(41),
             NodeIncarnation::from_u64(7),
         );
-        assert!(!hub.grant_lease(TABLET, foreign));
+        let planned = hub.plan(
+            TABLET,
+            &get_op(),
+            ReadContract::Latest,
+            moved,
+            ctx(awakened + 3),
+            ELIGIBLE,
+        );
+        assert_eq!(planned.plan, ReadPlan::AlrThenServe);
+    }
+
+    #[test]
+    fn roster_path_respects_eligibility_and_drift_contract() {
+        // Lease-ineligible reads (transactions, batches, scans) skip the
+        // roster even with full evidence: same Latest semantics via ALR.
+        let hub = lease_hub();
+        let quarantine = lease_params().quarantine();
+        let awakened = u64::try_from(quarantine.as_micros())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        let _ = drive_leader(&hub, 5, 41, 0);
+        let _ = drive_leader(&hub, 5, 41, awakened);
+        assert_eq!(
+            plan(&hub, ReadContract::Latest, 41, awakened + 1),
+            ReadPlan::ServeLocal {
+                path: ServePath::RosterLease
+            }
+        );
+        let planned = hub.plan(
+            TABLET,
+            &get_op(),
+            ReadContract::Latest,
+            fresh(41),
+            ctx(awakened + 1),
+            INELIGIBLE,
+        );
+        assert_eq!(planned.plan, ReadPlan::AlrThenServe);
+        // An untrusted drift contract disables the backend hub-wide:
+        // every Latest read plans ALR, never a local serve.
+        let untrusted = LeaseParams {
+            max_drift_ppm: kivi_types::roster::MAX_DRIFT_PPM + 1,
+            ..lease_params()
+        };
+        assert!(untrusted.validate().is_err());
+        let dark = ConsistencyHub::new(
+            NodeId::from_u64(1),
+            NodeIncarnation::from_u64(7),
+            ReadAuthorityProvider::RosterLease,
+            untrusted,
+        );
+        assert!(!dark.lease_available());
+        let _ = dark.lease_drive(
+            TABLET,
+            authority(),
+            RosterTerm::from_u64(5),
+            vec![NodeId::from_u64(1)],
+            true,
+            CommitPosition::from_u64(41),
+            CommitPosition::from_u64(41),
+            Ticks::from_micros(99_000_000),
+        );
+        assert_eq!(
+            dark.plan(
+                TABLET,
+                &get_op(),
+                ReadContract::Latest,
+                fresh(41),
+                ctx(99_000_001),
+                ELIGIBLE,
+            )
+            .plan,
+            ReadPlan::AlrThenServe
+        );
+        assert!(
+            dark.explain_latest(
+                TABLET,
+                CommitPosition::from_u64(41),
+                Ticks::from_micros(99_000_001)
+            )
+            .contains("drift contract untrusted")
+        );
     }
 
     #[test]
@@ -1492,6 +2252,7 @@ mod tests {
             },
             fresh(10),
             ctx(10_000),
+            ELIGIBLE,
         );
         let _ = hub.plan(
             TABLET,
@@ -1501,18 +2262,20 @@ mod tests {
             },
             fresh(10),
             ctx(10_000),
+            ELIGIBLE,
         );
         hub.note_served(TABLET, ReadContract::Latest, true);
         hub.note_served(TABLET, ReadContract::Any, false);
-        let (_, snapshot) = hub.snapshot(TABLET).expect("snapshot");
+        let (_, snapshot) = hub
+            .snapshot(TABLET, Ticks::from_micros(10_000))
+            .expect("snapshot");
         assert_eq!(snapshot.bounded_stale_hits, 1);
         assert_eq!(snapshot.bounded_stale_escalations, 1);
         assert_eq!(snapshot.reads_by_contract, (1, 0, 0, 1));
         assert_eq!(snapshot.local_serves, 1);
         assert_eq!(snapshot.authority_serves, 1);
-        // Unused imports stay honest: the proof TTL and wait cap bound
-        // the plans above (100ms < TTL < wait cap ordering is sane).
-        assert!(DEFAULT_PROOF_TTL > Duration::from_millis(100));
+        // The wait cap still bounds AtLeast waits (proof TTL concept is
+        // gone with the timing-based fast path; bounds ride receipts).
         assert!(AT_LEAST_WAIT_CAP >= Duration::from_secs(1));
     }
 
@@ -1522,12 +2285,245 @@ mod tests {
         // Poisoning a mutex guard panics, which the test harness would
         // catch as a failure rather than hub behavior, so this pins the
         // healthy arm: the fail-closed arm above is structural.
-        let planned = hub.plan(TABLET, &get_op(), ReadContract::Any, fresh(10), ctx(0));
+        let planned = hub.plan(
+            TABLET,
+            &get_op(),
+            ReadContract::Any,
+            fresh(10),
+            ctx(0),
+            ELIGIBLE,
+        );
         assert_eq!(
             planned.plan,
             ReadPlan::ServeLocal {
                 path: ServePath::AnyLocal
             }
+        );
+    }
+
+    /// Old roster, partitioned leader, new term, successor write, old
+    /// responder read — the mandatory fencing scenario, fully
+    /// deterministic across three hub engines with virtual time:
+    ///
+    /// ```text
+    /// term-5 roster stable everywhere; node 3 partitions;
+    /// term rises (leader 2); old grants revoke (fast path), the Revoke
+    /// to node 3 is lost; the successor write must NOT complete while
+    /// node 3 is still covered (the gate would fail its poll); node 3's
+    /// holds lapse without traffic, so its read falls back — never stale;
+    /// once the exclusion lapses the gate clears; a restarted node 3
+    /// owes the takeover fence before completing anything.
+    /// ```
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn partition_old_responder_falls_back_never_stale() {
+        use std::collections::BTreeMap;
+
+        fn voters3() -> Vec<NodeId> {
+            vec![
+                NodeId::from_u64(1),
+                NodeId::from_u64(2),
+                NodeId::from_u64(3),
+            ]
+        }
+
+        fn mesh(
+            hubs: &BTreeMap<NodeId, ConsistencyHub>,
+            term_of: impl Fn(NodeId) -> u64,
+            leader: u64,
+            applied_of: impl Fn(NodeId) -> u64,
+            now: u64,
+            skip: &[(NodeId, NodeId)],
+        ) {
+            // Exchange until quiet (bounded: healthy activation
+            // converges in a fixed small number of rounds). Each round
+            // drives every hub and delivers all pending traffic plus the
+            // previous round's piggybacked replies.
+            let mut pending: Vec<(NodeId, LeaseDriveOut)> = Vec::new();
+            for _ in 0..12 {
+                for (id, hub) in hubs {
+                    let applied = applied_of(*id);
+                    let out = hub.lease_drive(
+                        TABLET,
+                        authority(),
+                        RosterTerm::from_u64(term_of(*id)),
+                        voters3(),
+                        *id == NodeId::from_u64(leader),
+                        CommitPosition::from_u64(applied),
+                        CommitPosition::from_u64(applied),
+                        Ticks::from_micros(now),
+                    );
+                    for batch in out {
+                        pending.push((*id, batch));
+                    }
+                }
+                if pending.iter().all(|(_, batch)| batch.messages.is_empty()) {
+                    break;
+                }
+                let mut next = Vec::new();
+                for (from, batch) in std::mem::take(&mut pending) {
+                    if batch.messages.is_empty()
+                        || skip.contains(&(from, batch.target))
+                        || skip.contains(&(batch.target, from))
+                    {
+                        continue;
+                    }
+                    for reply in hubs[&batch.target].lease_receive(
+                        TABLET,
+                        from,
+                        batch.messages,
+                        Ticks::from_micros(now),
+                    ) {
+                        next.push((batch.target, reply));
+                    }
+                }
+                pending = next;
+            }
+        }
+
+        let mut hubs = BTreeMap::new();
+        for node in [1u64, 2, 3] {
+            hubs.insert(
+                NodeId::from_u64(node),
+                ConsistencyHub::new(
+                    NodeId::from_u64(node),
+                    NodeIncarnation::from_u64(7),
+                    ReadAuthorityProvider::RosterLease,
+                    lease_params(),
+                ),
+            );
+        }
+        // Term 5, leader 1: create (quarantined), then activate past the
+        // restart fence. All three hold a stable roster at applied 10.
+        mesh(&hubs, |_| 5, 1, |_| 10, 0, &[]);
+        mesh(&hubs, |_| 5, 1, |_| 10, 6_000_000, &[]);
+        for node in [1u64, 2, 3] {
+            assert!(
+                hubs[&NodeId::from_u64(node)]
+                    .evidence(
+                        TABLET,
+                        CommitPosition::from_u64(10),
+                        Ticks::from_micros(6_000_000)
+                    )
+                    .is_some(),
+                "node {node} stable under term 5"
+            );
+        }
+        // Node 3 partitions: it keeps observing term 5 (no election news
+        // cross a partition), while 1 and 2 rise to term 6 under leader 2.
+        // Old outgoing grants revoke on 1 and 2, but the Revoke to 3 is
+        // lost. The successor write reaches applied 42 on 1 and 2; node 3
+        // never sees it.
+        let three = NodeId::from_u64(3);
+        let cut = [
+            (NodeId::from_u64(1), three),
+            (NodeId::from_u64(2), three),
+            (three, NodeId::from_u64(1)),
+            (three, NodeId::from_u64(2)),
+        ];
+        mesh(
+            &hubs,
+            |id| if id == three { 5 } else { 6 },
+            2,
+            |_| 10,
+            6_100_000,
+            &cut,
+        );
+        // The new leader still covers node 3 (revoking exclusion): a
+        // successor write at 42 must not complete past it.
+        let covered: Vec<u64> = hubs[&NodeId::from_u64(2)]
+            .covered_grantees(TABLET, Ticks::from_micros(6_100_000))
+            .into_iter()
+            .map(|(peer, _)| peer.as_u64())
+            .collect();
+        assert!(
+            covered.contains(&3),
+            "old responder stays covered until revoked-or-lapsed, got {covered:?}"
+        );
+        // Node 3 still holds its term-5 roster (unexpired): it would serve
+        // 41 — legal, because 42 has not (and cannot yet) complete.
+        assert!(
+            hubs[&NodeId::from_u64(3)]
+                .evidence(
+                    TABLET,
+                    CommitPosition::from_u64(10),
+                    Ticks::from_micros(6_100_000)
+                )
+                .is_some(),
+            "unexpired old hold still authorizes pre-write state"
+        );
+        // Silence lapses node 3's holds: its read plans ALR fallback,
+        // never a stale success.
+        mesh(
+            &hubs,
+            |id| if id == three { 5 } else { 6 },
+            2,
+            |id| if id == three { 10 } else { 42 },
+            9_000_000,
+            &cut,
+        );
+        assert!(
+            hubs[&NodeId::from_u64(3)]
+                .evidence(
+                    TABLET,
+                    CommitPosition::from_u64(41),
+                    Ticks::from_micros(9_000_000)
+                )
+                .is_none(),
+            "partitioned responder loses evidence at its hold"
+        );
+        assert_eq!(
+            hubs[&NodeId::from_u64(3)]
+                .plan(
+                    TABLET,
+                    &get_op(),
+                    ReadContract::Latest,
+                    ReplicaFreshness::new(
+                        authority(),
+                        CommitPosition::from_u64(41),
+                        NodeIncarnation::from_u64(7),
+                    ),
+                    ctx(9_000_001),
+                    ELIGIBLE,
+                )
+                .plan,
+            ReadPlan::AlrThenServe
+        );
+        // The exclusion lapsed with it: the gate clears node 3 and the
+        // successor write may proceed.
+        let covered: Vec<u64> = hubs[&NodeId::from_u64(2)]
+            .covered_grantees(TABLET, Ticks::from_micros(9_000_000))
+            .into_iter()
+            .map(|(peer, _)| peer.as_u64())
+            .collect();
+        assert!(
+            !covered.contains(&3),
+            "lapsed exclusion leaves the covered set, got {covered:?}"
+        );
+        // Restarted node 3 (new incarnation, fresh hub) owes the takeover
+        // fence before completing anything, even with live peers.
+        hubs.insert(
+            NodeId::from_u64(3),
+            ConsistencyHub::new(
+                NodeId::from_u64(3),
+                NodeIncarnation::from_u64(8),
+                ReadAuthorityProvider::RosterLease,
+                lease_params(),
+            ),
+        );
+        mesh(&hubs, |_| 6, 2, |_| 42, 9_000_001, &[]);
+        assert!(
+            hubs[&NodeId::from_u64(3)]
+                .takeover_hold(TABLET, Ticks::from_micros(9_000_001))
+                .is_some(),
+            "restarted node waits out forgotten authority"
+        );
+        let fence = u64::try_from(lease_params().quarantine().as_micros()).unwrap_or(u64::MAX);
+        assert!(
+            hubs[&NodeId::from_u64(3)]
+                .takeover_hold(TABLET, Ticks::from_micros(9_000_001 + fence))
+                .is_none(),
+            "fence is bounded by the quarantine"
         );
     }
 
@@ -1556,23 +2552,22 @@ mod tests {
         let stale = || ReadContract::BoundedStale {
             max_staleness: bound,
         };
+        // Eligible point-read shorthand for this scenario's tablet.
+        let plan_here =
+            |hub: &ConsistencyHub, contract: ReadContract, f: ReplicaFreshness, t: u64| {
+                hub.plan(TABLET, &get_op(), contract, f, ctx(t), ELIGIBLE)
+                    .plan
+            };
 
         // 1. Cold replica: no evidence anywhere. BoundedStale escalates
         // (never ServeLocal), AtLeast-behind waits, AtLeast-foreign
         // rejects, Any serves with no claim.
         assert_eq!(
-            hub.plan(TABLET, &get_op(), stale(), fresh(10), ctx(0)).plan,
+            plan_here(&hub, stale(), fresh(10), 0),
             ReadPlan::BarrierThenServe { escalated: true }
         );
         assert_eq!(
-            hub.plan(
-                TABLET,
-                &get_op(),
-                ReadContract::AtLeast(token(11)),
-                fresh(10),
-                ctx(0)
-            )
-            .plan,
+            plan_here(&hub, ReadContract::AtLeast(token(11)), fresh(10), 0),
             ReadPlan::WaitThenServe { index: 10 }
         );
         let foreign = kivi_types::CommitToken::new(
@@ -1581,14 +2576,7 @@ mod tests {
             CommitPosition::from_u64(1),
         );
         assert!(matches!(
-            hub.plan(
-                TABLET,
-                &get_op(),
-                ReadContract::AtLeast(foreign),
-                fresh(10),
-                ctx(0)
-            )
-            .plan,
+            plan_here(&hub, ReadContract::AtLeast(foreign), fresh(10), 0),
             ReadPlan::Reject { .. }
         ));
 
@@ -1604,21 +2592,13 @@ mod tests {
             ),
         );
         assert_eq!(
-            hub.plan(TABLET, &get_op(), stale(), fresh(10), ctx(99_999))
-                .plan,
+            plan_here(&hub, stale(), fresh(10), 99_999),
             ReadPlan::ServeLocal {
                 path: ServePath::BoundedStaleProof
             }
         );
         assert_eq!(
-            hub.plan(
-                TABLET,
-                &get_op(),
-                ReadContract::AtLeast(token(10)),
-                fresh(10),
-                ctx(99_999)
-            )
-            .plan,
+            plan_here(&hub, ReadContract::AtLeast(token(10)), fresh(10), 99_999),
             ReadPlan::ServeLocal {
                 path: ServePath::AtLeastCovered
             }
@@ -1636,8 +2616,7 @@ mod tests {
             ),
         );
         assert_eq!(
-            hub.plan(TABLET, &get_op(), stale(), fresh(10), ctx(99_999))
-                .plan,
+            plan_here(&hub, stale(), fresh(10), 99_999),
             ReadPlan::ServeLocal {
                 path: ServePath::BoundedStaleProof
             }
@@ -1665,15 +2644,13 @@ mod tests {
         );
         // Proven at 500ms: fresh at 550ms, stale at 650ms.
         assert_eq!(
-            hub.plan(TABLET, &get_op(), stale(), fresh(10), ctx(550_000))
-                .plan,
+            plan_here(&hub, stale(), fresh(10), 550_000),
             ReadPlan::ServeLocal {
                 path: ServePath::BoundedStaleProof
             }
         );
         assert_eq!(
-            hub.plan(TABLET, &get_op(), stale(), fresh(10), ctx(650_000))
-                .plan,
+            plan_here(&hub, stale(), fresh(10), 650_000),
             ReadPlan::BarrierThenServe { escalated: true }
         );
 
@@ -1682,12 +2659,13 @@ mod tests {
         // (authority unreachable, modeled by the caller) counts unprovable
         // instead of serving weak data.
         assert_eq!(
-            hub.plan(TABLET, &get_op(), stale(), fresh(10), ctx(5_000_000))
-                .plan,
+            plan_here(&hub, stale(), fresh(10), 5_000_000),
             ReadPlan::BarrierThenServe { escalated: true }
         );
         hub.note_escalation_failed(TABLET);
-        let (_, snapshot) = hub.snapshot(TABLET).expect("snapshot");
+        let (_, snapshot) = hub
+            .snapshot(TABLET, Ticks::from_micros(5_000_000))
+            .expect("snapshot");
         assert_eq!(snapshot.freshness_unprovable, 1);
         assert!(snapshot.bounded_stale_escalations >= 3);
 
@@ -1697,11 +2675,10 @@ mod tests {
             NodeId::from_u64(1),
             NodeIncarnation::from_u64(7),
             ReadAuthorityProvider::ConservativeLeader,
+            lease_params(),
         );
         assert_eq!(
-            restarted
-                .plan(TABLET, &get_op(), stale(), fresh(10), ctx(550_000))
-                .plan,
+            plan_here(&restarted, stale(), fresh(10), 550_000),
             ReadPlan::BarrierThenServe { escalated: true }
         );
 
@@ -1713,8 +2690,7 @@ mod tests {
             NodeIncarnation::from_u64(7),
         );
         assert_eq!(
-            hub.plan(TABLET, &get_op(), stale(), moved, ctx(500_001))
-                .plan,
+            plan_here(&hub, stale(), moved, 500_001),
             ReadPlan::BarrierThenServe { escalated: true }
         );
         let old_lineage = kivi_types::CommitToken::new(
@@ -1723,14 +2699,7 @@ mod tests {
             CommitPosition::from_u64(5),
         );
         assert!(matches!(
-            hub.plan(
-                TABLET,
-                &get_op(),
-                ReadContract::AtLeast(old_lineage),
-                moved,
-                ctx(500_001)
-            )
-            .plan,
+            plan_here(&hub, ReadContract::AtLeast(old_lineage), moved, 500_001),
             ReadPlan::Reject { .. }
         ));
 
@@ -1758,103 +2727,97 @@ mod tests {
             ),
         );
         assert_eq!(
-            hub.plan(TABLET, &get_op(), stale(), guarded_fresh, ctx(9_000_001))
-                .plan,
+            plan_here(&hub, stale(), guarded_fresh, 9_000_001),
             ReadPlan::BarrierThenServe { escalated: true }
         );
 
-        // 9. Lease bounds are strict at every edge: member + coverage +
-        // authority + incarnation + `now < expires_at`.
-        let leased = ConsistencyHub::new(
-            NodeId::from_u64(1),
-            NodeIncarnation::from_u64(7),
-            ReadAuthorityProvider::RosterLease,
-        );
-        let lease = RosterLease::new(
-            authority(),
-            1,
-            vec![NodeId::from_u64(1)],
-            CommitPosition::from_u64(10),
-            Ticks::from_micros(1_000_000),
-            NodeIncarnation::from_u64(7),
-        );
-        assert!(leased.grant_lease(TABLET, lease));
-        // One tick before expiry with coverage: fast path.
+        // 9. Roster evidence is engine-derived, never leader-issued: a
+        // cold hub plans ALR; a driven+stabilized hub serves locally with
+        // floor coverage; expiry-equivalent states (term rise, restart,
+        // behind-floor) plan ALR, never a thin serve.
+        let leased = lease_hub();
         assert_eq!(
-            leased
-                .plan(
-                    TABLET,
-                    &get_op(),
-                    ReadContract::Latest,
-                    fresh(10),
-                    ctx(999_999)
-                )
-                .plan,
+            plan_here(&leased, ReadContract::Latest, fresh(10), 0),
+            ReadPlan::AlrThenServe
+        );
+        let quarantine = lease_params().quarantine();
+        let awakened = u64::try_from(quarantine.as_micros())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        let _ = drive_leader(&leased, 5, 10, 0);
+        let _ = drive_leader(&leased, 5, 10, awakened);
+        assert_eq!(
+            plan_here(&leased, ReadContract::Latest, fresh(10), awakened + 1),
             ReadPlan::ServeLocal {
                 path: ServePath::RosterLease
             }
         );
-        // At expiry: fallback. Behind the floor: fallback. Wrong member
-        // (hub bound to node 2 instead): fallback.
+        // Behind the floor: ALR fallback (hold-classified).
         assert_eq!(
+            plan_here(&leased, ReadContract::Latest, fresh(9), awakened + 1),
+            ReadPlan::AlrThenServe
+        );
+        // New term replaces the old roster: the first drive revokes (the
+        // replacement Guard waits out the live exclusion), the second
+        // grants it, and evidence exists again under the new term only
+        // (single-voter loopback stabilizes at once; multi-voter gaps are
+        // covered by the engine tests).
+        let _ = drive_leader(&leased, 6, 10, awakened + 2);
+        assert!(
             leased
-                .plan(
+                .evidence(
                     TABLET,
-                    &get_op(),
-                    ReadContract::Latest,
-                    fresh(10),
-                    ctx(1_000_000)
+                    CommitPosition::from_u64(10),
+                    Ticks::from_micros(awakened + 2)
                 )
-                .plan,
-            ReadPlan::BarrierThenServe { escalated: false }
+                .is_none(),
+            "revocation precedes replacement"
         );
-        assert_eq!(
-            leased
-                .plan(
-                    TABLET,
-                    &get_op(),
-                    ReadContract::Latest,
-                    fresh(9),
-                    ctx(999_999)
-                )
-                .plan,
-            ReadPlan::BarrierThenServe { escalated: false }
-        );
-        let outsider = ConsistencyHub::new(
-            NodeId::from_u64(2),
-            NodeIncarnation::from_u64(7),
-            ReadAuthorityProvider::RosterLease,
-        );
-        assert!(outsider.grant_lease(
-            TABLET,
-            RosterLease::new(
-                authority(),
-                1,
-                vec![NodeId::from_u64(1)],
+        let _ = drive_leader(&leased, 6, 10, awakened + 3);
+        let proof = leased
+            .evidence(
+                TABLET,
                 CommitPosition::from_u64(10),
-                Ticks::from_micros(1_000_000),
-                NodeIncarnation::from_u64(7),
+                Ticks::from_micros(awakened + 3),
             )
-        ));
+            .expect("new-term evidence");
+        assert_eq!(proof.roster.term.as_u64(), 6);
+        // Ineligible reads skip the roster even with evidence behind them:
+        // re-stabilize term 6 first, then check the skip.
+        let _ = drive_leader(&leased, 6, 10, awakened + 4);
         assert_eq!(
-            outsider
+            plan_here(&leased, ReadContract::Latest, fresh(10), awakened + 5),
+            ReadPlan::ServeLocal {
+                path: ServePath::RosterLease
+            }
+        );
+        assert_eq!(
+            leased
                 .plan(
                     TABLET,
                     &get_op(),
                     ReadContract::Latest,
                     fresh(10),
-                    ctx(999_999)
+                    ctx(awakened + 5),
+                    INELIGIBLE,
                 )
                 .plan,
-            ReadPlan::BarrierThenServe { escalated: false }
+            ReadPlan::AlrThenServe
         );
 
         // 10. Tablet isolation: evidence for one tablet never serves
         // another (split children start with empty hubs under fresh ids).
         let other = TabletId::from_u64(4);
         assert_eq!(
-            hub.plan(other, &get_op(), stale(), fresh(10), ctx(9_000_001))
-                .plan,
+            hub.plan(
+                other,
+                &get_op(),
+                stale(),
+                fresh(10),
+                ctx(9_000_001),
+                ELIGIBLE
+            )
+            .plan,
             ReadPlan::BarrierThenServe { escalated: true }
         );
     }

@@ -258,6 +258,13 @@ pub enum Status {
     /// cannot cure it: refresh the token from a read on its own lineage.
     /// Never retried under the same token.
     StaleToken = 21,
+    /// A strong write committed internally but responder coverage could
+    /// not be established, so it was not acknowledged as complete: the
+    /// outcome is uncertain — it may have applied. Never transparently
+    /// retried (that would double-apply anonymous non-idempotent writes);
+    /// identified writes may re-drive under the same identity, everyone
+    /// else must read-verify before retrying.
+    CoverageUncertain = 22,
 }
 
 impl Status {
@@ -287,6 +294,7 @@ impl Status {
             19 => Some(Self::UniqueViolation),
             20 => Some(Self::ScanCursorStale),
             21 => Some(Self::StaleToken),
+            22 => Some(Self::CoverageUncertain),
             _ => None,
         }
     }
@@ -341,6 +349,7 @@ impl core::fmt::Display for Status {
             Self::UniqueViolation => write!(f, "unique-violation"),
             Self::ScanCursorStale => write!(f, "scan-cursor-stale"),
             Self::StaleToken => write!(f, "stale-token"),
+            Self::CoverageUncertain => write!(f, "coverage-uncertain"),
         }
     }
 }
@@ -2448,6 +2457,7 @@ mod tests {
     #[case(Status::UniqueViolation)]
     #[case(Status::ScanCursorStale)]
     #[case(Status::StaleToken)]
+    #[case(Status::CoverageUncertain)]
     fn every_status_round_trips(#[case] status: Status) {
         assert_eq!(Status::from_u16(status.as_u16()), Some(status));
         assert_eq!(
@@ -2470,6 +2480,17 @@ mod tests {
         assert!(!Status::StaleToken.is_retriable());
         assert_eq!(Status::from_u16(21), Some(Status::StaleToken));
         assert_eq!(Status::StaleToken.to_string(), "stale-token");
+    }
+
+    #[test]
+    fn coverage_uncertain_is_terminal_and_ambiguous() {
+        // A coverage refusal is not a transport retry: the write may have
+        // committed, so blind redelivery could double-apply anonymous
+        // non-idempotent writes. Callers read-verify (or re-drive under
+        // the same identity) instead.
+        assert!(!Status::CoverageUncertain.is_retriable());
+        assert_eq!(Status::from_u16(22), Some(Status::CoverageUncertain));
+        assert_eq!(Status::CoverageUncertain.to_string(), "coverage-uncertain");
     }
 
     #[test]

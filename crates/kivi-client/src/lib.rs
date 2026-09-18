@@ -245,6 +245,7 @@ fn status_error(status: Status, body: &ResponseBody) -> ClientError {
         Status::UniqueViolation => ClientError::UniqueViolation,
         Status::ScanCursorStale => ClientError::ScanCursorStale,
         Status::StaleToken => ClientError::StaleToken,
+        Status::CoverageUncertain => ClientError::AmbiguousOutcome,
     }
 }
 

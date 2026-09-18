@@ -1,2 +1,6 @@
 /target
 *.log
+# TLC scratch: states dirs and error-trace modules are generated outside
+# spec/ by spec/run_tla.ps1; ignore strays from ad-hoc runs.
+/states/
+spec/*TTrace*

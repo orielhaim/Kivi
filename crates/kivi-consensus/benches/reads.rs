@@ -1,7 +1,7 @@
 //! Consistency-layer read-path benchmarks: planning cost decomposition
 //! per contract and path (no I/O, no Raft — the hub plan is the
-//! deterministic core; barrier/wait execution costs ride the network and
-//! are measured by the cluster benches).
+//! deterministic core; barrier/fence/coverage execution costs ride the
+//! network and are measured by the cluster benches).
 //!
 //! Run in release mode for meaningful figures:
 //! `cargo bench -p kivi-consensus --bench reads`.
@@ -16,8 +16,9 @@
 //! BoundedStale escalation ..... failed proof lookup, fallback decision
 //! Any ......................... cache probe, local serve
 //! strong-cache hit ............ cache probe + outcome clone
-//! Almost-Local hit ............ receipt usability + age check
-//! RosterLease hit ............. lease authorization + floor check
+//! ALR plan .................... provider dispatch to the batch path
+//! roster-evidence hit ......... stable-roster + floor-coverage proof
+//! lease drive ................. reconcile + tick + renew cadence work
 //! evidence install ............ barrier receipt insert + cache fill
 //! ```
 
@@ -28,12 +29,13 @@ use divan::{Bencher, black_box};
 use kivi_consensus::ConsistencyHub;
 use kivi_state::{Key, Operation, OperationResult};
 use kivi_types::{
-    CommitPosition, CommitToken, FreshnessReceipt, NodeId, NodeIncarnation, ReadAuthorityProvider,
-    ReadContext, ReadContract, ReplicaFreshness, RosterLease, TabletAuthority, TabletEpoch,
-    TabletId, Ticks, UnixMicros, WriteGuardGeneration,
+    CommitPosition, CommitToken, FreshnessReceipt, LeaseEligibility, LeaseParams, NodeId,
+    NodeIncarnation, ReadAuthorityProvider, ReadContext, ReadContract, ReplicaFreshness,
+    RosterTerm, TabletAuthority, TabletEpoch, TabletId, Ticks, UnixMicros, WriteGuardGeneration,
 };
 
 const TABLET: TabletId = TabletId::from_u64(3);
+const ELIGIBLE: LeaseEligibility = LeaseEligibility::Eligible;
 
 fn authority() -> TabletAuthority {
     TabletAuthority::new(
@@ -41,6 +43,10 @@ fn authority() -> TabletAuthority {
         TabletEpoch::from_u64(1),
         WriteGuardGeneration::from_u64(1),
     )
+}
+
+fn lease_params() -> LeaseParams {
+    LeaseParams::default()
 }
 
 fn fresh() -> ReplicaFreshness {
@@ -91,6 +97,7 @@ fn conservative() -> (ConsistencyHub, Operation) {
         NodeId::from_u64(1),
         NodeIncarnation::from_u64(7),
         ReadAuthorityProvider::ConservativeLeader,
+        lease_params(),
     );
     (hub, op())
 }
@@ -118,9 +125,8 @@ fn almost_local() -> (ConsistencyHub, Operation) {
     let hub = ConsistencyHub::new(
         NodeId::from_u64(1),
         NodeIncarnation::from_u64(7),
-        ReadAuthorityProvider::AlmostLocal {
-            max_proof_age: Duration::from_millis(100),
-        },
+        ReadAuthorityProvider::AlmostLocal,
+        lease_params(),
     );
     hub.note_barrier(TABLET, receipt());
     (hub, op())
@@ -131,17 +137,32 @@ fn roster() -> (ConsistencyHub, Operation) {
         NodeId::from_u64(1),
         NodeIncarnation::from_u64(7),
         ReadAuthorityProvider::RosterLease,
+        lease_params(),
     );
-    hub.grant_lease(
+    // Single-voter loopback stabilizes inside one drive past quarantine.
+    let quarantine = lease_params().quarantine();
+    let awakened = u64::try_from(quarantine.as_micros())
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let _ = hub.lease_drive(
         TABLET,
-        RosterLease::new(
-            authority(),
-            1,
-            vec![NodeId::from_u64(1)],
-            CommitPosition::from_u64(10),
-            Ticks::from_micros(1_000_000),
-            NodeIncarnation::from_u64(7),
-        ),
+        authority(),
+        RosterTerm::from_u64(5),
+        vec![NodeId::from_u64(1)],
+        true,
+        CommitPosition::from_u64(10),
+        CommitPosition::from_u64(10),
+        Ticks::from_micros(0),
+    );
+    let _ = hub.lease_drive(
+        TABLET,
+        authority(),
+        RosterTerm::from_u64(5),
+        vec![NodeId::from_u64(1)],
+        true,
+        CommitPosition::from_u64(10),
+        CommitPosition::from_u64(10),
+        Ticks::from_micros(awakened),
     );
     (hub, op())
 }
@@ -162,6 +183,7 @@ fn plan_latest_conservative(bencher: Bencher) {
             black_box(ReadContract::Latest),
             black_box(fresh),
             black_box(ctx),
+            black_box(ELIGIBLE),
         ))
     });
 }
@@ -179,6 +201,7 @@ fn plan_at_least_covered(bencher: Bencher) {
             black_box(contract),
             black_box(fresh),
             black_box(ctx),
+            black_box(ELIGIBLE),
         ))
     });
 }
@@ -196,6 +219,7 @@ fn plan_at_least_wait(bencher: Bencher) {
             black_box(contract),
             black_box(fresh),
             black_box(ctx),
+            black_box(ELIGIBLE),
         ))
     });
 }
@@ -215,6 +239,7 @@ fn plan_bounded_stale_proof(bencher: Bencher) {
             black_box(contract),
             black_box(fresh),
             black_box(ctx),
+            black_box(ELIGIBLE),
         ))
     });
 }
@@ -234,6 +259,7 @@ fn plan_bounded_stale_escalation(bencher: Bencher) {
             black_box(contract),
             black_box(fresh),
             black_box(ctx),
+            black_box(ELIGIBLE),
         ))
     });
 }
@@ -250,6 +276,7 @@ fn plan_any(bencher: Bencher) {
             black_box(ReadContract::Any),
             black_box(fresh),
             black_box(ctx),
+            black_box(ELIGIBLE),
         ))
     });
 }
@@ -266,12 +293,13 @@ fn plan_cache_hit(bencher: Bencher) {
             black_box(ReadContract::Any),
             black_box(fresh),
             black_box(ctx),
+            black_box(ELIGIBLE),
         ))
     });
 }
 
 #[divan::bench]
-fn plan_almost_local_hit(bencher: Bencher) {
+fn plan_alr_batch(bencher: Bencher) {
     let (hub, op) = almost_local();
     let fresh = fresh();
     let ctx = ctx();
@@ -282,12 +310,13 @@ fn plan_almost_local_hit(bencher: Bencher) {
             black_box(ReadContract::Latest),
             black_box(fresh),
             black_box(ctx),
+            black_box(ELIGIBLE),
         ))
     });
 }
 
 #[divan::bench]
-fn plan_roster_hit(bencher: Bencher) {
+fn plan_roster_evidence_hit(bencher: Bencher) {
     let (hub, op) = roster();
     let fresh = fresh();
     let ctx = ctx();
@@ -298,6 +327,24 @@ fn plan_roster_hit(bencher: Bencher) {
             black_box(ReadContract::Latest),
             black_box(fresh),
             black_box(ctx),
+            black_box(ELIGIBLE),
+        ))
+    });
+}
+
+#[divan::bench]
+fn lease_drive_steady_state(bencher: Bencher) {
+    let (hub, _) = roster();
+    bencher.bench(|| {
+        black_box(hub.lease_drive(
+            black_box(TABLET),
+            black_box(authority()),
+            black_box(RosterTerm::from_u64(5)),
+            black_box(vec![NodeId::from_u64(1)]),
+            black_box(true),
+            black_box(CommitPosition::from_u64(10)),
+            black_box(CommitPosition::from_u64(10)),
+            black_box(Ticks::from_micros(9_000_000)),
         ))
     });
 }
@@ -309,13 +356,14 @@ fn evidence_install(bencher: Bencher) {
     let receipt = receipt();
     let outcome = outcome();
     bencher.bench(|| {
-        black_box(hub.note_barrier(black_box(TABLET), black_box(receipt)));
-        black_box(hub.fill(
+        hub.note_barrier(black_box(TABLET), black_box(receipt));
+        hub.fill(
             black_box(TABLET),
             black_box(authority()),
             black_box(&op),
             black_box(&outcome),
             black_box(fresh.applied),
-        ));
+        );
+        black_box(());
     });
 }

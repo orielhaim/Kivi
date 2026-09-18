@@ -944,6 +944,7 @@ async fn open_node(
             peer_certs,
             insecure_peer_tls,
             preflight_enabled,
+            lease_params: kivi_types::LeaseParams::default(),
             worker_count: config.worker_count,
             durability: kivi_consensus::SharedDurabilityConfig::default(),
             control: Some(kivi_consensus::ControlGroupConfig {
@@ -1761,9 +1762,19 @@ async fn handle_get_stream(
             return Ok(());
         }
     };
+    // Large streamed values ride the same committed visibility boundary
+    // as point reads: the manifest resolves from the served applied
+    // state, so chunk delivery cannot cross it. Point-read eligibility
+    // applies (one tablet, one key).
     let outcome = match shared
         .node
-        .read(tablet, &operation, stream_contract, ctx)
+        .read(
+            tablet,
+            &operation,
+            stream_contract,
+            ctx,
+            kivi_types::LeaseEligibility::Eligible,
+        )
         .await
     {
         Ok(served) => served.outcome,
@@ -2042,7 +2053,17 @@ async fn handle_read(
             );
         }
     }
-    let response = match shared.node.read(tablet, operation, contract, ctx).await {
+    let response = match shared
+        .node
+        .read(
+            tablet,
+            operation,
+            contract,
+            ctx,
+            kivi_types::LeaseEligibility::Eligible,
+        )
+        .await
+    {
         Ok(served) => {
             let mut response = resolve_result(shared, opcode, operation, &served.outcome).await;
             response.proof = Some(served.receipt);
@@ -2440,6 +2461,13 @@ pub(crate) async fn shape_propose_error(
             status: Status::Overloaded,
             body: ResponseBody::Diagnostic("tablet fenced for topology cutover; retry".to_owned()),
         },
+        ProposeError::ResponderCoverage { detail } => Response {
+            proof: None,
+            status: Status::CoverageUncertain,
+            body: ResponseBody::Diagnostic(format!(
+                "responder coverage timed out; outcome uncertain ({detail})"
+            )),
+        },
         // Forward-compatibility: future proposal failures fail closed as
         // internal rather than mis-shaping on the wire.
         _ => Response {
@@ -2652,16 +2680,55 @@ struct TabletDto {
     consistency_cache_fallbacks: u64,
     /// Strong-cache invalidations on authority change.
     consistency_cache_invalidations: u64,
-    /// Almost-Local hits and fallbacks.
-    consistency_almost_hits: u64,
-    /// Almost-Local fallbacks to the barrier.
-    consistency_almost_fallbacks: u64,
-    /// Roster-lease hits and fallbacks.
+    /// Lazy-ALR batches formed.
+    consistency_alr_batches: u64,
+    /// Reads executed inside Lazy-ALR batches.
+    consistency_alr_reads: u64,
+    /// ALR batches that committed their own fence entry.
+    consistency_alr_syncs: u64,
+    /// ALR batches subsumed by a concurrent write.
+    consistency_alr_subsumed: u64,
+    /// ALR batches abandoned to the conservative barrier.
+    consistency_alr_fallbacks: u64,
+    /// Roster-lease fast-path hits.
     consistency_roster_hits: u64,
+    /// Roster-lease reads behind the safety floor (hold-or-fallback).
+    consistency_roster_holds: u64,
     /// Roster-lease fallbacks.
     consistency_roster_fallbacks: u64,
+    /// Roster pairings lapsed on local timers.
+    consistency_roster_expiries: u64,
+    /// Strong writes gated on explicit responder coverage.
+    consistency_coverage_waits: u64,
+    /// Coverage gates that timed out instead of acknowledging.
+    consistency_coverage_timeouts: u64,
+    /// Responders currently covered by the write gate.
+    consistency_covered_responders: u64,
+    /// Stable-roster summary (`None` when no roster is stable).
+    consistency_roster: Option<RosterDto>,
     /// Authority/fencing rejects on the read path.
     consistency_fencing_rejects: u64,
+}
+
+/// Copy-safe stable-roster summary for status surfaces.
+#[derive(Debug, Clone, Serialize)]
+struct RosterDto {
+    /// Roster generation served under.
+    generation: u64,
+    /// Consensus term the roster is bound to.
+    term: u64,
+    /// Designated responders.
+    responders: u64,
+    /// Grants backing stability.
+    grants: u64,
+    /// Majority count required.
+    required: u64,
+    /// Safety floor (inclusive commit position).
+    floor: u64,
+    /// Local applied position at snapshot time.
+    applied: u64,
+    /// Whether the lease engine is quarantined.
+    quarantined: bool,
 }
 
 /// Per-peer QUIC/H3 diagnostics (control + bulk connections).
@@ -2766,10 +2833,28 @@ fn tablet_dto(
         consistency_cache_hits: status.consistency.strong_cache_hits,
         consistency_cache_fallbacks: status.consistency.strong_cache_fallbacks,
         consistency_cache_invalidations: status.consistency.strong_cache_invalidations,
-        consistency_almost_hits: status.consistency.almost_local_hits,
-        consistency_almost_fallbacks: status.consistency.almost_local_fallbacks,
+        consistency_alr_batches: status.consistency.alr_batches,
+        consistency_alr_reads: status.consistency.alr_reads,
+        consistency_alr_syncs: status.consistency.alr_syncs,
+        consistency_alr_subsumed: status.consistency.alr_subsumed,
+        consistency_alr_fallbacks: status.consistency.alr_fallbacks,
         consistency_roster_hits: status.consistency.roster_hits,
+        consistency_roster_holds: status.consistency.roster_holds,
         consistency_roster_fallbacks: status.consistency.roster_fallbacks,
+        consistency_roster_expiries: status.consistency.roster_expiries,
+        consistency_coverage_waits: status.consistency.coverage_waits,
+        consistency_coverage_timeouts: status.consistency.coverage_timeouts,
+        consistency_covered_responders: status.consistency.covered_responders,
+        consistency_roster: status.consistency.roster.map(|summary| RosterDto {
+            generation: summary.generation,
+            term: summary.term,
+            responders: summary.responders,
+            grants: summary.grants,
+            required: summary.required,
+            floor: summary.floor.as_u64(),
+            applied: summary.applied.as_u64(),
+            quarantined: summary.quarantined,
+        }),
         consistency_fencing_rejects: status.consistency.fencing_rejects,
     }
 }
@@ -4969,10 +5054,13 @@ impl ClusterExecutor {
         let tablet = self.route(op)?;
         if op_is_read(op) {
             self.handle
-                .block_on(
-                    self.node
-                        .read(tablet, op, kivi_types::ReadContract::Any, read_ctx()),
-                )
+                .block_on(self.node.read(
+                    tablet,
+                    op,
+                    kivi_types::ReadContract::Any,
+                    read_ctx(),
+                    kivi_types::LeaseEligibility::Eligible,
+                ))
                 .map(|served| served.outcome)
                 .map_err(|_| E::Internal)
         } else {

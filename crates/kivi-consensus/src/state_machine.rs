@@ -836,7 +836,8 @@ impl ReplicatedTablet {
 
     /// Dispatches one committed envelope by group kind: tablet commands
     /// apply through the deterministic tablet path, control mutations
-    /// through replicated control state. Cross-kind commands fail as
+    /// through replicated control state, read fences advance the applied
+    /// pointer without touching logical state. Cross-kind commands fail as
     /// [`WrongGroup`](StateMachineFault::WrongGroup), never silently.
     fn apply_envelope(
         &mut self,
@@ -872,6 +873,32 @@ impl ReplicatedTablet {
                         index,
                         detail: error.to_string(),
                     })?;
+                let _ = log_id;
+                Ok(ReplicatedOutcome::none())
+            }
+            ConsensusCommand::ReadSync(sync) => {
+                // Lazy-ALR fence: ordering without mutation. The applied
+                // pointer advances (the caller in `apply_entry` records it),
+                // which is the entire effect — and exactly the effect the
+                // waiting batch needs. No objects, sessions, floors, or
+                // outcomes change, so there is nothing to verify and no
+                // dedup to install; a fence replays identically.
+                if self.is_control() {
+                    return Err(Fault::WrongGroup {
+                        detail: format!(
+                            "read fence for tablet {} reached the control group at index {index}",
+                            sync.fence.tablet.as_u64(),
+                        ),
+                    });
+                }
+                if sync.fence.tablet != self.tablet {
+                    return Err(Fault::Misrouted {
+                        namespace: self.namespace.as_u64(),
+                        tablet: sync.fence.tablet.as_u64(),
+                        expected_namespace: self.namespace.as_u64(),
+                        expected_tablet: self.tablet.as_u64(),
+                    });
+                }
                 let _ = log_id;
                 Ok(ReplicatedOutcome::none())
             }

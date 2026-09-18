@@ -465,6 +465,13 @@ where
         PeerRequest::Prepare(_) => Err(refused(
             "sidecar preflight serves from the durability gate".to_owned(),
         )),
+        // Read-authority RPCs never reach the Raft service: the owner
+        // thread serves leases from the lease engine, ALR syncs through
+        // the log, and coverage polls from the applied pointer.
+        // Arriving here is a routing bug, refused loudly.
+        PeerRequest::Lease(_) | PeerRequest::AlrSync(_) | PeerRequest::CoveragePoll(_) => Err(
+            refused("read-authority RPCs serve on the owner thread".to_owned()),
+        ),
     }
 }
 

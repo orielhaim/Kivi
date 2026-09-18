@@ -259,7 +259,8 @@ impl RaftStateMachine<KiviTypeConfig> for MemStateMachine {
                         crate::command::ConsensusCommand::Tablet(mutation) => {
                             crate::mutation::ReplicatedOutcome::new(mutation.expected().clone())
                         }
-                        crate::command::ConsensusCommand::Control(_) => {
+                        crate::command::ConsensusCommand::Control(_)
+                        | crate::command::ConsensusCommand::ReadSync(_) => {
                             crate::mutation::ReplicatedOutcome::none()
                         }
                     }

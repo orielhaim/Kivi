@@ -13,7 +13,7 @@
 //! grantee side, per grantor:  None → Guarded → Renewed → Expired
 //! ```
 //!
-//! Safety rests on five structural rules, each enforced by construction and
+//! Safety rests on structural rules, each enforced by construction and
 //! each covered by a dedicated negative test plus a TLA+ weakening variant
 //! (`spec/roster_lease*.tla`):
 //!
@@ -21,7 +21,7 @@
 //!    (`LeaseAttemptId` = grantor incarnation + per-pair sequence); every
 //!    Renew/Reply echoes it. A reply counts only toward the exact open
 //!    attempt it echoes — a leftover from an abandoned attempt can never
-//!    manufacture authority (cf. the PaxosLease renewal-qualifier finding).
+//!    manufacture authority (cf. the `PaxosLease` renewal-qualifier finding).
 //! 2. **Quarantine.** A (re)created engine grants nothing until its
 //!    quarantine elapses. The bound derives from the protocol itself
 //!    ([`LeaseParams::quarantine`]); it is checked sufficient and
@@ -29,13 +29,21 @@
 //! 3. **Roster identity.** [`RosterId`] binds tablet authority, consensus
 //!    term, and roster generation. Any of the three moving voids every
 //!    grant keyed on the old identity — no reuse across lineage, term, or
-//!    responder-set change.
+//!    responder-set change. Learning a newer generation prunes older
+//!    same-lineage rosters immediately (their exclusions still run out,
+//!    so writes keep covering them).
 //! 4. **Revocation before replacement.** Term/authority rises revoke stale
 //!    outgoing grants (fast path) and drop stale grantee state; conflicting
 //!    new authority waits out the old (failure path).
-//! 5. **Safety floor.** A responder serves only with majority Renewed
-//!    grants for one roster *and* local applied state covering the
-//!    quorum-derived floor (m-th smallest grantor threshold).
+//! 5. **Safety floor + leader leg.** A responder serves only with majority
+//!    `Renewed` grants for one roster *including a live pairing from the
+//!    roster's named leader*, local applied state covering the
+//!    quorum-derived floor, and its own designation in the roster. Each
+//!    pairing contributes `max(accepted-at-guard, committed-seen-in-renews)`;
+//!    the floor is the majority-th smallest contribution. The leader leg
+//!    is what makes leader-side responder coverage sufficient: every
+//!    stable responder was covered for every write completed during its
+//!    stability, and the floor covers everything completed before it.
 //!
 //! Timer placement (also cf. PaxosLease): every deadline is measured from
 //! the local send/receipt event that opens the attempt — never from quorum
@@ -51,9 +59,9 @@
 use core::fmt;
 use core::time::Duration;
 
+use crate::TabletAuthority;
 use crate::ids::{CommitPosition, NodeId, NodeIncarnation};
 use crate::time::Ticks;
-use crate::TabletAuthority;
 
 // ---------------------------------------------------------------------------
 // Identity: roster generation, roster term, roster id, roster content.
@@ -154,7 +162,7 @@ impl fmt::Display for RosterTerm {
 /// consensus term plus roster generation.
 ///
 /// The three halves close the three reuse hazards: authority binds tablet
-/// lineage and WriteGuard fencing (split/merge/migration/retirement void
+/// lineage and `WriteGuard` fencing (split/merge/migration/retirement void
 /// old rosters); term binds the leadership generation (a new election voids
 /// old rosters even when the responder set is unchanged); generation orders
 /// responder-set changes within one term. [`DirectoryVersion`] and
@@ -165,7 +173,7 @@ impl fmt::Display for RosterTerm {
 /// [kivi_control_scope]: https://doc.rust-lang.org/
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RosterId {
-    /// Tablet lineage + WriteGuard fencing the roster belongs to.
+    /// Tablet lineage + `WriteGuard` fencing the roster belongs to.
     pub authority: TabletAuthority,
     /// Leadership generation the roster is valid under.
     pub term: RosterTerm,
@@ -236,8 +244,8 @@ impl Roster {
             return Err(RosterError::InvalidId);
         }
         let mut responders = responders;
-        responders.sort_by_key(NodeId::as_u64);
-        responders.dedup_by_key(NodeId::as_u64);
+        responders.sort_by_key(|node| node.as_u64());
+        responders.dedup_by_key(|node| node.as_u64());
         responders.retain(|node| *node != leader);
         Ok(Self {
             id,
@@ -265,7 +273,12 @@ impl Roster {
 
 impl fmt::Display for Roster {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} leader={} responders=[", self.id, self.leader.as_u64())?;
+        write!(
+            f,
+            "{} leader={} responders=[",
+            self.id,
+            self.leader.as_u64()
+        )?;
         for (index, node) in self.responders.iter().enumerate() {
             if index > 0 {
                 write!(f, ",")?;
@@ -340,6 +353,16 @@ pub const DRIFT_PPM_DENOMINATOR: u32 = 1_000_000;
 /// silently weakened (see [`LeaseParams::validate`]).
 pub const MAX_DRIFT_PPM: u32 = 100_000;
 
+/// Consecutive unacknowledged renewals after which a grantor stops
+/// *sending* (not excluding): the pairing stays live until its exclusion
+/// deadline so the grantee's hold — strictly shorter by the asymmetric
+/// deadlines — always lapses first. Without muting, one partitioned
+/// grantee would hold every write's coverage gate forever; with it,
+/// writes stall at most ~(`MUTE_AFTER_UNACKED` + 1) lease durations and
+/// then proceed past the expired pairing. Re-establishment rides the
+/// normal Guard path afterwards.
+pub const MUTE_AFTER_UNACKED: u32 = 2;
+
 /// Deployment contract for roster leases: three nominal durations plus the
 /// single synchrony assumption the protocol needs — bounded clock-*rate*
 /// drift between any two participants. Absolute clock synchronization
@@ -359,6 +382,19 @@ pub struct LeaseParams {
 }
 
 impl LeaseParams {
+    /// Deployment default: 1s guard window, 2s lease, 200ms renewals,
+    /// 1000ppm (0.1%) maximum clock-rate drift. Restart quarantine is
+    /// ~3s; steady-state lease traffic is one Renew per live pairing per
+    /// 200ms. Deployments with weaker clocks must set explicit params
+    /// (or stay off the `RosterLease` backend) instead of silently
+    /// weakening these.
+    pub const DEFAULT: Self = Self {
+        guard_duration: Duration::from_millis(1_000),
+        lease_duration: Duration::from_millis(2_000),
+        renew_interval: Duration::from_millis(200),
+        max_drift_ppm: 1_000,
+    };
+
     /// Validates the deployment contract.
     ///
     /// # Errors
@@ -396,16 +432,17 @@ impl LeaseParams {
     /// Drift allowance for a nominal `duration`: the smallest span `A` with
     /// `2·L·ρ ≤ 2·A`, i.e. `A = ⌈L·ρ / (1−ρ)⌉`, so a grantee hold of `L−A`
     /// on a slow clock stays real-time inside a grantor exclusion of `L+A`
-    /// on a fast clock (PaxosLease containment shape
-    /// `Dp·rmax ≤ Da·rmin`, integer-exact and saturating).
+    /// on a fast clock (`PaxosLease` containment shape
+    /// `Dp·rmax ≤ Da·rmin`, integer-exact and saturating). This is the
+    /// headroom only, not the expanded duration (see [`LeaseParams::expand`]).
     #[must_use]
     pub fn allowance(&self, duration: Duration) -> Duration {
         let micros = duration.as_micros();
         let ppm = u128::from(self.max_drift_ppm);
-        let denom = u128::from(DRIFT_PPM_DENOMINATOR - self.max_drift_ppm.min(DRIFT_PPM_DENOMINATOR - 1));
+        let denom =
+            u128::from(DRIFT_PPM_DENOMINATOR - self.max_drift_ppm.min(DRIFT_PPM_DENOMINATOR - 1));
         let add = micros.saturating_mul(ppm).saturating_add(denom - 1) / denom;
-        let total = micros.saturating_add(add);
-        Duration::from_micros(u64::try_from(total).unwrap_or(u64::MAX))
+        Duration::from_micros(u64::try_from(add).unwrap_or(u64::MAX))
     }
 
     /// Expands a nominal duration into the worst-case real-time span a
@@ -463,7 +500,12 @@ impl LeaseAttemptId {
 
 impl fmt::Display for LeaseAttemptId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "attempt(inc{} #{})", self.grantor_incarnation.as_u64(), self.seq)
+        write!(
+            f,
+            "attempt(inc{} #{})",
+            self.grantor_incarnation.as_u64(),
+            self.seq
+        )
     }
 }
 
@@ -486,7 +528,7 @@ pub struct LeaseGuard {
     pub grantor: NodeId,
 }
 
-/// GuardReply: grantee entered Guarded within its guard window.
+/// `GuardReply`: grantee entered `Guarded` within its guard window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LeaseGuardReply {
     /// Roster the reply answers for.
@@ -502,7 +544,11 @@ pub struct LeaseGuardReply {
 }
 
 /// Renew: grantor extends an open pairing. Same attempt as the Guard that
-/// opened it; fresh message sequence.
+/// opened it; fresh message sequence. Carries the grantor's highest
+/// *committed* index: the grantee folds it into its floor contribution,
+/// so a responder that (re)established its pairing before a write
+/// completed still learns a floor covering that write from later renews.
+/// Accepted-at-guard alone would go stale across the establishment gap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LeaseRenew {
     /// Roster being renewed.
@@ -511,11 +557,14 @@ pub struct LeaseRenew {
     pub attempt: LeaseAttemptId,
     /// Message sequence on this pairing (strictly increasing).
     pub seq: u64,
+    /// Grantor's highest committed log index at send time (floor input
+    /// on the grantee side).
+    pub committed: CommitPosition,
     /// Sending grantor.
     pub grantor: NodeId,
 }
 
-/// RenewReply: grantee extended its hold for the echoed renewal.
+/// `RenewReply`: grantee extended its hold for the echoed renewal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LeaseRenewReply {
     /// Roster the reply answers for.
@@ -545,7 +594,7 @@ pub struct LeaseRevoke {
     pub grantor: NodeId,
 }
 
-/// RevokeReply: grantee dropped the pairing.
+/// `RevokeReply`: grantee dropped the pairing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LeaseRevokeReply {
     /// Roster the reply answers for.
@@ -604,6 +653,22 @@ impl LeaseMessage {
             Self::RevokeReply(message) => message.grantor,
         }
     }
+
+    /// Sending node of this message: the grantor for Guard/Renew/Revoke,
+    /// the grantee for replies. Harness and deterministic simulation use
+    /// only — production takes the sender from the authenticated transport
+    /// identity and never trusts this self-claim.
+    #[must_use]
+    pub const fn sender(&self) -> NodeId {
+        match self {
+            Self::Guard(message) => message.grantor,
+            Self::GuardReply(message) => message.grantee,
+            Self::Renew(message) => message.grantor,
+            Self::RenewReply(message) => message.grantee,
+            Self::Revoke(message) => message.grantor,
+            Self::RevokeReply(message) => message.grantee,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -615,11 +680,11 @@ impl LeaseMessage {
 pub enum GrantorPhase {
     /// No pairing (never opened, revoked and acknowledged, or expired).
     Idle,
-    /// Guard sent, awaiting the GuardReply that promotes to Renewing.
+    /// Guard sent, awaiting the `GuardReply` that promotes to `Renewing`.
     Guarding,
     /// Actively granting: renewals flow, exclusion holds.
     Renewing,
-    /// Revoke sent, awaiting the RevokeReply (or exclusion timeout).
+    /// Revoke sent, awaiting the `RevokeReply` (or exclusion timeout).
     Revoking,
     /// Exclusion lapsed without acknowledgment. Terminal until the next
     /// Guard opens a fresh attempt.
@@ -652,8 +717,21 @@ pub struct GrantorLease {
     /// Local deadline of the guard window (`Guarding` only).
     pub guard_deadline: Ticks,
     /// Local exclusion deadline (`Renewing`/`Revoking`): the grantor
-    /// refuses conflicting grants until this passes.
+    /// refuses conflicting grants until this passes. Reset to
+    /// send-time + lease + allowance on every renewal (never extended:
+    /// the exclusion is exactly one lease beyond the last vouched
+    /// renewal, which is what keeps the grantee's strictly shorter hold
+    /// inside it).
     pub lease_deadline: Ticks,
+    /// Next monotonic time a renewal is due (`Renewing` only). Renewals
+    /// flow every renew interval — not when the exclusion nears expiry —
+    /// so the send period (~renew) stays far below the grantee hold
+    /// (~lease). Set at promotion, advanced on every send.
+    pub renew_due: Ticks,
+    /// Consecutive renewals sent without any reply. At
+    /// [`MUTE_AFTER_UNACKED`] the grantor stops sending (the exclusion
+    /// above still runs to its deadline). Reset by any reply.
+    pub unacked: u32,
 }
 
 /// Grantee-side phase for one grantor pairing.
@@ -701,9 +779,16 @@ pub struct GranteeLease {
     /// Local hold deadline (`Renewed` only): the grantee serves local
     /// reads under this pairing only before this passes.
     pub lease_deadline: Ticks,
-    /// Grantor's highest accepted log index at Guard time: this pairing's
-    /// contribution to the roster safety floor.
+    /// Grantor's highest accepted log index at Guard time: the floor
+    /// contribution's first input (see `floor`).
     pub thresh_accepted: CommitPosition,
+    /// Floor contribution of this pairing: `max(thresh_accepted,
+    /// committed-seen-in-renews)`. Guard thresholds go stale across the
+    /// establishment gap (pairing opened before a write completed, renews
+    /// arriving after); folding every renewal's committed index keeps the
+    /// contribution covering everything committed before the latest
+    /// renewal was sent.
+    pub floor: CommitPosition,
 }
 
 // ---------------------------------------------------------------------------
@@ -732,7 +817,7 @@ impl LeaseOutbound {
 pub enum LeaseEvent {
     /// A Guard opened a fresh pairing attempt.
     GuardSent,
-    /// A GuardReply promoted a pairing to Renewing.
+    /// A `GuardReply` promoted a pairing to `Renewing`.
     GuardAnswered,
     /// A Renew extended a pairing.
     RenewSent,
@@ -749,6 +834,10 @@ pub enum LeaseEvent {
     StaleIgnored,
     /// A pairing lapsed on its local timer.
     Expired,
+    /// A grantor stopped sending renewals to an unresponsive grantee
+    /// (muted past [`MUTE_AFTER_UNACKED`]); the exclusion still runs to
+    /// its deadline, so coverage still holds it.
+    Muted,
     /// A grantor pairing was fenced by term/authority movement.
     Fenced,
 }
@@ -785,6 +874,16 @@ pub struct RosterEngine {
     voters: Vec<NodeId>,
     /// Deployment timing contract.
     params: LeaseParams,
+    /// Highest locally *accepted* (appended) log position, refreshed by the
+    /// driver every tick from the log. Grantor thresholds vouch for this —
+    /// never for applied or committed positions — and auto-grants opened on
+    /// learning a roster use it.
+    accepted: CommitPosition,
+    /// Highest locally *committed* log position, refreshed by the driver
+    /// every tick. Renewals vouch for this (folded into grantee floor
+    /// contributions), closing the establishment gap that guard-time
+    /// accepted thresholds alone leave open.
+    committed: CommitPosition,
     /// Grantor state per grantee.
     as_grantor: alloc_collections_BTreeMap<NodeId, GrantorLease>,
     /// Grantee state per (grantor, roster).
@@ -821,8 +920,8 @@ impl RosterEngine {
         now: Ticks,
     ) -> Self {
         let mut voters = voters;
-        voters.sort_by_key(NodeId::as_u64);
-        voters.dedup_by_key(NodeId::as_u64);
+        voters.sort_by_key(|node| node.as_u64());
+        voters.dedup_by_key(|node| node.as_u64());
         let quarantine_until = if incarnation == NodeIncarnation::INITIAL {
             now
         } else {
@@ -835,6 +934,8 @@ impl RosterEngine {
             term,
             voters,
             params,
+            accepted: CommitPosition::UNASSIGNED,
+            committed: CommitPosition::UNASSIGNED,
             as_grantor: alloc_collections_BTreeMap::new(),
             as_grantee: alloc_collections_BTreeMap::new(),
             announced: Vec::new(),
@@ -847,6 +948,25 @@ impl RosterEngine {
     #[must_use]
     pub const fn local(&self) -> NodeId {
         self.local
+    }
+
+    /// This process lifetime. Binds every attempt this engine opens and
+    /// every pairing it accepts.
+    #[must_use]
+    pub const fn incarnation(&self) -> NodeIncarnation {
+        self.incarnation
+    }
+
+    /// Deployment timing contract this engine enforces.
+    #[must_use]
+    pub const fn params(&self) -> LeaseParams {
+        self.params
+    }
+
+    /// Current voter set, sorted ascending, deduplicated.
+    #[must_use]
+    pub fn voters(&self) -> Vec<NodeId> {
+        self.voters.clone()
     }
 
     /// Current authority this engine serves.
@@ -873,17 +993,42 @@ impl RosterEngine {
         self.quarantine_until
     }
 
+    /// Records the driver's highest locally accepted log position
+    /// (monotonic: regressions are ignored, so a reordered driver update
+    /// can never shrink a threshold already vouched for).
+    pub fn set_accepted(&mut self, accepted: CommitPosition) {
+        if accepted.as_u64() > self.accepted.as_u64() {
+            self.accepted = accepted;
+        }
+    }
+
+    /// Highest locally accepted log position recorded so far.
+    #[must_use]
+    pub const fn accepted(&self) -> CommitPosition {
+        self.accepted
+    }
+
+    /// Records the driver's highest locally committed log position
+    /// (monotonic: regressions are ignored, so a reordered driver update
+    /// can never shrink a floor contribution already vouched for).
+    pub fn set_committed(&mut self, committed: CommitPosition) {
+        if committed.as_u64() > self.committed.as_u64() {
+            self.committed = committed;
+        }
+    }
+
+    /// Highest locally committed log position recorded so far.
+    #[must_use]
+    pub const fn committed(&self) -> CommitPosition {
+        self.committed
+    }
+
     /// Number of live grantor pairings (any non-terminal phase).
     #[must_use]
     pub fn grantor_pairings(&self) -> usize {
         self.as_grantor
             .values()
-            .filter(|lease| {
-                !matches!(
-                    lease.phase,
-                    GrantorPhase::Idle | GrantorPhase::Expired
-                )
-            })
+            .filter(|lease| !matches!(lease.phase, GrantorPhase::Idle | GrantorPhase::Expired))
             .count()
     }
 
@@ -892,9 +1037,7 @@ impl RosterEngine {
     pub fn grantee_pairings(&self) -> usize {
         self.as_grantee
             .values()
-            .filter(|lease| {
-                !matches!(lease.phase, GranteePhase::None | GranteePhase::Expired)
-            })
+            .filter(|lease| !matches!(lease.phase, GranteePhase::None | GranteePhase::Expired))
             .count()
     }
 
@@ -931,22 +1074,22 @@ impl RosterEngine {
         }
         if term != self.term {
             self.revoke_stale_grants(term, now, &mut out, &mut events);
-            // Grantee state keyed on older terms dies: a newer term means
-            // newer leadership, whose writes this roster never covered.
-            let before = self.as_grantee.len();
-            self.as_grantee
-                .retain(|(_, id), _| id.term >= term);
-            if self.as_grantee.len() != before {
-                events.push(LeaseEvent::Fenced);
-            }
+            // Grantee state for older terms is NOT dropped here: the
+            // revocations above answer it (fast path — including loopback,
+            // which is what clears a single voter's own exclusion), and
+            // anything unanswered lapses on its own timer. Dropping first
+            // would orphan the grantor side in `Revoking` with no reply
+            // ever coming. Safety needs no drop: `stable()` only counts
+            // pairings for the current term.
             self.term = term;
         }
         let mut voters = voters;
-        voters.sort_by_key(NodeId::as_u64);
-        voters.dedup_by_key(NodeId::as_u64);
+        voters.sort_by_key(|node| node.as_u64());
+        voters.dedup_by_key(|node| node.as_u64());
         if voters != self.voters {
-            self.voters = voters.clone();
-            self.as_grantor.retain(|peer, _| *peer == self.local || voters.contains(peer));
+            self.voters.clone_from(&voters);
+            self.as_grantor
+                .retain(|peer, _| *peer == self.local || voters.contains(peer));
             self.as_grantee
                 .retain(|(grantor, _), _| *grantor == self.local || voters.contains(grantor));
             events.push(LeaseEvent::Fenced);
@@ -967,7 +1110,7 @@ impl RosterEngine {
         events: &mut Vec<LeaseEvent>,
     ) {
         let allowance = self.params.allowance(self.params.lease_duration);
-        for (peer, lease) in self.as_grantor.iter_mut() {
+        for (peer, lease) in &mut self.as_grantor {
             if lease.roster_id.term >= term {
                 continue;
             }
@@ -979,11 +1122,8 @@ impl RosterEngine {
                 GrantorPhase::Renewing => {
                     lease.phase = GrantorPhase::Revoking;
                     lease.out_seq = lease.out_seq.saturating_add(1);
-                    lease.lease_deadline = now.advance_by(
-                        self.params
-                            .lease_duration
-                            .saturating_add(allowance),
-                    );
+                    lease.lease_deadline =
+                        now.advance_by(self.params.lease_duration.saturating_add(allowance));
                     out.push(LeaseOutbound::new(
                         *peer,
                         LeaseMessage::Revoke(LeaseRevoke {
@@ -1006,16 +1146,26 @@ impl RosterEngine {
     /// (`authority`, `term`), records it, and opens Guard pairings to
     /// every voter including self.
     ///
+    /// `thresh_accepted` is the announcer's own highest *accepted* (appended,
+    /// not merely applied or committed) log position: this pairing's
+    /// contribution to the roster safety floor. Accepted is the weakest
+    /// exact boundary that still proves safety — a grantor vouches only for
+    /// what it has durably appended, and the floor (majority-th smallest
+    /// threshold) intersects every committed write's majority.
+    ///
     /// # Errors
     ///
     /// Returns [`RosterError::Quarantined`] while the restart fence holds,
     /// [`RosterError::NotLeader`] when `leader != local` (defense in
     /// depth; the driver checks first), or [`RosterError::InvalidId`]
-    /// when the responder set cannot form a valid roster.
+    /// when the responder set cannot form a valid roster or the generation
+    /// space is exhausted (never wraps: reusing a generation would
+    /// resurrect a superseded responder set).
     pub fn announce(
         &mut self,
         leader: NodeId,
         responders: Vec<NodeId>,
+        thresh_accepted: CommitPosition,
         now: Ticks,
     ) -> Result<(Roster, Vec<LeaseOutbound>), RosterError> {
         if self.quarantined(now) {
@@ -1026,6 +1176,7 @@ impl RosterEngine {
         if leader != self.local {
             return Err(RosterError::NotLeader);
         }
+        self.set_accepted(thresh_accepted);
         let generation = self
             .known
             .keys()
@@ -1033,9 +1184,10 @@ impl RosterEngine {
             .filter(|id| id.authority == self.authority && id.term == self.term)
             .map(|id| id.generation.as_u64())
             .max()
-            .map_or(RosterGeneration::INITIAL, |max| {
-                RosterGeneration::from_u64(max.saturating_add(1))
-            });
+            .map_or(Ok(RosterGeneration::INITIAL), |max| {
+                RosterGeneration::from_u64(max).next()
+            })
+            .map_err(|_| RosterError::InvalidId)?;
         if !generation.is_valid() {
             return Err(RosterError::InvalidId);
         }
@@ -1049,6 +1201,13 @@ impl RosterEngine {
         let mut events = Vec::new();
         self.revoke_superseded_grants(id, now, &mut out, &mut events);
         self.known.insert(id, roster.clone());
+        // Same generation pruning as Guard receipt: the replacement voids
+        // older same-lineage holds immediately; exclusions still run out.
+        self.known.retain(|known, _| {
+            known.authority != id.authority
+                || known.term != id.term
+                || known.generation >= id.generation
+        });
         if !self.announced.contains(&id) {
             self.announced.push(id);
         }
@@ -1056,9 +1215,9 @@ impl RosterEngine {
         if !targets.contains(&self.local) {
             targets.push(self.local);
         }
-        targets.sort_by_key(NodeId::as_u64);
+        targets.sort_by_key(|node| node.as_u64());
         for peer in targets {
-            out.extend(self.open_guard(peer, &roster, CommitPosition::UNASSIGNED, now));
+            out.extend(self.open_guard(peer, &roster, thresh_accepted, now));
         }
         let _ = events;
         Ok((roster, out))
@@ -1074,7 +1233,7 @@ impl RosterEngine {
         events: &mut Vec<LeaseEvent>,
     ) {
         let allowance = self.params.allowance(self.params.lease_duration);
-        for (peer, lease) in self.as_grantor.iter_mut() {
+        for (peer, lease) in &mut self.as_grantor {
             let superseded = lease.roster_id.authority == id.authority
                 && lease.roster_id.term == id.term
                 && lease.roster_id.generation < id.generation;
@@ -1112,6 +1271,13 @@ impl RosterEngine {
     /// recording the grantor's current accepted position as the safety
     /// threshold. Each call opens a FRESH attempt: retries never continue
     /// an old one.
+    ///
+    /// A live exclusion (`Renewing` or `Revoking`, for any roster) is
+    /// never overwritten: the new roster must wait out the old exclusion
+    /// (fast path: `RevokeReply`; failure path: exclusion timeout)
+    /// before conflicting authority activates. Callers retry idempotently
+    /// — [`RosterEngine::grant_for`] on every driver tick — so a skipped
+    /// Guard is deferred, never dropped.
     fn open_guard(
         &mut self,
         peer: NodeId,
@@ -1119,6 +1285,11 @@ impl RosterEngine {
         thresh_accepted: CommitPosition,
         now: Ticks,
     ) -> Vec<LeaseOutbound> {
+        if let Some(held) = self.as_grantor.get(&peer)
+            && matches!(held.phase, GrantorPhase::Renewing | GrantorPhase::Revoking)
+        {
+            return Vec::new();
+        }
         let allowance = self.params.allowance(self.params.guard_duration);
         let out_seq = self
             .as_grantor
@@ -1135,8 +1306,11 @@ impl RosterEngine {
                 roster_id: roster.id,
                 attempt,
                 out_seq,
-                guard_deadline: now.advance_by(self.params.guard_duration.saturating_add(allowance)),
+                guard_deadline: now
+                    .advance_by(self.params.guard_duration.saturating_add(allowance)),
                 lease_deadline: now,
+                renew_due: now,
+                unacked: 0,
             },
         );
         vec![LeaseOutbound::new(
@@ -1157,14 +1331,18 @@ impl RosterEngine {
     /// the inputs.
     ///
     /// The caller supplies this engine's current accepted position
-    /// (`thresh_accepted`) for any Guard it (re)opens.
+    /// (`thresh_accepted`, for any Guard it (re)opens) and committed
+    /// position (`committed`, vouched in every Renew it emits).
     pub fn tick(
         &mut self,
         thresh_accepted: CommitPosition,
+        committed: CommitPosition,
         now: Ticks,
     ) -> (Vec<LeaseOutbound>, Vec<LeaseEvent>) {
         let mut out = Vec::new();
         let mut events = Vec::new();
+        self.set_accepted(thresh_accepted);
+        self.set_committed(committed);
         let lease_allowance = self.params.allowance(self.params.lease_duration);
         // Grantor side.
         let peers: Vec<NodeId> = self.as_grantor.keys().copied().collect();
@@ -1191,32 +1369,46 @@ impl RosterEngine {
                 }
                 GrantorPhase::Renewing => {
                     if now.as_micros() >= lease.lease_deadline.as_micros() {
-                        // Missed the renewal window: stop granting (the
-                        // grantee's hold already lapsed first, by the
-                        // asymmetric deadlines).
+                        // Exclusion lapsed (muted too long, or the driver
+                        // stopped ticking): stop granting. The grantee's
+                        // hold already lapsed first, by the asymmetric
+                        // deadlines — removing here never uncovers a live
+                        // hold.
                         self.as_grantor.remove(&peer);
                         events.push(LeaseEvent::Expired);
                         continue;
                     }
-                    let remaining = lease.lease_deadline.saturating_since(now);
-                    if remaining <= self.params.renew_interval {
-                        let mut live = lease;
-                        live.out_seq = live.out_seq.saturating_add(1);
-                        live.lease_deadline = live
-                            .lease_deadline
-                            .advance_by(self.params.lease_duration.saturating_add(lease_allowance));
-                        out.push(LeaseOutbound::new(
-                            peer,
-                            LeaseMessage::Renew(LeaseRenew {
-                                roster_id: live.roster_id,
-                                attempt: live.attempt,
-                                seq: live.out_seq,
-                                grantor: self.local,
-                            }),
-                        ));
-                        self.as_grantor.insert(peer, live);
-                        events.push(LeaseEvent::RenewSent);
+                    if now.as_micros() < lease.renew_due.as_micros() {
+                        continue;
                     }
+                    let mut live = lease;
+                    // Muted grantor: send nothing (the exclusion still
+                    // runs to its deadline, which the grantee's strictly
+                    // shorter hold precedes), so writes stall boundedly
+                    // instead of forever.
+                    if live.unacked >= MUTE_AFTER_UNACKED {
+                        events.push(LeaseEvent::Muted);
+                        self.as_grantor.insert(peer, live);
+                        continue;
+                    }
+                    live.out_seq = live.out_seq.saturating_add(1);
+                    live.unacked = live.unacked.saturating_add(1);
+                    live.renew_due = now.advance_by(self.params.renew_interval);
+                    live.lease_deadline =
+                        now.advance_by(self.params.lease_duration.saturating_add(lease_allowance));
+                    let committed = self.committed;
+                    out.push(LeaseOutbound::new(
+                        peer,
+                        LeaseMessage::Renew(LeaseRenew {
+                            roster_id: live.roster_id,
+                            attempt: live.attempt,
+                            seq: live.out_seq,
+                            committed,
+                            grantor: self.local,
+                        }),
+                    ));
+                    self.as_grantor.insert(peer, live);
+                    events.push(LeaseEvent::RenewSent);
                 }
                 GrantorPhase::Revoking => {
                     if now.as_micros() >= lease.lease_deadline.as_micros() {
@@ -1294,6 +1486,16 @@ impl RosterEngine {
         out: &mut Vec<LeaseOutbound>,
         events: &mut Vec<LeaseEvent>,
     ) {
+        // Restart fence: a quarantined engine takes no lease-layer part —
+        // neither granting nor holding. Post-restart state is empty, so the
+        // other handlers already no-op; the Guard is the one message that
+        // would create state, and it must not while forgotten grants may
+        // still be live elsewhere. Grantor retries re-establish the pairing
+        // after the quarantine lapses.
+        if self.quarantined(now) {
+            events.push(LeaseEvent::StaleIgnored);
+            return;
+        }
         let roster = guard.roster;
         if roster.id.authority != self.authority {
             events.push(LeaseEvent::StaleIgnored);
@@ -1335,7 +1537,7 @@ impl RosterEngine {
                 })
                 .map(|(_, lease)| lease.roster_id.generation.as_u64())
                 .max();
-            if newest.is_some_and(|gen| roster.id.generation.as_u64() < gen) {
+            if newest.is_some_and(|seen| roster.id.generation.as_u64() < seen) {
                 events.push(LeaseEvent::StaleIgnored);
                 return;
             }
@@ -1355,15 +1557,47 @@ impl RosterEngine {
             guard_deadline: now.advance_by(self.params.guard_duration.saturating_sub(allowance)),
             lease_deadline: now,
             thresh_accepted: guard.thresh_accepted,
+            floor: guard.thresh_accepted,
         };
         self.as_grantee.insert(key, lease);
-        self.known.insert(roster.id, roster);
+        // Supersede: when this Guard is not older than any known roster
+        // of its lineage, this node's own outgoing grants for older
+        // same-lineage rosters revoke now (fast path) instead of
+        // lingering beside the replacement. Older-generation redelivery
+        // revokes nothing. The new Guards below then wait out any live
+        // exclusion via the open-guard skip plus the driver's idempotent
+        // retry.
+        let not_older = !self
+            .known
+            .keys()
+            .filter(|id| {
+                id.authority == roster.id.authority
+                    && id.term == roster.id.term
+                    && id.generation != roster.id.generation
+            })
+            .any(|id| id.generation > roster.id.generation);
+        if not_older {
+            self.revoke_superseded_grants(roster.id, now, out, events);
+        }
+        self.known.insert(roster.id, roster.clone());
+        // Generation pruning: within one (authority, term) lineage only the
+        // newest learned generation counts. Older holds stop contributing
+        // to stability the moment newer authority is learned (fail-closed
+        // toward the replacement); their grantor-side exclusions still run
+        // to RevokeReply or timeout, so writes keep covering them.
+        // Out-of-order redelivery of an older generation prunes nothing:
+        // the retain keeps everything at or above the incoming generation.
+        self.known.retain(|id, _| {
+            id.authority != roster.id.authority
+                || id.term != roster.id.term
+                || id.generation >= roster.id.generation
+        });
         // GuardReply echoes the exact attempt+seq: it can only ever count
         // for the Guard it answers.
         out.push(LeaseOutbound::new(
             from,
             LeaseMessage::GuardReply(LeaseGuardReply {
-                roster_id: guard.roster.id,
+                roster_id: roster.id,
                 attempt: guard.attempt,
                 seq: guard.seq,
                 grantee: self.local,
@@ -1371,9 +1605,20 @@ impl RosterEngine {
             }),
         ));
         events.push(LeaseEvent::GuardSent);
+        // All-to-all closure: a designated participant grants back. Only
+        // pairings with no live outgoing state open a fresh attempt, so
+        // this converges instead of storming; non-designated voters never
+        // grant, so their pairings can never count toward stability.
+        if roster.covers(self.local) {
+            let fresh = self.grant_for(roster.id, self.accepted, now);
+            if !fresh.is_empty() {
+                events.push(LeaseEvent::GuardSent);
+            }
+            out.extend(fresh);
+        }
     }
 
-    /// GuardReply receipt: promotes `Guarding` to `Renewing` and emits the
+    /// `GuardReply` receipt: promotes `Guarding` to `Renewing` and emits the
     /// first Renew — but only for the exact open attempt. A reply for any
     /// other attempt (leftover from an abandoned Guard) is ignored, which
     /// is what makes abandon-and-retry safe at any quarantine length.
@@ -1409,6 +1654,8 @@ impl RosterEngine {
         let mut live = lease;
         live.phase = GrantorPhase::Renewing;
         live.out_seq = live.out_seq.saturating_add(1);
+        live.unacked = 0;
+        live.renew_due = now.advance_by(self.params.renew_interval);
         live.lease_deadline = now.advance_by(
             self.params
                 .guard_duration
@@ -1416,12 +1663,14 @@ impl RosterEngine {
                 .saturating_add(self.params.lease_duration)
                 .saturating_add(lease_allowance),
         );
+        let committed = self.committed;
         out.push(LeaseOutbound::new(
             from,
             LeaseMessage::Renew(LeaseRenew {
                 roster_id: live.roster_id,
                 attempt: live.attempt,
                 seq: live.out_seq,
+                committed,
                 grantor: self.local,
             }),
         ));
@@ -1467,6 +1716,7 @@ impl RosterEngine {
                 let mut live = lease;
                 live.phase = GranteePhase::Renewed;
                 live.last_seq = renew.seq;
+                live.floor = live.floor.max(renew.committed);
                 live.lease_deadline =
                     now.advance_by(self.params.lease_duration.saturating_sub(lease_allowance));
                 self.as_grantee.insert(key, live);
@@ -1491,13 +1741,15 @@ impl RosterEngine {
                 // Renew would grant (reordered duplicate). Count, extend
                 // nothing — this is what keeps a very delayed Renew from
                 // manufacturing fresh validity.
-                let grant = now.advance_by(self.params.lease_duration.saturating_sub(lease_allowance));
+                let grant =
+                    now.advance_by(self.params.lease_duration.saturating_sub(lease_allowance));
                 if grant.as_micros() <= lease.lease_deadline.as_micros() {
                     events.push(LeaseEvent::RenewDuplicate);
                     return;
                 }
                 let mut live = lease;
                 live.last_seq = renew.seq;
+                live.floor = live.floor.max(renew.committed);
                 live.lease_deadline = grant;
                 self.as_grantee.insert(key, live);
                 out.push(LeaseOutbound::new(
@@ -1518,9 +1770,14 @@ impl RosterEngine {
         }
     }
 
-    /// RenewReply receipt: tightens the loose exclusion deadline — only
+    /// `RenewReply` receipt: tightens the loose exclusion deadline — only
     /// for the exact open renewal it echoes.
-    fn on_renew_reply(&mut self, from: NodeId, reply: LeaseRenewReply, events: &mut Vec<LeaseEvent>) {
+    fn on_renew_reply(
+        &mut self,
+        from: NodeId,
+        reply: LeaseRenewReply,
+        events: &mut Vec<LeaseEvent>,
+    ) {
         let Some(lease) = self.as_grantor.get(&from).cloned() else {
             events.push(LeaseEvent::StaleIgnored);
             return;
@@ -1538,6 +1795,8 @@ impl RosterEngine {
         // tightening matters once transports delay replies: the deadline
         // stays anchored to live traffic, never to stale memory.)
         let mut live = lease;
+        // Any reply proves the grantee is reachable: unmute.
+        live.unacked = 0;
         live.lease_deadline = live.lease_deadline.min(
             // Recompute is intentionally not "now + …": the grantor has
             // no fresh timestamp in this pure handler. The deadline set
@@ -1609,7 +1868,7 @@ impl RosterEngine {
         let newer = revoke.roster_id.term > lease.roster_id.term
             || (revoke.roster_id.term == lease.roster_id.term
                 && revoke.roster_id.generation > lease.roster_id.generation);
-        if !(same || newer) && !incarnation_rise {
+        if !(same || newer || incarnation_rise) {
             events.push(LeaseEvent::StaleIgnored);
             return;
         }
@@ -1627,9 +1886,14 @@ impl RosterEngine {
         events.push(LeaseEvent::RevokeAccepted);
     }
 
-    /// RevokeReply receipt: drops a `Revoking` pairing promptly — only for
+    /// `RevokeReply` receipt: drops a `Revoking` pairing promptly — only for
     /// the exact Revoke it answers.
-    fn on_revoke_reply(&mut self, from: NodeId, reply: LeaseRevokeReply, events: &mut Vec<LeaseEvent>) {
+    fn on_revoke_reply(
+        &mut self,
+        from: NodeId,
+        reply: LeaseRevokeReply,
+        events: &mut Vec<LeaseEvent>,
+    ) {
         let Some(lease) = self.as_grantor.get(&from).cloned() else {
             events.push(LeaseEvent::StaleIgnored);
             return;
@@ -1647,15 +1911,33 @@ impl RosterEngine {
     }
 
     /// Stable-roster check: holds `Renewed` grants for one roster from at
-    /// least a majority of current voters (self counts via loopback).
+    /// least a majority of current voters (self counts via loopback),
+    /// *including a live pairing from the roster's named leader*.
+    ///
+    /// The leader leg is load-bearing, not decorative: the term leader
+    /// covers every responder it holds a live exclusion for before
+    /// completing a write externally, so a responder stable without the
+    /// leader's grant could miss a leader-completed write. Requiring the
+    /// leader's grant to self makes leader-side responder coverage
+    /// sufficient: every stable responder was covered for every write
+    /// completed during its stability.
+    ///
+    /// Fail-closed on stalls: only holds whose own deadline still covers
+    /// `now` count. An expired-but-unprocessed hold (tick starved, long
+    /// pause) authorizes nothing — the holder loses fast-path authority
+    /// instead of retaining stale authority. Bounded clock-rate drift is
+    /// the only timing assumption; no scheduler or tick fairness is
+    /// assumed.
+    ///
     /// Returns the roster, its grantors, and the safety floor: the
-    /// majority-th smallest accepted threshold, i.e. the highest position
-    /// every stable grantor had accepted no later than granting — so any
-    /// write completed before this roster became safe is ordered at or
-    /// below the floor.
+    /// majority-th smallest floor contribution. Each contribution is
+    /// `max(accepted-at-guard, committed-seen-in-renews)`, so the floor
+    /// covers everything committed before the latest renewal was sent —
+    /// closing the establishment gap that guard-time thresholds alone
+    /// leave open.
     #[must_use]
-    pub fn stable(&self) -> Option<StableRoster> {
-        let majority = majority_of(self.voters.len())? as usize;
+    pub fn stable(&self, now: Ticks) -> Option<StableRoster> {
+        let majority = usize::try_from(majority_of(self.voters.len())?).unwrap_or(usize::MAX);
         // Group live Renewed grants by roster identity.
         let mut by_roster: alloc_collections_BTreeMap<RosterId, Vec<(NodeId, CommitPosition)>> =
             alloc_collections_BTreeMap::new();
@@ -1663,7 +1945,18 @@ impl RosterEngine {
             if lease.phase != GranteePhase::Renewed {
                 continue;
             }
+            // Fail-closed stall check first: an unprocessed-expired hold
+            // contributes nothing, exactly as if tick() had removed it.
+            if now.as_micros() >= lease.lease_deadline.as_micros() {
+                continue;
+            }
             if id.authority != self.authority || id.term != self.term {
+                continue;
+            }
+            // Superseded generations (pruned from known on learning the
+            // replacement) contribute nothing, even before their pairings
+            // lapse: the replacement voids them immediately.
+            if !self.known.contains_key(id) {
                 continue;
             }
             // Only current voters count (a removed member's grant can
@@ -1671,17 +1964,31 @@ impl RosterEngine {
             if *grantor != self.local && !self.voters.contains(grantor) {
                 continue;
             }
+            // Only designated responders count: a grantor outside the
+            // roster's responder set vouches for nothing, even when it is
+            // a current voter (stale or foreign Guard traffic).
+            let roster = self.known.get(id);
+            if roster.is_none_or(|roster| !roster.covers(*grantor)) {
+                continue;
+            }
             by_roster
                 .entry(*id)
                 .or_default()
-                .push((*grantor, lease.thresh_accepted));
+                .push((*grantor, lease.floor));
         }
         // Deterministic choice: lowest roster identity among those with a
-        // majority (there can be at most one — enforced by fencing and
-        // checked by the model — but determinism must not depend on it).
+        // majority including the leader's grant (there can be at most one
+        // per term — enforced by fencing and checked by the model — but
+        // determinism must not depend on it).
         let mut best: Option<(RosterId, Vec<(NodeId, CommitPosition)>)> = None;
         for (id, grants) in by_roster {
             if grants.len() < majority {
+                continue;
+            }
+            let Some(roster) = self.known.get(&id) else {
+                continue;
+            };
+            if !grants.iter().any(|(grantor, _)| *grantor == roster.leader) {
                 continue;
             }
             if best.as_ref().is_some_and(|(best_id, _)| *best_id < id) {
@@ -1691,12 +1998,12 @@ impl RosterEngine {
         }
         let (id, mut grants) = best?;
         grants.sort_by_key(|(grantor, _)| grantor.as_u64());
-        // Majority-th smallest threshold: sort thresholds ascending, take
-        // index (majority - 1). At least `majority` grantors accepted at
-        // least this much no later than granting.
-        let mut thresholds: Vec<u64> = grants.iter().map(|(_, thresh)| thresh.as_u64()).collect();
-        thresholds.sort_unstable();
-        let floor = CommitPosition::from_u64(thresholds[majority - 1]);
+        // Majority-th smallest contribution: sort contributions ascending,
+        // take index (majority - 1). At least `majority` grantors vouched
+        // at least this much no later than their latest renewal.
+        let mut contributions: Vec<u64> = grants.iter().map(|(_, floor)| floor.as_u64()).collect();
+        contributions.sort_unstable();
+        let floor = CommitPosition::from_u64(contributions[majority - 1]);
         let roster = self.known.get(&id)?.clone();
         Some(StableRoster {
             roster,
@@ -1705,11 +2012,19 @@ impl RosterEngine {
         })
     }
 
-    /// Full fast-path evidence: a stable roster plus local applied state
-    /// covering its floor. `None` means "fall back" — never "serve thin".
+    /// Full fast-path evidence: a stable roster naming this responder,
+    /// plus local applied state covering its floor. `None` means "fall
+    /// back" — never "serve thin". Stability revalidates every hold
+    /// deadline against `now`, so this is the serve-time fail-closed
+    /// check, not just a phase read.
     #[must_use]
-    pub fn evidence(&self, applied: CommitPosition) -> Option<RosterEvidence> {
-        let stable = self.stable()?;
+    pub fn evidence(&self, applied: CommitPosition, now: Ticks) -> Option<RosterEvidence> {
+        let stable = self.stable(now)?;
+        // The responder itself must be designated: a roster authorizes
+        // its responders, not every holder of a coincidental majority.
+        if !stable.roster.covers(self.local) {
+            return None;
+        }
         if applied.as_u64() < stable.floor.as_u64() {
             return None;
         }
@@ -1733,6 +2048,122 @@ impl RosterEngine {
     #[must_use]
     pub fn roster_content(&self, id: RosterId) -> Option<Roster> {
         self.known.get(&id).cloned()
+    }
+
+    /// Every roster content learned and not yet pruned (current authority
+    /// only in practice; used by the driver to bound forgotten authority
+    /// across term changes).
+    #[must_use]
+    pub fn known_rosters(&self) -> Vec<Roster> {
+        self.known.values().cloned().collect()
+    }
+
+    /// Newest roster known for (`authority`, `term`), if any: the generation
+    /// a designated non-leader grants for, and the identity a leader must
+    /// supersede on responder-set change.
+    #[must_use]
+    pub fn current_roster_for_term(&self, term: RosterTerm) -> Option<Roster> {
+        self.known
+            .iter()
+            .filter(|(id, _)| id.authority == self.authority && id.term == term)
+            .max_by_key(|(id, _)| id.generation.as_u64())
+            .map(|(_, roster)| roster.clone())
+    }
+
+    /// Opens this node's own outgoing Guard pairings for a known roster
+    /// (non-leader designated participants grant too: every responder is a
+    /// grantor). Only pairings with no live outgoing state (`Guarding`,
+    /// `Renewing`, or `Revoking`) for that roster open a fresh attempt;
+    /// live pairings keep theirs, so retries never churn attempts and a
+    /// delayed duplicate call cannot resurrect anything.
+    pub fn grant_for(
+        &mut self,
+        id: RosterId,
+        thresh_accepted: CommitPosition,
+        now: Ticks,
+    ) -> Vec<LeaseOutbound> {
+        // Restart fence (defense in depth alongside the announce and
+        // Guard gates): a quarantined engine opens nothing.
+        if self.quarantined(now) {
+            return Vec::new();
+        }
+        let Some(roster) = self.known.get(&id).cloned() else {
+            return Vec::new();
+        };
+        if roster.id.authority != self.authority {
+            return Vec::new();
+        }
+        let mut targets: Vec<NodeId> = self.voters.clone();
+        if !targets.contains(&self.local) {
+            targets.push(self.local);
+        }
+        targets.sort_by_key(|node| node.as_u64());
+        let mut out = Vec::new();
+        for peer in targets {
+            let live = self.as_grantor.get(&peer).is_some_and(|lease| {
+                lease.roster_id == id
+                    && matches!(
+                        lease.phase,
+                        GrantorPhase::Guarding | GrantorPhase::Renewing | GrantorPhase::Revoking
+                    )
+            });
+            if !live {
+                out.extend(self.open_guard(peer, &roster, thresh_accepted, now));
+            }
+        }
+        out
+    }
+
+    /// Outgoing pairings whose grantees may still serve local reads under
+    /// the named roster: `Renewing` (actively granting) plus `Revoking`
+    /// (revoke unacknowledged — the grantee has not confirmed the drop, so
+    /// it must still be covered). A successful strong write must not be
+    /// acknowledged until every responder named here can serve it.
+    ///
+    /// Fail-closed on stalls, grantor side: only exclusions whose own
+    /// deadline still covers `now` count — the mirror of the hold check
+    /// in [`RosterEngine::stable`]. The asymmetric deadlines (exclusion
+    /// outlasts hold) keep the sides consistent: coverage never drops
+    /// while the grantee can still serve.
+    #[must_use]
+    pub fn covered_grantees(&self, now: Ticks) -> Vec<(NodeId, RosterId)> {
+        let mut out: Vec<(NodeId, RosterId)> = self
+            .as_grantor
+            .iter()
+            .filter(|(_, lease)| {
+                matches!(lease.phase, GrantorPhase::Renewing | GrantorPhase::Revoking)
+                    && now.as_micros() < lease.lease_deadline.as_micros()
+            })
+            .map(|(peer, lease)| (*peer, lease.roster_id))
+            .collect();
+        out.sort_by_key(|(peer, _)| peer.as_u64());
+        out
+    }
+
+    /// Forces one live outgoing grant (`Renewing`) into `Revoking`,
+    /// emitting its Revoke: the coverage-timeout fence. The grantee stays
+    /// covered until it answers or the exclusion lapses — revocation is
+    /// never assumed, only observed or waited out.
+    pub fn revoke_peer(&mut self, peer: NodeId, now: Ticks) -> Vec<LeaseOutbound> {
+        let allowance = self.params.allowance(self.params.lease_duration);
+        let Some(lease) = self.as_grantor.get_mut(&peer) else {
+            return Vec::new();
+        };
+        if lease.phase != GrantorPhase::Renewing {
+            return Vec::new();
+        }
+        lease.phase = GrantorPhase::Revoking;
+        lease.out_seq = lease.out_seq.saturating_add(1);
+        lease.lease_deadline = now.advance_by(self.params.lease_duration.saturating_add(allowance));
+        vec![LeaseOutbound::new(
+            peer,
+            LeaseMessage::Revoke(LeaseRevoke {
+                roster_id: lease.roster_id,
+                attempt: lease.attempt,
+                seq: lease.out_seq,
+                grantor: self.local,
+            }),
+        )]
     }
 }
 
@@ -1796,12 +2227,19 @@ impl fmt::Display for RosterEvidence {
 // Tests: lifecycle, exactness, fencing, arithmetic (both directions).
 // ---------------------------------------------------------------------------
 
+impl Default for LeaseParams {
+    /// Deployment default (see [`LeaseParams::DEFAULT`]).
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TabletAuthority;
     use crate::ids::TabletEpoch;
     use crate::ids::WriteGuardGeneration;
-    use crate::TabletAuthority;
 
     const PARAMS: LeaseParams = LeaseParams {
         guard_duration: Duration::from_millis(2_500),
@@ -1860,7 +2298,7 @@ mod tests {
             let Some(engine) = engines.get_mut(&target) else {
                 continue;
             };
-            let (replies, _) = engine.receive(outbound.message.grantor(), outbound.message, now);
+            let (replies, _) = engine.receive(outbound.message.sender(), outbound.message, now);
             for reply in replies {
                 next.push((reply.target, reply));
             }
@@ -1882,6 +2320,7 @@ mod tests {
     fn tick_all(
         engines: &mut alloc_collections_BTreeMap<NodeId, RosterEngine>,
         thresh: CommitPosition,
+        committed: CommitPosition,
         now: Ticks,
     ) -> Vec<(NodeId, LeaseOutbound)> {
         let mut out = Vec::new();
@@ -1889,7 +2328,7 @@ mod tests {
         let ids: Vec<NodeId> = engines.keys().copied().collect();
         for id in ids {
             let engine = engines.get_mut(&id).expect("present");
-            let (traffic, _) = engine.tick(thresh, now);
+            let (traffic, _) = engine.tick(thresh, committed, now);
             for message in traffic {
                 out.push((message.target, message));
             }
@@ -1905,7 +2344,42 @@ mod tests {
         engines
     }
 
-    /// Runs Guard → GuardReply → Renew to stability for `roster` from
+    /// Advances all engines with full delivery in `step`-sized jumps
+    /// until node 1 renews node 2 (or `max_rounds` elapses). Renewals
+    /// flow every renew interval once active, so the loop always
+    /// terminates quickly when healthy. Returns the tick time of the
+    /// watched renewal round.
+    fn advance_to_renewal(
+        engines: &mut alloc_collections_BTreeMap<NodeId, RosterEngine>,
+        thresh: CommitPosition,
+        committed: CommitPosition,
+        start: u64,
+        step: u64,
+        max_rounds: u64,
+    ) -> u64 {
+        let mut now = start;
+        for _ in 0..max_rounds {
+            now += step;
+            let out = tick_all(engines, thresh, committed, Ticks::from_micros(now));
+            let watched = out.iter().any(|(target, message)| {
+                *target == NodeId::from_u64(2)
+                    && message.message.sender() == NodeId::from_u64(1)
+                    && matches!(message.message, LeaseMessage::Renew(_))
+            });
+            let outbox: Vec<(NodeId, LeaseOutbound)> = out;
+            let replies = pump(engines, outbox, Ticks::from_micros(now));
+            if watched {
+                // Settle the watched round's replies too, so acknowledgment
+                // counters reset and grantee holds extend from this round:
+                // silence starts from a fully-acknowledged state.
+                let _ = pump(engines, replies, Ticks::from_micros(now));
+                return now;
+            }
+        }
+        panic!("no watched renewal round flowed within {max_rounds} rounds");
+    }
+
+    /// Runs `Guard` → `GuardReply` → `Renew` to stability for `roster` from
     /// `announcer`, delivering everything. Returns the roster.
     fn stabilize(
         engines: &mut alloc_collections_BTreeMap<NodeId, RosterEngine>,
@@ -1914,13 +2388,22 @@ mod tests {
         thresh: CommitPosition,
         now: Ticks,
     ) -> Roster {
+        // Converged replication: every participant appended through `thresh`
+        // before activation, so every grantor vouches for it and the floor
+        // is exactly `thresh`.
+        for engine in engines.values_mut() {
+            engine.set_accepted(thresh);
+            engine.set_committed(thresh);
+        }
         let (roster, traffic) = engines
             .get_mut(&announcer)
             .expect("announcer")
-            .announce(announcer, responders, now)
+            .announce(announcer, responders, thresh, now)
             .expect("announce");
-        let mut outbox: Vec<(NodeId, LeaseOutbound)> =
-            traffic.into_iter().map(|message| (message.target, message)).collect();
+        let mut outbox: Vec<(NodeId, LeaseOutbound)> = traffic
+            .into_iter()
+            .map(|message| (message.target, message))
+            .collect();
         // Guard → GuardReply → Renew → RenewReply → stable. Bound the
         // rounds: the protocol converges in a fixed small number when
         // healthy; the bound only guards the test against livelock.
@@ -1997,10 +2480,10 @@ mod tests {
 
     #[test]
     fn allowance_covers_the_containment_inequality() {
-        // For several (L, ρ): 2·L·ρ ≤ 2·A, i.e. a grantee hold of L−A on
+        // For several (L, ρ): L·ρ ≤ A·(1−ρ), i.e. a grantee hold of L−A on
         // the slowest clock stays real-time inside a grantor exclusion
-        // of L+A on the fastest clock. Integer-exact, both directions
-        // checked against the closed form.
+        // of L+A on the fastest clock. Integer-exact in microseconds,
+        // both directions checked against the closed form.
         for (millis, ppm) in [
             (2_500u64, 0u32),
             (2_500, 1),
@@ -2015,18 +2498,20 @@ mod tests {
             };
             let duration = Duration::from_millis(millis);
             let allowance = params.allowance(duration);
-            let left = (millis as u128) * (ppm as u128);
-            let right = allowance.as_micros() * 1_000_000;
+            let micros = u128::from(millis) * 1_000;
+            let denom = u128::from(DRIFT_PPM_DENOMINATOR - ppm.min(DRIFT_PPM_DENOMINATOR - 1));
+            let left = micros * u128::from(ppm);
+            let right = allowance.as_micros() * denom;
             assert!(
                 left <= right,
-                "2·L·ρ ≤ 2·A fails for L={millis}ms ρ={ppm}ppm"
+                "L·ρ ≤ A·(1−ρ) fails for L={millis}ms ρ={ppm}ppm"
             );
             // Tightness: one microsecond less must fail unless the
             // allowance is already zero (exact bound, both directions).
             if !allowance.is_zero() {
                 let tight = allowance.as_micros() - 1;
                 assert!(
-                    left > tight * 1_000_000,
+                    left > tight * denom,
                     "allowance not tight for L={millis}ms ρ={ppm}ppm"
                 );
             }
@@ -2071,7 +2556,12 @@ mod tests {
         // Incarnation 2 ⇒ not first boot ⇒ quarantined at creation.
         let mut engine = engine(1, 2, Ticks::from_micros(0));
         let error = engine
-            .announce(NodeId::from_u64(1), vec![NodeId::from_u64(2)], Ticks::from_micros(0))
+            .announce(
+                NodeId::from_u64(1),
+                vec![NodeId::from_u64(2)],
+                CommitPosition::from_u64(10),
+                Ticks::from_micros(0),
+            )
             .expect_err("quarantined");
         assert!(matches!(error, RosterError::Quarantined { .. }));
     }
@@ -2086,7 +2576,12 @@ mod tests {
         let error = engines
             .get_mut(&NodeId::from_u64(1))
             .expect("node")
-            .announce(NodeId::from_u64(2), vec![NodeId::from_u64(3)], now)
+            .announce(
+                NodeId::from_u64(2),
+                vec![NodeId::from_u64(3)],
+                CommitPosition::from_u64(10),
+                now,
+            )
             .expect_err("not leader");
         assert_eq!(error, RosterError::NotLeader);
     }
@@ -2112,7 +2607,7 @@ mod tests {
             let stable = engines
                 .get(&NodeId::from_u64(node))
                 .expect("node")
-                .stable()
+                .stable(now)
                 .expect("stable");
             assert_eq!(stable.roster.id, roster.id);
             assert_eq!(stable.grants.len(), 3);
@@ -2122,12 +2617,12 @@ mod tests {
         let evidence = engines
             .get(&NodeId::from_u64(2))
             .expect("node")
-            .evidence(CommitPosition::from_u64(41));
+            .evidence(CommitPosition::from_u64(41), now);
         assert!(evidence.is_some());
         let thin = engines
             .get(&NodeId::from_u64(2))
             .expect("node")
-            .evidence(CommitPosition::from_u64(40));
+            .evidence(CommitPosition::from_u64(40), now);
         assert!(thin.is_none());
     }
 
@@ -2141,7 +2636,12 @@ mod tests {
         let (roster, traffic) = engines
             .get_mut(&NodeId::from_u64(1))
             .expect("node")
-            .announce(NodeId::from_u64(1), vec![NodeId::from_u64(2)], now)
+            .announce(
+                NodeId::from_u64(1),
+                vec![NodeId::from_u64(2)],
+                CommitPosition::from_u64(10),
+                now,
+            )
             .expect("announce");
         // Deliver only to node 2; node 3's Guard is "lost". Node 1's
         // pairing to node 3 stays Guarding.
@@ -2159,10 +2659,11 @@ mod tests {
         // Node 1's guard to node 3 times out → fresh attempt (new seq).
         // The ORIGINAL Guard to node 3 now arrives, impossibly late.
         let later = now.advance_by(PARAMS.guard_duration * 2);
-        let (retry_traffic, _) = engines
-            .get_mut(&NodeId::from_u64(1))
-            .expect("node")
-            .tick(CommitPosition::UNASSIGNED, later);
+        let (retry_traffic, _) = engines.get_mut(&NodeId::from_u64(1)).expect("node").tick(
+            CommitPosition::UNASSIGNED,
+            CommitPosition::UNASSIGNED,
+            later,
+        );
         assert!(
             retry_traffic
                 .iter()
@@ -2219,12 +2720,13 @@ mod tests {
             roster_id: engines
                 .get(&NodeId::from_u64(2))
                 .expect("node")
-                .stable()
+                .stable(now)
                 .expect("stable")
                 .roster
                 .id,
             attempt: LeaseAttemptId::new(NodeIncarnation::from_u64(2), 1),
             seq: 99,
+            committed: CommitPosition::from_u64(10),
             grantor: NodeId::from_u64(1),
         });
         let (out, events) = engines
@@ -2254,6 +2756,7 @@ mod tests {
             .announce(
                 NodeId::from_u64(1),
                 vec![NodeId::from_u64(3)],
+                CommitPosition::from_u64(12),
                 now,
             )
             .expect("re-announce");
@@ -2264,10 +2767,9 @@ mod tests {
             .map(|message| (message.target, message))
             .collect();
         assert!(
-            revokes.iter().any(|(_, message)| matches!(
-                message.message,
-                LeaseMessage::Revoke(_)
-            )),
+            revokes
+                .iter()
+                .any(|(_, message)| matches!(message.message, LeaseMessage::Revoke(_))),
             "superseded grants revoke, not expire"
         );
         let replies = pump(&mut engines, revokes, now);
@@ -2298,19 +2800,16 @@ mod tests {
         // Every node observes term 6 (new election).
         let mut outbox = Vec::new();
         for node in [1u64, 2, 3] {
-            let (traffic, _) = engines.get_mut(&NodeId::from_u64(node)).expect("node").reconcile(
-                authority(),
-                RosterTerm::from_u64(6),
-                voters(),
-                now,
-            );
+            let (traffic, _) = engines
+                .get_mut(&NodeId::from_u64(node))
+                .expect("node")
+                .reconcile(authority(), RosterTerm::from_u64(6), voters(), now);
             outbox.extend(traffic.into_iter().map(|message| (message.target, message)));
         }
         assert!(
-            outbox.iter().any(|(_, message)| matches!(
-                message.message,
-                LeaseMessage::Revoke(_)
-            )),
+            outbox
+                .iter()
+                .any(|(_, message)| matches!(message.message, LeaseMessage::Revoke(_))),
             "term rise emits revokes"
         );
         let _ = pump(&mut engines, outbox, now);
@@ -2320,7 +2819,7 @@ mod tests {
                 engines
                     .get(&NodeId::from_u64(node))
                     .expect("node")
-                    .stable()
+                    .stable(now)
                     .is_none(),
                 "old-term roster cannot stay stable across an election"
             );
@@ -2344,18 +2843,16 @@ mod tests {
             crate::ids::WriteGuardGeneration::from_u64(7),
         );
         for node in [1u64, 2, 3] {
-            let (traffic, _) = engines.get_mut(&NodeId::from_u64(node)).expect("node").reconcile(
-                moved,
-                RosterTerm::from_u64(5),
-                voters(),
-                now,
-            );
+            let (traffic, _) = engines
+                .get_mut(&NodeId::from_u64(node))
+                .expect("node")
+                .reconcile(moved, RosterTerm::from_u64(5), voters(), now);
             assert!(traffic.is_empty(), "voiding is local, no revokes needed");
             assert!(
                 engines
                     .get(&NodeId::from_u64(node))
                     .expect("node")
-                    .stable()
+                    .stable(now)
                     .is_none()
             );
         }
@@ -2379,7 +2876,7 @@ mod tests {
             let (_, events) = engines
                 .get_mut(&NodeId::from_u64(node))
                 .expect("node")
-                .tick(CommitPosition::UNASSIGNED, far);
+                .tick(CommitPosition::UNASSIGNED, CommitPosition::UNASSIGNED, far);
             assert!(
                 events.contains(&LeaseEvent::Expired),
                 "pairings lapse without renewal traffic"
@@ -2388,7 +2885,7 @@ mod tests {
                 engines
                     .get(&NodeId::from_u64(node))
                     .expect("node")
-                    .stable()
+                    .stable(far)
                     .is_none(),
                 "no stability without live grants"
             );
@@ -2397,11 +2894,19 @@ mod tests {
 
     #[test]
     fn roster_normalizes_responder_set() {
-        let id = RosterId::new(authority(), RosterTerm::from_u64(5), RosterGeneration::INITIAL);
+        let id = RosterId::new(
+            authority(),
+            RosterTerm::from_u64(5),
+            RosterGeneration::INITIAL,
+        );
         let roster = Roster::new(
             id,
             NodeId::from_u64(1),
-            vec![NodeId::from_u64(3), NodeId::from_u64(2), NodeId::from_u64(1)],
+            vec![
+                NodeId::from_u64(3),
+                NodeId::from_u64(2),
+                NodeId::from_u64(1),
+            ],
         )
         .expect("valid");
         // Leader removed from the literal set, remainder sorted.
@@ -2434,7 +2939,7 @@ mod tests {
         let stable = engines
             .get(&NodeId::from_u64(1))
             .expect("node")
-            .stable()
+            .stable(now)
             .expect("stable");
         assert_eq!(stable.floor, CommitPosition::from_u64(77));
         assert_eq!(stable.grants.len(), 3);
@@ -2454,11 +2959,1136 @@ mod tests {
         let evidence = engines
             .get(&NodeId::from_u64(2))
             .expect("node")
-            .evidence(CommitPosition::from_u64(12))
+            .evidence(CommitPosition::from_u64(12), now)
             .expect("evidence");
         let text = evidence.explain();
-        assert!(text.contains("grants=3/3"), "explains grant count, got: {text}");
+        // Designated grantors only: leader 1 plus responder 2 (voter 3 is
+        // not designated and never grants, so its absence is correct).
+        assert!(
+            text.contains("grants=2/2"),
+            "explains grant count, got: {text}"
+        );
         assert!(text.contains("floor=10"), "explains floor, got: {text}");
-        assert!(text.contains("applied=12"), "explains coverage, got: {text}");
+        assert!(
+            text.contains("applied=12"),
+            "explains coverage, got: {text}"
+        );
+    }
+
+    /// The establishment gap, closed: a pairing guarded before a write
+    /// completes learns a covering floor from later renewals, which carry
+    /// the grantor's committed index. Guard-time accepted thresholds
+    /// alone would go stale across the gap.
+    #[test]
+    fn floor_advances_through_renew_committed() {
+        let now = Ticks::from_micros(0);
+        let mut engines = three_nodes(now);
+        stabilize(
+            &mut engines,
+            NodeId::from_u64(1),
+            vec![NodeId::from_u64(2), NodeId::from_u64(3)],
+            CommitPosition::from_u64(10),
+            now,
+        );
+        for node in [1u64, 2, 3] {
+            let floor = engines
+                .get(&NodeId::from_u64(node))
+                .expect("node")
+                .stable(now)
+                .expect("stable")
+                .floor;
+            assert_eq!(floor, CommitPosition::from_u64(10));
+        }
+        // A write commits everywhere (committed 41, accepted already past
+        // it); renewal rounds flowing every renew interval carry 41 to
+        // every grantee.
+        let _ = advance_to_renewal(
+            &mut engines,
+            CommitPosition::from_u64(10),
+            CommitPosition::from_u64(41),
+            0,
+            100_000,
+            200,
+        );
+        // Every floor advanced to the committed write without any new
+        // Guard: renewals, not re-grants, closed the gap.
+        for node in [1u64, 2, 3] {
+            let stable = engines
+                .get(&NodeId::from_u64(node))
+                .expect("node")
+                .stable(now)
+                .expect("stable");
+            assert_eq!(
+                stable.floor,
+                CommitPosition::from_u64(41),
+                "node {node} floor covers the committed write"
+            );
+            assert!(
+                engines
+                    .get(&NodeId::from_u64(node))
+                    .expect("node")
+                    .evidence(CommitPosition::from_u64(41), now)
+                    .is_some()
+            );
+            assert!(
+                engines
+                    .get(&NodeId::from_u64(node))
+                    .expect("node")
+                    .evidence(CommitPosition::from_u64(40), now)
+                    .is_none(),
+                "node {node} holds below the floor instead of serving thin"
+            );
+        }
+    }
+
+    /// The leader leg is load-bearing: a majority without the roster
+    /// leader's grant authorizes nothing, because leader-side responder
+    /// coverage — the write-completion gate — only covers the leader's
+    /// own grantees.
+    #[test]
+    fn stability_requires_leader_leg() {
+        let now = Ticks::from_micros(0);
+        let mut engines = three_nodes(now);
+        for engine in engines.values_mut() {
+            engine.set_accepted(CommitPosition::from_u64(10));
+            engine.set_committed(CommitPosition::from_u64(10));
+        }
+        let (_roster, traffic) = engines
+            .get_mut(&NodeId::from_u64(1))
+            .expect("node")
+            .announce(
+                NodeId::from_u64(1),
+                vec![NodeId::from_u64(2), NodeId::from_u64(3)],
+                CommitPosition::from_u64(10),
+                now,
+            )
+            .expect("announce");
+        // Partition the leader's Guard to node 2 (everything else flows).
+        let mut withheld = Vec::new();
+        let mut outbox = Vec::new();
+        for message in traffic {
+            if message.target == NodeId::from_u64(2)
+                && message.message.sender() == NodeId::from_u64(1)
+                && matches!(message.message, LeaseMessage::Guard(_))
+            {
+                withheld.push((message.target, message));
+            } else {
+                outbox.push((message.target, message));
+            }
+        }
+        assert_eq!(withheld.len(), 1, "exactly the leader Guard is held");
+        for _ in 0..8 {
+            if outbox.is_empty() {
+                break;
+            }
+            outbox = pump(&mut engines, outbox, now);
+        }
+        // Node 2 holds a voter majority (self + node 3) yet nothing is
+        // stable there: the leader never granted it.
+        let grants = engines.get(&NodeId::from_u64(2)).expect("node").stable(now);
+        assert!(
+            grants.is_none(),
+            "majority without the leader leg authorizes nothing"
+        );
+        assert!(
+            engines
+                .get(&NodeId::from_u64(2))
+                .expect("node")
+                .evidence(CommitPosition::from_u64(10), now)
+                .is_none()
+        );
+        // The partition heals: the leader's Guard arrives, the leg forms,
+        // stability follows.
+        let mut outbox = withheld;
+        for _ in 0..8 {
+            if outbox.is_empty() {
+                break;
+            }
+            outbox = pump(&mut engines, outbox, now);
+        }
+        let stable = engines
+            .get(&NodeId::from_u64(2))
+            .expect("node")
+            .stable(now)
+            .expect("leader leg completes the majority");
+        assert_eq!(stable.grants.len(), 3);
+    }
+
+    /// A non-designated voter may hold a coincidental majority yet never
+    /// read: rosters authorize their responders, and the read layer checks
+    /// designation even when the stability quorum holds.
+    #[test]
+    fn non_responder_holds_majority_but_never_reads() {
+        let now = Ticks::from_micros(0);
+        let mut engines = three_nodes(now);
+        stabilize(
+            &mut engines,
+            NodeId::from_u64(1),
+            vec![NodeId::from_u64(2)],
+            CommitPosition::from_u64(10),
+            now,
+        );
+        // Node 3 (voter, not responder) holds live pairings from the
+        // leader and node 2 — a full stability quorum — yet:
+        let stable = engines.get(&NodeId::from_u64(3)).expect("node").stable(now);
+        assert!(stable.is_some(), "quorum arithmetic alone holds for node 3");
+        assert!(
+            engines
+                .get(&NodeId::from_u64(3))
+                .expect("node")
+                .evidence(CommitPosition::from_u64(100), now)
+                .is_none(),
+            "a non-responder never serves, however covered"
+        );
+    }
+
+    /// Revoke lost: the grantor's exclusion strictly outlasts the
+    /// grantee's hold (asymmetric deadlines), so the revoked responder
+    /// stops serving before the writer stops covering it.
+    #[test]
+    fn revoke_lost_holds_exclusion_past_grantee_lapse() {
+        let now = Ticks::from_micros(0);
+        let mut engines = three_nodes(now);
+        stabilize(
+            &mut engines,
+            NodeId::from_u64(1),
+            vec![NodeId::from_u64(2)],
+            CommitPosition::from_u64(10),
+            now,
+        );
+        // Explicit fence of node 2; the Revoke itself is lost.
+        let revokes = engines
+            .get_mut(&NodeId::from_u64(1))
+            .expect("node")
+            .revoke_peer(NodeId::from_u64(2), now);
+        assert_eq!(revokes.len(), 1);
+        let _ = revokes;
+        // Grantee hold lapses first: node 2 loses stability while node 1
+        // still excludes (still covers) node 2.
+        let hold_lapse = Ticks::from_micros(2_497_497);
+        let (_, events) = engines.get_mut(&NodeId::from_u64(2)).expect("node").tick(
+            CommitPosition::from_u64(10),
+            CommitPosition::from_u64(10),
+            hold_lapse,
+        );
+        assert!(events.contains(&LeaseEvent::Expired));
+        assert!(
+            engines
+                .get(&NodeId::from_u64(2))
+                .expect("node")
+                .stable(now)
+                .is_none(),
+            "revoked responder stops serving at its hold"
+        );
+        let pairing = engines
+            .get(&NodeId::from_u64(1))
+            .expect("node")
+            .as_grantor
+            .get(&NodeId::from_u64(2))
+            .expect("exclusion persists")
+            .clone();
+        assert_eq!(pairing.phase, GrantorPhase::Revoking);
+        // Then the exclusion lapses: the writer stops covering node 2 only
+        // after node 2 provably cannot serve.
+        let exclusion_lapse = Ticks::from_micros(2_502_503);
+        let (_, events) = engines.get_mut(&NodeId::from_u64(1)).expect("node").tick(
+            CommitPosition::from_u64(10),
+            CommitPosition::from_u64(10),
+            exclusion_lapse,
+        );
+        assert!(events.contains(&LeaseEvent::Expired));
+        assert!(
+            !engines
+                .get(&NodeId::from_u64(1))
+                .expect("node")
+                .as_grantor
+                .contains_key(&NodeId::from_u64(2))
+        );
+    }
+
+    /// `RevokeReply` lost: the grantor stays `Revoking` (still covering)
+    /// until its exclusion deadline, then lapses — never assumed away.
+    #[test]
+    fn revoke_reply_lost_clears_grantor_on_timeout() {
+        let now = Ticks::from_micros(0);
+        let mut engines = three_nodes(now);
+        stabilize(
+            &mut engines,
+            NodeId::from_u64(1),
+            vec![NodeId::from_u64(2)],
+            CommitPosition::from_u64(10),
+            now,
+        );
+        let revokes = engines
+            .get_mut(&NodeId::from_u64(1))
+            .expect("node")
+            .revoke_peer(NodeId::from_u64(2), now);
+        // The Revoke arrives (grantee drops fast) but its reply is lost.
+        let outbox: Vec<(NodeId, LeaseOutbound)> = revokes
+            .into_iter()
+            .map(|message| (message.target, message))
+            .collect();
+        let replies = pump(&mut engines, outbox, now);
+        assert!(
+            replies
+                .iter()
+                .any(|(target, message)| *target == NodeId::from_u64(1)
+                    && matches!(message.message, LeaseMessage::RevokeReply(_))),
+            "grantee answers fast; the reply is what gets lost"
+        );
+        let _ = replies;
+        // Just before the deadline the grantor still excludes (covers).
+        // (Other pairings may renew on cadence; the revoked one sends
+        // nothing more.)
+        let before = Ticks::from_micros(2_502_502);
+        let (traffic, _) = engines.get_mut(&NodeId::from_u64(1)).expect("node").tick(
+            CommitPosition::from_u64(10),
+            CommitPosition::from_u64(10),
+            before,
+        );
+        assert!(
+            traffic
+                .iter()
+                .all(|message| message.target != NodeId::from_u64(2)),
+            "revoked pairing sends nothing more"
+        );
+        assert_eq!(
+            engines
+                .get(&NodeId::from_u64(1))
+                .expect("node")
+                .as_grantor
+                .get(&NodeId::from_u64(2))
+                .expect("still covering")
+                .phase,
+            GrantorPhase::Revoking
+        );
+        // At the deadline it lapses with an Expired event.
+        let (_, events) = engines.get_mut(&NodeId::from_u64(1)).expect("node").tick(
+            CommitPosition::from_u64(10),
+            CommitPosition::from_u64(10),
+            Ticks::from_micros(2_502_503),
+        );
+        assert!(events.contains(&LeaseEvent::Expired));
+    }
+
+    /// Expiry is strict at equality on both sides, and the grantor's
+    /// exclusion outlasts the grantee's hold by construction. Probes run
+    /// on clones so the measured engines stay pristine.
+    #[test]
+    fn expiry_boundary_is_strict_at_equality() {
+        let now = Ticks::from_micros(0);
+        let mut engines = three_nodes(now);
+        stabilize(
+            &mut engines,
+            NodeId::from_u64(1),
+            vec![NodeId::from_u64(2), NodeId::from_u64(3)],
+            CommitPosition::from_u64(10),
+            now,
+        );
+        // First-renewal holds lapse at L−A on every node: one microsecond
+        // before, every node is stable.
+        for node in [1u64, 2, 3] {
+            let mut probe = engines.get(&NodeId::from_u64(node)).expect("node").clone();
+            let (_, events) = probe.tick(
+                CommitPosition::from_u64(10),
+                CommitPosition::from_u64(10),
+                Ticks::from_micros(2_497_496),
+            );
+            assert!(!events.contains(&LeaseEvent::Expired));
+            assert!(
+                probe.stable(Ticks::from_micros(2_497_496)).is_some(),
+                "node {node} stable before the hold"
+            );
+        }
+        // At equality the holds lapse everywhere at once.
+        let mut probe = engines.get(&NodeId::from_u64(2)).expect("node").clone();
+        let (_, events) = probe.tick(
+            CommitPosition::from_u64(10),
+            CommitPosition::from_u64(10),
+            Ticks::from_micros(2_497_497),
+        );
+        assert!(events.contains(&LeaseEvent::Expired));
+        assert!(probe.stable(Ticks::from_micros(2_497_497)).is_none());
+        // The grantor still excludes past that point (its loose
+        // first-renewal exclusion runs far longer).
+        assert_eq!(
+            engines
+                .get(&NodeId::from_u64(1))
+                .expect("node")
+                .as_grantor
+                .get(&NodeId::from_u64(2))
+                .expect("exclusion persists")
+                .phase,
+            GrantorPhase::Renewing
+        );
+    }
+
+    /// Smallest real-time delta with `floor(delta * num / den) >= need`:
+    /// the lapse point of a deadline `need` (local µs) under clock rate
+    /// `num/den`. Integer-exact (`u128` math, ceiling division).
+    fn lapse_delta(need: u64, num: u64, den: u64) -> u64 {
+        let top = u128::from(need) * u128::from(den);
+        let step = u128::from(num);
+        u64::try_from(top.div_ceil(step)).unwrap_or(u64::MAX)
+    }
+
+    /// Clock reading at real time `real` for a clock synchronized at
+    /// `start` and running at rate `num/den` since.
+    fn skewed_from(start: u64, real: u64, num: u64, den: u64) -> u64 {
+        start + (real - start) * num / den
+    }
+
+    /// Opposite maximum drift preserves containment: with the grantor at
+    /// +ρ and the grantee at −ρ (the worst allowed combination), the
+    /// grantee's hold still lapses in real time strictly before the
+    /// grantor's exclusion. Skew applies from the silence start (clocks
+    /// were synchronized through the last renewal); lapse points derive
+    /// from the live deadlines in state, proving the allowance bound
+    /// sufficient for every steady state, not one hand-picked instant.
+    #[test]
+    fn opposite_max_drift_preserves_containment() {
+        let now = Ticks::from_micros(0);
+        let mut engines = three_nodes(now);
+        stabilize(
+            &mut engines,
+            NodeId::from_u64(1),
+            vec![NodeId::from_u64(2), NodeId::from_u64(3)],
+            CommitPosition::from_u64(10),
+            now,
+        );
+        // Steady renewals with synchronized clocks; silence starts right
+        // after a delivered renewal round.
+        let start = advance_to_renewal(
+            &mut engines,
+            CommitPosition::from_u64(10),
+            CommitPosition::from_u64(10),
+            0,
+            100_000,
+            200,
+        );
+        let grantor_deadline = engines
+            .get(&NodeId::from_u64(1))
+            .expect("node")
+            .as_grantor
+            .get(&NodeId::from_u64(2))
+            .expect("pairing")
+            .lease_deadline
+            .as_micros();
+        let grantee_deadline = engines
+            .get(&NodeId::from_u64(2))
+            .expect("node")
+            .as_grantee
+            .iter()
+            .filter(|((grantor, _), lease)| {
+                *grantor == NodeId::from_u64(1) && lease.phase == GranteePhase::Renewed
+            })
+            .map(|(_, lease)| lease.lease_deadline.as_micros())
+            .next()
+            .expect("live hold");
+        assert!(grantor_deadline > start && grantee_deadline > start);
+        let need_grantor = grantor_deadline - start;
+        let need_grantee = grantee_deadline - start;
+        // Renewals flow every renew interval while holds last ~lease, so
+        // the exclusion always outlasts the hold by ~2 allowances here.
+        assert!(need_grantor > need_grantee);
+        // Real-time lapse points under ±1000ppm from the silence start.
+        let grantee_lapse = start + lapse_delta(need_grantee, 999, 1_000);
+        let grantor_lapse = start + lapse_delta(need_grantor, 1_001, 1_000);
+        assert!(
+            grantee_lapse < grantor_lapse,
+            "containment holds at maximum allowed drift"
+        );
+        // Grantee live one real microsecond before its lapse (fresh
+        // clones: probing must not mutate the measured engines).
+        let mut probe = engines.get(&NodeId::from_u64(2)).expect("node").clone();
+        let at = Ticks::from_micros(skewed_from(start, grantee_lapse - 1, 999, 1_000));
+        let (_, events) = probe.tick(
+            CommitPosition::from_u64(10),
+            CommitPosition::from_u64(10),
+            at,
+        );
+        assert!(!events.contains(&LeaseEvent::Expired));
+        assert!(probe.stable(at).is_some());
+        // Lapsed exactly at its point.
+        let mut probe = engines.get(&NodeId::from_u64(2)).expect("node").clone();
+        let at = Ticks::from_micros(skewed_from(start, grantee_lapse, 999, 1_000));
+        let (_, events) = probe.tick(
+            CommitPosition::from_u64(10),
+            CommitPosition::from_u64(10),
+            at,
+        );
+        assert!(events.contains(&LeaseEvent::Expired));
+        assert!(probe.stable(at).is_none());
+        // Grantor still excludes at its lapse-minus-one.
+        let mut probe = engines.get(&NodeId::from_u64(1)).expect("node").clone();
+        let _ = probe.tick(
+            CommitPosition::from_u64(10),
+            CommitPosition::from_u64(10),
+            Ticks::from_micros(skewed_from(start, grantor_lapse - 1, 1_001, 1_000)),
+        );
+        assert_eq!(
+            probe
+                .as_grantor
+                .get(&NodeId::from_u64(2))
+                .expect("still excluding")
+                .phase,
+            GrantorPhase::Renewing
+        );
+        // And lapses exactly at its point — strictly after the grantee.
+        let mut probe = engines.get(&NodeId::from_u64(1)).expect("node").clone();
+        let (_, events) = probe.tick(
+            CommitPosition::from_u64(10),
+            CommitPosition::from_u64(10),
+            Ticks::from_micros(skewed_from(start, grantor_lapse, 1_001, 1_000)),
+        );
+        assert!(events.contains(&LeaseEvent::Expired));
+    }
+
+    /// Drift beyond the contract inverts containment (negative control):
+    /// at ±2000ppm against a 1000ppm contract the grantor's exclusion
+    /// lapses first. The bound is load-bearing — without it, leases
+    /// promise nothing, which is why an untrusted bound disables the
+    /// backend instead of weakening it.
+    #[test]
+    fn drift_beyond_contract_inverts_containment() {
+        let now = Ticks::from_micros(0);
+        let mut engines = three_nodes(now);
+        stabilize(
+            &mut engines,
+            NodeId::from_u64(1),
+            vec![NodeId::from_u64(2), NodeId::from_u64(3)],
+            CommitPosition::from_u64(10),
+            now,
+        );
+        // Steady renewals with synchronized clocks; silence starts right
+        // after a delivered (1→2) renewal round.
+        let start = advance_to_renewal(
+            &mut engines,
+            CommitPosition::from_u64(10),
+            CommitPosition::from_u64(10),
+            0,
+            100_000,
+            200,
+        );
+        let grantor_deadline = engines
+            .get(&NodeId::from_u64(1))
+            .expect("node")
+            .as_grantor
+            .get(&NodeId::from_u64(2))
+            .expect("pairing")
+            .lease_deadline
+            .as_micros();
+        let grantee_deadline = engines
+            .get(&NodeId::from_u64(2))
+            .expect("node")
+            .as_grantee
+            .iter()
+            .filter(|((grantor, _), lease)| {
+                *grantor == NodeId::from_u64(1) && lease.phase == GranteePhase::Renewed
+            })
+            .map(|(_, lease)| lease.lease_deadline.as_micros())
+            .next()
+            .expect("live hold");
+        assert!(grantor_deadline > start && grantee_deadline > start);
+        let need_grantor = grantor_deadline - start;
+        let need_grantee = grantee_deadline - start;
+        // ±2000ppm against the 1000ppm contract inverts the lapse order:
+        // the grantor's exclusion lapses first.
+        let grantee_lapse = start + lapse_delta(need_grantee, 998, 1_000);
+        let grantor_lapse = start + lapse_delta(need_grantor, 1_002, 1_000);
+        assert!(
+            grantor_lapse < grantee_lapse,
+            "beyond-contract drift inverts containment"
+        );
+        // The grantor lapses while the grantee still (wrongly, under a
+        // violated contract) holds: exactly the overlap the drift bound
+        // exists to forbid.
+        let mut probe = engines.get(&NodeId::from_u64(1)).expect("node").clone();
+        let (_, events) = probe.tick(
+            CommitPosition::from_u64(10),
+            CommitPosition::from_u64(10),
+            Ticks::from_micros(skewed_from(start, grantor_lapse, 1_002, 1_000)),
+        );
+        assert!(events.contains(&LeaseEvent::Expired));
+        let mut probe = engines.get(&NodeId::from_u64(2)).expect("node").clone();
+        let _ = probe.tick(
+            CommitPosition::from_u64(10),
+            CommitPosition::from_u64(10),
+            Ticks::from_micros(skewed_from(start, grantor_lapse, 998, 1_000)),
+        );
+        assert!(
+            probe
+                .stable(Ticks::from_micros(skewed_from(
+                    start,
+                    grantor_lapse,
+                    998,
+                    1_000
+                )))
+                .is_some(),
+            "grantee still holds past the grantor lapse: overlap"
+        );
+    }
+
+    /// Full-cluster restart: every engine recreated (new incarnations) is
+    /// quarantined — announcements refused, Guards refused, nothing
+    /// stable — until the fence lapses, after which activation converges
+    /// exactly like first boot.
+    #[test]
+    fn full_cluster_restart_quarantines_every_grant() {
+        let now = Ticks::from_micros(0);
+        let mut engines = three_nodes(now);
+        stabilize(
+            &mut engines,
+            NodeId::from_u64(1),
+            vec![NodeId::from_u64(2), NodeId::from_u64(3)],
+            CommitPosition::from_u64(10),
+            now,
+        );
+        // Crash everything: same node ids, fresh incarnations.
+        let mut rebooted = alloc_collections_BTreeMap::new();
+        for node in [1u64, 2, 3] {
+            rebooted.insert(
+                NodeId::from_u64(node),
+                RosterEngine::new(
+                    NodeId::from_u64(node),
+                    NodeIncarnation::from_u64(2),
+                    authority(),
+                    RosterTerm::from_u64(5),
+                    voters(),
+                    PARAMS,
+                    now,
+                ),
+            );
+        }
+        for engine in rebooted.values() {
+            assert!(engine.quarantined(now));
+        }
+        // Announcements refused while quarantined.
+        for node in [1u64, 2, 3] {
+            let error = rebooted
+                .get_mut(&NodeId::from_u64(node))
+                .expect("node")
+                .announce(
+                    NodeId::from_u64(node),
+                    vec![NodeId::from_u64(1)],
+                    CommitPosition::from_u64(10),
+                    now,
+                )
+                .expect_err("quarantined");
+            assert!(matches!(error, RosterError::Quarantined { .. }));
+        }
+        // A Guard from a survivor (first-boot temp announcer) is refused:
+        // a quarantined engine takes no lease-layer part at all.
+        let mut survivor = RosterEngine::new(
+            NodeId::from_u64(9),
+            NodeIncarnation::INITIAL,
+            authority(),
+            RosterTerm::from_u64(5),
+            vec![NodeId::from_u64(2), NodeId::from_u64(9)],
+            PARAMS,
+            now,
+        );
+        survivor.set_accepted(CommitPosition::from_u64(10));
+        survivor.set_committed(CommitPosition::from_u64(10));
+        let (_roster, traffic) = survivor
+            .announce(
+                NodeId::from_u64(9),
+                vec![NodeId::from_u64(2)],
+                CommitPosition::from_u64(10),
+                now,
+            )
+            .expect("first boot announces");
+        let guard = traffic
+            .into_iter()
+            .find(|message| message.target == NodeId::from_u64(2))
+            .expect("guard for node 2");
+        let (replies, events) = rebooted
+            .get_mut(&NodeId::from_u64(2))
+            .expect("node")
+            .receive(NodeId::from_u64(9), guard.message, now);
+        assert!(replies.is_empty());
+        assert!(events.contains(&LeaseEvent::StaleIgnored));
+        assert_eq!(
+            rebooted
+                .get(&NodeId::from_u64(2))
+                .expect("node")
+                .grantee_pairings(),
+            0
+        );
+        // Past the fence the cluster reactivates and stabilizes again.
+        let awake = now.advance_by(PARAMS.quarantine());
+        let roster = stabilize(
+            &mut rebooted,
+            NodeId::from_u64(1),
+            vec![NodeId::from_u64(2), NodeId::from_u64(3)],
+            CommitPosition::from_u64(10),
+            awake,
+        );
+        for node in [1u64, 2, 3] {
+            let stable = rebooted
+                .get(&NodeId::from_u64(node))
+                .expect("node")
+                .stable(awake)
+                .expect("reactivated");
+            assert_eq!(stable.roster.id, roster.id);
+        }
+    }
+
+    /// Delayed renewals after a grantor restart die twice: a renewal from
+    /// the new incarnation without a fresh Guard breaks attempt identity,
+    /// and a duplicated old renewal extends nothing past its deadline.
+    #[test]
+    fn delayed_renew_after_restart_extends_nothing() {
+        let now = Ticks::from_micros(0);
+        let mut engines = three_nodes(now);
+        stabilize(
+            &mut engines,
+            NodeId::from_u64(1),
+            vec![NodeId::from_u64(2)],
+            CommitPosition::from_u64(10),
+            now,
+        );
+        let deadline = engines
+            .get(&NodeId::from_u64(2))
+            .expect("node")
+            .as_grantee
+            .get(&(
+                NodeId::from_u64(1),
+                engines
+                    .get(&NodeId::from_u64(2))
+                    .expect("node")
+                    .stable(now)
+                    .expect("stable")
+                    .roster
+                    .id,
+            ))
+            .expect("pairing")
+            .lease_deadline;
+        // New-incarnation Renew without a fresh Guard: dead on arrival.
+        let roster_id = engines
+            .get(&NodeId::from_u64(2))
+            .expect("node")
+            .stable(now)
+            .expect("stable")
+            .roster
+            .id;
+        let forged = LeaseMessage::Renew(LeaseRenew {
+            roster_id,
+            attempt: LeaseAttemptId::new(NodeIncarnation::from_u64(2), 1),
+            seq: 99,
+            committed: CommitPosition::from_u64(10),
+            grantor: NodeId::from_u64(1),
+        });
+        let (out, events) = engines
+            .get_mut(&NodeId::from_u64(2))
+            .expect("node")
+            .receive(NodeId::from_u64(1), forged, now);
+        assert!(out.is_empty());
+        assert!(events.contains(&LeaseEvent::StaleIgnored));
+        // Exact resend of the last renewal: stale sequence, counted as
+        // stale (never re-extends).
+        let resend = LeaseMessage::Renew(LeaseRenew {
+            roster_id,
+            attempt: LeaseAttemptId::new(NodeIncarnation::from_u64(1), 1),
+            seq: 2,
+            committed: CommitPosition::from_u64(10),
+            grantor: NodeId::from_u64(1),
+        });
+        let (out, events) = engines
+            .get_mut(&NodeId::from_u64(2))
+            .expect("node")
+            .receive(NodeId::from_u64(1), resend, now);
+        assert!(out.is_empty());
+        assert!(events.contains(&LeaseEvent::StaleIgnored));
+        // Fresh sequence but no time progress: duplicate, counted, and
+        // the deadline does not move.
+        let duplicate = LeaseMessage::Renew(LeaseRenew {
+            roster_id,
+            attempt: LeaseAttemptId::new(NodeIncarnation::from_u64(1), 1),
+            seq: 3,
+            committed: CommitPosition::from_u64(10),
+            grantor: NodeId::from_u64(1),
+        });
+        let (out, events) = engines
+            .get_mut(&NodeId::from_u64(2))
+            .expect("node")
+            .receive(NodeId::from_u64(1), duplicate, now);
+        assert!(out.is_empty());
+        assert!(events.contains(&LeaseEvent::RenewDuplicate));
+        let after = engines
+            .get(&NodeId::from_u64(2))
+            .expect("node")
+            .as_grantee
+            .get(&(NodeId::from_u64(1), roster_id))
+            .expect("pairing")
+            .lease_deadline;
+        assert_eq!(after, deadline, "duplicates never extend a hold");
+    }
+
+    /// A `RenewReply` for anything but the exact open renewal dies: old
+    /// sequences and abandoned attempts can never tighten (or revive) a
+    /// pairing — the `PaxosLease` leftover-response hazard, structurally
+    /// closed.
+    #[test]
+    fn stale_renew_reply_for_old_sequence_dies() {
+        let now = Ticks::from_micros(0);
+        let mut engines = three_nodes(now);
+        stabilize(
+            &mut engines,
+            NodeId::from_u64(1),
+            vec![NodeId::from_u64(2)],
+            CommitPosition::from_u64(10),
+            now,
+        );
+        let roster_id = engines
+            .get(&NodeId::from_u64(1))
+            .expect("node")
+            .as_grantor
+            .get(&NodeId::from_u64(2))
+            .expect("pairing")
+            .roster_id;
+        let deadline = engines
+            .get(&NodeId::from_u64(1))
+            .expect("node")
+            .as_grantor
+            .get(&NodeId::from_u64(2))
+            .expect("pairing")
+            .lease_deadline;
+        // Old sequence for the live attempt.
+        let stale = LeaseMessage::RenewReply(LeaseRenewReply {
+            roster_id,
+            attempt: LeaseAttemptId::new(NodeIncarnation::from_u64(1), 1),
+            seq: 1,
+            grantee: NodeId::from_u64(2),
+            grantor: NodeId::from_u64(1),
+        });
+        let (out, events) = engines
+            .get_mut(&NodeId::from_u64(1))
+            .expect("node")
+            .receive(NodeId::from_u64(2), stale, now);
+        assert!(out.is_empty());
+        assert!(events.contains(&LeaseEvent::StaleIgnored));
+        // Abandoned attempt entirely.
+        let abandoned = LeaseMessage::RenewReply(LeaseRenewReply {
+            roster_id,
+            attempt: LeaseAttemptId::new(NodeIncarnation::from_u64(1), 99),
+            seq: 99,
+            grantee: NodeId::from_u64(2),
+            grantor: NodeId::from_u64(1),
+        });
+        let (out, events) = engines
+            .get_mut(&NodeId::from_u64(1))
+            .expect("node")
+            .receive(NodeId::from_u64(2), abandoned, now);
+        assert!(out.is_empty());
+        assert!(events.contains(&LeaseEvent::StaleIgnored));
+        let after = engines
+            .get(&NodeId::from_u64(1))
+            .expect("node")
+            .as_grantor
+            .get(&NodeId::from_u64(2))
+            .expect("pairing")
+            .lease_deadline;
+        assert_eq!(after, deadline, "stale replies move no deadline");
+    }
+
+    /// Voter removal drops pairings with the removed peer and recomputes
+    /// the majority over the survivors: stability survives with the new
+    /// quorum, and the removed grantor stops contributing to the floor.
+    #[test]
+    fn voter_removal_drops_pairings_and_recomputes_majority() {
+        let now = Ticks::from_micros(0);
+        let mut engines = three_nodes(now);
+        stabilize(
+            &mut engines,
+            NodeId::from_u64(1),
+            vec![NodeId::from_u64(2), NodeId::from_u64(3)],
+            CommitPosition::from_u64(10),
+            now,
+        );
+        let survivors = vec![NodeId::from_u64(1), NodeId::from_u64(2)];
+        for node in [1u64, 2] {
+            let (traffic, events) = engines
+                .get_mut(&NodeId::from_u64(node))
+                .expect("node")
+                .reconcile(authority(), RosterTerm::from_u64(5), survivors.clone(), now);
+            assert!(traffic.is_empty(), "removal is local");
+            assert!(events.contains(&LeaseEvent::Fenced));
+        }
+        let stable = engines
+            .get(&NodeId::from_u64(1))
+            .expect("node")
+            .stable(now)
+            .expect("survivor majority stabilizes");
+        assert_eq!(stable.grants.len(), 2);
+        assert!(!stable.grants.contains(&NodeId::from_u64(3)));
+        assert_eq!(stable.floor, CommitPosition::from_u64(10));
+        // The removed peer's pairings are gone on both sides.
+        assert!(
+            !engines
+                .get(&NodeId::from_u64(1))
+                .expect("node")
+                .as_grantor
+                .contains_key(&NodeId::from_u64(3))
+        );
+    }
+
+    /// Ticks node 1's grantor side at `at`, dropping all outbound
+    /// traffic (one silenced renewal round). Returns what would have
+    /// been sent plus the tick's events.
+    fn silent_grantor_tick(
+        engines: &mut alloc_collections_BTreeMap<NodeId, RosterEngine>,
+        at: u64,
+    ) -> (Vec<LeaseOutbound>, Vec<LeaseEvent>) {
+        engines.get_mut(&NodeId::from_u64(1)).expect("node").tick(
+            CommitPosition::from_u64(10),
+            CommitPosition::from_u64(10),
+            Ticks::from_micros(at),
+        )
+    }
+
+    /// Muted grantors keep excluding: after consecutive unacknowledged
+    /// renewals the grantor stops sending, but its exclusion still runs
+    /// to its deadline (covering writes), and the silenced grantee's
+    /// hold lapses strictly first. Writes stall boundedly, never
+    /// forever, and never uncover a live hold.
+    #[test]
+    fn muted_grantor_keeps_exclusion_then_expires() {
+        let now = Ticks::from_micros(0);
+        let mut engines = three_nodes(now);
+        stabilize(
+            &mut engines,
+            NodeId::from_u64(1),
+            vec![NodeId::from_u64(2)],
+            CommitPosition::from_u64(10),
+            now,
+        );
+        // Two renewal rounds go unanswered (replies dropped): the first
+        // two sends still emit (unacked 1, then 2 = the mute threshold).
+        // Renewals flow every renew interval once active.
+        let first = advance_to_renewal(
+            &mut engines,
+            CommitPosition::from_u64(10),
+            CommitPosition::from_u64(10),
+            0,
+            100_000,
+            200,
+        );
+        // Drop everything: from here node 2 hears nothing more.
+        for (round, want_unacked) in [(1u64, 1u32), (2, 2)] {
+            let at = first + round * 250_000;
+            let (traffic, _) = silent_grantor_tick(&mut engines, at);
+            assert!(
+                traffic
+                    .iter()
+                    .any(|message| message.target == NodeId::from_u64(2)),
+                "unmuted renewal still sends"
+            );
+            assert_eq!(
+                engines
+                    .get(&NodeId::from_u64(1))
+                    .expect("node")
+                    .as_grantor
+                    .get(&NodeId::from_u64(2))
+                    .expect("pairing")
+                    .unacked,
+                want_unacked
+            );
+        }
+        // Fourth round: muted — nothing addressed to node 2, Muted event,
+        // pairing still Renewing (still excluding).
+        let fourth = first + 3 * 250_000;
+        let (traffic, events) = silent_grantor_tick(&mut engines, fourth);
+        assert!(
+            traffic
+                .iter()
+                .all(|message| message.target != NodeId::from_u64(2)),
+            "muted grantor sends nothing to the silent grantee"
+        );
+        assert!(events.contains(&LeaseEvent::Muted));
+        assert_eq!(
+            engines
+                .get(&NodeId::from_u64(1))
+                .expect("node")
+                .as_grantor
+                .get(&NodeId::from_u64(2))
+                .expect("exclusion persists")
+                .phase,
+            GrantorPhase::Renewing
+        );
+        // The silenced grantee's hold lapsed long before the exclusion
+        // runs out (its last receipt was the first round).
+        let (_, events) = engines.get_mut(&NodeId::from_u64(2)).expect("node").tick(
+            CommitPosition::from_u64(10),
+            CommitPosition::from_u64(10),
+            Ticks::from_micros(first + 2_497_497),
+        );
+        assert!(events.contains(&LeaseEvent::Expired));
+        assert!(
+            engines
+                .get(&NodeId::from_u64(2))
+                .expect("node")
+                .stable(now)
+                .is_none(),
+            "silenced grantee holds nothing"
+        );
+        // Past the exclusion the pairing expires: writes proceed again.
+        let exclusion = engines
+            .get(&NodeId::from_u64(1))
+            .expect("node")
+            .as_grantor
+            .get(&NodeId::from_u64(2))
+            .expect("pairing")
+            .lease_deadline
+            .as_micros();
+        let (_, events) = engines.get_mut(&NodeId::from_u64(1)).expect("node").tick(
+            CommitPosition::from_u64(10),
+            CommitPosition::from_u64(10),
+            Ticks::from_micros(exclusion),
+        );
+        assert!(events.contains(&LeaseEvent::Expired));
+        assert!(
+            !engines
+                .get(&NodeId::from_u64(1))
+                .expect("node")
+                .as_grantor
+                .contains_key(&NodeId::from_u64(2))
+        );
+    }
+
+    /// Fail-closed serve under grantee stall: a hold past its deadline
+    /// authorizes nothing even when no tick has removed it yet. This is
+    /// the unit form of the TLA smoke hole (unprocessed-expired hold +
+    /// lapsed coverage + satisfied floor must not serve).
+    #[test]
+    fn stalled_grantee_hold_authorizes_nothing_without_tick() {
+        let now = Ticks::from_micros(0);
+        let mut engines = three_nodes(now);
+        stabilize(
+            &mut engines,
+            NodeId::from_u64(1),
+            vec![NodeId::from_u64(2), NodeId::from_u64(3)],
+            CommitPosition::from_u64(10),
+            now,
+        );
+        assert!(
+            engines
+                .get(&NodeId::from_u64(2))
+                .expect("node")
+                .stable(now)
+                .is_some()
+        );
+        // Past the hold with no tick anywhere: phases still Renewed, but
+        // the hold authorizes nothing.
+        let late = Ticks::from_micros(2_497_497);
+        let holder = engines.get(&NodeId::from_u64(2)).expect("node");
+        assert!(
+            holder
+                .as_grantee
+                .values()
+                .any(|lease| lease.phase == GranteePhase::Renewed),
+            "stall window: phases untouched, only time passed"
+        );
+        assert!(holder.stable(late).is_none());
+        assert!(
+            holder
+                .evidence(CommitPosition::from_u64(10), late)
+                .is_none()
+        );
+    }
+
+    /// Fail-closed coverage under grantor stall: an exclusion past its
+    /// deadline covers nothing even when no tick has removed it yet.
+    /// The writer must re-cover (or fence), never complete thin.
+    #[test]
+    fn stalled_grantor_exclusion_covers_nothing_without_tick() {
+        let now = Ticks::from_micros(0);
+        let mut engines = three_nodes(now);
+        stabilize(
+            &mut engines,
+            NodeId::from_u64(1),
+            vec![NodeId::from_u64(2), NodeId::from_u64(3)],
+            CommitPosition::from_u64(10),
+            now,
+        );
+        let leader = engines.get(&NodeId::from_u64(1)).expect("node");
+        assert!(!leader.covered_grantees(now).is_empty());
+        // Past the exclusion with no tick: phases still Renewing, but
+        // coverage is empty — fail closed, not thin. The first-renewal
+        // exclusion runs longer than the hold; read it live.
+        let exclusion = leader
+            .as_grantor
+            .get(&NodeId::from_u64(2))
+            .expect("pairing")
+            .lease_deadline;
+        let late = exclusion;
+        let leader = engines.get(&NodeId::from_u64(1)).expect("node");
+        assert!(
+            leader
+                .as_grantor
+                .values()
+                .any(|lease| lease.phase == GrantorPhase::Renewing),
+            "stall window: phases untouched, only time passed"
+        );
+        assert!(leader.covered_grantees(late).is_empty());
+    }
+
+    /// Asymmetric stall, end to end at the engine level: the grantor
+    /// processes its exclusion lapse while the grantee's tick starves.
+    /// Coverage is gone and the floor is satisfied, yet the stale holder
+    /// must not serve — the exact shape the TLA smoke trace exhibited
+    /// before the fail-closed checks.
+    #[test]
+    fn asymmetric_stall_never_serves_stale() {
+        let now = Ticks::from_micros(0);
+        let mut engines = three_nodes(now);
+        stabilize(
+            &mut engines,
+            NodeId::from_u64(1),
+            vec![NodeId::from_u64(2), NodeId::from_u64(3)],
+            CommitPosition::from_u64(10),
+            now,
+        );
+        // Only the grantor's tick runs: exclusions lapse (coverage gone)
+        // while the grantees starve with Renewed phases intact. Read the
+        // live exclusion deadline: the first-renewal exclusion outlasts
+        // the hold by construction.
+        let exclusion = engines
+            .get(&NodeId::from_u64(1))
+            .expect("node")
+            .as_grantor
+            .get(&NodeId::from_u64(2))
+            .expect("pairing")
+            .lease_deadline;
+        let late = exclusion;
+        let (_, events) = engines.get_mut(&NodeId::from_u64(1)).expect("node").tick(
+            CommitPosition::from_u64(10),
+            CommitPosition::from_u64(10),
+            late,
+        );
+        assert!(events.contains(&LeaseEvent::Expired));
+        assert!(
+            engines
+                .get(&NodeId::from_u64(1))
+                .expect("node")
+                .covered_grantees(late)
+                .is_empty()
+        );
+        let holder = engines.get(&NodeId::from_u64(2)).expect("node");
+        assert!(
+            holder
+                .as_grantee
+                .values()
+                .any(|lease| lease.phase == GranteePhase::Renewed),
+            "stall window: grantee phases untouched"
+        );
+        // Floor satisfied (floors folded committed 10 at activation, and
+        // applied 10 covers it) — yet no serve past the hold.
+        assert!(holder.stable(late).is_none());
+        assert!(
+            holder
+                .evidence(CommitPosition::from_u64(10), late)
+                .is_none()
+        );
     }
 }

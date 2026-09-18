@@ -1963,6 +1963,9 @@ impl Cluster {
     pub fn wait_node_state(&self, node_id: u64, state: &str, timeout: Duration) {
         let deadline = Instant::now() + timeout;
         let mut ticks = 0u32;
+        // Deep membership dumps are expensive (one RPC per stuck plan);
+        // heartbeat every poll, deep dump roughly every minute.
+        let mut last_deep: Option<Instant> = None;
         loop {
             let alive: Vec<u64> = (0..self.nodes.len())
                 .filter(|index| self.nodes[*index].child.is_some())
@@ -1989,6 +1992,10 @@ impl Cluster {
                 if ticks % 20 == 1 {
                     Self::drain_heartbeat(self, node_id, state, &alive, &json);
                 }
+            }
+            if last_deep.is_none_or(|dumped| dumped.elapsed() > Duration::from_secs(60)) {
+                last_deep = Some(Instant::now());
+                self.dump_stuck_plans(node_id);
             }
             assert!(
                 Instant::now() < deadline,
@@ -2072,9 +2079,64 @@ impl Cluster {
             || "none".to_owned(),
             |leader| self.nodes[leader].node_id.to_string(),
         );
+        let placement_version = json
+            .get("placement_version")
+            .map_or_else(String::new, ToString::to_string);
+        let generation = json
+            .get("generation")
+            .map_or_else(String::new, ToString::to_string);
         eprintln!(
-            "wait node {node_id} -> {state}: alive={alive:?} control_leader={leader} {placements} desire it, {live} live plans {phases:?} stuck={stuck:?}"
+            "wait node {node_id} -> {state}: alive={alive:?} control_leader={leader} placement_v={placement_version} gen={generation} {placements} desire it, {live} live plans {phases:?} stuck={stuck:?}"
         );
+    }
+
+    /// Deep drain-debug dump: for the first few non-terminal plans
+    /// touching `node_id`, log desired vs actual membership plus the
+    /// observed leader, so a stall names its exact gate (catch-up lag,
+    /// joint membership, leadership transfer, or retirement). Bounded
+    /// and best-effort: never panics, never blocks the waiter.
+    fn dump_stuck_plans(&self, node_id: u64) {
+        let Some(index) = (0..self.nodes.len()).find(|index| self.nodes[*index].child.is_some())
+        else {
+            return;
+        };
+        let (_, control) = self.admin_get(index, "/v1/control");
+        let plans: Vec<(u64, u64, String, u64, u64)> = control
+            .get("migrations")
+            .and_then(Value::as_array)
+            .map(|plans| {
+                plans
+                    .iter()
+                    .filter(|plan| {
+                        !matches!(
+                            plan.get("phase").and_then(Value::as_str),
+                            Some("Completed" | "Failed")
+                        ) && (plan.get("from").and_then(Value::as_u64) == Some(node_id)
+                            || plan.get("to").and_then(Value::as_u64) == Some(node_id))
+                    })
+                    .take(4)
+                    .map(|plan| {
+                        (
+                            plan.get("id").and_then(Value::as_u64).unwrap_or(0),
+                            plan.get("tablet").and_then(Value::as_u64).unwrap_or(0),
+                            plan.get("phase")
+                                .and_then(Value::as_str)
+                                .unwrap_or("?")
+                                .to_owned(),
+                            plan.get("from").and_then(Value::as_u64).unwrap_or(0),
+                            plan.get("to").and_then(Value::as_u64).unwrap_or(0),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (id, tablet, phase, from, to) in plans {
+            let (status, membership) =
+                self.admin_get(index, &format!("/v1/tablets/{tablet}/membership"));
+            eprintln!(
+                "DRAIN-DEBUG plan={id} tablet={tablet} phase={phase} {from}->{to} membership_status={status} membership={membership}"
+            );
+        }
     }
 
     /// Removes a safely drained node (fails loudly otherwise).

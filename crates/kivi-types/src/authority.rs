@@ -10,7 +10,7 @@ use core::fmt;
 use crate::ids::{TabletEpoch, TabletId, WriteGuardGeneration};
 
 /// The full fencing identity of one authoritative tablet range.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TabletAuthority {
     tablet: TabletId,
     epoch: TabletEpoch,

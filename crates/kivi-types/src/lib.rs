@@ -26,14 +26,15 @@ pub mod ids;
 pub mod names;
 pub mod position;
 pub mod reads;
+pub mod roster;
 pub mod time;
 
 pub use authority::{AuthorityMismatch, TabletAuthority};
 pub use consistency::{
-    AT_LEAST_WAIT_CAP, AuthorityTransition, ConsistencyMetrics, ConsistencySnapshot,
-    DEFAULT_PROOF_TTL, FreshnessReceipt, FreshnessReject, LeaseInvalid, ReadAuthorityProvider,
-    ReadContext, ReadReceipt, ReplicaFreshness, RosterLease, STRONG_CACHE_CAP,
-    STRONG_CACHE_VALUE_CAP, ServePath, next_guard_for_move, reconcile_authority,
+    AT_LEAST_WAIT_CAP, AlrFence, AuthorityTransition, ConsistencyMetrics, ConsistencySnapshot,
+    CoverageReport, FreshnessReceipt, FreshnessReject, LeaseEligibility, LeaseInvalid,
+    ReadAuthorityProvider, ReadContext, ReadReceipt, ReplicaFreshness, RosterSummary,
+    STRONG_CACHE_CAP, STRONG_CACHE_VALUE_CAP, ServePath, next_guard_for_move, reconcile_authority,
 };
 pub use hash::{ChunkId, ManifestId, PartitionHash};
 pub use identity::{IdempotencyKey, MutationIdentity, RequestIdentity};
@@ -45,4 +46,11 @@ pub use ids::{
 pub use names::{MAX_NAMESPACE_NAME_LEN, NamespaceName, NamespaceNameError};
 pub use position::CommitToken;
 pub use reads::ReadContract;
+pub use roster::{
+    DRIFT_PPM_DENOMINATOR, GranteeLease, GranteePhase, GrantorLease, GrantorPhase, LeaseAttemptId,
+    LeaseEvent, LeaseGuard, LeaseGuardReply, LeaseMessage, LeaseOutbound, LeaseParamReject,
+    LeaseParams, LeaseRenew, LeaseRenewReply, LeaseRevoke, LeaseRevokeReply, MAX_DRIFT_PPM, Roster,
+    RosterEngine, RosterError, RosterEvidence, RosterGeneration, RosterId, RosterTerm,
+    StableRoster, majority_of,
+};
 pub use time::{Expiry, Ticks, UnixMicros};

@@ -25,6 +25,9 @@ pub enum GenerationExhausted {
     /// A node incarnation reached the end of its numbering space.
     #[error("node incarnation space exhausted")]
     NodeIncarnation,
+    /// A roster generation reached the end of its numbering space.
+    #[error("roster generation space exhausted")]
+    RosterGeneration,
 }
 
 /// Reported when an ordering or deduplication counter cannot advance past

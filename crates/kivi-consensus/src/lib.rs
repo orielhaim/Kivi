@@ -46,6 +46,7 @@
 //! tasks plus membership in the shared mesh — never a connection per
 //! group.
 
+pub mod alr;
 pub mod cluster;
 pub mod command;
 pub mod config;
@@ -68,12 +69,18 @@ pub mod transport;
 pub mod types;
 pub mod worker;
 
+pub use alr::AlrCoordinator;
 pub use cluster::{
     Bootstrap, BootstrapError, ClusterTopology, DurableClusterView, NodeDescriptor,
     TabletAssignment, TopologyError, classify_bootstrap, verify_against_durable,
 };
-pub use command::{CONSENSUS_COMMAND_VERSION, ConsensusCommand, ConsensusCommandError};
-pub use consistency::{CachedServe, ConsistencyHub, PlannedRead, ReadPlan, ServedRead, ServedScan};
+pub use command::{
+    ALR_FENCE_SYNC_VERSION, AlrFenceSync, CONSENSUS_COMMAND_VERSION, ConsensusCommand,
+    ConsensusCommandError,
+};
+pub use consistency::{
+    CachedServe, ConsistencyHub, LeaseDriveOut, PlannedRead, ReadPlan, ServedRead, ServedScan,
+};
 pub use control::{
     CATCH_UP_LAG_THRESHOLD, ObservationAuthority, ObservedMembership, ReconcileStep, caught_up,
     next_step, observation_authority, select_authoritative,
@@ -88,13 +95,15 @@ pub use node::{
 };
 pub use peer::{
     AuthReject, CAP_CONSENSUS_V2, CAP_SIDECAR_V1, DecodedH3Request, IncarnationTable,
-    PeerAppendRequest, PeerAppendResponse, PeerChunkRequest, PeerChunkResponse, PeerEntry,
-    PeerEntryPayload, PeerIdentity, PeerLogId, PeerManifestRequest, PeerManifestResponse,
+    LEASE_BATCH_CAP, LEASE_BATCH_VERSION, LEASE_ROSTER_CAP, PeerAlrSyncRequest,
+    PeerAlrSyncResponse, PeerAppendRequest, PeerAppendResponse, PeerChunkRequest,
+    PeerChunkResponse, PeerCoveragePoll, PeerCoverageReport, PeerEntry, PeerEntryPayload,
+    PeerIdentity, PeerLeaseBatch, PeerLogId, PeerManifestRequest, PeerManifestResponse,
     PeerPrepareRequest, PeerPreparedResponse, PeerRequest, PeerResponse, PeerRpcError,
     PeerSnapshotMeta, PeerSnapshotRequest, PeerSnapshotResponse, PeerVote, PeerVoteRequest,
     PeerVoteResponse, REQUIRED_CAPABILITIES, ValidatedPeer, decode_h3_request, decode_h3_response,
-    encode_h3_request, encode_h3_response, h3_media_type, h3_method, h3_request_path, id32_hex,
-    parse_id32_hex, route, validate_peer_headers,
+    encode_h3_request, encode_h3_response, encode_lease_message, h3_media_type, h3_method,
+    h3_request_path, id32_hex, parse_id32_hex, route, validate_peer_headers,
 };
 pub use preflight::{
     PreflightMetrics, PreflightMetricsSnapshot, PreflightOutcome, followers_needed,

@@ -491,7 +491,9 @@ async fn resolve_one_intent(
     let now = super::cluster::wall_now();
     let ctx = super::cluster::read_ctx();
     // Read the decision record (fiat-routed to the coordinator tablet;
-    // followers redirect and this pass skips).
+    // followers redirect and this pass skips). Lease-ineligible: 2PC
+    // decisions integrate with final participant outcomes, never with a
+    // roster fast path.
     let record = match node
         .read(
             intent.coordinator,
@@ -500,6 +502,7 @@ async fn resolve_one_intent(
             },
             kivi_types::ReadContract::Latest,
             ctx,
+            kivi_types::LeaseEligibility::ConservativeOnly,
         )
         .await
     {
@@ -682,6 +685,7 @@ async fn cas_abort_record(node: &Arc<ConsensusNode>, record: &kivi_state::TxnRec
             },
             kivi_types::ReadContract::Latest,
             ctx,
+            kivi_types::LeaseEligibility::ConservativeOnly,
         )
         .await
     else {

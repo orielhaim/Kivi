@@ -1,24 +1,38 @@
-//! First-class commit/freshness metadata for the consistency layer (RFC §66–§72,
-//! Phase 7).
+//! First-class commit/freshness metadata for the consistency layer.
 //!
 //! The consistency layer reasons about exactly four facts, and nothing else:
 //!
 //! ```text
 //! what this replica has applied ........... ReplicaFreshness::applied
 //! what authority that information belongs to  ReplicaFreshness::authority
-//! what commit/freshness evidence is known ... FreshnessReceipt / RosterLease
+//! what commit/freshness evidence is known ... FreshnessReceipt / RosterEvidence
 //! whether that evidence survives change .... authority-equality checks
 //! ```
 //!
 //! Wall-clock age is never equated with replication freshness: a locally old
 //! timestamp proves nothing about what the leader has committed. A replica may
 //! claim a staleness bound only when it holds [`FreshnessReceipt`] evidence —
-//! a recent authority proof (consensus barrier or valid [`RosterLease`]) —
-//! whose age on the caller's monotonic clock ([`Ticks`], always passed in,
-//! never read) fits the bound, whose authority still matches the current
-//! authority exactly, and whose coverage boundary the replica has applied.
-//! Without such evidence the replica escalates to the authority path or
-//! reports the bound unprovable; it never serves out-of-bound data as success.
+//! a recent authority proof (consensus barrier) — whose age on the caller's
+//! monotonic clock ([`Ticks`], always passed in, never read) fits the bound,
+//! whose authority still matches the current authority exactly, and whose
+//! coverage boundary the replica has applied. Without such evidence the
+//! replica escalates to the authority path or reports the bound unprovable;
+//! it never serves out-of-bound data as success.
+//!
+//! Strong (`Latest`) reads travel one of three mechanisms with identical
+//! external semantics and different assumptions:
+//!
+//! ```text
+//! ConservativeLeader ... fresh Raft barrier per read. No timing assumption.
+//! AlmostLocal .......... Lazy-ALR: opportunistic batch + ordered ReadSync
+//!                        (no state mutation). No timing assumption.
+//! RosterLease .......... Bodega-style directional roster leases. Assumes
+//!                        bounded clock-rate drift (explicit deployment
+//!                        contract); unavailable without it.
+//! ```
+//!
+//! Every mechanism falls back toward the conservative baseline on any
+//! uncertainty; a fallback never weakens the `Latest` contract.
 //!
 //! All types here are pure values: no I/O, no clocks, no randomness. The
 //! execution layer (`kivi-consensus::consistency`) owns the hub that stores
@@ -31,11 +45,6 @@ use crate::ids::{CommitPosition, NodeId, NodeIncarnation, TabletEpoch, TabletId}
 use crate::position::CommitToken;
 use crate::time::Ticks;
 use crate::{TabletAuthority, WriteGuardGeneration};
-
-/// How long an [`FreshnessReceipt`] or [`RosterLease`] age may be trusted
-/// when the caller supplies no tighter bound. Separate from any read
-/// contract: this caps internal fast-path reuse, never a client promise.
-pub const DEFAULT_PROOF_TTL: Duration = Duration::from_secs(2);
 
 /// Maximum entries in one tablet's strong cache. The cache is an
 /// optimization: eviction only costs a fallback, never correctness.
@@ -428,40 +437,45 @@ impl ReadContext {
     }
 }
 
-/// How a replica may establish read authority (RFC §69). The conservative
-/// path is always available; the fast paths reuse explicit evidence and
-/// fall back the moment that evidence is missing, stale, ambiguous, or
-/// invalidated. The external contract is identical under every mode: only
-/// the evidence — and the documented assumption behind reusing it — differs.
+/// How a replica may establish read authority. The conservative path is
+/// always available; the accelerators reuse explicit evidence and fall back
+/// the moment that evidence is missing, uncertain, or invalidated. The
+/// external contract is identical under every mode: only the mechanism —
+/// and the documented assumption behind it — differs.
+///
+/// Fallback chain (never a weakening; every layer serves the same `Latest`):
+///
+/// ```text
+/// RosterLease ──► AlmostLocal (Lazy-ALR) ──► ConservativeLeader barrier
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReadAuthorityProvider {
     /// Every `Latest` read proves leadership with a fresh quorum barrier.
     /// No timing assumption beyond the barrier itself; the baseline that
     /// can never be weakened.
     ConservativeLeader,
-    /// A replica that proved leadership within `max_proof_age` (a barrier
-    /// receipt on the same monotonic clock) may serve `Latest` from applied
-    /// state covering that receipt's boundary without a fresh barrier.
+    /// True asynchronous Lazy-ALR backend for Raft/SMR (LAW work): pending
+    /// reads batch opportunistically behind one lightweight ordered
+    /// [`AlrFence`] sync — ordering of a write, no state mutation — and
+    /// execute locally once the sync boundary is applied. A concurrent
+    /// write ordered after batch formation may subsume the extra sync.
     ///
-    /// Assumption: no conflicting leadership committed newer state inside
-    /// the window undetected — i.e. bounded message delay plus a timely
-    /// quorum. On any doubt (no receipt, aged receipt, authority movement,
-    /// coverage gap) the read takes a fresh barrier. Removing this mode
-    /// changes latency only, never semantics.
-    AlmostLocal {
-        /// Maximum receipt age trusted without a fresh barrier.
-        max_proof_age: Duration,
-    },
-    /// Any roster member holding a valid [`RosterLease`] may serve `Latest`
-    /// from applied state covering the lease floor without contacting the
-    /// leader.
+    /// No timing assumption. On any doubt (no boundary, coverage timeout,
+    /// lost leadership) the read takes a fresh barrier instead.
+    AlmostLocal,
+    /// True local linearizable reads under an explicit bounded-clock-drift
+    /// assumption (Bodega-style directional roster leases, see
+    /// [`crate::roster`]): a responder serves only with a stable roster —
+    /// same-roster valid grants from an intersecting majority plus local
+    /// applied state covering the quorum-derived safety floor.
     ///
-    /// Assumption: the lease grant's synchrony contract held — the issuer
-    /// fenced other writers for the lease duration and the holder's clock
-    /// stayed within skew of the issuer's. Expiry, incarnation change, or
-    /// authority movement voids the lease immediately; the holder falls
-    /// back to the conservative path. Restart loses memory-held leases, so
-    /// a restarted member never serves the fast path until re-granted.
+    /// Assumption: the deployment honors the configured
+    /// [`crate::roster::LeaseParams`] drift bound. If the bound cannot be
+    /// trusted the backend is unavailable and reads use Lazy-ALR or the
+    /// conservative barrier. Expiry, incarnation change, authority/term
+    /// movement, or missing floor coverage voids the fast path
+    /// immediately. Restart loses memory-held lease state, and the restart
+    /// quarantine fences re-granting until forgotten grants are unusable.
     RosterLease,
 }
 
@@ -469,111 +483,147 @@ impl fmt::Display for ReadAuthorityProvider {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ConservativeLeader => write!(f, "conservative-leader"),
-            Self::AlmostLocal { max_proof_age } => {
-                write!(f, "almost-local({}ms)", max_proof_age.as_millis())
-            }
+            Self::AlmostLocal => write!(f, "almost-local"),
             Self::RosterLease => write!(f, "roster-lease"),
         }
     }
 }
 
-/// Roster-based read authority (RFC §69, Bodega mode): the lease issuer
-/// (the leader, after quorum agreement) designates a subset of replicas as
-/// local linearizable responders for a bounded duration.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RosterLease {
-    /// Authority the lease was granted under. Any movement voids it.
-    pub authority: TabletAuthority,
-    /// Lease generation within the authority (monotonic; renewal advances
-    /// it so a delayed duplicate grant cannot resurrect an older lease).
-    pub generation: u64,
-    /// Designated responders, sorted ascending, deduplicated.
-    pub members: Vec<NodeId>,
-    /// Minimum applied coverage a holder must have to serve (the issuer's
-    /// committed floor at grant time). A holder behind the floor waits
-    /// (bounded) or falls back — it never serves thinner state as lease
-    /// authority.
-    pub floor: CommitPosition,
-    /// Monotonic expiry (`Ticks` of the issuer's clock domain). Valid while
-    /// `now < expires_at`; equality fails closed.
-    pub expires_at: Ticks,
-    /// Holder incarnation the lease was granted to. A restart mints a new
-    /// incarnation and voids every lease the old process held.
-    pub incarnation: NodeIncarnation,
+/// Whether one read may use the [`ReadAuthorityProvider::RosterLease`]
+/// fast path. Cross-tablet transactions and multi-tablet scans are not one
+/// global snapshot, so until responder coverage integrates with the final
+/// committed participant outcome those paths run lease-ineligible: they
+/// still use Lazy-ALR or the conservative barrier (same `Latest`
+/// semantics), they just never serve from a roster lease.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LeaseEligibility {
+    /// Point reads on one tablet: the roster fast path may serve.
+    Eligible,
+    /// Transactions, batches, scans: skip the roster fast path.
+    ConservativeOnly,
 }
 
-impl RosterLease {
-    /// Issues a lease, normalizing the roster (sorted, deduplicated).
+impl LeaseEligibility {
+    /// Whether a stable roster may serve this read.
     #[must_use]
-    pub fn new(
-        authority: TabletAuthority,
-        generation: u64,
-        members: Vec<NodeId>,
-        floor: CommitPosition,
-        expires_at: Ticks,
-        incarnation: NodeIncarnation,
-    ) -> Self {
-        let mut members = members;
-        members.sort();
-        members.dedup();
+    pub const fn lease_may_serve(self) -> bool {
+        match self {
+            Self::Eligible => true,
+            Self::ConservativeOnly => false,
+        }
+    }
+}
+
+impl fmt::Display for LeaseEligibility {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Eligible => write!(f, "lease-eligible"),
+            Self::ConservativeOnly => write!(f, "lease-ineligible"),
+        }
+    }
+}
+
+/// Identity of one Lazy-ALR synchronization: the fence that orders a batch
+/// of pending reads without mutating logical state.
+///
+/// A fence has the ordering properties of a write (one Raft log slot,
+/// committed by the same majority, applied in the same order) and the
+/// mutation footprint of nothing: applying it advances the applied pointer
+/// only. When a batch's fence — or a subsuming write ordered after batch
+/// formation — is locally applied, every write that completed before the
+/// batch formed is necessarily visible, so the whole batch executes
+/// locally under exact `Latest` semantics with no timing assumption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AlrFence {
+    /// Tablet whose ordered stream carries the fence.
+    pub tablet: TabletId,
+    /// Batch sequence within the tablet (monotonic per replica driver).
+    pub batch: u64,
+    /// Replica that formed the batch (diagnostics only, never authority).
+    pub requester: NodeId,
+}
+
+impl AlrFence {
+    /// Builds a fence identity from its three facts.
+    #[must_use]
+    pub const fn new(tablet: TabletId, batch: u64, requester: NodeId) -> Self {
         Self {
-            authority,
-            generation,
-            members,
-            floor,
-            expires_at,
-            incarnation,
+            tablet,
+            batch,
+            requester,
         }
-    }
-
-    /// Whether `node` in `incarnation` may serve under this lease at `now`
-    /// against `current` authority. Every failure names its check so the
-    /// holder falls back for the right reason and metrics stay meaningful.
-    ///
-    /// # Errors
-    ///
-    /// Returns lease-invalid rejection naming the failed check.
-    pub fn authorizes(
-        &self,
-        node: NodeId,
-        incarnation: NodeIncarnation,
-        current: &TabletAuthority,
-        now: Ticks,
-    ) -> Result<(), FreshnessReject> {
-        if !self.members.contains(&node) {
-            return Err(FreshnessReject::InvalidLease {
-                detail: LeaseInvalid::NotMember,
-            });
-        }
-        if self.incarnation.as_u64() != incarnation.as_u64() {
-            return Err(FreshnessReject::InvalidLease {
-                detail: LeaseInvalid::WrongIncarnation,
-            });
-        }
-        if self.authority.tablet().as_u64() != current.tablet().as_u64()
-            || self.authority.epoch().as_u64() != current.epoch().as_u64()
-            || self.authority.guard().as_u64() != current.guard().as_u64()
-        {
-            return Err(FreshnessReject::InvalidLease {
-                detail: LeaseInvalid::WrongAuthority,
-            });
-        }
-        if now.as_micros() >= self.expires_at.as_micros() {
-            return Err(FreshnessReject::InvalidLease {
-                detail: LeaseInvalid::Expired,
-            });
-        }
-        Ok(())
-    }
-
-    /// Whether `other` supersedes this lease (same authority, higher
-    /// generation): renewal installs, delayed duplicates die.
-    #[must_use]
-    pub const fn superseded_by(&self, other: &Self) -> bool {
-        other.generation > self.generation
     }
 }
 
+impl fmt::Display for AlrFence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "alr-fence(tablet {} batch {} requester {})",
+            self.tablet.as_u64(),
+            self.batch,
+            self.requester.as_u64(),
+        )
+    }
+}
+
+/// Responder write-coverage report: the answering replica applied through
+/// `applied` and can (when `healthy`) satisfy the logical read contract
+/// from that state — inline values, chunked roots with resolvable
+/// sidecars, and manifests alike. The leader gates external write success
+/// on these reports (see `ResponderCoverage` in the execution layer):
+/// internal Raft commit and externally completed write are separate
+/// moments, and linearizability is defined over the latter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CoverageReport {
+    /// Reporting replica.
+    pub responder: NodeId,
+    /// Process lifetime that applied the state (restart voids memory).
+    pub incarnation: NodeIncarnation,
+    /// Applied commit position through the index mapping (inclusive).
+    pub applied: CommitPosition,
+    /// Whether the replica can serve the logical contract from `applied`
+    /// (applied chunked roots resolve; no latched storage fault).
+    pub healthy: bool,
+}
+
+impl CoverageReport {
+    /// Builds a coverage report from its four facts.
+    #[must_use]
+    pub const fn new(
+        responder: NodeId,
+        incarnation: NodeIncarnation,
+        applied: CommitPosition,
+        healthy: bool,
+    ) -> Self {
+        Self {
+            responder,
+            incarnation,
+            applied,
+            healthy,
+        }
+    }
+
+    /// Whether this report covers a write committed at `commit`: the
+    /// responder applied at or beyond it and can serve from it. Anything
+    /// else means "wait or revoke", never "assume covered".
+    #[must_use]
+    pub const fn covers(&self, commit: CommitPosition) -> bool {
+        self.healthy && self.applied.as_u64() >= commit.as_u64()
+    }
+}
+
+impl fmt::Display for CoverageReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "coverage(responder {} applied {} healthy {})",
+            self.responder.as_u64(),
+            self.applied.as_u64(),
+            self.healthy,
+        )
+    }
+}
 /// Which path served a read, for operators, debug, and tests. Every fast
 /// path names the evidence that made it valid; every fallback names why.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -593,9 +643,14 @@ pub enum ServePath {
     AnyLocal,
     /// Served from the strong cache under a valid authority.
     StrongCache,
-    /// `Latest` served from a valid Almost-Local leadership receipt.
-    AlmostLocalProof,
-    /// `Latest` served under a valid roster lease.
+    /// `Latest` served after this read's Lazy-ALR batch committed its own
+    /// ordered fence and the fence applied locally.
+    AlrSync,
+    /// `Latest` served after a concurrent write ordered past batch
+    /// formation subsumed the extra fence (same boundary proof, one fewer
+    /// log entry).
+    AlrSubsumed,
+    /// `Latest` served under one stable roster with floor coverage.
     RosterLease,
 }
 
@@ -609,7 +664,8 @@ impl fmt::Display for ServePath {
             Self::BoundedStaleEscalated => write!(f, "bounded-stale-escalated"),
             Self::AnyLocal => write!(f, "any-local"),
             Self::StrongCache => write!(f, "strong-cache"),
-            Self::AlmostLocalProof => write!(f, "almost-local-proof"),
+            Self::AlrSync => write!(f, "alr-sync"),
+            Self::AlrSubsumed => write!(f, "alr-subsumed"),
             Self::RosterLease => write!(f, "roster-lease"),
         }
     }
@@ -644,16 +700,39 @@ pub struct ConsistencyMetrics {
     pub strong_cache_fallbacks: u64,
     /// Strong-cache invalidations on authority change.
     pub strong_cache_invalidations: u64,
-    /// Almost-Local fast-path hits.
-    pub almost_local_hits: u64,
-    /// Almost-Local fallbacks to the barrier.
-    pub almost_local_fallbacks: u64,
+    /// Lazy-ALR batches formed (one fence or subsumption per batch).
+    pub alr_batches: u64,
+    /// Reads executed inside Lazy-ALR batches.
+    pub alr_reads: u64,
+    /// ALR batches that committed their own fence entry.
+    pub alr_syncs: u64,
+    /// ALR batches whose fence was subsumed by a concurrent write.
+    pub alr_subsumed: u64,
+    /// ALR batches abandoned to the conservative barrier.
+    pub alr_fallbacks: u64,
     /// Roster-lease fast-path hits.
     pub roster_hits: u64,
-    /// Roster-lease fallbacks (invalid lease, coverage gap).
+    /// Roster-lease reads with a stable roster but floor coverage behind
+    /// (hold-or-fallback; never thin serves).
+    pub roster_holds: u64,
+    /// Roster-lease fallbacks (no stable roster, expiry, ineligible path).
     pub roster_fallbacks: u64,
+    /// Roster pairings lapsed on local timers.
+    pub roster_expiries: u64,
+    /// Strong writes gated on explicit responder coverage.
+    pub coverage_waits: u64,
+    /// Coverage gates that timed out (write failed retryable, responder
+    /// fenced) instead of acknowledging an uncovered write.
+    pub coverage_timeouts: u64,
     /// Authority/fencing rejections on the read path.
     pub fencing_rejects: u64,
+    /// Current stable-roster summary for status surfaces (`None` when no
+    /// roster is stable on this replica).
+    pub roster: Option<RosterSummary>,
+    /// Responders this replica must currently cover before completing a
+    /// strong write. Gauge (refreshed on snapshot from live engine
+    /// state, not accumulated).
+    pub covered_responders: u64,
 }
 
 impl ConsistencyMetrics {
@@ -688,12 +767,70 @@ impl ConsistencyMetrics {
             strong_cache_hits: self.strong_cache_hits,
             strong_cache_fallbacks: self.strong_cache_fallbacks,
             strong_cache_invalidations: self.strong_cache_invalidations,
-            almost_local_hits: self.almost_local_hits,
-            almost_local_fallbacks: self.almost_local_fallbacks,
+            alr_batches: self.alr_batches,
+            alr_reads: self.alr_reads,
+            alr_syncs: self.alr_syncs,
+            alr_subsumed: self.alr_subsumed,
+            alr_fallbacks: self.alr_fallbacks,
             roster_hits: self.roster_hits,
+            roster_holds: self.roster_holds,
             roster_fallbacks: self.roster_fallbacks,
+            roster_expiries: self.roster_expiries,
+            coverage_waits: self.coverage_waits,
+            coverage_timeouts: self.coverage_timeouts,
             fencing_rejects: self.fencing_rejects,
+            roster: self.roster,
+            covered_responders: self.covered_responders,
         }
+    }
+}
+
+/// Copy-safe stable-roster summary for status/admin surfaces: every number
+/// that makes one local serve safe, without naming the lease internals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RosterSummary {
+    /// Roster generation served under.
+    pub generation: u64,
+    /// Consensus term the roster is bound to.
+    pub term: u64,
+    /// Designated responders (leader plus listed set).
+    pub responders: u64,
+    /// Grants backing stability (distinct grantors, same roster).
+    pub grants: u64,
+    /// Majority count required over current voters.
+    pub required: u64,
+    /// Quorum-derived safety floor (inclusive commit position).
+    pub floor: CommitPosition,
+    /// Local applied position at snapshot time.
+    pub applied: CommitPosition,
+    /// Whether the lease engine is quarantined after (re)start.
+    pub quarantined: bool,
+}
+
+impl RosterSummary {
+    /// One-line operator/debug explanation: why reads under this roster
+    /// are safe, not just that a lease is "valid".
+    #[must_use]
+    pub fn explain(&self) -> String {
+        use core::fmt::Write as _;
+        let mut out = String::new();
+        let _ = write!(
+            out,
+            "served locally because roster-gen={} term={} grants={}/{} floor={} applied={}",
+            self.generation,
+            self.term,
+            self.grants,
+            self.required,
+            self.floor.as_u64(),
+            self.applied.as_u64(),
+        );
+        out
+    }
+}
+
+impl fmt::Display for RosterSummary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.explain())
     }
 }
 
@@ -724,16 +861,40 @@ pub struct ConsistencySnapshot {
     pub strong_cache_fallbacks: u64,
     /// Strong-cache invalidations on authority change.
     pub strong_cache_invalidations: u64,
-    /// Almost-Local fast-path hits.
-    pub almost_local_hits: u64,
-    /// Almost-Local fallbacks to the barrier.
-    pub almost_local_fallbacks: u64,
+    /// Lazy-ALR batches formed (one fence or subsumption per batch).
+    pub alr_batches: u64,
+    /// Reads executed inside Lazy-ALR batches.
+    pub alr_reads: u64,
+    /// ALR batches that committed their own fence entry.
+    pub alr_syncs: u64,
+    /// ALR batches whose fence was subsumed by a concurrent write.
+    pub alr_subsumed: u64,
+    /// ALR batches abandoned to the conservative barrier.
+    pub alr_fallbacks: u64,
     /// Roster-lease fast-path hits.
     pub roster_hits: u64,
-    /// Roster-lease fallbacks (invalid lease, coverage gap).
+    /// Roster-lease reads with a stable roster but floor coverage behind
+    /// (hold-or-fallback; never thin serves).
+    pub roster_holds: u64,
+    /// Roster-lease fallbacks (no stable roster, expiry, ineligible path).
     pub roster_fallbacks: u64,
+    /// Roster pairings lapsed on local timers.
+    pub roster_expiries: u64,
+    /// Strong writes gated on explicit responder coverage.
+    pub coverage_waits: u64,
+    /// Coverage gates that timed out (write failed retryable, responder
+    /// fenced) instead of acknowledging an uncovered write.
+    pub coverage_timeouts: u64,
     /// Authority/fencing rejections on the read path.
     pub fencing_rejects: u64,
+    /// Current stable-roster summary for status surfaces (`None` when no
+    /// roster is stable on this replica).
+    pub roster: Option<RosterSummary>,
+    /// Responders this replica must currently cover before completing a
+    /// strong write (live grantor exclusions: actively granting plus
+    /// revoking-but-unacknowledged). The write-completion gate blocks on
+    /// exactly this set.
+    pub covered_responders: u64,
 }
 
 /// Fencing composition of one tablet lineage (RFC §70, §194, §251).
@@ -1048,91 +1209,48 @@ mod tests {
     }
 
     #[test]
-    fn roster_lease_checks_run_member_incarnation_authority_expiry() {
-        let current = authority(3, 1, 1);
-        let incarnation = NodeIncarnation::from_u64(7);
-        let lease = RosterLease::new(
-            current,
-            4,
-            vec![NodeId::from_u64(2), NodeId::from_u64(1)],
-            CommitPosition::from_u64(9),
-            Ticks::from_micros(10_000),
-            incarnation,
+    fn coverage_reports_cover_only_healthy_applied_state() {
+        let report = CoverageReport::new(
+            NodeId::from_u64(2),
+            NodeIncarnation::from_u64(7),
+            CommitPosition::from_u64(41),
+            true,
         );
-        // Roster normalized on issue.
-        assert_eq!(
-            lease.members,
-            vec![NodeId::from_u64(1), NodeId::from_u64(2)]
+        assert!(report.covers(CommitPosition::from_u64(41)));
+        assert!(report.covers(CommitPosition::from_u64(40)));
+        assert!(!report.covers(CommitPosition::from_u64(42)));
+        // An unhealthy replica covers nothing, even past its applied
+        // pointer: it cannot satisfy the logical contract from that
+        // state (missing sidecars, latched fault).
+        let unhealthy = CoverageReport::new(
+            NodeId::from_u64(2),
+            NodeIncarnation::from_u64(7),
+            CommitPosition::from_u64(99),
+            false,
         );
-        let now = Ticks::from_micros(9_999);
+        assert!(!unhealthy.covers(CommitPosition::from_u64(41)));
         assert_eq!(
-            lease.authorizes(NodeId::from_u64(1), incarnation, &current, now),
-            Ok(())
-        );
-        // Non-member never serves the fast path.
-        assert_eq!(
-            lease.authorizes(NodeId::from_u64(9), incarnation, &current, now),
-            Err(FreshnessReject::InvalidLease {
-                detail: LeaseInvalid::NotMember
-            })
-        );
-        // Restart voids the old process's lease.
-        assert_eq!(
-            lease.authorizes(
-                NodeId::from_u64(1),
-                NodeIncarnation::from_u64(8),
-                &current,
-                now
-            ),
-            Err(FreshnessReject::InvalidLease {
-                detail: LeaseInvalid::WrongIncarnation
-            })
-        );
-        // Authority movement voids even unexpired leases.
-        let moved = authority(3, 1, 2);
-        assert_eq!(
-            lease.authorizes(NodeId::from_u64(1), incarnation, &moved, now),
-            Err(FreshnessReject::InvalidLease {
-                detail: LeaseInvalid::WrongAuthority
-            })
-        );
-        // Expiry is strict: equality fails closed.
-        assert_eq!(
-            lease.authorizes(
-                NodeId::from_u64(1),
-                incarnation,
-                &current,
-                Ticks::from_micros(10_000)
-            ),
-            Err(FreshnessReject::InvalidLease {
-                detail: LeaseInvalid::Expired
-            })
+            report.to_string(),
+            "coverage(responder 2 applied 41 healthy true)"
         );
     }
 
     #[test]
-    fn lease_renewal_supersedes_by_generation_only() {
-        let current = authority(3, 1, 1);
-        let incarnation = NodeIncarnation::from_u64(7);
-        let old = RosterLease::new(
-            current,
-            4,
-            vec![NodeId::from_u64(1)],
-            CommitPosition::FIRST,
-            Ticks::from_micros(10_000),
-            incarnation,
+    fn alr_fences_name_tablet_batch_and_requester() {
+        let fence = AlrFence::new(tablet(3), 17, NodeId::from_u64(2));
+        assert_eq!(fence.tablet, tablet(3));
+        assert_eq!(fence.batch, 17);
+        assert_eq!(
+            fence.to_string(),
+            "alr-fence(tablet 3 batch 17 requester 2)"
         );
-        let renewed = RosterLease::new(
-            current,
-            5,
-            vec![NodeId::from_u64(1)],
-            CommitPosition::from_u64(12),
-            Ticks::from_micros(20_000),
-            incarnation,
-        );
-        assert!(old.superseded_by(&renewed));
-        assert!(!renewed.superseded_by(&old));
-        assert!(!old.superseded_by(&old));
+    }
+
+    #[test]
+    fn lease_eligibility_gates_only_the_roster_path() {
+        assert!(LeaseEligibility::Eligible.lease_may_serve());
+        assert!(!LeaseEligibility::ConservativeOnly.lease_may_serve());
+        assert_eq!(LeaseEligibility::Eligible.to_string(), "lease-eligible");
     }
 
     #[test]
@@ -1206,11 +1324,8 @@ mod tests {
     #[test]
     fn provider_modes_name_their_assumptions() {
         assert_eq!(
-            ReadAuthorityProvider::AlmostLocal {
-                max_proof_age: Duration::from_millis(50)
-            }
-            .to_string(),
-            "almost-local(50ms)"
+            ReadAuthorityProvider::AlmostLocal.to_string(),
+            "almost-local"
         );
         assert_eq!(
             ReadAuthorityProvider::RosterLease.to_string(),
@@ -1219,6 +1334,37 @@ mod tests {
         assert_eq!(
             ReadAuthorityProvider::ConservativeLeader.to_string(),
             "conservative-leader"
+        );
+    }
+
+    #[test]
+    fn serve_paths_name_their_evidence() {
+        assert_eq!(ServePath::AlrSync.to_string(), "alr-sync");
+        assert_eq!(ServePath::AlrSubsumed.to_string(), "alr-subsumed");
+        assert_eq!(ServePath::RosterLease.to_string(), "roster-lease");
+    }
+
+    #[test]
+    fn roster_summaries_explain_why_a_read_is_safe() {
+        let summary = RosterSummary {
+            generation: 4,
+            term: 9,
+            responders: 3,
+            grants: 2,
+            required: 2,
+            floor: CommitPosition::from_u64(18291),
+            applied: CommitPosition::from_u64(18304),
+            quarantined: false,
+        };
+        let text = summary.explain();
+        assert!(
+            text.contains("grants=2/2"),
+            "explains grant count, got: {text}"
+        );
+        assert!(text.contains("floor=18291"), "explains floor, got: {text}");
+        assert!(
+            text.contains("applied=18304"),
+            "explains coverage, got: {text}"
         );
     }
 

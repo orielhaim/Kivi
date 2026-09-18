@@ -314,6 +314,80 @@ pub struct PeerPreparedResponse {
     pub manifest: [u8; 32],
 }
 
+/// Framing version of [`PeerLeaseBatch`] bodies. Version 2 adds the
+/// grantor committed index to renewals (floor input closing the
+/// establishment gap); version 1 decoders refuse it loudly instead of
+/// misreading positions.
+pub const LEASE_BATCH_VERSION: u16 = 2;
+
+/// Maximum lease-protocol messages per batch (a tick emits at most one
+/// message per live pairing; the cap only bounds a corrupt peer).
+pub const LEASE_BATCH_CAP: usize = 256;
+
+/// Maximum responders in one decoded roster (voter sets are small; the cap
+/// only bounds a corrupt peer, never a real roster).
+pub const LEASE_ROSTER_CAP: usize = 4096;
+
+/// One lease-protocol batch: the outbound traffic of one engine step,
+/// in emission order. Requests carry live traffic; responses piggyback
+/// the replies the receiver's engine step produced (every message
+/// typically answers at most once, so piggybacking halves the packet
+/// count; second-order messages ride the next tick, which converges in a
+/// fixed small number of rounds when healthy).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerLeaseBatch {
+    /// Lease messages, in emission order.
+    pub messages: Vec<kivi_types::LeaseMessage>,
+}
+
+/// Lazy-ALR sync request: a follower (or the leader for its own batch)
+/// asks the leader to order a boundary after batch formation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PeerAlrSyncRequest {
+    /// Batch fence identity (tablet, batch, requester).
+    pub fence_tablet: u64,
+    /// Batch sequence within the tablet.
+    pub batch: u64,
+    /// Replica that formed the batch.
+    pub requester: u64,
+    /// Former applied commit position at batch formation (same-log
+    /// coordinates; `0` before the first apply).
+    pub formation_applied: u64,
+}
+
+/// Lazy-ALR sync answer: the ordered boundary to wait for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PeerAlrSyncResponse {
+    /// Raft log index whose local apply covers the batch: either the
+    /// appended fence or a subsuming write ordered after formation.
+    pub boundary: u64,
+    /// Whether a concurrent write subsumed the extra fence entry.
+    pub subsumed: bool,
+}
+
+/// Responder-coverage poll: the leader asks one active responder whether
+/// it applied through `commit` and can serve from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PeerCoveragePoll {
+    /// Committed position the write needs covered (inclusive).
+    pub commit: u64,
+}
+
+/// Responder-coverage report: the answering replica's applied pointer
+/// plus whether it can serve the logical contract from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PeerCoverageReport {
+    /// Reporting replica.
+    pub responder: u64,
+    /// Process lifetime that applied the state.
+    pub incarnation: u64,
+    /// Applied commit position (inclusive).
+    pub applied: u64,
+    /// Whether the replica can serve from `applied` (chunked roots
+    /// resolve; no latched storage fault).
+    pub healthy: bool,
+}
+
 /// One peer RPC. H3 request streams carry these without any further
 /// transport envelope: the route selects the family, the body is the
 /// payload codec below. Pre-vote reuses the vote shape under its own
@@ -340,6 +414,18 @@ pub enum PeerRequest {
     /// logical state and creates no Raft decision; it is purely an
     /// optimization moving sidecar movement before the tiny root proposal.
     Prepare(PeerPrepareRequest),
+    /// Roster-lease traffic batch (control lane): Guard/Renew/Revoke and
+    /// their replies for one tablet group. Served on the owner thread
+    /// through the lease engine, never through Raft itself.
+    Lease(PeerLeaseBatch),
+    /// Lazy-ALR sync request (control lane): order a read boundary after
+    /// batch formation. Served on the leader's owner thread only;
+    /// followers answer refusal.
+    AlrSync(PeerAlrSyncRequest),
+    /// Responder-coverage poll (control lane): "have you applied through
+    /// this commit and can you serve from it". Served on the owner thread
+    /// from the state machine's applied pointer.
+    CoveragePoll(PeerCoveragePoll),
 }
 
 /// One consensus RPC response body.
@@ -359,6 +445,14 @@ pub enum PeerResponse {
     Chunk(PeerChunkResponse),
     /// Sidecar preflight answer (bulk lane): the root is durable locally.
     Prepared(PeerPreparedResponse),
+    /// Roster-lease traffic answer (control lane): the replies the
+    /// receiver's engine step produced for the requested messages.
+    Lease(PeerLeaseBatch),
+    /// Lazy-ALR sync answer (control lane): the ordered boundary.
+    AlrSync(PeerAlrSyncResponse),
+    /// Responder-coverage answer (control lane): applied pointer plus
+    /// servability.
+    Coverage(PeerCoverageReport),
 }
 
 /// Remote-side RPC failure: the peer decoded the request but its Raft
@@ -410,6 +504,17 @@ pub enum PeerCodecError {
         /// Human-readable cause.
         detail: String,
     },
+    /// A decoded roster identity is not fully valid (bad authority, term,
+    /// or generation half). The engine would refuse it; the codec refuses
+    /// it first so no invalid roster ever enters engine state.
+    #[error("invalid roster identity in lease payload")]
+    InvalidRoster,
+    /// A framing version this binary cannot speak.
+    #[error("unsupported peer payload version {found}")]
+    UnsupportedVersion {
+        /// Observed version.
+        found: u16,
+    },
 }
 
 fn push_u64(out: &mut Vec<u8>, value: u64) {
@@ -456,7 +561,7 @@ fn push_nodes(out: &mut Vec<u8>, nodes: &[(u64, String)]) {
     }
 }
 
-struct Reader<'a> {
+pub(crate) struct Reader<'a> {
     input: &'a [u8],
     at: usize,
 }
@@ -697,6 +802,12 @@ pub mod route {
     pub const SNAPSHOT_FRAG: &str = "snapshot-frag";
     /// Sidecar-preflight route suffix (bulk lane, per-group Raft route).
     pub const PREPARE: &str = "prepare";
+    /// Roster-lease batch route suffix (control lane, per-group route).
+    pub const LEASE: &str = "lease";
+    /// Lazy-ALR sync route suffix (control lane, per-group route).
+    pub const ALR_SYNC: &str = "alr-sync";
+    /// Responder-coverage poll route suffix (control lane, per-group route).
+    pub const COVERAGE: &str = "coverage";
 }
 
 /// Renders the H3 path for one request under `group`'s tablet. Manifest
@@ -713,6 +824,15 @@ pub fn h3_request_path(group_tablet: u64, request: &PeerRequest) -> String {
         }
         PeerRequest::Prepare(_) => {
             format!("/_kivi/raft/{group_tablet}/{}", route::PREPARE)
+        }
+        PeerRequest::Lease(_) => {
+            format!("/_kivi/raft/{group_tablet}/{}", route::LEASE)
+        }
+        PeerRequest::AlrSync(_) => {
+            format!("/_kivi/raft/{group_tablet}/{}", route::ALR_SYNC)
+        }
+        PeerRequest::CoveragePoll(_) => {
+            format!("/_kivi/raft/{group_tablet}/{}", route::COVERAGE)
         }
         PeerRequest::Manifest(request) => {
             format!("/_kivi/immutable/manifest/{}", id32_hex(&request.manifest))
@@ -733,6 +853,9 @@ pub const fn h3_media_type(request: &PeerRequest) -> &'static str {
         | PeerRequest::Append(_)
         | PeerRequest::Snapshot(_) => "application/vnd.kivi.raft",
         PeerRequest::Prepare(_) => "application/vnd.kivi.prepare",
+        PeerRequest::Lease(_) | PeerRequest::AlrSync(_) | PeerRequest::CoveragePoll(_) => {
+            "application/vnd.kivi.read"
+        }
         PeerRequest::Manifest(_) => "application/vnd.kivi.manifest",
         PeerRequest::Chunk(_) => "application/vnd.kivi.chunk",
     }
@@ -752,7 +875,10 @@ pub fn h3_method(request: &PeerRequest) -> http::Method {
         | PeerRequest::PreVote(_)
         | PeerRequest::Append(_)
         | PeerRequest::Snapshot(_)
-        | PeerRequest::Prepare(_) => http::Method::POST,
+        | PeerRequest::Prepare(_)
+        | PeerRequest::Lease(_)
+        | PeerRequest::AlrSync(_)
+        | PeerRequest::CoveragePoll(_) => http::Method::POST,
     }
 }
 
@@ -819,6 +945,22 @@ pub fn encode_h3_request(request: &PeerRequest, group_tablet: u64) -> (String, V
             out.extend_from_slice(&request.manifest);
             push_u64(&mut out, request.logical_len);
         }
+        PeerRequest::Lease(batch) => {
+            out.extend_from_slice(&LEASE_BATCH_VERSION.to_le_bytes());
+            push_u64(&mut out, batch.messages.len() as u64);
+            for message in &batch.messages {
+                encode_lease_message(&mut out, message);
+            }
+        }
+        PeerRequest::AlrSync(request) => {
+            push_u64(&mut out, request.fence_tablet);
+            push_u64(&mut out, request.batch);
+            push_u64(&mut out, request.requester);
+            push_u64(&mut out, request.formation_applied);
+        }
+        PeerRequest::CoveragePoll(request) => {
+            push_u64(&mut out, request.commit);
+        }
         PeerRequest::Manifest(_) | PeerRequest::Chunk(_) => {}
     }
     (path, out)
@@ -856,6 +998,16 @@ pub fn decode_h3_request(path: &str, body: &[u8]) -> Result<DecodedH3Request, Pe
             route::APPEND => PeerRequest::Append(decode_append_request(&mut reader)?),
             route::SNAPSHOT_FRAG => PeerRequest::Snapshot(decode_snapshot_request(&mut reader)?),
             route::PREPARE => PeerRequest::Prepare(decode_prepare_request(&mut reader)?),
+            route::LEASE => PeerRequest::Lease(decode_lease_batch(&mut reader)?),
+            route::ALR_SYNC => PeerRequest::AlrSync(PeerAlrSyncRequest {
+                fence_tablet: reader.u64()?,
+                batch: reader.u64()?,
+                requester: reader.u64()?,
+                formation_applied: reader.u64()?,
+            }),
+            route::COVERAGE => PeerRequest::CoveragePoll(PeerCoveragePoll {
+                commit: reader.u64()?,
+            }),
             _ => {
                 return Err(PeerCodecError::UnknownRoute {
                     route: path.to_owned(),
@@ -916,6 +1068,23 @@ pub fn encode_h3_response(response: &PeerResponse) -> Vec<u8> {
         PeerResponse::Prepared(response) => {
             out.extend_from_slice(&response.manifest);
         }
+        PeerResponse::Lease(batch) => {
+            out.extend_from_slice(&LEASE_BATCH_VERSION.to_le_bytes());
+            push_u64(&mut out, batch.messages.len() as u64);
+            for message in &batch.messages {
+                encode_lease_message(&mut out, message);
+            }
+        }
+        PeerResponse::AlrSync(response) => {
+            push_u64(&mut out, response.boundary);
+            out.push(u8::from(response.subsumed));
+        }
+        PeerResponse::Coverage(response) => {
+            push_u64(&mut out, response.responder);
+            push_u64(&mut out, response.incarnation);
+            push_u64(&mut out, response.applied);
+            out.push(u8::from(response.healthy));
+        }
         PeerResponse::Manifest(response) => {
             out.extend_from_slice(&response.canonical);
         }
@@ -953,6 +1122,25 @@ pub fn decode_h3_response(
             let manifest = reader.id32()?;
             PeerResponse::Prepared(PeerPreparedResponse { manifest })
         }
+        PeerRequest::Lease(_) => PeerResponse::Lease(decode_lease_batch(&mut reader)?),
+        PeerRequest::AlrSync(_) => PeerResponse::AlrSync(PeerAlrSyncResponse {
+            boundary: reader.u64()?,
+            subsumed: match reader.u8()? {
+                0 => false,
+                1 => true,
+                tag => return Err(PeerCodecError::BadTag { tag }),
+            },
+        }),
+        PeerRequest::CoveragePoll(_) => PeerResponse::Coverage(PeerCoverageReport {
+            responder: reader.u64()?,
+            incarnation: reader.u64()?,
+            applied: reader.u64()?,
+            healthy: match reader.u8()? {
+                0 => false,
+                1 => true,
+                tag => return Err(PeerCodecError::BadTag { tag }),
+            },
+        }),
         PeerRequest::Manifest(request) => PeerResponse::Manifest(PeerManifestResponse {
             manifest: request.manifest,
             canonical: body.to_vec(),
@@ -1027,6 +1215,197 @@ fn decode_prepare_request(reader: &mut Reader<'_>) -> Result<PeerPrepareRequest,
     Ok(PeerPrepareRequest {
         manifest: reader.id32()?,
         logical_len: reader.u64()?,
+    })
+}
+
+/// Decodes one lease batch body (request or response direction).
+///
+/// # Errors
+///
+/// Returns [`PeerCodecError`] on version mismatch, truncation, oversize
+/// declarations, undecodable messages, or trailing bytes.
+fn decode_lease_batch(reader: &mut Reader<'_>) -> Result<PeerLeaseBatch, PeerCodecError> {
+    let version = u16::from_le_bytes(reader.bytes(2)?.try_into().unwrap_or([0; 2]));
+    if version != LEASE_BATCH_VERSION {
+        return Err(PeerCodecError::UnsupportedVersion { found: version });
+    }
+    let count = reader.u64()?;
+    let count = usize::try_from(count).map_err(|_| PeerCodecError::Oversize { len: usize::MAX })?;
+    if count > LEASE_BATCH_CAP {
+        return Err(PeerCodecError::Oversize { len: count });
+    }
+    let mut messages = Vec::with_capacity(count.min(16));
+    for _ in 0..count {
+        messages.push(decode_lease_message(reader)?);
+    }
+    Ok(PeerLeaseBatch { messages })
+}
+
+/// Encodes one lease-protocol message: tag `u8` plus fixed `u64` fields
+/// (roster content carries a count-prefixed responder vec, capped on
+/// decode). Structural only — attempt identity, incarnation binding, and
+/// roster ordering are engine checks, never codec checks.
+pub fn encode_lease_message(out: &mut Vec<u8>, message: &kivi_types::LeaseMessage) {
+    use kivi_types::LeaseMessage as M;
+    fn push_roster_id(out: &mut Vec<u8>, id: kivi_types::RosterId) {
+        push_u64(out, id.authority.tablet().as_u64());
+        push_u64(out, id.authority.epoch().as_u64());
+        push_u64(out, id.authority.guard().as_u64());
+        push_u64(out, id.term.as_u64());
+        push_u64(out, id.generation.as_u64());
+    }
+    fn push_attempt(out: &mut Vec<u8>, attempt: kivi_types::LeaseAttemptId) {
+        push_u64(out, attempt.grantor_incarnation.as_u64());
+        push_u64(out, attempt.seq);
+    }
+    match message {
+        M::Guard(guard) => {
+            out.push(0);
+            push_roster_id(out, guard.roster.id);
+            push_u64(out, guard.roster.leader.as_u64());
+            push_u64(out, guard.roster.responders.len() as u64);
+            for responder in &guard.roster.responders {
+                push_u64(out, responder.as_u64());
+            }
+            push_u64(out, guard.thresh_accepted.as_u64());
+            push_attempt(out, guard.attempt);
+            push_u64(out, guard.seq);
+            push_u64(out, guard.grantor.as_u64());
+        }
+        M::GuardReply(reply) => {
+            out.push(1);
+            push_roster_id(out, reply.roster_id);
+            push_attempt(out, reply.attempt);
+            push_u64(out, reply.seq);
+            push_u64(out, reply.grantee.as_u64());
+            push_u64(out, reply.grantor.as_u64());
+        }
+        M::Renew(renew) => {
+            out.push(2);
+            push_roster_id(out, renew.roster_id);
+            push_attempt(out, renew.attempt);
+            push_u64(out, renew.seq);
+            push_u64(out, renew.committed.as_u64());
+            push_u64(out, renew.grantor.as_u64());
+        }
+        M::RenewReply(reply) => {
+            out.push(3);
+            push_roster_id(out, reply.roster_id);
+            push_attempt(out, reply.attempt);
+            push_u64(out, reply.seq);
+            push_u64(out, reply.grantee.as_u64());
+            push_u64(out, reply.grantor.as_u64());
+        }
+        M::Revoke(revoke) => {
+            out.push(4);
+            push_roster_id(out, revoke.roster_id);
+            push_attempt(out, revoke.attempt);
+            push_u64(out, revoke.seq);
+            push_u64(out, revoke.grantor.as_u64());
+        }
+        M::RevokeReply(reply) => {
+            out.push(5);
+            push_roster_id(out, reply.roster_id);
+            push_attempt(out, reply.attempt);
+            push_u64(out, reply.seq);
+            push_u64(out, reply.grantee.as_u64());
+            push_u64(out, reply.grantor.as_u64());
+        }
+    }
+}
+
+/// Decodes one lease-protocol message.
+///
+/// # Errors
+///
+/// Returns [`PeerCodecError`] on truncation, unknown tags, oversize
+/// responder sets, or trailing structure. Unknown roster identities are
+/// accepted structurally — the engine (which owns authority, term, and
+/// generation validity) refuses what it must.
+pub(crate) fn decode_lease_message(
+    reader: &mut Reader<'_>,
+) -> Result<kivi_types::LeaseMessage, PeerCodecError> {
+    use kivi_types::{
+        CommitPosition, LeaseAttemptId, LeaseGuard, LeaseGuardReply, LeaseMessage as M, LeaseRenew,
+        LeaseRenewReply, LeaseRevoke, LeaseRevokeReply, RosterId, RosterTerm,
+    };
+    fn read_roster_id(reader: &mut Reader<'_>) -> Result<RosterId, PeerCodecError> {
+        use kivi_types::{TabletAuthority, TabletEpoch, TabletId, WriteGuardGeneration};
+        Ok(RosterId::new(
+            TabletAuthority::new(
+                TabletId::from_u64(reader.u64()?),
+                TabletEpoch::from_u64(reader.u64()?),
+                WriteGuardGeneration::from_u64(reader.u64()?),
+            ),
+            RosterTerm::from_u64(reader.u64()?),
+            kivi_types::RosterGeneration::from_u64(reader.u64()?),
+        ))
+    }
+    fn read_attempt(reader: &mut Reader<'_>) -> Result<LeaseAttemptId, PeerCodecError> {
+        Ok(LeaseAttemptId::new(
+            kivi_types::NodeIncarnation::from_u64(reader.u64()?),
+            reader.u64()?,
+        ))
+    }
+    Ok(match reader.u8()? {
+        0 => {
+            let id = read_roster_id(reader)?;
+            let leader = NodeId::from_u64(reader.u64()?);
+            let count = reader.u64()?;
+            let count =
+                usize::try_from(count).map_err(|_| PeerCodecError::Oversize { len: usize::MAX })?;
+            if count > LEASE_ROSTER_CAP {
+                return Err(PeerCodecError::Oversize { len: count });
+            }
+            let mut responders = Vec::with_capacity(count.min(64));
+            for _ in 0..count {
+                responders.push(NodeId::from_u64(reader.u64()?));
+            }
+            let roster = kivi_types::Roster::new(id, leader, responders)
+                .map_err(|_| PeerCodecError::InvalidRoster)?;
+            M::Guard(LeaseGuard {
+                roster,
+                thresh_accepted: CommitPosition::from_u64(reader.u64()?),
+                attempt: read_attempt(reader)?,
+                seq: reader.u64()?,
+                grantor: NodeId::from_u64(reader.u64()?),
+            })
+        }
+        1 => M::GuardReply(LeaseGuardReply {
+            roster_id: read_roster_id(reader)?,
+            attempt: read_attempt(reader)?,
+            seq: reader.u64()?,
+            grantee: NodeId::from_u64(reader.u64()?),
+            grantor: NodeId::from_u64(reader.u64()?),
+        }),
+        2 => M::Renew(LeaseRenew {
+            roster_id: read_roster_id(reader)?,
+            attempt: read_attempt(reader)?,
+            seq: reader.u64()?,
+            committed: kivi_types::CommitPosition::from_u64(reader.u64()?),
+            grantor: NodeId::from_u64(reader.u64()?),
+        }),
+        3 => M::RenewReply(LeaseRenewReply {
+            roster_id: read_roster_id(reader)?,
+            attempt: read_attempt(reader)?,
+            seq: reader.u64()?,
+            grantee: NodeId::from_u64(reader.u64()?),
+            grantor: NodeId::from_u64(reader.u64()?),
+        }),
+        4 => M::Revoke(LeaseRevoke {
+            roster_id: read_roster_id(reader)?,
+            attempt: read_attempt(reader)?,
+            seq: reader.u64()?,
+            grantor: NodeId::from_u64(reader.u64()?),
+        }),
+        5 => M::RevokeReply(LeaseRevokeReply {
+            roster_id: read_roster_id(reader)?,
+            attempt: read_attempt(reader)?,
+            seq: reader.u64()?,
+            grantee: NodeId::from_u64(reader.u64()?),
+            grantor: NodeId::from_u64(reader.u64()?),
+        }),
+        tag => return Err(PeerCodecError::BadTag { tag }),
     })
 }
 
@@ -1247,6 +1626,16 @@ mod tests {
                 manifest: [0x33; 32],
                 logical_len: 1234,
             }),
+            PeerRequest::Lease(PeerLeaseBatch {
+                messages: vec![lease_guard_fixture(), lease_renew_fixture()],
+            }),
+            PeerRequest::AlrSync(PeerAlrSyncRequest {
+                fence_tablet: 9,
+                batch: 17,
+                requester: 2,
+                formation_applied: 41,
+            }),
+            PeerRequest::CoveragePoll(PeerCoveragePoll { commit: 42 }),
         ];
         for request in &cases {
             // Tablet 9 rides every Raft path (Multi-Raft multiplexing).
@@ -1291,6 +1680,28 @@ mod tests {
                     vote,
                     granted: true,
                     last_log: Some(log),
+                }),
+            ),
+            (
+                &cases[7],
+                PeerResponse::Lease(PeerLeaseBatch {
+                    messages: vec![lease_guard_reply_fixture()],
+                }),
+            ),
+            (
+                &cases[8],
+                PeerResponse::AlrSync(PeerAlrSyncResponse {
+                    boundary: 43,
+                    subsumed: true,
+                }),
+            ),
+            (
+                &cases[9],
+                PeerResponse::Coverage(PeerCoverageReport {
+                    responder: 2,
+                    incarnation: 7,
+                    applied: 42,
+                    healthy: true,
                 }),
             ),
         ];
@@ -1340,5 +1751,151 @@ mod tests {
             parse_id32_hex(&id32_hex(&[0xCD; 32])).expect("parses"),
             [0xCD; 32]
         );
+    }
+
+    fn lease_roster_fixture() -> kivi_types::Roster {
+        use kivi_types::{
+            RosterGeneration, RosterId, RosterTerm, TabletAuthority, TabletEpoch, TabletId,
+            WriteGuardGeneration,
+        };
+        let id = RosterId::new(
+            TabletAuthority::new(
+                TabletId::from_u64(9),
+                TabletEpoch::from_u64(3),
+                WriteGuardGeneration::from_u64(7),
+            ),
+            RosterTerm::from_u64(5),
+            RosterGeneration::INITIAL,
+        );
+        kivi_types::Roster::new(
+            id,
+            NodeId::from_u64(1),
+            vec![NodeId::from_u64(2), NodeId::from_u64(3)],
+        )
+        .expect("valid fixture roster")
+    }
+
+    fn lease_attempt_fixture() -> kivi_types::LeaseAttemptId {
+        kivi_types::LeaseAttemptId::new(NodeIncarnation::from_u64(4), 11)
+    }
+
+    fn lease_guard_fixture() -> kivi_types::LeaseMessage {
+        kivi_types::LeaseMessage::Guard(kivi_types::LeaseGuard {
+            roster: lease_roster_fixture(),
+            thresh_accepted: kivi_types::CommitPosition::from_u64(41),
+            attempt: lease_attempt_fixture(),
+            seq: 11,
+            grantor: NodeId::from_u64(1),
+        })
+    }
+
+    fn lease_guard_reply_fixture() -> kivi_types::LeaseMessage {
+        kivi_types::LeaseMessage::GuardReply(kivi_types::LeaseGuardReply {
+            roster_id: lease_roster_fixture().id,
+            attempt: lease_attempt_fixture(),
+            seq: 11,
+            grantee: NodeId::from_u64(2),
+            grantor: NodeId::from_u64(1),
+        })
+    }
+
+    fn lease_renew_fixture() -> kivi_types::LeaseMessage {
+        kivi_types::LeaseMessage::Renew(kivi_types::LeaseRenew {
+            roster_id: lease_roster_fixture().id,
+            attempt: lease_attempt_fixture(),
+            seq: 12,
+            committed: kivi_types::CommitPosition::from_u64(40),
+            grantor: NodeId::from_u64(1),
+        })
+    }
+
+    #[test]
+    fn lease_messages_round_trip_through_batch_codec() {
+        for message in [
+            lease_guard_fixture(),
+            lease_guard_reply_fixture(),
+            lease_renew_fixture(),
+            kivi_types::LeaseMessage::RenewReply(kivi_types::LeaseRenewReply {
+                roster_id: lease_roster_fixture().id,
+                attempt: lease_attempt_fixture(),
+                seq: 12,
+                grantee: NodeId::from_u64(2),
+                grantor: NodeId::from_u64(1),
+            }),
+            kivi_types::LeaseMessage::Revoke(kivi_types::LeaseRevoke {
+                roster_id: lease_roster_fixture().id,
+                attempt: lease_attempt_fixture(),
+                seq: 13,
+                grantor: NodeId::from_u64(1),
+            }),
+            kivi_types::LeaseMessage::RevokeReply(kivi_types::LeaseRevokeReply {
+                roster_id: lease_roster_fixture().id,
+                attempt: lease_attempt_fixture(),
+                seq: 13,
+                grantee: NodeId::from_u64(2),
+                grantor: NodeId::from_u64(1),
+            }),
+        ] {
+            let mut out = Vec::new();
+            encode_lease_message(&mut out, &message);
+            let mut reader = Reader::new(&out);
+            assert_eq!(decode_lease_message(&mut reader).expect("decodes"), message);
+            reader.finish().expect("exact");
+            // Unknown tags refuse loudly (never misread as a live message).
+            let mut tagged = out.clone();
+            tagged[0] = 0x7F;
+            assert!(matches!(
+                decode_lease_message(&mut Reader::new(&tagged)),
+                Err(PeerCodecError::BadTag { .. })
+            ));
+        }
+        // An invalid roster identity (zero term) refuses at the codec, so
+        // it never enters engine state.
+        let mut out = Vec::new();
+        encode_lease_message(&mut out, &lease_guard_fixture());
+        // Corrupt the term half (bytes 2+8*3..2+8*4) to zero.
+        out[26..34].fill(0);
+        assert!(matches!(
+            decode_lease_message(&mut Reader::new(&out)),
+            Err(PeerCodecError::InvalidRoster)
+        ));
+    }
+
+    #[test]
+    fn lease_batch_rejects_version_and_oversize() {
+        let batch = PeerLeaseBatch {
+            messages: vec![lease_guard_fixture()],
+        };
+        let request = PeerRequest::Lease(batch);
+        let (path, mut body) = encode_h3_request(&request, 9);
+        assert_eq!(
+            decode_h3_request(&path, &body).expect("decodes").request,
+            request
+        );
+        // Version bump refuses loudly.
+        body[0] = body[0].wrapping_add(1);
+        assert!(matches!(
+            decode_h3_request(&path, &body),
+            Err(PeerCodecError::UnsupportedVersion { .. })
+        ));
+        // Declared responder floods refuse without allocating.
+        let mut flood = Vec::new();
+        flood.extend_from_slice(&LEASE_BATCH_VERSION.to_le_bytes());
+        flood.extend_from_slice(&1u64.to_le_bytes());
+        flood.push(0); // Guard tag
+        // Valid roster id halves.
+        for half in [9u64, 3, 7, 5, 1] {
+            flood.extend_from_slice(&half.to_le_bytes());
+        }
+        flood.extend_from_slice(&1u64.to_le_bytes()); // leader
+        flood.extend_from_slice(&u64::MAX.to_le_bytes()); // responder count
+        let flood_request = PeerRequest::Lease(PeerLeaseBatch {
+            messages: Vec::new(),
+        });
+        let flood_path = h3_request_path(9, &flood_request);
+        assert!(matches!(
+            decode_h3_request(&flood_path, &flood),
+            Err(PeerCodecError::Oversize { .. })
+        ));
     }
 }

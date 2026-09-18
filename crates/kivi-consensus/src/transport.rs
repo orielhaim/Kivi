@@ -90,6 +90,9 @@ const MEDIA_PREPARE: &str = "application/vnd.kivi.prepare";
 const MEDIA_MANIFEST: &str = "application/vnd.kivi.manifest";
 /// Media type for chunk bodies (raw logical chunk bytes).
 const MEDIA_CHUNK: &str = "application/vnd.kivi.chunk";
+/// Media type for read-authority RPC bodies (lease batches, ALR syncs,
+/// coverage polls and their answers).
+const MEDIA_READ: &str = "application/vnd.kivi.read";
 
 /// Authenticated Kivi request headers (application identity over the
 /// TLS-authenticated channel).
@@ -1692,6 +1695,9 @@ impl MeshDriver {
                     PeerResponse::Prepared(_) => MEDIA_PREPARE,
                     PeerResponse::Manifest(_) => MEDIA_MANIFEST,
                     PeerResponse::Chunk(_) => MEDIA_CHUNK,
+                    PeerResponse::Lease(_)
+                    | PeerResponse::AlrSync(_)
+                    | PeerResponse::Coverage(_) => MEDIA_READ,
                 };
                 let bytes = crate::peer::encode_h3_response(&response);
                 let http_response = http::Response::builder()

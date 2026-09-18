@@ -626,7 +626,10 @@ async fn finalize_wave(
 }
 
 /// Reads and decodes the coordinator record (`None` when absent or
-/// undecodable).
+/// undecodable). Transaction records are always lease-ineligible: the
+/// 2PC outcome must integrate with the final committed participant
+/// outcome, so coordinator reads run Lazy-ALR/conservative until
+/// responder coverage integrates with transactions.
 async fn read_record(
     shared: &ClusterShared,
     tablet: TabletId,
@@ -642,6 +645,7 @@ async fn read_record(
             },
             kivi_types::ReadContract::Latest,
             ctx,
+            kivi_types::LeaseEligibility::ConservativeOnly,
         )
         .await
     {

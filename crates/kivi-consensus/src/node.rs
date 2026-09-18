@@ -141,6 +141,22 @@ use crate::types::{
 /// How long `AtLeast` waits for local applied coverage before failing.
 const AT_LEAST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Maximum for one lease-batch round trip. Renew cadence is
+/// protocol-timed (engine deadlines); a slow batch only delays
+/// convergence to the next tick, never safety.
+const LEASE_RPC_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Maximum for one responder-coverage poll. Healthy responders answer
+/// in milliseconds; the bound only cuts off dead links per round.
+const COVERAGE_POLL_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Total bounded wait for responder coverage per write. Replication lag
+/// (milliseconds) must not fence a live responder, but a dead one must
+/// not stall writes forever: after this window the uncovered responders
+/// are fenced and the write fails retryable instead of completing
+/// uncovered.
+const COVERAGE_WAIT: Duration = Duration::from_secs(3);
+
 /// Depth of the owner request queue. Every request carries its own
 /// reply channel, so depth only bounds burst memory; a full queue fails
 /// the submitter with `ShuttingDown`-class backpressure instead of
@@ -185,6 +201,11 @@ pub struct NodeConfig {
     /// forces the append-gate fallback path (correctness probe: proves
     /// preflight is only an optimization).
     pub preflight_enabled: bool,
+    /// Deployment lease-timing contract (bounded clock-rate drift plus
+    /// guard/lease/renew durations). The `RosterLease` backend is
+    /// unavailable unless these validate; reads then use Lazy-ALR or the
+    /// conservative barrier.
+    pub lease_params: kivi_types::LeaseParams,
 }
 
 /// Why a replicated node could not open.
@@ -313,6 +334,17 @@ pub enum ProposeError {
         /// Fenced tablet.
         tablet: TabletId,
     },
+    /// Responder coverage could not be established before the bound: the
+    /// write stays unacknowledged (never externally completed uncovered)
+    /// and the uncovered responder was fenced. Shaped as
+    /// `CoverageUncertain` on the wire: the outcome is ambiguous (it may
+    /// have committed), so callers must not blindly retry non-idempotent
+    /// writes — read-verify first, or re-drive under the same identity.
+    #[error("responder coverage timed out: {detail}")]
+    ResponderCoverage {
+        /// Which responder(s) stayed uncovered.
+        detail: String,
+    },
 }
 
 /// Why a strong read failed.
@@ -394,6 +426,17 @@ pub(crate) struct NewReplica {
     pub(crate) authority: TabletAuthority,
 }
 
+/// Outcome of one Lazy-ALR synchronization: the ordered boundary whose
+/// local apply covers the batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncOutcome {
+    /// Raft log index whose local apply covers the batch: the appended
+    /// fence, or a subsuming write ordered after batch formation.
+    pub boundary: u64,
+    /// Whether a concurrent write subsumed the extra fence entry.
+    pub subsumed: bool,
+}
+
 /// One unit of work for the owner thread. Every variant carries its reply
 /// channel; dropping the reply (owner shutdown race) surfaces as
 /// `ShuttingDown` on the caller, never a hang.
@@ -461,16 +504,30 @@ pub(crate) enum OwnerRequest {
         /// Covered (`Ok`) or timed out (`Err(())`).
         reply: Reply<Result<(), ()>>,
     },
-    /// Cheap local leadership probe for the Almost-Local fast path: whether
-    /// this replica's owner currently believes it leads the group (from
-    /// Raft metrics, no quorum contact). A stale `true` is bounded by
-    /// heartbeat detection; the hub treats it as one input among receipt
-    /// age and authority checks, never as standalone proof.
-    IsLeader {
+    /// Order one Lazy-ALR batch boundary: on the leader, subsume with the
+    /// committed index when it already covers formation, else append the
+    /// fence; on a follower, forward the request to the leader over the
+    /// peer mesh. Any failure (not leader, stale leader view, transport,
+    /// commit refusal) answers `Err`, and the caller falls back — the
+    /// fence path never blocks a read past its wait budget.
+    ProposeSync {
         /// Addressed group.
         group: ConsensusGroupId,
-        /// Leadership belief.
-        reply: Reply<bool>,
+        /// Fence plus formation coordinates.
+        sync: crate::command::AlrFenceSync,
+        /// Maximum for the follower→leader forward hop (the fence commit
+        /// itself is Raft-bounded; the local boundary wait reuses the
+        /// read's wait budget through `WaitApplied`).
+        timeout: Duration,
+        /// Ordered boundary or the reason to fall back.
+        reply: Reply<Result<SyncOutcome, ProposeError>>,
+    },
+    /// One lease-driver tick for `group`: reconcile term/voters into the
+    /// tablet's lease engine, advance timers, announce or grant when
+    /// designated, and flush outbound traffic over the peer mesh.
+    LeaseTick {
+        /// Addressed group.
+        group: ConsensusGroupId,
     },
     /// Gather full diagnostics.
     Status {
@@ -629,7 +686,8 @@ impl OwnerRequest {
             | Self::ProposeChunked { group, .. }
             | Self::Barrier { group, .. }
             | Self::WaitApplied { group, .. }
-            | Self::IsLeader { group, .. }
+            | Self::ProposeSync { group, .. }
+            | Self::LeaseTick { group }
             | Self::Status { group, .. }
             | Self::Serve { group, .. }
             | Self::SnapshotPurge { group, .. }
@@ -665,8 +723,10 @@ impl OwnerRequest {
             Self::WaitApplied { reply, .. } => {
                 let _ = reply.send(Err(()));
             }
-            Self::IsLeader { reply, .. } => {
-                let _ = reply.send(false);
+            Self::ProposeSync { group, reply, .. } => {
+                let _ = reply.send(Err(ProposeError::Consensus(ConsensusError::Unavailable {
+                    reason: format!("group {group} not served by node {}", local.as_u64()),
+                })));
             }
             Self::Status { group, reply } => {
                 let _ = reply.send(NodeStatus {
@@ -732,7 +792,13 @@ impl OwnerRequest {
             Self::ObserveMembership { group, reply } => {
                 let _ = reply.send(Err(unroutable(group, local)));
             }
-            Self::SuspendPeer { .. } | Self::ResumePeer { .. } | Self::Shutdown => {}
+            // Node-wide requests have no group to mismatch, and
+            // group-scoped ticks without a replica drop (the next tick
+            // retries): neither hangs the caller.
+            Self::SuspendPeer { .. }
+            | Self::ResumePeer { .. }
+            | Self::Shutdown
+            | Self::LeaseTick { .. } => {}
         }
     }
 }
@@ -767,10 +833,14 @@ pub struct ReplicatedNode {
     incarnation: kivi_types::NodeIncarnation,
     group: ConsensusGroupId,
     data_dir: PathBuf,
-    /// Caller-side consistency hub: evidence, strong cache, providers,
-    /// metrics. Memory-held by construction — a restart starts empty, so
-    /// incarnation handling fails closed without any explicit clearing.
-    hub: ConsistencyHub,
+    /// Caller-side consistency hub: evidence, lease engines, strong
+    /// cache, providers, metrics. Shared with the owner thread (which
+    /// drives lease engines through it). Memory-held by construction — a
+    /// restart starts empty, so incarnation handling fails closed without
+    /// any explicit clearing.
+    hub: Arc<ConsistencyHub>,
+    /// Lazy-ALR batch coordinator for the tablet group.
+    alr: Arc<crate::alr::AlrCoordinator>,
     _dir_guard: kivi_durability::OpenDir,
 }
 
@@ -830,6 +900,8 @@ struct OwnerParams<S> {
     authority: TabletAuthority,
     preflight: Arc<crate::preflight::PreflightMetrics>,
     preflight_enabled: bool,
+    /// Shared consistency hub (lease engines, evidence, metrics).
+    hub: Arc<ConsistencyHub>,
     serve_tx: async_channel::Sender<OwnerRequest>,
     requests: async_channel::Receiver<OwnerRequest>,
     ready: futures::channel::oneshot::Sender<Result<std::net::SocketAddr, NodeOpenError>>,
@@ -999,6 +1071,16 @@ impl ReplicatedNode {
             futures::channel::oneshot::channel::<Result<std::net::SocketAddr, NodeOpenError>>();
         let router_tx = owner_tx.clone();
         let preflight = Arc::new(crate::preflight::PreflightMetrics::default());
+        let (hub, alr) = open_consistency_front(
+            &machine,
+            &owner_tx,
+            group,
+            config.tablet,
+            config.authority,
+            opened.meta.node,
+            opened.meta.incarnation,
+            config.lease_params,
+        );
         let owner_params = OwnerParams {
             store: store.clone(),
             machine: machine.clone(),
@@ -1017,6 +1099,7 @@ impl ReplicatedNode {
             authority: config.authority,
             preflight: Arc::clone(&preflight),
             preflight_enabled: config.preflight_enabled,
+            hub: Arc::clone(&hub),
             serve_tx: router_tx,
             requests: owner_rx,
             ready: ready_tx,
@@ -1026,36 +1109,15 @@ impl ReplicatedNode {
             reason: "consensus owner died during startup".to_owned(),
         })??;
         // Startup verification: every applied chunked root must resolve
-        // locally before serving reads. Missing sidecars poison the replica
-        // (reads fail closed, readiness reflects unhealthy) rather than
-        // serving incomplete state; repair arrives via sidecar fetch or a
-        // snapshot install carrying the missing bulk (which heals health).
-        // Never blocks startup waiting for peers.
-        for (manifest, logical_len) in machine.chunked_roots().await {
-            match sidecar.check_root(manifest, logical_len).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    machine
-                        .mark_unhealthy(format!(
-                            "applied root {manifest} references missing sidecars; repair required"
-                        ))
-                        .await;
-                    break;
-                }
-                Err(error) => {
-                    machine
-                        .mark_unhealthy(format!("sidecar check failed: {error}"))
-                        .await;
-                    break;
-                }
-            }
-        }
+        // locally before serving reads (fail-closed poison, repair via
+        // sidecar fetch or snapshot install — never a startup wait).
+        verify_chunked_roots(&machine, &sidecar).await;
         Ok(Self {
-            machine,
+            machine: machine.clone(),
             store: store.clone(),
             sidecar: sidecar.clone(),
             preflight,
-            owner_tx,
+            owner_tx: owner_tx.clone(),
             owner_thread: Mutex::new(Some(thread)),
             peer_addr,
             namespace: config.namespace,
@@ -1066,11 +1128,8 @@ impl ReplicatedNode {
             incarnation: opened.meta.incarnation,
             group,
             data_dir: config.data_dir,
-            hub: ConsistencyHub::new(
-                opened.meta.node,
-                opened.meta.incarnation,
-                ReadAuthorityProvider::ConservativeLeader,
-            ),
+            hub: Arc::clone(&hub),
+            alr,
             _dir_guard: opened,
         })
     }
@@ -1153,6 +1212,10 @@ impl ReplicatedNode {
     /// Serves one read under its contract, returning the outcome with its
     /// proof triple (authority, applied position, serve path).
     ///
+    /// `eligibility` gates the roster fast path: point reads pass
+    /// [`LeaseEligibility::Eligible`]; transactions, batches, and scans
+    /// pass [`LeaseEligibility::ConservativeOnly`].
+    ///
     /// # Errors
     ///
     /// Returns [`ReadError`] for routing, lineage, validation, or coverage
@@ -1162,104 +1225,54 @@ impl ReplicatedNode {
         op: &Operation,
         contract: ReadContract,
         ctx: ReadContext,
+        eligibility: kivi_types::LeaseEligibility,
     ) -> Result<ServedRead, ReadError> {
         ReadFront::bind(
             &self.machine,
             &self.owner_tx,
             &self.hub,
+            &self.alr,
             self.group,
             self.tablet,
             self.authority,
             self.incarnation,
         )
-        .read(op, contract, ctx)
+        .read(op, contract, ctx, eligibility)
         .await
     }
 
-    /// Grants a roster lease for this tablet's group: only the current
-    /// leader may issue (verified against the owner), and the floor is the
-    /// leader's current applied position. Members serve `Latest` locally
-    /// while the lease authorizes them; expiry, incarnation change, or
-    /// authority movement voids it immediately.
+    /// Serves one bounded scan page under its contract. Scans are always
+    /// lease-ineligible (a multi-tablet scan is not one global snapshot);
+    /// each tablet read is individually strong via Lazy-ALR or the
+    /// barrier.
     ///
     /// # Errors
     ///
-    /// Returns a human-readable reason when this replica is not the
-    /// leader or the owner is gone.
-    pub async fn grant_read_lease(
+    /// Returns [`ReadError`] for routing, lineage, validation, or coverage
+    /// failures.
+    pub async fn scan(
         &self,
-        members: Vec<NodeId>,
-        ttl: Duration,
-        generation: u64,
-    ) -> Result<(), String> {
-        let leader = owner_call_on(&self.owner_tx, |reply| OwnerRequest::IsLeader {
-            group: self.group,
-            reply,
-        })
-        .await
-        .map_err(|_| "consensus owner shut down".to_owned())?;
-        if !leader {
-            return Err("not the leader; only the leader issues roster leases".to_owned());
-        }
-        let applied = self.machine.status().await.applied_commit;
-        // Ticks for expiry must come from the caller's monotonic clock;
-        // without one the lease cannot bound anything, so issuance takes
-        // the TTL as a span over "now" supplied here from process time.
-        // Production issuers pass measured Ticks; tests pass virtual ones
-        // through `grant_read_lease_at`.
-        let now = process_ticks();
-        let lease = kivi_types::RosterLease::new(
+        spec: &kivi_state::ScanSpec,
+        contract: ReadContract,
+        ctx: ReadContext,
+    ) -> Result<crate::consistency::ServedScan, ReadError> {
+        ReadFront::bind(
+            &self.machine,
+            &self.owner_tx,
+            &self.hub,
+            &self.alr,
+            self.group,
+            self.tablet,
             self.authority,
-            generation,
-            members,
-            applied,
-            now.advance_by(ttl),
             self.incarnation,
-        );
-        if self.hub.grant_lease(self.tablet, lease) {
-            Ok(())
-        } else {
-            Err("lease refused for a foreign authority".to_owned())
-        }
-    }
-
-    /// Issues a roster lease against an explicit monotonic now (virtual
-    /// time for tests; the leader check still applies).
-    ///
-    /// # Errors
-    ///
-    /// Returns a human-readable reason when this replica is not the
-    /// leader or the owner is gone.
-    pub async fn grant_read_lease_at(
-        &self,
-        members: Vec<NodeId>,
-        now: Ticks,
-        ttl: Duration,
-        generation: u64,
-    ) -> Result<(), String> {
-        let leader = owner_call_on(&self.owner_tx, |reply| OwnerRequest::IsLeader {
-            group: self.group,
-            reply,
-        })
+        )
+        .scan(
+            spec,
+            contract,
+            ctx,
+            kivi_types::LeaseEligibility::ConservativeOnly,
+        )
         .await
-        .map_err(|_| "consensus owner shut down".to_owned())?;
-        if !leader {
-            return Err("not the leader; only the leader issues roster leases".to_owned());
-        }
-        let applied = self.machine.status().await.applied_commit;
-        let lease = kivi_types::RosterLease::new(
-            self.authority,
-            generation,
-            members,
-            applied,
-            now.advance_by(ttl),
-            self.incarnation,
-        );
-        if self.hub.grant_lease(self.tablet, lease) {
-            Ok(())
-        } else {
-            Err("lease refused for a foreign authority".to_owned())
-        }
     }
 
     /// Switches the read-authority mode (operator/test control for the
@@ -1272,7 +1285,7 @@ impl ReplicatedNode {
     #[must_use]
     pub fn consistency_snapshot(&self) -> kivi_types::ConsistencySnapshot {
         self.hub
-            .snapshot(self.tablet)
+            .snapshot(self.tablet, process_ticks())
             .map_or_else(kivi_types::ConsistencySnapshot::default, |(_, snapshot)| {
                 snapshot
             })
@@ -1381,11 +1394,73 @@ impl ReplicatedNode {
     }
 }
 
+/// Builds the caller-side consistency front: the shared hub (evidence,
+/// lease engines, metrics) plus the tablet's Lazy-ALR batch coordinator.
+/// Memory-held by construction — a restart starts empty, so incarnation
+/// handling fails closed without any explicit clearing.
+#[allow(clippy::too_many_arguments)]
+fn open_consistency_front(
+    machine: &ReplicatedStateMachine,
+    owner_tx: &async_channel::Sender<OwnerRequest>,
+    group: ConsensusGroupId,
+    tablet: TabletId,
+    authority: TabletAuthority,
+    local: NodeId,
+    incarnation: NodeIncarnation,
+    lease_params: kivi_types::LeaseParams,
+) -> (Arc<ConsistencyHub>, Arc<crate::alr::AlrCoordinator>) {
+    let hub = Arc::new(ConsistencyHub::new(
+        local,
+        incarnation,
+        ReadAuthorityProvider::ConservativeLeader,
+        lease_params,
+    ));
+    let alr = Arc::new(crate::alr::AlrCoordinator::bind(
+        machine.clone(),
+        owner_tx.clone(),
+        Arc::clone(&hub),
+        group,
+        tablet,
+        authority,
+        incarnation,
+        local,
+    ));
+    (hub, alr)
+}
+
+/// Verifies every applied chunked root resolves locally before serving
+/// reads. Missing sidecars poison the replica (reads fail closed,
+/// readiness reflects unhealthy) rather than serving incomplete state;
+/// repair arrives via sidecar fetch or a snapshot install carrying the
+/// missing bulk (which heals health). Never blocks startup waiting for
+/// peers.
+async fn verify_chunked_roots(machine: &ReplicatedStateMachine, sidecar: &SidecarStore) {
+    for (manifest, logical_len) in machine.chunked_roots().await {
+        match sidecar.check_root(manifest, logical_len).await {
+            Ok(true) => {}
+            Ok(false) => {
+                machine
+                    .mark_unhealthy(format!(
+                        "applied root {manifest} references missing sidecars; repair required"
+                    ))
+                    .await;
+                break;
+            }
+            Err(error) => {
+                machine
+                    .mark_unhealthy(format!("sidecar check failed: {error}"))
+                    .await;
+                break;
+            }
+        }
+    }
+}
+
 /// Process monotonic microseconds since first call (clock source for
 /// lease issuance only; deterministic callers pass virtual `Ticks`
 /// through `grant_read_lease_at` instead). Like `wall_now` on the server:
 /// a boundary clock, never inside deterministic logic.
-fn process_ticks() -> Ticks {
+pub(crate) fn process_ticks() -> Ticks {
     use std::sync::OnceLock;
     static START: OnceLock<std::time::Instant> = OnceLock::new();
     let start = START.get_or_init(std::time::Instant::now);
@@ -1535,17 +1610,19 @@ pub(crate) async fn propose_caller_side(
 /// machine, consistency hub, and owner queue.
 ///
 /// Planning is deterministic and synchronous ([`ConsistencyHub::plan`]);
-/// only barriers, waits, and the leadership probe hop to the owner thread
-/// (the Raft handle never leaves its reactor). Every served read returns
-/// its [`ServedRead`] proof triple; every contract is either satisfied or
-/// fails loudly — never silently weakened.
+/// only barriers, fence syncs, and waits hop to the owner thread (the Raft
+/// handle never leaves its reactor). Every served read returns its
+/// [`ServedRead`] proof triple; every contract is either satisfied or fails
+/// loudly — never silently weakened.
 pub(crate) struct ReadFront<'a> {
     /// Local state machine for reads and applied tracking.
     machine: &'a ReplicatedStateMachine,
-    /// Owner queue for barriers, waits, and leadership probes.
+    /// Owner queue for barriers, fence syncs, and waits.
     owner_tx: &'a async_channel::Sender<OwnerRequest>,
     /// Node-wide consistency hub (evidence, cache, providers, metrics).
     hub: &'a ConsistencyHub,
+    /// Tablet Lazy-ALR batch coordinator.
+    alr: &'a crate::alr::AlrCoordinator,
     /// Addressed group.
     group: ConsensusGroupId,
     /// Served tablet.
@@ -1559,10 +1636,11 @@ pub(crate) struct ReadFront<'a> {
 impl<'a> ReadFront<'a> {
     /// Binds one group's read path.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) const fn bind(
+    pub(crate) fn bind(
         machine: &'a ReplicatedStateMachine,
         owner_tx: &'a async_channel::Sender<OwnerRequest>,
         hub: &'a ConsistencyHub,
+        alr: &'a crate::alr::AlrCoordinator,
         group: ConsensusGroupId,
         tablet: TabletId,
         authority: TabletAuthority,
@@ -1572,6 +1650,7 @@ impl<'a> ReadFront<'a> {
             machine,
             owner_tx,
             hub,
+            alr,
             group,
             tablet,
             authority,
@@ -1590,10 +1669,13 @@ impl<'a> ReadFront<'a> {
         op: &Operation,
         contract: ReadContract,
         ctx: ReadContext,
+        eligibility: kivi_types::LeaseEligibility,
     ) -> Result<ServedRead, ReadError> {
         let applied = self.machine.status().await.applied_commit;
         let fresh = ReplicaFreshness::new(self.authority, applied, self.incarnation);
-        let planned = self.hub.plan(self.tablet, op, contract, fresh, ctx);
+        let planned = self
+            .hub
+            .plan(self.tablet, op, contract, fresh, ctx, eligibility);
         match planned.plan {
             ReadPlan::ServeLocal { path } => {
                 if path == ServePath::StrongCache
@@ -1610,9 +1692,12 @@ impl<'a> ReadFront<'a> {
                     // A planned cache hit without a cached outcome falls
                     // through to a live local read rather than failing.
                 }
-                if path == ServePath::AlmostLocalProof && !self.probe_leadership().await {
-                    // Deposed leader: the receipt is void, barrier instead.
-                    self.hub.note_almost_local_fallback(self.tablet);
+                if path == ServePath::RosterLease {
+                    return self.roster_serve(op, contract, ctx).await;
+                }
+                if path == ServePath::AlrSync || path == ServePath::AlrSubsumed {
+                    // Never planned (execution assigns ALR paths); a
+                    // planner emitting one is a bug — barrier instead.
                     return self.barrier_serve(op, contract, ctx, false).await;
                 }
                 let outcome = read_applied_on(self.machine, op, ctx.now).await?;
@@ -1635,11 +1720,68 @@ impl<'a> ReadFront<'a> {
             ReadPlan::BarrierThenServe { escalated } => {
                 self.barrier_serve(op, contract, ctx, escalated).await
             }
+            ReadPlan::AlrThenServe => self.alr_serve(op, contract, ctx).await,
             ReadPlan::WaitThenServe { index } => self.wait_serve(op, contract, ctx, index).await,
             ReadPlan::Reject { reject } => Err(ReadError::StaleToken {
                 detail: reject.to_string(),
             }),
         }
+    }
+
+    /// Serves one roster-planned read: revalidate evidence at serve time
+    /// (the plan's evidence may have destabilized since), serve live
+    /// applied state under it, or fall back to Lazy-ALR. Never serves a
+    /// previous value when a covered write has not applied yet — the
+    /// responder knows it is behind (no evidence) and falls back.
+    async fn roster_serve(
+        &self,
+        op: &Operation,
+        contract: ReadContract,
+        ctx: ReadContext,
+    ) -> Result<ServedRead, ReadError> {
+        let applied = self.machine.status().await.applied_commit;
+        if self.hub.evidence(self.tablet, applied, ctx.ticks).is_none() {
+            self.hub.note_roster_fallback(self.tablet);
+            return self.alr_serve(op, contract, ctx).await;
+        }
+        let outcome = read_applied_on(self.machine, op, ctx.now).await?;
+        let served = self.finish_live(outcome, ServePath::RosterLease).await;
+        self.hub.fill(
+            self.tablet,
+            self.authority,
+            op,
+            &served.outcome,
+            served.receipt.position,
+        );
+        self.hub.note_served(self.tablet, contract, false);
+        tracing::debug!("{}", served.describe());
+        Ok(served)
+    }
+
+    /// Serves one Lazy-ALR read: join (or form) the tablet's batch, wait
+    /// for its boundary to apply locally, then serve live applied state.
+    /// Batch failure falls back to the conservative barrier.
+    async fn alr_serve(
+        &self,
+        op: &Operation,
+        contract: ReadContract,
+        ctx: ReadContext,
+    ) -> Result<ServedRead, ReadError> {
+        let Some(path) = self.alr.join_batch(ctx).await else {
+            return self.barrier_serve(op, contract, ctx, false).await;
+        };
+        let outcome = read_applied_on(self.machine, op, ctx.now).await?;
+        let served = self.finish_live(outcome, path).await;
+        self.hub.fill(
+            self.tablet,
+            self.authority,
+            op,
+            &served.outcome,
+            served.receipt.position,
+        );
+        self.hub.note_served(self.tablet, contract, false);
+        tracing::debug!("{}", served.describe());
+        Ok(served)
     }
 
     /// Serves one bounded scan page under its contract. Each tablet read is
@@ -1655,14 +1797,19 @@ impl<'a> ReadFront<'a> {
         spec: &kivi_state::ScanSpec,
         contract: ReadContract,
         ctx: ReadContext,
+        eligibility: kivi_types::LeaseEligibility,
     ) -> Result<ServedScan, ReadError> {
         let applied = self.machine.status().await.applied_commit;
         let fresh = ReplicaFreshness::new(self.authority, applied, self.incarnation);
-        let planned = self.hub.plan_scan(self.tablet, contract, fresh, ctx);
+        let planned = self
+            .hub
+            .plan_scan(self.tablet, contract, fresh, ctx, eligibility);
         match planned.plan {
             ReadPlan::ServeLocal { path } => {
-                if path == ServePath::AlmostLocalProof && !self.probe_leadership().await {
-                    self.hub.note_almost_local_fallback(self.tablet);
+                if path == ServePath::RosterLease {
+                    return self.roster_scan(spec, contract, ctx).await;
+                }
+                if path == ServePath::AlrSync || path == ServePath::AlrSubsumed {
                     return self.barrier_scan(spec, contract, ctx, false).await;
                 }
                 let page = scan_applied_on(self.machine, spec, ctx.now).await?;
@@ -1673,6 +1820,7 @@ impl<'a> ReadFront<'a> {
             ReadPlan::BarrierThenServe { escalated } => {
                 self.barrier_scan(spec, contract, ctx, escalated).await
             }
+            ReadPlan::AlrThenServe => self.alr_scan(spec, contract, ctx).await,
             ReadPlan::WaitThenServe { index } => self.wait_scan(spec, contract, ctx, index).await,
             ReadPlan::Reject { reject } => Err(ReadError::StaleToken {
                 detail: reject.to_string(),
@@ -1680,10 +1828,44 @@ impl<'a> ReadFront<'a> {
         }
     }
 
+    /// Scan variant of [`ReadFront::roster_serve`].
+    async fn roster_scan(
+        &self,
+        spec: &kivi_state::ScanSpec,
+        contract: ReadContract,
+        ctx: ReadContext,
+    ) -> Result<ServedScan, ReadError> {
+        let applied = self.machine.status().await.applied_commit;
+        if self.hub.evidence(self.tablet, applied, ctx.ticks).is_none() {
+            self.hub.note_roster_fallback(self.tablet);
+            return self.alr_scan(spec, contract, ctx).await;
+        }
+        let page = scan_applied_on(self.machine, spec, ctx.now).await?;
+        let served = self.finish_scan(page, ServePath::RosterLease).await;
+        self.hub.note_served(self.tablet, contract, false);
+        Ok(served)
+    }
+
+    /// Scan variant of [`ReadFront::alr_serve`].
+    async fn alr_scan(
+        &self,
+        spec: &kivi_state::ScanSpec,
+        contract: ReadContract,
+        ctx: ReadContext,
+    ) -> Result<ServedScan, ReadError> {
+        let Some(path) = self.alr.join_batch(ctx).await else {
+            return self.barrier_scan(spec, contract, ctx, false).await;
+        };
+        let page = scan_applied_on(self.machine, spec, ctx.now).await?;
+        let served = self.finish_scan(page, path).await;
+        self.hub.note_served(self.tablet, contract, false);
+        Ok(served)
+    }
+
     /// Fresh quorum barrier, then a live local serve. A successful barrier
-    /// installs a [`FreshnessReceipt`] (future Almost-Local and
-    /// bounded-stale evidence) and fills the strong cache. Barrier failure
-    /// after a bounded-stale escalation counts the bound unprovable.
+    /// installs a [`FreshnessReceipt`] (bounded-stale evidence) and fills
+    /// the strong cache. Barrier failure after a bounded-stale escalation
+    /// counts the bound unprovable.
     async fn barrier_serve(
         &self,
         op: &Operation,
@@ -1830,17 +2012,6 @@ impl<'a> ReadFront<'a> {
         Ok(served)
     }
 
-    /// Local leadership probe for the Almost-Local fast path (metrics
-    /// read, no quorum contact). Owner death fails closed to follower.
-    async fn probe_leadership(&self) -> bool {
-        owner_call_on(self.owner_tx, |reply| OwnerRequest::IsLeader {
-            group: self.group,
-            reply,
-        })
-        .await
-        .unwrap_or(false)
-    }
-
     /// Maps a barrier failure, counting fencing rejects and — after a
     /// bounded-stale escalation — the unprovable bound.
     fn note_barrier_failure(&self, error: ConsensusError, escalated: bool) -> ReadError {
@@ -1941,6 +2112,7 @@ where
                 authority,
                 preflight,
                 preflight_enabled,
+                hub,
                 serve_tx,
                 requests,
                 ready,
@@ -1972,6 +2144,7 @@ where
                 authority,
                 preflight,
                 preflight_enabled,
+                hub,
                 serve_tx,
                 requests,
                 ready,
@@ -2016,6 +2189,7 @@ where
         authority,
         preflight,
         preflight_enabled,
+        hub,
         serve_tx,
         requests,
         ready,
@@ -2024,6 +2198,8 @@ where
     // handshake plus H3 streams replace the old TCP listener/accept pump.
     // A bind conflict fails loudly so the harness retries formation.
     let bulk_timeout = transport_config.bulk_timeout;
+    // Lease-tick channel: cloned before the mesh takes the original.
+    let tick_tx = serve_tx.clone();
     let started = open_mesh(
         transport_config,
         peer_identity,
@@ -2104,6 +2280,27 @@ where
     }
     let mut voter_list: Vec<NodeId> = voters.iter().map(|id| NodeId::from_u64(*id)).collect();
     voter_list.sort_by_key(|node| node.as_u64());
+    // Lease-driver ticker: one tick per renew quarter keeps renewals
+    // flowing and lapses prompt without busy-looping the reactor. The
+    // loop dies with the reactor on shutdown; a full queue (shutting
+    // down) ends it.
+    {
+        let tick_tx = tick_tx.clone();
+        let tick_interval = lease_tick_interval(hub.lease_params());
+        compio::runtime::spawn(async move {
+            loop {
+                compio::time::sleep(tick_interval).await;
+                if tick_tx
+                    .send(OwnerRequest::LeaseTick { group })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
     owner_serve_loop(
         OwnerCtx {
             raft: raft.clone(),
@@ -2117,17 +2314,28 @@ where
             authority,
             tablet,
             local,
+            incarnation: peer_identity.incarnation,
             voters: voter_list,
             bulk_timeout,
             preflight,
             preflight_enabled,
             transfers: Rc::new(RefCell::new(HashMap::new())),
+            hub,
         },
         raft,
         transport,
         requests,
     )
     .await;
+}
+
+/// Lease-tick cadence from the deployment contract: a quarter of the
+/// renew interval keeps at most a few ticks between renewals while never
+/// busy-looping (clamped to 10ms–1s so degenerate contracts fail loud in
+/// validation, not in spinning).
+pub(crate) fn lease_tick_interval(params: kivi_types::LeaseParams) -> Duration {
+    let quarter = params.renew_interval / 4;
+    quarter.clamp(Duration::from_millis(10), Duration::from_secs(1))
 }
 
 /// Spawns the Raft instance on the shared router (the fallible Raft
@@ -2250,6 +2458,8 @@ struct OwnerMain<S> {
     authority: TabletAuthority,
     preflight: Arc<crate::preflight::PreflightMetrics>,
     preflight_enabled: bool,
+    /// Shared consistency hub (lease engines, evidence, metrics).
+    hub: Arc<ConsistencyHub>,
     serve_tx: async_channel::Sender<OwnerRequest>,
     requests: async_channel::Receiver<OwnerRequest>,
     ready: futures::channel::oneshot::Sender<Result<std::net::SocketAddr, NodeOpenError>>,
@@ -2277,11 +2487,17 @@ pub(crate) struct OwnerCtx<S> {
     pub(crate) authority: TabletAuthority,
     pub(crate) tablet: TabletId,
     pub(crate) local: NodeId,
+    pub(crate) incarnation: NodeIncarnation,
     pub(crate) voters: Vec<NodeId>,
     pub(crate) bulk_timeout: Duration,
     pub(crate) preflight: Arc<crate::preflight::PreflightMetrics>,
     pub(crate) preflight_enabled: bool,
     pub(crate) transfers: Rc<RefCell<HashMap<u64, PartialTransfer>>>,
+    /// Caller-side consistency hub (shared with the node front): the
+    /// owner drives lease engines, polls coverage, and orders ALR fences
+    /// through it. Engine steps are pure and fast; planning never blocks
+    /// on transport.
+    pub(crate) hub: std::sync::Arc<crate::consistency::ConsistencyHub>,
 }
 
 /// One in-flight snapshot transfer being reassembled from fragments.
@@ -2405,12 +2621,26 @@ where
                 let covered = self.wait_applied(index, timeout).await;
                 let _ = reply.send(covered);
             }
-            OwnerRequest::IsLeader { group, reply } => {
+            OwnerRequest::ProposeSync {
+                group,
+                sync,
+                timeout,
+                reply,
+            } => {
                 if group != self.group {
-                    let _ = reply.send(false);
+                    let _ = reply.send(Err(ProposeError::Consensus(ConsensusError::Unavailable {
+                        reason: format!("group {group} not served here"),
+                    })));
                     return;
                 }
-                let _ = reply.send(self.is_leader());
+                let outcome = self.propose_sync(sync, timeout).await;
+                let _ = reply.send(outcome);
+            }
+            OwnerRequest::LeaseTick { group } => {
+                if group != self.group {
+                    return;
+                }
+                self.lease_tick_drive().await;
             }
             OwnerRequest::Status { group, reply } => {
                 if group != self.group {
@@ -2652,21 +2882,384 @@ where
 
     /// Quorum-commits one deterministic command and maps the result onto
     /// the Kivi-owned proposal contract. Runs on the owner thread.
+    ///
+    /// The commit is internal until [`OwnerCtx::coverage_gate`] passes:
+    /// a successful write is not acknowledged before every currently
+    /// active roster responder can serve it, so a later local read can
+    /// never miss an externally completed write.
     async fn propose(&self, command: ConsensusCommand) -> Result<ProposeOutcome, ProposeError> {
         let response = self
             .raft
             .client_write(command)
             .await
             .map_err(|error| client_write_error(&error))?;
+        let index = response.log_id.index;
         let outcome = response.data.outcome().cloned().ok_or_else(|| {
             ProposeError::Consensus(ConsensusError::Unavailable {
                 reason: "committed entry carried no outcome".to_owned(),
             })
         })?;
+        self.coverage_gate(crate::state_machine::commit_of_index(index))
+            .await?;
         Ok(ProposeOutcome::Applied {
-            index: ConsensusLogIndex::new(response.log_id.index),
+            index: ConsensusLogIndex::new(index),
             outcome,
         })
+    }
+
+    /// Highest committed Raft log index known locally (`0` before the
+    /// first commit). Runs on the owner thread.
+    async fn committed_index(&self) -> u64 {
+        let mut store = self.store.clone();
+        store
+            .read_committed()
+            .await
+            .ok()
+            .flatten()
+            .map_or(0, |id| id.index)
+    }
+
+    /// Lease-driver world view from Raft metrics: current term, voter set,
+    /// leadership belief, and highest appended index as a commit position
+    /// (`UNASSIGNED` before the first append — a threshold vouching for
+    /// nothing). Runs on the owner thread (metrics handles are `!Send`).
+    fn driver_view(&self) -> (kivi_types::RosterTerm, Vec<NodeId>, bool, CommitPosition) {
+        let metrics = self.raft.metrics().borrow_watched().clone();
+        let term = kivi_types::RosterTerm::from_u64(metrics.current_term);
+        let leader = metrics.current_leader.map(NodeId::from_u64);
+        let is_leader = leader.is_some_and(|node| node == self.local);
+        let voters: Vec<NodeId> = metrics
+            .membership_config
+            .membership()
+            .voter_ids()
+            .map(NodeId::from_u64)
+            .collect();
+        let accepted = metrics.last_log_index.map_or(
+            CommitPosition::UNASSIGNED,
+            crate::state_machine::commit_of_index,
+        );
+        (term, voters, is_leader, accepted)
+    }
+
+    /// Responder-coverage gate: after internal commit, poll every active
+    /// roster responder until each applied through `commit` and can serve
+    /// from it. Rounds repeat on a short sleep so ordinary replication
+    /// lag (milliseconds) never fences a live responder; after the
+    /// bounded window the still-uncovered responders are fenced (explicit
+    /// revoke, never assumed) and the write fails with an uncertain
+    /// outcome instead of completing uncovered. Empty responder sets pass
+    /// immediately, so the gate costs nothing unless leases are engaged.
+    ///
+    /// Before polling, the takeover fence runs: a leader that sat out the
+    /// previous term waits out forgotten old-term holds (bounded by the
+    /// protocol-derived quarantine) instead of completing writes a
+    /// partitioned old responder could miss.
+    async fn coverage_gate(&self, commit: CommitPosition) -> Result<(), ProposeError> {
+        if let Some(hold) = self.hub.takeover_hold(self.tablet, process_ticks()) {
+            compio::time::sleep(hold).await;
+        }
+        let mut responders = self.hub.covered_grantees(self.tablet, process_ticks());
+        responders.retain(|(peer, _)| *peer != self.local);
+        if responders.is_empty() {
+            return Ok(());
+        }
+        self.hub.note_coverage_wait(self.tablet);
+        responders.sort_by_key(|(peer, _)| peer.as_u64());
+        let mut uncovered: Vec<NodeId> = responders.into_iter().map(|(peer, _)| peer).collect();
+        let deadline = std::time::Instant::now() + COVERAGE_WAIT;
+        loop {
+            let mut still_out = Vec::new();
+            for peer in uncovered {
+                if !self.poll_coverage_once(peer, commit).await {
+                    still_out.push(peer);
+                }
+            }
+            uncovered = still_out;
+            if uncovered.is_empty() {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            compio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let now = process_ticks();
+        for peer in &uncovered {
+            let revokes = self.hub.lease_revoke_peer(self.tablet, *peer, now);
+            self.send_lease_batches(revokes).await;
+        }
+        self.hub.note_coverage_timeout(self.tablet);
+        Err(ProposeError::ResponderCoverage {
+            detail: format!(
+                "tablet {} commit {} uncovered by responders {:?}; fenced, outcome uncertain",
+                self.tablet.as_u64(),
+                commit.as_u64(),
+                uncovered
+                    .iter()
+                    .map(|node| node.as_u64())
+                    .collect::<Vec<_>>(),
+            ),
+        })
+    }
+
+    /// One coverage poll of one responder: `true` iff it already applied
+    /// through `commit` and can serve from it. `false` means "not yet (or
+    /// not reachable)" — the caller rounds again, then revokes and fails.
+    async fn poll_coverage_once(&self, peer: NodeId, commit: CommitPosition) -> bool {
+        use crate::peer::{PeerCoveragePoll, PeerRequest, PeerResponse};
+        let request = PeerRequest::CoveragePoll(PeerCoveragePoll {
+            commit: commit.as_u64(),
+        });
+        match self
+            .transport
+            .call(peer, self.group, request, COVERAGE_POLL_TIMEOUT)
+            .await
+        {
+            Ok(PeerResponse::Coverage(report)) => {
+                report.responder == peer.as_u64()
+                    && report.healthy
+                    && report.applied >= commit.as_u64()
+            }
+            Ok(_) | Err(_) => false,
+        }
+    }
+
+    /// Orders one Lazy-ALR batch boundary on the leader:
+    ///
+    /// * `committed > formation` — a write committed while the batch
+    ///   formed subsumes the extra fence. Proof (committed-prefix):
+    ///   every write completing before formation committed no later than
+    ///   formation began, hence at an index at or below any commit
+    ///   observed after receipt; waiting the subsuming commit covers them
+    ///   all. No entry is appended.
+    /// * `committed == formation` — no newer commit observed: append a
+    ///   dedicated fence ordered after formation. Proof: the fence
+    ///   commits by majority after receipt (hence after formation), so
+    ///   its prefix contains every pre-formation completed write; waiting
+    ///   the fence covers them. The fence mutates nothing.
+    /// * `committed < formation` — this leadership's view lags the
+    ///   former's: deposed or partitioned. Refuse (the caller falls back)
+    ///   rather than order a boundary this leadership cannot vouch for.
+    async fn resolve_alr_boundary(
+        &self,
+        sync: crate::command::AlrFenceSync,
+    ) -> Result<SyncOutcome, ProposeError> {
+        if self.group == ConsensusGroupId::control() {
+            return Err(ProposeError::Consensus(ConsensusError::Unavailable {
+                reason: "read fences serve tablet groups only".to_owned(),
+            }));
+        }
+        let formation = crate::state_machine::index_of_commit(sync.formation_applied).unwrap_or(0);
+        let committed = self.committed_index().await;
+        if committed < formation {
+            return Err(ProposeError::Consensus(ConsensusError::LeaderUnknown));
+        }
+        if committed > formation {
+            return Ok(SyncOutcome {
+                boundary: committed,
+                subsumed: true,
+            });
+        }
+        let response = self
+            .raft
+            .client_write(ConsensusCommand::ReadSync(sync))
+            .await
+            .map_err(|error| client_write_error(&error))?;
+        debug_assert!(
+            response.data.outcome().is_none(),
+            "fences carry no client outcome"
+        );
+        let boundary = response.log_id.index;
+        self.coverage_gate(crate::state_machine::commit_of_index(boundary))
+            .await?;
+        Ok(SyncOutcome {
+            boundary,
+            subsumed: false,
+        })
+    }
+
+    /// Orders one Lazy-ALR batch boundary from any replica: leaders
+    /// resolve locally, followers forward to the leader over the peer
+    /// mesh. Every failure answers `Err` for the barrier fallback.
+    async fn propose_sync(
+        &self,
+        sync: crate::command::AlrFenceSync,
+        timeout: Duration,
+    ) -> Result<SyncOutcome, ProposeError> {
+        use crate::peer::{PeerAlrSyncRequest, PeerRequest, PeerResponse};
+        if self.group == ConsensusGroupId::control() {
+            return Err(ProposeError::Consensus(ConsensusError::Unavailable {
+                reason: "read fences serve tablet groups only".to_owned(),
+            }));
+        }
+        if self.is_leader() {
+            return self.resolve_alr_boundary(sync).await;
+        }
+        let leader = self
+            .raft
+            .metrics()
+            .borrow_watched()
+            .clone()
+            .current_leader
+            .map(NodeId::from_u64);
+        let Some(leader) = leader else {
+            return Err(ProposeError::Consensus(ConsensusError::LeaderUnknown));
+        };
+        if leader == self.local {
+            // Metrics race (leader flag and leader id disagree): refuse
+            // rather than forward to self or order unstably.
+            return Err(ProposeError::Consensus(ConsensusError::LeaderUnknown));
+        }
+        let request = PeerRequest::AlrSync(PeerAlrSyncRequest {
+            fence_tablet: sync.fence.tablet.as_u64(),
+            batch: sync.fence.batch,
+            requester: sync.fence.requester.as_u64(),
+            formation_applied: sync.formation_applied.as_u64(),
+        });
+        match self
+            .transport
+            .call(leader, self.group, request, timeout)
+            .await
+        {
+            Ok(PeerResponse::AlrSync(reply)) => Ok(SyncOutcome {
+                boundary: reply.boundary,
+                subsumed: reply.subsumed,
+            }),
+            Ok(unexpected) => Err(ProposeError::Consensus(ConsensusError::Unavailable {
+                reason: format!("leader answered ALR sync with {unexpected:?}"),
+            })),
+            Err(_) => Err(ProposeError::Consensus(ConsensusError::LeaderUnknown)),
+        }
+    }
+
+    /// Serves one inbound lease batch through the tablet's engine and
+    /// answers the replies it produced (piggybacked, same batch shape).
+    /// Infallible: unknown tablets and foreign providers ignore the batch
+    /// (the engine refuses what it must), so there is no error to report.
+    fn serve_lease(&self, from: NodeId, batch: crate::peer::PeerLeaseBatch) -> PeerResponse {
+        let replies = self
+            .hub
+            .lease_receive(self.tablet, from, batch.messages, process_ticks());
+        PeerResponse::Lease(crate::peer::PeerLeaseBatch {
+            messages: replies
+                .into_iter()
+                .flat_map(|group| group.messages)
+                .collect(),
+        })
+    }
+
+    /// Serves one Lazy-ALR sync request (leader only): resolve the
+    /// boundary and answer it. Refusals fail the follower's batch into
+    /// its barrier fallback — never a local serve on a guess.
+    async fn serve_alr_sync(
+        &self,
+        request: crate::peer::PeerAlrSyncRequest,
+    ) -> Result<PeerResponse, PeerRpcError> {
+        let refused = |detail: String| PeerRpcError { detail };
+        if !self.is_leader() {
+            return Err(refused(
+                "not the leader; ALR syncs order on the leader".to_owned(),
+            ));
+        }
+        if request.fence_tablet != self.tablet.as_u64() {
+            return Err(refused(format!(
+                "fence for tablet {} reached tablet {}",
+                request.fence_tablet,
+                self.tablet.as_u64(),
+            )));
+        }
+        let sync = crate::command::AlrFenceSync::new(
+            kivi_types::AlrFence::new(
+                self.tablet,
+                request.batch,
+                NodeId::from_u64(request.requester),
+            ),
+            CommitPosition::from_u64(request.formation_applied),
+        );
+        match self.resolve_alr_boundary(sync).await {
+            Ok(outcome) => Ok(PeerResponse::AlrSync(crate::peer::PeerAlrSyncResponse {
+                boundary: outcome.boundary,
+                subsumed: outcome.subsumed,
+            })),
+            Err(error) => Err(refused(format!("ALR sync refused: {error}"))),
+        }
+    }
+
+    /// Serves one responder-coverage poll from the applied pointer: the
+    /// position plus whether this replica can satisfy the logical read
+    /// contract from it (healthy flag covers sidecar resolvability and
+    /// latched faults — an unhealthy replica covers nothing).
+    async fn serve_coverage(
+        &self,
+        poll: crate::peer::PeerCoveragePoll,
+    ) -> Result<PeerResponse, PeerRpcError> {
+        let status = self.machine.status().await;
+        let _ = poll;
+        Ok(PeerResponse::Coverage(crate::peer::PeerCoverageReport {
+            responder: self.local.as_u64(),
+            incarnation: self.incarnation.as_u64(),
+            applied: status.applied_commit.as_u64(),
+            healthy: status.healthy,
+        }))
+    }
+
+    /// One lease-driver tick: reconcile the observed world into the
+    /// tablet's engine and flush outbound traffic, following piggybacked
+    /// replies one bounded level (the rest rides the next tick; message
+    /// loss/duplication/reordering is protocol-tolerated).
+    async fn lease_tick_drive(&self) {
+        let (term, voters, is_leader, accepted) = self.driver_view();
+        let committed_at = self.committed_index().await;
+        let committed = if committed_at == 0 {
+            CommitPosition::UNASSIGNED
+        } else {
+            crate::state_machine::commit_of_index(committed_at)
+        };
+        let outbound = self.hub.lease_drive(
+            self.tablet,
+            self.authority,
+            term,
+            voters,
+            is_leader,
+            accepted,
+            committed,
+            process_ticks(),
+        );
+        self.send_lease_batches(outbound).await;
+    }
+
+    /// Sends grouped lease batches, feeding each piggybacked reply back
+    /// into the engine up to two levels deep.
+    async fn send_lease_batches(&self, batches: Vec<crate::consistency::LeaseDriveOut>) {
+        let mut pending = batches;
+        for _ in 0..3 {
+            if pending.is_empty() {
+                break;
+            }
+            let mut next = Vec::new();
+            for batch in pending {
+                if batch.messages.is_empty() {
+                    continue;
+                }
+                let target = batch.target;
+                let request = PeerRequest::Lease(crate::peer::PeerLeaseBatch {
+                    messages: batch.messages,
+                });
+                if let Ok(PeerResponse::Lease(reply)) = self
+                    .transport
+                    .call(target, self.group, request, LEASE_RPC_TIMEOUT)
+                    .await
+                {
+                    next.extend(self.hub.lease_receive(
+                        self.tablet,
+                        target,
+                        reply.messages,
+                        process_ticks(),
+                    ));
+                }
+            }
+            pending = next;
+        }
     }
 
     /// Registers a learner on the group leader. Must run on the owner
@@ -2871,7 +3464,7 @@ where
     /// only once durable — never consensus, never logical state).
     async fn serve_rpc(
         &self,
-        _from: NodeId,
+        from: NodeId,
         group: ConsensusGroupId,
         request: PeerRequest,
     ) -> Result<PeerResponse, PeerRpcError> {
@@ -2890,6 +3483,9 @@ where
         }
         match request {
             PeerRequest::Snapshot(fragment) => self.serve_fragment(fragment).await,
+            PeerRequest::Lease(batch) => Ok(self.serve_lease(from, batch)),
+            PeerRequest::AlrSync(request) => self.serve_alr_sync(request).await,
+            PeerRequest::CoveragePoll(poll) => self.serve_coverage(poll).await,
             other => serve_peer_request(&self.raft, other).await,
         }
     }
@@ -3508,8 +4104,8 @@ mod tests {
     use kivi_state::{Key, Operation, OperationResult};
     use kivi_types::{
         ClusterId, MutationIdentity, NamespaceId, NodeId, ReadContext, ReadContract,
-        RequestIdentity, RequestSeq, SessionId, TabletAuthority, TabletEpoch, TabletId, Ticks,
-        UnixMicros, WriteGuardGeneration,
+        RequestIdentity, RequestSeq, ServePath, SessionId, TabletAuthority, TabletEpoch, TabletId,
+        Ticks, UnixMicros, WriteGuardGeneration,
     };
 
     use super::{NodeConfig, ProposeError, ProposeOutcome, ReadError, ReplicatedNode};
@@ -3526,6 +4122,33 @@ mod tests {
     fn authority() -> TabletAuthority {
         TabletAuthority::new(TABLET, TabletEpoch::INITIAL, WriteGuardGeneration::INITIAL)
     }
+
+    /// Fast lease timing for tests: 500ms guard/lease, 50ms renewals
+    /// (12.5ms ticks), 1000ppm drift. Restart quarantine is ~1s.
+    fn test_lease_params() -> kivi_types::LeaseParams {
+        kivi_types::LeaseParams {
+            guard_duration: Duration::from_millis(500),
+            lease_duration: Duration::from_millis(500),
+            renew_interval: Duration::from_millis(50),
+            max_drift_ppm: 1_000,
+        }
+    }
+
+    /// Slow lease timing for failover-transition tests: 5s leases make
+    /// exclusion windows (~5s) deterministically outlast elections
+    /// (~1s), so refusal-then-success sequences never race the clock.
+    /// Restart quarantine is ~5.5s.
+    fn slow_lease_params() -> kivi_types::LeaseParams {
+        kivi_types::LeaseParams {
+            guard_duration: Duration::from_millis(500),
+            lease_duration: Duration::from_millis(5_000),
+            renew_interval: Duration::from_millis(50),
+            max_drift_ppm: 1_000,
+        }
+    }
+
+    /// Lease-eligible point reads (the common test shape).
+    const ELIGIBLE: kivi_types::LeaseEligibility = kivi_types::LeaseEligibility::Eligible;
 
     fn identity(session: u128, seq: u64) -> MutationIdentity {
         MutationIdentity::new(
@@ -3583,6 +4206,17 @@ mod tests {
         id: u64,
         topology: &ClusterTopology,
     ) -> ReplicatedNode {
+        open_test_node_with_params(dir, id, topology, test_lease_params()).await
+    }
+
+    /// Opens one test node with explicit lease timing (failover tests
+    /// need slower leases than the default fast ones).
+    async fn open_test_node_with_params(
+        dir: &std::path::Path,
+        id: u64,
+        topology: &ClusterTopology,
+        lease_params: kivi_types::LeaseParams,
+    ) -> ReplicatedNode {
         ReplicatedNode::open(NodeConfig {
             data_dir: dir.to_owned(),
             namespace: NS,
@@ -3595,6 +4229,7 @@ mod tests {
             peer_certs: std::collections::HashMap::new(),
             insecure_peer_tls: true,
             preflight_enabled: true,
+            lease_params,
         })
         .await
         .expect("node opens")
@@ -3610,13 +4245,20 @@ mod tests {
     /// scratch data directories. The topology (with the probed ports) is
     /// returned for restarts reusing the same addresses.
     async fn cluster() -> (Vec<ReplicatedNode>, Vec<tempfile::TempDir>, ClusterTopology) {
+        slow_cluster_with_params(test_lease_params()).await
+    }
+
+    /// One test cluster with explicit lease timing.
+    async fn slow_cluster_with_params(
+        lease_params: kivi_types::LeaseParams,
+    ) -> (Vec<ReplicatedNode>, Vec<tempfile::TempDir>, ClusterTopology) {
         let addrs = vec![probe_udp(), probe_udp(), probe_udp()];
         let topology = test_topology(&addrs);
         let mut nodes = Vec::new();
         let mut dirs = Vec::new();
         for id in [1u64, 2, 3] {
             let dir = tempfile::tempdir().expect("scratch");
-            nodes.push(open_test_node(dir.path(), id, &topology).await);
+            nodes.push(open_test_node_with_params(dir.path(), id, &topology, lease_params).await);
             dirs.push(dir);
         }
         (nodes, dirs, topology)
@@ -3774,7 +4416,21 @@ mod tests {
         usize,
         u64,
     ) {
-        let (nodes, dirs, topology) = cluster().await;
+        elected_cluster_with_params(test_lease_params()).await
+    }
+
+    /// Opens a cluster with explicit lease timing, elects, writes `x=1`
+    /// through the leader, and waits for full application.
+    async fn elected_cluster_with_params(
+        lease_params: kivi_types::LeaseParams,
+    ) -> (
+        Vec<ReplicatedNode>,
+        Vec<tempfile::TempDir>,
+        ClusterTopology,
+        usize,
+        u64,
+    ) {
+        let (nodes, dirs, topology) = slow_cluster_with_params(lease_params).await;
         let leader = wait_leader(&nodes).await;
         let outcome = nodes[leader]
             .propose(
@@ -3808,6 +4464,7 @@ mod tests {
                     },
                     ReadContract::Latest,
                     CTX,
+                    ELIGIBLE,
                 )
                 .await
                 .expect("latest reads");
@@ -3839,6 +4496,7 @@ mod tests {
                     },
                     ReadContract::Latest,
                     CTX,
+                    ELIGIBLE,
                 )
                 .await
                 .expect("leader reads")
@@ -3852,6 +4510,7 @@ mod tests {
                     },
                     ReadContract::AtLeast(receipt.token()),
                     CTX,
+                    ELIGIBLE,
                 )
                 .await
                 .expect("covered follower serves");
@@ -3876,6 +4535,7 @@ mod tests {
                     },
                     ReadContract::AtLeast(foreign),
                     CTX,
+                    ELIGIBLE,
                 )
                 .await
                 .expect_err("foreign tablet rejects");
@@ -3894,6 +4554,7 @@ mod tests {
                     },
                     ReadContract::AtLeast(old_epoch),
                     CTX,
+                    ELIGIBLE,
                 )
                 .await
                 .expect_err("superseded epoch rejects");
@@ -3911,12 +4572,12 @@ mod tests {
                 key: Key::from("y-absent"),
             };
             let first = nodes[follower]
-                .read(&any(), ReadContract::Any, CTX)
+                .read(&any(), ReadContract::Any, CTX, ELIGIBLE)
                 .await
                 .expect("first any serves");
             assert_eq!(first.outcome, OperationResult::Value(None));
             let second = nodes[follower]
-                .read(&any(), ReadContract::Any, CTX)
+                .read(&any(), ReadContract::Any, CTX, ELIGIBLE)
                 .await
                 .expect("second any serves");
             assert_eq!(second.outcome, OperationResult::Value(None));
@@ -3952,6 +4613,7 @@ mod tests {
                     },
                     bound,
                     CTX,
+                    ELIGIBLE,
                 )
                 .await
                 .expect_err("cold follower cannot prove the bound");
@@ -3973,6 +4635,7 @@ mod tests {
                     },
                     ReadContract::Latest,
                     CTX,
+                    ELIGIBLE,
                 )
                 .await
                 .expect("leader barriers");
@@ -3983,6 +4646,7 @@ mod tests {
                     },
                     bound,
                     CTX,
+                    ELIGIBLE,
                 )
                 .await
                 .expect("proven bound serves");
@@ -4002,93 +4666,202 @@ mod tests {
         });
     }
 
-    /// Almost-Local serves `Latest` from a fresh leadership receipt and
-    /// falls back to the barrier the moment the receipt ages out.
+    /// Lazy-ALR serves `Latest` on leaders and followers without any
+    /// barrier and without any timing assumption: one fence per batch,
+    /// local execution after the boundary applies.
     #[test]
-    fn almost_local_hits_on_fresh_proof_and_falls_back_on_age() {
-        use core::time::Duration;
-        use kivi_types::{ReadAuthorityProvider, Ticks};
+    fn lazy_alr_serves_without_barriers_or_clocks() {
+        use kivi_types::ReadAuthorityProvider;
 
         block_on(async {
             let (nodes, _dirs, _topology, leader, _index) = elected_cluster().await;
-            nodes[leader].set_read_provider(ReadAuthorityProvider::AlmostLocal {
-                max_proof_age: Duration::from_millis(50),
-            });
+            let follower = (leader + 1) % 3;
+            for node in &nodes {
+                node.set_read_provider(ReadAuthorityProvider::AlmostLocal);
+            }
             let get = || Operation::Get {
                 key: Key::from("x"),
             };
-            // No receipt yet: barrier, which installs one.
-            nodes[leader]
-                .read(&get(), ReadContract::Latest, CTX)
-                .await
-                .expect("first latest barriers");
-            // Fresh receipt: no new barrier.
-            nodes[leader]
-                .read(&get(), ReadContract::Latest, CTX)
-                .await
-                .expect("second latest is fast");
-            let metrics = nodes[leader].status().await.consistency;
-            assert_eq!(metrics.almost_local_hits, 1);
-            assert_eq!(metrics.authority_serves, 1);
-            // Aged past the window: fallback to a fresh barrier.
-            let aged = ReadContext::new(NOW, Ticks::from_micros(1_000_000 + 51_000), CTX.wait);
+            // Leader: batch orders a fence, no barrier is taken.
             let served = nodes[leader]
-                .read(&get(), ReadContract::Latest, aged)
+                .read(&get(), ReadContract::Latest, CTX, ELIGIBLE)
                 .await
-                .expect("aged proof falls back and serves");
+                .expect("leader ALR serves");
             assert_eq!(
                 served.outcome,
                 OperationResult::Value(Some(bytes::Bytes::from_static(b"1")))
             );
+            assert!(
+                matches!(served.path, ServePath::AlrSync | ServePath::AlrSubsumed),
+                "leader serves from its ALR batch, got {:?}",
+                served.path
+            );
             let metrics = nodes[leader].status().await.consistency;
-            assert_eq!(metrics.almost_local_fallbacks, 2, "cold + aged fall back");
-            assert_eq!(metrics.authority_serves, 2, "both fallbacks barriered");
+            assert_eq!(metrics.alr_batches, 1);
+            assert_eq!(metrics.authority_serves, 0, "no barrier on the ALR path");
+            // Follower: forwards the fence order to the leader, executes
+            // the batch locally once the boundary applies — still no
+            // barrier, still exact.
+            let served = nodes[follower]
+                .read(&get(), ReadContract::Latest, CTX, ELIGIBLE)
+                .await
+                .expect("follower ALR serves");
+            assert_eq!(
+                served.outcome,
+                OperationResult::Value(Some(bytes::Bytes::from_static(b"1")))
+            );
+            assert!(
+                matches!(served.path, ServePath::AlrSync | ServePath::AlrSubsumed),
+                "follower serves from its ALR batch, got {:?}",
+                served.path
+            );
+            let metrics = nodes[follower].status().await.consistency;
+            assert_eq!(metrics.authority_serves, 0, "follower takes no barrier");
             for node in &nodes {
                 node.shutdown().await;
             }
         });
     }
 
-    /// Roster leases let a member serve `Latest` locally while valid and
-    /// force fallback at expiry; non-members never take the fast path.
+    /// Roster leases serve `Latest` locally on responders; a leader
+    /// transition voids old-roster authority (term fencing) so an old
+    /// responder either sees the new write or fails over — never a stale
+    /// success. Partitioning the old responder forces the failure leg.
+    ///
+    /// Slow lease timing (5s leases): exclusion windows deterministically
+    /// outlast elections, so the refuse-then-succeed sequence never races
+    /// the clock.
     #[test]
-    fn roster_lease_serves_members_until_expiry() {
-        use core::time::Duration;
-        use kivi_types::{ReadAuthorityProvider, Ticks};
+    #[allow(clippy::too_many_lines)]
+    fn roster_lease_serves_until_term_fencing_forces_fallback() {
+        use kivi_types::ReadAuthorityProvider;
 
         block_on(async {
-            let (nodes, _dirs, _topology, leader, _index) = elected_cluster().await;
-            let member = nodes[leader].node();
-            let base = Ticks::from_micros(1_000_000);
-            nodes[leader]
-                .grant_read_lease_at(vec![member], base, Duration::from_secs(60), 1)
-                .await
-                .expect("leader issues its lease");
-            nodes[leader].set_read_provider(ReadAuthorityProvider::RosterLease);
+            let (nodes, _dirs, _topology, leader, _index) =
+                elected_cluster_with_params(slow_lease_params()).await;
+            for node in &nodes {
+                node.set_read_provider(ReadAuthorityProvider::RosterLease);
+            }
             let get = || Operation::Get {
                 key: Key::from("x"),
             };
-            let within = ReadContext::new(NOW, Ticks::from_micros(2_000_000), CTX.wait);
-            let served = nodes[leader]
-                .read(&get(), ReadContract::Latest, within)
-                .await
-                .expect("leaseholder serves fast");
+            // Wait for full-mesh activation, not just one responder:
+            // every node must hold live exclusions to all three peers
+            // (covered == 3 everywhere). Only then does killing the
+            // leader deterministically leave a live exclusion covering
+            // the dead node on the successor — the refusal below must
+            // not race activation.
+            let responder = (leader + 1) % 3;
+            let mut served = None;
+            for _ in 0..600 {
+                let attempt = nodes[responder]
+                    .read(&get(), ReadContract::Latest, CTX, ELIGIBLE)
+                    .await
+                    .expect("reads always answer while connected");
+                if attempt.path == ServePath::RosterLease {
+                    served = Some(attempt);
+                }
+                let mut meshed = served.is_some();
+                for node in &nodes {
+                    if node.consistency_snapshot().covered_responders != 3 {
+                        meshed = false;
+                    }
+                }
+                if meshed {
+                    break;
+                }
+                compio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let served = served.expect("roster stabilizes after quarantine");
             assert_eq!(
                 served.outcome,
                 OperationResult::Value(Some(bytes::Bytes::from_static(b"1")))
             );
-            let metrics = nodes[leader].status().await.consistency;
-            assert_eq!(metrics.roster_hits, 1);
+            let metrics = nodes[responder].status().await.consistency;
+            assert!(metrics.roster_hits >= 1, "served from the roster");
             assert_eq!(metrics.authority_serves, 0, "no barrier on the fast path");
-            // Past expiry the same read falls back to a fresh barrier.
-            let past = ReadContext::new(NOW, Ticks::from_micros(62_000_000), CTX.wait);
-            nodes[leader]
-                .read(&get(), ReadContract::Latest, past)
+            // Kill the leader: the successor's term voids the old roster,
+            // but the dead leader's exclusion still covers it — so the
+            // next write FAILS retryable instead of completing uncovered
+            // (the slow path of roster transition: revocation is
+            // impossible from a dead node, so the exclusion must lapse).
+            nodes[leader].shutdown().await;
+            let new_leader = wait_leader(&nodes).await;
+            assert_ne!(new_leader, leader, "leadership moved on");
+            let refused = nodes[new_leader]
+                .propose(
+                    &Operation::Set {
+                        key: Key::from("x"),
+                        value: bytes::Bytes::from_static(b"2"),
+                    },
+                    None,
+                    None,
+                    NOW,
+                )
                 .await
-                .expect("expired lease falls back and serves");
-            let metrics = nodes[leader].status().await.consistency;
-            assert_eq!(metrics.roster_fallbacks, 1);
-            assert_eq!(metrics.authority_serves, 1);
+                .expect_err("write cannot complete past a covered dead responder");
+            assert!(
+                matches!(refused, ProposeError::ResponderCoverage { .. }),
+                "coverage fails retryable, got {refused:?}"
+            );
+            // Past the exclusion lapse (slow timing: ~5s lease), the
+            // gate clears and the write succeeds; the old responder's
+            // next read either sees it (ALR over the live link) or fails
+            // over — never stale.
+            compio::time::sleep(Duration::from_millis(6_000)).await;
+            nodes[new_leader]
+                .propose(
+                    &Operation::Set {
+                        key: Key::from("x"),
+                        value: bytes::Bytes::from_static(b"2"),
+                    },
+                    None,
+                    None,
+                    NOW,
+                )
+                .await
+                .expect("write succeeds once the exclusion lapses");
+            let outcome = nodes[responder]
+                .read(&get(), ReadContract::Latest, CTX, ELIGIBLE)
+                .await
+                .expect("connected responder converges")
+                .outcome;
+            assert_eq!(
+                outcome,
+                OperationResult::Value(Some(bytes::Bytes::from_static(b"2"))),
+                "old responder sees the post-failover write, never stale data"
+            );
+            // Partition a pure follower (neither old nor new leader) from
+            // the new leader: while its lease is still valid it keeps
+            // serving — the covered value, never stale data.
+            let partitioned = (0..3)
+                .find(|index| *index != new_leader && *index != leader)
+                .expect("a pure follower exists");
+            nodes[partitioned]
+                .suspend_peer(nodes[new_leader].node())
+                .await;
+            let outcome = nodes[partitioned]
+                .read(&get(), ReadContract::Latest, CTX, ELIGIBLE)
+                .await
+                .expect("valid lease still serves under partition")
+                .outcome;
+            assert_eq!(
+                outcome,
+                OperationResult::Value(Some(bytes::Bytes::from_static(b"2"))),
+                "partitioned responder serves covered state, never stale"
+            );
+            // Past the hold lapse, with no leader leg (hence no stable
+            // roster), no ALR forward, and no follower barrier, the read
+            // fails instead of succeeding stale.
+            compio::time::sleep(Duration::from_millis(6_000)).await;
+            let error = nodes[partitioned]
+                .read(&get(), ReadContract::Latest, CTX, ELIGIBLE)
+                .await
+                .expect_err("lapsed responder cannot prove freshness");
+            assert!(
+                matches!(error, ReadError::Consensus(_)),
+                "partition fails over as routing, got {error:?}"
+            );
             for node in &nodes {
                 node.shutdown().await;
             }
@@ -4112,6 +4885,7 @@ mod tests {
                     },
                     ReadContract::Latest,
                     CTX,
+                    ELIGIBLE,
                 )
                 .await
                 .expect("pre-restart read")
@@ -4135,6 +4909,7 @@ mod tests {
                     },
                     bound,
                     CTX,
+                    ELIGIBLE,
                 )
                 .await
                 .expect("escalation serves after restart");
@@ -4157,6 +4932,7 @@ mod tests {
                     },
                     ReadContract::AtLeast(token),
                     CTX,
+                    ELIGIBLE,
                 )
                 .await
                 .expect("pre-restart token survives restart");
@@ -4200,6 +4976,7 @@ mod tests {
                     },
                     ReadContract::Latest,
                     CTX,
+                    ELIGIBLE,
                 )
                 .await
                 .expect("reads counter");
@@ -4248,6 +5025,7 @@ mod tests {
                     },
                     ReadContract::Latest,
                     CTX,
+                    ELIGIBLE,
                 )
                 .await
                 .expect_err("follower refuses Latest");
@@ -4262,6 +5040,7 @@ mod tests {
                     },
                     ReadContract::Any,
                     CTX,
+                    ELIGIBLE,
                 )
                 .await
                 .expect("follower serves Any");
@@ -4352,6 +5131,7 @@ mod tests {
                     },
                     ReadContract::Any,
                     CTX,
+                    ELIGIBLE,
                 )
                 .await
                 .expect("converged replica reads");
@@ -4441,6 +5221,7 @@ mod tests {
                     },
                     ReadContract::Latest,
                     CTX,
+                    ELIGIBLE,
                 )
                 .await
                 .expect("majority reads");
@@ -4458,6 +5239,7 @@ mod tests {
                         },
                         ReadContract::Any,
                         CTX,
+                        ELIGIBLE,
                     )
                     .await
                     .expect("converged read");
@@ -4564,6 +5346,7 @@ mod tests {
                         },
                         ReadContract::Any,
                         CTX,
+                        ELIGIBLE,
                     )
                     .await
                     .expect("converged read");
@@ -4678,6 +5461,7 @@ mod tests {
                     },
                     ReadContract::Latest,
                     CTX,
+                    ELIGIBLE,
                 )
                 .await
                 .expect("post-restart latest reads");
