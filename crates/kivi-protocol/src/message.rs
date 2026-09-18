@@ -13,8 +13,9 @@
 use kivi_state::{Key, Operation};
 use kivi_tablet::{DirectoryVersion, HashPrefix, OrderedRange, PartitionRange};
 use kivi_types::{
-    ClusterId, NamespaceId, NodeId, NodeIncarnation, RequestIdentity, RequestSeq, TabletEpoch,
-    TabletId, UnixMicros, WorkerId,
+    ClusterId, CommitPosition, CommitToken, NamespaceId, NodeId, NodeIncarnation, ReadContract,
+    ReadReceipt, RequestIdentity, RequestSeq, TabletAuthority, TabletEpoch, TabletId, UnixMicros,
+    WorkerId, WriteGuardGeneration,
 };
 
 use crate::frame::ProtocolError;
@@ -252,6 +253,11 @@ pub enum Status {
     /// A scan cursor no longer resolves (namespace dropped or cursor
     /// predates retention). Re-issue the scan from the start.
     ScanCursorStale = 20,
+    /// An `AtLeast` token's lineage is foreign to the serving replica
+    /// (wrong tablet, superseded epoch, or unassigned position). Waiting
+    /// cannot cure it: refresh the token from a read on its own lineage.
+    /// Never retried under the same token.
+    StaleToken = 21,
 }
 
 impl Status {
@@ -280,6 +286,7 @@ impl Status {
             18 => Some(Self::TxnCoordinatorUnavailable),
             19 => Some(Self::UniqueViolation),
             20 => Some(Self::ScanCursorStale),
+            21 => Some(Self::StaleToken),
             _ => None,
         }
     }
@@ -333,6 +340,7 @@ impl core::fmt::Display for Status {
             Self::TxnCoordinatorUnavailable => write!(f, "txn-coordinator-unavailable"),
             Self::UniqueViolation => write!(f, "unique-violation"),
             Self::ScanCursorStale => write!(f, "scan-cursor-stale"),
+            Self::StaleToken => write!(f, "stale-token"),
         }
     }
 }
@@ -612,6 +620,12 @@ pub struct Request {
     /// clients that predate durable dedup). Durable servers require it on
     /// every mutating request; ephemeral servers ignore it.
     pub identity: Option<RequestIdentity>,
+    /// Freshness contract for read opcodes (`Latest` when absent on the
+    /// wire: pre-contract clients only knew linearizable reads, and
+    /// `Latest` is the strongest contract, so defaulting is never a
+    /// silent weakening). Ignored on mutating opcodes. Non-`Latest`
+    /// contracts ride a trailer (see [`Request::encode`]).
+    pub contract: ReadContract,
     /// Client acknowledgement watermark for the identity's session
     /// (meaningful only alongside `identity`; zero otherwise).
     pub ack_floor: RequestSeq,
@@ -889,6 +903,13 @@ pub struct Response {
     pub status: Status,
     /// Outcome payload.
     pub body: ResponseBody,
+    /// Read proof attached to served reads (`Ok`/`NotFound` on read
+    /// opcodes): the authority and applied position the read served from,
+    /// for `AtLeast` chaining and operator diagnosis. `None` on writes
+    /// (which carry versions instead), on errors, and on responses from
+    /// pre-proof servers (treated as no evidence, never as freshness).
+    /// Rides a trailer (see [`Response::encode`]).
+    pub proof: Option<ReadReceipt>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1334,6 +1355,30 @@ impl Request {
                 push_u64(&mut out, self.ack_floor.as_u64());
             }
         }
+        // Read-contract trailer: `Latest` writes nothing (byte-identical
+        // to pre-contract encodings — old servers keep serving it as the
+        // only contract they know). Any other contract appends its tag,
+        // which old servers reject loudly as trailing bytes instead of
+        // silently serving stronger-or-weaker semantics. Tags mirror
+        // `kivi-codec`'s canonical `ReadContract` tags (0 is accepted on
+        // decode as `Latest` but never written).
+        match self.contract {
+            ReadContract::Latest => {}
+            ReadContract::AtLeast(token) => {
+                push_u8(&mut out, 1);
+                push_u64(&mut out, token.tablet().as_u64());
+                push_u64(&mut out, token.epoch().as_u64());
+                push_u64(&mut out, token.position().as_u64());
+            }
+            ReadContract::BoundedStale { max_staleness } => {
+                push_u8(&mut out, 2);
+                push_u64(
+                    &mut out,
+                    u64::try_from(max_staleness.as_micros()).unwrap_or(u64::MAX),
+                );
+            }
+            ReadContract::Any => push_u8(&mut out, 3),
+        }
         out
     }
 
@@ -1368,6 +1413,7 @@ impl Request {
             opcode,
             hint,
             key,
+            contract: kivi_types::ReadContract::Latest,
             value: None,
             delta: 0,
             expiry: 0,
@@ -1513,6 +1559,28 @@ impl Request {
                 _ => return Err(ProtocolError::Malformed { context: CONTEXT }),
             }
         }
+        // Contract trailer: absent means `Latest` (pre-contract clients
+        // only knew linearizable reads). Present trailers decode by tag;
+        // unknown tags are malformed, never guessed.
+        if cursor.remaining() > 0 {
+            request.contract = match cursor.u8(CONTEXT)? {
+                0 => ReadContract::Latest,
+                1 => {
+                    let tablet = TabletId::from_u64(cursor.u64(CONTEXT)?);
+                    let epoch = TabletEpoch::from_u64(cursor.u64(CONTEXT)?);
+                    let position = CommitPosition::from_u64(cursor.u64(CONTEXT)?);
+                    ReadContract::AtLeast(CommitToken::new(tablet, epoch, position))
+                }
+                2 => {
+                    let micros = cursor.u64(CONTEXT)?;
+                    ReadContract::BoundedStale {
+                        max_staleness: core::time::Duration::from_micros(micros),
+                    }
+                }
+                3 => ReadContract::Any,
+                _ => return Err(ProtocolError::Malformed { context: CONTEXT }),
+            };
+        }
         cursor.end(CONTEXT)?;
         Ok(request)
     }
@@ -1633,6 +1701,18 @@ impl Response {
                 push_u16(&mut out, u16::try_from(message.len()).unwrap_or(u16::MAX));
                 out.extend_from_slice(message.as_bytes());
             }
+        }
+        // Read-proof trailer: absent when `None` (byte-identical to
+        // pre-proof encodings), 40 bytes `(tablet, epoch, position,
+        // guard, incarnation)` when `Some`. Old decoders reject proofed
+        // responses loudly as trailing bytes; new decoders treat a
+        // missing trailer as no evidence, never as freshness.
+        if let Some(proof) = &self.proof {
+            push_u64(&mut out, proof.authority.tablet().as_u64());
+            push_u64(&mut out, proof.authority.epoch().as_u64());
+            push_u64(&mut out, proof.position.as_u64());
+            push_u64(&mut out, proof.authority.guard().as_u64());
+            push_u64(&mut out, proof.incarnation.as_u64());
         }
         out
     }
@@ -1797,9 +1877,45 @@ impl Response {
                 ResponseBody::Diagnostic(String::from_utf8_lossy(bytes).into_owned())
             }
         };
+        // Proof trailer: only `Ok`/`NotFound` responses may carry one
+        // (errors never vouch freshness). Absent means no evidence;
+        // present must be exactly 40 bytes, else malformed.
+        let proof = match status {
+            Status::Ok | Status::NotFound => decode_proof_trailer(&mut cursor)?,
+            _ => None,
+        };
         cursor.end(CONTEXT)?;
-        Ok((Self { status, body }, opcode))
+        Ok((
+            Self {
+                status,
+                body,
+                proof,
+            },
+            opcode,
+        ))
     }
+}
+
+/// Decodes the optional 40-byte read-proof trailer: empty remainder is
+/// `None`, exactly 40 bytes is `Some`, anything else is malformed.
+fn decode_proof_trailer(cursor: &mut Cursor<'_>) -> Result<Option<ReadReceipt>, ProtocolError> {
+    const CONTEXT: &str = "response proof";
+    if cursor.remaining() == 0 {
+        return Ok(None);
+    }
+    if cursor.remaining() != 40 {
+        return Err(ProtocolError::Malformed { context: CONTEXT });
+    }
+    let tablet = TabletId::from_u64(cursor.u64(CONTEXT)?);
+    let epoch = TabletEpoch::from_u64(cursor.u64(CONTEXT)?);
+    let position = CommitPosition::from_u64(cursor.u64(CONTEXT)?);
+    let guard = WriteGuardGeneration::from_u64(cursor.u64(CONTEXT)?);
+    let incarnation = kivi_types::NodeIncarnation::from_u64(cursor.u64(CONTEXT)?);
+    Ok(Some(ReadReceipt::new(
+        TabletAuthority::new(tablet, epoch, guard),
+        position,
+        incarnation,
+    )))
 }
 
 /// Decodes a `0/1` flag byte.
@@ -2082,6 +2198,7 @@ mod tests {
 
     fn request(opcode: Opcode) -> Request {
         Request {
+            contract: kivi_types::ReadContract::Latest,
             namespace: NS,
             opcode,
             hint: Some(RouteHint {
@@ -2171,6 +2288,7 @@ mod tests {
             ),
         ] {
             let response = Response {
+                proof: None,
                 status: Status::Ok,
                 body,
             };
@@ -2329,6 +2447,7 @@ mod tests {
     #[case(Status::TxnCoordinatorUnavailable)]
     #[case(Status::UniqueViolation)]
     #[case(Status::ScanCursorStale)]
+    #[case(Status::StaleToken)]
     fn every_status_round_trips(#[case] status: Status) {
         assert_eq!(Status::from_u16(status.as_u16()), Some(status));
         assert_eq!(
@@ -2345,6 +2464,15 @@ mod tests {
     }
 
     #[test]
+    fn stale_token_is_terminal() {
+        // A stale token never heals under the same token: retrying is
+        // pointless (refresh the token instead), so it is not retriable.
+        assert!(!Status::StaleToken.is_retriable());
+        assert_eq!(Status::from_u16(21), Some(Status::StaleToken));
+        assert_eq!(Status::StaleToken.to_string(), "stale-token");
+    }
+
+    #[test]
     fn dedup_statuses_are_terminal() {
         // Dedup outcomes are deterministic for the same state: retrying is
         // harmless but pointless, so they are not marked retriable.
@@ -2354,6 +2482,87 @@ mod tests {
         assert_eq!(Status::from_u16(14), Some(Status::SessionOverloaded));
         assert_eq!(Status::DedupExpired.to_string(), "dedup-expired");
         assert_eq!(Status::SessionOverloaded.to_string(), "session-overloaded");
+    }
+
+    #[test]
+    fn read_contracts_round_trip_with_stable_tags() {
+        use core::time::Duration;
+        // Latest writes no trailer: byte-identical to pre-contract
+        // encodings, decoding back to Latest.
+        let latest = request(Opcode::Get);
+        assert_eq!(latest.contract, ReadContract::Latest);
+        let decoded = Request::decode(&latest.encode()).expect("latest round trip");
+        assert_eq!(decoded.contract, ReadContract::Latest);
+        // Every other contract rides its tag and round-trips exactly.
+        let token = CommitToken::new(
+            TabletId::from_u64(3),
+            TabletEpoch::from_u64(9),
+            CommitPosition::from_u64(41),
+        );
+        for contract in [
+            ReadContract::AtLeast(token),
+            ReadContract::BoundedStale {
+                max_staleness: Duration::from_millis(250),
+            },
+            ReadContract::Any,
+        ] {
+            let mut wire = request(Opcode::Get);
+            wire.contract = contract;
+            let decoded = Request::decode(&wire.encode()).expect("contract round trip");
+            assert_eq!(decoded.contract, contract);
+        }
+        // Unknown contract tags fail closed, never guessed.
+        let mut bad = request(Opcode::Get).encode();
+        bad.push(0x7F);
+        assert!(Request::decode(&bad).is_err());
+        // A pre-contract encoding (no trailer at all) still decodes as
+        // Latest: the strongest contract, never a silent weakening.
+        // (Only the contract is compared: opcode tails never round-trip
+        // across shapes, as `every_operation_round_trips` pins.)
+        let truncated = request(Opcode::Get).encode();
+        assert_eq!(
+            Request::decode(&truncated)
+                .expect("pre-contract decodes")
+                .contract,
+            ReadContract::Latest
+        );
+    }
+
+    #[test]
+    fn read_proofs_round_trip_as_response_trailers() {
+        let proof = ReadReceipt::new(
+            TabletAuthority::new(
+                TabletId::from_u64(3),
+                TabletEpoch::from_u64(9),
+                WriteGuardGeneration::from_u64(12),
+            ),
+            CommitPosition::from_u64(41),
+            kivi_types::NodeIncarnation::from_u64(7),
+        );
+        let response = Response {
+            status: Status::Ok,
+            body: ResponseBody::Exists(true),
+            proof: Some(proof),
+        };
+        let (decoded, _) = Response::decode(&response.encode(Opcode::Exists)).expect("round trip");
+        assert_eq!(decoded, response);
+        assert_eq!(
+            decoded.proof.expect("proof").token().position(),
+            CommitPosition::from_u64(41)
+        );
+        // Proof-less responses are byte-identical to pre-proof encodings
+        // and decode to `None` (no evidence, never freshness).
+        let bare = Response {
+            status: Status::Ok,
+            body: ResponseBody::Exists(true),
+            proof: None,
+        };
+        let (decoded, _) = Response::decode(&bare.encode(Opcode::Exists)).expect("round trip");
+        assert_eq!(decoded.proof, None);
+        // A truncated trailer (neither absent nor 40 bytes) is malformed.
+        let mut bad = bare.encode(Opcode::Exists);
+        bad.extend_from_slice(&[1u8; 7]);
+        assert!(Response::decode(&bad).is_err());
     }
 
     #[test]
@@ -2475,6 +2684,7 @@ mod tests {
         ];
         for (opcode, body) in bodies {
             let response = Response {
+                proof: None,
                 status: Status::Ok,
                 body,
             };
@@ -2484,6 +2694,7 @@ mod tests {
         }
         // Redirects and diagnostics ride their own statuses.
         let redirect = Response {
+            proof: None,
             status: Status::StaleRoute,
             body: ResponseBody::Redirect(redirect()),
         };
@@ -2491,6 +2702,7 @@ mod tests {
         assert_eq!(opcode, Opcode::Get);
         assert_eq!(decoded, redirect);
         let error = Response {
+            proof: None,
             status: Status::WrongType,
             body: ResponseBody::Diagnostic("needs bytes".to_owned()),
         };
@@ -2498,6 +2710,7 @@ mod tests {
         assert_eq!(decoded, error);
         // Missing values surface as NotFound, not empty Ok bodies.
         let missing = Response {
+            proof: None,
             status: Status::NotFound,
             body: ResponseBody::Diagnostic(String::new()),
         };
@@ -2509,6 +2722,7 @@ mod tests {
         assert_eq!(decoded.status, Status::NotFound);
         assert_eq!(opcode, Opcode::GetVersion);
         let versioned = Response {
+            proof: None,
             status: Status::Ok,
             body: ResponseBody::Version(41),
         };
@@ -2522,6 +2736,7 @@ mod tests {
     fn malformed_responses_rejected() {
         // Truncated Ok body.
         let mut bytes = Response {
+            proof: None,
             status: Status::Ok,
             body: ResponseBody::Stored { version: 1 },
         }
@@ -2530,6 +2745,7 @@ mod tests {
         assert!(Response::decode(&bytes).is_err());
         // Ok body inconsistent with a redirect status.
         let mut bad = Response {
+            proof: None,
             status: Status::StaleRoute,
             body: ResponseBody::Stored { version: 1 },
         }
@@ -2538,6 +2754,7 @@ mod tests {
         assert!(Response::decode(&bad).is_err());
         // Unknown status code.
         let mut bad = Response {
+            proof: None,
             status: Status::Ok,
             body: ResponseBody::Exists(true),
         }

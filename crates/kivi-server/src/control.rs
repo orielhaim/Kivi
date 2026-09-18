@@ -489,6 +489,7 @@ async fn resolve_one_intent(
     let _ = namespace;
     let record_key = kivi_state::txn_record_key(intent.coordinator, intent.id);
     let now = super::cluster::wall_now();
+    let ctx = super::cluster::read_ctx();
     // Read the decision record (fiat-routed to the coordinator tablet;
     // followers redirect and this pass skips).
     let record = match node
@@ -498,39 +499,43 @@ async fn resolve_one_intent(
                 key: record_key.clone(),
             },
             kivi_types::ReadContract::Latest,
-            now,
+            ctx,
         )
         .await
     {
-        Ok(OperationResult::Value(Some(bytes))) => match TxnRecord::decode(&bytes) {
-            Ok(record) => Some(record),
-            Err(_) => return,
-        },
-        // Missing record with an expired lease: fence first, then discard.
-        // The fence CASes an Aborted decision on absence; a slow driver
-        // racing to decide CASes the same key, so exactly one wins and
-        // the loser follows the winner on re-read (next pass / re-drive).
-        // Without the fence a slow commit could land after this discard
-        // and report success for a write that never applied.
-        Ok(_) => {
-            if lease_expired(intent.prepared_at, now)
-                && cas_abort_absent_record(node, intent.coordinator, intent.id).await
-            {
-                let _ = node
-                    .propose(
-                        tablet,
-                        &Operation::TxnFinalize {
-                            txn: intent.id,
-                            key: intent.key.clone(),
-                            commit: false,
-                        },
-                        None,
-                        None,
-                        now,
-                    )
-                    .await;
+        Ok(served) => {
+            if let OperationResult::Value(Some(bytes)) = served.outcome {
+                match TxnRecord::decode(&bytes) {
+                    Ok(record) => Some(record),
+                    Err(_) => return,
+                }
+            } else {
+                // Missing record with an expired lease: fence first, then
+                // discard. The fence CASes an Aborted decision on absence;
+                // a slow driver racing to decide CASes the same key, so
+                // exactly one wins and the loser follows the winner on
+                // re-read (next pass / re-drive). Without the fence a slow
+                // commit could land after this discard and report success
+                // for a write that never applied.
+                if lease_expired(intent.prepared_at, now)
+                    && cas_abort_absent_record(node, intent.coordinator, intent.id).await
+                {
+                    let _ = node
+                        .propose(
+                            tablet,
+                            &Operation::TxnFinalize {
+                                txn: intent.id,
+                                key: intent.key.clone(),
+                                commit: false,
+                            },
+                            None,
+                            None,
+                            now,
+                        )
+                        .await;
+                }
+                return;
             }
-            return;
         }
         Err(_) => return,
     };
@@ -668,18 +673,21 @@ async fn cas_abort_absent_record(
 /// on the record tablet (same fast-path machinery, driven internally).
 async fn cas_abort_record(node: &Arc<ConsensusNode>, record: &kivi_state::TxnRecord) {
     let record_key = kivi_state::txn_record_key(record.coordinator, record.id);
-    let now = super::cluster::wall_now();
-    let Ok(kivi_state::OperationResult::Version(Some(version))) = node
+    let ctx = super::cluster::read_ctx();
+    let Ok(served) = node
         .read(
             record.coordinator,
             &kivi_state::Operation::GetVersion {
                 key: record_key.clone(),
             },
             kivi_types::ReadContract::Latest,
-            now,
+            ctx,
         )
         .await
     else {
+        return;
+    };
+    let kivi_state::OperationResult::Version(Some(version)) = served.outcome else {
         return;
     };
     let mut aborted = record.clone();

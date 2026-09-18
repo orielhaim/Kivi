@@ -1671,6 +1671,7 @@ dependencies = [
  "bytes",
  "compio",
  "crc32c",
+ "divan",
  "futures",
  "http",
  "kivi-chunk",

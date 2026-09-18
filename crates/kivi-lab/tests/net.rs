@@ -326,6 +326,7 @@ fn pipelined_raw_socket_round_trips_in_order() {
     // Pipeline three requests without waiting between them.
     for id in 10u64..13 {
         let request = Request {
+            contract: kivi_types::ReadContract::Latest,
             namespace: NS,
             opcode: Opcode::Set,
             hint: None,

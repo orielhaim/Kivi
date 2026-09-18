@@ -49,6 +49,7 @@
 pub mod cluster;
 pub mod command;
 pub mod config;
+pub mod consistency;
 pub mod control;
 pub mod gate;
 pub mod multi;
@@ -72,6 +73,7 @@ pub use cluster::{
     TabletAssignment, TopologyError, classify_bootstrap, verify_against_durable,
 };
 pub use command::{CONSENSUS_COMMAND_VERSION, ConsensusCommand, ConsensusCommandError};
+pub use consistency::{CachedServe, ConsistencyHub, PlannedRead, ReadPlan, ServedRead, ServedScan};
 pub use control::{
     CATCH_UP_LAG_THRESHOLD, ObservationAuthority, ObservedMembership, ReconcileStep, caught_up,
     next_step, observation_authority, select_authoritative,

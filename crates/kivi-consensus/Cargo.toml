@@ -43,6 +43,11 @@ rustls.workspace = true
 # the library or the production binary.
 sysinfo = "0.39"
 tempfile.workspace = true
+divan.workspace = true
+
+[[bench]]
+name = "reads"
+harness = false
 
 [lints.rust]
 unsafe_code = "deny"

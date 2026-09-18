@@ -94,6 +94,7 @@ impl RawDurable {
     ) -> kivi_protocol::Response {
         use kivi_protocol::{FrameKind, Opcode, Request};
         let request = Request {
+            contract: kivi_types::ReadContract::Latest,
             namespace: NS,
             opcode: Opcode::CounterAdd,
             hint: None,

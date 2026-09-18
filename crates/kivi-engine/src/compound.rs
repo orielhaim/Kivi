@@ -73,6 +73,7 @@ pub async fn handle_compound(
         ),
         _ => (
             Response {
+                proof: None,
                 status: Status::InvalidRequest,
                 body: ResponseBody::Diagnostic("not a compound request".to_owned()),
             },
@@ -143,6 +144,7 @@ fn handle_scan(
         Placement::Local => {}
         Placement::Redirect(info) => {
             return Response {
+                proof: None,
                 status: if info.worker == worker {
                     S::NotLocal
                 } else {
@@ -153,6 +155,7 @@ fn handle_scan(
         }
         Placement::Nowhere => {
             return Response {
+                proof: None,
                 status: S::NotLocal,
                 body: ResponseBody::Diagnostic("tablet not live on owner".to_owned()),
             };
@@ -163,6 +166,7 @@ fn handle_scan(
     };
     let PartitionRange::Ordered(tablet_range) = descriptor.range().clone() else {
         return Response {
+            proof: None,
             status: S::InvalidRequest,
             body: ResponseBody::Diagnostic("scan requires an ordered namespace".to_owned()),
         };
@@ -194,12 +198,14 @@ fn handle_scan(
     let mut borrowed = tablets.borrow_mut();
     let Some(live) = borrowed.get_mut(&tablet) else {
         return Response {
+            proof: None,
             status: S::NotLocal,
             body: ResponseBody::Diagnostic("tablet not live on owner".to_owned()),
         };
     };
     match live.scan_local(&spec, now) {
         Err(error) => Response {
+            proof: None,
             status: S::InvalidRequest,
             body: ResponseBody::Diagnostic(error.to_string()),
         },
@@ -216,6 +222,7 @@ fn handle_scan(
                 })
                 .collect();
             Response {
+                proof: None,
                 status: S::Ok,
                 body: ResponseBody::ScanPage {
                     entries,
@@ -323,6 +330,7 @@ fn handle_scan_window(
         Placement::Local => {}
         Placement::Redirect(info) => {
             return Response {
+                proof: None,
                 status: if info.worker == worker {
                     S::NotLocal
                 } else {
@@ -333,6 +341,7 @@ fn handle_scan_window(
         }
         Placement::Nowhere => {
             return Response {
+                proof: None,
                 status: S::NotLocal,
                 body: ResponseBody::Diagnostic("tablet not live on owner".to_owned()),
             };
@@ -387,16 +396,19 @@ fn scan_tablet_slice(
     let mut borrowed = tablets.borrow_mut();
     let Some(live) = borrowed.get_mut(&tablet) else {
         return Response {
+            proof: None,
             status: S::NotLocal,
             body: ResponseBody::Diagnostic("tablet not live on owner".to_owned()),
         };
     };
     match live.scan_local(&spec, now) {
         Err(error) => Response {
+            proof: None,
             status: S::InvalidRequest,
             body: ResponseBody::Diagnostic(error.to_string()),
         },
         Ok(page) => Response {
+            proof: None,
             status: S::Ok,
             body: ResponseBody::ScanPage {
                 entries: page
@@ -430,6 +442,7 @@ fn empty_page(
     exhausted: bool,
 ) -> Response {
     Response {
+        proof: None,
         status: Status::Ok,
         body: ResponseBody::ScanPage {
             entries: Vec::new(),
@@ -477,6 +490,7 @@ fn scan_gap(directory: &DirectorySnapshot, cursor: &[u8], request: &Request) -> 
     }
     let _ = request;
     Response {
+        proof: None,
         status: Status::Ok,
         body: ResponseBody::ScanPage {
             entries: Vec::new(),
@@ -567,6 +581,7 @@ fn min_bound(first: Option<&[u8]>, second: Option<&[u8]>) -> Option<Vec<u8>> {
 
 fn invalid(detail: &str) -> Response {
     Response {
+        proof: None,
         status: Status::InvalidRequest,
         body: ResponseBody::Diagnostic(detail.to_owned()),
     }
@@ -644,6 +659,7 @@ async fn drive_batch(
         Ok(plan) => plan,
         Err(TxnError::TooLarge) => {
             return Response {
+                proof: None,
                 status: S::TxnTooLarge,
                 body: ResponseBody::Diagnostic(
                     "batch is empty or exceeds transaction bounds".to_owned(),
@@ -652,6 +668,7 @@ async fn drive_batch(
         }
         Err(TxnError::RoutingChanged) => {
             return Response {
+                proof: None,
                 status: S::TxnCoordinatorUnavailable,
                 body: ResponseBody::Diagnostic(
                     "batch key routes nowhere; retry after topology settles".to_owned(),
@@ -662,6 +679,7 @@ async fn drive_batch(
     };
     if plan.groups.len() != 1 {
         return Response {
+            proof: None,
             status: S::TxnTooLarge,
             body: ResponseBody::Diagnostic(format!(
                 "batch spans {} tablets; drive it over TxnPrepare/TxnFinalize",
@@ -674,6 +692,7 @@ async fn drive_batch(
         Placement::Local => {}
         Placement::Redirect(info) => {
             return Response {
+                proof: None,
                 status: if info.worker == worker {
                     S::NotLocal
                 } else {
@@ -684,6 +703,7 @@ async fn drive_batch(
         }
         Placement::Nowhere => {
             return Response {
+                proof: None,
                 status: S::NotLocal,
                 body: ResponseBody::Diagnostic("tablet not live on owner".to_owned()),
             };
@@ -697,6 +717,7 @@ async fn drive_batch(
         .is_some_and(|live| live.pending_intent_count() > 0)
     {
         return Response {
+            proof: None,
             status: S::TxnCoordinatorUnavailable,
             body: ResponseBody::Diagnostic(
                 "tablet holds unresolved intents; retry after recovery".to_owned(),
@@ -792,6 +813,7 @@ async fn run_single_tablet_plan(
             }
             TxnState::Aborted => {
                 return Response {
+                    proof: None,
                     status: S::TxnAborted,
                     body: ResponseBody::Diagnostic("transaction aborted".to_owned()),
                 };
@@ -834,6 +856,7 @@ async fn run_single_tablet_plan(
             session,
             &mut step_identity,
             Response {
+                proof: None,
                 status: S::TxnAborted,
                 body: ResponseBody::Diagnostic("commit undecided; aborted".to_owned()),
             },
@@ -872,6 +895,7 @@ async fn prepare_wave(
                 return Err(Box::new((
                     prepared,
                     Response {
+                        proof: None,
                         status: S::TxnConflict,
                         body: ResponseBody::Diagnostic("transaction conflict".to_owned()),
                     },
@@ -881,6 +905,7 @@ async fn prepare_wave(
                 return Err(Box::new((
                     prepared,
                     Response {
+                        proof: None,
                         status: S::Internal,
                         body: ResponseBody::Diagnostic("unexpected prepare outcome".to_owned()),
                     },
@@ -896,6 +921,7 @@ async fn prepare_wave(
                 return Err(Box::new((
                     prepared,
                     Response {
+                        proof: None,
                         status: S::TxnAborted,
                         body: ResponseBody::Diagnostic("prepare ambiguous; aborted".to_owned()),
                     },
@@ -932,6 +958,7 @@ async fn finalize_wave(
             Ok(OperationResult::TxnFinalized { applied: false, .. }) => {}
             Ok(_) => {
                 return Response {
+                    proof: None,
                     status: S::Internal,
                     body: ResponseBody::Diagnostic("unexpected finalize outcome".to_owned()),
                 };
@@ -941,6 +968,7 @@ async fn finalize_wave(
                 // finalizes from the record. Report unavailable so the
                 // client re-drives (idempotent) or waits out recovery.
                 return Response {
+                    proof: None,
                     status: S::TxnCoordinatorUnavailable,
                     body: ResponseBody::Diagnostic(
                         "finalize ambiguous; commit durable, retry".to_owned(),
@@ -950,6 +978,7 @@ async fn finalize_wave(
         }
     }
     Response {
+        proof: None,
         status: S::Ok,
         body: ResponseBody::AtomicCommitted { versions },
     }
@@ -1132,18 +1161,22 @@ async fn abort_prepared(
 fn map_prepare_rejection(error: &DurableOutcome) -> Response {
     match error {
         DurableOutcome::Rejected(OpError::TxnConflict) => Response {
+            proof: None,
             status: Status::TxnConflict,
             body: ResponseBody::Diagnostic("transaction conflict".to_owned()),
         },
         DurableOutcome::Rejected(OpError::WrongType { .. }) => Response {
+            proof: None,
             status: Status::WrongType,
             body: ResponseBody::Diagnostic("wrong type".to_owned()),
         },
         DurableOutcome::Rejected(OpError::CounterOverflow) => Response {
+            proof: None,
             status: Status::CounterOverflow,
             body: ResponseBody::Diagnostic("counter overflow".to_owned()),
         },
         _ => Response {
+            proof: None,
             status: Status::Internal,
             body: ResponseBody::Diagnostic("prepare rejected".to_owned()),
         },
@@ -1303,6 +1336,7 @@ mod tests {
 
     fn scan_request(start: Option<Vec<u8>>, end: Option<Vec<u8>>, max_items: u32) -> Request {
         Request {
+            contract: kivi_types::ReadContract::Latest,
             namespace: NS,
             opcode: Opcode::Scan,
             hint: None,

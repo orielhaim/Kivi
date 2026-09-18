@@ -37,7 +37,10 @@ use kivi_protocol::{
     StreamAbort, StreamBegin, encode_frame,
 };
 use kivi_state::{Key, PartitionHasher};
-use kivi_types::{NamespaceId, RequestIdentity, RequestSeq, SessionId, UnixMicros, WorkerId};
+use kivi_types::{
+    CommitToken, NamespaceId, ReadContract, ReadReceipt, RequestIdentity, RequestSeq, SessionId,
+    UnixMicros, WorkerId,
+};
 
 pub use ordered::{
     AtomicBatchResult, BatchExpect, BatchWriteKind, BatchWriteSpec, ClientScanEntry,
@@ -207,6 +210,11 @@ pub enum ClientError {
     /// A scan cursor no longer resolves; re-issue the scan.
     #[error("scan cursor stale")]
     ScanCursorStale,
+    /// An `AtLeast` token's lineage is foreign to the serving replica.
+    /// Refresh the token from a read on its own lineage instead of
+    /// retrying the same token.
+    #[error("stale read token")]
+    StaleToken,
 }
 
 /// Maps a response status onto a client error (Ok/NotFound handled by callers).
@@ -236,6 +244,7 @@ fn status_error(status: Status, body: &ResponseBody) -> ClientError {
         Status::TxnCoordinatorUnavailable => ClientError::TxnCoordinatorUnavailable,
         Status::UniqueViolation => ClientError::UniqueViolation,
         Status::ScanCursorStale => ClientError::ScanCursorStale,
+        Status::StaleToken => ClientError::StaleToken,
     }
 }
 
@@ -1131,7 +1140,26 @@ impl NativeClient {
         seq: Option<RequestSeq>,
     ) -> Result<Response, ClientError> {
         use kivi_protocol::Status;
-        let response = self.execute_raw(key, opcode, build, seq)?;
+        use kivi_types::ReadContract;
+        let response = self.execute_raw(key, opcode, build, seq, ReadContract::Latest)?;
+        match response.status {
+            Status::Ok | Status::NotFound => Ok(response),
+            other => Err(status_error(other, &response.body)),
+        }
+    }
+
+    /// Executes one read request under an explicit freshness contract.
+    /// The contract is stamped onto every transport retry, so client
+    /// retries preserve it; only `Ok`/`NotFound` return `Ok`.
+    fn execute_with_contract(
+        &self,
+        key: &Key,
+        opcode: kivi_protocol::Opcode,
+        build: impl Fn() -> kivi_protocol::Request,
+        contract: kivi_types::ReadContract,
+    ) -> Result<Response, ClientError> {
+        use kivi_protocol::Status;
+        let response = self.execute_raw(key, opcode, build, None, contract)?;
         match response.status {
             Status::Ok | Status::NotFound => Ok(response),
             other => Err(status_error(other, &response.body)),
@@ -1150,6 +1178,7 @@ impl NativeClient {
         opcode: kivi_protocol::Opcode,
         build: impl Fn() -> kivi_protocol::Request,
         seq: Option<RequestSeq>,
+        contract: kivi_types::ReadContract,
     ) -> Result<Response, ClientError> {
         use kivi_protocol::Status;
         let hash = PartitionHasher::V1
@@ -1269,6 +1298,11 @@ impl NativeClient {
             };
             let mut request = build();
             request.hint = hint;
+            // The freshness contract is stamped onto every transport
+            // retry: redirects and redials preserve it exactly, so a
+            // retried read never silently weakens (or strengthens) its
+            // semantics mid-call.
+            request.contract = contract;
             if let Some((identity, floor, _)) = &identity {
                 request.identity = Some(*identity);
                 request.ack_floor = *floor;
@@ -1501,6 +1535,7 @@ impl NativeClient {
     pub fn get(&self, key: &Key) -> Result<Option<Bytes>, ClientError> {
         use kivi_protocol::{Opcode, ResponseBody};
         let response = self.execute(key, Opcode::Get, || kivi_protocol::Request {
+            contract: kivi_types::ReadContract::Latest,
             namespace: self.shared.namespace,
             opcode: Opcode::Get,
             hint: None,
@@ -1533,6 +1568,110 @@ impl NativeClient {
         }
     }
 
+    /// Fetches bytes under an explicit freshness contract, returning the
+    /// value with the server's read proof (`None` when the server predates
+    /// proofs: treat as no evidence, never as freshness).
+    ///
+    /// The contract rides every transport retry of this call, so redirects
+    /// and redials preserve it. Feed `proof.map(|proof| proof.token())`
+    /// back into [`get_at_least`](Self::get_at_least) to chain reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport/routing failure, wrong-type
+    /// access, or (for `AtLeast`) [`ClientError::StaleToken`] when the
+    /// token's lineage is foreign to the serving replica.
+    pub fn get_with_contract(
+        &self,
+        key: &Key,
+        contract: ReadContract,
+    ) -> Result<(Option<Bytes>, Option<ReadReceipt>), ClientError> {
+        use kivi_protocol::{Opcode, ResponseBody};
+        let response = self.execute_with_contract(
+            key,
+            Opcode::Get,
+            || kivi_protocol::Request {
+                contract: kivi_types::ReadContract::Latest,
+                namespace: self.shared.namespace,
+                opcode: Opcode::Get,
+                hint: None,
+                key: key.as_bytes().to_vec(),
+                value: None,
+                delta: 0,
+                expiry: 0,
+                offset: 0,
+                len: 0,
+                condition: kivi_protocol::COND_ALWAYS,
+                expiry_policy: kivi_protocol::EXPIRY_CLEAR,
+                identity: None,
+                ack_floor: RequestSeq::from_u64(0),
+                scan_start: None,
+                scan_end: None,
+                scan_direction: kivi_protocol::SCAN_FORWARD,
+                scan_max_items: 0,
+                scan_max_bytes: 0,
+                scan_projection: kivi_protocol::SCAN_KEYS_ONLY,
+                scan_consistency: kivi_protocol::SCAN_LATEST_PER_TABLET,
+                batch_txn: [0u8; 16],
+                batch_writes: Vec::new(),
+                txn_coordinator: 0,
+                txn_commit: false,
+            },
+            contract,
+        )?;
+        let value = match response.body {
+            ResponseBody::Value(value) => Ok(Some(Bytes::from(value))),
+            ResponseBody::Diagnostic(_) => Ok(None),
+            _ => Err(ClientError::Internal("unexpected get body".to_owned())),
+        }?;
+        Ok((value, response.proof))
+    }
+
+    /// Fetches bytes covered by `token` from any replica that has applied
+    /// it (served without contacting the leader when already covered;
+    /// bounded catch-up wait when behind; [`ClientError::StaleToken`]
+    /// when the token names a foreign lineage).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport/routing failure, wrong-type
+    /// access, or stale-token lineage mismatch.
+    pub fn get_at_least(
+        &self,
+        key: &Key,
+        token: CommitToken,
+    ) -> Result<(Option<Bytes>, Option<ReadReceipt>), ClientError> {
+        self.get_with_contract(key, ReadContract::AtLeast(token))
+    }
+
+    /// Fetches bytes acceptable up to `max_staleness` old. The server
+    /// serves from proven-fresh state or escalates to the authority path;
+    /// it never returns data outside the bound as success.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport/routing failure or wrong-type
+    /// access.
+    pub fn get_bounded_stale(
+        &self,
+        key: &Key,
+        max_staleness: core::time::Duration,
+    ) -> Result<(Option<Bytes>, Option<ReadReceipt>), ClientError> {
+        self.get_with_contract(key, ReadContract::BoundedStale { max_staleness })
+    }
+
+    /// Fetches whatever applied state the contacted replica holds, with no
+    /// freshness claim. May be arbitrarily stale; never blocks on
+    /// coverage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport/routing failure or wrong-type
+    /// access.
+    pub fn get_any(&self, key: &Key) -> Result<(Option<Bytes>, Option<ReadReceipt>), ClientError> {
+        self.get_with_contract(key, ReadContract::Any)
+    }
+
     /// Stores bytes, overwriting any type and clearing expiry. Takes the value
     /// by value: `Bytes` is a cheap shared handle and callers already own it.
     ///
@@ -1543,6 +1682,7 @@ impl NativeClient {
     pub fn set(&self, key: &Key, value: Bytes) -> Result<(), ClientError> {
         use kivi_protocol::{Opcode, ResponseBody};
         let response = self.execute(key, Opcode::Set, || kivi_protocol::Request {
+            contract: kivi_types::ReadContract::Latest,
             namespace: self.shared.namespace,
             opcode: Opcode::Set,
             hint: None,
@@ -1589,6 +1729,7 @@ impl NativeClient {
     pub fn set_range(&self, key: &Key, offset: u64, patch: Bytes) -> Result<(), ClientError> {
         use kivi_protocol::{Opcode, ResponseBody};
         let response = self.execute(key, Opcode::SetRange, || kivi_protocol::Request {
+            contract: kivi_types::ReadContract::Latest,
             namespace: self.shared.namespace,
             opcode: Opcode::SetRange,
             hint: None,
@@ -2065,6 +2206,7 @@ impl NativeClient {
             Err(error) => return GetOutcome::Fail(error),
         };
         let request = kivi_protocol::Request {
+            contract: kivi_types::ReadContract::Latest,
             namespace: self.shared.namespace,
             opcode: Opcode::GetStream,
             hint,
@@ -2245,6 +2387,7 @@ impl NativeClient {
             key,
             Opcode::Set,
             || kivi_protocol::Request {
+                contract: kivi_types::ReadContract::Latest,
                 namespace: self.shared.namespace,
                 opcode: Opcode::Set,
                 hint: None,
@@ -2285,6 +2428,7 @@ impl NativeClient {
     pub fn delete(&self, key: &Key) -> Result<bool, ClientError> {
         use kivi_protocol::{Opcode, ResponseBody};
         let response = self.execute(key, Opcode::Delete, || kivi_protocol::Request {
+            contract: kivi_types::ReadContract::Latest,
             namespace: self.shared.namespace,
             opcode: Opcode::Delete,
             hint: None,
@@ -2324,6 +2468,7 @@ impl NativeClient {
     pub fn exists(&self, key: &Key) -> Result<bool, ClientError> {
         use kivi_protocol::{Opcode, ResponseBody};
         let response = self.execute(key, Opcode::Exists, || kivi_protocol::Request {
+            contract: kivi_types::ReadContract::Latest,
             namespace: self.shared.namespace,
             opcode: Opcode::Exists,
             hint: None,
@@ -2363,6 +2508,7 @@ impl NativeClient {
     pub fn counter_get(&self, key: &Key) -> Result<Option<i64>, ClientError> {
         use kivi_protocol::{Opcode, ResponseBody};
         let response = self.execute(key, Opcode::CounterGet, || kivi_protocol::Request {
+            contract: kivi_types::ReadContract::Latest,
             namespace: self.shared.namespace,
             opcode: Opcode::CounterGet,
             hint: None,
@@ -2406,6 +2552,7 @@ impl NativeClient {
     pub fn counter_add(&self, key: &Key, delta: i64) -> Result<i64, ClientError> {
         use kivi_protocol::{Opcode, ResponseBody};
         let response = self.execute(key, Opcode::CounterAdd, || kivi_protocol::Request {
+            contract: kivi_types::ReadContract::Latest,
             namespace: self.shared.namespace,
             opcode: Opcode::CounterAdd,
             hint: None,
@@ -2461,6 +2608,7 @@ impl NativeClient {
             key,
             Opcode::CounterAdd,
             || kivi_protocol::Request {
+                contract: kivi_types::ReadContract::Latest,
                 namespace: self.shared.namespace,
                 opcode: Opcode::CounterAdd,
                 hint: None,
@@ -2504,6 +2652,7 @@ impl NativeClient {
     pub fn expire_at(&self, key: &Key, expires_at: UnixMicros) -> Result<bool, ClientError> {
         use kivi_protocol::{Opcode, ResponseBody};
         let response = self.execute(key, Opcode::ExpireAt, || kivi_protocol::Request {
+            contract: kivi_types::ReadContract::Latest,
             namespace: self.shared.namespace,
             opcode: Opcode::ExpireAt,
             hint: None,
@@ -2545,6 +2694,7 @@ impl NativeClient {
     pub fn persist_expiry(&self, key: &Key) -> Result<bool, ClientError> {
         use kivi_protocol::{Opcode, ResponseBody};
         let response = self.execute(key, Opcode::PersistExpiry, || kivi_protocol::Request {
+            contract: kivi_types::ReadContract::Latest,
             namespace: self.shared.namespace,
             opcode: Opcode::PersistExpiry,
             hint: None,
@@ -2584,6 +2734,7 @@ impl NativeClient {
     pub fn get_expiry(&self, key: &Key) -> Result<Option<kivi_types::Expiry>, ClientError> {
         use kivi_protocol::{Opcode, ResponseBody};
         let response = self.execute(key, Opcode::GetExpiry, || kivi_protocol::Request {
+            contract: kivi_types::ReadContract::Latest,
             namespace: self.shared.namespace,
             opcode: Opcode::GetExpiry,
             hint: None,
@@ -2635,6 +2786,7 @@ impl NativeClient {
     ) -> Result<Option<Bytes>, ClientError> {
         use kivi_protocol::{Opcode, ResponseBody};
         let response = self.execute(key, Opcode::GetRange, || kivi_protocol::Request {
+            contract: kivi_types::ReadContract::Latest,
             namespace: self.shared.namespace,
             opcode: Opcode::GetRange,
             hint: None,
@@ -2678,6 +2830,7 @@ impl NativeClient {
     pub fn bytes_length(&self, key: &Key) -> Result<Option<u64>, ClientError> {
         use kivi_protocol::{Opcode, ResponseBody};
         let response = self.execute(key, Opcode::BytesLength, || kivi_protocol::Request {
+            contract: kivi_types::ReadContract::Latest,
             namespace: self.shared.namespace,
             opcode: Opcode::BytesLength,
             hint: None,
@@ -2730,6 +2883,7 @@ impl NativeClient {
         use kivi_protocol::{Opcode, ResponseBody};
         let (condition_wire, policy_wire, stamp) = encode_conditional(condition, expiry);
         let response = self.execute(key, Opcode::SetConditional, || kivi_protocol::Request {
+            contract: kivi_types::ReadContract::Latest,
             namespace: self.shared.namespace,
             opcode: Opcode::SetConditional,
             hint: None,
@@ -2788,6 +2942,7 @@ impl NativeClient {
             key,
             Opcode::SetConditional,
             || kivi_protocol::Request {
+                contract: kivi_types::ReadContract::Latest,
                 namespace: self.shared.namespace,
                 opcode: Opcode::SetConditional,
                 hint: None,
@@ -3085,6 +3240,7 @@ mod tests {
                 .send((identity, request.ack_floor))
                 .expect("report");
             let response = Response {
+                proof: None,
                 status: Status::Ok,
                 body: ResponseBody::Stored { version: 7 },
             };
@@ -3120,6 +3276,7 @@ mod tests {
             )
             .expect("redirect builds");
             let response = Response {
+                proof: None,
                 status: Status::StaleRoute,
                 body: ResponseBody::Redirect(info),
             };

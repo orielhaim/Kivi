@@ -47,7 +47,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use kivi_state::{Operation, OperationResult};
+use kivi_state::Operation;
 use kivi_types::{
     ClusterId, IdempotencyKey, MutationIdentity, NamespaceId, NodeId, ReadContract,
     TabletAuthority, TabletEpoch, TabletId, UnixMicros, WriteGuardGeneration,
@@ -58,8 +58,7 @@ use crate::cluster::ClusterTopology;
 use crate::gate::SidecarGate;
 use crate::node::{
     BootstrapInputs, NodeOpenError, NodeStatus, OwnerCtx, OwnerRequest, ProposeError, ReadError,
-    bootstrap_group, classify_from_store, owner_call_on, propose_caller_side, read_caller_side,
-    scan_caller_side, spawn_raft,
+    bootstrap_group, classify_from_store, owner_call_on, propose_caller_side, spawn_raft,
 };
 use crate::peer::{PeerRequest, PeerResponse, PeerRpcError};
 use crate::router::PeerRouter;
@@ -178,6 +177,10 @@ pub struct ConsensusNode {
     local: NodeId,
     cluster: ClusterId,
     incarnation: kivi_types::NodeIncarnation,
+    /// Caller-side consistency hub: evidence, strong cache, providers,
+    /// metrics shared by every tablet group on this node. Memory-held by
+    /// construction — a restart starts empty.
+    hub: crate::consistency::ConsistencyHub,
     /// User tablets hosted (excludes the system control group, which is
     /// tracked in the maps above under its reserved id).
     tablets: Mutex<Vec<TabletId>>,
@@ -978,6 +981,11 @@ impl ConsensusNode {
             local: opened.meta.node,
             cluster: opened.meta.cluster,
             incarnation: opened.meta.incarnation,
+            hub: crate::consistency::ConsistencyHub::new(
+                opened.meta.node,
+                opened.meta.incarnation,
+                kivi_types::ReadAuthorityProvider::ConservativeLeader,
+            ),
             tablets: Mutex::new(served_tablets),
             worker_count,
             peer_addr,
@@ -1165,66 +1173,76 @@ impl ConsensusNode {
         .await
     }
 
-    /// Serves one read against `tablet`'s group under its contract.
+    /// Serves one read against `tablet`'s group under its contract,
+    /// returning the outcome with its proof triple.
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] for unknown tablets, routing, validation, or
-    /// coverage failures.
+    /// Returns [`ReadError`] for unknown tablets, routing, lineage,
+    /// validation, or coverage failures.
     pub async fn read(
         &self,
         tablet: TabletId,
         op: &Operation,
         contract: ReadContract,
-        now: UnixMicros,
-    ) -> Result<OperationResult, ReadError> {
-        let machine = self
-            .machines
-            .lock()
-            .map_err(|_| {
-                ReadError::Consensus(ConsensusError::Unavailable {
-                    reason: "consensus machine lock poisoned".to_owned(),
-                })
-            })?
-            .get(&tablet)
-            .cloned()
-            .ok_or_else(|| {
-                ReadError::Consensus(ConsensusError::Unavailable {
-                    reason: format!("tablet {} not served by this node", tablet.as_u64()),
-                })
-            })?;
-        let worker = self.worker_for(tablet).map_err(|error| match error {
-            ProposeError::Consensus(consensus) => ReadError::Consensus(consensus),
-            _ => ReadError::Consensus(ConsensusError::Unavailable {
-                reason: format!("tablet {} not served by this node", tablet.as_u64()),
-            }),
-        })?;
-        read_caller_side(
+        ctx: kivi_types::ReadContext,
+    ) -> Result<crate::consistency::ServedRead, ReadError> {
+        let (machine, authority, worker) = self.read_front(tablet)?;
+        crate::node::ReadFront::bind(
             &machine,
             &worker,
+            &self.hub,
             ConsensusGroupId::of_tablet(tablet),
-            op,
-            contract,
-            now,
+            tablet,
+            authority,
+            self.incarnation,
         )
+        .read(op, contract, ctx)
         .await
     }
 
     /// Serves one bounded scan page against `tablet`'s group under its
-    /// contract (`Latest` proves leadership; `Any` reads locally). Each
-    /// tablet read is strong; the multi-tablet scan is not one snapshot.
+    /// contract (each tablet read individually strong; the multi-tablet
+    /// scan is not one snapshot).
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] for unknown tablets, routing, validation, or
-    /// coverage failures.
+    /// Returns [`ReadError`] for unknown tablets, routing, lineage,
+    /// validation, or coverage failures.
     pub async fn scan(
         &self,
         tablet: TabletId,
         spec: &kivi_state::ScanSpec,
         contract: ReadContract,
-        now: UnixMicros,
-    ) -> Result<kivi_state::ScanPage, ReadError> {
+        ctx: kivi_types::ReadContext,
+    ) -> Result<crate::consistency::ServedScan, ReadError> {
+        let (machine, authority, worker) = self.read_front(tablet)?;
+        crate::node::ReadFront::bind(
+            &machine,
+            &worker,
+            &self.hub,
+            ConsensusGroupId::of_tablet(tablet),
+            tablet,
+            authority,
+            self.incarnation,
+        )
+        .scan(spec, contract, ctx)
+        .await
+    }
+
+    /// Resolves the machine, authority, and owner channel for one tablet's
+    /// read path.
+    fn read_front(
+        &self,
+        tablet: TabletId,
+    ) -> Result<
+        (
+            ReplicatedStateMachine,
+            TabletAuthority,
+            async_channel::Sender<OwnerRequest>,
+        ),
+        ReadError,
+    > {
         let machine = self
             .machines
             .lock()
@@ -1246,15 +1264,100 @@ impl ConsensusNode {
                 reason: format!("tablet {} not served by this node", tablet.as_u64()),
             }),
         })?;
-        scan_caller_side(
-            &machine,
-            &worker,
-            ConsensusGroupId::of_tablet(tablet),
-            spec,
-            contract,
-            now,
-        )
-        .await
+        let authority = self
+            .authorities
+            .lock()
+            .map_err(|_| {
+                ReadError::Consensus(ConsensusError::Unavailable {
+                    reason: "consensus authority lock poisoned".to_owned(),
+                })
+            })?
+            .get(&tablet)
+            .copied()
+            .ok_or_else(|| {
+                ReadError::Consensus(ConsensusError::Unavailable {
+                    reason: format!("tablet {} has no local authority", tablet.as_u64()),
+                })
+            })?;
+        Ok((machine, authority, worker))
+    }
+
+    /// Returns this node's serving authority for `tablet`, if hosted.
+    /// The server cross-checks it against the directory on every read
+    /// ([`reconcile_authority`](kivi_types::reconcile_authority)): any
+    /// drift between the routing view and the commit view fails closed.
+    #[must_use]
+    pub fn authority_for(&self, tablet: TabletId) -> Option<TabletAuthority> {
+        self.authorities.lock().ok()?.get(&tablet).copied()
+    }
+
+    /// Switches the read-authority mode for every tablet on this node
+    /// (operator/test control for the Almost-Local and roster-lease
+    /// prototypes).
+    pub fn set_read_provider(&self, provider: kivi_types::ReadAuthorityProvider) {
+        self.hub.set_provider(provider);
+    }
+
+    /// Grants a roster lease for `tablet`: only the current leader may
+    /// issue (verified against the owner); the floor is the leader's
+    /// current applied position.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable reason for unknown tablets, worker
+    /// shutdown, or when this replica is not the leader.
+    pub async fn grant_read_lease(
+        &self,
+        tablet: TabletId,
+        members: Vec<NodeId>,
+        now: kivi_types::Ticks,
+        ttl: std::time::Duration,
+        generation: u64,
+    ) -> Result<(), String> {
+        let group = ConsensusGroupId::of_tablet(tablet);
+        let worker = self
+            .channel_for(group)
+            .ok_or_else(|| format!("tablet {} not served by this node", tablet.as_u64()))?;
+        let leader =
+            crate::node::owner_call_on(&worker, |reply| OwnerRequest::IsLeader { group, reply })
+                .await
+                .map_err(|_| "consensus worker shut down".to_owned())?;
+        if !leader {
+            return Err("not the leader; only the leader issues roster leases".to_owned());
+        }
+        let (machine, authority) =
+            {
+                let machines = self
+                    .machines
+                    .lock()
+                    .map_err(|_| "consensus machine lock poisoned".to_owned())?;
+                let authorities = self
+                    .authorities
+                    .lock()
+                    .map_err(|_| "consensus authority lock poisoned".to_owned())?;
+                (
+                    machines.get(&tablet).cloned().ok_or_else(|| {
+                        format!("tablet {} not served by this node", tablet.as_u64())
+                    })?,
+                    authorities.get(&tablet).copied().ok_or_else(|| {
+                        format!("tablet {} has no local authority", tablet.as_u64())
+                    })?,
+                )
+            };
+        let applied = machine.status().await.applied_commit;
+        let lease = kivi_types::RosterLease::new(
+            authority,
+            generation,
+            members,
+            applied,
+            now.advance_by(ttl),
+            self.incarnation,
+        );
+        if self.hub.grant_lease(tablet, lease) {
+            Ok(())
+        } else {
+            Err("lease refused for a foreign authority".to_owned())
+        }
     }
 
     /// Gathers per-group diagnostics for every local group (fans out to
@@ -1263,6 +1366,7 @@ impl ConsensusNode {
     pub async fn status_all(&self) -> Vec<NodeStatus> {
         let tablets = self.tablets();
         let routing = self.group_to_worker.lock().ok().map(|map| map.clone());
+        let hub = &self.hub;
         let calls: Vec<_> = tablets
             .iter()
             .map(|tablet| {
@@ -1274,12 +1378,20 @@ impl ConsensusNode {
                 let sidecar = self.sidecar.metrics().snapshot();
                 let preflight = self.preflight.snapshot();
                 async move {
-                    let Some(worker) = worker else {
-                        return closed_status(group, local, sidecar, preflight);
+                    let mut status = {
+                        let Some(worker) = worker else {
+                            return closed_status(group, local, sidecar, preflight);
+                        };
+                        owner_call_on(&worker, |reply| OwnerRequest::Status { group, reply })
+                            .await
+                            .unwrap_or_else(|_| closed_status(group, local, sidecar, preflight))
                     };
-                    owner_call_on(&worker, |reply| OwnerRequest::Status { group, reply })
-                        .await
-                        .unwrap_or_else(|_| closed_status(group, local, sidecar, preflight))
+                    status.consistency = hub
+                        .snapshot(group.tablet())
+                        .map_or_else(kivi_types::ConsistencySnapshot::default, |(_, snapshot)| {
+                            snapshot
+                        });
+                    status
                 }
             })
             .collect();
@@ -1295,16 +1407,24 @@ impl ConsensusNode {
             .map(|index| self.workers[*index].clone())
     }
 
-    /// Gathers diagnostics for one group.
+    /// Gathers diagnostics for one group, overlaying live consistency
+    /// counters from the caller-side hub.
     pub async fn status_for(&self, group: ConsensusGroupId) -> NodeStatus {
         let sidecar = self.sidecar.metrics().snapshot();
         let preflight = self.preflight.snapshot();
         let Some(worker) = self.channel_for(group) else {
             return closed_status(group, self.local, sidecar, preflight);
         };
-        owner_call_on(&worker, |reply| OwnerRequest::Status { group, reply })
+        let mut status = owner_call_on(&worker, |reply| OwnerRequest::Status { group, reply })
             .await
-            .unwrap_or_else(|_| closed_status(group, self.local, sidecar, preflight))
+            .unwrap_or_else(|_| closed_status(group, self.local, sidecar, preflight));
+        status.consistency = self
+            .hub
+            .snapshot(group.tablet())
+            .map_or_else(kivi_types::ConsistencySnapshot::default, |(_, snapshot)| {
+                snapshot
+            });
+        status
     }
 
     /// Seals a snapshot and purges one group's log through its base.
@@ -1535,6 +1655,11 @@ impl ConsensusNode {
         if let Ok(mut authorities) = self.authorities.lock() {
             authorities.remove(&tablet);
         }
+        // A retired replica serves nothing: drop its receipts, leases,
+        // and cache entries. If the tablet is re-hosted here later
+        // (re-migration), it re-proves everything from authority instead
+        // of resurrecting pre-retirement evidence.
+        self.hub.invalidate(tablet);
         if let Ok(mut routing) = self.group_to_worker.lock() {
             routing.remove(&group);
         }
@@ -2034,6 +2159,7 @@ fn closed_status(
         peers: HashMap::new(),
         sidecar,
         preflight,
+        consistency: kivi_types::ConsistencySnapshot::default(),
     }
 }
 
@@ -2930,6 +3056,11 @@ mod tests {
 
     const NS: NamespaceId = NamespaceId::from_u64(1);
     const NOW: UnixMicros = UnixMicros::from_micros(1_000_000);
+    const CTX: kivi_types::ReadContext = kivi_types::ReadContext::new(
+        NOW,
+        kivi_types::Ticks::from_micros(1_000_000),
+        std::time::Duration::from_secs(5),
+    );
 
     fn block_on<F, T>(future: F) -> T
     where
@@ -3054,12 +3185,12 @@ mod tests {
                             key: Key::from(key),
                         },
                         ReadContract::Latest,
-                        NOW,
+                        CTX,
                     )
                     .await
                     .expect("tablet serves its key");
                 assert_eq!(
-                    read,
+                    read.outcome,
                     OperationResult::Value(Some(bytes::Bytes::from_static(b"v"))),
                     "tablet {} serves its key",
                     tablet.as_u64()
@@ -3253,7 +3384,7 @@ mod tests {
                         key: Key::from("x")
                     },
                     ReadContract::Any,
-                    NOW
+                    CTX
                 )
                 .await
                 .is_err(),

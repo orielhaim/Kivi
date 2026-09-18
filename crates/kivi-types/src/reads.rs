@@ -33,13 +33,29 @@ pub enum ReadContract {
 }
 
 impl ReadContract {
-    /// Whether serving this contract needs a consensus read barrier
-    /// (strong path) rather than a directly servable replica or cache.
+    /// Whether this contract promises linearizable (strong) semantics:
+    /// `Latest` always does; `AtLeast(token)` does for the token's lineage
+    /// (it never returns state before the token). `BoundedStale` and `Any`
+    /// are explicitly weak and must never be served as if strong.
     #[must_use]
-    pub const fn requires_barrier(self) -> bool {
+    pub const fn is_strong(self) -> bool {
         match self {
             Self::Latest | Self::AtLeast(_) => true,
             Self::BoundedStale { .. } | Self::Any => false,
+        }
+    }
+
+    /// Stable metric discriminant for [`ConsistencyMetrics`](crate::ConsistencyMetrics):
+    /// `Latest = 0`, `AtLeast = 1`, `BoundedStale = 2`, `Any = 3`.
+    /// Discriminants only, never wire tags (wire tags live in `kivi-codec`
+    /// and `kivi-protocol`, which own their own versioning).
+    #[must_use]
+    pub const fn metric_discriminant(self) -> u8 {
+        match self {
+            Self::Latest => 0,
+            Self::AtLeast(_) => 1,
+            Self::BoundedStale { .. } => 2,
+            Self::Any => 3,
         }
     }
 }
@@ -63,21 +79,40 @@ mod tests {
     use crate::ids::{CommitPosition, TabletEpoch, TabletId};
 
     #[test]
-    fn strong_contracts_need_a_barrier_weak_ones_do_not() {
-        assert!(ReadContract::Latest.requires_barrier());
+    fn strong_contracts_are_latest_and_at_least() {
+        assert!(ReadContract::Latest.is_strong());
         let token = CommitToken::new(
             TabletId::from_u64(1),
             TabletEpoch::INITIAL,
             CommitPosition::FIRST,
         );
-        assert!(ReadContract::AtLeast(token).requires_barrier());
+        assert!(ReadContract::AtLeast(token).is_strong());
         assert!(
             !ReadContract::BoundedStale {
                 max_staleness: Duration::from_millis(100)
             }
-            .requires_barrier()
+            .is_strong()
         );
-        assert!(!ReadContract::Any.requires_barrier());
+        assert!(!ReadContract::Any.is_strong());
+    }
+
+    #[test]
+    fn metric_discriminants_are_stable() {
+        assert_eq!(ReadContract::Latest.metric_discriminant(), 0);
+        let token = CommitToken::new(
+            TabletId::from_u64(1),
+            TabletEpoch::INITIAL,
+            CommitPosition::FIRST,
+        );
+        assert_eq!(ReadContract::AtLeast(token).metric_discriminant(), 1);
+        assert_eq!(
+            ReadContract::BoundedStale {
+                max_staleness: Duration::from_millis(100)
+            }
+            .metric_discriminant(),
+            2
+        );
+        assert_eq!(ReadContract::Any.metric_discriminant(), 3);
     }
 
     #[test]

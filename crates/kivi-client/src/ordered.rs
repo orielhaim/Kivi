@@ -245,6 +245,7 @@ impl NativeClient {
             &route_key,
             Opcode::Scan,
             || kivi_protocol::Request {
+                contract: kivi_types::ReadContract::Latest,
                 namespace,
                 opcode: Opcode::Scan,
                 hint: None,
@@ -271,6 +272,7 @@ impl NativeClient {
                 txn_commit: false,
             },
             None,
+            kivi_types::ReadContract::Latest,
         )?;
         match (response.status, response.body) {
             (
@@ -495,6 +497,7 @@ impl NativeClient {
             &route_key,
             Opcode::GetVersion,
             || kivi_protocol::Request {
+                contract: kivi_types::ReadContract::Latest,
                 namespace,
                 opcode: Opcode::GetVersion,
                 hint: None,
@@ -521,6 +524,7 @@ impl NativeClient {
                 txn_commit: false,
             },
             None,
+            kivi_types::ReadContract::Latest,
         )?;
         match (response.status, response.body) {
             (kivi_protocol::Status::Ok, ResponseBody::Version(version)) => Ok(Some(version)),
@@ -703,6 +707,7 @@ impl NativeClient {
                 &route_key,
                 Opcode::AtomicBatch,
                 || kivi_protocol::Request {
+                    contract: kivi_types::ReadContract::Latest,
                     namespace,
                     opcode: Opcode::AtomicBatch,
                     hint: None,
@@ -729,6 +734,7 @@ impl NativeClient {
                     txn_commit: false,
                 },
                 None,
+                kivi_types::ReadContract::Latest,
             )
             .map_err(BatchAttempt::Error)?;
         match (response.status, response.body) {
@@ -1101,6 +1107,7 @@ impl NativeClient {
             &route_key,
             Opcode::TxnPrepare,
             || kivi_protocol::Request {
+                contract: kivi_types::ReadContract::Latest,
                 namespace,
                 opcode: Opcode::TxnPrepare,
                 hint: None,
@@ -1134,6 +1141,7 @@ impl NativeClient {
                 txn_commit: false,
             },
             None,
+            kivi_types::ReadContract::Latest,
         )?;
         match (response.status, response.body) {
             (kivi_protocol::Status::Ok, ResponseBody::TxnPrepared { tablet, .. }) => {
@@ -1157,6 +1165,7 @@ impl NativeClient {
             &route_key,
             Opcode::TxnFinalize,
             || kivi_protocol::Request {
+                contract: kivi_types::ReadContract::Latest,
                 namespace,
                 opcode: Opcode::TxnFinalize,
                 hint: None,
@@ -1183,6 +1192,7 @@ impl NativeClient {
                 txn_commit: commit,
             },
             None,
+            kivi_types::ReadContract::Latest,
         )?;
         match (response.status, response.body) {
             (kivi_protocol::Status::Ok, ResponseBody::TxnFinalized { applied, version }) => {
@@ -1205,6 +1215,7 @@ impl NativeClient {
             &route_key,
             Opcode::Get,
             || kivi_protocol::Request {
+                contract: kivi_types::ReadContract::Latest,
                 namespace,
                 opcode: Opcode::Get,
                 hint: None,
@@ -1231,6 +1242,7 @@ impl NativeClient {
                 txn_commit: false,
             },
             None,
+            kivi_types::ReadContract::Latest,
         )?;
         match (response.status, response.body) {
             (kivi_protocol::Status::Ok, ResponseBody::Value(value)) => Ok(Some(value)),

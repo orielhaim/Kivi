@@ -51,7 +51,10 @@ use kivi_protocol::{
     encode_frame,
 };
 use kivi_state::{ExpiryPolicy, Key, Operation, OperationResult, SetCondition};
-use kivi_types::{ClusterId, MutationIdentity, NodeId, NodeIncarnation, TabletId, WorkerId};
+use kivi_types::{
+    ClusterId, CommitToken, MutationIdentity, NodeId, NodeIncarnation, ReadContract,
+    ReplicaFreshness, TabletId, WorkerId,
+};
 
 use crate::affinity::{AffinityError, AffinityMode, pin_current_thread};
 use crate::clock::SystemClock;
@@ -1480,6 +1483,7 @@ impl Conn {
                     stream,
                     kivi_protocol::Opcode::Set,
                     kivi_protocol::Response {
+                        proof: None,
                         status: kivi_protocol::Status::NotLocal,
                         body: kivi_protocol::ResponseBody::Diagnostic(
                             "tablet not live on owner".to_owned(),
@@ -1519,6 +1523,7 @@ impl Conn {
                     request_id,
                     request.opcode,
                     Response {
+                        proof: None,
                         status: Status::InvalidRequest,
                         body: ResponseBody::Diagnostic("unknown namespace".to_owned()),
                     },
@@ -1560,6 +1565,7 @@ impl Conn {
                     request_id,
                     request.opcode,
                     Response {
+                        proof: None,
                         status: Status::InvalidRequest,
                         body: ResponseBody::Diagnostic(
                             "direct writes to index entries are forbidden; use indexed writes"
@@ -1578,6 +1584,7 @@ impl Conn {
                     request_id,
                     request.opcode,
                     Response {
+                        proof: None,
                         status: Status::NotLocal,
                         body: ResponseBody::Diagnostic("no tablet covers key".to_owned()),
                     },
@@ -1607,6 +1614,7 @@ impl Conn {
                         request_id,
                         request.opcode,
                         Response {
+                            proof: None,
                             status,
                             body: ResponseBody::Redirect(info),
                         },
@@ -1619,6 +1627,7 @@ impl Conn {
                         request_id,
                         request.opcode,
                         Response {
+                            proof: None,
                             status: Status::NotLocal,
                             body: ResponseBody::Diagnostic("no tablet covers key".to_owned()),
                         },
@@ -1633,6 +1642,7 @@ impl Conn {
                     request_id,
                     request.opcode,
                     Response {
+                        proof: None,
                         status: Status::StaleRoute,
                         body: ResponseBody::Redirect(info),
                     },
@@ -1662,6 +1672,29 @@ impl Conn {
         // though it executes the same read as `Get`.
         let requested = request.opcode;
         let streamed = requested == kivi_protocol::Opcode::GetStream;
+        // Scan and AtomicBatch ride dedicated payloads with their own
+        // consistency selectors; a freshness contract on them is a
+        // caller bug — reject loudly instead of silently ignoring it.
+        if matches!(
+            requested,
+            kivi_protocol::Opcode::Scan | kivi_protocol::Opcode::AtomicBatch
+        ) && request.contract != ReadContract::Latest
+        {
+            return self
+                .respond(
+                    request_id,
+                    requested,
+                    kivi_protocol::Response {
+                        proof: None,
+                        status: kivi_protocol::Status::InvalidRequest,
+                        body: kivi_protocol::ResponseBody::Diagnostic(
+                            "freshness contracts ride point reads, not scans or batches".to_owned(),
+                        ),
+                    },
+                )
+                .await;
+        }
+        let contract = request.contract;
         // Scan and AtomicBatch never reach single-key translation (no
         // single key to route); the connection-level dispatcher handles
         // them before routing, so reaching here is a peer bug.
@@ -1671,6 +1704,7 @@ impl Conn {
                     request_id,
                     requested,
                     kivi_protocol::Response {
+                        proof: None,
                         status: kivi_protocol::Status::InvalidRequest,
                         body: kivi_protocol::ResponseBody::Diagnostic(
                             "untranslatable operation".to_owned(),
@@ -1776,6 +1810,37 @@ impl Conn {
                     }
                 }
             };
+        // Single-node contract gate: this replica holds the only copy, so
+        // local applied state is definitionally fresh — Latest,
+        // BoundedStale, and Any serve directly. AtLeast still validates
+        // lineage (a foreign tablet/epoch token never validates) and
+        // coverage; a token beyond applied names a write this owner has
+        // not committed, which means retry rather than a wait that would
+        // stall the tablet (Overloaded, retryable).
+        if let ReadContract::AtLeast(token) = contract
+            && !operation.is_mutating()
+            && let Err(reject) = self.check_at_least(tablet, token)
+        {
+            use kivi_types::FreshnessReject;
+            let (status, detail) = match &reject {
+                FreshnessReject::BeyondApplied { .. } => (
+                    kivi_protocol::Status::Overloaded,
+                    "token beyond local applied state; retry".to_owned(),
+                ),
+                _ => (kivi_protocol::Status::StaleToken, reject.to_string()),
+            };
+            return self
+                .respond(
+                    request_id,
+                    requested,
+                    kivi_protocol::Response {
+                        proof: None,
+                        status,
+                        body: kivi_protocol::ResponseBody::Diagnostic(detail),
+                    },
+                )
+                .await;
+        }
         if self.durability.is_some() {
             return self
                 .handle_request_durable(
@@ -1790,6 +1855,7 @@ impl Conn {
                     request_id,
                     requested,
                     kivi_protocol::Response {
+                        proof: None,
                         status: kivi_protocol::Status::NotLocal,
                         body: kivi_protocol::ResponseBody::Diagnostic(
                             "tablet not live on owner".to_owned(),
@@ -1844,6 +1910,7 @@ impl Conn {
                     request_id,
                     kivi_protocol::Opcode::SetRange,
                     kivi_protocol::Response {
+                        proof: None,
                         status: kivi_protocol::Status::InvalidRequest,
                         body: kivi_protocol::ResponseBody::Diagnostic(detail),
                     },
@@ -1907,6 +1974,35 @@ impl Conn {
     /// never the reactor, and the tablet stays the sole mutation owner
     /// throughout (§16, §17). `GetStream` completions fan out into
     /// `ValueStream*` frames instead of one response frame.
+    /// Validates an `AtLeast` token against local single-node state.
+    /// Lineage failures (wrong tablet/epoch/shape) answer `StaleToken`;
+    /// a token beyond applied names a write this owner has not committed
+    /// and answers retryable `Overloaded`. An unknown tablet falls through
+    /// to the normal routing error below.
+    ///
+    /// # Errors
+    ///
+    /// Returns the freshness rejection; the caller shapes it onto the wire.
+    fn check_at_least(
+        &self,
+        tablet: TabletId,
+        token: CommitToken,
+    ) -> Result<(), kivi_types::FreshnessReject> {
+        let tablets = self.tablets.borrow();
+        let Some(live) = tablets.get(&tablet) else {
+            return Ok(());
+        };
+        // Single-node validation covers lineage and position only: the
+        // process is its own fencing domain, so no incarnation participates
+        // (covers_token ignores it; the placeholder never authorizes).
+        let fresh = ReplicaFreshness::new(
+            live.authority(),
+            live.applied_commit(),
+            NodeIncarnation::INITIAL,
+        );
+        fresh.covers_token(token)
+    }
+
     async fn respond_result(
         &mut self,
         request_id: u64,
@@ -1970,6 +2066,7 @@ impl Conn {
                     request_id,
                     kivi_protocol::Opcode::GetStream,
                     Response {
+                        proof: None,
                         status: Status::NotFound,
                         body: ResponseBody::Diagnostic(String::new()),
                     },
@@ -1999,6 +2096,7 @@ impl Conn {
                             request_id,
                             kivi_protocol::Opcode::GetStream,
                             Response {
+                                proof: None,
                                 status: Status::Internal,
                                 body: ResponseBody::Diagnostic(
                                     "chunked value unavailable".to_owned(),
@@ -2045,6 +2143,7 @@ impl Conn {
                     request_id,
                     kivi_protocol::Opcode::GetStream,
                     Response {
+                        proof: None,
                         status: Status::Internal,
                         body: ResponseBody::Diagnostic("chunked value unavailable".to_owned()),
                     },
@@ -2138,6 +2237,7 @@ impl Conn {
             request_id,
             opcode,
             Response {
+                proof: None,
                 status,
                 body: ResponseBody::Diagnostic(diagnostic.to_owned()),
             },
@@ -2223,6 +2323,7 @@ impl Conn {
                     request_id,
                     opcode,
                     Response {
+                        proof: None,
                         status: Status::NotLocal,
                         body: ResponseBody::Diagnostic("tablet not live on owner".to_owned()),
                     },
@@ -2234,6 +2335,7 @@ impl Conn {
                     request_id,
                     opcode,
                     Response {
+                        proof: None,
                         status: Status::DedupExpired,
                         body: ResponseBody::Diagnostic(
                             "mutation identity expired below the session floor".to_owned(),
@@ -2247,6 +2349,7 @@ impl Conn {
                     request_id,
                     opcode,
                     Response {
+                        proof: None,
                         status: Status::SessionOverloaded,
                         body: ResponseBody::Diagnostic(
                             "session outcome window exhausted".to_owned(),
@@ -2263,6 +2366,7 @@ impl Conn {
                     request_id,
                     opcode,
                     Response {
+                        proof: None,
                         status: Status::InvalidRequest,
                         body: ResponseBody::Diagnostic(detail.clone()),
                     },
@@ -2309,6 +2413,7 @@ impl Conn {
                         request_id,
                         opcode,
                         Response {
+                            proof: None,
                             status: Status::InvalidRequest,
                             body: ResponseBody::Diagnostic(
                                 "mutating request lacks client identity".to_owned(),
@@ -2333,6 +2438,7 @@ impl Conn {
                     request_id,
                     opcode,
                     Response {
+                        proof: None,
                         status: Status::NotLocal,
                         body: ResponseBody::Diagnostic("tablet not live on owner".to_owned()),
                     },
@@ -2396,6 +2502,7 @@ impl Conn {
             request_id,
             opcode,
             Response {
+                proof: None,
                 status,
                 body: ResponseBody::Diagnostic("durable write failed".to_owned()),
             },
@@ -2532,6 +2639,7 @@ impl Conn {
         use kivi_state::OperationResult as R;
         let response = match outcome {
             R::Value(Some(value)) => Response {
+                proof: None,
                 status: Status::Ok,
                 body: ResponseBody::Value(value.to_vec()),
             },
@@ -2540,14 +2648,17 @@ impl Conn {
             | R::Expiry(None)
             | R::Length(None)
             | R::Version(None) => Response {
+                proof: None,
                 status: Status::NotFound,
                 body: ResponseBody::Diagnostic(String::new()),
             },
             R::Version(Some(version)) => Response {
+                proof: None,
                 status: Status::Ok,
                 body: ResponseBody::Version(version.as_u64()),
             },
             R::Length(Some(len)) => Response {
+                proof: None,
                 status: Status::Ok,
                 body: ResponseBody::Length(*len),
             },
@@ -2562,12 +2673,14 @@ impl Conn {
                 if *applied && opcode == kivi_protocol::Opcode::SetRange {
                     match version {
                         Some(version) => Response {
+                            proof: None,
                             status: Status::Ok,
                             body: ResponseBody::Stored {
                                 version: version.as_u64(),
                             },
                         },
                         None => Response {
+                            proof: None,
                             status: Status::Internal,
                             body: ResponseBody::Diagnostic(
                                 "conditional set applied without a version".to_owned(),
@@ -2576,6 +2689,7 @@ impl Conn {
                     }
                 } else {
                     Response {
+                        proof: None,
                         status: Status::Ok,
                         body: ResponseBody::ConditionalSet {
                             applied: *applied,
@@ -2585,24 +2699,29 @@ impl Conn {
                 }
             }
             R::Stored { version } => Response {
+                proof: None,
                 status: Status::Ok,
                 body: ResponseBody::Stored {
                     version: version.as_u64(),
                 },
             },
             R::Deleted { existed } => Response {
+                proof: None,
                 status: Status::Ok,
                 body: ResponseBody::Deleted { existed: *existed },
             },
             R::Exists(present) => Response {
+                proof: None,
                 status: Status::Ok,
                 body: ResponseBody::Exists(*present),
             },
             R::Counter(Some(value)) => Response {
+                proof: None,
                 status: Status::Ok,
                 body: ResponseBody::Counter(*value),
             },
             R::CounterUpdated { value, version } => Response {
+                proof: None,
                 status: Status::Ok,
                 body: ResponseBody::CounterUpdated {
                     value: *value,
@@ -2610,14 +2729,17 @@ impl Conn {
                 },
             },
             R::ExpirySet { applied } => Response {
+                proof: None,
                 status: Status::Ok,
                 body: ResponseBody::ExpirySet { applied: *applied },
             },
             R::ExpiryPersisted { removed } => Response {
+                proof: None,
                 status: Status::Ok,
                 body: ResponseBody::ExpiryPersisted { removed: *removed },
             },
             R::Expiry(Some(expiry)) => Response {
+                proof: None,
                 status: Status::Ok,
                 body: match expiry.as_stamp() {
                     None => ResponseBody::ExpiryNever,
@@ -2625,6 +2747,7 @@ impl Conn {
                 },
             },
             R::TxnPrepared => Response {
+                proof: None,
                 status: Status::Ok,
                 body: ResponseBody::TxnPrepared {
                     tablet: tablet.as_u64(),
@@ -2632,10 +2755,12 @@ impl Conn {
                 },
             },
             R::TxnConflict => Response {
+                proof: None,
                 status: Status::TxnConflict,
                 body: ResponseBody::Diagnostic("transaction conflict".to_owned()),
             },
             R::TxnFinalized { applied, version } => Response {
+                proof: None,
                 status: Status::Ok,
                 body: ResponseBody::TxnFinalized {
                     applied: *applied,
@@ -2648,6 +2773,7 @@ impl Conn {
             // loudly retriable `Internal` (never wrong bytes, never a
             // crash) — and the resolution tests below pin the real paths.
             R::ChunkedValue { .. } => Response {
+                proof: None,
                 status: Status::Internal,
                 body: ResponseBody::Diagnostic(
                     "chunked value reached the wire unresolved".to_owned(),
@@ -2706,6 +2832,7 @@ impl Conn {
             request_id,
             opcode,
             Response {
+                proof: None,
                 status,
                 body: ResponseBody::Diagnostic(message.to_owned()),
             },

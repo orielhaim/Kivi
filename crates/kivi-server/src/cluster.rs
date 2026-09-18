@@ -239,10 +239,12 @@ fn route_normal_key(
 fn route_error(error: RouteError) -> Response {
     match error {
         RouteError::UnsupportedHash => Response {
+            proof: None,
             status: Status::InvalidRequest,
             body: ResponseBody::Diagnostic("partition hash unsupported".to_owned()),
         },
         RouteError::NoTablet => Response {
+            proof: None,
             status: Status::Internal,
             body: ResponseBody::Diagnostic("no tablet owns key".to_owned()),
         },
@@ -1695,7 +1697,7 @@ async fn handle_stream_commit(
     Ok(())
 }
 
-/// Handles `GetStream`: linearizable read on the leader, then streams
+/// Handles `GetStream`: read under the request contract, then streams
 /// `ValueStreamBegin/Data/End` under the request id (or a terminal
 /// `Response` for absent/redirect/error, which the client loops on).
 #[allow(clippy::too_many_lines)]
@@ -1711,6 +1713,7 @@ async fn handle_get_stream(
     };
     if request.namespace != shared.namespace {
         let response = Response {
+            proof: None,
             status: Status::InvalidRequest,
             body: ResponseBody::Diagnostic("unknown namespace".to_owned()),
         };
@@ -1723,8 +1726,15 @@ async fn handle_get_stream(
             .await?;
         return Ok(());
     }
+    // Streamed reads honor the request contract like point reads (same
+    // visibility boundary for the root); the streamed frames carry no
+    // proof trailer, so `AtLeast` chaining after a stream needs a point
+    // read for its receipt. Captured before `into_operation` consumes the
+    // request.
+    let stream_contract = request.contract;
     let Some(operation) = request.into_operation() else {
         let response = Response {
+            proof: None,
             status: Status::InvalidRequest,
             body: ResponseBody::Diagnostic("untranslatable operation".to_owned()),
         };
@@ -1737,7 +1747,7 @@ async fn handle_get_stream(
             .await?;
         return Ok(());
     };
-    let now = wall_now();
+    let ctx = read_ctx();
     let tablet = match route_key(shared, operation.key().as_bytes()) {
         Ok(tablet) => tablet,
         Err(error) => {
@@ -1753,10 +1763,10 @@ async fn handle_get_stream(
     };
     let outcome = match shared
         .node
-        .read(tablet, &operation, ReadContract::Latest, now)
+        .read(tablet, &operation, stream_contract, ctx)
         .await
     {
-        Ok(outcome) => outcome,
+        Ok(served) => served.outcome,
         Err(error) => {
             let response = shape_read_error(shared, tablet, &error).await;
             writer
@@ -1812,6 +1822,7 @@ async fn handle_get_stream(
     };
     let Some(bytes) = bytes else {
         let response = Response {
+            proof: None,
             status: Status::NotFound,
             body: ResponseBody::Diagnostic(String::new()),
         };
@@ -1860,9 +1871,31 @@ async fn handle_request(
     let namespace = request.namespace;
     let identity = request.identity;
     let ack_floor = request.ack_floor;
+    // The freshness contract is honored on every read opcode below and
+    // stamped onto the response proof; mutating opcodes ignore it. Scans
+    // and batches ride dedicated payloads with their own selectors, so a
+    // non-Latest contract on them is a caller bug, rejected loudly.
+    let contract = request.contract;
+    if matches!(
+        opcode,
+        kivi_protocol::Opcode::Scan | kivi_protocol::Opcode::AtomicBatch
+    ) && contract != ReadContract::Latest
+    {
+        return Some((
+            Response {
+                proof: None,
+                status: Status::InvalidRequest,
+                body: ResponseBody::Diagnostic(
+                    "freshness contracts ride point reads, not scans or batches".to_owned(),
+                ),
+            },
+            opcode,
+        ));
+    }
     if namespace != shared.namespace {
         return Some((
             Response {
+                proof: None,
                 status: Status::InvalidRequest,
                 body: ResponseBody::Diagnostic("unknown namespace".to_owned()),
             },
@@ -1889,6 +1922,7 @@ async fn handle_request(
     if is_direct_single_key_write(opcode) && kivi_state::is_index_key(&request.key) {
         return Some((
             Response {
+                proof: None,
                 status: Status::InvalidRequest,
                 body: ResponseBody::Diagnostic(
                     "direct writes to index entries are forbidden; use indexed writes".to_owned(),
@@ -1900,6 +1934,7 @@ async fn handle_request(
     let Some(operation) = request.into_operation() else {
         return Some((
             Response {
+                proof: None,
                 status: Status::InvalidRequest,
                 body: ResponseBody::Diagnostic("untranslatable operation".to_owned()),
             },
@@ -1913,57 +1948,109 @@ async fn handle_request(
     let now = wall_now();
     if opcode.is_mutating() {
         let identity = identity.map(|client| MutationIdentity { client, ack_floor });
-        Some((
-            match shared
-                .node
-                .propose(tablet, &operation, identity, None, now)
-                .await
-            {
-                Ok(outcome) => match outcome {
-                    ProposeOutcome::Applied { outcome, .. }
-                    | ProposeOutcome::Duplicate { outcome }
-                    | ProposeOutcome::Read { outcome } => {
-                        // Tablet-naming prepare outcomes shape here (the
-                        // tablet is known at this layer, not in the store).
-                        if opcode == kivi_protocol::Opcode::TxnPrepare
-                            && matches!(outcome, OperationResult::TxnPrepared)
-                        {
-                            Response {
-                                status: Status::Ok,
-                                body: ResponseBody::TxnPrepared {
-                                    tablet: tablet.as_u64(),
-                                    dir_version: shared.directory_snapshot().version().as_u64(),
-                                },
-                            }
-                        } else {
-                            resolve_result(shared, opcode, &operation, &outcome).await
-                        }
-                    }
-                    ProposeOutcome::Rejected { outcome } => {
-                        resolve_durable(shared, &operation, &outcome, opcode).await
-                    }
-                },
-                Err(error) => shape_propose_error(shared, tablet, &error).await,
-            },
-            opcode,
-        ))
+        Some(handle_write(shared, tablet, &operation, identity, opcode, now).await)
     } else {
-        // Native reads are linearizable in cluster mode: the barrier runs
-        // on the tablet's leader; followers redirect. Chunked roots
-        // resolve via sidecars (same bytes as single-node, never wrong
-        // bytes).
-        Some((
-            match shared
-                .node
-                .read(tablet, &operation, ReadContract::Latest, now)
-                .await
-            {
-                Ok(outcome) => resolve_result(shared, opcode, &operation, &outcome).await,
-                Err(error) => shape_read_error(shared, tablet, &error).await,
-            },
-            opcode,
-        ))
+        Some(handle_read(shared, tablet, &operation, contract, opcode).await)
     }
+}
+
+/// Serves one mutating request: propose through the tablet's group and
+/// shape the outcome (prepare outcomes name their tablet here, where the
+/// tablet is known rather than in the store).
+async fn handle_write(
+    shared: &ClusterShared,
+    tablet: TabletId,
+    operation: &kivi_state::Operation,
+    identity: Option<MutationIdentity>,
+    opcode: kivi_protocol::Opcode,
+    now: UnixMicros,
+) -> (Response, kivi_protocol::Opcode) {
+    let response = match shared
+        .node
+        .propose(tablet, operation, identity, None, now)
+        .await
+    {
+        Ok(outcome) => match outcome {
+            ProposeOutcome::Applied { outcome, .. }
+            | ProposeOutcome::Duplicate { outcome }
+            | ProposeOutcome::Read { outcome } => {
+                // Tablet-naming prepare outcomes shape here (the
+                // tablet is known at this layer, not in the store).
+                if opcode == kivi_protocol::Opcode::TxnPrepare
+                    && matches!(outcome, OperationResult::TxnPrepared)
+                {
+                    Response {
+                        proof: None,
+                        status: Status::Ok,
+                        body: ResponseBody::TxnPrepared {
+                            tablet: tablet.as_u64(),
+                            dir_version: shared.directory_snapshot().version().as_u64(),
+                        },
+                    }
+                } else {
+                    resolve_result(shared, opcode, operation, &outcome).await
+                }
+            }
+            ProposeOutcome::Rejected { outcome } => {
+                resolve_durable(shared, operation, &outcome, opcode).await
+            }
+        },
+        Err(error) => shape_propose_error(shared, tablet, &error).await,
+    };
+    (response, opcode)
+}
+
+/// Serves one point read under the request contract: `Latest` barriers on
+/// the tablet's leader (followers redirect), `AtLeast` serves from any
+/// sufficiently applied replica, `BoundedStale` serves from proven-fresh
+/// state or escalates, `Any` serves locally. Chunked roots resolve via
+/// sidecars under the same visibility boundary (the manifest comes from
+/// the served state, never newer). The served proof rides the response
+/// for `AtLeast` chaining.
+async fn handle_read(
+    shared: &ClusterShared,
+    tablet: TabletId,
+    operation: &kivi_state::Operation,
+    contract: kivi_types::ReadContract,
+    opcode: kivi_protocol::Opcode,
+) -> (Response, kivi_protocol::Opcode) {
+    let ctx = read_ctx();
+    // Directory-vs-serving cross-check: the routing view and the commit
+    // view must name the same authority. Any drift on a hosted tablet
+    // (stale directory, half-applied topology change) fails closed before
+    // any state is read — evidence and tokens never validate across it.
+    // Unhosted tablets skip the check: the read path below answers "not
+    // served by this node" with a forward redirect (normal mid-migration),
+    // which a mismatch error here would wrongly shadow.
+    if let Some(recorded) = shared
+        .directory_snapshot()
+        .get(tablet)
+        .and_then(kivi_tablet::TabletDescriptor::authority)
+    {
+        let drifted = match shared.node.authority_for(tablet) {
+            Some(serving) => kivi_types::reconcile_authority(&serving, Some(&recorded)).is_err(),
+            None => false,
+        };
+        if drifted {
+            return (
+                Response {
+                    proof: None,
+                    status: Status::Internal,
+                    body: ResponseBody::Diagnostic("tablet authority mismatch; retry".to_owned()),
+                },
+                opcode,
+            );
+        }
+    }
+    let response = match shared.node.read(tablet, operation, contract, ctx).await {
+        Ok(served) => {
+            let mut response = resolve_result(shared, opcode, operation, &served.outcome).await;
+            response.proof = Some(served.receipt);
+            response
+        }
+        Err(error) => shape_read_error(shared, tablet, &error).await,
+    };
+    (response, opcode)
 }
 
 /// Resolves a deterministic outcome, fetching chunked bytes via sidecars
@@ -1983,6 +2070,7 @@ async fn resolve_result(
             kivi_protocol::Opcode::Get => {
                 if *logical_len > kivi_chunk::policy::MAX_LEGACY_VALUE_BYTES {
                     return Response {
+                        proof: None,
                         status: Status::ValueTooLarge,
                         body: ResponseBody::Diagnostic(
                             "value exceeds legacy GET; use get_stream".to_owned(),
@@ -1996,10 +2084,12 @@ async fn resolve_result(
                     .await
                 {
                     Ok(bytes) => Response {
+                        proof: None,
                         status: Status::Ok,
                         body: ResponseBody::Value(bytes),
                     },
                     Err(_) => Response {
+                        proof: None,
                         status: Status::Internal,
                         body: ResponseBody::Diagnostic("chunked value unavailable".to_owned()),
                     },
@@ -2017,10 +2107,12 @@ async fn resolve_result(
                     .await
                 {
                     Ok(bytes) => Response {
+                        proof: None,
                         status: Status::Ok,
                         body: ResponseBody::Value(slice_range(&bytes, offset, len)),
                     },
                     Err(_) => Response {
+                        proof: None,
                         status: Status::Internal,
                         body: ResponseBody::Diagnostic("chunked value unavailable".to_owned()),
                     },
@@ -2065,6 +2157,7 @@ fn shape_result(opcode: kivi_protocol::Opcode, outcome: &OperationResult) -> Res
     use kivi_state::OperationResult as R;
     match outcome {
         R::Value(Some(value)) => Response {
+            proof: None,
             status: Status::Ok,
             body: ResponseBody::Value(value.to_vec()),
         },
@@ -2073,14 +2166,17 @@ fn shape_result(opcode: kivi_protocol::Opcode, outcome: &OperationResult) -> Res
         | R::Expiry(None)
         | R::Length(None)
         | R::Version(None) => Response {
+            proof: None,
             status: Status::NotFound,
             body: ResponseBody::Diagnostic(String::new()),
         },
         R::Version(Some(version)) => Response {
+            proof: None,
             status: Status::Ok,
             body: ResponseBody::Version(version.as_u64()),
         },
         R::Length(Some(len)) => Response {
+            proof: None,
             status: Status::Ok,
             body: ResponseBody::Length(*len),
         },
@@ -2089,12 +2185,14 @@ fn shape_result(opcode: kivi_protocol::Opcode, outcome: &OperationResult) -> Res
             if *applied && opcode == kivi_protocol::Opcode::SetRange {
                 match version {
                     Some(version) => Response {
+                        proof: None,
                         status: Status::Ok,
                         body: ResponseBody::Stored {
                             version: version.as_u64(),
                         },
                     },
                     None => Response {
+                        proof: None,
                         status: Status::Internal,
                         body: ResponseBody::Diagnostic(
                             "conditional set applied without a version".to_owned(),
@@ -2103,6 +2201,7 @@ fn shape_result(opcode: kivi_protocol::Opcode, outcome: &OperationResult) -> Res
                 }
             } else {
                 Response {
+                    proof: None,
                     status: Status::Ok,
                     body: ResponseBody::ConditionalSet {
                         applied: *applied,
@@ -2112,24 +2211,29 @@ fn shape_result(opcode: kivi_protocol::Opcode, outcome: &OperationResult) -> Res
             }
         }
         R::Stored { version } => Response {
+            proof: None,
             status: Status::Ok,
             body: ResponseBody::Stored {
                 version: version.as_u64(),
             },
         },
         R::Deleted { existed } => Response {
+            proof: None,
             status: Status::Ok,
             body: ResponseBody::Deleted { existed: *existed },
         },
         R::Exists(present) => Response {
+            proof: None,
             status: Status::Ok,
             body: ResponseBody::Exists(*present),
         },
         R::Counter(Some(value)) => Response {
+            proof: None,
             status: Status::Ok,
             body: ResponseBody::Counter(*value),
         },
         R::CounterUpdated { value, version } => Response {
+            proof: None,
             status: Status::Ok,
             body: ResponseBody::CounterUpdated {
                 value: *value,
@@ -2137,14 +2241,17 @@ fn shape_result(opcode: kivi_protocol::Opcode, outcome: &OperationResult) -> Res
             },
         },
         R::ExpirySet { applied } => Response {
+            proof: None,
             status: Status::Ok,
             body: ResponseBody::ExpirySet { applied: *applied },
         },
         R::ExpiryPersisted { removed } => Response {
+            proof: None,
             status: Status::Ok,
             body: ResponseBody::ExpiryPersisted { removed: *removed },
         },
         R::Expiry(Some(expiry)) => Response {
+            proof: None,
             status: Status::Ok,
             body: match expiry.as_stamp() {
                 None => ResponseBody::ExpiryNever,
@@ -2154,6 +2261,7 @@ fn shape_result(opcode: kivi_protocol::Opcode, outcome: &OperationResult) -> Res
         // Chunked roots never replicate in this stage; reaching the wire
         // unresolved is a serving bug, answered loudly, never wrong bytes.
         R::ChunkedValue { .. } => Response {
+            proof: None,
             status: Status::Internal,
             body: ResponseBody::Diagnostic("chunked value reached the wire unresolved".to_owned()),
         },
@@ -2161,14 +2269,17 @@ fn shape_result(opcode: kivi_protocol::Opcode, outcome: &OperationResult) -> Res
         // the tablet (see `handle_request`); reaching here is a serving
         // bug, answered loudly.
         R::TxnPrepared => Response {
+            proof: None,
             status: Status::Internal,
             body: ResponseBody::Diagnostic("prepare reached the wire unnamed".to_owned()),
         },
         R::TxnConflict => Response {
+            proof: None,
             status: Status::TxnConflict,
             body: ResponseBody::Diagnostic("transaction conflict".to_owned()),
         },
         R::TxnFinalized { applied, version } => Response {
+            proof: None,
             status: Status::Ok,
             body: ResponseBody::TxnFinalized {
                 applied: *applied,
@@ -2185,22 +2296,27 @@ pub(crate) fn shape_durable(outcome: &DurableOutcome, opcode: kivi_protocol::Opc
     match outcome {
         DurableOutcome::Completed(result) => shape_result(opcode, result),
         DurableOutcome::Rejected(OpError::WrongType { .. }) => Response {
+            proof: None,
             status: Status::WrongType,
             body: ResponseBody::Diagnostic("wrong type".to_owned()),
         },
         DurableOutcome::Rejected(OpError::CounterOverflow) => Response {
+            proof: None,
             status: Status::CounterOverflow,
             body: ResponseBody::Diagnostic("overflow".to_owned()),
         },
         DurableOutcome::Rejected(OpError::StaleRangeBase) => Response {
+            proof: None,
             status: Status::InvalidRequest,
             body: ResponseBody::Diagnostic("range base changed; retry".to_owned()),
         },
         DurableOutcome::Rejected(OpError::TxnConflict) => Response {
+            proof: None,
             status: Status::TxnConflict,
             body: ResponseBody::Diagnostic("transaction conflict".to_owned()),
         },
         DurableOutcome::VersionExhausted => Response {
+            proof: None,
             status: Status::VersionExhausted,
             body: ResponseBody::Diagnostic("version exhausted".to_owned()),
         },
@@ -2232,6 +2348,7 @@ async fn desired_redirect(shared: &ClusterShared, tablet: TabletId) -> Option<Re
             .get(tablet)
             .map(|descriptor| descriptor.range().clone())?;
         Some(Response {
+            proof: None,
             status: Status::StaleRoute,
             body: ResponseBody::Redirect(RedirectInfo {
                 dir_version: directory.version(),
@@ -2258,6 +2375,7 @@ pub(crate) async fn shape_propose_error(
             redirect_or_overloaded(shared, tablet, hint.leader.map(replica_node))
         }
         ProposeError::Consensus(ConsensusError::LeaderUnknown) => Response {
+            proof: None,
             status: Status::Overloaded,
             body: ResponseBody::Diagnostic("leader unknown; retry".to_owned()),
         },
@@ -2267,53 +2385,65 @@ pub(crate) async fn shape_propose_error(
             // Normal during migration: this node holds no replica.
             // Route through desired placement instead of a generic miss.
             desired_redirect(shared, tablet).await.unwrap_or(Response {
+                proof: None,
                 status: Status::Overloaded,
                 body: ResponseBody::Diagnostic("tablet migrating; retry".to_owned()),
             })
         }
         ProposeError::Consensus(ConsensusError::Unavailable { reason }) => Response {
+            proof: None,
             status: Status::Internal,
             body: ResponseBody::Diagnostic(format!("consensus unavailable: {reason}")),
         },
         ProposeError::Consensus(ConsensusError::ShuttingDown) => Response {
+            proof: None,
             status: Status::Internal,
             body: ResponseBody::Diagnostic("replica shutting down".to_owned()),
         },
         ProposeError::Expired => Response {
+            proof: None,
             status: Status::DedupExpired,
             body: ResponseBody::Diagnostic("mutation identity expired".to_owned()),
         },
         ProposeError::Overloaded => Response {
+            proof: None,
             status: Status::SessionOverloaded,
             body: ResponseBody::Diagnostic("session outcome window exhausted".to_owned()),
         },
         ProposeError::Unsupported { reason } => Response {
+            proof: None,
             status: Status::Unsupported,
             body: ResponseBody::Diagnostic(reason.clone()),
         },
         ProposeError::Op(OpError::WrongType { .. }) => Response {
+            proof: None,
             status: Status::WrongType,
             body: ResponseBody::Diagnostic("wrong type".to_owned()),
         },
         ProposeError::Op(OpError::CounterOverflow) => Response {
+            proof: None,
             status: Status::CounterOverflow,
             body: ResponseBody::Diagnostic("overflow".to_owned()),
         },
         ProposeError::Op(OpError::StaleRangeBase) => Response {
+            proof: None,
             status: Status::InvalidRequest,
             body: ResponseBody::Diagnostic("range base changed; retry".to_owned()),
         },
         ProposeError::Op(OpError::TxnConflict) => Response {
+            proof: None,
             status: Status::TxnConflict,
             body: ResponseBody::Diagnostic("transaction conflict".to_owned()),
         },
         ProposeError::Fenced { .. } => Response {
+            proof: None,
             status: Status::Overloaded,
             body: ResponseBody::Diagnostic("tablet fenced for topology cutover; retry".to_owned()),
         },
         // Forward-compatibility: future proposal failures fail closed as
         // internal rather than mis-shaping on the wire.
         _ => Response {
+            proof: None,
             status: Status::Internal,
             body: ResponseBody::Diagnostic("proposal failed".to_owned()),
         },
@@ -2331,6 +2461,7 @@ pub(crate) async fn shape_read_error(
             redirect_or_overloaded(shared, tablet, hint.leader.map(replica_node))
         }
         kivi_consensus::ReadError::Consensus(ConsensusError::LeaderUnknown) => Response {
+            proof: None,
             status: Status::Overloaded,
             body: ResponseBody::Diagnostic("leader unknown; retry".to_owned()),
         },
@@ -2338,41 +2469,55 @@ pub(crate) async fn shape_read_error(
             if reason.contains("not served by this node") =>
         {
             desired_redirect(shared, tablet).await.unwrap_or(Response {
+                proof: None,
                 status: Status::Overloaded,
                 body: ResponseBody::Diagnostic("tablet migrating; retry".to_owned()),
             })
         }
         kivi_consensus::ReadError::Consensus(ConsensusError::Unavailable { reason }) => Response {
+            proof: None,
             status: Status::Internal,
             body: ResponseBody::Diagnostic(format!("consensus unavailable: {reason}")),
         },
         kivi_consensus::ReadError::Consensus(ConsensusError::ShuttingDown) => Response {
+            proof: None,
             status: Status::Internal,
             body: ResponseBody::Diagnostic("replica shutting down".to_owned()),
         },
         kivi_consensus::ReadError::Op(OpError::WrongType { .. }) => Response {
+            proof: None,
             status: Status::WrongType,
             body: ResponseBody::Diagnostic("wrong type".to_owned()),
         },
         kivi_consensus::ReadError::Op(OpError::CounterOverflow) => Response {
+            proof: None,
             status: Status::CounterOverflow,
             body: ResponseBody::Diagnostic("overflow".to_owned()),
         },
         kivi_consensus::ReadError::Op(OpError::StaleRangeBase) => Response {
+            proof: None,
             status: Status::InvalidRequest,
             body: ResponseBody::Diagnostic("range base changed; retry".to_owned()),
         },
         kivi_consensus::ReadError::NotARead => Response {
+            proof: None,
             status: Status::InvalidRequest,
             body: ResponseBody::Diagnostic("not a read operation".to_owned()),
         },
+        kivi_consensus::ReadError::StaleToken { detail } => Response {
+            proof: None,
+            status: Status::StaleToken,
+            body: ResponseBody::Diagnostic(detail.clone()),
+        },
         kivi_consensus::ReadError::CoverageTimeout => Response {
+            proof: None,
             status: Status::Overloaded,
             body: ResponseBody::Diagnostic("applied coverage timed out; retry".to_owned()),
         },
         // Forward-compatibility: future read failures fail closed as
         // internal rather than mis-shaping on the wire.
         _ => Response {
+            proof: None,
             status: Status::Internal,
             body: ResponseBody::Diagnostic("read failed".to_owned()),
         },
@@ -2396,6 +2541,7 @@ fn redirect_or_overloaded(
         .map(|descriptor| descriptor.range().clone());
     match (endpoint, range) {
         (Some(addr), Some(range)) => Response {
+            proof: None,
             status: Status::StaleRoute,
             body: ResponseBody::Redirect(RedirectInfo {
                 dir_version: directory.version(),
@@ -2407,6 +2553,7 @@ fn redirect_or_overloaded(
             }),
         },
         _ => Response {
+            proof: None,
             status: Status::Overloaded,
             body: ResponseBody::Diagnostic("leader unknown; retry".to_owned()),
         },
@@ -2420,6 +2567,27 @@ pub(crate) fn wall_now() -> UnixMicros {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     UnixMicros::from_micros(elapsed.as_micros().try_into().unwrap_or(u64::MAX))
+}
+
+/// Default bounded wait for `AtLeast` catch-up on one read. The
+/// consistency layer caps it again at its own hard bound; this only sets
+/// the server's ask.
+const DEFAULT_READ_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Process monotonic microseconds since first call: the staleness/lease
+/// clock for read contexts. Wall time measures expiry; this measures ages
+/// — the two are never equated (see `kivi_types::consistency`).
+pub(crate) fn mono_now() -> kivi_types::Ticks {
+    use std::sync::OnceLock;
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    let start = START.get_or_init(std::time::Instant::now);
+    kivi_types::Ticks::from_micros(start.elapsed().as_micros().try_into().unwrap_or(u64::MAX))
+}
+
+/// Builds one read execution context: wall time for expiry, monotonic
+/// time for proof/lease ages, bounded wait for catch-up.
+pub(crate) fn read_ctx() -> kivi_types::ReadContext {
+    kivi_types::ReadContext::new(wall_now(), mono_now(), DEFAULT_READ_WAIT)
 }
 
 /// Read-only cluster admin plane: per-tablet diagnostics for operators
@@ -2459,6 +2627,41 @@ struct TabletDto {
     /// Prepared transaction intents on this replica (stuck-intent
     /// detection for tests and operators).
     intent_count: usize,
+    /// Consistency-layer counters for this tablet: reads per contract
+    /// `(latest, at_least, bounded_stale, any)`.
+    consistency_reads: (u64, u64, u64, u64),
+    /// Reads served without a fresh barrier vs after one.
+    consistency_local_serves: u64,
+    /// Reads served after a fresh authority barrier.
+    consistency_authority_serves: u64,
+    /// `AtLeast` waits, wait timeouts, and lineage rejects.
+    consistency_at_least_waits: u64,
+    /// `AtLeast` waits that timed out instead of covering.
+    consistency_at_least_timeouts: u64,
+    /// `AtLeast` tokens rejected for lineage.
+    consistency_at_least_rejects: u64,
+    /// `BoundedStale` proof hits, escalations, and unprovable bounds.
+    consistency_bounded_hits: u64,
+    /// `BoundedStale` reads escalated to the authority path.
+    consistency_bounded_escalations: u64,
+    /// Reads failed because no freshness proof could be established.
+    consistency_unprovable: u64,
+    /// Strong-cache hits, fallbacks, and authority invalidations.
+    consistency_cache_hits: u64,
+    /// Strong-cache fallbacks.
+    consistency_cache_fallbacks: u64,
+    /// Strong-cache invalidations on authority change.
+    consistency_cache_invalidations: u64,
+    /// Almost-Local hits and fallbacks.
+    consistency_almost_hits: u64,
+    /// Almost-Local fallbacks to the barrier.
+    consistency_almost_fallbacks: u64,
+    /// Roster-lease hits and fallbacks.
+    consistency_roster_hits: u64,
+    /// Roster-lease fallbacks.
+    consistency_roster_fallbacks: u64,
+    /// Authority/fencing rejects on the read path.
+    consistency_fencing_rejects: u64,
 }
 
 /// Per-peer QUIC/H3 diagnostics (control + bulk connections).
@@ -2551,6 +2754,23 @@ fn tablet_dto(
         range_end,
         state,
         intent_count,
+        consistency_reads: status.consistency.reads_by_contract,
+        consistency_local_serves: status.consistency.local_serves,
+        consistency_authority_serves: status.consistency.authority_serves,
+        consistency_at_least_waits: status.consistency.at_least_waits,
+        consistency_at_least_timeouts: status.consistency.at_least_timeouts,
+        consistency_at_least_rejects: status.consistency.at_least_lineage_rejects,
+        consistency_bounded_hits: status.consistency.bounded_stale_hits,
+        consistency_bounded_escalations: status.consistency.bounded_stale_escalations,
+        consistency_unprovable: status.consistency.freshness_unprovable,
+        consistency_cache_hits: status.consistency.strong_cache_hits,
+        consistency_cache_fallbacks: status.consistency.strong_cache_fallbacks,
+        consistency_cache_invalidations: status.consistency.strong_cache_invalidations,
+        consistency_almost_hits: status.consistency.almost_local_hits,
+        consistency_almost_fallbacks: status.consistency.almost_local_fallbacks,
+        consistency_roster_hits: status.consistency.roster_hits,
+        consistency_roster_fallbacks: status.consistency.roster_fallbacks,
+        consistency_fencing_rejects: status.consistency.fencing_rejects,
     }
 }
 
@@ -4739,6 +4959,8 @@ impl ClusterExecutor {
 
     /// Executes one typed operation against its tablet's replica:
     /// reads serve local applied state, mutations propose anonymously.
+    /// RESP reads stay `Any` (the RESP edge promises no freshness
+    /// contract); native reads name theirs explicitly.
     fn execute_inner(&self, op: &Operation) -> Result<OperationResult, kivi_resp::ExecuteError> {
         use kivi_resp::ExecuteError as E;
         // `block_on` from a blocking context: `RespConnection` drains on
@@ -4747,7 +4969,11 @@ impl ClusterExecutor {
         let tablet = self.route(op)?;
         if op_is_read(op) {
             self.handle
-                .block_on(self.node.read(tablet, op, ReadContract::Any, wall_now()))
+                .block_on(
+                    self.node
+                        .read(tablet, op, kivi_types::ReadContract::Any, read_ctx()),
+                )
+                .map(|served| served.outcome)
                 .map_err(|_| E::Internal)
         } else {
             match self

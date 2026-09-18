@@ -68,15 +68,30 @@
 //! [`ConsensusError::LeaderUnknown`]); `OpenRaft` error types never cross
 //! the native protocol.
 //!
-//! ## Linearizable reads and follower reads
+//! ## Linearizable reads and follower reads (Phase 7 consistency layer)
 //!
-//! `Latest` runs a `ReadIndex` barrier on the leader — 0.10's
-//! `ensure_linearizable` waits for local applied coverage of the
-//! leadership-bound [`ReadBarrier`] itself —
-//! and then reads local applied state. No leader leases. `Latest` on a
-//! follower is `NotLeader`; `Any` (and `BoundedStale`, with no staleness
-//! bound claimed yet) reads local applied state; `AtLeast` waits for
-//! local applied coverage of its token on any replica.
+//! Reads execute under explicit contracts through the caller-side read
+//! front and the node-wide [`ConsistencyHub`]:
+//!
+//! ```text
+//! Latest .................. quorum `ReadIndex` barrier on the leader
+//!                           (0.10 `ensure_linearizable` awaits readiness
+//!                           itself), then local applied state; optional
+//!                           Almost-Local / roster-lease fast paths reuse
+//!                           explicit evidence and fall back otherwise.
+//! AtLeast(CommitToken) ..... lineage-validated (tablet + epoch, never
+//!                           just position); serves from any replica at or
+//!                           beyond the token, waits bounded when behind,
+//!                           rejects foreign tokens as `StaleToken`.
+//! BoundedStale(duration) ... serves only from a `FreshnessReceipt`
+//!                           proving the bound, else escalates to a fresh
+//!                           barrier (which satisfies any bound) — never
+//!                           weak data labeled successful.
+//! Any ..................... local applied state, no freshness claim.
+//! ```
+//!
+//! Every served read returns its proof triple (authority, applied
+//! position, serve path). `Latest` on a follower is `NotLeader`.
 //!
 //! ## Storage health
 //!
@@ -96,8 +111,9 @@ use std::time::Duration;
 
 use kivi_state::{DurableOutcome, OpError, Operation, OperationResult};
 use kivi_types::{
-    ClusterId, CommitPosition, IdempotencyKey, MutationIdentity, NamespaceId, NodeId, ReadContract,
-    TabletAuthority, TabletId, UnixMicros,
+    ClusterId, CommitPosition, FreshnessReceipt, IdempotencyKey, MutationIdentity, NamespaceId,
+    NodeId, NodeIncarnation, ReadAuthorityProvider, ReadContext, ReadContract, ReadReceipt,
+    ReplicaFreshness, ServePath, TabletAuthority, TabletId, Ticks, UnixMicros,
 };
 use openraft::storage::RaftStateMachine as _;
 use openraft::type_config::async_runtime::watch::WatchReceiver as _;
@@ -105,6 +121,7 @@ use openraft::type_config::async_runtime::watch::WatchReceiver as _;
 use crate::cluster::{Bootstrap, ClusterTopology, DurableClusterView, classify_bootstrap};
 use crate::command::ConsensusCommand;
 use crate::config::{KiviTypeConfig, cluster_config};
+use crate::consistency::{ConsistencyHub, ReadPlan, ServedRead, ServedScan};
 use crate::gate::SidecarGate;
 use crate::mutation::ReplicatedMutation;
 use crate::peer::{
@@ -314,6 +331,14 @@ pub enum ReadError {
     /// Applied coverage never arrived before the deadline.
     #[error("applied coverage timed out")]
     CoverageTimeout,
+    /// The `AtLeast` token's lineage is foreign to this replica (wrong
+    /// tablet, superseded epoch, or unassigned position). Waiting cannot
+    /// cure it: refresh the token from a read on the token's lineage.
+    #[error("stale read token: {detail}")]
+    StaleToken {
+        /// Which lineage check failed.
+        detail: String,
+    },
 }
 
 /// Per-replicated-tablet diagnostics for the admin plane.
@@ -351,6 +376,10 @@ pub struct NodeStatus {
     pub sidecar: crate::sidecar::SidecarMetricsSnapshot,
     /// Sidecar preflight diagnostics (attempts, quorum-ready, fallbacks).
     pub preflight: crate::preflight::PreflightMetricsSnapshot,
+    /// Consistency-layer counters for this tablet: contract mix,
+    /// local/authority split, waits, escalations, cache and fast-path
+    /// hits/fallbacks, fencing rejects.
+    pub consistency: kivi_types::ConsistencySnapshot,
 }
 
 type Reply<T> = futures::channel::oneshot::Sender<T>;
@@ -425,8 +454,23 @@ pub(crate) enum OwnerRequest {
         group: ConsensusGroupId,
         /// Index to cover.
         index: u64,
+        /// Maximum to wait (capped owner-side by `AT_LEAST_TIMEOUT`).
+        /// The caller derives this from its read context; the owner never
+        /// waits longer no matter what arrives here.
+        timeout: Duration,
         /// Covered (`Ok`) or timed out (`Err(())`).
         reply: Reply<Result<(), ()>>,
+    },
+    /// Cheap local leadership probe for the Almost-Local fast path: whether
+    /// this replica's owner currently believes it leads the group (from
+    /// Raft metrics, no quorum contact). A stale `true` is bounded by
+    /// heartbeat detection; the hub treats it as one input among receipt
+    /// age and authority checks, never as standalone proof.
+    IsLeader {
+        /// Addressed group.
+        group: ConsensusGroupId,
+        /// Leadership belief.
+        reply: Reply<bool>,
     },
     /// Gather full diagnostics.
     Status {
@@ -585,6 +629,7 @@ impl OwnerRequest {
             | Self::ProposeChunked { group, .. }
             | Self::Barrier { group, .. }
             | Self::WaitApplied { group, .. }
+            | Self::IsLeader { group, .. }
             | Self::Status { group, .. }
             | Self::Serve { group, .. }
             | Self::SnapshotPurge { group, .. }
@@ -619,6 +664,9 @@ impl OwnerRequest {
             }
             Self::WaitApplied { reply, .. } => {
                 let _ = reply.send(Err(()));
+            }
+            Self::IsLeader { reply, .. } => {
+                let _ = reply.send(false);
             }
             Self::Status { group, reply } => {
                 let _ = reply.send(NodeStatus {
@@ -659,6 +707,7 @@ impl OwnerRequest {
                         ready_replies: 0,
                         latency_us: 0,
                     },
+                    consistency: kivi_types::ConsistencySnapshot::default(),
                 });
             }
             Self::Serve { reply, .. } => {
@@ -718,6 +767,10 @@ pub struct ReplicatedNode {
     incarnation: kivi_types::NodeIncarnation,
     group: ConsensusGroupId,
     data_dir: PathBuf,
+    /// Caller-side consistency hub: evidence, strong cache, providers,
+    /// metrics. Memory-held by construction — a restart starts empty, so
+    /// incarnation handling fails closed without any explicit clearing.
+    hub: ConsistencyHub,
     _dir_guard: kivi_durability::OpenDir,
 }
 
@@ -1013,6 +1066,11 @@ impl ReplicatedNode {
             incarnation: opened.meta.incarnation,
             group,
             data_dir: config.data_dir,
+            hub: ConsistencyHub::new(
+                opened.meta.node,
+                opened.meta.incarnation,
+                ReadAuthorityProvider::ConservativeLeader,
+            ),
             _dir_guard: opened,
         })
     }
@@ -1092,28 +1150,142 @@ impl ReplicatedNode {
         .await
     }
 
-    /// Serves one read under its contract.
+    /// Serves one read under its contract, returning the outcome with its
+    /// proof triple (authority, applied position, serve path).
     ///
     /// # Errors
     ///
-    /// Returns [`ReadError`] for routing, validation, or coverage
+    /// Returns [`ReadError`] for routing, lineage, validation, or coverage
     /// failures.
     pub async fn read(
         &self,
         op: &Operation,
         contract: ReadContract,
-        now: UnixMicros,
-    ) -> Result<OperationResult, ReadError> {
-        read_caller_side(&self.machine, &self.owner_tx, self.group, op, contract, now).await
+        ctx: ReadContext,
+    ) -> Result<ServedRead, ReadError> {
+        ReadFront::bind(
+            &self.machine,
+            &self.owner_tx,
+            &self.hub,
+            self.group,
+            self.tablet,
+            self.authority,
+            self.incarnation,
+        )
+        .read(op, contract, ctx)
+        .await
+    }
+
+    /// Grants a roster lease for this tablet's group: only the current
+    /// leader may issue (verified against the owner), and the floor is the
+    /// leader's current applied position. Members serve `Latest` locally
+    /// while the lease authorizes them; expiry, incarnation change, or
+    /// authority movement voids it immediately.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable reason when this replica is not the
+    /// leader or the owner is gone.
+    pub async fn grant_read_lease(
+        &self,
+        members: Vec<NodeId>,
+        ttl: Duration,
+        generation: u64,
+    ) -> Result<(), String> {
+        let leader = owner_call_on(&self.owner_tx, |reply| OwnerRequest::IsLeader {
+            group: self.group,
+            reply,
+        })
+        .await
+        .map_err(|_| "consensus owner shut down".to_owned())?;
+        if !leader {
+            return Err("not the leader; only the leader issues roster leases".to_owned());
+        }
+        let applied = self.machine.status().await.applied_commit;
+        // Ticks for expiry must come from the caller's monotonic clock;
+        // without one the lease cannot bound anything, so issuance takes
+        // the TTL as a span over "now" supplied here from process time.
+        // Production issuers pass measured Ticks; tests pass virtual ones
+        // through `grant_read_lease_at`.
+        let now = process_ticks();
+        let lease = kivi_types::RosterLease::new(
+            self.authority,
+            generation,
+            members,
+            applied,
+            now.advance_by(ttl),
+            self.incarnation,
+        );
+        if self.hub.grant_lease(self.tablet, lease) {
+            Ok(())
+        } else {
+            Err("lease refused for a foreign authority".to_owned())
+        }
+    }
+
+    /// Issues a roster lease against an explicit monotonic now (virtual
+    /// time for tests; the leader check still applies).
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable reason when this replica is not the
+    /// leader or the owner is gone.
+    pub async fn grant_read_lease_at(
+        &self,
+        members: Vec<NodeId>,
+        now: Ticks,
+        ttl: Duration,
+        generation: u64,
+    ) -> Result<(), String> {
+        let leader = owner_call_on(&self.owner_tx, |reply| OwnerRequest::IsLeader {
+            group: self.group,
+            reply,
+        })
+        .await
+        .map_err(|_| "consensus owner shut down".to_owned())?;
+        if !leader {
+            return Err("not the leader; only the leader issues roster leases".to_owned());
+        }
+        let applied = self.machine.status().await.applied_commit;
+        let lease = kivi_types::RosterLease::new(
+            self.authority,
+            generation,
+            members,
+            applied,
+            now.advance_by(ttl),
+            self.incarnation,
+        );
+        if self.hub.grant_lease(self.tablet, lease) {
+            Ok(())
+        } else {
+            Err("lease refused for a foreign authority".to_owned())
+        }
+    }
+
+    /// Switches the read-authority mode (operator/test control for the
+    /// Almost-Local and roster-lease prototypes).
+    pub fn set_read_provider(&self, provider: ReadAuthorityProvider) {
+        self.hub.set_provider(provider);
+    }
+
+    /// Freezes this tablet's consistency counters for status surfaces.
+    #[must_use]
+    pub fn consistency_snapshot(&self) -> kivi_types::ConsistencySnapshot {
+        self.hub
+            .snapshot(self.tablet)
+            .map_or_else(kivi_types::ConsistencySnapshot::default, |(_, snapshot)| {
+                snapshot
+            })
     }
 
     /// Reads full diagnostics: group, role, term, leader, log pointers,
-    /// snapshot base, health, and per-peer stats.
+    /// snapshot base, health, per-peer stats, and consistency counters.
     pub async fn status(&self) -> NodeStatus {
         // The owner is gone only after shutdown; a dead owner reports a
         // closed status rather than hanging the admin plane.
         let group = self.group;
-        self.owner_call(|reply| OwnerRequest::Status { group, reply })
+        let mut status = self
+            .owner_call(|reply| OwnerRequest::Status { group, reply })
             .await
             .unwrap_or_else(|_| NodeStatus {
                 group: self.group,
@@ -1132,7 +1304,12 @@ impl ReplicatedNode {
                 peers: HashMap::new(),
                 sidecar: self.sidecar.metrics().snapshot(),
                 preflight: self.preflight.snapshot(),
-            })
+                consistency: kivi_types::ConsistencySnapshot::default(),
+            });
+        // The hub lives caller-side (the owner never touches it), so the
+        // front overlays live consistency counters here.
+        status.consistency = self.consistency_snapshot();
+        status
     }
 
     /// Seals a snapshot and purges the log through its base through
@@ -1202,6 +1379,17 @@ impl ReplicatedNode {
             let _ = thread.join();
         }
     }
+}
+
+/// Process monotonic microseconds since first call (clock source for
+/// lease issuance only; deterministic callers pass virtual `Ticks`
+/// through `grant_read_lease_at` instead). Like `wall_now` on the server:
+/// a boundary clock, never inside deterministic logic.
+fn process_ticks() -> Ticks {
+    use std::sync::OnceLock;
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    let start = START.get_or_init(std::time::Instant::now);
+    Ticks::from_micros(start.elapsed().as_micros().try_into().unwrap_or(u64::MAX))
 }
 
 /// Sends one owner request over an explicit queue and awaits its reply.
@@ -1342,60 +1530,346 @@ pub(crate) async fn propose_caller_side(
     .await?
 }
 
-/// Caller-side read shared by the single-group node and every
-/// multi-tablet replica: contract dispatch over one group's machine and
-/// owner queue.
+/// Caller-side read front shared by the single-group node and every
+/// multi-tablet replica: hub-planned contract dispatch over one group's
+/// machine, consistency hub, and owner queue.
 ///
-/// # Errors
-///
-/// Returns [`ReadError`] for routing, validation, or coverage failures.
-pub(crate) async fn read_caller_side(
-    machine: &ReplicatedStateMachine,
-    owner_tx: &async_channel::Sender<OwnerRequest>,
+/// Planning is deterministic and synchronous ([`ConsistencyHub::plan`]);
+/// only barriers, waits, and the leadership probe hop to the owner thread
+/// (the Raft handle never leaves its reactor). Every served read returns
+/// its [`ServedRead`] proof triple; every contract is either satisfied or
+/// fails loudly — never silently weakened.
+pub(crate) struct ReadFront<'a> {
+    /// Local state machine for reads and applied tracking.
+    machine: &'a ReplicatedStateMachine,
+    /// Owner queue for barriers, waits, and leadership probes.
+    owner_tx: &'a async_channel::Sender<OwnerRequest>,
+    /// Node-wide consistency hub (evidence, cache, providers, metrics).
+    hub: &'a ConsistencyHub,
+    /// Addressed group.
     group: ConsensusGroupId,
-    op: &Operation,
-    contract: ReadContract,
-    now: UnixMicros,
-) -> Result<OperationResult, ReadError> {
-    match contract {
-        ReadContract::Latest => {
-            // Leader-only strong read: the `ReadIndex` barrier proves
-            // leadership with a quorum AND waits for local applied
-            // coverage of its boundary (0.10 `ensure_linearizable`
-            // awaits readiness itself), and fails with
-            // `ForwardToLeader` on followers.
-            owner_call_on(owner_tx, |reply| OwnerRequest::Barrier { group, reply })
-                .await
-                .map_err(ReadError::Consensus)?
-                .map_err(ReadError::Consensus)?;
-            Ok(read_applied_on(machine, op, now).await?)
+    /// Served tablet.
+    tablet: TabletId,
+    /// Replica authority (epoch/guard fencing).
+    authority: TabletAuthority,
+    /// This process's incarnation (lease/proof binding).
+    incarnation: NodeIncarnation,
+}
+
+impl<'a> ReadFront<'a> {
+    /// Binds one group's read path.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) const fn bind(
+        machine: &'a ReplicatedStateMachine,
+        owner_tx: &'a async_channel::Sender<OwnerRequest>,
+        hub: &'a ConsistencyHub,
+        group: ConsensusGroupId,
+        tablet: TabletId,
+        authority: TabletAuthority,
+        incarnation: NodeIncarnation,
+    ) -> Self {
+        Self {
+            machine,
+            owner_tx,
+            hub,
+            group,
+            tablet,
+            authority,
+            incarnation,
         }
-        ReadContract::Any | ReadContract::BoundedStale { .. } => {
-            // Weak read over local applied state; no staleness bound
-            // is claimed in this stage.
-            Ok(read_applied_on(machine, op, now).await?)
+    }
+
+    /// Serves one read under its contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] for routing, lineage, validation, or coverage
+    /// failures.
+    pub(crate) async fn read(
+        &self,
+        op: &Operation,
+        contract: ReadContract,
+        ctx: ReadContext,
+    ) -> Result<ServedRead, ReadError> {
+        let applied = self.machine.status().await.applied_commit;
+        let fresh = ReplicaFreshness::new(self.authority, applied, self.incarnation);
+        let planned = self.hub.plan(self.tablet, op, contract, fresh, ctx);
+        match planned.plan {
+            ReadPlan::ServeLocal { path } => {
+                if path == ServePath::StrongCache
+                    && let Some(hit) = planned.cached
+                {
+                    let served = ServedRead::new(
+                        hit.outcome,
+                        ReadReceipt::new(self.authority, hit.position, self.incarnation),
+                        path,
+                    );
+                    self.hub.note_served(self.tablet, contract, false);
+                    tracing::debug!("{}", served.describe());
+                    return Ok(served);
+                    // A planned cache hit without a cached outcome falls
+                    // through to a live local read rather than failing.
+                }
+                if path == ServePath::AlmostLocalProof && !self.probe_leadership().await {
+                    // Deposed leader: the receipt is void, barrier instead.
+                    self.hub.note_almost_local_fallback(self.tablet);
+                    return self.barrier_serve(op, contract, ctx, false).await;
+                }
+                let outcome = read_applied_on(self.machine, op, ctx.now).await?;
+                let served = self.finish_live(outcome, path).await;
+                // Successful fast-path serves replay under their own
+                // evidence: the hub attaches the current receipt when it
+                // still validates, else stores a proof-less fill (Any /
+                // AtLeast replay only — never freshness).
+                self.hub.fill(
+                    self.tablet,
+                    self.authority,
+                    op,
+                    &served.outcome,
+                    served.receipt.position,
+                );
+                self.hub.note_served(self.tablet, contract, false);
+                tracing::debug!("{}", served.describe());
+                Ok(served)
+            }
+            ReadPlan::BarrierThenServe { escalated } => {
+                self.barrier_serve(op, contract, ctx, escalated).await
+            }
+            ReadPlan::WaitThenServe { index } => self.wait_serve(op, contract, ctx, index).await,
+            ReadPlan::Reject { reject } => Err(ReadError::StaleToken {
+                detail: reject.to_string(),
+            }),
         }
-        ReadContract::AtLeast(token) => {
-            // Any replica whose applied coverage reaches the token
-            // serves it (committed by definition of applied). The
-            // wait runs on the owner thread (reactor sleep); this
-            // future stays runtime-agnostic.
-            let index =
-                crate::state_machine::index_of_commit(token.position()).ok_or_else(|| {
-                    ReadError::Consensus(ConsensusError::Unavailable {
-                        reason: "at-least token names no log slot".to_owned(),
-                    })
-                })?;
-            owner_call_on(owner_tx, |reply| OwnerRequest::WaitApplied {
-                group,
-                index,
-                reply,
-            })
-            .await
-            .map_err(ReadError::Consensus)?
-            .map_err(|()| ReadError::CoverageTimeout)?;
-            Ok(read_applied_on(machine, op, now).await?)
+    }
+
+    /// Serves one bounded scan page under its contract. Each tablet read is
+    /// individually strong; the multi-tablet scan is still not one global
+    /// snapshot (see `ScanConsistency`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadError`] for routing, lineage, validation, or coverage
+    /// failures.
+    pub(crate) async fn scan(
+        &self,
+        spec: &kivi_state::ScanSpec,
+        contract: ReadContract,
+        ctx: ReadContext,
+    ) -> Result<ServedScan, ReadError> {
+        let applied = self.machine.status().await.applied_commit;
+        let fresh = ReplicaFreshness::new(self.authority, applied, self.incarnation);
+        let planned = self.hub.plan_scan(self.tablet, contract, fresh, ctx);
+        match planned.plan {
+            ReadPlan::ServeLocal { path } => {
+                if path == ServePath::AlmostLocalProof && !self.probe_leadership().await {
+                    self.hub.note_almost_local_fallback(self.tablet);
+                    return self.barrier_scan(spec, contract, ctx, false).await;
+                }
+                let page = scan_applied_on(self.machine, spec, ctx.now).await?;
+                let served = self.finish_scan(page, path).await;
+                self.hub.note_served(self.tablet, contract, false);
+                Ok(served)
+            }
+            ReadPlan::BarrierThenServe { escalated } => {
+                self.barrier_scan(spec, contract, ctx, escalated).await
+            }
+            ReadPlan::WaitThenServe { index } => self.wait_scan(spec, contract, ctx, index).await,
+            ReadPlan::Reject { reject } => Err(ReadError::StaleToken {
+                detail: reject.to_string(),
+            }),
         }
+    }
+
+    /// Fresh quorum barrier, then a live local serve. A successful barrier
+    /// installs a [`FreshnessReceipt`] (future Almost-Local and
+    /// bounded-stale evidence) and fills the strong cache. Barrier failure
+    /// after a bounded-stale escalation counts the bound unprovable.
+    async fn barrier_serve(
+        &self,
+        op: &Operation,
+        contract: ReadContract,
+        ctx: ReadContext,
+        escalated: bool,
+    ) -> Result<ServedRead, ReadError> {
+        // Leader-only strong read: the `ReadIndex` barrier proves
+        // leadership with a quorum AND waits for local applied coverage of
+        // its boundary (0.10 `ensure_linearizable` awaits readiness
+        // itself), and fails with `ForwardToLeader` on followers. No
+        // separate leader pre-check: a stale pre-check only adds a
+        // lost-leadership race without removing the mapping below.
+        let barrier = owner_call_on(self.owner_tx, |reply| OwnerRequest::Barrier {
+            group: self.group,
+            reply,
+        })
+        .await
+        .map_err(|error| self.note_barrier_failure(error, escalated))?
+        .map_err(|error| self.note_barrier_failure(error, escalated))?;
+        let receipt = FreshnessReceipt::new(
+            self.authority,
+            crate::state_machine::commit_of_index(barrier.boundary.get()),
+            ctx.ticks,
+            self.incarnation,
+        );
+        self.hub.note_barrier(self.tablet, receipt);
+        let outcome = read_applied_on(self.machine, op, ctx.now).await?;
+        let path = if escalated {
+            ServePath::BoundedStaleEscalated
+        } else {
+            ServePath::AuthorityBarrier
+        };
+        let served = self.finish_live(outcome, path).await;
+        self.hub.fill(
+            self.tablet,
+            self.authority,
+            op,
+            &served.outcome,
+            served.receipt.position,
+        );
+        self.hub.note_served(self.tablet, contract, true);
+        tracing::debug!("{}", served.describe());
+        Ok(served)
+    }
+
+    /// Bounded catch-up wait for an `AtLeast` token behind the replica,
+    /// then a live local serve. The wait runs on the owner thread (reactor
+    /// sleep with the context's capped budget); this future stays
+    /// runtime-agnostic.
+    async fn wait_serve(
+        &self,
+        op: &Operation,
+        contract: ReadContract,
+        ctx: ReadContext,
+        index: u64,
+    ) -> Result<ServedRead, ReadError> {
+        let timeout = ctx.capped_wait();
+        owner_call_on(self.owner_tx, |reply| OwnerRequest::WaitApplied {
+            group: self.group,
+            index,
+            timeout,
+            reply,
+        })
+        .await
+        .map_err(ReadError::Consensus)?
+        .map_err(|()| {
+            self.hub.note_wait_timeout(self.tablet);
+            ReadError::CoverageTimeout
+        })?;
+        let outcome = read_applied_on(self.machine, op, ctx.now).await?;
+        let served = self.finish_live(outcome, ServePath::AtLeastWaited).await;
+        self.hub.fill(
+            self.tablet,
+            self.authority,
+            op,
+            &served.outcome,
+            served.receipt.position,
+        );
+        self.hub.note_served(self.tablet, contract, false);
+        tracing::debug!("{}", served.describe());
+        Ok(served)
+    }
+
+    /// Barrier variant of [`ReadFront::barrier_serve`] for scan pages.
+    async fn barrier_scan(
+        &self,
+        spec: &kivi_state::ScanSpec,
+        contract: ReadContract,
+        ctx: ReadContext,
+        escalated: bool,
+    ) -> Result<ServedScan, ReadError> {
+        let barrier = owner_call_on(self.owner_tx, |reply| OwnerRequest::Barrier {
+            group: self.group,
+            reply,
+        })
+        .await
+        .map_err(|error| self.note_barrier_failure(error, escalated))?
+        .map_err(|error| self.note_barrier_failure(error, escalated))?;
+        self.hub.note_barrier(
+            self.tablet,
+            FreshnessReceipt::new(
+                self.authority,
+                crate::state_machine::commit_of_index(barrier.boundary.get()),
+                ctx.ticks,
+                self.incarnation,
+            ),
+        );
+        let page = scan_applied_on(self.machine, spec, ctx.now).await?;
+        let path = if escalated {
+            ServePath::BoundedStaleEscalated
+        } else {
+            ServePath::AuthorityBarrier
+        };
+        let served = self.finish_scan(page, path).await;
+        self.hub.note_served(self.tablet, contract, true);
+        Ok(served)
+    }
+
+    /// Wait variant of [`ReadFront::wait_serve`] for scan pages.
+    async fn wait_scan(
+        &self,
+        spec: &kivi_state::ScanSpec,
+        contract: ReadContract,
+        ctx: ReadContext,
+        index: u64,
+    ) -> Result<ServedScan, ReadError> {
+        let timeout = ctx.capped_wait();
+        owner_call_on(self.owner_tx, |reply| OwnerRequest::WaitApplied {
+            group: self.group,
+            index,
+            timeout,
+            reply,
+        })
+        .await
+        .map_err(ReadError::Consensus)?
+        .map_err(|()| {
+            self.hub.note_wait_timeout(self.tablet);
+            ReadError::CoverageTimeout
+        })?;
+        let page = scan_applied_on(self.machine, spec, ctx.now).await?;
+        let served = self.finish_scan(page, ServePath::AtLeastWaited).await;
+        self.hub.note_served(self.tablet, contract, false);
+        Ok(served)
+    }
+
+    /// Local leadership probe for the Almost-Local fast path (metrics
+    /// read, no quorum contact). Owner death fails closed to follower.
+    async fn probe_leadership(&self) -> bool {
+        owner_call_on(self.owner_tx, |reply| OwnerRequest::IsLeader {
+            group: self.group,
+            reply,
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    /// Maps a barrier failure, counting fencing rejects and — after a
+    /// bounded-stale escalation — the unprovable bound.
+    fn note_barrier_failure(&self, error: ConsensusError, escalated: bool) -> ReadError {
+        self.hub.note_fencing_reject(self.tablet);
+        if escalated {
+            self.hub.note_escalation_failed(self.tablet);
+        }
+        ReadError::Consensus(error)
+    }
+
+    /// Builds the served-read proof from post-serve applied state: the
+    /// receipt vouches exactly the state the outcome came from.
+    async fn finish_live(&self, outcome: OperationResult, path: ServePath) -> ServedRead {
+        let applied = self.machine.status().await.applied_commit;
+        ServedRead::new(
+            outcome,
+            ReadReceipt::new(self.authority, applied, self.incarnation),
+            path,
+        )
+    }
+
+    /// Scan variant of [`ReadFront::finish_live`].
+    async fn finish_scan(&self, page: kivi_state::ScanPage, path: ServePath) -> ServedScan {
+        let applied = self.machine.status().await.applied_commit;
+        ServedScan::new(
+            page,
+            ReadReceipt::new(self.authority, applied, self.incarnation),
+            path,
+        )
     }
 }
 
@@ -1415,40 +1889,6 @@ pub(crate) async fn read_applied_on(
                 reason: other.to_string(),
             }),
         })
-}
-
-/// Caller-side scan shared by the single-group node and every multi-tablet
-/// replica: contract dispatch over one group's machine and owner queue.
-/// `Latest` (the primary product path) proves leadership with a quorum
-/// barrier; `Any` reads local applied state. Either way each tablet read
-/// is strong — the full multi-tablet scan is still not one global snapshot
-/// (see `ScanConsistency`).
-///
-/// # Errors
-///
-/// Returns [`ReadError`] for routing, validation, or coverage failures.
-pub(crate) async fn scan_caller_side(
-    machine: &ReplicatedStateMachine,
-    owner_tx: &async_channel::Sender<OwnerRequest>,
-    group: ConsensusGroupId,
-    spec: &kivi_state::ScanSpec,
-    contract: ReadContract,
-    now: UnixMicros,
-) -> Result<kivi_state::ScanPage, ReadError> {
-    match contract {
-        ReadContract::Latest => {
-            owner_call_on(owner_tx, |reply| OwnerRequest::Barrier { group, reply })
-                .await
-                .map_err(ReadError::Consensus)?
-                .map_err(ReadError::Consensus)?;
-            Ok(scan_applied_on(machine, spec, now).await?)
-        }
-        ReadContract::Any | ReadContract::BoundedStale { .. } | ReadContract::AtLeast(_) => {
-            // Weak/token reads serve local applied state; scans never
-            // claim a global snapshot, so token coverage adds nothing.
-            Ok(scan_applied_on(machine, spec, now).await?)
-        }
-    }
 }
 
 /// Scans local applied state, mapping machine faults honestly.
@@ -1955,14 +2395,22 @@ where
             OwnerRequest::WaitApplied {
                 group,
                 index,
+                timeout,
                 reply,
             } => {
                 if group != self.group {
                     let _ = reply.send(Err(()));
                     return;
                 }
-                let covered = self.wait_applied(index).await;
+                let covered = self.wait_applied(index, timeout).await;
                 let _ = reply.send(covered);
+            }
+            OwnerRequest::IsLeader { group, reply } => {
+                if group != self.group {
+                    let _ = reply.send(false);
+                    return;
+                }
+                let _ = reply.send(self.is_leader());
             }
             OwnerRequest::Status { group, reply } => {
                 if group != self.group {
@@ -1987,6 +2435,7 @@ where
                         peers: HashMap::new(),
                         sidecar: self.sidecar.metrics().snapshot(),
                         preflight: self.preflight.snapshot(),
+                        consistency: kivi_types::ConsistencySnapshot::default(),
                     });
                     return;
                 }
@@ -2312,12 +2761,14 @@ where
         })
     }
 
-    /// Waits for local applied coverage of `index` (bounded reactor
-    /// sleeps; the caller stays runtime-agnostic). Timeout is `Err(())`
-    /// (the caller maps it to `CoverageTimeout`); owner death surfaces
-    /// through the dropped reply instead.
-    async fn wait_applied(&self, index: u64) -> Result<(), ()> {
-        let deadline = std::time::Instant::now() + AT_LEAST_TIMEOUT;
+    /// Waits for local applied coverage of `index` on bounded reactor
+    /// sleeps; the caller stays runtime-agnostic. `timeout` is capped by
+    /// `AT_LEAST_TIMEOUT` no matter what the caller asked: every
+    /// queue/retry/wait is bounded. Timeout is `Err(())` (the caller maps
+    /// it to `CoverageTimeout`); owner death surfaces through the dropped
+    /// reply instead.
+    async fn wait_applied(&self, index: u64, timeout: Duration) -> Result<(), ()> {
+        let deadline = std::time::Instant::now() + timeout.min(AT_LEAST_TIMEOUT);
         loop {
             if self.machine.status().await.applied_index.unwrap_or(0) >= index {
                 return Ok(());
@@ -2327,6 +2778,18 @@ where
             }
             compio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// Whether this replica's owner currently believes it leads the group.
+    /// Local metrics read, no quorum contact: the Almost-Local fast path
+    /// combines it with receipt age and authority checks, and falls back
+    /// the moment it reports follower.
+    fn is_leader(&self) -> bool {
+        self.raft
+            .metrics()
+            .borrow_watched()
+            .current_leader
+            .is_some_and(|leader| leader == self.local.as_u64())
     }
 
     /// Best-effort leader hint from metrics (fills gaps when the error
@@ -2394,6 +2857,7 @@ where
             peers: self.transport.stats().await,
             sidecar: sidecar_metrics,
             preflight: self.preflight.snapshot(),
+            consistency: kivi_types::ConsistencySnapshot::default(),
         }
     }
 
@@ -3043,9 +3507,9 @@ mod tests {
 
     use kivi_state::{Key, Operation, OperationResult};
     use kivi_types::{
-        ClusterId, MutationIdentity, NamespaceId, NodeId, ReadContract, RequestIdentity,
-        RequestSeq, SessionId, TabletAuthority, TabletEpoch, TabletId, UnixMicros,
-        WriteGuardGeneration,
+        ClusterId, MutationIdentity, NamespaceId, NodeId, ReadContext, ReadContract,
+        RequestIdentity, RequestSeq, SessionId, TabletAuthority, TabletEpoch, TabletId, Ticks,
+        UnixMicros, WriteGuardGeneration,
     };
 
     use super::{NodeConfig, ProposeError, ProposeOutcome, ReadError, ReplicatedNode};
@@ -3056,6 +3520,8 @@ mod tests {
     const NS: NamespaceId = NamespaceId::from_u64(1);
     const TABLET: TabletId = TabletId::from_u64(9);
     const NOW: UnixMicros = UnixMicros::from_micros(1_000_000);
+    const CTX: ReadContext =
+        ReadContext::new(NOW, Ticks::from_micros(1_000_000), Duration::from_secs(5));
 
     fn authority() -> TabletAuthority {
         TabletAuthority::new(TABLET, TabletEpoch::INITIAL, WriteGuardGeneration::INITIAL)
@@ -3341,12 +3807,361 @@ mod tests {
                         key: Key::from("x"),
                     },
                     ReadContract::Latest,
-                    NOW,
+                    CTX,
                 )
                 .await
                 .expect("latest reads");
             assert_eq!(
-                read,
+                read.outcome,
+                OperationResult::Value(Some(bytes::Bytes::from_static(b"1")))
+            );
+            for node in &nodes {
+                node.shutdown().await;
+            }
+        });
+    }
+
+    /// `AtLeast` serves from a lagging-but-covered follower without
+    /// contacting the leader; foreign lineages reject as `StaleToken`
+    /// without waiting; the strong cache replays `Any`.
+    #[test]
+    fn at_least_covers_follower_and_rejects_foreign_lineage() {
+        use kivi_types::{CommitPosition, CommitToken, TabletEpoch, TabletId};
+
+        block_on(async {
+            let (nodes, _dirs, _topology, leader, _index) = elected_cluster().await;
+            let follower = (leader + 1) % 3;
+            // The leader's receipt vouches its applied position.
+            let receipt = nodes[leader]
+                .read(
+                    &Operation::Get {
+                        key: Key::from("x"),
+                    },
+                    ReadContract::Latest,
+                    CTX,
+                )
+                .await
+                .expect("leader reads")
+                .receipt;
+            // A covered follower serves without a barrier: local serve,
+            // no authority contact.
+            let served = nodes[follower]
+                .read(
+                    &Operation::Get {
+                        key: Key::from("x"),
+                    },
+                    ReadContract::AtLeast(receipt.token()),
+                    CTX,
+                )
+                .await
+                .expect("covered follower serves");
+            assert_eq!(
+                served.outcome,
+                OperationResult::Value(Some(bytes::Bytes::from_static(b"1")))
+            );
+            let metrics = nodes[follower].status().await.consistency;
+            assert_eq!(metrics.reads_by_contract.1, 1, "one at-least read");
+            assert_eq!(metrics.authority_serves, 0, "no barrier taken");
+            assert_eq!(metrics.local_serves, 1, "served locally");
+            // A token for another tablet never validates here.
+            let foreign = CommitToken::new(
+                TabletId::from_u64(4242),
+                TabletEpoch::INITIAL,
+                CommitPosition::FIRST,
+            );
+            let error = nodes[follower]
+                .read(
+                    &Operation::Get {
+                        key: Key::from("x"),
+                    },
+                    ReadContract::AtLeast(foreign),
+                    CTX,
+                )
+                .await
+                .expect_err("foreign tablet rejects");
+            assert!(
+                matches!(error, ReadError::StaleToken { .. }),
+                "wrong tablet is a stale token, got {error:?}"
+            );
+            // A token from a superseded epoch rejects too: split/merge
+            // lineage never accidentally validates.
+            let old_epoch =
+                CommitToken::new(TABLET, TabletEpoch::from_u64(999), CommitPosition::FIRST);
+            let error = nodes[follower]
+                .read(
+                    &Operation::Get {
+                        key: Key::from("x"),
+                    },
+                    ReadContract::AtLeast(old_epoch),
+                    CTX,
+                )
+                .await
+                .expect_err("superseded epoch rejects");
+            assert!(
+                matches!(error, ReadError::StaleToken { .. }),
+                "stale epoch is a stale token, got {error:?}"
+            );
+            let metrics = nodes[follower].status().await.consistency;
+            assert_eq!(
+                metrics.at_least_lineage_rejects, 2,
+                "both foreign tokens counted"
+            );
+            // The strong cache replays `Any` on a second read of one key.
+            let any = || Operation::Get {
+                key: Key::from("y-absent"),
+            };
+            let first = nodes[follower]
+                .read(&any(), ReadContract::Any, CTX)
+                .await
+                .expect("first any serves");
+            assert_eq!(first.outcome, OperationResult::Value(None));
+            let second = nodes[follower]
+                .read(&any(), ReadContract::Any, CTX)
+                .await
+                .expect("second any serves");
+            assert_eq!(second.outcome, OperationResult::Value(None));
+            let metrics = nodes[follower].status().await.consistency;
+            assert_eq!(metrics.strong_cache_hits, 1, "second any replays");
+            for node in &nodes {
+                node.shutdown().await;
+            }
+        });
+    }
+
+    /// `BoundedStale` without evidence escalates instead of serving weak
+    /// data: on a follower the escalation barrier fails as `NotLeader`
+    /// (a redirect at the server layer), never as a value. On the leader
+    /// a prior `Latest` installs the receipt and the bound serves from
+    /// proof.
+    #[test]
+    fn bounded_stale_escalates_without_proof_and_hits_with_it() {
+        use core::time::Duration;
+
+        block_on(async {
+            let (nodes, _dirs, _topology, leader, _index) = elected_cluster().await;
+            let follower = (leader + 1) % 3;
+            let bound = ReadContract::BoundedStale {
+                max_staleness: Duration::from_secs(60),
+            };
+            // Cold follower: no receipt, so escalation; the barrier then
+            // fails as NotLeader. The bound is never served weakly.
+            let error = nodes[follower]
+                .read(
+                    &Operation::Get {
+                        key: Key::from("x"),
+                    },
+                    bound,
+                    CTX,
+                )
+                .await
+                .expect_err("cold follower cannot prove the bound");
+            assert!(
+                matches!(
+                    error,
+                    ReadError::Consensus(ConsensusError::NotLeader { .. })
+                ),
+                "escalation surfaces routing, never weak data: {error:?}"
+            );
+            let metrics = nodes[follower].status().await.consistency;
+            assert_eq!(metrics.bounded_stale_escalations, 1);
+            // The leader's `Latest` installs a receipt; the same bound
+            // then serves from proof with no second barrier.
+            nodes[leader]
+                .read(
+                    &Operation::Get {
+                        key: Key::from("x"),
+                    },
+                    ReadContract::Latest,
+                    CTX,
+                )
+                .await
+                .expect("leader barriers");
+            let served = nodes[leader]
+                .read(
+                    &Operation::Get {
+                        key: Key::from("x"),
+                    },
+                    bound,
+                    CTX,
+                )
+                .await
+                .expect("proven bound serves");
+            assert_eq!(
+                served.outcome,
+                OperationResult::Value(Some(bytes::Bytes::from_static(b"1")))
+            );
+            let metrics = nodes[leader].status().await.consistency;
+            assert_eq!(metrics.bounded_stale_hits, 1, "proof hit counted");
+            assert_eq!(
+                metrics.authority_serves, 1,
+                "only the Latest took a barrier"
+            );
+            for node in &nodes {
+                node.shutdown().await;
+            }
+        });
+    }
+
+    /// Almost-Local serves `Latest` from a fresh leadership receipt and
+    /// falls back to the barrier the moment the receipt ages out.
+    #[test]
+    fn almost_local_hits_on_fresh_proof_and_falls_back_on_age() {
+        use core::time::Duration;
+        use kivi_types::{ReadAuthorityProvider, Ticks};
+
+        block_on(async {
+            let (nodes, _dirs, _topology, leader, _index) = elected_cluster().await;
+            nodes[leader].set_read_provider(ReadAuthorityProvider::AlmostLocal {
+                max_proof_age: Duration::from_millis(50),
+            });
+            let get = || Operation::Get {
+                key: Key::from("x"),
+            };
+            // No receipt yet: barrier, which installs one.
+            nodes[leader]
+                .read(&get(), ReadContract::Latest, CTX)
+                .await
+                .expect("first latest barriers");
+            // Fresh receipt: no new barrier.
+            nodes[leader]
+                .read(&get(), ReadContract::Latest, CTX)
+                .await
+                .expect("second latest is fast");
+            let metrics = nodes[leader].status().await.consistency;
+            assert_eq!(metrics.almost_local_hits, 1);
+            assert_eq!(metrics.authority_serves, 1);
+            // Aged past the window: fallback to a fresh barrier.
+            let aged = ReadContext::new(NOW, Ticks::from_micros(1_000_000 + 51_000), CTX.wait);
+            let served = nodes[leader]
+                .read(&get(), ReadContract::Latest, aged)
+                .await
+                .expect("aged proof falls back and serves");
+            assert_eq!(
+                served.outcome,
+                OperationResult::Value(Some(bytes::Bytes::from_static(b"1")))
+            );
+            let metrics = nodes[leader].status().await.consistency;
+            assert_eq!(metrics.almost_local_fallbacks, 2, "cold + aged fall back");
+            assert_eq!(metrics.authority_serves, 2, "both fallbacks barriered");
+            for node in &nodes {
+                node.shutdown().await;
+            }
+        });
+    }
+
+    /// Roster leases let a member serve `Latest` locally while valid and
+    /// force fallback at expiry; non-members never take the fast path.
+    #[test]
+    fn roster_lease_serves_members_until_expiry() {
+        use core::time::Duration;
+        use kivi_types::{ReadAuthorityProvider, Ticks};
+
+        block_on(async {
+            let (nodes, _dirs, _topology, leader, _index) = elected_cluster().await;
+            let member = nodes[leader].node();
+            let base = Ticks::from_micros(1_000_000);
+            nodes[leader]
+                .grant_read_lease_at(vec![member], base, Duration::from_secs(60), 1)
+                .await
+                .expect("leader issues its lease");
+            nodes[leader].set_read_provider(ReadAuthorityProvider::RosterLease);
+            let get = || Operation::Get {
+                key: Key::from("x"),
+            };
+            let within = ReadContext::new(NOW, Ticks::from_micros(2_000_000), CTX.wait);
+            let served = nodes[leader]
+                .read(&get(), ReadContract::Latest, within)
+                .await
+                .expect("leaseholder serves fast");
+            assert_eq!(
+                served.outcome,
+                OperationResult::Value(Some(bytes::Bytes::from_static(b"1")))
+            );
+            let metrics = nodes[leader].status().await.consistency;
+            assert_eq!(metrics.roster_hits, 1);
+            assert_eq!(metrics.authority_serves, 0, "no barrier on the fast path");
+            // Past expiry the same read falls back to a fresh barrier.
+            let past = ReadContext::new(NOW, Ticks::from_micros(62_000_000), CTX.wait);
+            nodes[leader]
+                .read(&get(), ReadContract::Latest, past)
+                .await
+                .expect("expired lease falls back and serves");
+            let metrics = nodes[leader].status().await.consistency;
+            assert_eq!(metrics.roster_fallbacks, 1);
+            assert_eq!(metrics.authority_serves, 1);
+            for node in &nodes {
+                node.shutdown().await;
+            }
+        });
+    }
+
+    /// Restart clears memory-held evidence but preserves token meaning:
+    /// after the leader restarts and the cluster re-elects, `BoundedStale`
+    /// escalates (no resurrected receipt) while a pre-restart `AtLeast`
+    /// token still covers.
+    #[test]
+    fn restart_drops_evidence_and_preserves_valid_tokens() {
+        use core::time::Duration;
+
+        block_on(async {
+            let (mut nodes, dirs, topology, leader, _index) = elected_cluster().await;
+            let token = nodes[leader]
+                .read(
+                    &Operation::Get {
+                        key: Key::from("x"),
+                    },
+                    ReadContract::Latest,
+                    CTX,
+                )
+                .await
+                .expect("pre-restart read")
+                .receipt
+                .token();
+            // Restart the leader in place; the cluster re-elects with the
+            // rejoined replica (fresh hub, replayed durable state).
+            nodes[leader].shutdown().await;
+            drop(nodes.remove(leader));
+            nodes.insert(leader, restart(&dirs, &topology, leader).await);
+            let new_leader = wait_leader(&nodes).await;
+            // No resurrected receipts anywhere: BoundedStale escalates to
+            // a fresh barrier even though the data is present.
+            let bound = ReadContract::BoundedStale {
+                max_staleness: Duration::from_secs(60),
+            };
+            let served = nodes[new_leader]
+                .read(
+                    &Operation::Get {
+                        key: Key::from("x"),
+                    },
+                    bound,
+                    CTX,
+                )
+                .await
+                .expect("escalation serves after restart");
+            assert_eq!(
+                served.outcome,
+                OperationResult::Value(Some(bytes::Bytes::from_static(b"1")))
+            );
+            let metrics = nodes[new_leader].status().await.consistency;
+            assert_eq!(
+                metrics.bounded_stale_escalations, 1,
+                "restart left no usable receipt"
+            );
+            // The pre-restart token names the same lineage and still
+            // covers: restart preserves valid tokens, never silently
+            // redefines them.
+            let served = nodes[new_leader]
+                .read(
+                    &Operation::Get {
+                        key: Key::from("x"),
+                    },
+                    ReadContract::AtLeast(token),
+                    CTX,
+                )
+                .await
+                .expect("pre-restart token survives restart");
+            assert_eq!(
+                served.outcome,
                 OperationResult::Value(Some(bytes::Bytes::from_static(b"1")))
             );
             for node in &nodes {
@@ -3384,11 +4199,11 @@ mod tests {
                         key: Key::from("n"),
                     },
                     ReadContract::Latest,
-                    NOW,
+                    CTX,
                 )
                 .await
                 .expect("reads counter");
-            assert_eq!(value, OperationResult::Counter(Some(1)));
+            assert_eq!(value.outcome, OperationResult::Counter(Some(1)));
             for node in &nodes {
                 node.shutdown().await;
             }
@@ -3432,7 +4247,7 @@ mod tests {
                         key: Key::from("x"),
                     },
                     ReadContract::Latest,
-                    NOW,
+                    CTX,
                 )
                 .await
                 .expect_err("follower refuses Latest");
@@ -3446,12 +4261,12 @@ mod tests {
                         key: Key::from("x"),
                     },
                     ReadContract::Any,
-                    NOW,
+                    CTX,
                 )
                 .await
                 .expect("follower serves Any");
             assert_eq!(
-                weak,
+                weak.outcome,
                 OperationResult::Value(Some(bytes::Bytes::from_static(b"1")))
             );
             // Undurable chunked roots fail closed (never proposed): the
@@ -3536,11 +4351,11 @@ mod tests {
                         key: Key::from("n"),
                     },
                     ReadContract::Any,
-                    NOW,
+                    CTX,
                 )
                 .await
                 .expect("converged replica reads");
-            assert_eq!(value, OperationResult::Counter(Some(6)));
+            assert_eq!(value.outcome, OperationResult::Counter(Some(6)));
             restarted.shutdown().await;
             for node in &nodes {
                 node.shutdown().await;
@@ -3625,11 +4440,11 @@ mod tests {
                         key: Key::from("n"),
                     },
                     ReadContract::Latest,
-                    NOW,
+                    CTX,
                 )
                 .await
                 .expect("majority reads");
-            assert_eq!(read, OperationResult::Counter(Some(11)));
+            assert_eq!(read.outcome, OperationResult::Counter(Some(11)));
             // Heal: the isolated entry (never quorum-committed) vanishes and
             // every replica converges on the majority history — no dual
             // acknowledged history exists anywhere.
@@ -3642,11 +4457,11 @@ mod tests {
                             key: Key::from("n"),
                         },
                         ReadContract::Any,
-                        NOW,
+                        CTX,
                     )
                     .await
                     .expect("converged read");
-                assert_eq!(value, OperationResult::Counter(Some(11)));
+                assert_eq!(value.outcome, OperationResult::Counter(Some(11)));
             }
             for node in &nodes {
                 node.shutdown().await;
@@ -3748,12 +4563,12 @@ mod tests {
                             key: Key::from("n"),
                         },
                         ReadContract::Any,
-                        NOW,
+                        CTX,
                     )
                     .await
                     .expect("converged read");
                 assert_eq!(
-                    value,
+                    value.outcome,
                     OperationResult::Counter(Some(11)),
                     "divergent +100 must not survive anywhere"
                 );
@@ -3862,12 +4677,12 @@ mod tests {
                         key: Key::from("n"),
                     },
                     ReadContract::Latest,
-                    NOW,
+                    CTX,
                 )
                 .await
                 .expect("post-restart latest reads");
             // 1+2+3+4+5+100+1000, exactly once each.
-            assert_eq!(value, OperationResult::Counter(Some(1115)));
+            assert_eq!(value.outcome, OperationResult::Counter(Some(1115)));
             for node in &fresh {
                 node.shutdown().await;
             }

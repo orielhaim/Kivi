@@ -129,6 +129,53 @@ kill — the new leader returns the original outcome, the counter advances
 once. See `crates/kivi-lab/tests/cluster_replication.rs` (single tablet)
 and `cluster_multitablet.rs` (non-default tablet).
 
+## Read contracts
+
+Every native point read names its freshness contract on the wire
+(`Latest` when absent — pre-contract clients only knew linearizable
+reads, and `Latest` is the strongest contract, so the default never
+weakens). Contract retries preserve it across redirects and redials.
+
+```text
+Latest
+  Conservative linearizable read: a quorum ReadIndex barrier on the
+  tablet's leader, then local applied state. A non-leader answers
+  NotLeader (shaped as StaleRoute + leader redirect, or retriable
+  Overloaded mid-election). Optional Almost-Local / roster-lease fast
+  paths reuse explicit evidence and fall back to the barrier.
+
+AtLeast(CommitToken)
+  Serves from any replica whose applied state covers the token — no
+  leader contact when already covered. A replica behind the token waits
+  bounded (deadline-aware, default 5s server-side, hard-capped 10s).
+  Tokens are lineage-bound (tablet + epoch): a token from another
+  tablet, a superseded epoch (split/merge lineage), or an unassigned
+  position rejects as StaleToken without waiting. Valid tokens survive
+  failover, restart, and migration; retired lineages reject.
+
+BoundedStale(max_staleness)
+  Serves only from a FreshnessReceipt proving the bound (a recent
+  authority proof on the server's monotonic clock, same authority,
+  coverage applied). Without satisfying evidence the read escalates to
+  a fresh barrier — which satisfies any bound — instead of serving weak
+  data. If the authority path is unreachable the read fails retriable
+  (Overloaded/StaleRoute), never out-of-bound data labeled success.
+  Single-node servers are definitionally fresh and serve directly.
+
+Any
+  Local applied state with no freshness claim. May be arbitrarily stale;
+  never blocks on coverage.
+```
+
+Every served read carries a proof (authority triple, applied position,
+serving incarnation) on the response trailer. Feed `proof.token()` back
+as `AtLeast(token)` to chain reads. Pre-proof servers omit it (treated
+as no evidence, never as freshness). Client methods: `get` (Latest),
+`get_with_contract`, `get_at_least`, `get_bounded_stale`, `get_any`.
+Scans select per-tablet `Latest`/`Any` via the scan-consistency byte
+(the multi-tablet scan is not one global snapshot); batches and scans
+reject non-`Latest` contracts loudly.
+
 ## Partition drill
 
 ```powershell
@@ -164,14 +211,22 @@ curl -X POST 127.0.0.1:9301/v1/snapshot -d '{"tablet":4}'
 curl 127.0.0.1:9301/ready        # ready only when EVERY tablet is healthy
 curl 127.0.0.1:9301/v1/node      # cluster, node, tablets[], workers, dir_version
 curl 127.0.0.1:9301/v1/tablets   # per tablet: worker owner, role, leader, term,
-                                 #   committed, applied, snapshot, health, range
+                                  #   committed, applied, snapshot, health, range
+                                  #   + consistency_* counters (see below)
 curl 127.0.0.1:9301/v1/tablet    # single-tablet clusters only (400 otherwise)
 curl 127.0.0.1:9301/v1/peers     # per-lane H3 connections, requests, bytes, rtt_ms
 curl 127.0.0.1:9301/v1/sidecar   # bulk requests, cache hits/misses, inflight
 curl 127.0.0.1:9301/v1/durability # shared writer: batches, records/batch,
-                                 #   groups/batch, fsyncs, queue, barrier latency
+                                  #   groups/batch, fsyncs, queue, barrier latency
 curl 127.0.0.1:9301/v1/preflight # preflight attempts, quorum-ready, fallbacks
 ```
+
+Per-tablet `consistency_*` counters answer why reads took a given path
+without reverse-engineering logs (reads per contract, local vs authority
+serves, `AtLeast` waits/timeouts/lineage rejects, bounded-stale
+hits/escalations/unprovable, strong-cache hits/fallbacks/invalidations,
+Almost-Local and roster-lease hits/fallbacks, fencing rejects). Served
+reads also log their path, authority, and position at debug level.
 
 `/ready` is usable-only and multi-tablet aware: `ready` requires every
 configured tablet healthy (with `tablets_total` / `tablets_healthy` /
@@ -221,8 +276,17 @@ deduplicated sidecar transfer, differential snapshot catch-up. See
 
 ## Limits in this stage
 
-* Static placement: every node hosts one replica of every tablet, fixed
-  3 voters per group. No add/remove voter, learners, split/merge,
-  migration, or control-plane Raft.
+* Dynamic placement (migration, repair, split, merge, drain) runs through
+  the replicated control plane with learner catch-up, joint-consensus
+  membership changes, and tombstoned parents. Read contracts hold across
+  all of it: evidence is reconciled against the serving authority on
+  every read, retired replicas drop theirs, and foreign lineages reject.
 * `Latest` on a non-leader redirects (`StaleRoute` with the tablet's
   range); RESP followers answer retryable `BUSY` (never `MOVED`/`ASK`).
+* Consistency fast paths (Almost-Local, roster leases, strong cache) are
+  correctness-complete prototypes behind explicit modes: the conservative
+  leader barrier is always available and is the default. Roster-lease
+  issuance is leader-local (quorum-agreed issuance is future control-plane
+  work); the synchrony assumptions are documented on the provider modes.
+* Streamed reads (`get_stream`) honor the request contract for their root
+  but carry no proof trailer: chain `AtLeast` from a point read.

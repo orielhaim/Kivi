@@ -97,6 +97,7 @@ async fn scan_tablet(
     let PartitionRange::Ordered(tablet_range) = descriptor.range().clone() else {
         return (
             Response {
+                proof: None,
                 status: Status::InvalidRequest,
                 body: ResponseBody::Diagnostic("scan requires an ordered namespace".to_owned()),
             },
@@ -126,17 +127,19 @@ async fn scan_tablet(
         kivi_protocol::SCAN_ANY => ReadContract::Any,
         _ => ReadContract::Latest,
     };
-    let now = super::cluster::wall_now();
-    match shared.node.scan(tablet, &spec, contract, now).await {
+    let ctx = super::cluster::read_ctx();
+    match shared.node.scan(tablet, &spec, contract, ctx).await {
         Err(error) => (
             super::cluster::shape_read_error(shared, tablet, &error).await,
             Opcode::Scan,
         ),
-        Ok(page) => (
+        Ok(served) => (
             Response {
+                proof: Some(served.receipt),
                 status: Status::Ok,
                 body: ResponseBody::ScanPage {
-                    entries: page
+                    entries: served
+                        .page
                         .entries
                         .iter()
                         .map(|entry| kivi_protocol::ScanEntryBody {
@@ -144,8 +147,8 @@ async fn scan_tablet(
                             value: scan_value_body(entry.value.as_ref()),
                         })
                         .collect(),
-                    exhausted: page.exhausted,
-                    last_key: page.last_key.map(|key| key.as_bytes().to_vec()),
+                    exhausted: served.page.exhausted,
+                    last_key: served.page.last_key.map(|key| key.as_bytes().to_vec()),
                     tablet: tablet.as_u64(),
                     range_start: tablet_range.start().to_vec(),
                     range_end: tablet_range.end().map(<[u8]>::to_vec),
@@ -249,6 +252,7 @@ fn empty_page(
     exhausted: bool,
 ) -> Response {
     Response {
+        proof: None,
         status: Status::Ok,
         body: ResponseBody::ScanPage {
             entries: Vec::new(),
@@ -289,6 +293,7 @@ fn scan_gap(directory: &DirectorySnapshot, cursor: &[u8]) -> Response {
         }
     }
     Response {
+        proof: None,
         status: Status::Ok,
         body: ResponseBody::ScanPage {
             entries: Vec::new(),
@@ -322,6 +327,7 @@ fn min_bound(first: Option<&[u8]>, second: Option<&[u8]>) -> Option<Vec<u8>> {
 
 fn invalid(detail: &str) -> Response {
     Response {
+        proof: None,
         status: Status::InvalidRequest,
         body: ResponseBody::Diagnostic(detail.to_owned()),
     }
@@ -359,6 +365,7 @@ pub async fn handle_batch(shared: &ClusterShared, request: &Request) -> (Respons
         Err(TxnError::TooLarge) => {
             return (
                 Response {
+                    proof: None,
                     status: Status::TxnTooLarge,
                     body: ResponseBody::Diagnostic(
                         "batch is empty or exceeds transaction bounds".to_owned(),
@@ -370,6 +377,7 @@ pub async fn handle_batch(shared: &ClusterShared, request: &Request) -> (Respons
         Err(TxnError::RoutingChanged) => {
             return (
                 Response {
+                    proof: None,
                     status: Status::TxnCoordinatorUnavailable,
                     body: ResponseBody::Diagnostic(
                         "batch key routes nowhere; retry after topology settles".to_owned(),
@@ -383,6 +391,7 @@ pub async fn handle_batch(shared: &ClusterShared, request: &Request) -> (Respons
     if plan.groups.len() != 1 {
         return (
             Response {
+                proof: None,
                 status: Status::TxnTooLarge,
                 body: ResponseBody::Diagnostic(format!(
                     "batch spans {} tablets; drive it over TxnPrepare/TxnFinalize",
@@ -400,6 +409,7 @@ pub async fn handle_batch(shared: &ClusterShared, request: &Request) -> (Respons
     {
         return (
             Response {
+                proof: None,
                 status: Status::TxnCoordinatorUnavailable,
                 body: ResponseBody::Diagnostic(
                     "tablet holds unresolved intents; retry after recovery".to_owned(),
@@ -476,6 +486,7 @@ async fn run_single_tablet_plan(
             TxnState::Aborted => {
                 return (
                     Response {
+                        proof: None,
                         status: Status::TxnAborted,
                         body: ResponseBody::Diagnostic("transaction aborted".to_owned()),
                     },
@@ -509,6 +520,7 @@ async fn run_single_tablet_plan(
             session,
             &mut step_identity,
             Response {
+                proof: None,
                 status: Status::TxnAborted,
                 body: ResponseBody::Diagnostic("commit undecided; aborted".to_owned()),
             },
@@ -541,6 +553,7 @@ async fn prepare_wave(
                 return Err(Box::new((
                     prepared,
                     Response {
+                        proof: None,
                         status: Status::TxnConflict,
                         body: ResponseBody::Diagnostic("transaction conflict".to_owned()),
                     },
@@ -550,6 +563,7 @@ async fn prepare_wave(
                 return Err(Box::new((
                     prepared,
                     Response {
+                        proof: None,
                         status: Status::Internal,
                         body: ResponseBody::Diagnostic("unexpected prepare outcome".to_owned()),
                     },
@@ -591,6 +605,7 @@ async fn finalize_wave(
             Ok(_) => {
                 return (
                     Response {
+                        proof: None,
                         status: Status::Internal,
                         body: ResponseBody::Diagnostic("unexpected finalize outcome".to_owned()),
                     },
@@ -602,6 +617,7 @@ async fn finalize_wave(
     }
     (
         Response {
+            proof: None,
             status: Status::Ok,
             body: ResponseBody::AtomicCommitted { versions },
         },
@@ -616,7 +632,7 @@ async fn read_record(
     tablet: TabletId,
     record_key: &kivi_state::Key,
 ) -> Option<kivi_state::TxnRecord> {
-    let now = super::cluster::wall_now();
+    let ctx = super::cluster::read_ctx();
     match shared
         .node
         .read(
@@ -625,11 +641,14 @@ async fn read_record(
                 key: record_key.clone(),
             },
             kivi_types::ReadContract::Latest,
-            now,
+            ctx,
         )
         .await
     {
-        Ok(OperationResult::Value(Some(bytes))) => kivi_state::TxnRecord::decode(&bytes).ok(),
+        Ok(served) => match served.outcome {
+            OperationResult::Value(Some(bytes)) => kivi_state::TxnRecord::decode(&bytes).ok(),
+            _ => None,
+        },
         _ => None,
     }
 }

@@ -19,6 +19,7 @@
 //!   simulation can supply virtual time.
 
 pub mod authority;
+pub mod consistency;
 pub mod hash;
 pub mod identity;
 pub mod ids;
@@ -28,6 +29,12 @@ pub mod reads;
 pub mod time;
 
 pub use authority::{AuthorityMismatch, TabletAuthority};
+pub use consistency::{
+    AT_LEAST_WAIT_CAP, AuthorityTransition, ConsistencyMetrics, ConsistencySnapshot,
+    DEFAULT_PROOF_TTL, FreshnessReceipt, FreshnessReject, LeaseInvalid, ReadAuthorityProvider,
+    ReadContext, ReadReceipt, ReplicaFreshness, RosterLease, STRONG_CACHE_CAP,
+    STRONG_CACHE_VALUE_CAP, ServePath, next_guard_for_move, reconcile_authority,
+};
 pub use hash::{ChunkId, ManifestId, PartitionHash};
 pub use identity::{IdempotencyKey, MutationIdentity, RequestIdentity};
 pub use ids::{
