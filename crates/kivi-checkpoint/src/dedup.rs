@@ -12,7 +12,7 @@
 //! ```text
 //! header (32 bytes, fixed):
 //!   0   4  magic "KVCD"
-//!   4   2  major = 2
+//!   4   2  major = 3
 //!   6   2  minor = 0
 //!   8   8  tablet (u64)
 //!   16  8  cut commit position (u64)
@@ -25,7 +25,7 @@
 //! then intents sorted by key:
 //!   intent_count u32,
 //!   txn16, coordinator u64, key (Key codec), expect (TxnExpect codec),
-//!     write (TxnWriteKind codec), observed flag u8 (+ version u64),
+//!     write (TxnWriteKind codec), digest32, observed flag u8 (+ version u64),
 //!     prepared_at u64
 //! footer (40 bytes): body CRC32C, BLAKE3 of header[0..28] + body
 //! (content identity covers artifact identity), footer CRC32C
@@ -38,9 +38,10 @@
 //! Intents restore verbatim: unresolved transactions are never discarded
 //! on restart.
 //!
-//! Format v1 (sessions only, no intents) is rejected: breaking prototype
-//! formats is allowed, and silently dropping intents would violate the
-//! durability contract.
+//! Format v1 (sessions only, no intents) and v2 (intents without
+//! write-set digests) are rejected: breaking prototype formats is
+//! allowed, and silently dropping intents — or their confused-deputy
+//! binding — would violate the durability contract.
 
 use kivi_codec::integrity::crc32c_checksum;
 use kivi_codec::{Decode as _, Encode as _};
@@ -52,8 +53,9 @@ use crate::error::CheckpointError;
 
 /// Magic word: ASCII `"KVCD"` read as a little-endian `u32`.
 pub const DEDUP_MAGIC: u32 = 0x4443_564B;
-/// Current dedup-component major version (v2 appends the intent section).
-pub const DEDUP_MAJOR: u16 = 2;
+/// Current dedup-component major version (v3 binds intents to their
+/// write-set digests; v1/v2 are rejected loudly).
+pub const DEDUP_MAJOR: u16 = 3;
 /// Current dedup-component minor version.
 pub const DEDUP_MINOR: u16 = 0;
 /// Encoded header length in bytes.
@@ -228,6 +230,7 @@ fn encode_intents(
         intent.key.encode(body);
         intent.write.expect.encode(body);
         intent.write.kind.encode(body);
+        body.extend_from_slice(&intent.digest);
         match intent.observed {
             None => body.push(0),
             Some(version) => {
@@ -284,6 +287,9 @@ fn decode_intents(cursor: &[u8]) -> Result<(Vec<kivi_state::TxnIntent>, usize), 
         let (kind, used) = kivi_state::TxnWriteKind::decode(&cursor[at..])
             .map_err(|_| corrupt("dedup intent write undecodable".to_owned()))?;
         at += used;
+        let digest: [u8; 32] = intent_take(cursor, &mut at, 32)?
+            .try_into()
+            .map_err(|_| corrupt("dedup intent digest unreadable".to_owned()))?;
         let observed = match intent_take(cursor, &mut at, 1)?[0] {
             0 => None,
             1 => {
@@ -315,6 +321,7 @@ fn decode_intents(cursor: &[u8]) -> Result<(Vec<kivi_state::TxnIntent>, usize), 
             coordinator,
             key: key.clone(),
             write: kivi_state::TxnWrite { key, kind, expect },
+            digest,
             observed,
             prepared_at,
         });
@@ -606,6 +613,7 @@ mod tests {
                 kind: TxnWriteKind::Put(bytes::Bytes::from_static(b"v")),
                 expect: TxnExpect::Any,
             },
+            digest: [0xD1; 32],
             observed: None,
             prepared_at: 99,
         };

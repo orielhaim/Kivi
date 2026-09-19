@@ -245,3 +245,23 @@ fn client_set_range_inline(bencher: Bencher) {
         black_box(());
     });
 }
+
+/// Same-tablet atomic batch end to end: four blind puts through the
+/// embedded client, exercising the cheap `TxnCommitLocal` path (one
+/// ordered mutation, no 2PC) against the point-op baselines above.
+#[divan::bench]
+fn client_atomic_batch_local(bencher: Bencher) {
+    use kivi_state::{TxnExpect, TxnWrite, TxnWriteKind};
+    let engine = root_engine();
+    let client = engine.client();
+    let writes: Vec<TxnWrite> = (0..4)
+        .map(|index| TxnWrite {
+            key: Key::from(format!("batch:{index}")),
+            kind: TxnWriteKind::Put(Bytes::from_static(VALUE_16)),
+            expect: TxnExpect::Any,
+        })
+        .collect();
+    bencher.counter(ItemsCount::new(4u64)).bench_local(|| {
+        black_box(client.atomic_batch(black_box(&writes)).expect("batch"));
+    });
+}

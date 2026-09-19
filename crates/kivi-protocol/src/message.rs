@@ -10,7 +10,7 @@
 //! Human-readable diagnostics may accompany a response, but the stable
 //! machine-readable [`Status`] code is the only semantic contract.
 
-use kivi_state::{Key, Operation};
+use kivi_state::{Key, Mutation, Operation};
 use kivi_tablet::{DirectoryVersion, HashPrefix, OrderedRange, PartitionRange};
 use kivi_types::{
     ClusterId, CommitPosition, CommitToken, NamespaceId, NodeId, NodeIncarnation, ReadContract,
@@ -116,6 +116,46 @@ pub enum Opcode {
     /// (`None` when absent; works for chunked values without resolving
     /// any bytes). Index maintenance and OCC planning use this.
     GetVersion = 19,
+    /// Fetch a commutative counter's current sum (a state query, not an
+    /// ordinal; additions stay order-free).
+    CommutativeGet = 20,
+    /// Add to a commutative counter. The result is `Applied`, never an
+    /// ordinal, so additions commute observably.
+    CommutativeAdd = 21,
+    /// Create a bounded counter with a global capacity and a full local
+    /// escrow share for the executing tablet.
+    BoundedCounterCreate = 22,
+    /// Add to a bounded counter within locally owned escrow rights.
+    BoundedCounterAdd = 23,
+    /// Read a bounded counter's value and capacity.
+    BoundedCounterGet = 24,
+    /// Narrow one bounded counter's escrow share (lone operations narrow
+    /// only; widening pairs inside atomic transfers).
+    EscrowTransfer = 25,
+    /// Create a semaphore with a total permit capacity.
+    SemaphoreCreate = 26,
+    /// Acquire permits under a client-minted permit id (idempotent retry).
+    SemaphoreAcquire = 27,
+    /// Release the permits held under a permit id (idempotent, mints nothing).
+    SemaphoreRelease = 28,
+    /// Inspect a semaphore's outstanding load and capacity.
+    SemaphoreInspect = 29,
+    /// Acquire (or re-acquire after expiry) a fenced lease.
+    LeaseAcquire = 30,
+    /// Extend a live lease grant (exact fencing token required).
+    LeaseRenew = 31,
+    /// Release a lease grant (exact fencing token required).
+    LeaseRelease = 32,
+    /// Inspect a lease's live holder and next fencing token.
+    LeaseInspect = 33,
+    /// Create one shard of a sharded stream.
+    StreamCreate = 34,
+    /// Append one entry to a stream shard (shard-local offset assigned).
+    StreamAppend = 35,
+    /// Read one shard's entries from an offset (shard-local, no global order).
+    StreamRead = 36,
+    /// Trim one shard's retained prefix (cursor never rewinds).
+    StreamTrim = 37,
 }
 
 impl Opcode {
@@ -142,6 +182,24 @@ impl Opcode {
             17 => Some(Self::TxnPrepare),
             18 => Some(Self::TxnFinalize),
             19 => Some(Self::GetVersion),
+            20 => Some(Self::CommutativeGet),
+            21 => Some(Self::CommutativeAdd),
+            22 => Some(Self::BoundedCounterCreate),
+            23 => Some(Self::BoundedCounterAdd),
+            24 => Some(Self::BoundedCounterGet),
+            25 => Some(Self::EscrowTransfer),
+            26 => Some(Self::SemaphoreCreate),
+            27 => Some(Self::SemaphoreAcquire),
+            28 => Some(Self::SemaphoreRelease),
+            29 => Some(Self::SemaphoreInspect),
+            30 => Some(Self::LeaseAcquire),
+            31 => Some(Self::LeaseRenew),
+            32 => Some(Self::LeaseRelease),
+            33 => Some(Self::LeaseInspect),
+            34 => Some(Self::StreamCreate),
+            35 => Some(Self::StreamAppend),
+            36 => Some(Self::StreamRead),
+            37 => Some(Self::StreamTrim),
             _ => None,
         }
     }
@@ -168,6 +226,19 @@ impl Opcode {
                 | Self::AtomicBatch
                 | Self::TxnPrepare
                 | Self::TxnFinalize
+                | Self::CommutativeAdd
+                | Self::BoundedCounterCreate
+                | Self::BoundedCounterAdd
+                | Self::EscrowTransfer
+                | Self::SemaphoreCreate
+                | Self::SemaphoreAcquire
+                | Self::SemaphoreRelease
+                | Self::LeaseAcquire
+                | Self::LeaseRenew
+                | Self::LeaseRelease
+                | Self::StreamCreate
+                | Self::StreamAppend
+                | Self::StreamTrim
         )
     }
 }
@@ -194,6 +265,24 @@ impl core::fmt::Display for Opcode {
             Self::TxnPrepare => write!(f, "txn-prepare"),
             Self::TxnFinalize => write!(f, "txn-finalize"),
             Self::GetVersion => write!(f, "get-version"),
+            Self::CommutativeGet => write!(f, "commutative-get"),
+            Self::CommutativeAdd => write!(f, "commutative-add"),
+            Self::BoundedCounterCreate => write!(f, "bounded-counter-create"),
+            Self::BoundedCounterAdd => write!(f, "bounded-counter-add"),
+            Self::BoundedCounterGet => write!(f, "bounded-counter-get"),
+            Self::EscrowTransfer => write!(f, "escrow-transfer"),
+            Self::SemaphoreCreate => write!(f, "semaphore-create"),
+            Self::SemaphoreAcquire => write!(f, "semaphore-acquire"),
+            Self::SemaphoreRelease => write!(f, "semaphore-release"),
+            Self::SemaphoreInspect => write!(f, "semaphore-inspect"),
+            Self::LeaseAcquire => write!(f, "lease-acquire"),
+            Self::LeaseRenew => write!(f, "lease-renew"),
+            Self::LeaseRelease => write!(f, "lease-release"),
+            Self::LeaseInspect => write!(f, "lease-inspect"),
+            Self::StreamCreate => write!(f, "stream-create"),
+            Self::StreamAppend => write!(f, "stream-append"),
+            Self::StreamRead => write!(f, "stream-read"),
+            Self::StreamTrim => write!(f, "stream-trim"),
         }
     }
 }
@@ -265,6 +354,24 @@ pub enum Status {
     /// identified writes may re-drive under the same identity, everyone
     /// else must read-verify before retrying.
     CoverageUncertain = 22,
+    /// A bounded-counter addition would leave locally owned escrow rights
+    /// (or the global bound). Move rights first, then retry.
+    BoundedExceeded = 23,
+    /// A semaphore acquisition would exceed capacity. Retry after releases.
+    SemaphoreExhausted = 24,
+    /// A lease acquisition met a live holder owned by someone else.
+    LeaseConflict = 25,
+    /// A lease renew/release named a fencing token that is not the current
+    /// grant's. Re-acquire; never retry blindly with the stale token.
+    StaleFencing = 26,
+    /// A stream append would exceed the shard's entry or payload bounds.
+    StreamFull = 27,
+    /// Conflicting final decisions for one transaction (durable corruption).
+    /// Never guessed; surfaced for operator repair.
+    TxnDecisionConflict = 28,
+    /// The batch spans tablets: drive it over `TxnPrepare`/`TxnFinalize`.
+    /// Typed (never string-matched): oversize batches stay `TxnTooLarge`.
+    TxnCrossTablet = 29,
 }
 
 impl Status {
@@ -295,6 +402,13 @@ impl Status {
             20 => Some(Self::ScanCursorStale),
             21 => Some(Self::StaleToken),
             22 => Some(Self::CoverageUncertain),
+            23 => Some(Self::BoundedExceeded),
+            24 => Some(Self::SemaphoreExhausted),
+            25 => Some(Self::LeaseConflict),
+            26 => Some(Self::StaleFencing),
+            27 => Some(Self::StreamFull),
+            28 => Some(Self::TxnDecisionConflict),
+            29 => Some(Self::TxnCrossTablet),
             _ => None,
         }
     }
@@ -350,6 +464,13 @@ impl core::fmt::Display for Status {
             Self::ScanCursorStale => write!(f, "scan-cursor-stale"),
             Self::StaleToken => write!(f, "stale-token"),
             Self::CoverageUncertain => write!(f, "coverage-uncertain"),
+            Self::BoundedExceeded => write!(f, "bounded-exceeded"),
+            Self::SemaphoreExhausted => write!(f, "semaphore-exhausted"),
+            Self::LeaseConflict => write!(f, "lease-conflict"),
+            Self::StaleFencing => write!(f, "stale-fencing"),
+            Self::StreamFull => write!(f, "stream-full"),
+            Self::TxnDecisionConflict => write!(f, "txn-decision-conflict"),
+            Self::TxnCrossTablet => write!(f, "txn-cross-tablet"),
         }
     }
 }
@@ -521,6 +642,16 @@ pub const BATCH_PUT: u8 = 1;
 pub const BATCH_DELETE: u8 = 2;
 /// Wire values for batch write kinds on `AtomicBatch`.
 pub const BATCH_COUNTER_ADD: u8 = 3;
+/// Chunked put by staged manifest reference (value blob carries 32-byte
+/// manifest id plus 8-byte LE logical length).
+pub const BATCH_PUT_CHUNKED: u8 = 4;
+/// Commutative-counter add (order-free; no ordinal produced).
+pub const BATCH_COMMUTATIVE_ADD: u8 = 5;
+/// Bounded-counter add (escrow rights checked at prepare).
+pub const BATCH_BOUNDED_ADD: u8 = 6;
+/// Escrow share move (value blob carries 8-byte LE min plus 8-byte LE max;
+/// one side of a paired, conservation-checked transfer).
+pub const BATCH_ESCROW_SHARE: u8 = 7;
 
 /// Wire values for batch OCC expectations on `AtomicBatch`: blind write.
 pub const BATCH_EXPECT_ANY: u8 = 0;
@@ -537,7 +668,9 @@ pub const BATCH_EXPECT_VERSION: u8 = 2;
 pub struct BatchWrite {
     /// Target key.
     pub key: Vec<u8>,
-    /// One of [`BATCH_PUT`], [`BATCH_DELETE`], [`BATCH_COUNTER_ADD`].
+    /// One of [`BATCH_PUT`], [`BATCH_DELETE`], [`BATCH_COUNTER_ADD`],
+    /// [`BATCH_PUT_CHUNKED`], [`BATCH_COMMUTATIVE_ADD`],
+    /// [`BATCH_BOUNDED_ADD`], [`BATCH_ESCROW_SHARE`].
     pub kind: u8,
     /// Put payload (meaningful for `BATCH_PUT` only).
     pub value: Vec<u8>,
@@ -581,6 +714,14 @@ pub enum ScanValueBody {
         /// Logical length of the value.
         logical_len: u64,
     },
+    /// Typed semantic value by small descriptor (object type tag plus
+    /// canonical descriptor bytes; never inlined bulk).
+    Semantic {
+        /// Object type tag (mirrors `kivi-state`'s `ObjectType` tags).
+        object: u8,
+        /// Small canonical descriptor bytes for `object`.
+        descriptor: Vec<u8>,
+    },
 }
 
 /// Wire tags for [`ScanValueBody`]. Fixed, never reused.
@@ -593,6 +734,8 @@ pub const SCAN_VALUE_COUNTER: u8 = 2;
 pub const SCAN_VALUE_CHUNKED: u8 = 3;
 /// Wire tags for [`ScanValueBody`]. Fixed, never reused.
 pub const SCAN_VALUE_OVERSIZE: u8 = 4;
+/// Typed semantic descriptor tag. Fixed, never reused.
+pub const SCAN_VALUE_SEMANTIC: u8 = 5;
 
 /// One typed native request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -662,6 +805,37 @@ pub struct Request {
     /// Whether to apply (`true`) or discard (`false`) the intent
     /// (`TxnFinalize` only).
     pub txn_commit: bool,
+    /// Digest over the full transaction write set (`TxnPrepare` /
+    /// `TxnFinalize`): binds the step to the exact transaction, so a
+    /// conflicting driver under one `TxnId` is rejected, never mixed in.
+    pub txn_digest: [u8; 32],
+    /// Total capacity (`BoundedCounterCreate` / `SemaphoreCreate` only).
+    pub capacity: u64,
+    /// Tablet holding a new bounded counter's initial full escrow share
+    /// (`BoundedCounterCreate` only; filled by the driver after routing).
+    pub holder: u64,
+    /// Permit identity (16 bytes; `SemaphoreAcquire` / `SemaphoreRelease`).
+    pub permit: [u8; 16],
+    /// Owner/session identity (`SemaphoreAcquire`, lease ops).
+    pub owner: u64,
+    /// Permit quantity (`SemaphoreAcquire` only).
+    pub qty: u64,
+    /// Fencing token of the named grant (`LeaseRenew` / `LeaseRelease`).
+    pub fencing: u64,
+    /// Logical time-to-live in micros from now (`LeaseAcquire` /
+    /// `LeaseRenew`; `0` means an immortal grant).
+    pub ttl: u64,
+    /// Stream identity (16 bytes; `StreamCreate` only).
+    pub stream: [u8; 16],
+    /// Shard index within the stream (`StreamCreate` only).
+    pub shard: u32,
+    /// Partition key that routed this entry (`StreamAppend` only; retained
+    /// for audit, not a second payload).
+    pub partition: Vec<u8>,
+    /// New escrow share lower bound (`EscrowTransfer` only).
+    pub share_min: i64,
+    /// New escrow share upper bound (`EscrowTransfer` only).
+    pub share_max: i64,
 }
 
 impl Request {
@@ -741,6 +915,34 @@ impl Request {
                     }
                     BATCH_DELETE => kivi_state::TxnWriteKind::Delete,
                     BATCH_COUNTER_ADD => kivi_state::TxnWriteKind::CounterAdd(write.delta),
+                    BATCH_PUT_CHUNKED => {
+                        if write.value.len() != 40 {
+                            return None;
+                        }
+                        let mut manifest = [0u8; 32];
+                        manifest.copy_from_slice(&write.value[..32]);
+                        let mut len = [0u8; 8];
+                        len.copy_from_slice(&write.value[32..]);
+                        kivi_state::TxnWriteKind::PutChunked {
+                            manifest: kivi_types::ManifestId::from_bytes(manifest),
+                            logical_len: u64::from_le_bytes(len),
+                        }
+                    }
+                    BATCH_COMMUTATIVE_ADD => kivi_state::TxnWriteKind::CommutativeAdd(write.delta),
+                    BATCH_BOUNDED_ADD => kivi_state::TxnWriteKind::BoundedAdd(write.delta),
+                    BATCH_ESCROW_SHARE => {
+                        if write.value.len() != 16 {
+                            return None;
+                        }
+                        let mut min = [0u8; 8];
+                        let mut max = [0u8; 8];
+                        min.copy_from_slice(&write.value[..8]);
+                        max.copy_from_slice(&write.value[8..]);
+                        kivi_state::TxnWriteKind::EscrowSetShare {
+                            min: i64::from_le_bytes(min),
+                            max: i64::from_le_bytes(max),
+                        }
+                    }
                     _ => return None,
                 };
                 let expect = match write.expect {
@@ -758,6 +960,7 @@ impl Request {
                         kind,
                         expect,
                     },
+                    digest: self.txn_digest,
                 });
             }
             Opcode::TxnFinalize => {
@@ -765,8 +968,80 @@ impl Request {
                     txn: kivi_state::TxnId::from_bytes(self.batch_txn),
                     key,
                     commit: self.txn_commit,
+                    digest: self.txn_digest,
                 });
             }
+            Opcode::CommutativeGet => Operation::CommutativeGet { key },
+            Opcode::CommutativeAdd => Operation::CommutativeAdd {
+                key,
+                delta: self.delta,
+            },
+            Opcode::BoundedCounterCreate => Operation::BoundedCounterCreate {
+                key,
+                capacity: self.capacity,
+                holder: TabletId::from_u64(self.holder),
+            },
+            Opcode::BoundedCounterAdd => Operation::BoundedCounterAdd {
+                key,
+                delta: self.delta,
+            },
+            Opcode::BoundedCounterGet => Operation::BoundedCounterGet { key },
+            Opcode::EscrowTransfer => Operation::EscrowTransfer {
+                key,
+                new_min: self.share_min,
+                new_max: self.share_max,
+            },
+            Opcode::SemaphoreCreate => Operation::SemaphoreCreate {
+                key,
+                capacity: self.capacity,
+            },
+            Opcode::SemaphoreAcquire => Operation::SemaphoreAcquire {
+                key,
+                permit: kivi_state::PermitId::from_bytes(self.permit),
+                owner: self.owner,
+                qty: self.qty,
+            },
+            Opcode::SemaphoreRelease => Operation::SemaphoreRelease {
+                key,
+                permit: kivi_state::PermitId::from_bytes(self.permit),
+            },
+            Opcode::SemaphoreInspect => Operation::SemaphoreInspect { key },
+            Opcode::LeaseAcquire => Operation::LeaseAcquire {
+                key,
+                owner: self.owner,
+                ttl_micros: self.ttl,
+            },
+            Opcode::LeaseRenew => Operation::LeaseRenew {
+                key,
+                owner: self.owner,
+                fencing: kivi_state::FencingToken::from_u64(self.fencing),
+                ttl_micros: self.ttl,
+            },
+            Opcode::LeaseRelease => Operation::LeaseRelease {
+                key,
+                owner: self.owner,
+                fencing: kivi_state::FencingToken::from_u64(self.fencing),
+            },
+            Opcode::LeaseInspect => Operation::LeaseInspect { key },
+            Opcode::StreamCreate => Operation::StreamCreate {
+                key,
+                stream: self.stream,
+                shard: self.shard,
+            },
+            Opcode::StreamAppend => Operation::StreamAppend {
+                key,
+                partition: self.partition,
+                payload: bytes::Bytes::from(self.value.unwrap_or_default()),
+            },
+            Opcode::StreamRead => Operation::StreamRead {
+                key,
+                from_offset: self.offset,
+                max_entries: u32::try_from(self.len).unwrap_or(u32::MAX),
+            },
+            Opcode::StreamTrim => Operation::StreamTrim {
+                key,
+                through_offset: self.offset,
+            },
         };
         Some(operation)
     }
@@ -799,9 +1074,76 @@ pub fn operation_opcode(operation: &Operation) -> Opcode {
             Opcode::SetConditional
         }
         // Transaction steps ride the normal propose path with dedup and
-        // response shaping; each shapes as its own opcode.
+        // response shaping; each shapes as its own opcode. Local commits
+        // shape as their parent batch opcode.
         Operation::TxnPrepare { .. } => Opcode::TxnPrepare,
         Operation::TxnFinalize { .. } => Opcode::TxnFinalize,
+        Operation::TxnCommitLocal { .. } => Opcode::AtomicBatch,
+        Operation::CommutativeGet { .. } => Opcode::CommutativeGet,
+        Operation::CommutativeAdd { .. } => Opcode::CommutativeAdd,
+        Operation::BoundedCounterCreate { .. } => Opcode::BoundedCounterCreate,
+        Operation::BoundedCounterAdd { .. } => Opcode::BoundedCounterAdd,
+        Operation::BoundedCounterGet { .. } => Opcode::BoundedCounterGet,
+        Operation::EscrowTransfer { .. } => Opcode::EscrowTransfer,
+        Operation::SemaphoreCreate { .. } => Opcode::SemaphoreCreate,
+        Operation::SemaphoreAcquire { .. } => Opcode::SemaphoreAcquire,
+        Operation::SemaphoreRelease { .. } => Opcode::SemaphoreRelease,
+        Operation::SemaphoreInspect { .. } => Opcode::SemaphoreInspect,
+        Operation::LeaseAcquire { .. } => Opcode::LeaseAcquire,
+        Operation::LeaseRenew { .. } => Opcode::LeaseRenew,
+        Operation::LeaseRelease { .. } => Opcode::LeaseRelease,
+        Operation::LeaseInspect { .. } => Opcode::LeaseInspect,
+        Operation::StreamCreate { .. } => Opcode::StreamCreate,
+        Operation::StreamAppend { .. } => Opcode::StreamAppend,
+        Operation::StreamRead { .. } => Opcode::StreamRead,
+        Operation::StreamTrim { .. } => Opcode::StreamTrim,
+    }
+}
+
+/// Maps a persisted mutation back to its originating opcode discriminant
+/// (response shaping + replay mapping). The single canonical copy: the
+/// engine tablet path and the consensus state machine both derive from
+/// the originating request through [`Mutation`], so they cannot
+/// disagree. The `is_persist_expiry` flag is the same one
+/// [`kivi_state::outcome_for`] takes (both derive from the single
+/// originating request).
+#[must_use]
+pub fn mutation_opcode(mutation: &Mutation, is_persist_expiry: bool) -> Opcode {
+    match mutation {
+        // Chunked roots answer exactly like inline stores: the response
+        // shapes `Stored{version}` either way. Range patches answer the
+        // same `Stored{version}` shape.
+        Mutation::PutBytes { .. } | Mutation::ReplaceChunkedRoot { .. } => Opcode::Set,
+        Mutation::PutBytesWithExpiry { .. } | Mutation::ReplaceChunkedRootWithExpiry { .. } => {
+            Opcode::SetConditional
+        }
+        Mutation::SpliceBytes { .. } => Opcode::SetRange,
+        Mutation::Delete { .. } => Opcode::Delete,
+        Mutation::CounterAdd { .. } => Opcode::CounterAdd,
+        Mutation::SetExpiry { .. } => {
+            if is_persist_expiry {
+                Opcode::PersistExpiry
+            } else {
+                Opcode::ExpireAt
+            }
+        }
+        // Transaction steps shape as their parent batch opcode.
+        Mutation::TxnPrepare { .. }
+        | Mutation::TxnFinalize { .. }
+        | Mutation::TxnCommitLocal { .. } => Opcode::AtomicBatch,
+        Mutation::CommutativeAdd { .. } => Opcode::CommutativeAdd,
+        Mutation::BoundedCreate { .. } => Opcode::BoundedCounterCreate,
+        Mutation::BoundedAdd { .. } => Opcode::BoundedCounterAdd,
+        Mutation::EscrowSetShare { .. } => Opcode::EscrowTransfer,
+        Mutation::SemaphoreCreate { .. } => Opcode::SemaphoreCreate,
+        Mutation::SemaphoreAcquire { .. } => Opcode::SemaphoreAcquire,
+        Mutation::SemaphoreRelease { .. } => Opcode::SemaphoreRelease,
+        Mutation::LeaseAcquire { .. } => Opcode::LeaseAcquire,
+        Mutation::LeaseRenew { .. } => Opcode::LeaseRenew,
+        Mutation::LeaseRelease { .. } => Opcode::LeaseRelease,
+        Mutation::StreamCreate { .. } => Opcode::StreamCreate,
+        Mutation::StreamAppend { .. } => Opcode::StreamAppend,
+        Mutation::StreamTrim { .. } => Opcode::StreamTrim,
     }
 }
 
@@ -898,11 +1240,112 @@ pub enum ResponseBody {
         applied: bool,
         /// Version after the applied write (zero when nothing applied).
         version: u64,
+        /// Serving tablet that resolved the intent (drivers verify lineage:
+        /// a finalize served elsewhere means the tablet moved mid-txn).
+        tablet: u64,
+    },
+    /// Commutative addition applied (pairs with `CommutativeAdd`): no
+    /// ordinal, by design — permutations are indistinguishable.
+    CommutativeApplied,
+    /// Commutative counter sum (pairs with `CommutativeGet`).
+    CommutativeValue(i64),
+    /// Bounded-counter write outcome (pairs with `BoundedCounterAdd`).
+    BoundedUpdated {
+        /// Value after the addition.
+        value: i64,
+        /// Version after the update.
+        version: u64,
+    },
+    /// Bounded-counter read answer (pairs with `BoundedCounterGet`;
+    /// absent keys arrive with `NotFound` status instead).
+    BoundedValue {
+        /// Current value.
+        value: i64,
+        /// Global capacity.
+        capacity: u64,
+        /// Locally owned escrow share lower bound.
+        share_min: i64,
+        /// Locally owned escrow share upper bound.
+        share_max: i64,
+    },
+    /// Semaphore acquisition applied (pairs with `SemaphoreAcquire`).
+    SemaphoreAcquired,
+    /// Semaphore release outcome (pairs with `SemaphoreRelease`).
+    SemaphoreReleased {
+        /// Whether a live permit was released.
+        released: bool,
+    },
+    /// Semaphore load answer (pairs with `SemaphoreInspect`).
+    SemaphoreLoad {
+        /// Total outstanding quantity.
+        outstanding: u64,
+        /// Total capacity.
+        capacity: u64,
+    },
+    /// Lease grant outcome (pairs with `LeaseAcquire`).
+    LeaseAcquired {
+        /// Fencing token issued with this grant.
+        fencing: u64,
+        /// Logical expiry of the grant.
+        expires_at: u64,
+    },
+    /// Lease renewal outcome (pairs with `LeaseRenew`; same token).
+    LeaseRenewed {
+        /// Fencing token of the continuing grant.
+        fencing: u64,
+        /// New logical expiry of the grant.
+        expires_at: u64,
+    },
+    /// Lease release outcome (pairs with `LeaseRelease`).
+    LeaseReleased {
+        /// Whether a live holding was released.
+        released: bool,
+    },
+    /// Lease inspection answer (pairs with `LeaseInspect`).
+    LeaseInfo {
+        /// Live holder's owner (`None` when free or expired).
+        owner: Option<u64>,
+        /// Live holder's fencing token (zero when no live holder).
+        fencing: u64,
+        /// Live holder's logical expiry (zero when no live holder).
+        expires_at: u64,
+        /// Next fencing token to be issued.
+        next_fencing: u64,
+    },
+    /// Stream shard created (pairs with `StreamCreate`).
+    StreamCreated,
+    /// Stream append outcome (pairs with `StreamAppend`).
+    StreamAppended {
+        /// Assigned shard-local offset.
+        offset: u64,
+    },
+    /// Stream read page (pairs with `StreamRead`): entries in shard order.
+    StreamEntries {
+        /// Entries as `(offset, partition, payload)` triples.
+        entries: Vec<StreamEntryBody>,
+        /// Shard's next offset (exclusive upper bound of the log).
+        next_offset: u64,
+    },
+    /// Stream trim outcome (pairs with `StreamTrim`).
+    StreamTrimmed {
+        /// Entries removed.
+        removed: u64,
     },
     /// Retry directly at the attached authority.
     Redirect(RedirectInfo),
     /// Machine code plus optional human diagnostic (never Rust internals).
     Diagnostic(String),
+}
+
+/// One stream entry in a `StreamRead` response page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamEntryBody {
+    /// Shard-local offset.
+    pub offset: u64,
+    /// Partition key that routed this entry here.
+    pub partition: Vec<u8>,
+    /// Entry payload bytes.
+    pub payload: Vec<u8>,
 }
 
 /// One typed native response: stable status plus body.
@@ -1265,13 +1708,19 @@ impl Request {
         push_blob(&mut out, &self.key);
         match self.opcode {
             Opcode::Set => push_blob(&mut out, self.value.as_deref().unwrap_or_default()),
-            Opcode::CounterAdd => push_i64(&mut out, self.delta),
+            // All three counters share the delta wire shape; the opcode
+            // names the semantics, never the encoding.
+            Opcode::CounterAdd | Opcode::CommutativeAdd | Opcode::BoundedCounterAdd => {
+                push_i64(&mut out, self.delta);
+            }
             Opcode::ExpireAt => push_u64(&mut out, self.expiry),
             Opcode::SetRange => {
                 push_u64(&mut out, self.offset);
                 push_blob(&mut out, self.value.as_deref().unwrap_or_default());
             }
-            Opcode::GetRange => {
+            // Slices share the offset+length wire shape (byte ranges and
+            // shard reads alike); the opcode names the semantics.
+            Opcode::GetRange | Opcode::StreamRead => {
                 push_u64(&mut out, self.offset);
                 push_u64(&mut out, self.len);
             }
@@ -1326,6 +1775,7 @@ impl Request {
                 // with a single entry plus the coordinator.
                 out.extend_from_slice(&self.batch_txn);
                 push_u64(&mut out, self.txn_coordinator);
+                out.extend_from_slice(&self.txn_digest);
                 push_u16(
                     &mut out,
                     u16::try_from(self.batch_writes.len()).unwrap_or(u16::MAX),
@@ -1342,6 +1792,48 @@ impl Request {
             Opcode::TxnFinalize => {
                 out.extend_from_slice(&self.batch_txn);
                 push_u8(&mut out, u8::from(self.txn_commit));
+                out.extend_from_slice(&self.txn_digest);
+            }
+            Opcode::BoundedCounterCreate => {
+                push_u64(&mut out, self.capacity);
+                push_u64(&mut out, self.holder);
+            }
+            Opcode::EscrowTransfer => {
+                push_i64(&mut out, self.share_min);
+                push_i64(&mut out, self.share_max);
+            }
+            Opcode::SemaphoreCreate => push_u64(&mut out, self.capacity),
+            Opcode::SemaphoreAcquire => {
+                out.extend_from_slice(&self.permit);
+                push_u64(&mut out, self.owner);
+                push_u64(&mut out, self.qty);
+            }
+            Opcode::SemaphoreRelease => {
+                out.extend_from_slice(&self.permit);
+            }
+            Opcode::LeaseAcquire => {
+                push_u64(&mut out, self.owner);
+                push_u64(&mut out, self.ttl);
+            }
+            Opcode::LeaseRenew => {
+                push_u64(&mut out, self.owner);
+                push_u64(&mut out, self.fencing);
+                push_u64(&mut out, self.ttl);
+            }
+            Opcode::LeaseRelease => {
+                push_u64(&mut out, self.owner);
+                push_u64(&mut out, self.fencing);
+            }
+            Opcode::StreamCreate => {
+                out.extend_from_slice(&self.stream);
+                push_u32(&mut out, self.shard);
+            }
+            Opcode::StreamAppend => {
+                push_blob(&mut out, &self.partition);
+                push_blob(&mut out, self.value.as_deref().unwrap_or_default());
+            }
+            Opcode::StreamTrim => {
+                push_u64(&mut out, self.offset);
             }
             Opcode::Get
             | Opcode::Delete
@@ -1351,6 +1843,10 @@ impl Request {
             | Opcode::GetExpiry
             | Opcode::GetStream
             | Opcode::GetVersion
+            | Opcode::CommutativeGet
+            | Opcode::BoundedCounterGet
+            | Opcode::SemaphoreInspect
+            | Opcode::LeaseInspect
             | Opcode::BytesLength => {}
         }
         // Retry identity rides last so pre-identity decoders fail cleanly on
@@ -1443,12 +1939,26 @@ impl Request {
             batch_writes: Vec::new(),
             txn_coordinator: 0,
             txn_commit: false,
+            txn_digest: [0u8; 32],
+            capacity: 0,
+            holder: 0,
+            permit: [0u8; 16],
+            owner: 0,
+            qty: 0,
+            fencing: 0,
+            ttl: 0,
+            stream: [0u8; 16],
+            shard: 0,
+            partition: Vec::new(),
+            share_min: 0,
+            share_max: 0,
         };
         match opcode {
             Opcode::Set => {
                 request.value = Some(cursor.blob(CONTEXT)?.to_vec());
             }
-            Opcode::CounterAdd => {
+            // All three counters share the delta wire shape.
+            Opcode::CounterAdd | Opcode::CommutativeAdd | Opcode::BoundedCounterAdd => {
                 request.delta = cursor.i64(CONTEXT)?;
             }
             Opcode::ExpireAt => {
@@ -1458,7 +1968,7 @@ impl Request {
                 request.offset = cursor.u64(CONTEXT)?;
                 request.value = Some(cursor.blob(CONTEXT)?.to_vec());
             }
-            Opcode::GetRange => {
+            Opcode::GetRange | Opcode::StreamRead => {
                 request.offset = cursor.u64(CONTEXT)?;
                 request.len = cursor.u64(CONTEXT)?;
             }
@@ -1524,6 +2034,10 @@ impl Request {
                     .try_into()
                     .map_err(|_| ProtocolError::Malformed { context: CONTEXT })?;
                 request.txn_coordinator = cursor.u64(CONTEXT)?;
+                let digest = cursor.take(32, CONTEXT)?;
+                request.txn_digest = digest
+                    .try_into()
+                    .map_err(|_| ProtocolError::Malformed { context: CONTEXT })?;
                 // One prepare reserves exactly one key: the batch tail
                 // carries a single entry, never a set.
                 let writes = decode_batch_writes(&mut cursor, 1)?;
@@ -1542,6 +2056,62 @@ impl Request {
                     1 => true,
                     _ => return Err(ProtocolError::Malformed { context: CONTEXT }),
                 };
+                let digest = cursor.take(32, CONTEXT)?;
+                request.txn_digest = digest
+                    .try_into()
+                    .map_err(|_| ProtocolError::Malformed { context: CONTEXT })?;
+            }
+            Opcode::BoundedCounterCreate => {
+                request.capacity = cursor.u64(CONTEXT)?;
+                request.holder = cursor.u64(CONTEXT)?;
+            }
+            Opcode::EscrowTransfer => {
+                request.share_min = cursor.i64(CONTEXT)?;
+                request.share_max = cursor.i64(CONTEXT)?;
+            }
+            Opcode::SemaphoreCreate => {
+                request.capacity = cursor.u64(CONTEXT)?;
+            }
+            Opcode::SemaphoreAcquire => {
+                let raw = cursor.take(16, CONTEXT)?;
+                request.permit = raw
+                    .try_into()
+                    .map_err(|_| ProtocolError::Malformed { context: CONTEXT })?;
+                request.owner = cursor.u64(CONTEXT)?;
+                request.qty = cursor.u64(CONTEXT)?;
+            }
+            Opcode::SemaphoreRelease => {
+                let raw = cursor.take(16, CONTEXT)?;
+                request.permit = raw
+                    .try_into()
+                    .map_err(|_| ProtocolError::Malformed { context: CONTEXT })?;
+            }
+            Opcode::LeaseAcquire => {
+                request.owner = cursor.u64(CONTEXT)?;
+                request.ttl = cursor.u64(CONTEXT)?;
+            }
+            Opcode::LeaseRenew => {
+                request.owner = cursor.u64(CONTEXT)?;
+                request.fencing = cursor.u64(CONTEXT)?;
+                request.ttl = cursor.u64(CONTEXT)?;
+            }
+            Opcode::LeaseRelease => {
+                request.owner = cursor.u64(CONTEXT)?;
+                request.fencing = cursor.u64(CONTEXT)?;
+            }
+            Opcode::StreamCreate => {
+                let raw = cursor.take(16, CONTEXT)?;
+                request.stream = raw
+                    .try_into()
+                    .map_err(|_| ProtocolError::Malformed { context: CONTEXT })?;
+                request.shard = cursor.u32(CONTEXT)?;
+            }
+            Opcode::StreamAppend => {
+                request.partition = cursor.blob(CONTEXT)?.to_vec();
+                request.value = Some(cursor.blob(CONTEXT)?.to_vec());
+            }
+            Opcode::StreamTrim => {
+                request.offset = cursor.u64(CONTEXT)?;
             }
             Opcode::Get
             | Opcode::Delete
@@ -1551,6 +2121,10 @@ impl Request {
             | Opcode::GetExpiry
             | Opcode::GetStream
             | Opcode::GetVersion
+            | Opcode::CommutativeGet
+            | Opcode::BoundedCounterGet
+            | Opcode::SemaphoreInspect
+            | Opcode::LeaseInspect
             | Opcode::BytesLength => {}
         }
         // Identity suffix: absent on pre-identity encodings (exact end),
@@ -1611,8 +2185,11 @@ impl Response {
             }
             ResponseBody::Deleted { existed } => push_u8(&mut out, u8::from(*existed)),
             ResponseBody::Exists(present) => push_u8(&mut out, u8::from(*present)),
-            ResponseBody::Counter(value) => push_i64(&mut out, *value),
-            ResponseBody::CounterUpdated { value, version } => {
+            ResponseBody::Counter(value) | ResponseBody::CommutativeValue(value) => {
+                push_i64(&mut out, *value);
+            }
+            ResponseBody::CounterUpdated { value, version }
+            | ResponseBody::BoundedUpdated { value, version } => {
                 push_i64(&mut out, *value);
                 push_u64(&mut out, *version);
             }
@@ -1626,10 +2203,89 @@ impl Response {
                 push_u8(&mut out, 0);
             }
             ResponseBody::Length(len) => push_u64(&mut out, *len),
-            ResponseBody::ConditionalSet { applied, version }
-            | ResponseBody::TxnFinalized { applied, version } => {
+            ResponseBody::ConditionalSet { applied, version } => {
                 push_u8(&mut out, u8::from(*applied));
                 push_u64(&mut out, *version);
+            }
+            ResponseBody::TxnFinalized {
+                applied,
+                version,
+                tablet,
+            } => {
+                push_u8(&mut out, u8::from(*applied));
+                push_u64(&mut out, *version);
+                push_u64(&mut out, *tablet);
+            }
+            ResponseBody::CommutativeApplied
+            | ResponseBody::StreamCreated
+            | ResponseBody::SemaphoreAcquired => {}
+            ResponseBody::BoundedValue {
+                value,
+                capacity,
+                share_min,
+                share_max,
+            } => {
+                push_i64(&mut out, *value);
+                push_u64(&mut out, *capacity);
+                push_i64(&mut out, *share_min);
+                push_i64(&mut out, *share_max);
+            }
+            ResponseBody::SemaphoreReleased { released }
+            | ResponseBody::LeaseReleased { released } => {
+                push_u8(&mut out, u8::from(*released));
+            }
+            ResponseBody::SemaphoreLoad {
+                outstanding,
+                capacity,
+            } => {
+                push_u64(&mut out, *outstanding);
+                push_u64(&mut out, *capacity);
+            }
+            ResponseBody::LeaseAcquired {
+                fencing,
+                expires_at,
+            }
+            | ResponseBody::LeaseRenewed {
+                fencing,
+                expires_at,
+            } => {
+                push_u64(&mut out, *fencing);
+                push_u64(&mut out, *expires_at);
+            }
+            ResponseBody::LeaseInfo {
+                owner,
+                fencing,
+                expires_at,
+                next_fencing,
+            } => {
+                match owner {
+                    None => push_u8(&mut out, 0),
+                    Some(owner) => {
+                        push_u8(&mut out, 1);
+                        push_u64(&mut out, *owner);
+                    }
+                }
+                push_u64(&mut out, *fencing);
+                push_u64(&mut out, *expires_at);
+                push_u64(&mut out, *next_fencing);
+            }
+            ResponseBody::StreamAppended { offset } => {
+                push_u64(&mut out, *offset);
+            }
+            ResponseBody::StreamEntries {
+                entries,
+                next_offset,
+            } => {
+                push_u32(&mut out, u32::try_from(entries.len()).unwrap_or(u32::MAX));
+                for entry in entries {
+                    push_u64(&mut out, entry.offset);
+                    push_blob(&mut out, &entry.partition);
+                    push_blob(&mut out, &entry.payload);
+                }
+                push_u64(&mut out, *next_offset);
+            }
+            ResponseBody::StreamTrimmed { removed } => {
+                push_u64(&mut out, *removed);
             }
             ResponseBody::ScanPage {
                 entries,
@@ -1664,6 +2320,11 @@ impl Response {
                         ScanValueBody::Oversize { logical_len } => {
                             push_u8(&mut out, SCAN_VALUE_OVERSIZE);
                             push_u64(&mut out, *logical_len);
+                        }
+                        ScanValueBody::Semantic { object, descriptor } => {
+                            push_u8(&mut out, SCAN_VALUE_SEMANTIC);
+                            push_u8(&mut out, *object);
+                            push_blob(&mut out, descriptor);
                         }
                     }
                 }
@@ -1745,7 +2406,13 @@ impl Response {
                 Opcode::Get | Opcode::GetRange => {
                     ResponseBody::Value(cursor.blob(CONTEXT)?.to_vec())
                 }
-                Opcode::Set | Opcode::SetRange => ResponseBody::Stored {
+                // Creates answer like ordinary stores: the version names
+                // the new object either way, never the rights.
+                Opcode::Set
+                | Opcode::SetRange
+                | Opcode::BoundedCounterCreate
+                | Opcode::EscrowTransfer
+                | Opcode::SemaphoreCreate => ResponseBody::Stored {
                     version: cursor.u64(CONTEXT)?,
                 },
                 Opcode::BytesLength => ResponseBody::Length(cursor.u64(CONTEXT)?),
@@ -1809,6 +2476,10 @@ impl Response {
                             SCAN_VALUE_OVERSIZE => ScanValueBody::Oversize {
                                 logical_len: cursor.u64(CONTEXT)?,
                             },
+                            SCAN_VALUE_SEMANTIC => ScanValueBody::Semantic {
+                                object: cursor.u8(CONTEXT)?,
+                                descriptor: cursor.blob(CONTEXT)?.to_vec(),
+                            },
                             _ => return Err(ProtocolError::Malformed { context: CONTEXT }),
                         };
                         entries.push(ScanEntryBody { key, value });
@@ -1859,11 +2530,84 @@ impl Response {
                 Opcode::TxnFinalize => ResponseBody::TxnFinalized {
                     applied: flag(&mut cursor)?,
                     version: cursor.u64(CONTEXT)?,
+                    tablet: cursor.u64(CONTEXT)?,
+                },
+                Opcode::CommutativeGet => ResponseBody::CommutativeValue(cursor.i64(CONTEXT)?),
+                Opcode::CommutativeAdd => ResponseBody::CommutativeApplied,
+                Opcode::BoundedCounterAdd => ResponseBody::BoundedUpdated {
+                    value: cursor.i64(CONTEXT)?,
+                    version: cursor.u64(CONTEXT)?,
+                },
+                Opcode::BoundedCounterGet => ResponseBody::BoundedValue {
+                    value: cursor.i64(CONTEXT)?,
+                    capacity: cursor.u64(CONTEXT)?,
+                    share_min: cursor.i64(CONTEXT)?,
+                    share_max: cursor.i64(CONTEXT)?,
+                },
+                Opcode::SemaphoreAcquire => ResponseBody::SemaphoreAcquired,
+                Opcode::SemaphoreRelease => ResponseBody::SemaphoreReleased {
+                    released: flag(&mut cursor)?,
+                },
+                Opcode::SemaphoreInspect => ResponseBody::SemaphoreLoad {
+                    outstanding: cursor.u64(CONTEXT)?,
+                    capacity: cursor.u64(CONTEXT)?,
+                },
+                Opcode::LeaseAcquire => ResponseBody::LeaseAcquired {
+                    fencing: cursor.u64(CONTEXT)?,
+                    expires_at: cursor.u64(CONTEXT)?,
+                },
+                Opcode::LeaseRenew => ResponseBody::LeaseRenewed {
+                    fencing: cursor.u64(CONTEXT)?,
+                    expires_at: cursor.u64(CONTEXT)?,
+                },
+                Opcode::LeaseRelease => ResponseBody::LeaseReleased {
+                    released: flag(&mut cursor)?,
+                },
+                Opcode::LeaseInspect => {
+                    let owner = match cursor.u8(CONTEXT)? {
+                        0 => None,
+                        1 => Some(cursor.u64(CONTEXT)?),
+                        _ => return Err(ProtocolError::Malformed { context: CONTEXT }),
+                    };
+                    ResponseBody::LeaseInfo {
+                        owner,
+                        fencing: cursor.u64(CONTEXT)?,
+                        expires_at: cursor.u64(CONTEXT)?,
+                        next_fencing: cursor.u64(CONTEXT)?,
+                    }
+                }
+                Opcode::StreamCreate => ResponseBody::StreamCreated,
+                Opcode::StreamAppend => ResponseBody::StreamAppended {
+                    offset: cursor.u64(CONTEXT)?,
+                },
+                Opcode::StreamRead => {
+                    let count = cursor.u32(CONTEXT)? as usize;
+                    if count > 4096 {
+                        return Err(ProtocolError::Malformed { context: CONTEXT });
+                    }
+                    let mut entries = Vec::with_capacity(count.min(256));
+                    for _ in 0..count {
+                        entries.push(StreamEntryBody {
+                            offset: cursor.u64(CONTEXT)?,
+                            partition: cursor.blob(CONTEXT)?.to_vec(),
+                            payload: cursor.blob(CONTEXT)?.to_vec(),
+                        });
+                    }
+                    ResponseBody::StreamEntries {
+                        entries,
+                        next_offset: cursor.u64(CONTEXT)?,
+                    }
+                }
+                Opcode::StreamTrim => ResponseBody::StreamTrimmed {
+                    removed: cursor.u64(CONTEXT)?,
                 },
             },
             Status::NotFound => match opcode {
                 Opcode::Get
                 | Opcode::CounterGet
+                | Opcode::CommutativeGet
+                | Opcode::BoundedCounterGet
+                | Opcode::SemaphoreInspect
                 | Opcode::GetExpiry
                 | Opcode::GetStream
                 | Opcode::GetRange
@@ -1953,7 +2697,16 @@ fn decode_batch_writes(
     for _ in 0..count {
         let key = cursor.blob(CONTEXT)?.to_vec();
         let kind = cursor.u8(CONTEXT)?;
-        if !matches!(kind, BATCH_PUT | BATCH_DELETE | BATCH_COUNTER_ADD) {
+        if !matches!(
+            kind,
+            BATCH_PUT
+                | BATCH_DELETE
+                | BATCH_COUNTER_ADD
+                | BATCH_PUT_CHUNKED
+                | BATCH_COMMUTATIVE_ADD
+                | BATCH_BOUNDED_ADD
+                | BATCH_ESCROW_SHARE
+        ) {
             return Err(ProtocolError::Malformed { context: CONTEXT });
         }
         let value = cursor.blob(CONTEXT)?.to_vec();
@@ -2246,6 +2999,19 @@ mod tests {
             }],
             txn_coordinator: 0,
             txn_commit: false,
+            txn_digest: [0xD1; 32],
+            capacity: 0,
+            holder: 0,
+            permit: [0u8; 16],
+            owner: 0,
+            qty: 0,
+            fencing: 0,
+            ttl: 0,
+            stream: [0u8; 16],
+            shard: 0,
+            partition: Vec::new(),
+            share_min: 0,
+            share_max: 0,
         }
     }
 
@@ -2293,6 +3059,7 @@ mod tests {
                 ResponseBody::TxnFinalized {
                     applied: true,
                     version: 5,
+                    tablet: 7,
                 },
             ),
         ] {
@@ -2323,6 +3090,24 @@ mod tests {
     #[case(Opcode::BytesLength)]
     #[case(Opcode::GetVersion)]
     #[case(Opcode::SetConditional)]
+    #[case(Opcode::CommutativeGet)]
+    #[case(Opcode::CommutativeAdd)]
+    #[case(Opcode::BoundedCounterCreate)]
+    #[case(Opcode::BoundedCounterAdd)]
+    #[case(Opcode::BoundedCounterGet)]
+    #[case(Opcode::EscrowTransfer)]
+    #[case(Opcode::SemaphoreCreate)]
+    #[case(Opcode::SemaphoreAcquire)]
+    #[case(Opcode::SemaphoreRelease)]
+    #[case(Opcode::SemaphoreInspect)]
+    #[case(Opcode::LeaseAcquire)]
+    #[case(Opcode::LeaseRenew)]
+    #[case(Opcode::LeaseRelease)]
+    #[case(Opcode::LeaseInspect)]
+    #[case(Opcode::StreamCreate)]
+    #[case(Opcode::StreamAppend)]
+    #[case(Opcode::StreamRead)]
+    #[case(Opcode::StreamTrim)]
     #[case(Opcode::Scan)]
     #[case(Opcode::AtomicBatch)]
     fn every_operation_round_trips(#[case] opcode: Opcode) {
@@ -2395,6 +3180,36 @@ mod tests {
             }
             // GetStream executes the same read as Get; only delivery differs.
             Opcode::GetStream => assert!(matches!(op, Operation::Get { .. })),
+            Opcode::CommutativeGet => assert!(matches!(op, Operation::CommutativeGet { .. })),
+            Opcode::CommutativeAdd => assert!(matches!(op, Operation::CommutativeAdd { .. })),
+            Opcode::BoundedCounterCreate => {
+                assert!(matches!(op, Operation::BoundedCounterCreate { .. }));
+            }
+            Opcode::BoundedCounterAdd => {
+                assert!(matches!(op, Operation::BoundedCounterAdd { .. }));
+            }
+            Opcode::BoundedCounterGet => {
+                assert!(matches!(op, Operation::BoundedCounterGet { .. }));
+            }
+            Opcode::EscrowTransfer => assert!(matches!(op, Operation::EscrowTransfer { .. })),
+            Opcode::SemaphoreCreate => assert!(matches!(op, Operation::SemaphoreCreate { .. })),
+            Opcode::SemaphoreAcquire => {
+                assert!(matches!(op, Operation::SemaphoreAcquire { .. }));
+            }
+            Opcode::SemaphoreRelease => {
+                assert!(matches!(op, Operation::SemaphoreRelease { .. }));
+            }
+            Opcode::SemaphoreInspect => {
+                assert!(matches!(op, Operation::SemaphoreInspect { .. }));
+            }
+            Opcode::LeaseAcquire => assert!(matches!(op, Operation::LeaseAcquire { .. })),
+            Opcode::LeaseRenew => assert!(matches!(op, Operation::LeaseRenew { .. })),
+            Opcode::LeaseRelease => assert!(matches!(op, Operation::LeaseRelease { .. })),
+            Opcode::LeaseInspect => assert!(matches!(op, Operation::LeaseInspect { .. })),
+            Opcode::StreamCreate => assert!(matches!(op, Operation::StreamCreate { .. })),
+            Opcode::StreamAppend => assert!(matches!(op, Operation::StreamAppend { .. })),
+            Opcode::StreamRead => assert!(matches!(op, Operation::StreamRead { .. })),
+            Opcode::StreamTrim => assert!(matches!(op, Operation::StreamTrim { .. })),
             Opcode::TxnPrepare => assert!(matches!(op, Operation::TxnPrepare { .. })),
             Opcode::TxnFinalize => assert!(matches!(op, Operation::TxnFinalize { .. })),
             // Scan and AtomicBatch return early above (no Operation).
@@ -2751,6 +3566,161 @@ mod tests {
             Response::decode(&versioned.encode(Opcode::GetVersion)).expect("ok");
         assert_eq!(decoded, versioned);
         assert_eq!(opcode, Opcode::GetVersion);
+    }
+
+    /// Every semantic response body survives its opcode's codec. The
+    /// client maps these (never strings), so a codec regression here is a
+    /// silent contract break downstream.
+    #[test]
+    fn semantic_response_bodies_round_trip() {
+        for (opcode, body) in semantic_bodies() {
+            let response = Response {
+                proof: None,
+                status: Status::Ok,
+                body,
+            };
+            let (decoded, back) = Response::decode(&response.encode(opcode)).expect("round trip");
+            assert_eq!(back, opcode);
+            assert_eq!(decoded, response);
+        }
+    }
+
+    fn semantic_bodies() -> Vec<(Opcode, ResponseBody)> {
+        vec![
+            (Opcode::CommutativeAdd, ResponseBody::CommutativeApplied),
+            (Opcode::CommutativeGet, ResponseBody::CommutativeValue(-9)),
+            (
+                Opcode::BoundedCounterCreate,
+                ResponseBody::Stored { version: 1 },
+            ),
+            (
+                Opcode::BoundedCounterAdd,
+                ResponseBody::BoundedUpdated {
+                    value: 6,
+                    version: 2,
+                },
+            ),
+            (
+                Opcode::BoundedCounterGet,
+                ResponseBody::BoundedValue {
+                    value: 6,
+                    capacity: 10,
+                    share_min: 0,
+                    share_max: 10,
+                },
+            ),
+            (Opcode::SemaphoreCreate, ResponseBody::Stored { version: 1 }),
+            (Opcode::SemaphoreAcquire, ResponseBody::SemaphoreAcquired),
+            (
+                Opcode::SemaphoreRelease,
+                ResponseBody::SemaphoreReleased { released: true },
+            ),
+            (
+                Opcode::SemaphoreInspect,
+                ResponseBody::SemaphoreLoad {
+                    outstanding: 1,
+                    capacity: 2,
+                },
+            ),
+            (
+                Opcode::LeaseAcquire,
+                ResponseBody::LeaseAcquired {
+                    fencing: 3,
+                    expires_at: 100,
+                },
+            ),
+            (
+                Opcode::LeaseRenew,
+                ResponseBody::LeaseRenewed {
+                    fencing: 3,
+                    expires_at: 200,
+                },
+            ),
+            (
+                Opcode::LeaseRelease,
+                ResponseBody::LeaseReleased { released: false },
+            ),
+            (
+                Opcode::LeaseInspect,
+                ResponseBody::LeaseInfo {
+                    owner: Some(7),
+                    fencing: 3,
+                    expires_at: 100,
+                    next_fencing: 4,
+                },
+            ),
+            (Opcode::StreamCreate, ResponseBody::StreamCreated),
+            (
+                Opcode::StreamAppend,
+                ResponseBody::StreamAppended { offset: 5 },
+            ),
+            (
+                Opcode::StreamRead,
+                ResponseBody::StreamEntries {
+                    entries: vec![StreamEntryBody {
+                        offset: 5,
+                        partition: b"p".to_vec(),
+                        payload: b"e".to_vec(),
+                    }],
+                    next_offset: 6,
+                },
+            ),
+            (
+                Opcode::StreamTrim,
+                ResponseBody::StreamTrimmed { removed: 2 },
+            ),
+        ]
+    }
+
+    /// Typed semantic values page through scans without inlining bulk.
+    #[test]
+    fn semantic_scan_values_page_intact() {
+        let page = Response {
+            proof: None,
+            status: Status::Ok,
+            body: ResponseBody::ScanPage {
+                entries: vec![ScanEntryBody {
+                    key: b"k".to_vec(),
+                    value: ScanValueBody::Semantic {
+                        object: 9,
+                        descriptor: vec![1, 2, 3],
+                    },
+                }],
+                exhausted: true,
+                last_key: Some(b"k".to_vec()),
+                tablet: 3,
+                range_start: b"a".to_vec(),
+                range_end: Some(b"z".to_vec()),
+                dir_version: 11,
+            },
+        };
+        let (decoded, back) = Response::decode(&page.encode(Opcode::Scan)).expect("scan page");
+        assert_eq!(back, Opcode::Scan);
+        assert_eq!(decoded, page);
+    }
+
+    /// Every new machine-readable status survives the wire on a
+    /// diagnostic body (clients match the status, never the text).
+    #[test]
+    fn semantic_statuses_ride_diagnostics() {
+        for status in [
+            Status::BoundedExceeded,
+            Status::SemaphoreExhausted,
+            Status::LeaseConflict,
+            Status::StaleFencing,
+            Status::StreamFull,
+            Status::TxnDecisionConflict,
+            Status::TxnCrossTablet,
+        ] {
+            let error = Response {
+                proof: None,
+                status,
+                body: ResponseBody::Diagnostic("typed".to_owned()),
+            };
+            let (decoded, _) = Response::decode(&error.encode(Opcode::Get)).expect("status");
+            assert_eq!(decoded.status, status);
+            assert_eq!(decoded, error);
+        }
     }
 
     #[test]

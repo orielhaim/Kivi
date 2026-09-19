@@ -15,7 +15,7 @@ use kivi_codec::{CodecError, Decode, Encode, decode_byte_vec, encode_bytes};
 use kivi_types::{Expiry, ManifestId};
 
 use crate::object::{Key, ObjectType, ObjectVersion};
-use crate::txn::{TxnExpect, TxnId, TxnWriteKind};
+use crate::txn::{TxnExpect, TxnId, TxnWrite, TxnWriteKind};
 
 /// One deterministic state transition.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,6 +119,9 @@ pub enum Mutation {
         expect: TxnExpect,
         /// Prepared write (applied at finalize-commit).
         write: TxnWriteKind,
+        /// Digest over the full write set (confused-deputy binding: a
+        /// different digest under one `TxnId` conflicts, never overwrites).
+        digest: [u8; 32],
     },
     /// Resolve one key's intent for `txn`: commit applies the prepared
     /// write, abort discards it. Idempotent: a missing intent (already
@@ -130,6 +133,145 @@ pub enum Mutation {
         key: Key,
         /// Whether to apply (`true`) or discard (`false`) the intent.
         commit: bool,
+        /// Digest the intent was prepared for (must match the reservation).
+        digest: [u8; 32],
+    },
+    /// Commit a same-tablet write set as one ordered atomic record: every
+    /// write validates and applies together, or nothing does. The
+    /// single-tablet cheap path persists exactly one of these per
+    /// transaction (no prepare/record/finalize waves); replay applies it
+    /// through the same [`commit_local`](crate::ObjectStore::commit_local)
+    /// path, so replicas converge without re-planning. Always non-empty
+    /// (decode rejects empty sets loudly).
+    TxnCommitLocal {
+        /// Transaction identity (idempotency key for the whole batch).
+        txn: TxnId,
+        /// Writes in request order (duplicates collapse last-wins).
+        writes: Vec<TxnWrite>,
+    },
+    /// Add `delta` to a commutative counter, creating it at `delta` when
+    /// absent. No ordinal is produced: the outcome carries the post-apply
+    /// sum only for durability prediction, and the client-visible result is
+    /// `Applied`.
+    CommutativeAdd {
+        /// Target key.
+        key: Key,
+        /// Signed addend.
+        delta: i64,
+    },
+    /// Create a bounded counter with global `capacity` and full local share
+    /// `[0, capacity]` held by `holder` (the executing tablet,
+    /// leader-materialized at prepare like all deterministic inputs).
+    BoundedCreate {
+        /// Target key.
+        key: Key,
+        /// Global capacity (inclusive upper bound).
+        capacity: u64,
+        /// Tablet holding the initial full share.
+        holder: u64,
+    },
+    /// Add `delta` to a bounded counter within locally owned rights.
+    BoundedAdd {
+        /// Target key.
+        key: Key,
+        /// Signed addend.
+        delta: i64,
+    },
+    /// Durably move one bounded counter's escrow share to `[min, max]`.
+    /// Narrowing gives rights away unilaterally; widening must pair with a
+    /// matching narrow in the same atomic batch/transaction (conservation
+    /// checked by the driver), so rights are never minted.
+    EscrowSetShare {
+        /// Target key.
+        key: Key,
+        /// New share lower bound (inclusive).
+        min: i64,
+        /// New share upper bound (inclusive).
+        max: i64,
+    },
+    /// Create a semaphore with `capacity` total permits.
+    SemaphoreCreate {
+        /// Target key.
+        key: Key,
+        /// Total capacity.
+        capacity: u64,
+    },
+    /// Acquire `qty` permits under `permit`: idempotent by permit id.
+    SemaphoreAcquire {
+        /// Target key.
+        key: Key,
+        /// Permit identity (stable across retries).
+        permit: [u8; 16],
+        /// Owner/session identity acquiring.
+        owner: u64,
+        /// Quantity to acquire.
+        qty: u64,
+    },
+    /// Release the permits held under `permit`: idempotent, mints nothing.
+    SemaphoreRelease {
+        /// Target key.
+        key: Key,
+        /// Permit identity to release.
+        permit: [u8; 16],
+    },
+    /// Grant the lease to `owner` under the resolved fencing token until
+    /// the resolved expiry. Both are fixed at prepare (deterministic
+    /// inputs), so replay issues the identical grant.
+    LeaseAcquire {
+        /// Target key.
+        key: Key,
+        /// Owner/session identity acquiring.
+        owner: u64,
+        /// Fencing token issued with this grant.
+        fencing: crate::FencingToken,
+        /// Logical expiry of the grant.
+        expires_at: kivi_types::UnixMicros,
+    },
+    /// Extend a live grant to the resolved expiry (same fencing token).
+    LeaseRenew {
+        /// Target key.
+        key: Key,
+        /// Owner/session identity renewing.
+        owner: u64,
+        /// Fencing token of the grant being renewed.
+        fencing: crate::FencingToken,
+        /// New logical expiry of the grant.
+        expires_at: kivi_types::UnixMicros,
+    },
+    /// Release the grant named by (`owner`, `fencing`).
+    LeaseRelease {
+        /// Target key.
+        key: Key,
+        /// Owner/session identity releasing.
+        owner: u64,
+        /// Fencing token of the grant being released.
+        fencing: crate::FencingToken,
+    },
+    /// Create one shard of a sharded stream.
+    StreamCreate {
+        /// Key holding this shard's log.
+        key: Key,
+        /// Stream identity (shared by all shards of the stream).
+        stream: [u8; 16],
+        /// Shard index within the stream.
+        shard: u32,
+    },
+    /// Append one entry to a shard (offset assigned deterministically at
+    /// apply from the shard's `next_offset`).
+    StreamAppend {
+        /// Key holding this shard's log.
+        key: Key,
+        /// Partition key that routed this entry here.
+        partition: bytes::Bytes,
+        /// Entry payload bytes.
+        payload: bytes::Bytes,
+    },
+    /// Trim a shard's retained prefix through `through` (inclusive).
+    StreamTrim {
+        /// Key holding this shard's log.
+        key: Key,
+        /// Trim retained entries with `offset <= through`.
+        through: u64,
     },
 }
 
@@ -151,13 +293,47 @@ const TAG_REPLACE_CHUNKED_ROOT_WITH_EXPIRY: u8 = 8;
 const TAG_TXN_PREPARE: u8 = 9;
 /// Transaction per-key finalize tag.
 const TAG_TXN_FINALIZE: u8 = 10;
+/// Commutative-counter add tag. New tags never reuse old ones.
+const TAG_COMMUTATIVE_ADD: u8 = 11;
+/// Bounded-counter create tag. New tags never reuse old ones.
+const TAG_BOUNDED_CREATE: u8 = 12;
+/// Bounded-counter add tag. New tags never reuse old ones.
+const TAG_BOUNDED_ADD: u8 = 13;
+/// Escrow share-move tag. New tags never reuse old ones.
+const TAG_ESCROW_SET_SHARE: u8 = 14;
+/// Semaphore create tag. New tags never reuse old ones.
+const TAG_SEMAPHORE_CREATE: u8 = 15;
+/// Semaphore acquire tag. New tags never reuse old ones.
+const TAG_SEMAPHORE_ACQUIRE: u8 = 16;
+/// Semaphore release tag. New tags never reuse old ones.
+const TAG_SEMAPHORE_RELEASE: u8 = 17;
+/// Lease acquire tag. New tags never reuse old ones.
+const TAG_LEASE_ACQUIRE: u8 = 18;
+/// Lease renew tag. New tags never reuse old ones.
+const TAG_LEASE_RENEW: u8 = 19;
+/// Lease release tag. New tags never reuse old ones.
+const TAG_LEASE_RELEASE: u8 = 20;
+/// Stream-shard create tag. New tags never reuse old ones.
+const TAG_STREAM_CREATE: u8 = 21;
+/// Stream append tag. New tags never reuse old ones.
+const TAG_STREAM_APPEND: u8 = 22;
+/// Stream trim tag. New tags never reuse old ones.
+const TAG_STREAM_TRIM: u8 = 23;
+/// Same-tablet atomic commit tag. New tags never reuse old ones.
+const TAG_TXN_COMMIT_LOCAL: u8 = 24;
 
 impl Mutation {
-    /// Returns the single key this mutation touches. Every mutation in
-    /// this stage is single-key; dirty-band tracking and overlays rely on
-    /// that (a future multi-key mutation must extend this contract, not
-    /// silently bypass it). Transaction variants reserve/resolve exactly
-    /// one key each, so the contract holds for 2PC as well.
+    /// Returns the single key this mutation touches. Every mutation is
+    /// single-key except [`TxnCommitLocal`](Self::TxnCommitLocal), which
+    /// answers its first write's key (routing anchor; all keys share one
+    /// tablet by driver construction). Callers that must cover every key
+    /// (dirty bands, sweeps, overlays) use [`keys`](Self::keys) instead.
+    ///
+    /// # Panics
+    ///
+    /// Panics on [`TxnCommitLocal`](Self::TxnCommitLocal) with an empty
+    /// write list: drivers never construct one (admission and the codec
+    /// reject empties), so an empty commit here is a caller bug.
     #[must_use]
     pub fn key(&self) -> &Key {
         match self {
@@ -170,7 +346,59 @@ impl Mutation {
             | Self::PutBytesWithExpiry { key, .. }
             | Self::ReplaceChunkedRootWithExpiry { key, .. }
             | Self::TxnPrepare { key, .. }
-            | Self::TxnFinalize { key, .. } => key,
+            | Self::TxnFinalize { key, .. }
+            | Self::CommutativeAdd { key, .. }
+            | Self::BoundedCreate { key, .. }
+            | Self::BoundedAdd { key, .. }
+            | Self::EscrowSetShare { key, .. }
+            | Self::SemaphoreCreate { key, .. }
+            | Self::SemaphoreAcquire { key, .. }
+            | Self::SemaphoreRelease { key, .. }
+            | Self::LeaseAcquire { key, .. }
+            | Self::LeaseRenew { key, .. }
+            | Self::LeaseRelease { key, .. }
+            | Self::StreamCreate { key, .. }
+            | Self::StreamAppend { key, .. }
+            | Self::StreamTrim { key, .. } => key,
+            Self::TxnCommitLocal { writes, .. } => {
+                &writes.first().expect("local commits are never empty").key
+            }
+        }
+    }
+
+    /// Returns every key this mutation touches, in a deterministic order
+    /// (request order for local commits, deduplicated). Dirty-band
+    /// tracking, sweep exclusion, and overlays iterate this; [`key`](Self::key)
+    /// stays for single-key call sites (routing, per-key dedup).
+    #[must_use]
+    pub fn keys(&self) -> Vec<&Key> {
+        match self {
+            Self::TxnCommitLocal { writes, .. } => {
+                let mut seen = std::collections::BTreeSet::new();
+                let mut out = Vec::new();
+                for write in writes {
+                    if seen.insert(write.key.as_bytes()) {
+                        out.push(&write.key);
+                    }
+                }
+                out
+            }
+            _ => vec![self.key()],
+        }
+    }
+
+    /// Maps a stored expiry to its conditional replay policy: `NEVER`
+    /// always came from `PersistExpiry` (its only producer), anything else
+    /// from `ExpireAt`.
+    fn conditional_policy(expiry: &kivi_types::Expiry) -> crate::ops::ExpiryPolicy {
+        if *expiry == kivi_types::Expiry::NEVER {
+            crate::ops::ExpiryPolicy::Clear
+        } else {
+            crate::ops::ExpiryPolicy::ExpireAt(
+                expiry
+                    .as_stamp()
+                    .unwrap_or(kivi_types::UnixMicros::from_micros(0)),
+            )
         }
     }
 
@@ -182,6 +410,15 @@ impl Mutation {
     #[must_use]
     pub fn as_operation(&self) -> crate::ops::Operation {
         use crate::ops::Operation;
+        if let Some(operation) = self.as_txn_operation() {
+            return operation;
+        }
+        if let Some(operation) = self.as_semaphore_stream_operation() {
+            return operation;
+        }
+        if let Some(operation) = self.as_conditional_operation() {
+            return operation;
+        }
         match self {
             Self::PutBytes { key, value } => Operation::Set {
                 key: key.clone(),
@@ -218,55 +455,92 @@ impl Mutation {
                 offset: *offset,
                 patch: patch.clone(),
             },
-            Self::PutBytesWithExpiry { key, value, expiry } => {
-                let policy = if *expiry == kivi_types::Expiry::NEVER {
-                    crate::ops::ExpiryPolicy::Clear
-                } else {
-                    crate::ops::ExpiryPolicy::ExpireAt(
-                        expiry
-                            .as_stamp()
-                            .unwrap_or(kivi_types::UnixMicros::from_micros(0)),
-                    )
-                };
-                Operation::SetConditional {
-                    key: key.clone(),
-                    value: value.clone(),
-                    condition: crate::ops::SetCondition::Always,
-                    expiry: policy,
-                }
+            Self::PutBytesWithExpiry { .. } | Self::ReplaceChunkedRootWithExpiry { .. } => {
+                unreachable!("conditional mutations dispatch above")
             }
-            Self::ReplaceChunkedRootWithExpiry {
+            Self::TxnPrepare { .. } | Self::TxnFinalize { .. } | Self::TxnCommitLocal { .. } => {
+                unreachable!("transaction mutations dispatch above")
+            }
+            Self::SemaphoreCreate { .. }
+            | Self::SemaphoreAcquire { .. }
+            | Self::SemaphoreRelease { .. }
+            | Self::StreamCreate { .. }
+            | Self::StreamAppend { .. }
+            | Self::StreamTrim { .. } => {
+                unreachable!("semaphore/stream mutations dispatch above")
+            }
+            Self::CommutativeAdd { key, delta } => Operation::CommutativeAdd {
+                key: key.clone(),
+                delta: *delta,
+            },
+            Self::BoundedCreate {
                 key,
-                manifest: _,
-                logical_len: _,
-                expiry,
-            } => {
-                let policy = if *expiry == kivi_types::Expiry::NEVER {
-                    crate::ops::ExpiryPolicy::Clear
-                } else {
-                    crate::ops::ExpiryPolicy::ExpireAt(
-                        expiry
-                            .as_stamp()
-                            .unwrap_or(kivi_types::UnixMicros::from_micros(0)),
-                    )
-                };
-                // Chunked conditional roots replay through the same
-                // conditional shape; the manifest itself is the mutation's
-                // truth, the operation is only the replay-mapping key.
-                Operation::SetConditional {
-                    key: key.clone(),
-                    value: bytes::Bytes::new(),
-                    condition: crate::ops::SetCondition::Always,
-                    expiry: policy,
-                }
+                capacity,
+                holder,
+            } => Operation::BoundedCounterCreate {
+                key: key.clone(),
+                capacity: *capacity,
+                holder: kivi_types::TabletId::from_u64(*holder),
+            },
+            Self::BoundedAdd { key, delta } => Operation::BoundedCounterAdd {
+                key: key.clone(),
+                delta: *delta,
+            },
+            Self::EscrowSetShare { key, min, max } => Operation::EscrowTransfer {
+                key: key.clone(),
+                new_min: *min,
+                new_max: *max,
+            },
+            // Lease mutations carry prepare-resolved fencing/expiry while
+            // operations carry caller TTLs; like the chunked-conditional
+            // precedent above, the mutation is the truth and the operation
+            // is only the replay-mapping key (never used to re-derive).
+            // Both grant shapes replay identically: a renew under the same
+            // identity is indistinguishable from its grant.
+            Self::LeaseAcquire {
+                key,
+                owner,
+                fencing,
+                ..
             }
+            | Self::LeaseRenew {
+                key,
+                owner,
+                fencing,
+                ..
+            } => Operation::LeaseRenew {
+                key: key.clone(),
+                owner: *owner,
+                fencing: *fencing,
+                ttl_micros: 0,
+            },
+            Self::LeaseRelease {
+                key,
+                owner,
+                fencing,
+            } => Operation::LeaseRelease {
+                key: key.clone(),
+                owner: *owner,
+                fencing: *fencing,
+            },
+        }
+    }
+
+    /// Reconstructs a transaction originating operation (`Some` for the
+    /// three 2PC shapes, `None` otherwise): dispatches first in
+    /// [`as_operation`](Self::as_operation) so the shared match stays
+    /// reviewable.
+    fn as_txn_operation(&self) -> Option<crate::ops::Operation> {
+        use crate::ops::Operation;
+        match self {
             Self::TxnPrepare {
                 txn,
                 coordinator,
                 key,
                 expect,
                 write,
-            } => Operation::TxnPrepare {
+                digest,
+            } => Some(Operation::TxnPrepare {
                 txn: *txn,
                 coordinator: kivi_types::TabletId::from_u64(*coordinator),
                 write: crate::txn::TxnWrite {
@@ -274,12 +548,104 @@ impl Mutation {
                     kind: write.clone(),
                     expect: *expect,
                 },
-            },
-            Self::TxnFinalize { txn, key, commit } => Operation::TxnFinalize {
+                digest: *digest,
+            }),
+            Self::TxnFinalize {
+                txn,
+                key,
+                commit,
+                digest,
+            } => Some(Operation::TxnFinalize {
                 txn: *txn,
                 key: key.clone(),
                 commit: *commit,
-            },
+                digest: *digest,
+            }),
+            Self::TxnCommitLocal { txn, writes } => Some(Operation::TxnCommitLocal {
+                txn: *txn,
+                writes: writes.clone(),
+            }),
+            _ => None,
+        }
+    }
+    /// Reconstructs a conditional originating operation (`Some` for the
+    /// two conditional shapes, `None` otherwise): dispatches first in
+    /// [`as_operation`](Self::as_operation) so the shared match stays
+    /// reviewable.
+    fn as_conditional_operation(&self) -> Option<crate::ops::Operation> {
+        use crate::ops::Operation;
+        match self {
+            Self::PutBytesWithExpiry { key, value, expiry } => Some(Operation::SetConditional {
+                key: key.clone(),
+                value: value.clone(),
+                condition: crate::ops::SetCondition::Always,
+                expiry: Self::conditional_policy(expiry),
+            }),
+            Self::ReplaceChunkedRootWithExpiry {
+                key,
+                manifest: _,
+                logical_len: _,
+                expiry,
+            } => {
+                // Chunked conditional roots replay through the same
+                // conditional shape; the manifest itself is the mutation's
+                // truth, the operation is only the replay-mapping key.
+                Some(Operation::SetConditional {
+                    key: key.clone(),
+                    value: bytes::Bytes::new(),
+                    condition: crate::ops::SetCondition::Always,
+                    expiry: Self::conditional_policy(expiry),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Reconstructs a semaphore/stream originating operation (`Some` for
+    /// those six shapes, `None` otherwise): dispatches first in
+    /// [`as_operation`](Self::as_operation) so the shared match stays
+    /// reviewable.
+    fn as_semaphore_stream_operation(&self) -> Option<crate::ops::Operation> {
+        use crate::ops::Operation;
+        match self {
+            Self::SemaphoreCreate { key, capacity } => Some(Operation::SemaphoreCreate {
+                key: key.clone(),
+                capacity: *capacity,
+            }),
+            Self::SemaphoreAcquire {
+                key,
+                permit,
+                owner,
+                qty,
+            } => Some(Operation::SemaphoreAcquire {
+                key: key.clone(),
+                permit: crate::PermitId::from_bytes(*permit),
+                owner: *owner,
+                qty: *qty,
+            }),
+            Self::SemaphoreRelease { key, permit } => Some(Operation::SemaphoreRelease {
+                key: key.clone(),
+                permit: crate::PermitId::from_bytes(*permit),
+            }),
+            Self::StreamCreate { key, stream, shard } => Some(Operation::StreamCreate {
+                key: key.clone(),
+                stream: *stream,
+                shard: *shard,
+            }),
+            Self::StreamAppend {
+                key,
+                partition,
+                payload,
+            } => Some(Operation::StreamAppend {
+                key: key.clone(),
+                partition: partition.to_vec(),
+                payload: payload.clone(),
+            }),
+            Self::StreamTrim { key, through } => Some(Operation::StreamTrim {
+                key: key.clone(),
+                through_offset: *through,
+            }),
+            _ => None,
         }
     }
 }
@@ -289,7 +655,13 @@ impl Encode for Mutation {
         match self {
             Self::PutBytes { key, value } => 1 + (4 + key.len()) + (4 + value.len()),
             Self::Delete { key } => 1 + (4 + key.len()),
-            Self::CounterAdd { key, .. } => 1 + (4 + key.len()) + 8,
+            // Shared key + u64 body shape (signed delta, capacity, or
+            // trim cursor).
+            Self::CounterAdd { key, .. }
+            | Self::CommutativeAdd { key, .. }
+            | Self::BoundedAdd { key, .. }
+            | Self::SemaphoreCreate { key, .. }
+            | Self::StreamTrim { key, .. } => 1 + (4 + key.len()) + 8,
             Self::SetExpiry { key, expiry } => 1 + (4 + key.len()) + expiry.encoded_len(),
             Self::ReplaceChunkedRoot { key, .. } => 1 + (4 + key.len()) + 32 + 8,
             Self::SpliceBytes { key, patch, .. } => 1 + (4 + key.len()) + 8 + (4 + patch.len()),
@@ -301,8 +673,35 @@ impl Encode for Mutation {
             }
             Self::TxnPrepare {
                 key, expect, write, ..
-            } => 1 + 16 + 8 + (4 + key.len()) + expect.encoded_len() + write.encoded_len(),
-            Self::TxnFinalize { key, .. } => 1 + 16 + (4 + key.len()) + 1,
+            } => 1 + 16 + 8 + (4 + key.len()) + expect.encoded_len() + write.encoded_len() + 32,
+            Self::TxnFinalize { key, .. } => 1 + 16 + (4 + key.len()) + 1 + 32,
+            Self::TxnCommitLocal { writes, .. } => {
+                1 + 16
+                    + 2
+                    + writes
+                        .iter()
+                        .map(|write| {
+                            (4 + write.key.len())
+                                + write.expect.encoded_len()
+                                + write.kind.encoded_len()
+                        })
+                        .sum::<usize>()
+            }
+            Self::BoundedCreate { key, .. } | Self::EscrowSetShare { key, .. } => {
+                1 + (4 + key.len()) + 8 + 8
+            }
+            Self::SemaphoreAcquire { key, .. } => 1 + (4 + key.len()) + 16 + 8 + 8,
+            Self::SemaphoreRelease { key, .. } => 1 + (4 + key.len()) + 16,
+            Self::LeaseAcquire { key, .. } | Self::LeaseRenew { key, .. } => {
+                1 + (4 + key.len()) + 8 + 8 + kivi_types::UnixMicros::from_micros(0).encoded_len()
+            }
+            Self::LeaseRelease { key, .. } => 1 + (4 + key.len()) + 8 + 8,
+            Self::StreamCreate { key, .. } => 1 + (4 + key.len()) + 16 + 4,
+            Self::StreamAppend {
+                key,
+                partition,
+                payload,
+            } => 1 + (4 + key.len()) + (4 + partition.len()) + (4 + payload.len()),
         }
     }
 
@@ -318,9 +717,7 @@ impl Encode for Mutation {
                 encode_bytes(out, key.as_bytes());
             }
             Self::CounterAdd { key, delta } => {
-                out.push(TAG_COUNTER_ADD);
-                encode_bytes(out, key.as_bytes());
-                out.extend_from_slice(&delta.to_le_bytes());
+                Self::encode_key_delta(out, TAG_COUNTER_ADD, key, *delta);
             }
             Self::SetExpiry { key, expiry } => {
                 out.push(TAG_SET_EXPIRY);
@@ -367,20 +764,222 @@ impl Encode for Mutation {
                 key,
                 expect,
                 write,
+                digest,
+            } => Self::encode_txn_prepare(out, txn, *coordinator, key, expect, write, digest),
+            Self::TxnFinalize {
+                txn,
+                key,
+                commit,
+                digest,
             } => {
-                out.push(TAG_TXN_PREPARE);
-                txn.encode(out);
-                coordinator.encode(out);
-                encode_bytes(out, key.as_bytes());
-                expect.encode(out);
-                write.encode(out);
+                Self::encode_txn_finalize(out, txn, key, *commit, digest);
             }
-            Self::TxnFinalize { txn, key, commit } => {
-                out.push(TAG_TXN_FINALIZE);
-                txn.encode(out);
-                encode_bytes(out, key.as_bytes());
-                commit.encode(out);
+            Self::TxnCommitLocal { txn, writes } => Self::encode_txn_commit_local(out, txn, writes),
+            Self::CommutativeAdd { key, delta } => {
+                Self::encode_key_delta(out, TAG_COMMUTATIVE_ADD, key, *delta);
             }
+            Self::BoundedCreate { .. } | Self::BoundedAdd { .. } | Self::EscrowSetShare { .. } => {
+                self.encode_bounded_mutation(out);
+            }
+            Self::SemaphoreCreate { .. }
+            | Self::SemaphoreAcquire { .. }
+            | Self::SemaphoreRelease { .. } => {
+                self.encode_semaphore_mutation(out);
+            }
+            Self::LeaseAcquire {
+                key,
+                owner,
+                fencing,
+                expires_at,
+            } => {
+                Self::encode_lease_grant(out, TAG_LEASE_ACQUIRE, key, *owner, *fencing, *expires_at)
+            }
+            Self::LeaseRenew {
+                key,
+                owner,
+                fencing,
+                expires_at,
+            } => Self::encode_lease_grant(out, TAG_LEASE_RENEW, key, *owner, *fencing, *expires_at),
+            Self::LeaseRelease {
+                key,
+                owner,
+                fencing,
+            } => {
+                out.push(TAG_LEASE_RELEASE);
+                encode_bytes(out, key.as_bytes());
+                owner.encode(out);
+                fencing.encode(out);
+            }
+            Self::StreamCreate { .. } | Self::StreamAppend { .. } | Self::StreamTrim { .. } => {
+                self.encode_stream_mutation(out);
+            }
+        }
+    }
+}
+
+impl Mutation {
+    /// Encodes one `key + i64` counter-style body (strict, commutative, and
+    /// bounded adds share the shape; only the tag differs).
+    fn encode_key_delta(out: &mut Vec<u8>, tag: u8, key: &Key, delta: i64) {
+        out.push(tag);
+        encode_bytes(out, key.as_bytes());
+        out.extend_from_slice(&delta.to_le_bytes());
+    }
+
+    /// Encodes one 2PC prepare: coordinator, key, expectation, write, and
+    /// the write-set digest binding the reservation to its transaction.
+    fn encode_txn_prepare(
+        out: &mut Vec<u8>,
+        txn: &crate::txn::TxnId,
+        coordinator: u64,
+        key: &Key,
+        expect: &crate::txn::TxnExpect,
+        write: &crate::txn::TxnWriteKind,
+        digest: &[u8; 32],
+    ) {
+        out.push(TAG_TXN_PREPARE);
+        txn.encode(out);
+        coordinator.encode(out);
+        encode_bytes(out, key.as_bytes());
+        expect.encode(out);
+        write.encode(out);
+        out.extend_from_slice(digest);
+    }
+
+    /// Encodes one 2PC finalize: which intent resolves, how, and under
+    /// which digest (mismatches finalize nothing).
+    fn encode_txn_finalize(
+        out: &mut Vec<u8>,
+        txn: &crate::txn::TxnId,
+        key: &Key,
+        commit: bool,
+        digest: &[u8; 32],
+    ) {
+        out.push(TAG_TXN_FINALIZE);
+        txn.encode(out);
+        encode_bytes(out, key.as_bytes());
+        commit.encode(out);
+        out.extend_from_slice(digest);
+    }
+
+    /// Encodes one same-tablet atomic commit: the id plus every write
+    /// (key, expectation, kind) in request order.
+    fn encode_txn_commit_local(
+        out: &mut Vec<u8>,
+        txn: &crate::txn::TxnId,
+        writes: &[crate::txn::TxnWrite],
+    ) {
+        out.push(TAG_TXN_COMMIT_LOCAL);
+        txn.encode(out);
+        let count = u16::try_from(writes.len()).unwrap_or(u16::MAX);
+        out.extend_from_slice(&count.to_le_bytes());
+        for write in writes {
+            encode_bytes(out, write.key.as_bytes());
+            write.expect.encode(out);
+            write.kind.encode(out);
+        }
+    }
+
+    /// Encodes one lease grant shape (acquire and renew share it): owner,
+    /// fencing token, and resolved expiry.
+    fn encode_lease_grant(
+        out: &mut Vec<u8>,
+        tag: u8,
+        key: &Key,
+        owner: u64,
+        fencing: crate::FencingToken,
+        expires_at: kivi_types::UnixMicros,
+    ) {
+        out.push(tag);
+        encode_bytes(out, key.as_bytes());
+        owner.encode(out);
+        fencing.encode(out);
+        expires_at.encode(out);
+    }
+
+    /// Encodes one bounded-counter shape (create, add, or share move):
+    /// dispatches on the variant so the shared tag match stays reviewable.
+    fn encode_bounded_mutation(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::BoundedCreate {
+                key,
+                capacity,
+                holder,
+            } => {
+                out.push(TAG_BOUNDED_CREATE);
+                encode_bytes(out, key.as_bytes());
+                capacity.encode(out);
+                holder.encode(out);
+            }
+            Self::BoundedAdd { key, delta } => {
+                Self::encode_key_delta(out, TAG_BOUNDED_ADD, key, *delta);
+            }
+            Self::EscrowSetShare { key, min, max } => {
+                out.push(TAG_ESCROW_SET_SHARE);
+                encode_bytes(out, key.as_bytes());
+                out.extend_from_slice(&min.to_le_bytes());
+                out.extend_from_slice(&max.to_le_bytes());
+            }
+            _ => unreachable!("bounded shapes only"),
+        }
+    }
+
+    /// Encodes one semaphore shape (create, acquire, or release):
+    /// dispatches on the variant so the shared tag match stays reviewable.
+    fn encode_semaphore_mutation(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::SemaphoreCreate { key, capacity } => {
+                out.push(TAG_SEMAPHORE_CREATE);
+                encode_bytes(out, key.as_bytes());
+                capacity.encode(out);
+            }
+            Self::SemaphoreAcquire {
+                key,
+                permit,
+                owner,
+                qty,
+            } => {
+                out.push(TAG_SEMAPHORE_ACQUIRE);
+                encode_bytes(out, key.as_bytes());
+                out.extend_from_slice(permit);
+                owner.encode(out);
+                qty.encode(out);
+            }
+            Self::SemaphoreRelease { key, permit } => {
+                out.push(TAG_SEMAPHORE_RELEASE);
+                encode_bytes(out, key.as_bytes());
+                out.extend_from_slice(permit);
+            }
+            _ => unreachable!("semaphore shapes only"),
+        }
+    }
+
+    /// Encodes one stream shape (create, append, or trim): dispatches on
+    /// the variant so the shared tag match stays reviewable.
+    fn encode_stream_mutation(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::StreamCreate { key, stream, shard } => {
+                out.push(TAG_STREAM_CREATE);
+                encode_bytes(out, key.as_bytes());
+                out.extend_from_slice(stream);
+                shard.encode(out);
+            }
+            Self::StreamAppend {
+                key,
+                partition,
+                payload,
+            } => {
+                out.push(TAG_STREAM_APPEND);
+                encode_bytes(out, key.as_bytes());
+                encode_bytes(out, partition);
+                encode_bytes(out, payload);
+            }
+            Self::StreamTrim { key, through } => {
+                out.push(TAG_STREAM_TRIM);
+                encode_bytes(out, key.as_bytes());
+                through.encode(out);
+            }
+            _ => unreachable!("stream shapes only"),
         }
     }
 }
@@ -493,6 +1092,8 @@ impl Decode for Mutation {
                 let (expect, fifth) = TxnExpect::decode(&input[first + second + third + fourth..])?;
                 let (write, sixth) =
                     TxnWriteKind::decode(&input[first + second + third + fourth + fifth..])?;
+                let at = first + second + third + fourth + fifth + sixth;
+                let (digest, used) = <[u8; 32]>::decode(&input[at..])?;
                 Ok((
                     Self::TxnPrepare {
                         txn,
@@ -500,21 +1101,225 @@ impl Decode for Mutation {
                         key: Key::from(key),
                         expect,
                         write,
+                        digest,
                     },
-                    first + second + third + fourth + fifth + sixth,
+                    at + used,
                 ))
             }
             TAG_TXN_FINALIZE => {
                 let (txn, second) = TxnId::decode(&input[first..])?;
                 let (key, third) = decode_byte_vec(&input[first + second..])?;
                 let (commit, fourth) = bool::decode(&input[first + second + third..])?;
+                let at = first + second + third + fourth;
+                let (digest, used) = <[u8; 32]>::decode(&input[at..])?;
                 Ok((
                     Self::TxnFinalize {
                         txn,
                         key: Key::from(key),
                         commit,
+                        digest,
+                    },
+                    at + used,
+                ))
+            }
+            TAG_TXN_COMMIT_LOCAL => {
+                let (txn, mut at) = TxnId::decode(&input[first..])?;
+                at += first;
+                let (count_raw, used) = <[u8; 2]>::decode(&input[at..])?;
+                at += used;
+                let count = usize::from(u16::from_le_bytes(count_raw));
+                // Empty local commits are malformed (drivers never send
+                // them; `key()` has no anchor without a first write).
+                if count == 0 || count > crate::txn::MAX_TXN_KEYS {
+                    return Err(CodecError::InvalidTag {
+                        kind: "mutation",
+                        tag: TAG_TXN_COMMIT_LOCAL,
+                    });
+                }
+                let mut writes = Vec::with_capacity(count.min(16));
+                for _ in 0..count {
+                    let (key, used) = decode_byte_vec(&input[at..])?;
+                    at += used;
+                    let (expect, used) = TxnExpect::decode(&input[at..])?;
+                    at += used;
+                    let (kind, used) = TxnWriteKind::decode(&input[at..])?;
+                    at += used;
+                    writes.push(crate::txn::TxnWrite {
+                        key: Key::from(key),
+                        kind,
+                        expect,
+                    });
+                }
+                Ok((Self::TxnCommitLocal { txn, writes }, at))
+            }
+            TAG_COMMUTATIVE_ADD => {
+                let (key, second) = decode_byte_vec(&input[first..])?;
+                let (raw, third) = <[u8; 8]>::decode(&input[first + second..])?;
+                Ok((
+                    Self::CommutativeAdd {
+                        key: Key::from(key),
+                        delta: i64::from_le_bytes(raw),
+                    },
+                    first + second + third,
+                ))
+            }
+            TAG_BOUNDED_CREATE => {
+                let (key, second) = decode_byte_vec(&input[first..])?;
+                let (capacity, third) = u64::decode(&input[first + second..])?;
+                let (holder, fourth) = u64::decode(&input[first + second + third..])?;
+                Ok((
+                    Self::BoundedCreate {
+                        key: Key::from(key),
+                        capacity,
+                        holder,
                     },
                     first + second + third + fourth,
+                ))
+            }
+            TAG_BOUNDED_ADD => {
+                let (key, second) = decode_byte_vec(&input[first..])?;
+                let (raw, third) = <[u8; 8]>::decode(&input[first + second..])?;
+                Ok((
+                    Self::BoundedAdd {
+                        key: Key::from(key),
+                        delta: i64::from_le_bytes(raw),
+                    },
+                    first + second + third,
+                ))
+            }
+            TAG_ESCROW_SET_SHARE => {
+                let (key, second) = decode_byte_vec(&input[first..])?;
+                let (min_raw, third) = <[u8; 8]>::decode(&input[first + second..])?;
+                let (max_raw, fourth) = <[u8; 8]>::decode(&input[first + second + third..])?;
+                Ok((
+                    Self::EscrowSetShare {
+                        key: Key::from(key),
+                        min: i64::from_le_bytes(min_raw),
+                        max: i64::from_le_bytes(max_raw),
+                    },
+                    first + second + third + fourth,
+                ))
+            }
+            TAG_SEMAPHORE_CREATE => {
+                let (key, second) = decode_byte_vec(&input[first..])?;
+                let (capacity, third) = u64::decode(&input[first + second..])?;
+                Ok((
+                    Self::SemaphoreCreate {
+                        key: Key::from(key),
+                        capacity,
+                    },
+                    first + second + third,
+                ))
+            }
+            TAG_SEMAPHORE_ACQUIRE => {
+                let (key, second) = decode_byte_vec(&input[first..])?;
+                let (permit, third) = <[u8; 16]>::decode(&input[first + second..])?;
+                let (owner, fourth) = u64::decode(&input[first + second + third..])?;
+                let (qty, fifth) = u64::decode(&input[first + second + third + fourth..])?;
+                Ok((
+                    Self::SemaphoreAcquire {
+                        key: Key::from(key),
+                        permit,
+                        owner,
+                        qty,
+                    },
+                    first + second + third + fourth + fifth,
+                ))
+            }
+            TAG_SEMAPHORE_RELEASE => {
+                let (key, second) = decode_byte_vec(&input[first..])?;
+                let (permit, third) = <[u8; 16]>::decode(&input[first + second..])?;
+                Ok((
+                    Self::SemaphoreRelease {
+                        key: Key::from(key),
+                        permit,
+                    },
+                    first + second + third,
+                ))
+            }
+            TAG_LEASE_ACQUIRE => {
+                let (key, second) = decode_byte_vec(&input[first..])?;
+                let (owner, third) = u64::decode(&input[first + second..])?;
+                let (fencing, fourth) =
+                    crate::FencingToken::decode(&input[first + second + third..])?;
+                let (expires_at, fifth) =
+                    kivi_types::UnixMicros::decode(&input[first + second + third + fourth..])?;
+                Ok((
+                    Self::LeaseAcquire {
+                        key: Key::from(key),
+                        owner,
+                        fencing,
+                        expires_at,
+                    },
+                    first + second + third + fourth + fifth,
+                ))
+            }
+            TAG_LEASE_RENEW => {
+                let (key, second) = decode_byte_vec(&input[first..])?;
+                let (owner, third) = u64::decode(&input[first + second..])?;
+                let (fencing, fourth) =
+                    crate::FencingToken::decode(&input[first + second + third..])?;
+                let (expires_at, fifth) =
+                    kivi_types::UnixMicros::decode(&input[first + second + third + fourth..])?;
+                Ok((
+                    Self::LeaseRenew {
+                        key: Key::from(key),
+                        owner,
+                        fencing,
+                        expires_at,
+                    },
+                    first + second + third + fourth + fifth,
+                ))
+            }
+            TAG_LEASE_RELEASE => {
+                let (key, second) = decode_byte_vec(&input[first..])?;
+                let (owner, third) = u64::decode(&input[first + second..])?;
+                let (fencing, fourth) =
+                    crate::FencingToken::decode(&input[first + second + third..])?;
+                Ok((
+                    Self::LeaseRelease {
+                        key: Key::from(key),
+                        owner,
+                        fencing,
+                    },
+                    first + second + third + fourth,
+                ))
+            }
+            TAG_STREAM_CREATE => {
+                let (key, second) = decode_byte_vec(&input[first..])?;
+                let (stream, third) = <[u8; 16]>::decode(&input[first + second..])?;
+                let (shard, fourth) = u32::decode(&input[first + second + third..])?;
+                Ok((
+                    Self::StreamCreate {
+                        key: Key::from(key),
+                        stream,
+                        shard,
+                    },
+                    first + second + third + fourth,
+                ))
+            }
+            TAG_STREAM_APPEND => {
+                let (key, second) = decode_byte_vec(&input[first..])?;
+                let (partition, third) = decode_byte_vec(&input[first + second..])?;
+                let (payload, fourth) = decode_byte_vec(&input[first + second + third..])?;
+                Ok((
+                    Self::StreamAppend {
+                        key: Key::from(key),
+                        partition: bytes::Bytes::from(partition),
+                        payload: bytes::Bytes::from(payload),
+                    },
+                    first + second + third + fourth,
+                ))
+            }
+            TAG_STREAM_TRIM => {
+                let (key, second) = decode_byte_vec(&input[first..])?;
+                let (through, third) = u64::decode(&input[first + second..])?;
+                Ok((
+                    Self::StreamTrim {
+                        key: Key::from(key),
+                        through,
+                    },
+                    first + second + third,
                 ))
             }
             other => Err(CodecError::InvalidTag {
@@ -571,6 +1376,59 @@ pub enum ApplyOutcome {
         /// Version after the applied write (`None` when nothing applied).
         version: Option<ObjectVersion>,
     },
+    /// Commutative addition applied with the post-apply sum and version.
+    /// The client-visible result drops the sum (`Applied`): this outcome
+    /// exists so durability prediction and replay verify exactly.
+    Commutative {
+        /// Version after the addition.
+        version: ObjectVersion,
+        /// Sum after the addition.
+        value: i64,
+    },
+    /// Bounded-counter addition applied with the post-apply value/version.
+    Bounded {
+        /// Version after the addition.
+        version: ObjectVersion,
+        /// Value after the addition.
+        value: i64,
+    },
+    /// Semaphore acquisition applied (permit live, or identical retry).
+    SemaphoreAcquired,
+    /// Semaphore release applied.
+    SemaphoreReleased {
+        /// Whether a live permit was released.
+        released: bool,
+    },
+    /// Lease grant applied (acquire or renew) with the authoritative token.
+    LeaseGranted {
+        /// Fencing token of the grant.
+        fencing: crate::FencingToken,
+        /// Logical expiry of the grant.
+        expires_at: kivi_types::UnixMicros,
+    },
+    /// Lease release applied.
+    LeaseReleased {
+        /// Whether a live holding was released.
+        released: bool,
+    },
+    /// Stream append applied with the assigned shard-local offset.
+    StreamAppended {
+        /// Assigned offset.
+        offset: u64,
+    },
+    /// Stream trim applied with the dropped entry count.
+    StreamTrimmed {
+        /// Entries removed.
+        removed: u64,
+    },
+    /// Same-tablet atomic commit applied: resulting versions in request
+    /// order (`None` for deletes, which carry no version). The whole set
+    /// validated and applied together; verification compares this vector
+    /// element-wise against the predicted one.
+    TxnLocalCommitted {
+        /// Resulting versions in request order.
+        versions: Vec<Option<ObjectVersion>>,
+    },
 }
 
 /// Deterministic apply failure. Same state plus same mutation always agrees,
@@ -606,6 +1464,24 @@ pub enum ApplyError {
     /// divergence. Fail closed, never partial intent state.
     #[error("transaction mutation diverged from its prepared prediction")]
     TxnDiverged,
+    /// A bounded-counter mutation would leave owned escrow rights (only
+    /// reachable by applying mutations against divergent state: admission
+    /// checks rights before the WAL).
+    #[error("bounded counter would exceed owned escrow rights")]
+    BoundedExceeded,
+    /// A semaphore acquisition would exceed capacity (only reachable on
+    /// divergent state: admission checks capacity before the WAL).
+    #[error("semaphore capacity exhausted")]
+    SemaphoreExhausted,
+    /// A lease mutation met a conflicting live holder or a stale fencing
+    /// token (only reachable on divergent state: admission validates the
+    /// grant before the WAL).
+    #[error("lease grant conflict")]
+    LeaseConflict,
+    /// A stream append would exceed shard bounds (only reachable on
+    /// divergent state: admission bounds entries before the WAL).
+    #[error("stream shard full")]
+    StreamFull,
 }
 
 #[cfg(test)]
@@ -616,7 +1492,21 @@ mod tests {
     #[test]
     fn mutation_codecs_round_trip() {
         let key = Key::from("user:1");
-        let cases = vec![
+        let cases = legacy_codec_cases(&key)
+            .into_iter()
+            .chain(txn_codec_cases(&key))
+            .chain(semantic_codec_cases(&key));
+        for mutation in cases {
+            assert_eq!(mutation.encoded_len(), mutation.encode_to_vec().len());
+            assert_eq!(
+                Mutation::decode_exact(&mutation.encode_to_vec()).expect("round trip"),
+                mutation
+            );
+        }
+    }
+
+    fn legacy_codec_cases(key: &Key) -> Vec<Mutation> {
+        vec![
             Mutation::PutBytes {
                 key: key.clone(),
                 value: bytes::Bytes::from_static(b"v"),
@@ -665,12 +1555,18 @@ mod tests {
                 logical_len: 11,
                 expiry: Expiry::NEVER,
             },
+        ]
+    }
+
+    fn txn_codec_cases(key: &Key) -> Vec<Mutation> {
+        vec![
             Mutation::TxnPrepare {
                 txn: crate::txn::TxnId::derive(3, 4, 0),
                 coordinator: 9,
                 key: key.clone(),
                 expect: crate::txn::TxnExpect::Version(ObjectVersion::from_u64(2)),
                 write: crate::txn::TxnWriteKind::Put(bytes::Bytes::from_static(b"v")),
+                digest: [0xD1; 32],
             },
             Mutation::TxnPrepare {
                 txn: crate::txn::TxnId::derive(3, 5, 0),
@@ -678,20 +1574,98 @@ mod tests {
                 key: key.clone(),
                 expect: crate::txn::TxnExpect::Absent,
                 write: crate::txn::TxnWriteKind::CounterAdd(-3),
+                digest: [0xD2; 32],
             },
             Mutation::TxnFinalize {
                 txn: crate::txn::TxnId::derive(3, 4, 0),
                 key: key.clone(),
                 commit: true,
+                digest: [0xD1; 32],
             },
-        ];
-        for mutation in cases {
-            assert_eq!(mutation.encoded_len(), mutation.encode_to_vec().len());
-            assert_eq!(
-                Mutation::decode_exact(&mutation.encode_to_vec()).expect("round trip"),
-                mutation
-            );
-        }
+            Mutation::TxnCommitLocal {
+                txn: crate::txn::TxnId::derive(3, 4, 0),
+                writes: vec![
+                    crate::txn::TxnWrite {
+                        key: key.clone(),
+                        kind: crate::txn::TxnWriteKind::Put(bytes::Bytes::from_static(b"v")),
+                        expect: crate::txn::TxnExpect::Any,
+                    },
+                    crate::txn::TxnWrite {
+                        key: Key::from("user:2"),
+                        kind: crate::txn::TxnWriteKind::CounterAdd(3),
+                        expect: crate::txn::TxnExpect::Absent,
+                    },
+                ],
+            },
+        ]
+    }
+
+    fn semantic_codec_cases(key: &Key) -> Vec<Mutation> {
+        vec![
+            Mutation::CommutativeAdd {
+                key: key.clone(),
+                delta: 7,
+            },
+            Mutation::BoundedCreate {
+                key: key.clone(),
+                capacity: 100,
+                holder: 9,
+            },
+            Mutation::BoundedAdd {
+                key: key.clone(),
+                delta: -3,
+            },
+            Mutation::EscrowSetShare {
+                key: key.clone(),
+                min: 0,
+                max: 60,
+            },
+            Mutation::SemaphoreCreate {
+                key: key.clone(),
+                capacity: 4,
+            },
+            Mutation::SemaphoreAcquire {
+                key: key.clone(),
+                permit: [0xA5; 16],
+                owner: 11,
+                qty: 2,
+            },
+            Mutation::SemaphoreRelease {
+                key: key.clone(),
+                permit: [0xA5; 16],
+            },
+            Mutation::LeaseAcquire {
+                key: key.clone(),
+                owner: 11,
+                fencing: crate::FencingToken::from_u64(2),
+                expires_at: kivi_types::UnixMicros::from_micros(99),
+            },
+            Mutation::LeaseRenew {
+                key: key.clone(),
+                owner: 11,
+                fencing: crate::FencingToken::from_u64(2),
+                expires_at: kivi_types::UnixMicros::from_micros(199),
+            },
+            Mutation::LeaseRelease {
+                key: key.clone(),
+                owner: 11,
+                fencing: crate::FencingToken::from_u64(2),
+            },
+            Mutation::StreamCreate {
+                key: key.clone(),
+                stream: [0x5E; 16],
+                shard: 3,
+            },
+            Mutation::StreamAppend {
+                key: key.clone(),
+                partition: bytes::Bytes::from_static(b"p"),
+                payload: bytes::Bytes::from_static(b"e"),
+            },
+            Mutation::StreamTrim {
+                key: key.clone(),
+                through: 41,
+            },
+        ]
     }
 
     #[test]

@@ -207,6 +207,29 @@ pub enum ClientError {
     /// A unique index term is already owned by another primary.
     #[error("unique index violation")]
     UniqueViolation,
+    /// The batch spans tablets: drive it over `TxnPrepare`/`TxnFinalize`.
+    /// The batch driver intercepts this before it surfaces; reaching user
+    /// code means a direct `AtomicBatch` crossed tablets unexpectedly.
+    #[error("batch spans tablets; use a transaction driver")]
+    TxnCrossTablet,
+    /// A bounded-counter addition would leave locally owned escrow rights.
+    #[error("bounded counter would exceed owned escrow rights")]
+    BoundedExceeded,
+    /// A semaphore acquisition would exceed capacity.
+    #[error("semaphore capacity exhausted")]
+    SemaphoreExhausted,
+    /// A lease acquisition met a live holder owned by someone else.
+    #[error("lease held by another live owner")]
+    LeaseConflict,
+    /// A lease renew/release named a stale fencing token.
+    #[error("stale fencing token")]
+    StaleFencing,
+    /// A stream append would exceed the shard's bounds.
+    #[error("stream shard full")]
+    StreamFull,
+    /// Conflicting final decisions for one transaction (durable corruption).
+    #[error("transaction decision conflict")]
+    TxnDecisionConflict,
     /// A scan cursor no longer resolves; re-issue the scan.
     #[error("scan cursor stale")]
     ScanCursorStale,
@@ -243,6 +266,13 @@ fn status_error(status: Status, body: &ResponseBody) -> ClientError {
         Status::TxnTooLarge => ClientError::TxnTooLarge,
         Status::TxnCoordinatorUnavailable => ClientError::TxnCoordinatorUnavailable,
         Status::UniqueViolation => ClientError::UniqueViolation,
+        Status::TxnCrossTablet => ClientError::TxnCrossTablet,
+        Status::BoundedExceeded => ClientError::BoundedExceeded,
+        Status::SemaphoreExhausted => ClientError::SemaphoreExhausted,
+        Status::LeaseConflict => ClientError::LeaseConflict,
+        Status::StaleFencing => ClientError::StaleFencing,
+        Status::StreamFull => ClientError::StreamFull,
+        Status::TxnDecisionConflict => ClientError::TxnDecisionConflict,
         Status::ScanCursorStale => ClientError::ScanCursorStale,
         Status::StaleToken => ClientError::StaleToken,
         Status::CoverageUncertain => ClientError::AmbiguousOutcome,
@@ -839,6 +869,23 @@ struct Shared {
     requests: AtomicU64,
     redirects: AtomicU64,
     errors: AtomicU64,
+    /// Transactions started (per `atomic_batch` call).
+    txns_started: AtomicU64,
+    /// Transactions committed (fast path and 2PC).
+    txns_committed: AtomicU64,
+    /// Transactions aborted on OCC conflict (retryable by the caller).
+    txns_aborted_conflict: AtomicU64,
+    /// Transactions aborted for any other reason.
+    txns_aborted_other: AtomicU64,
+    /// Commits via the single-tablet fast path.
+    same_tablet_txns: AtomicU64,
+    /// Commits via cross-tablet 2PC.
+    cross_tablet_txns: AtomicU64,
+    /// Prepare-wave latencies in micros (2PC only; lock held briefly on
+    /// transaction completion, never on the point-op path).
+    prepare_latency: Mutex<hdrhistogram::Histogram<u64>>,
+    /// Decision-write latencies in micros (2PC only).
+    decision_latency: Mutex<hdrhistogram::Histogram<u64>>,
 }
 
 /// Observable client counters (all cumulative across clones).
@@ -850,6 +897,33 @@ pub struct ClientStats {
     pub redirects: u64,
     /// Terminal failures surfaced to callers.
     pub errors: u64,
+    /// Transactions started (per `atomic_batch` call).
+    pub txns_started: u64,
+    /// Transactions committed (fast path and 2PC).
+    pub txns_committed: u64,
+    /// Transactions aborted on OCC conflict.
+    pub txns_aborted_conflict: u64,
+    /// Transactions aborted for any other reason.
+    pub txns_aborted_other: u64,
+    /// Commits via the single-tablet fast path.
+    pub same_tablet_txns: u64,
+    /// Commits via cross-tablet 2PC.
+    pub cross_tablet_txns: u64,
+}
+
+/// Transaction latency snapshot (2PC paths only; micros).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TxnLatencySnapshot {
+    /// Prepare-wave p50 / p99 (`None` before the first sampled transaction).
+    pub prepare_p50: Option<u64>,
+    /// Prepare-wave p99.
+    pub prepare_p99: Option<u64>,
+    /// Decision-write p50 / p99.
+    pub decision_p50: Option<u64>,
+    /// Decision-write p99.
+    pub decision_p99: Option<u64>,
+    /// Sampled transactions behind this snapshot.
+    pub samples: u64,
 }
 
 /// Native Kivi client: typed operations over sparse-routed TCP connections.
@@ -870,6 +944,11 @@ impl NativeClient {
     ///
     /// Returns [`ClientError::Io`] when no seed address is configured or the
     /// OS random source is unavailable for the session identity.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the latency histograms fail to build (effectively
+    /// unreachable: the significant-figures parameter is a constant).
     pub fn new(config: ClientConfig) -> Result<Self, ClientError> {
         if config.seeds.is_empty() {
             return Err(ClientError::Io("no seed addresses configured".to_owned()));
@@ -909,6 +988,18 @@ impl NativeClient {
                 requests: AtomicU64::new(0),
                 redirects: AtomicU64::new(0),
                 errors: AtomicU64::new(0),
+                txns_started: AtomicU64::new(0),
+                txns_committed: AtomicU64::new(0),
+                txns_aborted_conflict: AtomicU64::new(0),
+                txns_aborted_other: AtomicU64::new(0),
+                same_tablet_txns: AtomicU64::new(0),
+                cross_tablet_txns: AtomicU64::new(0),
+                prepare_latency: Mutex::new(
+                    hdrhistogram::Histogram::new(3).expect("latency histogram builds"),
+                ),
+                decision_latency: Mutex::new(
+                    hdrhistogram::Histogram::new(3).expect("latency histogram builds"),
+                ),
             }),
         })
     }
@@ -928,6 +1019,84 @@ impl NativeClient {
             requests: self.shared.requests.load(Ordering::Relaxed),
             redirects: self.shared.redirects.load(Ordering::Relaxed),
             errors: self.shared.errors.load(Ordering::Relaxed),
+            txns_started: self.shared.txns_started.load(Ordering::Relaxed),
+            txns_committed: self.shared.txns_committed.load(Ordering::Relaxed),
+            txns_aborted_conflict: self.shared.txns_aborted_conflict.load(Ordering::Relaxed),
+            txns_aborted_other: self.shared.txns_aborted_other.load(Ordering::Relaxed),
+            same_tablet_txns: self.shared.same_tablet_txns.load(Ordering::Relaxed),
+            cross_tablet_txns: self.shared.cross_tablet_txns.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Snapshots 2PC transaction latencies (prepare wave, decision write).
+    /// Point operations and fast-path commits never touch these
+    /// histograms; samples count completed 2PC phases only.
+    #[must_use]
+    pub fn txn_latencies(&self) -> TxnLatencySnapshot {
+        fn quantile(histogram: &hdrhistogram::Histogram<u64>, quantile: f64) -> Option<u64> {
+            (!histogram.is_empty()).then(|| histogram.value_at_quantile(quantile))
+        }
+        let prepare = self.shared.prepare_latency.lock().ok();
+        let decision = self.shared.decision_latency.lock().ok();
+        TxnLatencySnapshot {
+            prepare_p50: prepare
+                .as_deref()
+                .and_then(|histogram| quantile(histogram, 0.5)),
+            prepare_p99: prepare
+                .as_deref()
+                .and_then(|histogram| quantile(histogram, 0.99)),
+            decision_p50: decision
+                .as_deref()
+                .and_then(|histogram| quantile(histogram, 0.5)),
+            decision_p99: decision
+                .as_deref()
+                .and_then(|histogram| quantile(histogram, 0.99)),
+            samples: prepare.map_or(0, |histogram| histogram.len()),
+        }
+    }
+
+    /// Records a started transaction attempt (2PC driver paths call this
+    /// once per `atomic_batch` call).
+    pub(crate) fn note_txn_started(&self) {
+        self.shared.txns_started.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a committed transaction and its path (fast or 2PC).
+    pub(crate) fn note_txn_committed(&self, cross_tablet: bool) {
+        self.shared.txns_committed.fetch_add(1, Ordering::Relaxed);
+        if cross_tablet {
+            self.shared
+                .cross_tablet_txns
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.shared.same_tablet_txns.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Records an aborted transaction by cause family.
+    pub(crate) fn note_txn_aborted(&self, conflict: bool) {
+        if conflict {
+            self.shared
+                .txns_aborted_conflict
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.shared
+                .txns_aborted_other
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Records one 2PC prepare-wave latency sample (micros).
+    pub(crate) fn note_prepare_latency(&self, micros: u64) {
+        if let Ok(mut histogram) = self.shared.prepare_latency.lock() {
+            let _ = histogram.record(micros);
+        }
+    }
+
+    /// Records one 2PC decision-write latency sample (micros).
+    pub(crate) fn note_decision_latency(&self, micros: u64) {
+        if let Ok(mut histogram) = self.shared.decision_latency.lock() {
+            let _ = histogram.record(micros);
         }
     }
 
@@ -1561,6 +1730,19 @@ impl NativeClient {
             batch_writes: Vec::new(),
             txn_coordinator: 0,
             txn_commit: false,
+            txn_digest: [0u8; 32],
+            capacity: 0,
+            holder: 0,
+            permit: [0u8; 16],
+            owner: 0,
+            qty: 0,
+            fencing: 0,
+            ttl: 0,
+            stream: [0u8; 16],
+            shard: 0,
+            partition: Vec::new(),
+            share_min: 0,
+            share_max: 0,
         })?;
         match response.body {
             ResponseBody::Value(value) => Ok(Some(Bytes::from(value))),
@@ -1617,6 +1799,19 @@ impl NativeClient {
                 batch_writes: Vec::new(),
                 txn_coordinator: 0,
                 txn_commit: false,
+                txn_digest: [0u8; 32],
+                capacity: 0,
+                holder: 0,
+                permit: [0u8; 16],
+                owner: 0,
+                qty: 0,
+                fencing: 0,
+                ttl: 0,
+                stream: [0u8; 16],
+                shard: 0,
+                partition: Vec::new(),
+                share_min: 0,
+                share_max: 0,
             },
             contract,
         )?;
@@ -1708,6 +1903,19 @@ impl NativeClient {
             batch_writes: Vec::new(),
             txn_coordinator: 0,
             txn_commit: false,
+            txn_digest: [0u8; 32],
+            capacity: 0,
+            holder: 0,
+            permit: [0u8; 16],
+            owner: 0,
+            qty: 0,
+            fencing: 0,
+            ttl: 0,
+            stream: [0u8; 16],
+            shard: 0,
+            partition: Vec::new(),
+            share_min: 0,
+            share_max: 0,
         })?;
         match response.body {
             ResponseBody::Stored { .. } => Ok(()),
@@ -1755,6 +1963,19 @@ impl NativeClient {
             batch_writes: Vec::new(),
             txn_coordinator: 0,
             txn_commit: false,
+            txn_digest: [0u8; 32],
+            capacity: 0,
+            holder: 0,
+            permit: [0u8; 16],
+            owner: 0,
+            qty: 0,
+            fencing: 0,
+            ttl: 0,
+            stream: [0u8; 16],
+            shard: 0,
+            partition: Vec::new(),
+            share_min: 0,
+            share_max: 0,
         })?;
         match response.body {
             ResponseBody::Stored { .. } => Ok(()),
@@ -2206,33 +2427,8 @@ impl NativeClient {
             Err(ClientError::Overloaded) => return GetOutcome::Overloaded,
             Err(error) => return GetOutcome::Fail(error),
         };
-        let request = kivi_protocol::Request {
-            contract: kivi_types::ReadContract::Latest,
-            namespace: self.shared.namespace,
-            opcode: Opcode::GetStream,
-            hint,
-            key: key.as_bytes().to_vec(),
-            value: None,
-            delta: 0,
-            expiry: 0,
-            offset: 0,
-            len: 0,
-            condition: kivi_protocol::COND_ALWAYS,
-            expiry_policy: kivi_protocol::EXPIRY_CLEAR,
-            identity: None,
-            ack_floor: RequestSeq::from_u64(0),
-            scan_start: None,
-            scan_end: None,
-            scan_direction: kivi_protocol::SCAN_FORWARD,
-            scan_max_items: 0,
-            scan_max_bytes: 0,
-            scan_projection: kivi_protocol::SCAN_KEYS_ONLY,
-            scan_consistency: kivi_protocol::SCAN_LATEST_PER_TABLET,
-            batch_txn: [0u8; 16],
-            batch_writes: Vec::new(),
-            txn_coordinator: 0,
-            txn_commit: false,
-        };
+        let mut request = self.request_base(key, Opcode::GetStream);
+        request.hint = hint;
         if let Err(error) =
             Connection::send_frame(conn, FrameKind::Request, stream, &request.encode())
         {
@@ -2413,6 +2609,19 @@ impl NativeClient {
                 batch_writes: Vec::new(),
                 txn_coordinator: 0,
                 txn_commit: false,
+                txn_digest: [0u8; 32],
+                capacity: 0,
+                holder: 0,
+                permit: [0u8; 16],
+                owner: 0,
+                qty: 0,
+                fencing: 0,
+                ttl: 0,
+                stream: [0u8; 16],
+                shard: 0,
+                partition: Vec::new(),
+                share_min: 0,
+                share_max: 0,
             },
             Some(seq),
         )?;
@@ -2454,6 +2663,19 @@ impl NativeClient {
             batch_writes: Vec::new(),
             txn_coordinator: 0,
             txn_commit: false,
+            txn_digest: [0u8; 32],
+            capacity: 0,
+            holder: 0,
+            permit: [0u8; 16],
+            owner: 0,
+            qty: 0,
+            fencing: 0,
+            ttl: 0,
+            stream: [0u8; 16],
+            shard: 0,
+            partition: Vec::new(),
+            share_min: 0,
+            share_max: 0,
         })?;
         match response.body {
             ResponseBody::Deleted { existed } => Ok(existed),
@@ -2494,6 +2716,19 @@ impl NativeClient {
             batch_writes: Vec::new(),
             txn_coordinator: 0,
             txn_commit: false,
+            txn_digest: [0u8; 32],
+            capacity: 0,
+            holder: 0,
+            permit: [0u8; 16],
+            owner: 0,
+            qty: 0,
+            fencing: 0,
+            ttl: 0,
+            stream: [0u8; 16],
+            shard: 0,
+            partition: Vec::new(),
+            share_min: 0,
+            share_max: 0,
         })?;
         match response.body {
             ResponseBody::Exists(present) => Ok(present),
@@ -2534,6 +2769,19 @@ impl NativeClient {
             batch_writes: Vec::new(),
             txn_coordinator: 0,
             txn_commit: false,
+            txn_digest: [0u8; 32],
+            capacity: 0,
+            holder: 0,
+            permit: [0u8; 16],
+            owner: 0,
+            qty: 0,
+            fencing: 0,
+            ttl: 0,
+            stream: [0u8; 16],
+            shard: 0,
+            partition: Vec::new(),
+            share_min: 0,
+            share_max: 0,
         })?;
         match response.body {
             ResponseBody::Counter(value) => Ok(Some(value)),
@@ -2578,6 +2826,19 @@ impl NativeClient {
             batch_writes: Vec::new(),
             txn_coordinator: 0,
             txn_commit: false,
+            txn_digest: [0u8; 32],
+            capacity: 0,
+            holder: 0,
+            permit: [0u8; 16],
+            owner: 0,
+            qty: 0,
+            fencing: 0,
+            ttl: 0,
+            stream: [0u8; 16],
+            shard: 0,
+            partition: Vec::new(),
+            share_min: 0,
+            share_max: 0,
         })?;
         match response.body {
             ResponseBody::CounterUpdated { value, .. } => Ok(value),
@@ -2634,6 +2895,19 @@ impl NativeClient {
                 batch_writes: Vec::new(),
                 txn_coordinator: 0,
                 txn_commit: false,
+                txn_digest: [0u8; 32],
+                capacity: 0,
+                holder: 0,
+                permit: [0u8; 16],
+                owner: 0,
+                qty: 0,
+                fencing: 0,
+                ttl: 0,
+                stream: [0u8; 16],
+                shard: 0,
+                partition: Vec::new(),
+                share_min: 0,
+                share_max: 0,
             },
             Some(seq),
         )?;
@@ -2678,6 +2952,19 @@ impl NativeClient {
             batch_writes: Vec::new(),
             txn_coordinator: 0,
             txn_commit: false,
+            txn_digest: [0u8; 32],
+            capacity: 0,
+            holder: 0,
+            permit: [0u8; 16],
+            owner: 0,
+            qty: 0,
+            fencing: 0,
+            ttl: 0,
+            stream: [0u8; 16],
+            shard: 0,
+            partition: Vec::new(),
+            share_min: 0,
+            share_max: 0,
         })?;
         match response.body {
             ResponseBody::ExpirySet { applied } => Ok(applied),
@@ -2720,6 +3007,19 @@ impl NativeClient {
             batch_writes: Vec::new(),
             txn_coordinator: 0,
             txn_commit: false,
+            txn_digest: [0u8; 32],
+            capacity: 0,
+            holder: 0,
+            permit: [0u8; 16],
+            owner: 0,
+            qty: 0,
+            fencing: 0,
+            ttl: 0,
+            stream: [0u8; 16],
+            shard: 0,
+            partition: Vec::new(),
+            share_min: 0,
+            share_max: 0,
         })?;
         match response.body {
             ResponseBody::ExpiryPersisted { removed } => Ok(removed),
@@ -2760,6 +3060,19 @@ impl NativeClient {
             batch_writes: Vec::new(),
             txn_coordinator: 0,
             txn_commit: false,
+            txn_digest: [0u8; 32],
+            capacity: 0,
+            holder: 0,
+            permit: [0u8; 16],
+            owner: 0,
+            qty: 0,
+            fencing: 0,
+            ttl: 0,
+            stream: [0u8; 16],
+            shard: 0,
+            partition: Vec::new(),
+            share_min: 0,
+            share_max: 0,
         })?;
         match response.body {
             ResponseBody::ExpiryAt(stamp) => Ok(Some(kivi_types::Expiry::at(
@@ -2812,6 +3125,19 @@ impl NativeClient {
             batch_writes: Vec::new(),
             txn_coordinator: 0,
             txn_commit: false,
+            txn_digest: [0u8; 32],
+            capacity: 0,
+            holder: 0,
+            permit: [0u8; 16],
+            owner: 0,
+            qty: 0,
+            fencing: 0,
+            ttl: 0,
+            stream: [0u8; 16],
+            shard: 0,
+            partition: Vec::new(),
+            share_min: 0,
+            share_max: 0,
         })?;
         match response.body {
             ResponseBody::Value(value) => Ok(Some(Bytes::from(value))),
@@ -2856,6 +3182,19 @@ impl NativeClient {
             batch_writes: Vec::new(),
             txn_coordinator: 0,
             txn_commit: false,
+            txn_digest: [0u8; 32],
+            capacity: 0,
+            holder: 0,
+            permit: [0u8; 16],
+            owner: 0,
+            qty: 0,
+            fencing: 0,
+            ttl: 0,
+            stream: [0u8; 16],
+            shard: 0,
+            partition: Vec::new(),
+            share_min: 0,
+            share_max: 0,
         })?;
         match response.body {
             ResponseBody::Length(len) => Ok(Some(len)),
@@ -2909,6 +3248,19 @@ impl NativeClient {
             batch_writes: Vec::new(),
             txn_coordinator: 0,
             txn_commit: false,
+            txn_digest: [0u8; 32],
+            capacity: 0,
+            holder: 0,
+            permit: [0u8; 16],
+            owner: 0,
+            qty: 0,
+            fencing: 0,
+            ttl: 0,
+            stream: [0u8; 16],
+            shard: 0,
+            partition: Vec::new(),
+            share_min: 0,
+            share_max: 0,
         })?;
         match response.body {
             ResponseBody::ConditionalSet { applied, version } => {
@@ -2968,6 +3320,19 @@ impl NativeClient {
                 batch_writes: Vec::new(),
                 txn_coordinator: 0,
                 txn_commit: false,
+                txn_digest: [0u8; 32],
+                capacity: 0,
+                holder: 0,
+                permit: [0u8; 16],
+                owner: 0,
+                qty: 0,
+                fencing: 0,
+                ttl: 0,
+                stream: [0u8; 16],
+                shard: 0,
+                partition: Vec::new(),
+                share_min: 0,
+                share_max: 0,
             },
             Some(seq),
         )?;
@@ -2997,6 +3362,623 @@ impl NativeClient {
             .write_all(&bytes)
             .map_err(|error| ClientError::Io(error.to_string()))?;
         Ok(())
+    }
+}
+
+/// A lease grant: the fencing token that authorizes the external resource
+/// plus the grant's logical expiry. Present the token on every guarded
+/// action; the resource MUST reject tokens older than the one it last saw
+/// (time expiry alone never retires an old holder's authority).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaseGrant {
+    /// Fencing token issued with this grant (strictly increasing).
+    pub fencing: u64,
+    /// Logical expiry in micros (`u64::MAX` = immortal until released).
+    pub expires_at: u64,
+}
+
+/// Lease inspection answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaseInfo {
+    /// Live holder's owner (`None` when free or expired).
+    pub owner: Option<u64>,
+    /// Live holder's fencing token (zero when no live holder).
+    pub fencing: u64,
+    /// Live holder's logical expiry (zero when no live holder).
+    pub expires_at: u64,
+    /// Next fencing token to be issued.
+    pub next_fencing: u64,
+}
+
+/// Semaphore load answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SemaphoreLoad {
+    /// Total outstanding quantity.
+    pub outstanding: u64,
+    /// Total capacity.
+    pub capacity: u64,
+}
+
+/// Bounded-counter read answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundedValue {
+    /// Current value.
+    pub value: i64,
+    /// Global capacity.
+    pub capacity: u64,
+    /// Locally owned escrow share lower bound.
+    pub share_min: i64,
+    /// Locally owned escrow share upper bound.
+    pub share_max: i64,
+}
+
+/// One stream entry read from a shard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamEntry {
+    /// Shard-local offset.
+    pub offset: u64,
+    /// Partition key that routed this entry here.
+    pub partition: Vec<u8>,
+    /// Entry payload bytes.
+    pub payload: Vec<u8>,
+}
+
+/// One stream-shard read page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamPage {
+    /// Entries in shard order.
+    pub entries: Vec<StreamEntry>,
+    /// Shard's next offset (exclusive upper bound; resume cursor).
+    pub next_offset: u64,
+}
+
+impl NativeClient {
+    /// Builds a zeroed native request for `key`/`opcode`: per-operation
+    /// helpers set only their meaningful fields. Keeps call sites small
+    /// and future-proof as the protocol grows new opcodes.
+    pub(crate) fn request_base(
+        &self,
+        key: &Key,
+        opcode: kivi_protocol::Opcode,
+    ) -> kivi_protocol::Request {
+        kivi_protocol::Request {
+            contract: kivi_types::ReadContract::Latest,
+            namespace: self.shared.namespace,
+            opcode,
+            hint: None,
+            key: key.as_bytes().to_vec(),
+            value: None,
+            delta: 0,
+            expiry: 0,
+            offset: 0,
+            len: 0,
+            condition: kivi_protocol::COND_ALWAYS,
+            expiry_policy: kivi_protocol::EXPIRY_CLEAR,
+            identity: None,
+            ack_floor: RequestSeq::from_u64(0),
+            scan_start: None,
+            scan_end: None,
+            scan_direction: kivi_protocol::SCAN_FORWARD,
+            scan_max_items: 0,
+            scan_max_bytes: 0,
+            scan_projection: kivi_protocol::SCAN_KEYS_ONLY,
+            scan_consistency: kivi_protocol::SCAN_LATEST_PER_TABLET,
+            batch_txn: [0u8; 16],
+            batch_writes: Vec::new(),
+            txn_coordinator: 0,
+            txn_commit: false,
+            txn_digest: [0u8; 32],
+            capacity: 0,
+            holder: 0,
+            permit: [0u8; 16],
+            owner: 0,
+            qty: 0,
+            fencing: 0,
+            ttl: 0,
+            stream: [0u8; 16],
+            shard: 0,
+            partition: Vec::new(),
+            share_min: 0,
+            share_max: 0,
+        }
+    }
+
+    /// Adds `delta` to a commutative counter. The result is `Applied`
+    /// (no ordinal): permutations of additions produce identical observable
+    /// histories, which is what will make a future unordered fast path
+    /// safe. For exact ordinals use [`counter_add`](Self::counter_add).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport/routing failure, wrong-type
+    /// access, or counter overflow.
+    pub fn commutative_add(&self, key: &Key, delta: i64) -> Result<(), ClientError> {
+        use kivi_protocol::{Opcode, ResponseBody};
+        let response = self.execute(key, Opcode::CommutativeAdd, || {
+            let mut request = self.request_base(key, Opcode::CommutativeAdd);
+            request.delta = delta;
+            request
+        })?;
+        match response.body {
+            ResponseBody::CommutativeApplied => Ok(()),
+            _ => Err(ClientError::Internal(
+                "unexpected commutative-add body".to_owned(),
+            )),
+        }
+    }
+
+    /// Reads a commutative counter's current sum (`None` when absent; a
+    /// state query, not an ordinal).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport/routing failure or wrong-type access.
+    pub fn commutative_get(&self, key: &Key) -> Result<Option<i64>, ClientError> {
+        use kivi_protocol::{Opcode, ResponseBody};
+        let response = self.execute(key, Opcode::CommutativeGet, || {
+            self.request_base(key, Opcode::CommutativeGet)
+        })?;
+        match response.body {
+            ResponseBody::CommutativeValue(value) => Ok(Some(value)),
+            ResponseBody::Diagnostic(_) => Ok(None),
+            _ => Err(ClientError::Internal(
+                "unexpected commutative-get body".to_owned(),
+            )),
+        }
+    }
+
+    /// Creates a bounded counter with global `capacity` and a full local
+    /// escrow share `[0, capacity]` on the serving tablet.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport/routing failure, when the key
+    /// already holds live state, or when the capacity is unrepresentable.
+    pub fn bounded_create(&self, key: &Key, capacity: u64) -> Result<u64, ClientError> {
+        use kivi_protocol::{Opcode, ResponseBody};
+        let response = self.execute(key, Opcode::BoundedCounterCreate, || {
+            let mut request = self.request_base(key, Opcode::BoundedCounterCreate);
+            request.capacity = capacity;
+            request
+        })?;
+        match response.body {
+            ResponseBody::Stored { version } => Ok(version),
+            _ => Err(ClientError::Internal(
+                "unexpected bounded-create body".to_owned(),
+            )),
+        }
+    }
+
+    /// Adds `delta` to a bounded counter within locally owned escrow
+    /// rights, returning the new value and version. Fails without
+    /// mutating when the result would leave owned rights (move rights
+    /// first) or the global bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport/routing failure, wrong-type
+    /// access, overflow, or [`ClientError::BoundedExceeded`].
+    pub fn bounded_add(&self, key: &Key, delta: i64) -> Result<(i64, u64), ClientError> {
+        use kivi_protocol::{Opcode, ResponseBody};
+        let response = self.execute(key, Opcode::BoundedCounterAdd, || {
+            let mut request = self.request_base(key, Opcode::BoundedCounterAdd);
+            request.delta = delta;
+            request
+        })?;
+        match response.body {
+            ResponseBody::BoundedUpdated { value, version } => Ok((value, version)),
+            _ => Err(ClientError::Internal(
+                "unexpected bounded-add body".to_owned(),
+            )),
+        }
+    }
+
+    /// Reads a bounded counter's value, capacity, and owned share
+    /// (`None` when absent).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport/routing failure or wrong-type access.
+    pub fn bounded_get(&self, key: &Key) -> Result<Option<BoundedValue>, ClientError> {
+        use kivi_protocol::{Opcode, ResponseBody};
+        let response = self.execute(key, Opcode::BoundedCounterGet, || {
+            self.request_base(key, Opcode::BoundedCounterGet)
+        })?;
+        match response.body {
+            ResponseBody::BoundedValue {
+                value,
+                capacity,
+                share_min,
+                share_max,
+            } => Ok(Some(BoundedValue {
+                value,
+                capacity,
+                share_min,
+                share_max,
+            })),
+            ResponseBody::Diagnostic(_) => Ok(None),
+            _ => Err(ClientError::Internal(
+                "unexpected bounded-get body".to_owned(),
+            )),
+        }
+    }
+
+    /// Narrows one bounded counter's escrow share to `[new_min, new_max]`
+    /// (lone operations narrow only — widening pairs inside atomic
+    /// transfers, see `OrderedClient` batch composition with
+    /// [`kivi_state::plan_escrow_transfer`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport/routing failure, wrong-type
+    /// access, or [`ClientError::BoundedExceeded`] (not a narrowing, the
+    /// value uncovered, or outside capacity).
+    pub fn escrow_narrow(&self, key: &Key, new_min: i64, new_max: i64) -> Result<u64, ClientError> {
+        use kivi_protocol::{Opcode, ResponseBody};
+        let response = self.execute(key, Opcode::EscrowTransfer, || {
+            let mut request = self.request_base(key, Opcode::EscrowTransfer);
+            request.share_min = new_min;
+            request.share_max = new_max;
+            request
+        })?;
+        match response.body {
+            ResponseBody::Stored { version } => Ok(version),
+            _ => Err(ClientError::Internal(
+                "unexpected escrow-transfer body".to_owned(),
+            )),
+        }
+    }
+
+    /// Creates a semaphore with `capacity` total permits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport/routing failure or when the key
+    /// already holds live state.
+    pub fn semaphore_create(&self, key: &Key, capacity: u64) -> Result<u64, ClientError> {
+        use kivi_protocol::{Opcode, ResponseBody};
+        let response = self.execute(key, Opcode::SemaphoreCreate, || {
+            let mut request = self.request_base(key, Opcode::SemaphoreCreate);
+            request.capacity = capacity;
+            request
+        })?;
+        match response.body {
+            ResponseBody::Stored { version } => Ok(version),
+            _ => Err(ClientError::Internal(
+                "unexpected semaphore-create body".to_owned(),
+            )),
+        }
+    }
+
+    /// Acquires `qty` permits under `permit`: idempotent by permit id (a
+    /// retry with the same id returns success without acquiring twice —
+    /// mint stable ids per acquisition attempt, e.g. via
+    /// [`kivi_state::PermitId::derive`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport/routing failure, wrong-type
+    /// access, unknown semaphore, or [`ClientError::SemaphoreExhausted`].
+    pub fn semaphore_acquire(
+        &self,
+        key: &Key,
+        permit: [u8; 16],
+        owner: u64,
+        qty: u64,
+    ) -> Result<(), ClientError> {
+        use kivi_protocol::{Opcode, ResponseBody};
+        let response = self.execute(key, Opcode::SemaphoreAcquire, || {
+            let mut request = self.request_base(key, Opcode::SemaphoreAcquire);
+            request.permit = permit;
+            request.owner = owner;
+            request.qty = qty;
+            request
+        })?;
+        match response.body {
+            ResponseBody::SemaphoreAcquired => Ok(()),
+            _ => Err(ClientError::Internal(
+                "unexpected semaphore-acquire body".to_owned(),
+            )),
+        }
+    }
+
+    /// Releases the permits held under `permit`: idempotent (unknown or
+    /// already-released ids report `false` and mint nothing).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport/routing failure or wrong-type access.
+    pub fn semaphore_release(&self, key: &Key, permit: [u8; 16]) -> Result<bool, ClientError> {
+        use kivi_protocol::{Opcode, ResponseBody};
+        let response = self.execute(key, Opcode::SemaphoreRelease, || {
+            let mut request = self.request_base(key, Opcode::SemaphoreRelease);
+            request.permit = permit;
+            request
+        })?;
+        match response.body {
+            ResponseBody::SemaphoreReleased { released } => Ok(released),
+            _ => Err(ClientError::Internal(
+                "unexpected semaphore-release body".to_owned(),
+            )),
+        }
+    }
+
+    /// Inspects a semaphore's outstanding load and capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport/routing failure, wrong-type
+    /// access, or unknown semaphore.
+    pub fn semaphore_inspect(&self, key: &Key) -> Result<SemaphoreLoad, ClientError> {
+        use kivi_protocol::{Opcode, ResponseBody};
+        let response = self.execute(key, Opcode::SemaphoreInspect, || {
+            self.request_base(key, Opcode::SemaphoreInspect)
+        })?;
+        match response.body {
+            ResponseBody::SemaphoreLoad {
+                outstanding,
+                capacity,
+            } => Ok(SemaphoreLoad {
+                outstanding,
+                capacity,
+            }),
+            _ => Err(ClientError::Internal(
+                "unexpected semaphore-inspect body".to_owned(),
+            )),
+        }
+    }
+
+    /// Acquires (or re-acquires after expiry) the lease for `owner` with a
+    /// logical TTL in micros (`0` = immortal until released). Success
+    /// issues a fresh fencing token: present it on every guarded external
+    /// action, and require the resource to reject older tokens — that
+    /// rejection (not the expiry) is what retires old holders.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport/routing failure, wrong-type
+    /// access, or [`ClientError::LeaseConflict`] (live holder — renew
+    /// instead of re-granting).
+    pub fn lease_acquire(
+        &self,
+        key: &Key,
+        owner: u64,
+        ttl_micros: u64,
+    ) -> Result<LeaseGrant, ClientError> {
+        use kivi_protocol::{Opcode, ResponseBody};
+        let response = self.execute(key, Opcode::LeaseAcquire, || {
+            let mut request = self.request_base(key, Opcode::LeaseAcquire);
+            request.owner = owner;
+            request.ttl = ttl_micros;
+            request
+        })?;
+        match response.body {
+            ResponseBody::LeaseAcquired {
+                fencing,
+                expires_at,
+            } => Ok(LeaseGrant {
+                fencing,
+                expires_at,
+            }),
+            _ => Err(ClientError::Internal(
+                "unexpected lease-acquire body".to_owned(),
+            )),
+        }
+    }
+
+    /// Extends a live grant: requires the exact current fencing token. A
+    /// stale token fails without mutating and can never revive a
+    /// replaced or expired lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport/routing failure, wrong-type
+    /// access, or [`ClientError::StaleFencing`].
+    pub fn lease_renew(
+        &self,
+        key: &Key,
+        owner: u64,
+        fencing: u64,
+        ttl_micros: u64,
+    ) -> Result<LeaseGrant, ClientError> {
+        use kivi_protocol::{Opcode, ResponseBody};
+        let response = self.execute(key, Opcode::LeaseRenew, || {
+            let mut request = self.request_base(key, Opcode::LeaseRenew);
+            request.owner = owner;
+            request.fencing = fencing;
+            request.ttl = ttl_micros;
+            request
+        })?;
+        match response.body {
+            ResponseBody::LeaseRenewed {
+                fencing,
+                expires_at,
+            } => Ok(LeaseGrant {
+                fencing,
+                expires_at,
+            }),
+            _ => Err(ClientError::Internal(
+                "unexpected lease-renew body".to_owned(),
+            )),
+        }
+    }
+
+    /// Releases a live grant: requires the exact current fencing token. A
+    /// stale token fails without mutating and can never free a newer
+    /// holder's lease. Releasing a free lease reports `false`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport/routing failure, wrong-type
+    /// access, or [`ClientError::StaleFencing`].
+    pub fn lease_release(&self, key: &Key, owner: u64, fencing: u64) -> Result<bool, ClientError> {
+        use kivi_protocol::{Opcode, ResponseBody};
+        let response = self.execute(key, Opcode::LeaseRelease, || {
+            let mut request = self.request_base(key, Opcode::LeaseRelease);
+            request.owner = owner;
+            request.fencing = fencing;
+            request
+        })?;
+        match response.body {
+            ResponseBody::LeaseReleased { released } => Ok(released),
+            _ => Err(ClientError::Internal(
+                "unexpected lease-release body".to_owned(),
+            )),
+        }
+    }
+
+    /// Inspects a lease: the live holder at now (`None` when free or
+    /// expired) plus the next fencing token to be issued. Never mutates.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport/routing failure or wrong-type access.
+    pub fn lease_inspect(&self, key: &Key) -> Result<LeaseInfo, ClientError> {
+        use kivi_protocol::{Opcode, ResponseBody};
+        let response = self.execute(key, Opcode::LeaseInspect, || {
+            self.request_base(key, Opcode::LeaseInspect)
+        })?;
+        match response.body {
+            ResponseBody::LeaseInfo {
+                owner,
+                fencing,
+                expires_at,
+                next_fencing,
+            } => Ok(LeaseInfo {
+                owner,
+                fencing,
+                expires_at,
+                next_fencing,
+            }),
+            _ => Err(ClientError::Internal(
+                "unexpected lease-inspect body".to_owned(),
+            )),
+        }
+    }
+
+    /// Creates one shard of a sharded stream. Shards are independent
+    /// ordered logs: total order within the shard, none across shards.
+    /// Callers own shard keys (any bytes; distinct keys hash to distinct
+    /// tablets) and map partitions to shards with
+    /// [`OrderedClient::stream_shard_for`] (stable, deterministic).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport/routing failure or when the key
+    /// already holds live state.
+    pub fn stream_create(
+        &self,
+        key: &Key,
+        stream: [u8; 16],
+        shard: u32,
+    ) -> Result<(), ClientError> {
+        use kivi_protocol::{Opcode, ResponseBody};
+        let response = self.execute(key, Opcode::StreamCreate, || {
+            let mut request = self.request_base(key, Opcode::StreamCreate);
+            request.stream = stream;
+            request.shard = shard;
+            request
+        })?;
+        match response.body {
+            ResponseBody::StreamCreated => Ok(()),
+            _ => Err(ClientError::Internal(
+                "unexpected stream-create body".to_owned(),
+            )),
+        }
+    }
+
+    /// Appends one entry to a stream shard, assigning the shard's next
+    /// offset. The `partition` key is retained for audit (it is what
+    /// routed the entry here); the offset is shard-local and monotonic,
+    /// never global.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport/routing failure, wrong-type
+    /// access, unknown shard, or [`ClientError::StreamFull`].
+    pub fn stream_append(
+        &self,
+        key: &Key,
+        partition: &[u8],
+        payload: &[u8],
+    ) -> Result<u64, ClientError> {
+        use kivi_protocol::{Opcode, ResponseBody};
+        let response = self.execute(key, Opcode::StreamAppend, || {
+            let mut request = self.request_base(key, Opcode::StreamAppend);
+            request.partition = partition.to_vec();
+            request.value = Some(payload.to_vec());
+            request
+        })?;
+        match response.body {
+            ResponseBody::StreamAppended { offset } => Ok(offset),
+            _ => Err(ClientError::Internal(
+                "unexpected stream-append body".to_owned(),
+            )),
+        }
+    }
+
+    /// Reads one shard's entries from `from_offset` (inclusive), up to
+    /// `max_entries`. Implies nothing about other shards: merged
+    /// cross-shard reads are the caller's explicit composition, never a
+    /// fabricated global order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport/routing failure or wrong-type access.
+    pub fn stream_read(
+        &self,
+        key: &Key,
+        from_offset: u64,
+        max_entries: u32,
+    ) -> Result<StreamPage, ClientError> {
+        use kivi_protocol::{Opcode, ResponseBody};
+        let response = self.execute(key, Opcode::StreamRead, || {
+            let mut request = self.request_base(key, Opcode::StreamRead);
+            request.offset = from_offset;
+            request.len = u64::from(max_entries);
+            request
+        })?;
+        match response.body {
+            ResponseBody::StreamEntries {
+                entries,
+                next_offset,
+            } => Ok(StreamPage {
+                entries: entries
+                    .into_iter()
+                    .map(|entry| StreamEntry {
+                        offset: entry.offset,
+                        partition: entry.partition,
+                        payload: entry.payload,
+                    })
+                    .collect(),
+                next_offset,
+            }),
+            _ => Err(ClientError::Internal(
+                "unexpected stream-read body".to_owned(),
+            )),
+        }
+    }
+
+    /// Trims a shard's retained prefix through `through_offset`
+    /// (inclusive). The cursor never rewinds: trimmed offsets are gone,
+    /// not reusable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport/routing failure or wrong-type access.
+    pub fn stream_trim(&self, key: &Key, through_offset: u64) -> Result<u64, ClientError> {
+        use kivi_protocol::{Opcode, ResponseBody};
+        let response = self.execute(key, Opcode::StreamTrim, || {
+            let mut request = self.request_base(key, Opcode::StreamTrim);
+            request.offset = through_offset;
+            request
+        })?;
+        match response.body {
+            ResponseBody::StreamTrimmed { removed } => Ok(removed),
+            _ => Err(ClientError::Internal(
+                "unexpected stream-trim body".to_owned(),
+            )),
+        }
     }
 }
 

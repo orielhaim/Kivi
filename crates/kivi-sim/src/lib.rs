@@ -31,6 +31,7 @@ pub mod rng;
 pub mod scheduler;
 pub mod storage;
 pub mod trace;
+pub mod txn;
 
 pub use cluster::{
     AppHandler, ClusterAction, ClusterError, ClusterEvent, ClusterTrace, DropKind,
@@ -47,3 +48,8 @@ pub use rng::SimRng;
 pub use scheduler::{ScheduleError, Scheduled, Scheduler};
 pub use storage::{StorageError, StorageFault, StorageOp, StorageResult, VirtualDisk};
 pub use trace::{RecordedDecision, Trace, TraceEntry};
+pub use txn::{
+    AppliedWrite, TxnDecision, TxnDigest, TxnDriverEv, TxnIntent, TxnKey, TxnMsg, TxnSim, TxnSimId,
+    TxnWrite, assert_quiesced_atomic, decode_msg, encode_msg, invariant_no_guess,
+    invariant_no_partial_commit, invariant_no_split_decision,
+};

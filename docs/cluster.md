@@ -110,6 +110,55 @@ bounded (`--max-redirects`, default 8), and surfaces `Overloaded`
 (election in flight) instead of looping. There is deliberately no
 global leader: each tablet elects independently.
 
+## Transactions and semantic types
+
+Atomic multi-key writes, same API from one key to many:
+
+```powershell
+cargo run -p kivi-server --bin kivi-cli -- --server 127.0.0.1:9202 atomic-batch --write a=1,b=2
+# both commit or neither does
+```
+
+Single-tablet batches commit server-side in one roundtrip. Batches
+spanning tablets run client-driven OCC + 2PC with bounded retries: the
+coordinator is always the lowest participant tablet (derived, never
+configured — recovery re-drives agree with no control-plane
+involvement), prepares carry a write-set digest binding the exact
+transaction (a conflicting digest under one id is rejected, never
+mixed in), and conflicts surface as `TxnConflict` after retries. Range
+and predicate transactions are rejected loudly — point writes only.
+
+Beyond bytes and strict counters, keys can hold typed values (client
+methods, same routing and contracts as point ops):
+
+```text
+commutative counter   order-free adds, no ordinals exposed
+                      (commutative_add / commutative_get)
+bounded counter       capacity + escrow shares; adds stay inside owned
+                      rights, rights move by paired transfer — narrowing
+                      is unilateral, widening pairs in one atomic batch
+                      (bounded_create / bounded_add / bounded_get)
+semaphore             capacity permits, idempotent acquire by client-
+                      minted permit id, releases never mint capacity
+                      (semaphore_create / semaphore_acquire /
+                      semaphore_release / semaphore_inspect)
+lease                 fencing tokens advance on every grant; stale
+                      tokens are powerless (renew/release reject them),
+                      expiry frees the lease but only a newer token
+                      retires the old holder
+                      (lease_acquire / lease_renew / lease_release /
+                      lease_inspect)
+sharded stream        per-shard ordered logs; offsets are shard-local
+                      and monotonic, trims never rewind, appends never
+                      reuse (stream_create / stream_append /
+                      stream_read / stream_trim)
+```
+
+Failures are machine-readable statuses, never strings:
+`BoundedExceeded`, `SemaphoreExhausted`, `LeaseConflict`,
+`StaleFencing`, `StreamFull`, `TxnConflict`, `TxnCrossTablet`.
+Scans surface typed values as descriptors, never inlined bulk.
+
 ## Failover drill (the product promise)
 
 ```text

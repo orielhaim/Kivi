@@ -8,12 +8,18 @@ rust-version.workspace = true
 kivi-types.workspace = true
 kivi-codec.workspace = true
 hashbrown.workspace = true
+bitflags.workspace = true
 bytes.workspace = true
 blake3.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+divan.workspace = true
 proptest.workspace = true
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "semantic"
+harness = false

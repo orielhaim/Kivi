@@ -1,16 +1,16 @@
 #Requires -Version 7
 <#
 .SYNOPSIS
-  TLC check runner for the roster_lease formal model (fast gate only).
+  TLC check runner for the Kivi formal models (fast gate only).
 .DESCRIPTION
   Runs each TLC configuration in an isolated scratch directory (never in
   spec/, so TLC states/traces never pollute the repo) and verifies the
   verdict against the declared expectation:
-    - the canonical model must PASS exhaustive and clean;
-    - each exhibiting broken variant must FAIL with a NoStaleRead
-      violation — a broken config that passes, violates a different
-      invariant, or needs more than the timeout to fire is a modeling
-      problem and fails the run.
+    - each canonical model must PASS exhaustive and clean;
+    - each exhibiting broken variant must FAIL with its declared
+      invariant violation - a broken config that passes, violates a
+      different invariant, or needs more than the timeout to fire is a
+      modeling problem and fails the run.
   Every check here finishes in ~2 minutes or less on a development
   machine. Larger explorations (full-composition base model, deep
   variant scopes) are manual research, not gate checks: reconstruct
@@ -30,15 +30,26 @@ param(
 
 $ErrorActionPreference = "Stop"
 $SpecDir = $PSScriptRoot
-$Jar = Join-Path $SpecDir "..\.research\tla2tools.jar" | Resolve-Path | ForEach-Object { $_.Path }
+$JarPath = Join-Path $SpecDir "..\.research\tla2tools.jar"
+if (-not (Test-Path $JarPath)) {
+  throw "TLC jar not found at $JarPath. Download tla2tools.jar (https://github.com/tlaplus/tlaplus/releases) into .research/ (git-ignored, never committed)."
+}
+$Jar = (Resolve-Path $JarPath).Path
 
-# Fast gate set: canonical exhaustive plus the two exhibiting
-# negatives. Everything here verdicts in ~2 minutes or less.
+# Fast gate set: canonical exhaustive plus the exhibiting negatives.
+# Everything here verdicts in ~2 minutes or less.
 if ($Only.Count -eq 0) {
   $Only = @(
     "roster_lease_canonical",
     "roster_lease_broken_floor",
-    "roster_lease_broken_takeover"
+    "roster_lease_broken_takeover",
+    "txn_2pc_canonical",
+    "txn_2pc_broken_guess_commit",
+    "txn_2pc_broken_guess_abort",
+    "escrow_canonical",
+    "escrow_broken_mint",
+    "lease_canonical",
+    "lease_broken_revive"
   )
 }
 
@@ -47,6 +58,27 @@ $Expectations = @{
   "roster_lease_canonical"         = "pass"
   "roster_lease_broken_floor"      = "NoStaleRead"
   "roster_lease_broken_takeover"   = "NoStaleRead"
+  "txn_2pc_canonical"              = "pass"
+  "txn_2pc_broken_guess_commit"    = "CommitNeedsDecision"
+  "txn_2pc_broken_guess_abort"     = "NoPartialCommit"
+  "escrow_canonical"               = "pass"
+  "escrow_broken_mint"             = "RightsConserved"
+  "lease_canonical"                = "pass"
+  "lease_broken_revive"            = "HolderFresh"
+}
+
+# check name -> TLA module under test.
+$Modules = @{
+  "roster_lease_canonical"         = "roster_lease"
+  "roster_lease_broken_floor"      = "roster_lease"
+  "roster_lease_broken_takeover"   = "roster_lease"
+  "txn_2pc_canonical"              = "txn_2pc"
+  "txn_2pc_broken_guess_commit"    = "txn_2pc"
+  "txn_2pc_broken_guess_abort"     = "txn_2pc"
+  "escrow_canonical"               = "escrow"
+  "escrow_broken_mint"             = "escrow"
+  "lease_canonical"                = "lease"
+  "lease_broken_revive"            = "lease"
 }
 
 $Failures = 0
@@ -56,10 +88,11 @@ $Rows = @()
 foreach ($name in $Only) {
   if (-not $Expectations.ContainsKey($name)) { throw "unknown check: $name" }
   $expect = $Expectations[$name]
+  $module = $Modules[$name]
   $work = Join-Path $WorkRoot $name
   if (Test-Path $work) { Remove-Item $work -Recurse -Force }
   New-Item -ItemType Directory -Path $work | Out-Null
-  Copy-Item (Join-Path $SpecDir "roster_lease.tla") $work
+  Copy-Item (Join-Path $SpecDir "$module.tla") $work
   Copy-Item (Join-Path $SpecDir "$name.cfg") $work
   $meta = Join-Path $work "meta"
   $outFile = Join-Path $work "tlc-out.txt"
@@ -70,7 +103,7 @@ foreach ($name in $Only) {
     "-Xmx$Xmx", "-XX:+UseParallelGC",
     "-cp", $Jar, "tlc2.TLC",
     "-config", "$name.cfg", "-workers", "$Workers",
-    "-metadir", $meta, "roster_lease"
+    "-metadir", $meta, $module
   ) -WorkingDirectory $work -NoNewWindow -PassThru `
     -RedirectStandardOutput $outFile -RedirectStandardError $errFile
   $finished = $proc.WaitForExit($TimeoutSec * 1000)

@@ -126,6 +126,14 @@ pub enum ClientScanValue {
         /// Logical length.
         logical_len: u64,
     },
+    /// Typed semantic value by small descriptor (object type tag plus
+    /// canonical descriptor bytes; never inlined bulk).
+    Semantic {
+        /// Object type tag (mirrors `kivi-state`'s `ObjectType` tags).
+        object: u8,
+        /// Small canonical descriptor bytes for `object`.
+        descriptor: Bytes,
+    },
 }
 
 /// One scan page with its routing metadata.
@@ -143,6 +151,8 @@ pub struct ClientScanPage {
     pub range_start: Vec<u8>,
     /// Serving range end (`None` = `+∞`).
     pub range_end: Option<Vec<u8>>,
+    /// Serving directory version (staleness hint for transaction plans).
+    pub dir_version: u64,
 }
 
 /// Resumable scan cursor: everything semantically required, nothing
@@ -270,6 +280,19 @@ impl NativeClient {
                 batch_writes: Vec::new(),
                 txn_coordinator: 0,
                 txn_commit: false,
+                txn_digest: [0u8; 32],
+                capacity: 0,
+                holder: 0,
+                permit: [0u8; 16],
+                owner: 0,
+                qty: 0,
+                fencing: 0,
+                ttl: 0,
+                stream: [0u8; 16],
+                shard: 0,
+                partition: Vec::new(),
+                share_min: 0,
+                share_max: 0,
             },
             None,
             kivi_types::ReadContract::Latest,
@@ -284,7 +307,7 @@ impl NativeClient {
                     tablet,
                     range_start,
                     range_end,
-                    dir_version: _,
+                    dir_version,
                 },
             ) => Ok(ClientScanPage {
                 entries: entries
@@ -309,6 +332,12 @@ impl NativeClient {
                             kivi_protocol::ScanValueBody::Oversize { logical_len } => {
                                 ClientScanValue::Oversize { logical_len }
                             }
+                            kivi_protocol::ScanValueBody::Semantic { object, descriptor } => {
+                                ClientScanValue::Semantic {
+                                    object,
+                                    descriptor: Bytes::from(descriptor),
+                                }
+                            }
                         },
                     })
                     .collect(),
@@ -317,6 +346,7 @@ impl NativeClient {
                 tablet,
                 range_start,
                 range_end,
+                dir_version,
             }),
             (status, body) => Err(status_error(status, &body)),
         }
@@ -522,6 +552,19 @@ impl NativeClient {
                 batch_writes: Vec::new(),
                 txn_coordinator: 0,
                 txn_commit: false,
+                txn_digest: [0u8; 32],
+                capacity: 0,
+                holder: 0,
+                permit: [0u8; 16],
+                owner: 0,
+                qty: 0,
+                fencing: 0,
+                ttl: 0,
+                stream: [0u8; 16],
+                shard: 0,
+                partition: Vec::new(),
+                share_min: 0,
+                share_max: 0,
             },
             None,
             kivi_types::ReadContract::Latest,
@@ -554,10 +597,32 @@ pub struct BatchWriteSpec {
 pub enum BatchWriteKind {
     /// Store bytes (SET semantics).
     Put(Vec<u8>),
+    /// Store a staged large value by chunk reference (stage the bytes
+    /// through a streaming upload first; the reference is proven at
+    /// admission before any participant may prepare).
+    PutChunked {
+        /// Manifest addressing the immutable chunk sequence.
+        manifest: [u8; 32],
+        /// Total logical bytes across the manifest.
+        logical_len: u64,
+    },
     /// Remove the key.
     Delete,
-    /// Add to a counter.
+    /// Add to a strict counter (ordinal result).
     CounterAdd(i64),
+    /// Add to a commutative counter (order-free; result is `Applied`).
+    CommutativeAdd(i64),
+    /// Add to a bounded counter (escrow rights checked at prepare).
+    BoundedAdd(i64),
+    /// Move one bounded counter's escrow share to `[min, max]` (one side
+    /// of a paired, conservation-checked transfer — see
+    /// [`kivi_state::plan_escrow_transfer`]).
+    EscrowSetShare {
+        /// New share lower bound (inclusive).
+        min: i64,
+        /// New share upper bound (inclusive).
+        max: i64,
+    },
 }
 
 /// OCC expectation for one batch write.
@@ -616,13 +681,19 @@ impl NativeClient {
                 write.key.len()
                     + match &write.kind {
                         BatchWriteKind::Put(value) => value.len(),
-                        BatchWriteKind::Delete | BatchWriteKind::CounterAdd(_) => 8,
+                        BatchWriteKind::PutChunked { .. } => 40,
+                        BatchWriteKind::Delete
+                        | BatchWriteKind::CounterAdd(_)
+                        | BatchWriteKind::CommutativeAdd(_)
+                        | BatchWriteKind::BoundedAdd(_)
+                        | BatchWriteKind::EscrowSetShare { .. } => 8,
                     }
             })
             .sum();
         if bytes > kivi_state::MAX_TXN_BYTES {
             return Err(ClientError::TxnTooLarge);
         }
+        self.note_txn_started();
         let mut attempt: u32 = 0;
         loop {
             let salt = self.next_id().as_u64();
@@ -633,12 +704,24 @@ impl NativeClient {
                     attempt += 1;
                     backoff(Duration::from_millis(10), attempt.min(6));
                 }
-                Err(BatchAttempt::Conflict) => return Err(ClientError::TxnConflict),
+                Err(BatchAttempt::Conflict) => {
+                    self.note_txn_aborted(true);
+                    return Err(ClientError::TxnConflict);
+                }
                 Err(BatchAttempt::Redrive) => {
                     // Same-transaction re-drive: bounded internally.
-                    return self.redrive(namespace, writes, txn);
+                    return match self.redrive(namespace, writes, txn) {
+                        Ok(result) => Ok(result),
+                        Err(error) => {
+                            self.note_txn_aborted(matches!(error, ClientError::TxnConflict));
+                            Err(error)
+                        }
+                    };
                 }
-                Err(BatchAttempt::Error(error)) => return Err(error),
+                Err(BatchAttempt::Error(error)) => {
+                    self.note_txn_aborted(matches!(error, ClientError::TxnConflict));
+                    return Err(error);
+                }
             }
         }
     }
@@ -669,6 +752,53 @@ impl NativeClient {
         }
     }
 
+    /// Encodes one batch write for the wire: kind, value, delta, and OCC
+    /// expectation. Shared by the fast-path batch and the 2PC prepare
+    /// step so both waves encode identically.
+    fn encode_wire_write(write: &BatchWriteSpec) -> kivi_protocol::BatchWrite {
+        let (kind, value, delta) = match &write.kind {
+            BatchWriteKind::Put(value) => (kivi_protocol::BATCH_PUT, value.clone(), 0),
+            BatchWriteKind::PutChunked {
+                manifest,
+                logical_len,
+            } => {
+                let mut blob = Vec::with_capacity(40);
+                blob.extend_from_slice(manifest);
+                blob.extend_from_slice(&logical_len.to_le_bytes());
+                (kivi_protocol::BATCH_PUT_CHUNKED, blob, 0)
+            }
+            BatchWriteKind::Delete => (kivi_protocol::BATCH_DELETE, Vec::new(), 0),
+            BatchWriteKind::CounterAdd(delta) => {
+                (kivi_protocol::BATCH_COUNTER_ADD, Vec::new(), *delta)
+            }
+            BatchWriteKind::CommutativeAdd(delta) => {
+                (kivi_protocol::BATCH_COMMUTATIVE_ADD, Vec::new(), *delta)
+            }
+            BatchWriteKind::BoundedAdd(delta) => {
+                (kivi_protocol::BATCH_BOUNDED_ADD, Vec::new(), *delta)
+            }
+            BatchWriteKind::EscrowSetShare { min, max } => {
+                let mut blob = Vec::with_capacity(16);
+                blob.extend_from_slice(&min.to_le_bytes());
+                blob.extend_from_slice(&max.to_le_bytes());
+                (kivi_protocol::BATCH_ESCROW_SHARE, blob, 0)
+            }
+        };
+        let (expect, expect_version) = match write.expect {
+            BatchExpect::Any => (kivi_protocol::BATCH_EXPECT_ANY, 0),
+            BatchExpect::Absent => (kivi_protocol::BATCH_EXPECT_ABSENT, 0),
+            BatchExpect::Version(version) => (kivi_protocol::BATCH_EXPECT_VERSION, version),
+        };
+        kivi_protocol::BatchWrite {
+            key: write.key.clone(),
+            kind,
+            value,
+            delta,
+            expect,
+            expect_version,
+        }
+    }
+
     /// One batch attempt under a fixed `TxnId`: fast path first, then
     /// client-driven 2PC on multi-tablet rejection.
     fn batch_attempt(
@@ -678,73 +808,37 @@ impl NativeClient {
         txn: TxnId,
     ) -> Result<AtomicBatchResult, BatchAttempt> {
         use kivi_protocol::{Opcode, ResponseBody};
-        let mut wire = Vec::with_capacity(writes.len());
-        for write in writes {
-            let (kind, value, delta) = match &write.kind {
-                BatchWriteKind::Put(value) => (kivi_protocol::BATCH_PUT, value.clone(), 0),
-                BatchWriteKind::Delete => (kivi_protocol::BATCH_DELETE, Vec::new(), 0),
-                BatchWriteKind::CounterAdd(delta) => {
-                    (kivi_protocol::BATCH_COUNTER_ADD, Vec::new(), *delta)
-                }
-            };
-            let (expect, expect_version) = match write.expect {
-                BatchExpect::Any => (kivi_protocol::BATCH_EXPECT_ANY, 0),
-                BatchExpect::Absent => (kivi_protocol::BATCH_EXPECT_ABSENT, 0),
-                BatchExpect::Version(version) => (kivi_protocol::BATCH_EXPECT_VERSION, version),
-            };
-            wire.push(kivi_protocol::BatchWrite {
-                key: write.key.clone(),
-                kind,
-                value,
-                delta,
-                expect,
-                expect_version,
-            });
-        }
+        let wire: Vec<kivi_protocol::BatchWrite> =
+            writes.iter().map(Self::encode_wire_write).collect();
         let route_key = Key::from(writes[0].key.clone());
+        let mut request = self.request_base(&route_key, Opcode::AtomicBatch);
+        request.namespace = namespace;
+        request.batch_txn = txn.as_bytes();
+        request.batch_writes = wire;
         let response = self
             .execute_raw(
                 &route_key,
                 Opcode::AtomicBatch,
-                || kivi_protocol::Request {
-                    contract: kivi_types::ReadContract::Latest,
-                    namespace,
-                    opcode: Opcode::AtomicBatch,
-                    hint: None,
-                    key: Vec::new(),
-                    value: None,
-                    delta: 0,
-                    expiry: 0,
-                    offset: 0,
-                    len: 0,
-                    condition: kivi_protocol::COND_ALWAYS,
-                    expiry_policy: kivi_protocol::EXPIRY_CLEAR,
-                    identity: None,
-                    ack_floor: kivi_types::RequestSeq::from_u64(0),
-                    scan_start: None,
-                    scan_end: None,
-                    scan_direction: kivi_protocol::SCAN_FORWARD,
-                    scan_max_items: 0,
-                    scan_max_bytes: 0,
-                    scan_projection: kivi_protocol::SCAN_KEYS_ONLY,
-                    scan_consistency: kivi_protocol::SCAN_LATEST_PER_TABLET,
-                    batch_txn: txn.as_bytes(),
-                    batch_writes: wire.clone(),
-                    txn_coordinator: 0,
-                    txn_commit: false,
-                },
+                || request.clone(),
                 None,
                 kivi_types::ReadContract::Latest,
             )
             .map_err(BatchAttempt::Error)?;
         match (response.status, response.body) {
             (kivi_protocol::Status::Ok, ResponseBody::AtomicCommitted { versions }) => {
+                self.note_txn_committed(false);
                 Ok(AtomicBatchResult { txn, versions })
             }
-            (kivi_protocol::Status::TxnTooLarge, ResponseBody::Diagnostic(message))
-                if message.contains("tablets") =>
-            {
-                self.drive_2pc(namespace, writes, txn)
+            // Typed cross-tablet signal (never string-matched):
+            // single-tablet fast path cannot serve this set.
+            (kivi_protocol::Status::TxnCrossTablet, _) => {
+                match self.drive_2pc(namespace, writes, txn) {
+                    Ok(result) => {
+                        self.note_txn_committed(true);
+                        Ok(result)
+                    }
+                    Err(attempt) => Err(attempt),
+                }
             }
             (kivi_protocol::Status::TxnConflict, _) => Err(BatchAttempt::Conflict),
             (
@@ -756,76 +850,168 @@ impl NativeClient {
         }
     }
 
-    /// Client-driven OCC + 2PC across tablets: probe coordinator, prepare
+    /// Client-driven OCC + 2PC across tablets: probe participants, prepare
     /// every key, persist the decision, finalize all. Recovery-first: an
     /// existing durable decision skips straight to finalizes.
+    ///
+    /// Coordinator selection is deterministic: the lowest probed
+    /// participant tablet. Every drive of one write set under stable
+    /// routing derives the same coordinator with no control-plane
+    /// involvement, so recovery re-drives agree after failures.
     fn drive_2pc(
         &self,
         namespace: NamespaceId,
         writes: &[BatchWriteSpec],
         txn: TxnId,
     ) -> Result<AtomicBatchResult, BatchAttempt> {
+        let typed = Self::typed_writes(writes)?;
+        let digest = kivi_state::write_set_digest(&typed, namespace);
+        let drive = self.probe_participants(namespace, writes)?;
+        let attempt = TxnAttempt {
+            txn,
+            coordinator: drive.coordinator,
+            digest,
+        };
         // Recovery-first: a durable decision from an earlier drive of this
-        // transaction resolves without re-preparing (re-prepares after a
-        // commit would spuriously conflict with the committed state).
-        // The coordinator is unknown before the first prepare, so probe
-        // the record optimistically is impossible: learn it below.
-        let coordinator = self.probe_coordinator(namespace, &writes[0].key)?;
-        let record_key = kivi_state::txn_record_key(coordinator, txn);
+        // transaction resolves without re-preparing. Only a decision
+        // carrying this exact digest governs (a foreign digest under one
+        // `TxnId` is a conflicting driver — fail loudly, never follow).
+        let record_key = kivi_state::txn_record_key(attempt.coordinator, txn);
         if let Some(record) = self.read_txn_record(namespace, &record_key)? {
             match record.state {
-                TxnState::Committed => {
-                    return self.finalize_all(namespace, writes, txn, true);
+                TxnState::Committed if record.digest == digest => {
+                    return self.finalize_all_recovery(namespace, writes, txn, true, digest);
                 }
-                TxnState::Aborted => return Err(BatchAttempt::Error(ClientError::TxnAborted)),
+                TxnState::Aborted if record.digest == digest => {
+                    return Err(BatchAttempt::Error(ClientError::TxnAborted));
+                }
                 TxnState::Begun => {}
+                _ => return Err(BatchAttempt::Conflict),
             }
         }
-        // Prepare every key in request order (deterministic), learning
-        // participant tablets from the prepare responses.
+        let ready = match self.prepare_wave(namespace, writes, attempt, &drive.probed) {
+            Ok(ready) => ready,
+            Err((aborted, prepared)) => {
+                return self.abort_or_commit(namespace, writes, attempt, &prepared, aborted);
+            }
+        };
+        self.decide_and_finalize(namespace, writes, attempt, drive, ready)
+    }
+
+    /// Discovers one drive's participants (route-cache first, one-entry
+    /// scan probes on misses) and derives the lowest-tablet coordinator
+    /// plus the directory version the plan routes against.
+    fn probe_participants(
+        &self,
+        namespace: NamespaceId,
+        writes: &[BatchWriteSpec],
+    ) -> Result<ProbedDrive, BatchAttempt> {
+        // Probes warm the route cache for the waves below.
+        let mut probed: std::collections::BTreeMap<Vec<u8>, (TabletId, u64)> =
+            std::collections::BTreeMap::new();
+        let mut dir_version: u64 = 0;
+        for write in writes {
+            let (tablet, version) = self.probe_tablet(namespace, &write.key)?;
+            dir_version = dir_version.max(version);
+            probed.insert(write.key.clone(), (tablet, version));
+        }
+        let coordinator = probed
+            .values()
+            .map(|(tablet, _)| *tablet)
+            .min()
+            .ok_or(BatchAttempt::Error(ClientError::InvalidRequest))?;
+        Ok(ProbedDrive {
+            probed,
+            coordinator,
+            dir_version,
+        })
+    }
+
+    /// Prepares every key in request order (deterministic), verifying
+    /// each prepare served on its probed tablet. Stops at the first
+    /// failure with the partial reservations made: the driver aborts
+    /// those explicitly (never a silent remap into another lineage, never
+    /// an ambiguous half-drive).
+    fn prepare_wave(
+        &self,
+        namespace: NamespaceId,
+        writes: &[BatchWriteSpec],
+        attempt: TxnAttempt,
+        probed: &std::collections::BTreeMap<Vec<u8>, (TabletId, u64)>,
+    ) -> Result<PreparedDrive, (BatchAttempt, Vec<usize>)> {
+        let prepare_start = std::time::Instant::now();
         let mut prepared: Vec<usize> = Vec::with_capacity(writes.len());
         let mut observed: std::collections::BTreeSet<TabletId> = std::collections::BTreeSet::new();
         for (index, write) in writes.iter().enumerate() {
-            match self.txn_prepare(namespace, write, txn, coordinator) {
+            let (expected_tablet, _) = probed[write.key.as_slice()];
+            match self.txn_prepare(
+                namespace,
+                write,
+                attempt.txn,
+                attempt.coordinator,
+                attempt.digest,
+            ) {
                 Ok(tablet) => {
+                    if tablet != expected_tablet {
+                        return Err((BatchAttempt::Conflict, prepared));
+                    }
                     observed.insert(tablet);
                     prepared.push(index);
                 }
-                Err(
-                    ClientError::TxnConflict
-                    | ClientError::WrongType
-                    | ClientError::CounterOverflow,
-                ) => {
-                    return self.abort_or_commit(
-                        namespace,
-                        writes,
-                        txn,
-                        coordinator,
-                        &prepared,
-                        BatchAttempt::Conflict,
-                    );
+                Err(ClientError::TxnConflict) => {
+                    return Err((BatchAttempt::Conflict, prepared));
                 }
                 Err(error) if is_ambiguous(&error) => {
-                    return self.abort_or_commit(
-                        namespace,
-                        writes,
-                        txn,
-                        coordinator,
-                        &prepared,
-                        BatchAttempt::Redrive,
-                    );
+                    return Err((BatchAttempt::Redrive, prepared));
                 }
+                // Deterministic semantic rejections (wrong type, overflow,
+                // rights, fencing, bounds) abort the attempt and surface
+                // intact — retrying the same writes would fail identically.
                 Err(error) => {
-                    return self.abort_or_commit(
-                        namespace,
-                        writes,
-                        txn,
-                        coordinator,
-                        &prepared,
-                        BatchAttempt::Error(error),
-                    );
+                    return Err((BatchAttempt::Error(error), prepared));
                 }
             }
+        }
+        self.note_prepare_latency(
+            u64::try_from(prepare_start.elapsed().as_micros()).unwrap_or(u64::MAX),
+        );
+        Ok(PreparedDrive { prepared, observed })
+    }
+
+    /// Verifies the prepared set against the probe, persists the Commit
+    /// decision (guarded CAS), re-verifies the durable record, and
+    /// finalizes. A lost decide race re-reads before aborting (an
+    /// ambiguous decide may actually have committed — never
+    /// blind-overwrite a decision with an abort).
+    fn decide_and_finalize(
+        &self,
+        namespace: NamespaceId,
+        writes: &[BatchWriteSpec],
+        attempt: TxnAttempt,
+        drive: ProbedDrive,
+        prepared: PreparedDrive,
+    ) -> Result<AtomicBatchResult, BatchAttempt> {
+        let TxnAttempt {
+            txn,
+            coordinator,
+            digest,
+        } = attempt;
+        // The probed set must equal the observed set: any drift means
+        // routing moved under the attempt.
+        if prepared
+            .observed
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            != drive.probed.values().map(|(tablet, _)| *tablet).collect()
+        {
+            return self.abort_or_commit(
+                namespace,
+                writes,
+                attempt,
+                &prepared.prepared,
+                BatchAttempt::Conflict,
+            );
         }
         // All prepared: persist the Commit decision with the observed
         // participants and the canonical digest — guarded (CAS): a
@@ -836,16 +1022,26 @@ impl NativeClient {
             writes,
             txn,
             coordinator,
-            observed.into_iter().collect(),
+            prepared.observed.into_iter().collect(),
+            drive.dir_version,
             TxnState::Committed,
         );
-        if !self.decide_record(namespace, coordinator, &record_key, &record, 0) {
+        let record_key = kivi_state::txn_record_key(coordinator, txn);
+        let decide_start = std::time::Instant::now();
+        let decided = self.decide_record(namespace, coordinator, &record_key, &record, 0);
+        self.note_decision_latency(
+            u64::try_from(decide_start.elapsed().as_micros()).unwrap_or(u64::MAX),
+        );
+        if !decided {
             // Decide failed: re-read before aborting (an ambiguous decide
             // may actually have committed — never blind-overwrite a
             // decision with an abort).
             match self.read_txn_record(namespace, &record_key) {
                 Ok(Some(record)) if record.state == TxnState::Committed => {
-                    return self.finalize_all(namespace, writes, txn, true);
+                    if record.digest != digest {
+                        return Err(BatchAttempt::Conflict);
+                    }
+                    return self.finalize_all_recovery(namespace, writes, txn, true, digest);
                 }
                 Ok(_) => {}
                 Err(BatchAttempt::Redrive) => return Err(BatchAttempt::Redrive),
@@ -855,13 +1051,32 @@ impl NativeClient {
             return self.abort_or_commit(
                 namespace,
                 writes,
-                txn,
-                coordinator,
-                &prepared,
+                attempt,
+                &prepared.prepared,
                 BatchAttempt::Redrive,
             );
         }
-        self.finalize_all(namespace, writes, txn, true)
+        // Verify the durable decision before finalizing: state, digest,
+        // and lineage must be exactly what this attempt decided.
+        match self.read_txn_record(namespace, &record_key) {
+            Ok(Some(record)) if record.state == TxnState::Committed && record.digest == digest => {}
+            Ok(_) => {
+                return self.abort_or_commit(
+                    namespace,
+                    writes,
+                    attempt,
+                    &prepared.prepared,
+                    BatchAttempt::Conflict,
+                );
+            }
+            Err(attempt) => return Err(attempt),
+        }
+        let expected: std::collections::BTreeMap<Vec<u8>, TabletId> = drive
+            .probed
+            .into_iter()
+            .map(|(key, (tablet, _))| (key, tablet))
+            .collect();
+        self.finalize_all(namespace, writes, txn, true, digest, &expected)
     }
 
     /// Persists one terminal decision through an absence-guarded
@@ -883,9 +1098,9 @@ impl NativeClient {
         };
         // The decide runs as its own single-key transaction on the record
         // tablet (any coordinator works for one key; use a derived id so
-        // re-drives are idempotent).
+        // re-drives are idempotent). Record-key steps bind the zero digest.
         let decide_txn = TxnId::derive(u128::from_le_bytes(record.id.as_bytes()), 0, decide_salt);
-        match self.txn_prepare(namespace, &write, decide_txn, coordinator) {
+        match self.txn_prepare(namespace, &write, decide_txn, coordinator, [0u8; 32]) {
             Ok(_) => {}
             Err(_) => return false,
         }
@@ -894,8 +1109,14 @@ impl NativeClient {
         // decide intent outside a racing abort — treat as failure and let
         // the caller re-read the record).
         matches!(
-            self.txn_finalize(namespace, record_key.as_bytes(), decide_txn, true),
-            Ok(FinalizeOutcome::Applied(_))
+            self.txn_finalize(
+                namespace,
+                record_key.as_bytes(),
+                decide_txn,
+                true,
+                [0u8; 32]
+            ),
+            Ok(FinalizeOutcome::Applied(_, _))
         )
     }
 
@@ -906,18 +1127,55 @@ impl NativeClient {
         txn: TxnId,
         coordinator: TabletId,
         participants: Vec<TabletId>,
+        dir_version: u64,
         state: TxnState,
     ) -> TxnRecord {
-        let typed: Vec<kivi_state::TxnWrite> = writes
+        let typed = Self::typed_writes(writes).unwrap_or_default();
+        // Participants are observed prepare tablets (advisory for
+        // operators); the record's decision + digest are authoritative.
+        let digest = kivi_state::write_set_digest(&typed, namespace);
+        TxnRecord {
+            id: txn,
+            coordinator,
+            participants,
+            state,
+            dir_version,
+            digest,
+        }
+    }
+
+    /// Translates batch specs into typed writes (shared by digest
+    /// computation and record building, so drivers and records agree).
+    fn typed_writes(writes: &[BatchWriteSpec]) -> Result<Vec<kivi_state::TxnWrite>, BatchAttempt> {
+        writes
             .iter()
             .map(|write| {
                 let kind = match &write.kind {
                     BatchWriteKind::Put(value) => {
                         kivi_state::TxnWriteKind::Put(Bytes::from(value.clone()))
                     }
+                    BatchWriteKind::PutChunked {
+                        manifest,
+                        logical_len,
+                    } => kivi_state::TxnWriteKind::PutChunked {
+                        manifest: kivi_types::ManifestId::from_bytes(*manifest),
+                        logical_len: *logical_len,
+                    },
                     BatchWriteKind::Delete => kivi_state::TxnWriteKind::Delete,
                     BatchWriteKind::CounterAdd(delta) => {
                         kivi_state::TxnWriteKind::CounterAdd(*delta)
+                    }
+                    BatchWriteKind::CommutativeAdd(delta) => {
+                        kivi_state::TxnWriteKind::CommutativeAdd(*delta)
+                    }
+                    BatchWriteKind::BoundedAdd(delta) => {
+                        kivi_state::TxnWriteKind::BoundedAdd(*delta)
+                    }
+                    BatchWriteKind::EscrowSetShare { min, max } => {
+                        kivi_state::TxnWriteKind::EscrowSetShare {
+                            min: *min,
+                            max: *max,
+                        }
                     }
                 };
                 let expect = match write.expect {
@@ -927,33 +1185,33 @@ impl NativeClient {
                         kivi_state::TxnExpect::Version(kivi_state::ObjectVersion::from_u64(version))
                     }
                 };
-                kivi_state::TxnWrite {
+                Ok(kivi_state::TxnWrite {
                     key: Key::from(write.key.clone()),
                     kind,
                     expect,
-                }
+                })
             })
-            .collect();
-        // Participants are observed prepare tablets (advisory for
-        // operators); the record's decision + digest are authoritative.
-        let digest = kivi_state::write_set_digest(&typed, namespace);
-        TxnRecord {
-            id: txn,
-            coordinator,
-            participants,
-            state,
-            dir_version: 0,
-            digest,
-        }
+            .collect()
     }
 
-    /// Discovers the coordinator (first write's tablet) with a one-entry
-    /// scan probe (also warms the route cache via the page range).
-    fn probe_coordinator(
+    /// Discovers one key's tablet: route-cache first (learned ranges need
+    /// no probe — hash ranges by partition hash, ordered ranges by key),
+    /// else a one-entry scan probe (which also warms the cache for the
+    /// waves below). Returns the tablet plus the freshest directory
+    /// version observed.
+    fn probe_tablet(
         &self,
         namespace: NamespaceId,
         key: &[u8],
-    ) -> Result<TabletId, BatchAttempt> {
+    ) -> Result<(TabletId, u64), BatchAttempt> {
+        if let Some(hash) = kivi_state::PartitionHasher::V1.hash(namespace, key)
+            && let Some(entry) = self.shared.routes.lookup(hash)
+        {
+            return Ok((entry.tablet, entry.dir_version));
+        }
+        if let Some(entry) = self.shared.routes.lookup_key(key) {
+            return Ok((entry.tablet, entry.dir_version));
+        }
         let mut tries: u32 = 0;
         loop {
             let page = self
@@ -969,7 +1227,7 @@ impl NativeClient {
                 )
                 .map_err(BatchAttempt::Error)?;
             if page.tablet != 0 {
-                return Ok(TabletId::from_u64(page.tablet));
+                return Ok((TabletId::from_u64(page.tablet), page.dir_version));
             }
             tries += 1;
             if tries >= MAX_BATCH_REDRIVES {
@@ -997,18 +1255,54 @@ impl NativeClient {
 
     /// Finalizes every key (commit or abort), collecting versions in
     /// request order. Missing intents (already resolved) report
-    /// not-applied without failing: convergence, not error.
+    /// not-applied without failing: convergence, not error. Every
+    /// finalize carries the plan digest and must be served by its expected
+    /// participant: a foreign serving tablet means the tablet moved
+    /// mid-transaction, which aborts the attempt for a fresh plan (never a
+    /// silent remap into another lineage).
     fn finalize_all(
         &self,
         namespace: NamespaceId,
         writes: &[BatchWriteSpec],
         txn: TxnId,
         commit: bool,
+        digest: [u8; 32],
+        expected: &std::collections::BTreeMap<Vec<u8>, TabletId>,
     ) -> Result<AtomicBatchResult, BatchAttempt> {
         let mut versions: Vec<Option<u64>> = vec![None; writes.len()];
         for (order, write) in writes.iter().enumerate() {
-            match self.txn_finalize(namespace, &write.key, txn, commit) {
-                Ok(FinalizeOutcome::Applied(version)) => versions[order] = version,
+            let participant = expected.get(&write.key).copied();
+            match self.txn_finalize(namespace, &write.key, txn, commit, digest) {
+                Ok(FinalizeOutcome::Applied(version, tablet)) => {
+                    if participant.is_some_and(|expected| expected != tablet) {
+                        return Err(BatchAttempt::Conflict);
+                    }
+                    versions[order] = version;
+                }
+                Ok(FinalizeOutcome::Gone) => {}
+                Ok(FinalizeOutcome::Conflict) => return Err(BatchAttempt::Conflict),
+                Err(error) if is_ambiguous(&error) => return Err(BatchAttempt::Redrive),
+                Err(error) => return Err(BatchAttempt::Error(error)),
+            }
+        }
+        Ok(AtomicBatchResult { txn, versions })
+    }
+
+    /// Finalizes every key on the recovery path (no serving-tablet
+    /// expectations available): the record decision plus the digest
+    /// binding carry correctness here.
+    fn finalize_all_recovery(
+        &self,
+        namespace: NamespaceId,
+        writes: &[BatchWriteSpec],
+        txn: TxnId,
+        commit: bool,
+        digest: [u8; 32],
+    ) -> Result<AtomicBatchResult, BatchAttempt> {
+        let mut versions: Vec<Option<u64>> = vec![None; writes.len()];
+        for (order, write) in writes.iter().enumerate() {
+            match self.txn_finalize(namespace, &write.key, txn, commit, digest) {
+                Ok(FinalizeOutcome::Applied(version, _)) => versions[order] = version,
                 Ok(FinalizeOutcome::Gone) => {}
                 Ok(FinalizeOutcome::Conflict) => return Err(BatchAttempt::Conflict),
                 Err(error) if is_ambiguous(&error) => return Err(BatchAttempt::Redrive),
@@ -1026,14 +1320,22 @@ impl NativeClient {
         &self,
         namespace: NamespaceId,
         writes: &[BatchWriteSpec],
-        txn: TxnId,
-        coordinator: TabletId,
+        attempt: TxnAttempt,
         prepared: &[usize],
         aborted: BatchAttempt,
     ) -> Result<AtomicBatchResult, BatchAttempt> {
-        match self.abort_prepared(namespace, writes, txn, coordinator, prepared) {
+        match self.abort_prepared(
+            namespace,
+            writes,
+            attempt.txn,
+            attempt.coordinator,
+            attempt.digest,
+            prepared,
+        ) {
             Ok(AbortOutcome::Aborted) => Err(aborted),
-            Ok(AbortOutcome::Committed) => self.finalize_all(namespace, writes, txn, true),
+            Ok(AbortOutcome::Committed) => {
+                self.finalize_all_recovery(namespace, writes, attempt.txn, true, attempt.digest)
+            }
             Err(attempt) => Err(attempt),
         }
     }
@@ -1051,6 +1353,7 @@ impl NativeClient {
         writes: &[BatchWriteSpec],
         txn: TxnId,
         coordinator: TabletId,
+        digest: [u8; 32],
         prepared: &[usize],
     ) -> Result<AbortOutcome, BatchAttempt> {
         let record_key = kivi_state::txn_record_key(coordinator, txn);
@@ -1060,14 +1363,19 @@ impl NativeClient {
             txn,
             coordinator,
             Vec::new(),
+            0,
             TxnState::Aborted,
         );
         if !self.decide_record(namespace, coordinator, &record_key, &record, 1) {
             // Lost the decide race: re-read (an ambiguous decide may
             // actually have committed — never finalize-abort a committed
-            // transaction).
+            // transaction). A foreign digest under one `TxnId` fails the
+            // attempt instead of following another transaction.
             return match self.read_txn_record(namespace, &record_key) {
                 Ok(Some(record)) if record.state == TxnState::Committed => {
+                    if record.digest != digest {
+                        return Err(BatchAttempt::Conflict);
+                    }
                     Ok(AbortOutcome::Committed)
                 }
                 Ok(_) => Ok(AbortOutcome::Aborted),
@@ -1075,71 +1383,38 @@ impl NativeClient {
             };
         }
         for index in prepared {
-            let _ = self.txn_finalize(namespace, &writes[*index].key, txn, false);
+            let _ = self.txn_finalize(namespace, &writes[*index].key, txn, false, digest);
         }
         Ok(AbortOutcome::Aborted)
     }
 
     /// Sends one prepare (OCC + intent reservation, no visible mutation).
+    /// Steps are idempotent by `TxnId` (same id + key replays the
+    /// reservation rather than duplicating it), so transport retries carry
+    /// no separate identity — request identity and transaction identity
+    /// stay distinct, with exactly-once resting on the latter.
     fn txn_prepare(
         &self,
         namespace: NamespaceId,
         write: &BatchWriteSpec,
         txn: TxnId,
         coordinator: TabletId,
+        digest: [u8; 32],
     ) -> Result<TabletId, ClientError> {
         use kivi_protocol::{Opcode, ResponseBody};
-        let (kind, value, delta) = match &write.kind {
-            BatchWriteKind::Put(value) => (kivi_protocol::BATCH_PUT, value.clone(), 0),
-            BatchWriteKind::Delete => (kivi_protocol::BATCH_DELETE, Vec::new(), 0),
-            BatchWriteKind::CounterAdd(delta) => {
-                (kivi_protocol::BATCH_COUNTER_ADD, Vec::new(), *delta)
-            }
-        };
-        let (expect, expect_version) = match write.expect {
-            BatchExpect::Any => (kivi_protocol::BATCH_EXPECT_ANY, 0),
-            BatchExpect::Absent => (kivi_protocol::BATCH_EXPECT_ABSENT, 0),
-            BatchExpect::Version(version) => (kivi_protocol::BATCH_EXPECT_VERSION, version),
-        };
+        let wire = Self::encode_wire_write(write);
         let route_key = Key::from(write.key.clone());
-        let value_owned = value;
+        let mut request = self.request_base(&route_key, Opcode::TxnPrepare);
+        request.namespace = namespace;
+        request.key.clone_from(&write.key);
+        request.batch_txn = txn.as_bytes();
+        request.batch_writes = vec![wire];
+        request.txn_coordinator = coordinator.as_u64();
+        request.txn_digest = digest;
         let response = self.execute_raw(
             &route_key,
             Opcode::TxnPrepare,
-            || kivi_protocol::Request {
-                contract: kivi_types::ReadContract::Latest,
-                namespace,
-                opcode: Opcode::TxnPrepare,
-                hint: None,
-                key: write.key.clone(),
-                value: None,
-                delta: 0,
-                expiry: 0,
-                offset: 0,
-                len: 0,
-                condition: kivi_protocol::COND_ALWAYS,
-                expiry_policy: kivi_protocol::EXPIRY_CLEAR,
-                identity: None,
-                ack_floor: kivi_types::RequestSeq::from_u64(0),
-                scan_start: None,
-                scan_end: None,
-                scan_direction: kivi_protocol::SCAN_FORWARD,
-                scan_max_items: 0,
-                scan_max_bytes: 0,
-                scan_projection: kivi_protocol::SCAN_KEYS_ONLY,
-                scan_consistency: kivi_protocol::SCAN_LATEST_PER_TABLET,
-                batch_txn: txn.as_bytes(),
-                batch_writes: vec![kivi_protocol::BatchWrite {
-                    key: write.key.clone(),
-                    kind,
-                    value: value_owned.clone(),
-                    delta,
-                    expect,
-                    expect_version,
-                }],
-                txn_coordinator: coordinator.as_u64(),
-                txn_commit: false,
-            },
+            || request.clone(),
             None,
             kivi_types::ReadContract::Latest,
         )?;
@@ -1152,52 +1427,46 @@ impl NativeClient {
     }
 
     /// Sends one finalize (commit applies, abort discards; idempotent).
+    /// Reports the serving tablet with every application so the driver can
+    /// verify lineage (a finalize served elsewhere means the tablet moved
+    /// mid-transaction).
     fn txn_finalize(
         &self,
         namespace: NamespaceId,
         key: &[u8],
         txn: TxnId,
         commit: bool,
+        digest: [u8; 32],
     ) -> Result<FinalizeOutcome, ClientError> {
         use kivi_protocol::{Opcode, ResponseBody};
         let route_key = Key::from(key.to_vec());
+        let mut request = self.request_base(&route_key, Opcode::TxnFinalize);
+        request.namespace = namespace;
+        request.key = key.to_vec();
+        request.batch_txn = txn.as_bytes();
+        request.txn_commit = commit;
+        request.txn_digest = digest;
         let response = self.execute_raw(
             &route_key,
             Opcode::TxnFinalize,
-            || kivi_protocol::Request {
-                contract: kivi_types::ReadContract::Latest,
-                namespace,
-                opcode: Opcode::TxnFinalize,
-                hint: None,
-                key: key.to_vec(),
-                value: None,
-                delta: 0,
-                expiry: 0,
-                offset: 0,
-                len: 0,
-                condition: kivi_protocol::COND_ALWAYS,
-                expiry_policy: kivi_protocol::EXPIRY_CLEAR,
-                identity: None,
-                ack_floor: kivi_types::RequestSeq::from_u64(0),
-                scan_start: None,
-                scan_end: None,
-                scan_direction: kivi_protocol::SCAN_FORWARD,
-                scan_max_items: 0,
-                scan_max_bytes: 0,
-                scan_projection: kivi_protocol::SCAN_KEYS_ONLY,
-                scan_consistency: kivi_protocol::SCAN_LATEST_PER_TABLET,
-                batch_txn: txn.as_bytes(),
-                batch_writes: Vec::new(),
-                txn_coordinator: 0,
-                txn_commit: commit,
-            },
+            || request.clone(),
             None,
             kivi_types::ReadContract::Latest,
         )?;
         match (response.status, response.body) {
-            (kivi_protocol::Status::Ok, ResponseBody::TxnFinalized { applied, version }) => {
+            (
+                kivi_protocol::Status::Ok,
+                ResponseBody::TxnFinalized {
+                    applied,
+                    version,
+                    tablet,
+                },
+            ) => {
                 if applied {
-                    Ok(FinalizeOutcome::Applied((version != 0).then_some(version)))
+                    Ok(FinalizeOutcome::Applied(
+                        (version != 0).then_some(version),
+                        TabletId::from_u64(tablet),
+                    ))
                 } else {
                     Ok(FinalizeOutcome::Gone)
                 }
@@ -1240,6 +1509,19 @@ impl NativeClient {
                 batch_writes: Vec::new(),
                 txn_coordinator: 0,
                 txn_commit: false,
+                txn_digest: [0u8; 32],
+                capacity: 0,
+                holder: 0,
+                permit: [0u8; 16],
+                owner: 0,
+                qty: 0,
+                fencing: 0,
+                ttl: 0,
+                stream: [0u8; 16],
+                shard: 0,
+                partition: Vec::new(),
+                share_min: 0,
+                share_max: 0,
             },
             None,
             kivi_types::ReadContract::Latest,
@@ -1255,8 +1537,9 @@ impl NativeClient {
 /// One finalize RPC outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FinalizeOutcome {
-    /// Intent applied (`Some` version, `None` for deletes / recovered).
-    Applied(Option<u64>),
+    /// Intent applied (`Some` version, `None` for deletes / recovered),
+    /// plus the serving tablet (lineage verification).
+    Applied(Option<u64>, TabletId),
     /// No intent left (idempotent replay or abort).
     Gone,
     /// A foreign intent blocks the key.
@@ -1283,6 +1566,36 @@ enum AbortOutcome {
     Committed,
 }
 
+/// Identity of one transaction attempt across every 2PC step: the id,
+/// the derived coordinator, and the write-set digest binding the exact
+/// transaction. Steps take this (never bare fields) so a step can
+/// neither mix attempts nor forget the binding.
+#[derive(Debug, Clone, Copy)]
+struct TxnAttempt {
+    txn: TxnId,
+    coordinator: TabletId,
+    digest: [u8; 32],
+}
+
+/// One 2PC drive's probed geography: the participant map, the derived
+/// lowest-tablet coordinator, and the directory version the plan routes
+/// against. Prepare/decide/finalize waves consume this (never
+/// re-probe), so a routing move mid-drive aborts instead of silently
+/// remapping.
+struct ProbedDrive {
+    probed: std::collections::BTreeMap<Vec<u8>, (TabletId, u64)>,
+    coordinator: TabletId,
+    dir_version: u64,
+}
+
+/// One 2PC drive's prepared state: which request indexes reserved, and
+/// which tablets served them. The decide wave verifies this against
+/// the probe before persisting anything.
+struct PreparedDrive {
+    prepared: Vec<usize>,
+    observed: std::collections::BTreeSet<TabletId>,
+}
+
 impl From<BatchAttempt> for ClientError {
     fn from(attempt: BatchAttempt) -> Self {
         match attempt {
@@ -1304,6 +1617,104 @@ fn is_ambiguous(error: &ClientError) -> bool {
             | ClientError::Io(_)
             | ClientError::Timeout
     )
+}
+
+// ---------------------------------------------------------------------------
+// Escrow transfer + stream affinity
+// ---------------------------------------------------------------------------
+
+impl NativeClient {
+    /// Maps a partition key to a shard index in `[0, shard_count)`:
+    /// stable and deterministic (FNV-1a 64 over the partition bytes),
+    /// so the same partition always routes to the same shard key while
+    /// different partitions spread. A routing hint, not a correctness
+    /// mechanism: per-shard order holds whatever the mapping, and changing
+    /// `shard_count` remaps (streams scale by adding shards, then
+    /// trimming the old ones once drained).
+    #[must_use]
+    pub fn stream_shard_for(partition: &[u8], shard_count: u32) -> u32 {
+        if shard_count == 0 {
+            return 0;
+        }
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in partition {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+        // The remainder under a `u32` count always fits `u32`.
+        u32::try_from(hash % u64::from(shard_count)).unwrap_or(u32::MAX)
+    }
+
+    /// Atomically moves `amount` of escrow rights from the bounded counter
+    /// at `donor_key` to the one at `recipient_key`: reads both shares and
+    /// versions, plans the paired move
+    /// ([`kivi_state::plan_escrow_transfer`], conservation by
+    /// construction), and commits both share moves in one transaction with
+    /// version expectations — a concurrent move fails the OCC check and
+    /// surfaces [`ClientError::TxnConflict`] for a fresh retry instead of
+    /// minting or destroying rights.
+    ///
+    /// Cross-tablet pairs commit via 2PC; colocated pairs via the
+    /// single-tablet fast path. Either way the transfer is atomic.
+    /// Operates in this client's namespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on missing/non-bounded keys
+    /// ([`ClientError::BoundedExceeded`]), unplannable moves
+    /// ([`ClientError::TxnConflict`] when the donor cannot cover `amount`,
+    /// [`ClientError::InvalidRequest`] for malformed amounts or capacity),
+    /// OCC conflicts (retry), or transport/routing failure.
+    pub fn escrow_transfer(
+        &self,
+        donor_key: &[u8],
+        recipient_key: &[u8],
+        amount: u64,
+    ) -> Result<(Option<u64>, Option<u64>), ClientError> {
+        use super::ClientError as E;
+        let namespace = self.shared.namespace;
+        let donor_key = Key::from(donor_key.to_vec());
+        let recipient_key = Key::from(recipient_key.to_vec());
+        let donor = self.bounded_get(&donor_key)?.ok_or(E::BoundedExceeded)?;
+        let recipient = self
+            .bounded_get(&recipient_key)?
+            .ok_or(E::BoundedExceeded)?;
+        let donor_version = self.get_version(namespace, donor_key.as_bytes())?;
+        let recipient_version = self.get_version(namespace, recipient_key.as_bytes())?;
+        let ((donor_min, donor_new_max), (recipient_min, recipient_new_max)) =
+            kivi_state::plan_escrow_transfer(
+                (donor.share_min, donor.share_max),
+                donor.value,
+                (recipient.share_min, recipient.share_max),
+                recipient.capacity,
+                amount,
+            )
+            .map_err(|error| match error {
+                kivi_state::TxnError::Conflict => E::TxnConflict,
+                _ => E::InvalidRequest,
+            })?;
+        let writes = vec![
+            BatchWriteSpec {
+                key: donor_key.as_bytes().to_vec(),
+                kind: BatchWriteKind::EscrowSetShare {
+                    min: donor_min,
+                    max: donor_new_max,
+                },
+                expect: donor_version.map_or(BatchExpect::Absent, BatchExpect::Version),
+            },
+            BatchWriteSpec {
+                key: recipient_key.as_bytes().to_vec(),
+                kind: BatchWriteKind::EscrowSetShare {
+                    min: recipient_min,
+                    max: recipient_new_max,
+                },
+                expect: recipient_version.map_or(BatchExpect::Absent, BatchExpect::Version),
+            },
+        ];
+        let result = self.atomic_batch(namespace, &writes)?;
+        let mut versions = result.versions.into_iter();
+        Ok((versions.next().flatten(), versions.next().flatten()))
+    }
 }
 
 // ---------------------------------------------------------------------------

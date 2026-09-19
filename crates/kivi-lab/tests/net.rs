@@ -351,6 +351,19 @@ fn pipelined_raw_socket_round_trips_in_order() {
             batch_writes: Vec::new(),
             txn_coordinator: 0,
             txn_commit: false,
+            txn_digest: [0u8; 32],
+            capacity: 0,
+            holder: 0,
+            permit: [0u8; 16],
+            owner: 0,
+            qty: 0,
+            fencing: 0,
+            ttl: 0,
+            stream: [0u8; 16],
+            shard: 0,
+            partition: Vec::new(),
+            share_min: 0,
+            share_max: 0,
         };
         socket
             .write_all(&encode_frame(FrameKind::Request, id, &request.encode()))

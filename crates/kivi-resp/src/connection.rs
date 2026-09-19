@@ -1422,6 +1422,9 @@ mod fuzz {
             op: &kivi_state::Operation,
         ) -> Result<kivi_state::OperationResult, crate::translate::ExecuteError> {
             // Total over operations: every op maps to some reply without I/O.
+            if let Some(result) = Self::execute_semantic(op) {
+                return Ok(result);
+            }
             Ok(match op {
                 kivi_state::Operation::Get { .. } => kivi_state::OperationResult::Value(None),
                 kivi_state::Operation::GetRange { .. } => {
@@ -1439,9 +1442,15 @@ mod fuzz {
                 }
                 kivi_state::Operation::Set { .. }
                 | kivi_state::Operation::SetChunked { .. }
-                | kivi_state::Operation::SetRange { .. } => kivi_state::OperationResult::Stored {
-                    version: kivi_state::ObjectVersion::FIRST,
-                },
+                | kivi_state::Operation::SetRange { .. }
+                | kivi_state::Operation::BoundedCounterCreate { .. }
+                | kivi_state::Operation::EscrowTransfer { .. }
+                | kivi_state::Operation::SemaphoreCreate { .. } => {
+                    // Creates answer stored (new version, never the rights).
+                    kivi_state::OperationResult::Stored {
+                        version: kivi_state::ObjectVersion::FIRST,
+                    }
+                }
                 kivi_state::Operation::Delete { .. } => {
                     kivi_state::OperationResult::Deleted { existed: false }
                 }
@@ -1468,7 +1477,8 @@ mod fuzz {
                 // multi-key verbs): the executor names the conflict so the
                 // totality of this match is explicit, never silent.
                 kivi_state::Operation::TxnPrepare { .. }
-                | kivi_state::Operation::TxnFinalize { .. } => {
+                | kivi_state::Operation::TxnFinalize { .. }
+                | kivi_state::Operation::TxnCommitLocal { .. } => {
                     kivi_state::OperationResult::TxnConflict
                 }
                 // No Redis verb reads bare versions; version checks arrive
@@ -1476,11 +1486,107 @@ mod fuzz {
                 kivi_state::Operation::GetVersion { .. } => {
                     kivi_state::OperationResult::Version(None)
                 }
+                kivi_state::Operation::CommutativeGet { .. }
+                | kivi_state::Operation::CommutativeAdd { .. }
+                | kivi_state::Operation::BoundedCounterAdd { .. }
+                | kivi_state::Operation::BoundedCounterGet { .. }
+                | kivi_state::Operation::SemaphoreAcquire { .. }
+                | kivi_state::Operation::SemaphoreRelease { .. }
+                | kivi_state::Operation::SemaphoreInspect { .. }
+                | kivi_state::Operation::LeaseAcquire { .. }
+                | kivi_state::Operation::LeaseRenew { .. }
+                | kivi_state::Operation::LeaseRelease { .. }
+                | kivi_state::Operation::LeaseInspect { .. }
+                | kivi_state::Operation::StreamCreate { .. }
+                | kivi_state::Operation::StreamAppend { .. }
+                | kivi_state::Operation::StreamRead { .. }
+                | kivi_state::Operation::StreamTrim { .. } => {
+                    unreachable!("semantic ops dispatch above")
+                }
             })
         }
 
         fn now_micros(&self) -> u64 {
             0
+        }
+    }
+
+    impl VoidExec {
+        /// Answers the semantic verbs with inert dummies (`Some`) or
+        /// declines (`None`): the RESP edge exposes no semantic verbs
+        /// (native API only), so the void executor answers their shapes
+        /// with dummies to keep the match total and explicit.
+        fn execute_semantic(op: &kivi_state::Operation) -> Option<kivi_state::OperationResult> {
+            Some(match op {
+                kivi_state::Operation::CommutativeGet { .. } => {
+                    kivi_state::OperationResult::CommutativeValue(None)
+                }
+                kivi_state::Operation::CommutativeAdd { .. } => {
+                    kivi_state::OperationResult::CommutativeApplied
+                }
+                kivi_state::Operation::BoundedCounterAdd { .. } => {
+                    kivi_state::OperationResult::BoundedUpdated {
+                        value: 0,
+                        version: kivi_state::ObjectVersion::FIRST,
+                    }
+                }
+                kivi_state::Operation::BoundedCounterGet { .. } => {
+                    kivi_state::OperationResult::BoundedValue {
+                        value: None,
+                        capacity: None,
+                        share: None,
+                    }
+                }
+                kivi_state::Operation::SemaphoreAcquire { .. } => {
+                    kivi_state::OperationResult::SemaphoreAcquired
+                }
+                kivi_state::Operation::SemaphoreRelease { .. } => {
+                    kivi_state::OperationResult::SemaphoreReleased { released: false }
+                }
+                kivi_state::Operation::SemaphoreInspect { .. } => {
+                    kivi_state::OperationResult::SemaphoreLoad {
+                        outstanding: 0,
+                        capacity: 0,
+                    }
+                }
+                kivi_state::Operation::LeaseAcquire { .. } => {
+                    kivi_state::OperationResult::LeaseAcquired {
+                        fencing: kivi_state::FencingToken::from_u64(1),
+                        expires_at: kivi_types::UnixMicros::from_micros(0),
+                    }
+                }
+                kivi_state::Operation::LeaseRenew { .. } => {
+                    kivi_state::OperationResult::LeaseRenewed {
+                        fencing: kivi_state::FencingToken::from_u64(1),
+                        expires_at: kivi_types::UnixMicros::from_micros(0),
+                    }
+                }
+                kivi_state::Operation::LeaseRelease { .. } => {
+                    kivi_state::OperationResult::LeaseReleased { released: false }
+                }
+                kivi_state::Operation::LeaseInspect { .. } => {
+                    kivi_state::OperationResult::LeaseInfo {
+                        holder: None,
+                        next_fencing: kivi_state::FencingToken::from_u64(1),
+                    }
+                }
+                kivi_state::Operation::StreamCreate { .. } => {
+                    kivi_state::OperationResult::StreamCreated
+                }
+                kivi_state::Operation::StreamAppend { .. } => {
+                    kivi_state::OperationResult::StreamAppended { offset: 0 }
+                }
+                kivi_state::Operation::StreamRead { .. } => {
+                    kivi_state::OperationResult::StreamEntries {
+                        entries: Vec::new(),
+                        next_offset: 0,
+                    }
+                }
+                kivi_state::Operation::StreamTrim { .. } => {
+                    kivi_state::OperationResult::StreamTrimmed { removed: 0 }
+                }
+                _ => return None,
+            })
         }
     }
 

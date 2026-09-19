@@ -110,7 +110,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use kivi_codec::{Decode, Encode, decode_byte_vec, encode_bytes};
-use kivi_protocol::Opcode;
 use kivi_state::{
     DurableOutcome, Key, LogicalValue, Mutation, ObjectStore, ObjectVersion, Operation,
     OperationResult, StoredObject, outcome_for,
@@ -152,8 +151,9 @@ const CONTROL_SNAPSHOT_MAGIC: u32 = 0x4353_564B;
 const CONTROL_SNAPSHOT_VERSION: u16 = 1;
 /// Applied-file framing magic (`KVSA`: Kivi state-machine applied).
 const APPLIED_MAGIC: u32 = 0x4153_564B;
-/// Snapshot framing version.
-const SNAPSHOT_VERSION: u16 = 1;
+/// Snapshot framing version (v2 binds prepared intents to their write-set
+/// digests; v1 images are rejected loudly, never migrated).
+const SNAPSHOT_VERSION: u16 = 2;
 /// Applied-file framing version.
 const APPLIED_VERSION: u16 = 1;
 
@@ -164,6 +164,16 @@ const VALUE_BYTES: u8 = 1;
 const VALUE_CHUNKED: u8 = 2;
 /// Strict-counter tag.
 const VALUE_COUNTER: u8 = 3;
+/// Commutative-counter tag (order-free sum; never an ordinal).
+const VALUE_COMMUTATIVE: u8 = 4;
+/// Bounded-counter tag (value plus explicit escrow share).
+const VALUE_BOUNDED: u8 = 5;
+/// Semaphore tag (capacity plus live permits).
+const VALUE_SEMAPHORE: u8 = 6;
+/// Lease tag (holder plus monotonic fencing).
+const VALUE_LEASE: u8 = 7;
+/// Stream-shard tag (cursor plus retained entries).
+const VALUE_STREAM_SHARD: u8 = 8;
 
 /// Converts an applied Raft log index into its [`CommitPosition`]
 /// (task D, Option 1: `CommitPosition = raft_index + 1`; the `+1` preserves
@@ -301,8 +311,9 @@ pub enum RangeBase {
     Absent,
     /// Resident byte string (safe to splice inline).
     Inline,
-    /// Strict counter (range patches reject deterministically).
-    Counter,
+    /// Non-bytes value (counters and semantic objects: range patches
+    /// reject deterministically).
+    NonBytes,
     /// Chunked root (needs restaging; unreplicated in this stage).
     Chunked,
 }
@@ -448,31 +459,6 @@ pub enum StateMachineFault {
         /// Human-readable cause.
         detail: String,
     },
-}
-
-/// Maps a persisted mutation back to its originating opcode discriminant,
-/// mirroring the engine's mapping exactly (both derive from the single
-/// originating request through [`Mutation`], so they cannot disagree).
-fn opcode_for(mutation: &Mutation, is_persist_expiry: bool) -> u8 {
-    match mutation {
-        Mutation::PutBytes { .. } | Mutation::ReplaceChunkedRoot { .. } => Opcode::Set,
-        Mutation::PutBytesWithExpiry { .. } | Mutation::ReplaceChunkedRootWithExpiry { .. } => {
-            Opcode::SetConditional
-        }
-        Mutation::SpliceBytes { .. } => Opcode::SetRange,
-        Mutation::Delete { .. } => Opcode::Delete,
-        Mutation::CounterAdd { .. } => Opcode::CounterAdd,
-        Mutation::SetExpiry { .. } => {
-            if is_persist_expiry {
-                Opcode::PersistExpiry
-            } else {
-                Opcode::ExpireAt
-            }
-        }
-        // Transaction steps shape as their parent batch opcode.
-        Mutation::TxnPrepare { .. } | Mutation::TxnFinalize { .. } => Opcode::AtomicBatch,
-    }
-    .as_u8()
 }
 
 /// Whether the mutation originated from a persist-expiry request,
@@ -967,7 +953,8 @@ impl ReplicatedTablet {
             seq,
             RetainedOutcome {
                 commit: commit_of_index(index),
-                opcode: opcode_for(&mutation, is_persist_expiry(&mutation)),
+                opcode: kivi_protocol::mutation_opcode(&mutation, is_persist_expiry(&mutation))
+                    .as_u8(),
                 outcome: DurableOutcome::Completed(result),
             },
         );
@@ -1094,7 +1081,8 @@ impl From<ImageFault> for StateMachineFault {
 }
 
 /// Encodes one prepared transaction intent for snapshots (deterministic
-/// key-ordered section after sessions).
+/// key-ordered section after sessions). Carries the write-set digest so
+/// restarts never lose the confused-deputy binding.
 fn encode_intent(out: &mut Vec<u8>, intent: &kivi_state::TxnIntent) {
     use kivi_codec::Encode;
     out.extend_from_slice(&intent.id.as_bytes());
@@ -1102,6 +1090,7 @@ fn encode_intent(out: &mut Vec<u8>, intent: &kivi_state::TxnIntent) {
     intent.key.encode(out);
     intent.write.expect.encode(out);
     intent.write.kind.encode(out);
+    out.extend_from_slice(&intent.digest);
     match intent.observed {
         None => out.push(0),
         Some(version) => {
@@ -1143,6 +1132,10 @@ fn decode_snapshot_intents(
                 detail: "snapshot intent write invalid".to_owned(),
             })?;
         *at += used;
+        let digest_raw = snap_take(body, at, 32)?;
+        let digest: [u8; 32] = digest_raw.try_into().map_err(|_| Fault::CorruptImage {
+            detail: "snapshot intent digest invalid".to_owned(),
+        })?;
         let observed = match snap_take(body, at, 1)?[0] {
             0 => None,
             1 => {
@@ -1165,6 +1158,7 @@ fn decode_snapshot_intents(
             coordinator,
             key: key.clone(),
             write: kivi_state::TxnWrite { key, kind, expect },
+            digest,
             observed,
             prepared_at,
         });
@@ -1186,6 +1180,26 @@ fn encode_object(out: &mut Vec<u8>, object: &StoredObject) {
         LogicalValue::StrictCounter(value) => {
             out.push(VALUE_COUNTER);
             out.extend_from_slice(&value.to_le_bytes());
+        }
+        LogicalValue::CommutativeCounter(value) => {
+            out.push(VALUE_COMMUTATIVE);
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        LogicalValue::BoundedCounter(state) => {
+            out.push(VALUE_BOUNDED);
+            state.encode(out);
+        }
+        LogicalValue::Semaphore(state) => {
+            out.push(VALUE_SEMAPHORE);
+            state.encode(out);
+        }
+        LogicalValue::Lease(state) => {
+            out.push(VALUE_LEASE);
+            state.encode(out);
+        }
+        LogicalValue::StreamShard(shard) => {
+            out.push(VALUE_STREAM_SHARD);
+            shard.encode(out);
         }
     }
     object.version().encode(out);
@@ -1214,6 +1228,41 @@ fn decode_object(input: &[u8]) -> Result<(StoredObject, usize), ImageFault> {
             }
             let value = i64::from_le_bytes(input[1..9].try_into().unwrap_or([0; 8]));
             (LogicalValue::StrictCounter(value), 9)
+        }
+        VALUE_COMMUTATIVE => {
+            if input.len() < 1 + 8 {
+                return Err(Fault::Truncated);
+            }
+            let value = i64::from_le_bytes(input[1..9].try_into().unwrap_or([0; 8]));
+            (LogicalValue::CommutativeCounter(value), 9)
+        }
+        VALUE_BOUNDED => {
+            let (state, used) = kivi_state::BoundedCounterState::decode(&input[1..])
+                .map_err(|_| Fault::BadBytes)?;
+            if !state.invariant_holds() {
+                return Err(Fault::BadValueTag { tag: VALUE_BOUNDED });
+            }
+            (LogicalValue::BoundedCounter(state), 1 + used)
+        }
+        VALUE_SEMAPHORE => {
+            let (state, used) =
+                kivi_state::SemaphoreState::decode(&input[1..]).map_err(|_| Fault::BadBytes)?;
+            if !state.invariant_holds() {
+                return Err(Fault::BadValueTag {
+                    tag: VALUE_SEMAPHORE,
+                });
+            }
+            (LogicalValue::Semaphore(state), 1 + used)
+        }
+        VALUE_LEASE => {
+            let (state, used) =
+                kivi_state::LeaseState::decode(&input[1..]).map_err(|_| Fault::BadBytes)?;
+            (LogicalValue::Lease(state), 1 + used)
+        }
+        VALUE_STREAM_SHARD => {
+            let (shard, used) =
+                kivi_state::StreamShardState::decode(&input[1..]).map_err(|_| Fault::BadBytes)?;
+            (LogicalValue::StreamShard(shard), 1 + used)
         }
         tag => return Err(Fault::BadValueTag { tag }),
     };
@@ -2224,8 +2273,8 @@ impl ReplicatedStateMachine {
             None => RangeBase::Absent,
             Some(object) => match object.value() {
                 kivi_state::LogicalValue::Bytes(_) => RangeBase::Inline,
-                kivi_state::LogicalValue::StrictCounter(_) => RangeBase::Counter,
                 kivi_state::LogicalValue::Chunked(_) => RangeBase::Chunked,
+                _ => RangeBase::NonBytes,
             },
         })
     }
@@ -2874,6 +2923,7 @@ mod tests {
             key: Key::from("k"),
             expect: TxnExpect::Absent,
             write: TxnWriteKind::Put(bytes::Bytes::from_static(b"v")),
+            digest: [0xD1; 32],
         };
         let outcome = apply(
             &mut tablet,
@@ -2902,6 +2952,7 @@ mod tests {
             txn,
             key: Key::from("k"),
             commit: true,
+            digest: [0xD1; 32],
         };
         apply(
             &mut tablet,
@@ -2938,6 +2989,7 @@ mod tests {
                     key: Key::from("k"),
                     expect: TxnExpect::Any,
                     write: TxnWriteKind::Put(bytes::Bytes::from_static(b"v")),
+                    digest: [0xD1; 32],
                 },
                 OperationResult::TxnPrepared,
             ),

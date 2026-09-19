@@ -3961,6 +3961,62 @@ fn client_write_error(
 /// Returns `Ok(None)` to proceed with `op`, `Ok(Some(restaged))` to
 /// proceed with a restaged operation instead.
 #[allow(clippy::too_many_lines)]
+/// Proves one transactional write's chunked reference names durable local
+/// payload. Plain writes carry no references and pass trivially.
+async fn check_txn_write_sidecars(
+    sidecar: &SidecarStore,
+    write: &kivi_state::TxnWrite,
+) -> Result<(), ProposeError> {
+    use crate::types::ConsensusError;
+    let kivi_state::TxnWriteKind::PutChunked {
+        manifest,
+        logical_len,
+    } = &write.kind
+    else {
+        return Ok(());
+    };
+    let durable = sidecar
+        .check_root(*manifest, *logical_len)
+        .await
+        .map_err(|error| {
+            ProposeError::Consensus(ConsensusError::Unavailable {
+                reason: format!("sidecar check failed: {error}"),
+            })
+        })?;
+    if !durable {
+        return Err(ProposeError::Consensus(ConsensusError::Unavailable {
+            reason: format!(
+                "transactional chunked write references unavailable payload: {manifest}"
+            ),
+        }));
+    }
+    Ok(())
+}
+
+/// Proves one chunked root durable locally before proposing: the manifest
+/// must name staged payload, or the proposal fails loudly — a later commit
+/// can never meet a durable root with unavailable payload.
+async fn check_chunked_root(
+    sidecar: &SidecarStore,
+    manifest: kivi_types::ManifestId,
+    logical_len: u64,
+) -> Result<(), ProposeError> {
+    let durable = sidecar
+        .check_root(manifest, logical_len)
+        .await
+        .map_err(|error| {
+            ProposeError::Consensus(ConsensusError::Unavailable {
+                reason: format!("sidecar check failed: {error}"),
+            })
+        })?;
+    if !durable {
+        return Err(ProposeError::Consensus(ConsensusError::Unavailable {
+            reason: format!("chunked root {manifest} not durable locally; stage before proposing"),
+        }));
+    }
+    Ok(())
+}
+
 async fn ensure_proposal_sidecars_for(
     sidecar: &SidecarStore,
     machine: &ReplicatedStateMachine,
@@ -3972,43 +4028,27 @@ async fn ensure_proposal_sidecars_for(
             manifest,
             logical_len,
             ..
-        } => {
-            let durable = sidecar
-                .check_root(*manifest, *logical_len)
-                .await
-                .map_err(|error| {
-                    ProposeError::Consensus(ConsensusError::Unavailable {
-                        reason: format!("sidecar check failed: {error}"),
-                    })
-                })?;
-            if !durable {
-                return Err(ProposeError::Consensus(ConsensusError::Unavailable {
-                    reason: format!(
-                        "chunked root {manifest} not durable locally; stage before proposing"
-                    ),
-                }));
-            }
-            Ok(None)
         }
-        Operation::SetConditionalChunked {
+        | Operation::SetConditionalChunked {
             manifest,
             logical_len,
             ..
         } => {
-            let durable = sidecar
-                .check_root(*manifest, *logical_len)
-                .await
-                .map_err(|error| {
-                    ProposeError::Consensus(ConsensusError::Unavailable {
-                        reason: format!("sidecar check failed: {error}"),
-                    })
-                })?;
-            if !durable {
-                return Err(ProposeError::Consensus(ConsensusError::Unavailable {
-                    reason: format!(
-                        "chunked root {manifest} not durable locally; stage before proposing"
-                    ),
-                }));
+            check_chunked_root(sidecar, *manifest, *logical_len).await?;
+            Ok(None)
+        }
+        // Transactional chunked writes prove the same contract before a
+        // participant may say Prepared: every `PutChunked` reference must
+        // name durable local payload (staged uploads and committed packs
+        // alike), or the prepare fails loudly — a later Commit can never
+        // meet a durable root with unavailable payload.
+        Operation::TxnPrepare { write, .. } => {
+            check_txn_write_sidecars(sidecar, write).await?;
+            Ok(None)
+        }
+        Operation::TxnCommitLocal { writes, .. } => {
+            for write in writes {
+                check_txn_write_sidecars(sidecar, write).await?;
             }
             Ok(None)
         }

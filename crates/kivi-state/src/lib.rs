@@ -21,6 +21,7 @@ pub mod mutation;
 pub mod object;
 pub mod ops;
 pub mod scan;
+pub mod semantics;
 pub mod store;
 pub mod txn;
 pub use envelope::{EnvelopeError, MUTATION_ENVELOPE_VERSION, MutationEnvelope};
@@ -35,7 +36,10 @@ pub use index::{
 use kivi_types::TabletId;
 pub use mutation::{ApplyError, ApplyOutcome, Mutation};
 pub use object::{
-    ChunkedRef, Key, LogicalValue, ObjectType, ObjectVersion, StoredObject, VersionExhausted,
+    BoundedCounterState, ChunkedRef, EscrowShare, FencingToken, Key, LeaseHolder, LeaseState,
+    LogicalValue, MAX_SEMAPHORE_PERMITS, MAX_STREAM_ENTRY_BYTES, MAX_STREAM_SHARD_ENTRIES,
+    ObjectType, ObjectVersion, PermitId, PermitRecord, SemaphoreState, StoredObject, StreamEntry,
+    StreamShardState, VersionExhausted,
 };
 pub use ops::{
     DurableOutcome, ExpiryPolicy, OpError, Operation, OperationResult, SetCondition, outcome_for,
@@ -43,13 +47,19 @@ pub use ops::{
 pub use scan::{
     ScanDirection, ScanEntry, ScanError, ScanPage, ScanProjection, ScanSpec, ScannedValue,
 };
-pub use store::{ObjectStore, Prepared, StorePrepared, StoreStats, slice_range, splice_inline};
+pub use semantics::{Caps, ConflictScope, OperationSemantics, semantics_of};
+pub use store::{
+    LocalCommitError, MAX_LEASE_TTL_MICROS, ObjectStore, Prepared, StorePrepared, StoreStats,
+    lease_expires_at, local_versions, slice_range, splice_inline,
+};
 pub use txn::{
-    MAX_TXN_BYTES, MAX_TXN_KEYS, MAX_TXN_LIFETIME_MICROS, MAX_TXN_PARTICIPANTS,
+    MAX_TXN_BYTES, MAX_TXN_KEYS, MAX_TXN_LIFETIME_MICROS, MAX_TXN_PARTICIPANTS, PlannedEscrowMove,
     RESOLVE_GRACE_MICROS, TXN_RECORD_KEY_LEN, TXN_RECORD_PREFIX, TXN_RECORD_VERSION,
-    TxnDecodeError, TxnDriverPlan, TxnError, TxnExpect, TxnId, TxnIntent, TxnRecord, TxnState,
-    TxnWrite, TxnWriteKind, check_bounds, group_by_tablet, parse_txn_record_key, participant_set,
-    plan_transaction, select_coordinator, txn_write_from_wire, write_set_digest,
+    TxnCoordinator, TxnDecision, TxnDecodeError, TxnDriverPlan, TxnError, TxnExpect, TxnId,
+    TxnIntent, TxnOutcome, TxnParticipant, TxnPrepare, TxnReadVersion, TxnRecord, TxnReservation,
+    TxnState, TxnWrite, TxnWriteKind, check_bounds, group_by_tablet, parse_txn_record_key,
+    participant_set, plan_escrow_transfer, plan_transaction, reservation_cost, select_coordinator,
+    txn_write_from_wire, verify_escrow_widths, write_set_digest,
 };
 
 /// System key holding the coordinator decision record for `txn` on

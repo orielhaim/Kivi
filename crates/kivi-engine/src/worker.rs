@@ -348,6 +348,13 @@ pub enum WorkerControl {
         /// Where `(tablet, journal)` pairs go.
         respond: Sender<ChunkJournals>,
     },
+    /// List every prepared transaction intent on owned tablets as
+    /// `(tablet, intent)` pairs. The embedded resolver drives decisions
+    /// from these; workers never resolve on their own.
+    ListIntents {
+        /// Where the intent pairs go.
+        respond: Sender<Vec<(TabletId, kivi_state::TxnIntent)>>,
+    },
 }
 
 /// Chunk lane access for one worker: the lane handle, the representation
@@ -779,6 +786,18 @@ pub(crate) fn handle_control(
             let _ = respond.try_send(journals);
             true
         }
+        WorkerControl::ListIntents { respond } => {
+            let intents = tablets
+                .values()
+                .flat_map(|live| {
+                    live.pending_intents()
+                        .into_iter()
+                        .map(|intent| (live.id(), intent))
+                })
+                .collect();
+            let _ = respond.try_send(intents);
+            true
+        }
     }
 }
 
@@ -799,7 +818,12 @@ pub(crate) fn peek_range_base(
         None => RangeBase::Absent,
         Some(object) => match object.value() {
             kivi_state::LogicalValue::Bytes(bytes) => RangeBase::Inline(bytes.clone()),
-            kivi_state::LogicalValue::StrictCounter(_) => RangeBase::Counter,
+            kivi_state::LogicalValue::StrictCounter(_)
+            | kivi_state::LogicalValue::CommutativeCounter(_)
+            | kivi_state::LogicalValue::BoundedCounter(_)
+            | kivi_state::LogicalValue::Semaphore(_)
+            | kivi_state::LogicalValue::Lease(_)
+            | kivi_state::LogicalValue::StreamShard(_) => RangeBase::NonBytes,
             kivi_state::LogicalValue::Chunked(chunked) => RangeBase::Chunked {
                 manifest: chunked.manifest,
                 logical_len: chunked.logical_len,
@@ -943,6 +967,59 @@ fn stage_value_work(
     }
 }
 
+/// Proves every chunked reference a transaction carries names durable
+/// local payload (staged uploads and committed packs alike): a dangling
+/// root is rejected loudly before any participant may say Prepared, so a
+/// later Commit can never meet missing payload.
+fn verify_txn_chunk_refs(
+    op: &Operation,
+    chunks: &WorkerChunks,
+    metrics: &core::cell::Cell<WorkerMetrics>,
+    respond: &Sender<WorkerResponse>,
+) -> Result<(), ()> {
+    fn failed(
+        metrics: &core::cell::Cell<WorkerMetrics>,
+        respond: &Sender<WorkerResponse>,
+        detail: String,
+    ) -> Result<(), ()> {
+        let mut snapshot = metrics.get();
+        snapshot.channel_ops += 1;
+        metrics.set(snapshot);
+        let _ = respond.try_send(Err(WorkerRequestError::InvalidRequest { detail }));
+        Err(())
+    }
+    let refs: Vec<(kivi_types::ManifestId, u64)> = match op {
+        Operation::TxnPrepare { write, .. } => match &write.kind {
+            kivi_state::TxnWriteKind::PutChunked {
+                manifest,
+                logical_len,
+            } => vec![(*manifest, *logical_len)],
+            _ => Vec::new(),
+        },
+        Operation::TxnCommitLocal { writes, .. } => writes
+            .iter()
+            .filter_map(|write| match &write.kind {
+                kivi_state::TxnWriteKind::PutChunked {
+                    manifest,
+                    logical_len,
+                } => Some((*manifest, *logical_len)),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    for (manifest, logical_len) in refs {
+        if let Err(error) = chunks.lane.check_root_blocking(manifest, logical_len) {
+            return failed(
+                metrics,
+                respond,
+                format!("transactional chunked write references unavailable payload: {error}"),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Stages a restaged range result, preserving expiry exactly like the
 /// inline splice does (partial writes touch bytes, never the TTL).
 fn stage_restaged(
@@ -979,42 +1056,35 @@ fn capture_namespace(durability: Option<&WorkerDurability>) -> NamespaceId {
 /// caller resolves those through the lane (async on the reactor, blocking
 /// on caller threads). A dropped responder (client gone) only drops the
 /// outcome.
-pub(crate) fn handle_request(
-    request: TabletRequest,
+/// Stages one request's representation before admission, answering
+/// rejections and lane failures inline: `None` means the request already
+/// answered with state untouched; `Some` carries the admitted operation
+/// plus its upload pins.
+fn stage_request_representation(
+    op: Operation,
     tablets: &mut HashMap<TabletId, LiveTablet>,
-    metrics: &core::cell::Cell<WorkerMetrics>,
-    durability: Option<&mut WorkerDurability>,
+    tablet: TabletId,
+    now: UnixMicros,
     chunks: &WorkerChunks,
-) {
-    let TabletRequest {
-        tablet,
-        op,
-        now,
-        identity,
-        respond,
-    } = request;
-    // Representation split before anything else: values over the threshold
-    // stage (chunks, manifest, one sync barrier) and re-enter as a small
-    // `SetChunked`. Range patches plan against the peeked base first
-    // (small inline results WAL as splices, chunked bases restage through
-    // the lane splice). Staging precedes admission, so a lane failure or
-    // a rejected range answers here with state untouched.
-    let (op, pinned) = match op {
+    metrics: &core::cell::Cell<WorkerMetrics>,
+    respond: &Sender<WorkerResponse>,
+) -> Option<(Operation, Vec<crate::chunk_lane::PinnedUpload>)> {
+    let staged = match op {
         Operation::SetRange { key, offset, patch } => {
             let base = peek_range_base(tablets, tablet, &key, now);
             match plan_set_range(key, offset, patch, base, chunks.inline_threshold) {
-                SetRangePlan::Inline(op) => (op, None),
+                SetRangePlan::Inline(op) => (op, Vec::new()),
                 SetRangePlan::Reject { detail } => {
                     let mut snapshot = metrics.get();
                     snapshot.channel_ops += 1;
                     metrics.set(snapshot);
                     let _ = respond.try_send(Err(WorkerRequestError::InvalidRequest { detail }));
-                    return;
+                    return None;
                 }
                 SetRangePlan::RestageSet { key, value } => {
-                    match stage_restaged(&key, value, chunks, metrics, &respond) {
-                        Ok(staged) => staged,
-                        Err(()) => return,
+                    match stage_restaged(&key, value, chunks, metrics, respond) {
+                        Ok((staged, pin)) => (staged, pin.into_iter().collect()),
+                        Err(()) => return None,
                     }
                 }
                 SetRangePlan::Splice {
@@ -1034,20 +1104,20 @@ pub(crate) fn handle_request(
                         },
                         chunks,
                         metrics,
-                        &respond,
+                        respond,
                     ) {
-                        Ok(staged) => staged,
-                        Err(()) => return,
+                        Ok((staged, pin)) => (staged, pin.into_iter().collect()),
+                        Err(()) => return None,
                     }
                 }
             }
         }
         other => match split_large_set(other, chunks.inline_threshold) {
-            LargeSetSplit::Inline(op) => (op, None),
+            LargeSetSplit::Inline(op) => (op, Vec::new()),
             LargeSetSplit::Stage { key, value } => {
-                match stage_value_work(&key, StageWork::Value(value), chunks, metrics, &respond) {
-                    Ok(staged) => staged,
-                    Err(()) => return,
+                match stage_value_work(&key, StageWork::Value(value), chunks, metrics, respond) {
+                    Ok((staged, pin)) => (staged, pin.into_iter().collect()),
+                    Err(()) => return None,
                 }
             }
             LargeSetSplit::StageConditional {
@@ -1064,13 +1134,59 @@ pub(crate) fn handle_request(
                 },
                 chunks,
                 metrics,
-                &respond,
+                respond,
             ) {
-                Ok(staged) => staged,
-                Err(()) => return,
+                Ok((staged, pin)) => (staged, pin.into_iter().collect()),
+                Err(()) => return None,
             },
         },
     };
+    Some(staged)
+}
+
+pub(crate) fn handle_request(
+    request: TabletRequest,
+    tablets: &mut HashMap<TabletId, LiveTablet>,
+    metrics: &core::cell::Cell<WorkerMetrics>,
+    durability: Option<&mut WorkerDurability>,
+    chunks: &WorkerChunks,
+) {
+    let TabletRequest {
+        tablet,
+        op,
+        now,
+        identity,
+        respond,
+    } = request;
+    // Representation split before anything else: values over the threshold
+    // stage (chunks, manifest, one sync barrier) and re-enter as small
+    // chunked roots. Range patches plan against the peeked base first
+    // (small inline results WAL as splices, chunked bases restage through
+    // the lane splice). Transactional writes pass through unstaged: large
+    // inline puts stay inline (bounded by the transaction byte cap), while
+    // every chunked reference a transaction carries is proven below before
+    // admission, so a later Commit can never meet a durable root with
+    // unavailable payload. Staging precedes admission, so a lane failure
+    // or a rejected range answers here with state untouched.
+    let Some((op, pins)) =
+        stage_request_representation(op, tablets, tablet, now, chunks, metrics, &respond)
+    else {
+        return;
+    };
+    // Prove every chunked reference a transaction carries: staged values
+    // pass (just proven above and still pinned), as do copies of live
+    // committed roots (their packs are indexed); anything else is a dangling
+    // root and the prepare is rejected loudly, never committed.
+    if let Err(()) = verify_txn_chunk_refs(&op, chunks, metrics, &respond) {
+        return;
+    }
+    // Attribute escrow ownership: a bounded-counter create takes its
+    // initial full share on the tablet executing it (clients send zero;
+    // routing already placed the key here, so the holder is exact).
+    let mut op = op;
+    if let Operation::BoundedCounterCreate { holder, .. } = &mut op {
+        *holder = TabletId::from_u64(tablet.as_u64());
+    }
     let outcome = match durability {
         None => match tablets.get_mut(&tablet) {
             None => Err(WorkerRequestError::UnknownTablet { tablet }),
@@ -1079,7 +1195,7 @@ pub(crate) fn handle_request(
         Some(durable) => {
             durable
                 .commit
-                .admit(PendingEntry::new(tablet, op, now, identity, respond).with_pinned(pinned));
+                .admit(PendingEntry::new(tablet, op, now, identity, respond).with_pins(pins));
             durable.commit.poll(tablets, durable.namespace);
             // Admission itself is the outcome; the reply arrives through
             // the responder once the batch completes.
@@ -1243,13 +1359,13 @@ mod tests {
             ),
             SetRangePlan::RestageSet { .. }
         ));
-        // Counters pass through: preparation rejects them, not the plan.
+        // Non-bytes bases pass through: preparation rejects them, not the plan.
         assert!(matches!(
             plan_set_range(
                 key(),
                 0,
                 bytes::Bytes::from_static(b"v"),
-                RangeBase::Counter,
+                RangeBase::NonBytes,
                 1024
             ),
             SetRangePlan::Inline(_)

@@ -87,6 +87,10 @@ const CLUSTER_STREAM_MAX_DATA: u32 = 1_048_576;
 const ADMIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// Admin body limit.
 const MAX_ADMIN_BODY_BYTES: usize = 64 * 1024;
+/// Maximum stream entries encoded in one `StreamEntries` response page
+/// (mirrors the embedded engine's bound; shaping truncates explicitly and
+/// the client resumes by offset, keeping shard order).
+const MAX_STREAM_PAGE_ENTRIES: usize = 256;
 
 /// Static cluster server configuration (parsed/validated in `main`).
 #[derive(Debug, Clone)]
@@ -1666,7 +1670,7 @@ async fn handle_stream_commit(
                     let mut pins = shared.node.sidecar().pins().lock().await;
                     pins.unpin_root(&manifest, &chunk_ids);
                 }
-                shape_result(kivi_protocol::Opcode::Set, &outcome)
+                shape_result(kivi_protocol::Opcode::Set, tablet, &outcome)
             }
             ProposeOutcome::Rejected { outcome } => {
                 {
@@ -1675,7 +1679,7 @@ async fn handle_stream_commit(
                     let mut pins = shared.node.sidecar().pins().lock().await;
                     pins.unpin_root(&manifest, &chunk_ids);
                 }
-                shape_durable(&outcome, kivi_protocol::Opcode::Set)
+                shape_durable(&outcome, kivi_protocol::Opcode::Set, tablet)
             }
         },
         Err(error) => {
@@ -1820,7 +1824,7 @@ async fn handle_get_stream(
             }
         }
         _ => {
-            let response = shape_result(kivi_protocol::Opcode::GetStream, &outcome);
+            let response = shape_result(kivi_protocol::Opcode::GetStream, tablet, &outcome);
             writer
                 .write_all(&encode_frame(
                     FrameKind::Response,
@@ -1976,9 +1980,15 @@ async fn handle_write(
     opcode: kivi_protocol::Opcode,
     now: UnixMicros,
 ) -> (Response, kivi_protocol::Opcode) {
+    // Attribute escrow ownership: a bounded-counter create takes its
+    // initial full share on the serving tablet (clients send zero).
+    let mut operation = operation.clone();
+    if let kivi_state::Operation::BoundedCounterCreate { holder, .. } = &mut operation {
+        *holder = tablet;
+    }
     let response = match shared
         .node
-        .propose(tablet, operation, identity, None, now)
+        .propose(tablet, &operation, identity, None, now)
         .await
     {
         Ok(outcome) => match outcome {
@@ -1999,11 +2009,11 @@ async fn handle_write(
                         },
                     }
                 } else {
-                    resolve_result(shared, opcode, operation, &outcome).await
+                    resolve_result(shared, opcode, tablet, &operation, &outcome).await
                 }
             }
             ProposeOutcome::Rejected { outcome } => {
-                resolve_durable(shared, operation, &outcome, opcode).await
+                resolve_durable(shared, tablet, &operation, &outcome, opcode).await
             }
         },
         Err(error) => shape_propose_error(shared, tablet, &error).await,
@@ -2065,7 +2075,8 @@ async fn handle_read(
         .await
     {
         Ok(served) => {
-            let mut response = resolve_result(shared, opcode, operation, &served.outcome).await;
+            let mut response =
+                resolve_result(shared, opcode, tablet, operation, &served.outcome).await;
             response.proof = Some(served.receipt);
             response
         }
@@ -2079,6 +2090,7 @@ async fn handle_read(
 async fn resolve_result(
     shared: &ClusterShared,
     opcode: kivi_protocol::Opcode,
+    tablet: TabletId,
     operation: &kivi_state::Operation,
     outcome: &OperationResult,
 ) -> Response {
@@ -2139,24 +2151,25 @@ async fn resolve_result(
                     },
                 }
             }
-            _ => shape_result(opcode, outcome),
+            _ => shape_result(opcode, tablet, outcome),
         },
-        _ => shape_result(opcode, outcome),
+        _ => shape_result(opcode, tablet, outcome),
     }
 }
 
 /// Resolves a terminal outcome, fetching chunked bytes when completed.
 async fn resolve_durable(
     shared: &ClusterShared,
+    tablet: TabletId,
     operation: &kivi_state::Operation,
     outcome: &DurableOutcome,
     opcode: kivi_protocol::Opcode,
 ) -> Response {
     match outcome {
         DurableOutcome::Completed(result) => {
-            resolve_result(shared, opcode, operation, result).await
+            resolve_result(shared, opcode, tablet, operation, result).await
         }
-        _ => shape_durable(outcome, opcode),
+        _ => shape_durable(outcome, opcode, tablet),
     }
 }
 
@@ -2174,7 +2187,11 @@ fn slice_range(value: &[u8], offset: u64, len: u64) -> Vec<u8> {
 /// Shapes a deterministic outcome like the single-node edge (same bodies
 /// for the same results, so clients cannot tell the modes apart).
 #[allow(clippy::too_many_lines)]
-fn shape_result(opcode: kivi_protocol::Opcode, outcome: &OperationResult) -> Response {
+fn shape_result(
+    opcode: kivi_protocol::Opcode,
+    tablet: TabletId,
+    outcome: &OperationResult,
+) -> Response {
     use kivi_state::OperationResult as R;
     match outcome {
         R::Value(Some(value)) => Response {
@@ -2184,6 +2201,7 @@ fn shape_result(opcode: kivi_protocol::Opcode, outcome: &OperationResult) -> Res
         },
         R::Value(None)
         | R::Counter(None)
+        | R::CommutativeValue(None)
         | R::Expiry(None)
         | R::Length(None)
         | R::Version(None) => Response {
@@ -2305,7 +2323,154 @@ fn shape_result(opcode: kivi_protocol::Opcode, outcome: &OperationResult) -> Res
             body: ResponseBody::TxnFinalized {
                 applied: *applied,
                 version: version.map_or(0, kivi_state::ObjectVersion::as_u64),
+                tablet: tablet.as_u64(),
             },
+        },
+        R::TxnLocalCommitted { versions } => Response {
+            proof: None,
+            status: Status::Ok,
+            body: ResponseBody::AtomicCommitted {
+                versions: versions
+                    .iter()
+                    .map(|version| version.map(kivi_state::ObjectVersion::as_u64))
+                    .collect(),
+            },
+        },
+        R::CommutativeApplied => Response {
+            proof: None,
+            status: Status::Ok,
+            body: ResponseBody::CommutativeApplied,
+        },
+        R::CommutativeValue(Some(value)) => Response {
+            proof: None,
+            status: Status::Ok,
+            body: ResponseBody::CommutativeValue(*value),
+        },
+        R::BoundedUpdated { value, version } => Response {
+            proof: None,
+            status: Status::Ok,
+            body: ResponseBody::BoundedUpdated {
+                value: *value,
+                version: version.as_u64(),
+            },
+        },
+        R::BoundedValue {
+            value: Some(value),
+            capacity: Some(capacity),
+            share: Some((share_min, share_max)),
+        } => Response {
+            proof: None,
+            status: Status::Ok,
+            body: ResponseBody::BoundedValue {
+                value: *value,
+                capacity: *capacity,
+                share_min: *share_min,
+                share_max: *share_max,
+            },
+        },
+        R::BoundedValue { .. } => Response {
+            proof: None,
+            status: Status::Internal,
+            body: ResponseBody::Diagnostic("bounded counter value without capacity".to_owned()),
+        },
+        R::SemaphoreAcquired => Response {
+            proof: None,
+            status: Status::Ok,
+            body: ResponseBody::SemaphoreAcquired,
+        },
+        R::SemaphoreReleased { released } => Response {
+            proof: None,
+            status: Status::Ok,
+            body: ResponseBody::SemaphoreReleased {
+                released: *released,
+            },
+        },
+        R::SemaphoreLoad {
+            outstanding,
+            capacity,
+        } => Response {
+            proof: None,
+            status: Status::Ok,
+            body: ResponseBody::SemaphoreLoad {
+                outstanding: *outstanding,
+                capacity: *capacity,
+            },
+        },
+        R::LeaseAcquired {
+            fencing,
+            expires_at,
+        } => Response {
+            proof: None,
+            status: Status::Ok,
+            body: ResponseBody::LeaseAcquired {
+                fencing: fencing.as_u64(),
+                expires_at: expires_at.as_micros(),
+            },
+        },
+        R::LeaseRenewed {
+            fencing,
+            expires_at,
+        } => Response {
+            proof: None,
+            status: Status::Ok,
+            body: ResponseBody::LeaseRenewed {
+                fencing: fencing.as_u64(),
+                expires_at: expires_at.as_micros(),
+            },
+        },
+        R::LeaseReleased { released } => Response {
+            proof: None,
+            status: Status::Ok,
+            body: ResponseBody::LeaseReleased {
+                released: *released,
+            },
+        },
+        R::LeaseInfo {
+            holder,
+            next_fencing,
+        } => Response {
+            proof: None,
+            status: Status::Ok,
+            body: ResponseBody::LeaseInfo {
+                owner: holder.map(|holder| holder.owner),
+                fencing: holder.map_or(0, |holder| holder.fencing.as_u64()),
+                expires_at: holder.map_or(0, |holder| holder.expires_at.as_micros()),
+                next_fencing: next_fencing.as_u64(),
+            },
+        },
+        R::StreamCreated => Response {
+            proof: None,
+            status: Status::Ok,
+            body: ResponseBody::StreamCreated,
+        },
+        R::StreamAppended { offset } => Response {
+            proof: None,
+            status: Status::Ok,
+            body: ResponseBody::StreamAppended { offset: *offset },
+        },
+        R::StreamEntries {
+            entries,
+            next_offset,
+        } => Response {
+            proof: None,
+            status: Status::Ok,
+            body: ResponseBody::StreamEntries {
+                entries: entries
+                    .iter()
+                    .take(MAX_STREAM_PAGE_ENTRIES)
+                    .map(|entry| kivi_protocol::StreamEntryBody {
+                        offset: entry.offset,
+                        partition: entry.partition.clone(),
+                        payload: entry.payload.to_vec(),
+                    })
+                    .collect(),
+                next_offset: *next_offset,
+            },
+        },
+        R::StreamTrimmed { removed } => Response {
+            proof: None,
+            status: Status::Ok,
+            body: ResponseBody::StreamTrimmed { removed: *removed },
         },
     }
 }
@@ -2313,9 +2478,13 @@ fn shape_result(opcode: kivi_protocol::Opcode, outcome: &OperationResult) -> Res
 /// Shapes a terminal (non-replicating) outcome: completed results shape
 /// normally under the requesting opcode; rejections shape as their
 /// stable statuses.
-pub(crate) fn shape_durable(outcome: &DurableOutcome, opcode: kivi_protocol::Opcode) -> Response {
+pub(crate) fn shape_durable(
+    outcome: &DurableOutcome,
+    opcode: kivi_protocol::Opcode,
+    tablet: TabletId,
+) -> Response {
     match outcome {
-        DurableOutcome::Completed(result) => shape_result(opcode, result),
+        DurableOutcome::Completed(result) => shape_result(opcode, tablet, result),
         DurableOutcome::Rejected(OpError::WrongType { .. }) => Response {
             proof: None,
             status: Status::WrongType,
@@ -2335,6 +2504,36 @@ pub(crate) fn shape_durable(outcome: &DurableOutcome, opcode: kivi_protocol::Opc
             proof: None,
             status: Status::TxnConflict,
             body: ResponseBody::Diagnostic("transaction conflict".to_owned()),
+        },
+        DurableOutcome::Rejected(OpError::BoundedExceeded) => Response {
+            proof: None,
+            status: Status::BoundedExceeded,
+            body: ResponseBody::Diagnostic("bounded counter would exceed owned rights".to_owned()),
+        },
+        DurableOutcome::Rejected(OpError::SemaphoreExhausted) => Response {
+            proof: None,
+            status: Status::SemaphoreExhausted,
+            body: ResponseBody::Diagnostic("semaphore capacity exhausted".to_owned()),
+        },
+        DurableOutcome::Rejected(OpError::LeaseConflict) => Response {
+            proof: None,
+            status: Status::LeaseConflict,
+            body: ResponseBody::Diagnostic("lease held by another live owner".to_owned()),
+        },
+        DurableOutcome::Rejected(OpError::StaleFencing) => Response {
+            proof: None,
+            status: Status::StaleFencing,
+            body: ResponseBody::Diagnostic("stale fencing token".to_owned()),
+        },
+        DurableOutcome::Rejected(OpError::StreamFull) => Response {
+            proof: None,
+            status: Status::StreamFull,
+            body: ResponseBody::Diagnostic("stream shard full".to_owned()),
+        },
+        DurableOutcome::Rejected(OpError::NotFound) => Response {
+            proof: None,
+            status: Status::NotFound,
+            body: ResponseBody::Diagnostic(String::new()),
         },
         DurableOutcome::VersionExhausted => Response {
             proof: None,
@@ -2655,6 +2854,10 @@ struct TabletDto {
     /// Prepared transaction intents on this replica (stuck-intent
     /// detection for tests and operators).
     intent_count: usize,
+    /// Age of the oldest prepared intent in micros (`None` when no
+    /// intents are prepared): with `intent_count` answers "what is
+    /// blocking resolution" at a glance.
+    oldest_prepared_age_micros: Option<u64>,
     /// Consistency-layer counters for this tablet: reads per contract
     /// `(latest, at_least, bounded_stale, any)`.
     consistency_reads: (u64, u64, u64, u64),
@@ -2770,6 +2973,7 @@ fn tablet_dto(
     status: &NodeStatus,
     directory: &DirectorySnapshot,
     intent_count: usize,
+    oldest_prepared_age_micros: Option<u64>,
 ) -> TabletDto {
     // Static clusters always tile the hash space; non-hash layouts (a
     // future concern) encode as nulls, never wrong ranges.
@@ -2821,6 +3025,7 @@ fn tablet_dto(
         range_end,
         state,
         intent_count,
+        oldest_prepared_age_micros,
         consistency_reads: status.consistency.reads_by_contract,
         consistency_local_serves: status.consistency.local_serves,
         consistency_authority_serves: status.consistency.authority_serves,
@@ -2992,75 +3197,11 @@ async fn tablets(State(shared): State<ClusterShared>) -> Json<Vec<serde_json::Va
                 .collect()
         })
         .unwrap_or_default();
+    let directory = shared.directory_snapshot();
     let mut out = Vec::new();
     for status in &statuses {
         let id = status.group.tablet().as_u64();
-        let item = health.get(&id);
-        let directory = shared.directory_snapshot();
-        let intent_count = shared
-            .node
-            .tablet_intent_count(TabletId::from_u64(id))
-            .await
-            .unwrap_or(0);
-        let mut value = serde_json::to_value(tablet_dto(status, &directory, intent_count))
-            .unwrap_or(serde_json::Value::Null);
-        if let serde_json::Value::Object(ref mut map) = value {
-            map.insert(
-                "voters".to_owned(),
-                item.and_then(|item| item.actual.clone()).map_or(
-                    serde_json::Value::Null,
-                    |voters| {
-                        serde_json::json!(
-                            voters.iter().map(|node| node.as_u64()).collect::<Vec<_>>()
-                        )
-                    },
-                ),
-            );
-            map.insert(
-                "learners".to_owned(),
-                item.map_or(serde_json::json!([]), |item| {
-                    serde_json::json!(
-                        item.learners
-                            .iter()
-                            .map(|node| node.as_u64())
-                            .collect::<Vec<_>>()
-                    )
-                }),
-            );
-            map.insert(
-                "desired".to_owned(),
-                item.map_or(serde_json::Value::Null, |item| {
-                    serde_json::json!(
-                        item.desired
-                            .iter()
-                            .map(|node| node.as_u64())
-                            .collect::<Vec<_>>()
-                    )
-                }),
-            );
-            map.insert(
-                "placement".to_owned(),
-                serde_json::Value::String(
-                    item.map_or("unknown", |item| match item.status {
-                        kivi_control::TabletHealth::Healthy => "healthy",
-                        kivi_control::TabletHealth::Converging => "converging",
-                        kivi_control::TabletHealth::UnderReplicated => "under-replicated",
-                        kivi_control::TabletHealth::Unavailable => "unavailable",
-                        kivi_control::TabletHealth::OverReplicated => "over-replicated",
-                    })
-                    .to_owned(),
-                ),
-            );
-            map.insert(
-                "healthy".to_owned(),
-                serde_json::Value::Bool(item.is_some_and(|item| item.healthy)),
-            );
-            map.insert(
-                "migrating".to_owned(),
-                serde_json::Value::Bool(item.is_some_and(|item| item.migrating)),
-            );
-        }
-        out.push(value);
+        out.push(tablet_row(&shared, status, &directory, health.get(&id)).await);
     }
     out.sort_by_key(|value| {
         value
@@ -3069,6 +3210,89 @@ async fn tablets(State(shared): State<ClusterShared>) -> Json<Vec<serde_json::Va
             .unwrap_or(u64::MAX)
     });
     Json(out)
+}
+
+/// Renders one tablet's admin row: base DTO plus placement, health, and
+/// intent age. Split from the `/v1/tablets` handler so the endpoint
+/// stays a gather-and-sort loop.
+async fn tablet_row(
+    shared: &ClusterShared,
+    status: &NodeStatus,
+    directory: &DirectorySnapshot,
+    item: Option<&super::control::PlacementHealth>,
+) -> serde_json::Value {
+    let id = status.group.tablet().as_u64();
+    let intents = shared
+        .node
+        .tablet_intents(TabletId::from_u64(id))
+        .await
+        .unwrap_or_default();
+    let now = wall_now().as_micros();
+    let oldest_prepared_age = intents
+        .iter()
+        .map(|intent| intent.prepared_at)
+        .min()
+        .map(|oldest| now.saturating_sub(oldest));
+    let mut value = serde_json::to_value(tablet_dto(
+        status,
+        directory,
+        intents.len(),
+        oldest_prepared_age,
+    ))
+    .unwrap_or(serde_json::Value::Null);
+    if let serde_json::Value::Object(ref mut map) = value {
+        map.insert(
+            "voters".to_owned(),
+            item.and_then(|item| item.actual.clone())
+                .map_or(serde_json::Value::Null, |voters| {
+                    serde_json::json!(voters.iter().map(|node| node.as_u64()).collect::<Vec<_>>())
+                }),
+        );
+        map.insert(
+            "learners".to_owned(),
+            item.map_or(serde_json::json!([]), |item| {
+                serde_json::json!(
+                    item.learners
+                        .iter()
+                        .map(|node| node.as_u64())
+                        .collect::<Vec<_>>()
+                )
+            }),
+        );
+        map.insert(
+            "desired".to_owned(),
+            item.map_or(serde_json::Value::Null, |item| {
+                serde_json::json!(
+                    item.desired
+                        .iter()
+                        .map(|node| node.as_u64())
+                        .collect::<Vec<_>>()
+                )
+            }),
+        );
+        map.insert(
+            "placement".to_owned(),
+            serde_json::Value::String(
+                item.map_or("unknown", |item| match item.status {
+                    kivi_control::TabletHealth::Healthy => "healthy",
+                    kivi_control::TabletHealth::Converging => "converging",
+                    kivi_control::TabletHealth::UnderReplicated => "under-replicated",
+                    kivi_control::TabletHealth::Unavailable => "unavailable",
+                    kivi_control::TabletHealth::OverReplicated => "over-replicated",
+                })
+                .to_owned(),
+            ),
+        );
+        map.insert(
+            "healthy".to_owned(),
+            serde_json::Value::Bool(item.is_some_and(|item| item.healthy)),
+        );
+        map.insert(
+            "migrating".to_owned(),
+            serde_json::Value::Bool(item.is_some_and(|item| item.migrating)),
+        );
+    }
+    value
 }
 
 /// Single-tablet compatibility: serves the only group when exactly one
@@ -3084,12 +3308,23 @@ async fn tablet(State(shared): State<ClusterShared>) -> (StatusCode, Json<serde_
     }
     let status = statuses.pop().expect("exactly one status");
     let directory = shared.directory_snapshot();
-    let intent_count = shared
+    let intents = shared
         .node
-        .tablet_intent_count(TabletId::from_u64(status.group.tablet().as_u64()))
+        .tablet_intents(TabletId::from_u64(status.group.tablet().as_u64()))
         .await
-        .unwrap_or(0);
-    match serde_json::to_value(tablet_dto(&status, &directory, intent_count)) {
+        .unwrap_or_default();
+    let now = wall_now().as_micros();
+    let oldest_prepared_age_micros = intents
+        .iter()
+        .map(|intent| intent.prepared_at)
+        .min()
+        .map(|oldest| now.saturating_sub(oldest));
+    match serde_json::to_value(tablet_dto(
+        &status,
+        &directory,
+        intents.len(),
+        oldest_prepared_age_micros,
+    )) {
         Ok(value) => (StatusCode::OK, Json(value)),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,

@@ -321,6 +321,15 @@ fn mixed_workload_matches_sequential_reference() {
                 assert_eq!(entry.1, Some(*value), "counter for {key}");
                 assert_eq!(entry.0, None, "no bytes for {key}");
             }
+            // Unreachable here: the scripted ops never create semantic
+            // objects (Set/CounterAdd/expiry/delete only).
+            kivi_state::LogicalValue::CommutativeCounter(_)
+            | kivi_state::LogicalValue::BoundedCounter(_)
+            | kivi_state::LogicalValue::Semaphore(_)
+            | kivi_state::LogicalValue::Lease(_)
+            | kivi_state::LogicalValue::StreamShard(_) => {
+                panic!("no scripted op produces semantic objects for {key}")
+            }
         }
         assert_eq!(entry.2, Some(object.expiry()), "expiry for {key}");
     }

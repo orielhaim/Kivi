@@ -146,6 +146,17 @@ pub enum ScannedValue {
         /// Logical length of the value.
         logical_len: u64,
     },
+    /// Typed semantic value by small descriptor (see
+    /// [`LogicalValue::scan_descriptor`](crate::LogicalValue::scan_descriptor)):
+    /// counters, escrow state, semaphore load, lease grants, and stream
+    /// shard cursors project without inlining unbounded state (permit sets
+    /// and retained entries never enter scan pages).
+    Semantic {
+        /// Object type of the scanned value.
+        object: crate::ObjectType,
+        /// Small canonical descriptor bytes for `object`.
+        descriptor: Bytes,
+    },
 }
 
 /// One bounded scan page.

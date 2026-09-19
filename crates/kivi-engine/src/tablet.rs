@@ -31,6 +31,11 @@ use kivi_types::{
 
 /// Local per-tablet counters. Plain integers behind the owner thread —
 /// aggregation across workers happens outside the hot path.
+///
+/// Transaction and semantic counters record replicated apply truth (what
+/// committed), not driver attempts: `txn_prepares` counts reserved
+/// intents, `txn_local_commits` counts atomic batch commits, and the
+/// `rejected_*` family counts terminal rejections that persisted nothing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TabletMetrics {
     /// Operations executed (reads and writes).
@@ -41,6 +46,109 @@ pub struct TabletMetrics {
     pub writes: u64,
     /// Expired objects reclaimed through explicit delete mutations.
     pub expired_reclaimed: u64,
+    /// Same-tablet atomic commits applied (`TxnCommitLocal`).
+    pub txn_local_commits: u64,
+    /// Cross-tablet prepares that reserved an intent.
+    pub txn_prepares: u64,
+    /// Prepares that met OCC/intent contention.
+    pub txn_prepare_conflicts: u64,
+    /// Intent resolutions applied (commit or abort).
+    pub txn_finalizes: u64,
+    /// Finalizes that met a foreign or digest-mismatched intent.
+    pub txn_finalize_conflicts: u64,
+    /// Commutative-counter mutations applied.
+    pub commutative_ops: u64,
+    /// Bounded-counter mutations applied (creates and adds).
+    pub bounded_ops: u64,
+    /// Escrow share moves applied.
+    pub escrow_moves: u64,
+    /// Semaphore mutations applied (creates, acquisitions, releases).
+    pub semaphore_ops: u64,
+    /// Lease acquisitions applied.
+    pub lease_acquires: u64,
+    /// Lease renewals applied.
+    pub lease_renews: u64,
+    /// Lease releases applied.
+    pub lease_releases: u64,
+    /// Stream mutations applied (creates, appends, trims).
+    pub stream_ops: u64,
+    /// Terminal `TxnConflict` rejections (nothing persisted).
+    pub rejected_conflicts: u64,
+    /// Terminal `BoundedExceeded` rejections.
+    pub rejected_rights: u64,
+    /// Terminal `SemaphoreExhausted` rejections.
+    pub rejected_capacity: u64,
+    /// Terminal `LeaseConflict` rejections.
+    pub rejected_lease: u64,
+    /// Terminal `StaleFencing` rejections.
+    pub rejected_fencing: u64,
+    /// Terminal `StreamFull` rejections.
+    pub rejected_stream: u64,
+    /// Terminal `NotFound` rejections.
+    pub rejected_not_found: u64,
+    /// Terminal `WrongType` rejections.
+    pub rejected_wrong_type: u64,
+    /// Terminal `CounterOverflow` rejections.
+    pub rejected_overflow: u64,
+}
+
+impl TabletMetrics {
+    /// Records one applied mutation by category. Exhaustive over
+    /// variants (no wildcard): a new mutation must be counted explicitly.
+    pub fn note_applied(&mut self, mutation: &kivi_state::Mutation) {
+        use kivi_state::Mutation as M;
+        match mutation {
+            M::TxnCommitLocal { .. } => self.txn_local_commits += 1,
+            M::TxnPrepare { .. } => self.txn_prepares += 1,
+            M::TxnFinalize { .. } => self.txn_finalizes += 1,
+            M::CommutativeAdd { .. } => self.commutative_ops += 1,
+            M::BoundedCreate { .. } | M::BoundedAdd { .. } => self.bounded_ops += 1,
+            M::EscrowSetShare { .. } => self.escrow_moves += 1,
+            M::SemaphoreCreate { .. } | M::SemaphoreAcquire { .. } | M::SemaphoreRelease { .. } => {
+                self.semaphore_ops += 1;
+            }
+            M::LeaseAcquire { .. } => self.lease_acquires += 1,
+            M::LeaseRenew { .. } => self.lease_renews += 1,
+            M::LeaseRelease { .. } => self.lease_releases += 1,
+            M::StreamCreate { .. } | M::StreamAppend { .. } | M::StreamTrim { .. } => {
+                self.stream_ops += 1;
+            }
+            M::PutBytes { .. }
+            | M::Delete { .. }
+            | M::CounterAdd { .. }
+            | M::SetExpiry { .. }
+            | M::ReplaceChunkedRoot { .. }
+            | M::SpliceBytes { .. }
+            | M::PutBytesWithExpiry { .. }
+            | M::ReplaceChunkedRootWithExpiry { .. } => {}
+        }
+    }
+
+    /// Records one applied transaction outcome that carries no mutation
+    /// of its own (prepare conflicts, finalize conflicts).
+    pub fn note_txn_outcome(&mut self, outcome: &kivi_state::ApplyOutcome) {
+        use kivi_state::ApplyOutcome as O;
+        if outcome == &O::TxnConflict {
+            self.txn_prepare_conflicts += 1;
+        }
+    }
+
+    /// Records one terminal rejection by error category.
+    pub fn note_rejection(&mut self, error: &kivi_state::OpError) {
+        use kivi_state::OpError as E;
+        match error {
+            E::TxnConflict => self.rejected_conflicts += 1,
+            E::BoundedExceeded => self.rejected_rights += 1,
+            E::SemaphoreExhausted => self.rejected_capacity += 1,
+            E::LeaseConflict => self.rejected_lease += 1,
+            E::StaleFencing => self.rejected_fencing += 1,
+            E::StreamFull => self.rejected_stream += 1,
+            E::NotFound => self.rejected_not_found += 1,
+            E::WrongType { .. } => self.rejected_wrong_type += 1,
+            E::CounterOverflow => self.rejected_overflow += 1,
+            E::StaleRangeBase => {}
+        }
+    }
 }
 
 /// Live tablet failure modes.
@@ -211,36 +319,6 @@ pub enum DurablePrepared {
     /// The session holds too many unacknowledged outcomes: reject before
     /// persisting anything (so no phantom execution can follow).
     Overloaded,
-}
-
-/// Maps a persisted mutation back to its originating opcode discriminant
-/// (response shaping + replay mapping). The `is_persist_expiry` flag is the
-/// same one [`kivi_state::outcome_for`] takes: both derive from the single
-/// originating request, so they cannot disagree.
-fn opcode_for(mutation: &Mutation, is_persist_expiry: bool) -> u8 {
-    use kivi_protocol::Opcode;
-    match mutation {
-        // Chunked roots answer exactly like inline stores: the response
-        // shapes `Stored{version}` either way (see `operation_opcode`).
-        // Range patches answer the same `Stored{version}` shape.
-        Mutation::PutBytes { .. } | Mutation::ReplaceChunkedRoot { .. } => Opcode::Set,
-        Mutation::PutBytesWithExpiry { .. } | Mutation::ReplaceChunkedRootWithExpiry { .. } => {
-            Opcode::SetConditional
-        }
-        Mutation::SpliceBytes { .. } => Opcode::SetRange,
-        Mutation::Delete { .. } => Opcode::Delete,
-        Mutation::CounterAdd { .. } => Opcode::CounterAdd,
-        Mutation::SetExpiry { .. } => {
-            if is_persist_expiry {
-                Opcode::PersistExpiry
-            } else {
-                Opcode::ExpireAt
-            }
-        }
-        // Transaction steps shape as their parent batch opcode.
-        Mutation::TxnPrepare { .. } | Mutation::TxnFinalize { .. } => Opcode::AtomicBatch,
-    }
-    .as_u8()
 }
 
 /// Checkpoint-restored tablet state: plain data the recovery loader
@@ -462,6 +540,8 @@ impl LiveTablet {
         let outcome = self.store.apply(mutation, now)?;
         self.metrics.writes += 1;
         self.metrics.ops_total += 1;
+        self.metrics.note_applied(mutation);
+        self.metrics.note_txn_outcome(&outcome);
         Ok(outcome)
     }
 
@@ -486,7 +566,11 @@ impl LiveTablet {
         op: &Operation,
         now: UnixMicros,
     ) -> Result<OperationResult, TabletError> {
-        match self.store.prepare(op, now)? {
+        let prepared = self.store.prepare(op, now).map_err(|error| {
+            self.metrics.note_rejection(&error);
+            TabletError::Op(error)
+        })?;
+        match prepared {
             Prepared::Read(result) => {
                 self.metrics.reads += 1;
                 self.metrics.ops_total += 1;
@@ -496,6 +580,8 @@ impl LiveTablet {
                 let outcome = self.store.apply(&mutation, now)?;
                 self.metrics.writes += 1;
                 self.metrics.ops_total += 1;
+                self.metrics.note_applied(&mutation);
+                self.metrics.note_txn_outcome(&outcome);
                 Ok(kivi_state::outcome_for(
                     &mutation,
                     &outcome,
@@ -703,7 +789,9 @@ impl LiveTablet {
             commit.as_u64(),
         );
         self.set_applied(commit);
-        self.note_key_dirty(mutation.key());
+        for key in mutation.keys() {
+            self.note_key_dirty(key);
+        }
         self.note_chunked_commit(commit, mutation);
         if let Some(marker) = identity {
             self.install_dedup(
@@ -711,23 +799,46 @@ impl LiveTablet {
                 marker.client.seq(),
                 DedupEntry {
                     commit,
-                    opcode: opcode_for(mutation, is_persist_expiry),
+                    opcode: kivi_protocol::mutation_opcode(mutation, is_persist_expiry).as_u8(),
                     outcome: DurableOutcome::Completed(result.clone()),
                 },
             );
         }
         self.metrics.writes += 1;
         self.metrics.ops_total += 1;
+        self.metrics.note_applied(mutation);
+        self.metrics.note_txn_outcome(&outcome);
         Ok(result)
     }
 
-    /// Records a chunked root's commit in the GC journal. Called on every
-    /// path that installs a `ReplaceChunkedRoot`: live apply, WAL replay,
-    /// and checkpoint restore (which conservatively files restored roots
-    /// under the restore cut — retention-longer, never shorter).
+    /// Records chunked roots installed by a commit in the GC journal.
+    /// Called after every apply (live, replay, restore-conservative): roots
+    /// are observed in post-apply state rather than named from the mutation,
+    /// so transactionally committed roots (finalize-applied inner writes,
+    /// local-commit sets) journal exactly like direct ones, and deletions
+    /// journal nothing. Prepared intents journal their referenced manifests
+    /// directly (no post-state root exists yet): the entry lingers past an
+    /// abort until the prune bound passes — retention-longer, never
+    /// shorter — so payload a later Commit needs can never be collected
+    /// first. GC always sees staged data as either pinned or journaled,
+    /// never neither.
     fn note_chunked_commit(&mut self, commit: CommitPosition, mutation: &Mutation) {
-        if let Mutation::ReplaceChunkedRoot { manifest, .. } = mutation {
+        if let Mutation::TxnPrepare {
+            write: kivi_state::TxnWriteKind::PutChunked { manifest, .. },
+            ..
+        } = mutation
+        {
             self.chunked_commits.push_back((commit.as_u64(), *manifest));
+        }
+        for key in mutation.keys() {
+            if let Some(chunked) = self
+                .store
+                .get_stored(key)
+                .and_then(kivi_state::StoredObject::chunk_ref)
+            {
+                self.chunked_commits
+                    .push_back((commit.as_u64(), chunked.manifest));
+            }
         }
     }
 
@@ -767,6 +878,9 @@ impl LiveTablet {
             );
         }
         self.metrics.ops_total += 1;
+        if let DurableOutcome::Rejected(error) = outcome {
+            self.metrics.note_rejection(error);
+        }
         outcome.clone()
     }
 
@@ -822,22 +936,26 @@ impl LiveTablet {
         }
         self.next_commit = commit;
         self.set_applied(commit);
-        self.note_key_dirty(mutation.key());
+        for key in mutation.keys() {
+            self.note_key_dirty(key);
+        }
         self.note_chunked_commit(commit, mutation);
+        self.metrics.writes += 1;
+        self.metrics.ops_total += 1;
+        self.metrics.note_applied(mutation);
+        self.metrics.note_txn_outcome(&outcome);
         if let Some(marker) = identity {
             self.install_dedup(
                 marker.client.session(),
                 marker.client.seq(),
                 DedupEntry {
                     commit,
-                    opcode: opcode_for(mutation, is_persist_expiry),
+                    opcode: kivi_protocol::mutation_opcode(mutation, is_persist_expiry).as_u8(),
                     outcome: DurableOutcome::Completed(result),
                 },
             );
             self.advance_replay_floor(marker);
         }
-        self.metrics.writes += 1;
-        self.metrics.ops_total += 1;
         Ok(())
     }
 

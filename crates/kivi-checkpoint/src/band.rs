@@ -69,6 +69,16 @@ pub const REPR_CHUNKED: u8 = 1;
 pub const TYPE_BYTES: u8 = 0;
 /// Counter value tag.
 pub const TYPE_COUNTER: u8 = 1;
+/// Commutative-counter value tag (order-free sum). Fixed forever.
+pub const TYPE_COMMUTATIVE: u8 = 2;
+/// Bounded-counter value tag (value plus escrow share). Fixed forever.
+pub const TYPE_BOUNDED: u8 = 3;
+/// Semaphore value tag (capacity plus live permits). Fixed forever.
+pub const TYPE_SEMAPHORE: u8 = 4;
+/// Lease value tag (holder plus fencing). Fixed forever.
+pub const TYPE_LEASE: u8 = 5;
+/// Stream-shard value tag (cursor plus retained entries). Fixed forever.
+pub const TYPE_STREAM_SHARD: u8 = 6;
 
 /// Compression codec for a band body. `NONE` is the production default;
 /// `LZ4` is the evaluated optional experiment (see the checkpoint
@@ -518,6 +528,41 @@ fn encode_record(record: &BandRecord, out: &mut Vec<u8>) -> Result<(), Checkpoin
             record.object.expiry().encode(out);
             out.extend_from_slice(&value.to_le_bytes());
         }
+        LogicalValue::CommutativeCounter(value) => {
+            out.push(REPR_INLINE);
+            out.push(TYPE_COMMUTATIVE);
+            out.extend_from_slice(&record.object.version().as_u64().to_le_bytes());
+            record.object.expiry().encode(out);
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        LogicalValue::BoundedCounter(state) => {
+            out.push(REPR_INLINE);
+            out.push(TYPE_BOUNDED);
+            out.extend_from_slice(&record.object.version().as_u64().to_le_bytes());
+            record.object.expiry().encode(out);
+            state.encode(out);
+        }
+        LogicalValue::Semaphore(state) => {
+            out.push(REPR_INLINE);
+            out.push(TYPE_SEMAPHORE);
+            out.extend_from_slice(&record.object.version().as_u64().to_le_bytes());
+            record.object.expiry().encode(out);
+            state.encode(out);
+        }
+        LogicalValue::Lease(state) => {
+            out.push(REPR_INLINE);
+            out.push(TYPE_LEASE);
+            out.extend_from_slice(&record.object.version().as_u64().to_le_bytes());
+            record.object.expiry().encode(out);
+            state.encode(out);
+        }
+        LogicalValue::StreamShard(shard) => {
+            out.push(REPR_INLINE);
+            out.push(TYPE_STREAM_SHARD);
+            out.extend_from_slice(&record.object.version().as_u64().to_le_bytes());
+            record.object.expiry().encode(out);
+            shard.encode(out);
+        }
     }
     Ok(())
 }
@@ -590,6 +635,27 @@ fn decode_record(input: &[u8]) -> Result<(BandRecord, usize), CodecError> {
             at,
         ));
     }
+    let (value, used) = decode_band_value(input, at, value_tag)?;
+    at = used;
+    Ok((
+        BandRecord {
+            hash,
+            key,
+            object: StoredObject::restore(value, version, expiry),
+        },
+        at,
+    ))
+}
+
+/// Decodes one inline band value by its type tag, verifying structural
+/// invariants (bounded rights, semaphore capacity) at the boundary: a
+/// checkpoint carrying a violated invariant fails closed here, never
+/// after restore.
+fn decode_band_value(
+    input: &[u8],
+    mut at: usize,
+    value_tag: u8,
+) -> Result<(LogicalValue, usize), CodecError> {
     let value = match value_tag {
         TYPE_BYTES => {
             let len = u32::from_le_bytes(band_take(input, &mut at)?) as usize;
@@ -604,6 +670,63 @@ fn decode_record(input: &[u8]) -> Result<(BandRecord, usize), CodecError> {
             value
         }
         TYPE_COUNTER => LogicalValue::StrictCounter(i64::from_le_bytes(band_take(input, &mut at)?)),
+        TYPE_COMMUTATIVE => {
+            LogicalValue::CommutativeCounter(i64::from_le_bytes(band_take(input, &mut at)?))
+        }
+        TYPE_BOUNDED => {
+            let (state, used) =
+                kivi_state::BoundedCounterState::decode(&input[at..]).map_err(|_| {
+                    CodecError::InvalidTag {
+                        kind: "band bounded counter",
+                        tag: TYPE_BOUNDED,
+                    }
+                })?;
+            if !state.invariant_holds() {
+                return Err(CodecError::InvalidTag {
+                    kind: "band bounded counter",
+                    tag: TYPE_BOUNDED,
+                });
+            }
+            at += used;
+            LogicalValue::BoundedCounter(state)
+        }
+        TYPE_SEMAPHORE => {
+            let (state, used) = kivi_state::SemaphoreState::decode(&input[at..]).map_err(|_| {
+                CodecError::InvalidTag {
+                    kind: "band semaphore",
+                    tag: TYPE_SEMAPHORE,
+                }
+            })?;
+            if !state.invariant_holds() {
+                return Err(CodecError::InvalidTag {
+                    kind: "band semaphore",
+                    tag: TYPE_SEMAPHORE,
+                });
+            }
+            at += used;
+            LogicalValue::Semaphore(state)
+        }
+        TYPE_LEASE => {
+            let (state, used) = kivi_state::LeaseState::decode(&input[at..]).map_err(|_| {
+                CodecError::InvalidTag {
+                    kind: "band lease",
+                    tag: TYPE_LEASE,
+                }
+            })?;
+            at += used;
+            LogicalValue::Lease(state)
+        }
+        TYPE_STREAM_SHARD => {
+            let (shard, used) =
+                kivi_state::StreamShardState::decode(&input[at..]).map_err(|_| {
+                    CodecError::InvalidTag {
+                        kind: "band stream shard",
+                        tag: TYPE_STREAM_SHARD,
+                    }
+                })?;
+            at += used;
+            LogicalValue::StreamShard(shard)
+        }
         other => {
             return Err(CodecError::InvalidTag {
                 kind: "band value type",
@@ -611,14 +734,7 @@ fn decode_record(input: &[u8]) -> Result<(BandRecord, usize), CodecError> {
             });
         }
     };
-    Ok((
-        BandRecord {
-            hash,
-            key,
-            object: StoredObject::restore(value, version, expiry),
-        },
-        at,
-    ))
+    Ok((value, at))
 }
 
 #[cfg(test)]

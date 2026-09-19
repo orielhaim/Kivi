@@ -332,6 +332,35 @@ impl ChunkLaneHandle {
         reply.recv_blocking().map_err(|_| ChunkError::Overloaded)?
     }
 
+    /// Verifies one chunked root names durable local payload (manifest
+    /// indexed, lengths agree, every chunk present). Reactor-style wait
+    /// for async admission paths; transaction admission proves every
+    /// chunked reference this way before a participant may say Prepared.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChunkError::Overloaded`] when the bounded lane queue is
+    /// full or the lane is gone, or the verification failure (missing or
+    /// corrupt data fails loudly — a commit must never reference it).
+    pub async fn check_root_async(
+        &self,
+        manifest: ManifestId,
+        logical_len: u64,
+    ) -> Result<(), ChunkError> {
+        let (reply_tx, reply_rx) = bounded(1);
+        self.tx
+            .try_send(ChunkJob::CheckRoot {
+                manifest,
+                logical_len,
+                reply: reply_tx,
+            })
+            .map_err(|_| ChunkError::Overloaded)?;
+        ChunkReply { rx: reply_rx }
+            .recv_async()
+            .await
+            .map_err(|_| ChunkError::Overloaded)?
+    }
+
     /// Non-blocking submit for bridge turns: returns the reply to poll.
     ///
     /// # Errors
@@ -1624,6 +1653,13 @@ impl Drop for PinnedUpload {
 /// untouched, so call-site behavior for all other opcodes is unchanged.
 /// Conditional stores split identically, preserving their condition and
 /// expiry policy into a staged conditional chunked operation.
+///
+/// Transactional writes pass through untouched: large inline puts stay
+/// inline (bounded by the transaction byte cap), and chunked references
+/// are proven — never staged — at admission (`verify_txn_chunk_refs` on
+/// the worker path, the async twin on the connection path, sidecar checks
+/// on the consensus path), so a later Commit can never meet a durable
+/// root with unavailable payload.
 pub fn split_large_set(op: kivi_state::Operation, threshold: u64) -> LargeSetSplit {
     match op {
         kivi_state::Operation::Set { key, value } if value.len() as u64 > threshold => {
@@ -1654,8 +1690,9 @@ pub fn split_large_set(op: kivi_state::Operation, threshold: u64) -> LargeSetSpl
 pub enum RangeBase {
     /// No live object: the patch applies over empty bytes.
     Absent,
-    /// Live counter: patches reject with `WrongType` at prepare.
-    Counter,
+    /// Live non-bytes value (counters and semantic objects): patches reject
+    /// with `WrongType` at prepare.
+    NonBytes,
     /// Live inline bytes to splice in memory.
     Inline(Bytes),
     /// Live chunked root: the lane restages instead of recording a splice.
@@ -1725,7 +1762,7 @@ pub fn plan_set_range(
         };
     };
     match base {
-        RangeBase::Counter => {
+        RangeBase::NonBytes => {
             SetRangePlan::Inline(kivi_state::Operation::SetRange { key, offset, patch })
         }
         RangeBase::Chunked {

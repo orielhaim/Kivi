@@ -530,6 +530,7 @@ async fn resolve_one_intent(
                                 txn: intent.id,
                                 key: intent.key.clone(),
                                 commit: false,
+                                digest: intent.digest,
                             },
                             None,
                             None,
@@ -557,6 +558,7 @@ async fn resolve_one_intent(
                         txn: intent.id,
                         key: intent.key.clone(),
                         commit: true,
+                        digest: intent.digest,
                     },
                     None,
                     None,
@@ -575,6 +577,7 @@ async fn resolve_one_intent(
                         txn: intent.id,
                         key: intent.key.clone(),
                         commit: false,
+                        digest: intent.digest,
                     },
                     None,
                     None,
@@ -640,6 +643,8 @@ async fn cas_abort_absent_record(
             kind: TxnWriteKind::Put(bytes::Bytes::from(aborted.encode())),
             expect: TxnExpect::Absent,
         },
+        // Record-key steps bind the zero digest (no user write set).
+        digest: [0u8; 32],
     };
     if !matches!(
         node.propose(coordinator, &prepare, None, None, now).await,
@@ -657,6 +662,7 @@ async fn cas_abort_absent_record(
         txn: abort_txn,
         key: record_key,
         commit: true,
+        digest: [0u8; 32],
     };
     matches!(
         node.propose(coordinator, &finalize, None, None, now).await,
@@ -914,6 +920,35 @@ async fn advance_merge(
     }
 }
 
+/// Whether one parent tablet is under-replicated (a degraded parent
+/// never splits or merges: safety before optimization).
+fn parent_degraded(state: &ControlState, parent: TabletId) -> bool {
+    state.desired(parent).is_some_and(|desired| {
+        desired.replicas.iter().any(|replica| {
+            state.node(*replica).is_some_and(|record| {
+                matches!(record.state, NodeState::Unavailable | NodeState::Removed)
+            })
+        })
+    })
+}
+
+/// Returns the parents in `parents` holding unresolved intents: intents
+/// never migrate, so any blocked parent defers drain, fence, seal, and
+/// retire alike.
+async fn blocked_parents(node: &Arc<ConsensusNode>, parents: &[TabletId]) -> Vec<TabletId> {
+    let mut blocked = Vec::new();
+    for parent in parents {
+        if node
+            .tablet_intent_count(*parent)
+            .await
+            .is_some_and(|count| count > 0)
+        {
+            blocked.push(*parent);
+        }
+    }
+    blocked
+}
+
 /// Drives one split plan a single idempotent step.
 ///
 /// Repair wins over split: a parent with a live migration plan (repair,
@@ -936,13 +971,7 @@ async fn drive_split(
         return;
     }
     // A degraded parent never splits: safety before optimization.
-    if state.desired(plan.parent).is_some_and(|desired| {
-        desired.replicas.iter().any(|replica| {
-            state.node(*replica).is_some_and(|record| {
-                matches!(record.state, NodeState::Unavailable | NodeState::Removed)
-            })
-        })
-    }) {
+    if parent_degraded(state, plan.parent) {
         tracing::debug!(
             plan = plan.id.as_u64(),
             parent = plan.parent.as_u64(),
@@ -964,6 +993,19 @@ async fn drive_split(
             }
         }
         SplitPhase::BaseSeeded => {
+            // Drain before fence: unresolved intents block the seal (they
+            // never migrate — topology copies carry objects and sessions
+            // only), and finalizes flow only while unfenced. Fencing with
+            // live intents would strand them: the fence blocks the very
+            // finalizes that could resolve them.
+            if !blocked_parents(node, &[plan.parent]).await.is_empty() {
+                tracing::debug!(
+                    plan = plan.id.as_u64(),
+                    parent = plan.parent.as_u64(),
+                    "split deferred: parent holds unresolved intents"
+                );
+                return;
+            }
             let fenced_at = std::time::Instant::now();
             if fence_tablets(node, state, &[plan.parent], true).await
                 && seed_split_children(node, state, plan).await
@@ -981,11 +1023,38 @@ async fn drive_split(
             }
         }
         SplitPhase::Fenced => {
+            // Seal gate: a prepare admitted between the drain check and the
+            // fence would strand at cutover (intents never migrate), so the
+            // seal re-verifies zero intents under fence. On a race the seal
+            // unfences and regresses to BaseSeeded (finalizes flow again,
+            // the next pass re-drains and re-fences) rather than stranding
+            // transactional state in a retired lineage.
+            if !blocked_parents(node, &[plan.parent]).await.is_empty() {
+                tracing::info!(
+                    plan = plan.id.as_u64(),
+                    parent = plan.parent.as_u64(),
+                    "split seal deferred: intents raced the fence; unfencing"
+                );
+                let _ = fence_tablets(node, state, &[plan.parent], false).await;
+                advance_split(node, plan, SplitPhase::BaseSeeded).await;
+                return;
+            }
             if publish_split_cutover(node, state, plan, directory).await {
                 advance_split(node, plan, SplitPhase::CutoverCommitted).await;
             }
         }
         SplitPhase::CutoverCommitted => {
+            // Retirement reclaims the parent lineage: never retire under
+            // unresolved intents (a stranded intent could never resolve
+            // once its group is gone).
+            if !blocked_parents(node, &[plan.parent]).await.is_empty() {
+                tracing::debug!(
+                    plan = plan.id.as_u64(),
+                    parent = plan.parent.as_u64(),
+                    "split retire deferred: parent holds unresolved intents"
+                );
+                return;
+            }
             if retire_tablets(node, state, &[plan.parent], plan.generation.as_u64()).await {
                 advance_split(node, plan, SplitPhase::ParentRetiring).await;
             }
@@ -994,6 +1063,51 @@ async fn drive_split(
             advance_split(node, plan, SplitPhase::Completed).await;
         }
         SplitPhase::Completed | SplitPhase::Failed => {}
+    }
+}
+
+/// Defers a merge step while any parent holds unresolved intents,
+/// logging each blocked parent: `true` means all clear (drain, seal, and
+/// retire share the gate — intents never migrate, so the step retries on
+/// a later pass). Seal races log at info (`notable`); routine drains at
+/// debug.
+async fn merge_parents_clear(
+    node: &Arc<ConsensusNode>,
+    plan: &kivi_control::MergePlan,
+    cause: &str,
+    notable: bool,
+) -> bool {
+    let blocked = blocked_parents(node, &[plan.left, plan.right]).await;
+    for parent in &blocked {
+        if notable {
+            tracing::info!(plan = plan.id.as_u64(), parent = parent.as_u64(), "{cause}");
+        } else {
+            tracing::debug!(plan = plan.id.as_u64(), parent = parent.as_u64(), "{cause}");
+        }
+    }
+    blocked.is_empty()
+}
+
+/// Installs the merge final tail under fence: seed, snapshot, advance —
+/// or unfence on any failure so finalizes flow again.
+async fn merge_install_tail(
+    node: &Arc<ConsensusNode>,
+    state: &ControlState,
+    plan: &kivi_control::MergePlan,
+) {
+    let fenced_at = std::time::Instant::now();
+    if fence_tablets(node, state, &[plan.left, plan.right], true).await
+        && seed_merge_target_nodes(node, state, plan).await
+        && snapshot_merge_target(node, state, plan).await
+    {
+        tracing::info!(
+            plan = plan.id.as_u64(),
+            fence_ms = u64::try_from(fenced_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "merge final tail installed under fence"
+        );
+        advance_merge(node, plan, MergePhase::Fenced).await;
+    } else {
+        let _ = fence_tablets(node, state, &[plan.left, plan.right], false).await;
     }
 }
 
@@ -1015,13 +1129,7 @@ async fn drive_merge(
         return;
     }
     for parent in [plan.left, plan.right] {
-        if state.desired(parent).is_some_and(|desired| {
-            desired.replicas.iter().any(|replica| {
-                state.node(*replica).is_some_and(|record| {
-                    matches!(record.state, NodeState::Unavailable | NodeState::Removed)
-                })
-            })
-        }) {
+        if parent_degraded(state, parent) {
             tracing::debug!(
                 plan = plan.id.as_u64(),
                 parent = parent.as_u64(),
@@ -1044,27 +1152,54 @@ async fn drive_merge(
             }
         }
         MergePhase::BaseSeeded => {
-            let fenced_at = std::time::Instant::now();
-            if fence_tablets(node, state, &[plan.left, plan.right], true).await
-                && seed_merge_target_nodes(node, state, plan).await
-                && snapshot_merge_target(node, state, plan).await
+            // Drain before fence (see the split seal gate): unresolved
+            // intents never migrate, and finalizes flow only while
+            // unfenced.
+            if !merge_parents_clear(
+                node,
+                plan,
+                "merge deferred: parent holds unresolved intents",
+                false,
+            )
+            .await
             {
-                tracing::info!(
-                    plan = plan.id.as_u64(),
-                    fence_ms = u64::try_from(fenced_at.elapsed().as_millis()).unwrap_or(u64::MAX),
-                    "merge final tail installed under fence"
-                );
-                advance_merge(node, plan, MergePhase::Fenced).await;
-            } else {
-                let _ = fence_tablets(node, state, &[plan.left, plan.right], false).await;
+                return;
             }
+            merge_install_tail(node, state, plan).await;
         }
         MergePhase::Fenced => {
+            // Seal gate (see the split seal gate): re-verify zero intents
+            // under fence; on a race, unfence and regress rather than
+            // strand transactional state in a retired lineage.
+            if !merge_parents_clear(
+                node,
+                plan,
+                "merge seal deferred: intents raced the fence; unfencing",
+                true,
+            )
+            .await
+            {
+                let _ = fence_tablets(node, state, &[plan.left, plan.right], false).await;
+                advance_merge(node, plan, MergePhase::BaseSeeded).await;
+                return;
+            }
             if publish_merge_cutover(node, state, plan, directory).await {
                 advance_merge(node, plan, MergePhase::CutoverCommitted).await;
             }
         }
         MergePhase::CutoverCommitted => {
+            // Retirement reclaims the parent lineages: never retire under
+            // unresolved intents.
+            if !merge_parents_clear(
+                node,
+                plan,
+                "merge retire deferred: parent holds unresolved intents",
+                false,
+            )
+            .await
+            {
+                return;
+            }
             if retire_tablets(
                 node,
                 state,

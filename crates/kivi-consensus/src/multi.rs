@@ -1751,6 +1751,20 @@ impl ConsensusNode {
     ///
     /// Returns a human-readable reason when either replica is not hosted
     /// locally.
+    /// Seeds a hash split child from its local parent: keys whose partition
+    /// hash falls on this side go here, including system (`\xff`) keys by
+    /// the same hash rule — transaction decision records therefore land in
+    /// exactly the child that post-cutover hash routing finds, so recovery
+    /// always finds them. Sessions copy wholesale to both children
+    /// (bounded, and required for exactly-once retries across the cutover);
+    /// prepared intents are NOT copied and never migrate (the reconciler
+    /// only seals parents with zero unresolved intents). Idempotent:
+    /// re-seeding overwrites the inactive target.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable reason when any replica is not hosted
+    /// locally.
     pub async fn seed_split_child(
         &self,
         parent: TabletId,
@@ -1844,12 +1858,16 @@ impl ConsensusNode {
 
     /// Seeds an ordered split child from its local parent: keys strictly
     /// below `split_key` go left, the rest go right (half-open `[start,
-    /// end)` boundary, never a hash midpoint). Sessions copy wholesale to
-    /// the child; prepared intents are NOT copied (the parent stays fenced
-    /// and the cutover migrates live intents to their new owners — seeding
-    /// a copy would fork the reservation). The child inherits the parent's
-    /// ordered-index flag. Idempotent: re-seeding overwrites the inactive
-    /// target.
+    /// end)` boundary, never a hash midpoint). System (`\xff`) keys sort
+    /// past every user split point, so transaction decision records land in
+    /// the right child deterministically — and post-cutover record reads
+    /// route by the same ordered rule, so recovery always finds them.
+    /// Sessions copy wholesale to the child; prepared intents are NOT
+    /// copied and never migrate (a copy would fork the reservation):
+    /// the reconciler only seals parents with zero unresolved intents, so
+    /// there is nothing to migrate at cutover. The child inherits the
+    /// parent's ordered-index flag. Idempotent: re-seeding overwrites the
+    /// inactive target.
     ///
     /// # Errors
     ///

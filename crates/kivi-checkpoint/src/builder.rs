@@ -542,17 +542,7 @@ mod tests {
         let logical_bytes: u64 = snapshot
             .objects
             .iter()
-            .map(|(key, object)| {
-                key.as_bytes().len() as u64
-                    + match object.value() {
-                        kivi_state::LogicalValue::Bytes(value) => value.len() as u64,
-                        // Chunked roots count logical bytes, not the
-                        // resident reference: the benchmark sizes the
-                        // logical value either representation holds.
-                        kivi_state::LogicalValue::Chunked(chunked) => chunked.logical_len,
-                        kivi_state::LogicalValue::StrictCounter(_) => 8,
-                    }
-            })
+            .map(|(key, object)| key.as_bytes().len() as u64 + object.value().logical_bytes())
             .sum();
         // NONE baseline.
         let none_policy = CheckpointPolicy::DEFAULT;

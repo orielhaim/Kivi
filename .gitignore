@@ -1,5 +1,7 @@
 /target
 *.log
+# TLC model-checker binary (fetched by hand, never committed).
+/.research/
 # TLC scratch: states dirs and error-trace modules are generated outside
 # spec/ by spec/run_tla.ps1; ignore strays from ad-hoc runs.
 /states/

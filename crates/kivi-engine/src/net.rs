@@ -98,6 +98,11 @@ const BRIDGE_IDLE_BACKSTOP: Duration = Duration::from_millis(20);
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Startup handshake timeout (bind + runtime creation must report fast).
 pub(crate) const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum stream entries encoded in one `StreamEntries` response page.
+/// The store page may hold more; shaping truncates explicitly and the
+/// client resumes by offset, so one giant shard can never blow the frame
+/// budget. Truncation keeps shard order (a prefix of the page).
+const MAX_STREAM_PAGE_ENTRIES: usize = 256;
 
 /// Connection-level bounds, all explicit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1810,6 +1815,28 @@ impl Conn {
                     }
                 }
             };
+        // Prove every chunked reference a transaction carries before
+        // admission (mirrors the worker path's blocking check): a dangling
+        // root is rejected loudly, never committed.
+        if let Err(detail) = self.verify_txn_chunk_refs(&operation).await {
+            return self
+                .respond(
+                    request_id,
+                    requested,
+                    kivi_protocol::Response {
+                        proof: None,
+                        status: kivi_protocol::Status::InvalidRequest,
+                        body: kivi_protocol::ResponseBody::Diagnostic(detail),
+                    },
+                )
+                .await;
+        }
+        // Attribute escrow ownership: a bounded-counter create takes its
+        // initial full share on the serving tablet (clients send zero).
+        let mut operation = operation;
+        if let Operation::BoundedCounterCreate { holder, .. } = &mut operation {
+            *holder = tablet;
+        }
         // Single-node contract gate: this replica holds the only copy, so
         // local applied state is definitionally fresh — Latest,
         // BoundedStale, and Any serve directly. AtLeast still validates
@@ -2245,6 +2272,47 @@ impl Conn {
         .await
     }
 
+    /// Proves every chunked reference a transaction carries names durable
+    /// local payload (async twin of the worker path's blocking check):
+    /// staged uploads and committed packs alike pass; anything else is a
+    /// dangling root and the prepare is rejected loudly, never committed.
+    /// Returns the diagnostic for the rejection response.
+    async fn verify_txn_chunk_refs(&self, operation: &Operation) -> Result<(), String> {
+        let refs: Vec<(kivi_types::ManifestId, u64)> = match operation {
+            Operation::TxnPrepare { write, .. } => match &write.kind {
+                kivi_state::TxnWriteKind::PutChunked {
+                    manifest,
+                    logical_len,
+                } => vec![(*manifest, *logical_len)],
+                _ => Vec::new(),
+            },
+            Operation::TxnCommitLocal { writes, .. } => writes
+                .iter()
+                .filter_map(|write| match &write.kind {
+                    kivi_state::TxnWriteKind::PutChunked {
+                        manifest,
+                        logical_len,
+                    } => Some((*manifest, *logical_len)),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        for (manifest, logical_len) in refs {
+            if let Err(error) = self
+                .chunks
+                .lane
+                .check_root_async(manifest, logical_len)
+                .await
+            {
+                return Err(format!(
+                    "transactional chunked write references unavailable payload: {error}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Pumps the shared commit coordinator (no-op in ephemeral mode).
     /// Synchronous borrows only; never held across an `.await`.
     fn pump_coordinator(&mut self) {
@@ -2645,6 +2713,7 @@ impl Conn {
             },
             R::Value(None)
             | R::Counter(None)
+            | R::CommutativeValue(None)
             | R::Expiry(None)
             | R::Length(None)
             | R::Version(None) => Response {
@@ -2765,7 +2834,157 @@ impl Conn {
                 body: ResponseBody::TxnFinalized {
                     applied: *applied,
                     version: version.map_or(0, kivi_state::ObjectVersion::as_u64),
+                    tablet: tablet.as_u64(),
                 },
+            },
+            R::TxnLocalCommitted { versions } => Response {
+                proof: None,
+                status: Status::Ok,
+                body: ResponseBody::AtomicCommitted {
+                    versions: versions
+                        .iter()
+                        .map(|version| version.map(kivi_state::ObjectVersion::as_u64))
+                        .collect(),
+                },
+            },
+            R::CommutativeApplied => Response {
+                proof: None,
+                status: Status::Ok,
+                body: ResponseBody::CommutativeApplied,
+            },
+            R::CommutativeValue(Some(value)) => Response {
+                proof: None,
+                status: Status::Ok,
+                body: ResponseBody::CommutativeValue(*value),
+            },
+            R::BoundedUpdated { value, version } => Response {
+                proof: None,
+                status: Status::Ok,
+                body: ResponseBody::BoundedUpdated {
+                    value: *value,
+                    version: version.as_u64(),
+                },
+            },
+            R::BoundedValue {
+                value: Some(value),
+                capacity: Some(capacity),
+                share: Some((share_min, share_max)),
+            } => Response {
+                proof: None,
+                status: Status::Ok,
+                body: ResponseBody::BoundedValue {
+                    value: *value,
+                    capacity: *capacity,
+                    share_min: *share_min,
+                    share_max: *share_max,
+                },
+            },
+            // Absent bounded counters arrive as `NotFound` (handled with
+            // the other absent reads above); a half-present value here is
+            // divergent state, never a client answer.
+            R::BoundedValue { .. } => Response {
+                proof: None,
+                status: Status::Internal,
+                body: ResponseBody::Diagnostic("bounded counter value without capacity".to_owned()),
+            },
+            R::SemaphoreAcquired => Response {
+                proof: None,
+                status: Status::Ok,
+                body: ResponseBody::SemaphoreAcquired,
+            },
+            R::SemaphoreReleased { released } => Response {
+                proof: None,
+                status: Status::Ok,
+                body: ResponseBody::SemaphoreReleased {
+                    released: *released,
+                },
+            },
+            R::SemaphoreLoad {
+                outstanding,
+                capacity,
+            } => Response {
+                proof: None,
+                status: Status::Ok,
+                body: ResponseBody::SemaphoreLoad {
+                    outstanding: *outstanding,
+                    capacity: *capacity,
+                },
+            },
+            R::LeaseAcquired {
+                fencing,
+                expires_at,
+            } => Response {
+                proof: None,
+                status: Status::Ok,
+                body: ResponseBody::LeaseAcquired {
+                    fencing: fencing.as_u64(),
+                    expires_at: expires_at.as_micros(),
+                },
+            },
+            R::LeaseRenewed {
+                fencing,
+                expires_at,
+            } => Response {
+                proof: None,
+                status: Status::Ok,
+                body: ResponseBody::LeaseRenewed {
+                    fencing: fencing.as_u64(),
+                    expires_at: expires_at.as_micros(),
+                },
+            },
+            R::LeaseReleased { released } => Response {
+                proof: None,
+                status: Status::Ok,
+                body: ResponseBody::LeaseReleased {
+                    released: *released,
+                },
+            },
+            R::LeaseInfo {
+                holder,
+                next_fencing,
+            } => Response {
+                proof: None,
+                status: Status::Ok,
+                body: ResponseBody::LeaseInfo {
+                    owner: holder.map(|holder| holder.owner),
+                    fencing: holder.map_or(0, |holder| holder.fencing.as_u64()),
+                    expires_at: holder.map_or(0, |holder| holder.expires_at.as_micros()),
+                    next_fencing: next_fencing.as_u64(),
+                },
+            },
+            R::StreamCreated => Response {
+                proof: None,
+                status: Status::Ok,
+                body: ResponseBody::StreamCreated,
+            },
+            R::StreamAppended { offset } => Response {
+                proof: None,
+                status: Status::Ok,
+                body: ResponseBody::StreamAppended { offset: *offset },
+            },
+            R::StreamEntries {
+                entries,
+                next_offset,
+            } => Response {
+                proof: None,
+                status: Status::Ok,
+                body: ResponseBody::StreamEntries {
+                    entries: entries
+                        .iter()
+                        .take(MAX_STREAM_PAGE_ENTRIES)
+                        .map(|entry| kivi_protocol::StreamEntryBody {
+                            offset: entry.offset,
+                            partition: entry.partition.clone(),
+                            payload: entry.payload.to_vec(),
+                        })
+                        .collect(),
+                    next_offset: *next_offset,
+                },
+            },
+            R::StreamTrimmed { removed } => Response {
+                proof: None,
+                status: Status::Ok,
+                body: ResponseBody::StreamTrimmed { removed: *removed },
             },
             // Unreachable by construction: the engine resolves chunked
             // reads through the chunk lane before responding, so a
@@ -2804,6 +3023,30 @@ impl Conn {
             E::Op(kivi_state::OpError::TxnConflict) => {
                 (Status::TxnConflict, "transaction conflict")
             }
+            // Prepare-time and apply-time verdicts share the wire shape:
+            // admission validates before the WAL, so an apply-side
+            // semantic error means same-log/same-state divergence — fail
+            // closed with the same typed status either way.
+            E::Op(kivi_state::OpError::BoundedExceeded)
+            | E::Apply(kivi_state::ApplyError::BoundedExceeded) => (
+                Status::BoundedExceeded,
+                "bounded counter would exceed owned rights",
+            ),
+            E::Op(kivi_state::OpError::SemaphoreExhausted)
+            | E::Apply(kivi_state::ApplyError::SemaphoreExhausted) => {
+                (Status::SemaphoreExhausted, "semaphore capacity exhausted")
+            }
+            E::Op(kivi_state::OpError::LeaseConflict) => {
+                (Status::LeaseConflict, "lease held by another live owner")
+            }
+            E::Op(kivi_state::OpError::StaleFencing) => {
+                (Status::StaleFencing, "stale fencing token")
+            }
+            E::Op(kivi_state::OpError::StreamFull)
+            | E::Apply(kivi_state::ApplyError::StreamFull) => {
+                (Status::StreamFull, "stream shard full")
+            }
+            E::Op(kivi_state::OpError::NotFound) => (Status::NotFound, "not found"),
             E::Apply(kivi_state::ApplyError::VersionExhausted) => {
                 (Status::VersionExhausted, "version exhausted")
             }
@@ -2823,6 +3066,11 @@ impl Conn {
             // Fail closed as internal, never partial intent state.
             E::Apply(kivi_state::ApplyError::TxnDiverged) => {
                 (Status::Internal, "transaction diverged")
+            }
+            // Semantic divergence: same-log/same-state never produces
+            // these (admission validates before the WAL). Fail closed.
+            E::Apply(kivi_state::ApplyError::LeaseConflict) => {
+                (Status::LeaseConflict, "lease grant conflict")
             }
             E::OpScan(_) => (Status::InvalidRequest, "scan rejected"),
             E::AuthorityMismatch { .. } => (Status::Internal, "authority mismatch"),

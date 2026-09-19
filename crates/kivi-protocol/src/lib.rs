@@ -21,11 +21,13 @@ pub use frame::{
     PROTOCOL_MAGIC, PROTOCOL_MAJOR, PROTOCOL_MINOR, ProtocolError, encode_frame,
 };
 pub use message::{
-    BATCH_COUNTER_ADD, BATCH_DELETE, BATCH_EXPECT_ABSENT, BATCH_EXPECT_ANY, BATCH_EXPECT_VERSION,
-    BATCH_PUT, BatchWrite, COND_ALWAYS, COND_IF_ABSENT, COND_IF_PRESENT, Capabilities, ClientHello,
-    EXPIRY_AT, EXPIRY_CLEAR, EXPIRY_KEEP, MAX_STREAM_UPLOAD_BYTES, Opcode, RedirectInfo, Request,
-    RequestId, Response, ResponseBody, RouteHint, SCAN_ANY, SCAN_FORWARD, SCAN_KEYS_AND_VALUES,
+    BATCH_BOUNDED_ADD, BATCH_COMMUTATIVE_ADD, BATCH_COUNTER_ADD, BATCH_DELETE, BATCH_ESCROW_SHARE,
+    BATCH_EXPECT_ABSENT, BATCH_EXPECT_ANY, BATCH_EXPECT_VERSION, BATCH_PUT, BATCH_PUT_CHUNKED,
+    BatchWrite, COND_ALWAYS, COND_IF_ABSENT, COND_IF_PRESENT, Capabilities, ClientHello, EXPIRY_AT,
+    EXPIRY_CLEAR, EXPIRY_KEEP, MAX_STREAM_UPLOAD_BYTES, Opcode, RedirectInfo, Request, RequestId,
+    Response, ResponseBody, RouteHint, SCAN_ANY, SCAN_FORWARD, SCAN_KEYS_AND_VALUES,
     SCAN_KEYS_ONLY, SCAN_LATEST_PER_TABLET, SCAN_REVERSE, SCAN_VALUE_CHUNKED, SCAN_VALUE_COUNTER,
-    SCAN_VALUE_INLINE, SCAN_VALUE_NONE, SCAN_VALUE_OVERSIZE, ScanEntryBody, ScanValueBody,
-    ServerHello, Status, StreamAbort, StreamBegin, StreamReady, ValueStreamBegin, operation_opcode,
+    SCAN_VALUE_INLINE, SCAN_VALUE_NONE, SCAN_VALUE_OVERSIZE, SCAN_VALUE_SEMANTIC, ScanEntryBody,
+    ScanValueBody, ServerHello, Status, StreamAbort, StreamBegin, StreamEntryBody, StreamReady,
+    ValueStreamBegin, mutation_opcode, operation_opcode,
 };

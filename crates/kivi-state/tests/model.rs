@@ -379,8 +379,29 @@ fn norm_result(result: &OperationResult, registry: &BTreeMap<[u8; 32], Vec<u8>>)
         // operation generator; reaching one is a model bug.
         OperationResult::TxnPrepared
         | OperationResult::TxnConflict
-        | OperationResult::TxnFinalized { .. } => {
+        | OperationResult::TxnFinalized { .. }
+        | OperationResult::TxnLocalCommitted { .. } => {
             panic!("model driver generated no transaction operations")
+        }
+        // Semantic outcomes never arise either: the generator covers the
+        // original bytes/counter surface, while the semantic types carry
+        // their own property suites in the store module.
+        OperationResult::CommutativeApplied
+        | OperationResult::CommutativeValue(_)
+        | OperationResult::BoundedUpdated { .. }
+        | OperationResult::BoundedValue { .. }
+        | OperationResult::SemaphoreAcquired
+        | OperationResult::SemaphoreReleased { .. }
+        | OperationResult::SemaphoreLoad { .. }
+        | OperationResult::LeaseAcquired { .. }
+        | OperationResult::LeaseRenewed { .. }
+        | OperationResult::LeaseReleased { .. }
+        | OperationResult::LeaseInfo { .. }
+        | OperationResult::StreamCreated
+        | OperationResult::StreamAppended { .. }
+        | OperationResult::StreamEntries { .. }
+        | OperationResult::StreamTrimmed { .. } => {
+            panic!("model driver generated no semantic operations")
         }
     }
 }
@@ -396,6 +417,14 @@ fn norm_error(error: &OpError) -> RefErr {
         // Unreachable: the model generates no transaction operations, so
         // no intent can block a key.
         OpError::TxnConflict => panic!("model driver generated no transaction operations"),
+        // Unreachable: the generator covers bytes/counters only; semantic
+        // failures carry their own suites in the store module.
+        OpError::BoundedExceeded
+        | OpError::SemaphoreExhausted
+        | OpError::LeaseConflict
+        | OpError::StaleFencing
+        | OpError::StreamFull
+        | OpError::NotFound => panic!("model driver generated no semantic operations"),
     }
 }
 
@@ -418,6 +447,14 @@ fn kivi_dump(
                     0,
                 ),
                 LogicalValue::StrictCounter(value) => (1, Vec::new(), *value),
+                // Unreachable: the generator never creates semantic objects.
+                LogicalValue::CommutativeCounter(_)
+                | LogicalValue::BoundedCounter(_)
+                | LogicalValue::Semaphore(_)
+                | LogicalValue::Lease(_)
+                | LogicalValue::StreamShard(_) => {
+                    panic!("model driver generated no semantic objects")
+                }
             };
             (
                 key.as_bytes().to_vec(),
@@ -517,6 +554,15 @@ proptest! {
                                 .get(chunked.manifest.as_bytes())
                                 .expect("driver resolves planted manifests")
                                 .clone(),
+                            // Unreachable: the generator never creates
+                            // semantic objects.
+                            LogicalValue::CommutativeCounter(_)
+                            | LogicalValue::BoundedCounter(_)
+                            | LogicalValue::Semaphore(_)
+                            | LogicalValue::Lease(_)
+                            | LogicalValue::StreamShard(_) => {
+                                panic!("model driver generated no semantic objects")
+                            }
                         },
                         None => Vec::new(),
                     };

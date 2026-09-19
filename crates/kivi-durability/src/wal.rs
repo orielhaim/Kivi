@@ -261,10 +261,15 @@ pub enum WalRecord {
 /// lane; families never mix inside one batch (tablet batches seal tablet
 /// commits, consensus batches seal one group's Raft progress). Tablet
 /// code paths match `Tablet` first and never interpret consensus bytes.
+///
+/// The tablet record rides boxed: a full mutation record dwarfs consensus
+/// metadata by an order of magnitude, and entries already live behind
+/// heap batch buffers — the box keeps the enum (and every batch `Vec`)
+/// small instead of padding every consensus entry to mutation size.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WalEntry {
     /// Tablet-committed mutation or outcome (single-node history).
-    Tablet(WalRecord),
+    Tablet(Box<WalRecord>),
     /// Consensus metadata (replicated-mode history; see [`crate::raft`]).
     Consensus(crate::raft::RaftRecord),
 }
@@ -675,18 +680,20 @@ fn decode_record_body(kind: u16, version: u16, body: &[u8]) -> Result<WalEntry, 
             if consumed != expected_bytes.len() {
                 return Err(RecordFault::Corrupt("trailing bytes in expected outcome"));
             }
-            Ok(WalEntry::Tablet(WalRecord::Mutation(MutationRecord {
-                namespace: NamespaceId::from_u64(prefix.namespace),
-                tablet: TabletId::from_u64(prefix.tablet),
-                epoch: TabletEpoch::from_u64(prefix.epoch),
-                guard: WriteGuardGeneration::from_u64(prefix.guard),
-                commit: kivi_types::CommitPosition::from_u64(prefix.commit),
-                now: kivi_types::UnixMicros::from_micros(prefix.now),
-                opcode: prefix.opcode,
-                identity,
-                mutation,
-                expected,
-            })))
+            Ok(WalEntry::Tablet(Box::new(WalRecord::Mutation(
+                MutationRecord {
+                    namespace: NamespaceId::from_u64(prefix.namespace),
+                    tablet: TabletId::from_u64(prefix.tablet),
+                    epoch: TabletEpoch::from_u64(prefix.epoch),
+                    guard: WriteGuardGeneration::from_u64(prefix.guard),
+                    commit: kivi_types::CommitPosition::from_u64(prefix.commit),
+                    now: kivi_types::UnixMicros::from_micros(prefix.now),
+                    opcode: prefix.opcode,
+                    identity,
+                    mutation,
+                    expected,
+                },
+            ))))
         }
         RECORD_KIND_OUTCOME => {
             let (prefix, mut at) = decode_fixed_prefix(body)?;
@@ -702,17 +709,19 @@ fn decode_record_body(kind: u16, version: u16, body: &[u8]) -> Result<WalEntry, 
             if consumed != outcome_bytes.len() {
                 return Err(RecordFault::Corrupt("trailing bytes in outcome"));
             }
-            Ok(WalEntry::Tablet(WalRecord::Outcome(OutcomeRecord {
-                namespace: NamespaceId::from_u64(prefix.namespace),
-                tablet: TabletId::from_u64(prefix.tablet),
-                epoch: TabletEpoch::from_u64(prefix.epoch),
-                guard: WriteGuardGeneration::from_u64(prefix.guard),
-                commit: kivi_types::CommitPosition::from_u64(prefix.commit),
-                now: kivi_types::UnixMicros::from_micros(prefix.now),
-                opcode: prefix.opcode,
-                identity,
-                outcome,
-            })))
+            Ok(WalEntry::Tablet(Box::new(WalRecord::Outcome(
+                OutcomeRecord {
+                    namespace: NamespaceId::from_u64(prefix.namespace),
+                    tablet: TabletId::from_u64(prefix.tablet),
+                    epoch: TabletEpoch::from_u64(prefix.epoch),
+                    guard: WriteGuardGeneration::from_u64(prefix.guard),
+                    commit: kivi_types::CommitPosition::from_u64(prefix.commit),
+                    now: kivi_types::UnixMicros::from_micros(prefix.now),
+                    opcode: prefix.opcode,
+                    identity,
+                    outcome,
+                },
+            ))))
         }
         other => Err(RecordFault::Unknown {
             kind: other,
@@ -1715,7 +1724,7 @@ mod tests {
             .records
             .into_iter()
             .map(|entry| match entry.entry {
-                WalEntry::Tablet(record) => record,
+                WalEntry::Tablet(record) => *record,
                 WalEntry::Consensus(_) => panic!("tablet-only lane holds no consensus entries"),
             })
             .collect();
@@ -1760,7 +1769,7 @@ mod tests {
         assert_eq!(recovery.records.len(), 4);
         assert!(matches!(
             &recovery.records[0].entry,
-            WalEntry::Tablet(WalRecord::Mutation(_))
+            WalEntry::Tablet(record) if matches!(**record, WalRecord::Mutation(_))
         ));
         assert_eq!(recovery.records[0].batch_seq, 1);
         assert!(matches!(
@@ -1775,7 +1784,7 @@ mod tests {
         assert_eq!(recovery.records[2].batch_seq, 2);
         assert!(matches!(
             &recovery.records[3].entry,
-            WalEntry::Tablet(WalRecord::Mutation(_))
+            WalEntry::Tablet(record) if matches!(**record, WalRecord::Mutation(_))
         ));
         assert_eq!(recovery.records[3].batch_seq, 3);
     }

@@ -370,6 +370,12 @@ struct EngineShared {
     /// Chunk lane per worker index, for caller-side chunked-read
     /// resolution on the embedded path (blocking, caller thread).
     chunk_lanes: Vec<crate::chunk_lane::ChunkLaneHandle>,
+    /// Transaction resolver passes (rare background work; atomics fine).
+    recovery_runs: std::sync::atomic::AtomicU64,
+    /// Intents commit-finalized by the resolver.
+    resolved_commits: std::sync::atomic::AtomicU64,
+    /// Intents abort-finalized by the resolver.
+    resolved_aborts: std::sync::atomic::AtomicU64,
 }
 
 /// The running engine: worker threads, routing, placement, lifecycle.
@@ -840,6 +846,9 @@ impl LocalEngine {
                 routing,
                 senders,
                 chunk_lanes: chunk_lanes.clone(),
+                recovery_runs: std::sync::atomic::AtomicU64::new(0),
+                resolved_commits: std::sync::atomic::AtomicU64::new(0),
+                resolved_aborts: std::sync::atomic::AtomicU64::new(0),
             }),
             workers,
             bound,
@@ -1156,7 +1165,7 @@ impl LocalEngine {
                         per_tablet
                             .entry(record.tablet())
                             .or_default()
-                            .push((record.commit().as_u64(), record));
+                            .push((record.commit().as_u64(), *record));
                     }
                     WalEntry::Consensus(record) => {
                         consensus
@@ -1417,6 +1426,198 @@ impl LocalEngine {
         }
     }
 
+    /// Returns cumulative transaction-resolver counters
+    /// `(passes, commit-finalized, abort-finalized)`.
+    #[must_use]
+    pub fn resolver_metrics(&self) -> (u64, u64, u64) {
+        use std::sync::atomic::Ordering;
+        (
+            self.shared.recovery_runs.load(Ordering::Relaxed),
+            self.shared.resolved_commits.load(Ordering::Relaxed),
+            self.shared.resolved_aborts.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Inspects one transaction across every local tablet: who coordinates,
+    /// who participates, who prepared what, which decision is durably
+    /// known, and how old the oldest prepared intent is. Everything an
+    /// operator needs to answer "what is blocking resolution": a prepared
+    /// intent with no known decision waits (correctly) for the coordinator
+    /// record; run [`resolve_transactions`](Self::resolve_transactions) to
+    /// converge it.
+    #[must_use]
+    pub fn transaction_status(&self, txn: TxnId) -> TxnStatusReport {
+        use std::collections::{BTreeMap, BTreeSet};
+        let mut prepared: BTreeMap<TabletId, Vec<Vec<u8>>> = BTreeMap::new();
+        let mut coordinators: BTreeSet<TabletId> = BTreeSet::new();
+        let mut oldest: Option<u64> = None;
+        for worker in &self.workers {
+            let (respond, receive) = crossbeam_channel::bounded(1);
+            if worker
+                .control_sender()
+                .try_send(crate::worker::WorkerControl::ListIntents { respond })
+                .is_err()
+            {
+                continue;
+            }
+            let Ok(listed) = receive.recv() else {
+                continue;
+            };
+            for (tablet, intent) in listed {
+                if intent.id != txn {
+                    continue;
+                }
+                coordinators.insert(intent.coordinator);
+                prepared
+                    .entry(tablet)
+                    .or_default()
+                    .push(intent.key.as_bytes().to_vec());
+                oldest = Some(oldest.map_or(intent.prepared_at, |oldest: u64| {
+                    oldest.min(intent.prepared_at)
+                }));
+            }
+        }
+        let now = crate::clock::SystemClock::wall_now().as_micros();
+        let coordinator = coordinators.iter().next().copied();
+        let (decision, digest) = coordinator
+            .and_then(|coordinator| {
+                self.client()
+                    .get(&kivi_state::txn_record_key(coordinator, txn))
+                    .ok()
+                    .flatten()
+                    .and_then(|bytes| kivi_state::TxnRecord::decode(&bytes).ok())
+            })
+            .map_or((None, None), |record| {
+                (Some(record.state), Some(record.digest))
+            });
+        TxnStatusReport {
+            txn,
+            coordinator,
+            coordinator_disagree: coordinators.len() > 1,
+            participants: prepared.keys().copied().collect(),
+            prepared,
+            decision,
+            digest,
+            oldest_prepared_age_micros: oldest.map(|prepared_at| now.saturating_sub(prepared_at)),
+        }
+    }
+
+    /// Resolves abandoned cross-tablet transaction intents on every local
+    /// tablet: decided transactions finalize per their coordinator record;
+    /// expired undecided transactions CAS-abort through the record (never
+    /// unilaterally — the CAS proves no commit won the race); live intents
+    /// wait. Mirrors the cluster reconciler's rules (grace windows,
+    /// decision-first, fence-before-discard) for the embedded topology.
+    /// Returns `(finalized_commits, finalized_aborts)`.
+    ///
+    /// Same-tablet transactions never need this (one atomic record leaves
+    /// no prepared intents behind), but cross-tablet 2PC sets do after a
+    /// driver or process crash.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError`] on routing/transport failure; per-intent
+    /// failures are skipped (the next pass retries), never fatal.
+    pub fn resolve_transactions(&self) -> Result<(usize, usize), EngineError> {
+        use kivi_state::{MAX_TXN_LIFETIME_MICROS, RESOLVE_GRACE_MICROS, TxnRecord, TxnState};
+        use std::sync::atomic::Ordering;
+        self.shared.recovery_runs.fetch_add(1, Ordering::Relaxed);
+        let client = self.client();
+        // Enumerate prepared intents across workers (bounded rendezvous;
+        // exited workers simply contribute nothing).
+        let mut intents: Vec<(TabletId, kivi_state::TxnIntent)> = Vec::new();
+        for worker in &self.workers {
+            let (respond, receive) = crossbeam_channel::bounded(1);
+            if worker
+                .control_sender()
+                .try_send(crate::worker::WorkerControl::ListIntents { respond })
+                .is_err()
+            {
+                continue;
+            }
+            if let Ok(listed) = receive.recv() {
+                intents.extend(listed);
+            }
+            if intents.len() >= 4096 {
+                break;
+            }
+        }
+        let now = crate::clock::SystemClock::wall_now();
+        let mut committed = 0usize;
+        let mut aborted = 0usize;
+        for (_tablet, intent) in &intents {
+            let record_key = kivi_state::txn_record_key(intent.coordinator, intent.id);
+            // Per-intent failures skip (the next pass retries), never fail
+            // the pass: one unresponsive tablet must not block the rest.
+            let Ok(record) = client.get(&record_key) else {
+                continue;
+            };
+            let record: Option<TxnRecord> = record.and_then(|bytes| TxnRecord::decode(&bytes).ok());
+            let age = now.as_micros().saturating_sub(intent.prepared_at);
+            match record {
+                Some(record) if record.state == TxnState::Committed => {
+                    if age < RESOLVE_GRACE_MICROS {
+                        continue;
+                    }
+                    if client
+                        .txn_finalize(&intent.key, intent.id, true, record.digest)
+                        .is_ok()
+                    {
+                        committed += 1;
+                        self.shared.resolved_commits.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                Some(record) if record.state == TxnState::Aborted => {
+                    if age < RESOLVE_GRACE_MICROS {
+                        continue;
+                    }
+                    if client
+                        .txn_finalize(&intent.key, intent.id, false, record.digest)
+                        .is_ok()
+                    {
+                        aborted += 1;
+                        self.shared.resolved_aborts.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                _ => {
+                    // Undecided (or record-less): only an expired lease may
+                    // resolve, and only through a fenced CAS-abort — never
+                    // by discarding the intent directly.
+                    if age < MAX_TXN_LIFETIME_MICROS {
+                        continue;
+                    }
+                    let aborted_record = match record {
+                        Some(mut record) => {
+                            if record.decide(kivi_state::TxnDecision::Abort).is_err() {
+                                continue;
+                            }
+                            record
+                        }
+                        None => TxnRecord {
+                            id: intent.id,
+                            coordinator: intent.coordinator,
+                            participants: Vec::new(),
+                            state: TxnState::Aborted,
+                            dir_version: 0,
+                            digest: [0u8; 32],
+                        },
+                    };
+                    // Resolver salt (2) never aliases driver decides
+                    // (commit 0 / abort 1): distinct intents, genuine OCC.
+                    if client.decide_record_raw(intent.coordinator, intent.id, &aborted_record, 2)
+                        && client
+                            .txn_finalize(&intent.key, intent.id, false, aborted_record.digest)
+                            .is_ok()
+                    {
+                        aborted += 1;
+                        self.shared.resolved_aborts.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+        Ok((committed, aborted))
+    }
+
     /// Atomically replaces the routing publication after revalidation.
     /// Callers observe the old coherent pair or the new one, never a mix.
     ///
@@ -1650,6 +1851,32 @@ enum BatchAttempt {
     Conflict,
     /// Terminal driver failure.
     Fatal(EngineError),
+}
+
+/// Operator inspection of one transaction's distributed state.
+#[derive(Debug, Clone)]
+pub struct TxnStatusReport {
+    /// Transaction inspected.
+    pub txn: TxnId,
+    /// Coordinator tablet (from prepared intents; `None` when nothing is
+    /// prepared anywhere — no decision can exist without intents... or the
+    /// record alone remains after full resolution).
+    pub coordinator: Option<TabletId>,
+    /// Whether prepared intents disagree on the coordinator (conflicting
+    /// drivers under one id — resolve by digest, never by guessing).
+    pub coordinator_disagree: bool,
+    /// Participant tablets holding prepared intents.
+    pub participants: Vec<TabletId>,
+    /// Prepared keys per participant tablet.
+    pub prepared: std::collections::BTreeMap<TabletId, Vec<Vec<u8>>>,
+    /// Durably known decision (`None` = unresolved: correct behavior is to
+    /// WAIT, never to guess).
+    pub decision: Option<kivi_state::TxnState>,
+    /// Digest of the known decision record, when known.
+    pub digest: Option<[u8; 32]>,
+    /// Age of the oldest prepared intent in micros (`None` when nothing
+    /// is prepared).
+    pub oldest_prepared_age_micros: Option<u64>,
 }
 
 /// Which decision the coordinator record converged to after the guarded
@@ -1940,6 +2167,7 @@ impl LocalClient {
         txn: TxnId,
         coordinator: TabletId,
         write: TxnWrite,
+        digest: [u8; 32],
     ) -> Result<(), EngineError> {
         let key = write.key.clone();
         match self.execute(
@@ -1948,6 +2176,7 @@ impl LocalClient {
                 txn,
                 coordinator,
                 write,
+                digest,
             },
         )? {
             OperationResult::TxnPrepared => Ok(()),
@@ -1974,6 +2203,7 @@ impl LocalClient {
         key: &Key,
         txn: TxnId,
         commit: bool,
+        digest: [u8; 32],
     ) -> Result<Option<ObjectVersion>, EngineError> {
         match self.execute(
             key,
@@ -1981,6 +2211,7 @@ impl LocalClient {
                 txn,
                 key: key.clone(),
                 commit,
+                digest,
             },
         )? {
             OperationResult::TxnFinalized { applied, version } => {
@@ -1994,9 +2225,11 @@ impl LocalClient {
     }
 
     /// Executes an atomic batch: all writes commit or none does, across
-    /// one or many tablets (uniform OCC + 2PC with coordinator == first
-    /// write's tablet). Transport is synchronous channel execution, so
-    /// multi-worker batches work like single-worker ones.
+    /// one or many tablets. Single-tablet batches commit as one ordered
+    /// atomic record (no 2PC waves); multi-tablet batches use OCC + 2PC
+    /// with the lowest participant tablet as deterministic coordinator.
+    /// Transport is synchronous channel execution, so multi-worker batches
+    /// work like single-worker ones.
     ///
     /// Returns resulting versions in request order (`None` for deletes).
     ///
@@ -2056,14 +2289,27 @@ impl LocalClient {
                 detail: "batch exceeds transaction bounds or routes nowhere".to_owned(),
             })
         })?;
+        // Cheap path: one participant commits as one atomic record (no
+        // coordinator state, no prepare/finalize waves). Identity is
+        // stable per attempt, so a retry after a lost reply replays.
+        if plan.groups.len() == 1 {
+            return self.batch_attempt_local(&plan);
+        }
         // Recovery-first: an existing durable decision resolves without
         // re-preparing (re-prepares after a commit would spuriously
-        // conflict with the committed state).
+        // conflict with the committed state). A record carrying a
+        // different digest belongs to a conflicting driver under one
+        // `TxnId`: never follow it, fail the attempt instead.
         let record_key = txn_record_key(plan.coordinator, txn);
         if let Some(record) = self.read_record(&record_key) {
+            if record.digest != plan.record.digest {
+                return Err(BatchAttempt::Conflict);
+            }
             match record.state {
                 TxnState::Committed => {
-                    return self.finalize_all(&plan, true).map_err(BatchAttempt::Fatal);
+                    return self
+                        .finalize_all(&plan, true, record.digest)
+                        .map_err(BatchAttempt::Fatal);
                 }
                 TxnState::Aborted => {
                     return Err(BatchAttempt::Fatal(EngineError::InvalidRequest {
@@ -2075,24 +2321,24 @@ impl LocalClient {
         }
         let mut prepared: Vec<usize> = Vec::with_capacity(writes.len());
         for (index, write) in writes.iter().enumerate() {
-            match self.txn_prepare(txn, plan.coordinator, write.clone()) {
+            match self.txn_prepare(txn, plan.coordinator, write.clone(), plan.record.digest) {
                 Ok(()) => prepared.push(index),
                 Err(EngineError::Tablet(crate::tablet::TabletError::Op(
                     kivi_state::OpError::TxnConflict,
                 ))) => {
                     return match self.abort_prepared(&plan, &prepared) {
                         AbortOutcome::Aborted => Err(BatchAttempt::Conflict),
-                        AbortOutcome::Committed => {
-                            self.finalize_all(&plan, true).map_err(BatchAttempt::Fatal)
-                        }
+                        AbortOutcome::Committed => self
+                            .finalize_all(&plan, true, plan.record.digest)
+                            .map_err(BatchAttempt::Fatal),
                     };
                 }
                 Err(error) => {
                     return match self.abort_prepared(&plan, &prepared) {
                         AbortOutcome::Aborted => Err(BatchAttempt::Fatal(error)),
-                        AbortOutcome::Committed => {
-                            self.finalize_all(&plan, true).map_err(BatchAttempt::Fatal)
-                        }
+                        AbortOutcome::Committed => self
+                            .finalize_all(&plan, true, plan.record.digest)
+                            .map_err(BatchAttempt::Fatal),
                     };
                 }
             }
@@ -2101,24 +2347,55 @@ impl LocalClient {
         decided.state = TxnState::Committed;
         if !self.decide_commit(&plan, &decided) {
             // Re-read: an ambiguous decide may actually have committed
-            // (never blind-overwrite a decision with an abort).
+            // (never blind-overwrite a decision with an abort). A
+            // conflicting digest still fails the attempt outright.
             let record_key = txn_record_key(plan.coordinator, plan.txn);
-            if self
-                .read_record(&record_key)
-                .is_some_and(|record| record.state == TxnState::Committed)
-            {
-                return self.finalize_all(&plan, true).map_err(BatchAttempt::Fatal);
+            if let Some(record) = self.read_record(&record_key) {
+                if record.digest != plan.record.digest {
+                    return Err(BatchAttempt::Conflict);
+                }
+                if record.state == TxnState::Committed {
+                    return self
+                        .finalize_all(&plan, true, plan.record.digest)
+                        .map_err(BatchAttempt::Fatal);
+                }
             }
             return match self.abort_prepared(&plan, &prepared) {
                 AbortOutcome::Aborted => Err(BatchAttempt::Fatal(EngineError::InvalidRequest {
                     detail: "commit undecided; aborted".to_owned(),
                 })),
-                AbortOutcome::Committed => {
-                    self.finalize_all(&plan, true).map_err(BatchAttempt::Fatal)
-                }
+                AbortOutcome::Committed => self
+                    .finalize_all(&plan, true, plan.record.digest)
+                    .map_err(BatchAttempt::Fatal),
             };
         }
-        self.finalize_all(&plan, true).map_err(BatchAttempt::Fatal)
+        self.finalize_all(&plan, true, plan.record.digest)
+            .map_err(BatchAttempt::Fatal)
+    }
+
+    /// One single-tablet batch attempt: the whole write set commits as one
+    /// atomic record. OCC conflicts (including foreign intent reservations)
+    /// retry with a fresh attempt; every other rejection is terminal for
+    /// this attempt (nothing was applied — validation precedes all writes).
+    fn batch_attempt_local(
+        &self,
+        plan: &kivi_state::TxnDriverPlan,
+    ) -> Result<Vec<Option<ObjectVersion>>, BatchAttempt> {
+        use kivi_state::{Operation, OperationResult};
+        let op = Operation::TxnCommitLocal {
+            txn: plan.txn,
+            writes: plan.writes.clone(),
+        };
+        match self.execute_on(plan.coordinator, op, None) {
+            Ok(OperationResult::TxnLocalCommitted { versions }) => Ok(versions),
+            Ok(unexpected) => Err(BatchAttempt::Fatal(EngineError::InvalidRequest {
+                detail: format!("local commit outcome mismatch: {unexpected:?}"),
+            })),
+            Err(EngineError::Tablet(crate::tablet::TabletError::Op(
+                kivi_state::OpError::TxnConflict,
+            ))) => Err(BatchAttempt::Conflict),
+            Err(error) => Err(BatchAttempt::Fatal(error)),
+        }
     }
 
     /// Persists the Commit decision guarded on absence (CAS): the record
@@ -2126,7 +2403,7 @@ impl LocalClient {
     /// drive already decided. Returns whether the commit decision is
     /// durable.
     fn decide_commit(&self, plan: &kivi_state::TxnDriverPlan, decided: &TxnRecord) -> bool {
-        self.decide_record(plan, decided, 0)
+        self.decide_record_raw(plan.coordinator, plan.txn, decided, 0)
     }
 
     /// Persists one terminal decision through an absence-guarded
@@ -2139,21 +2416,37 @@ impl LocalClient {
         decided: &TxnRecord,
         decide_salt: u64,
     ) -> bool {
+        self.decide_record_raw(plan.coordinator, plan.txn, decided, decide_salt)
+    }
+
+    /// Raw decision write shared by drivers and the resolver: CAS-persist
+    /// `decided` on its record key under a deterministic decide-transaction
+    /// id (re-drives idempotently).
+    fn decide_record_raw(
+        &self,
+        coordinator: TabletId,
+        txn: TxnId,
+        decided: &TxnRecord,
+        decide_salt: u64,
+    ) -> bool {
         use kivi_state::{Operation, OperationResult, TxnExpect, TxnWrite, TxnWriteKind};
-        let record_key = txn_record_key(plan.coordinator, plan.txn);
+        let record_key = txn_record_key(coordinator, txn);
         // Deterministic decide-transaction id (re-drives idempotently).
-        let decide_txn = TxnId::derive(u128::from_le_bytes(plan.txn.as_bytes()), 0, decide_salt);
+        // Record-key steps bind the zero digest (they carry no user write
+        // set; prepare and finalize agree with each other by construction).
+        let decide_txn = TxnId::derive(u128::from_le_bytes(txn.as_bytes()), 0, decide_salt);
         let prepare = Operation::TxnPrepare {
             txn: decide_txn,
-            coordinator: plan.coordinator,
+            coordinator,
             write: TxnWrite {
                 key: record_key.clone(),
                 kind: TxnWriteKind::Put(bytes::Bytes::from(decided.encode())),
                 expect: TxnExpect::Absent,
             },
+            digest: [0u8; 32],
         };
         if !matches!(
-            self.execute_on(plan.coordinator, prepare, None),
+            self.execute_on(coordinator, prepare, None),
             Ok(OperationResult::TxnPrepared)
         ) {
             return false;
@@ -2162,23 +2455,27 @@ impl LocalClient {
             txn: decide_txn,
             key: record_key,
             commit: true,
+            digest: [0u8; 32],
         };
         matches!(
-            self.execute_on(plan.coordinator, finalize, None),
+            self.execute_on(coordinator, finalize, None),
             Ok(OperationResult::TxnFinalized { applied: true, .. })
         )
     }
 
     /// Finalizes every key of a plan (commit or abort), collecting
-    /// versions in request order.
+    /// versions in request order. The digest binds every finalize to the
+    /// exact reservation (drivers pass their plan digest; resolvers pass
+    /// the record digest they follow).
     fn finalize_all(
         &self,
         plan: &kivi_state::TxnDriverPlan,
         commit: bool,
+        digest: [u8; 32],
     ) -> Result<Vec<Option<ObjectVersion>>, EngineError> {
         let mut versions: Vec<Option<ObjectVersion>> = vec![None; plan.writes.len()];
         for (order, write) in plan.writes.iter().enumerate() {
-            if let Some(version) = self.txn_finalize(&write.key, plan.txn, commit)? {
+            if let Some(version) = self.txn_finalize(&write.key, plan.txn, commit, digest)? {
                 versions[order] = Some(version);
             }
         }
@@ -2211,27 +2508,14 @@ impl LocalClient {
             return AbortOutcome::Aborted;
         }
         for index in prepared {
-            let _ = self.txn_finalize(&plan.writes[*index].key, plan.txn, false);
+            let _ = self.txn_finalize(
+                &plan.writes[*index].key,
+                plan.txn,
+                false,
+                plan.record.digest,
+            );
         }
         AbortOutcome::Aborted
-    }
-
-    /// Resolves abandoned transaction intents on every local tablet:
-    /// decided transactions finalize per their coordinator record;
-    /// expired undecided transactions are CAS-aborted through the record
-    /// (never unilaterally). Returns `(finalized, aborted)`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EngineError`] on routing/transport failure; per-intent
-    /// failures are skipped (the next pass retries), never fatal.
-    pub fn resolve_transactions(&self) -> Result<(usize, usize), EngineError> {
-        // Embedded discovery: LocalClient addresses tablets through worker
-        // channels and cannot enumerate cross-thread intent tables, so
-        // discovery-driven resolution lives in the cluster reconciler
-        // (which owns machine access). Embedded callers resolve explicitly
-        // via `resolve_transaction` with the keys they drove.
-        Ok((0, 0))
     }
 
     /// Resolves one transaction's intents over `keys`: reads its
@@ -2258,14 +2542,17 @@ impl LocalClient {
                 detail: "undecodable transaction record".to_owned(),
             })?;
         let commit = match record {
-            Some(record) if record.state == TxnState::Committed => true,
-            Some(record) if record.state == TxnState::Aborted => false,
+            Some(record) if record.state == TxnState::Committed => (true, record.digest),
+            Some(record) if record.state == TxnState::Aborted => (false, record.digest),
             _ => return Ok((0, 0)),
         };
+        let (commit, digest) = commit;
         let mut done = 0usize;
         for key in keys {
             // Missing intents (already resolved) count as converged.
-            if self.txn_finalize(key, txn, commit).is_ok() {
+            // Finalizes carry the record digest they follow, so a
+            // conflicting reservation is never resolved by mistake.
+            if self.txn_finalize(key, txn, commit, digest).is_ok() {
                 done += 1;
             }
         }

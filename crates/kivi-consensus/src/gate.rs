@@ -119,13 +119,25 @@ impl SidecarGate {
 
     /// Extracts immutable dependencies from one replicated command's bytes.
     ///
-    /// Returns `None` for small/state-local mutations (no sidecars) and
-    /// for control-plane commands (never chunked).
+    /// Returns an empty vector for small/state-local mutations (no
+    /// sidecars) and for control-plane commands (never chunked). Chunked
+    /// roots — direct or carried inside transaction prepares and local
+    /// commits — each contribute one entry, so followers fetch every
+    /// payload a commit may reference before the entry may apply.
     #[must_use]
-    pub fn dependencies_of(command: &[u8]) -> Option<ImmutableDependencies> {
-        let envelope_command = crate::command::ConsensusCommand::decode_exact(command).ok()?;
-        let mutation = envelope_command.as_tablet()?;
+    pub fn dependencies_of(command: &[u8]) -> Vec<ImmutableDependencies> {
+        let Some(envelope_command) = crate::command::ConsensusCommand::decode_exact(command).ok()
+        else {
+            return Vec::new();
+        };
+        let Some(mutation) = envelope_command.as_tablet() else {
+            return Vec::new();
+        };
         let envelope = mutation.envelope();
+        // Domain binds at apply time from namespace; the gate uses
+        // its configured domain (namespace-derived, single-domain
+        // lanes). Cross-domain manifests fail verification later.
+        let domain = SecurityDomainId::from_u64(0);
         match envelope.operation() {
             kivi_state::Mutation::ReplaceChunkedRoot {
                 manifest,
@@ -136,26 +148,39 @@ impl SidecarGate {
                 manifest,
                 logical_len,
                 ..
-            } => {
-                // Domain binds at apply time from namespace; the gate uses
-                // its configured domain (namespace-derived, single-domain
-                // lanes). Cross-domain manifests fail verification later.
-                Some(ImmutableDependencies::new(
-                    *manifest,
-                    *logical_len,
-                    SecurityDomainId::from_u64(0),
-                ))
-            }
-            _ => None,
+            } => vec![ImmutableDependencies::new(*manifest, *logical_len, domain)],
+            kivi_state::Mutation::TxnPrepare {
+                write:
+                    kivi_state::TxnWriteKind::PutChunked {
+                        manifest,
+                        logical_len,
+                    },
+                ..
+            } => vec![ImmutableDependencies::new(*manifest, *logical_len, domain)],
+            kivi_state::Mutation::TxnCommitLocal { writes, .. } => writes
+                .iter()
+                .filter_map(|write| match &write.kind {
+                    kivi_state::TxnWriteKind::PutChunked {
+                        manifest,
+                        logical_len,
+                    } => Some(ImmutableDependencies::new(*manifest, *logical_len, domain)),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
         }
     }
 
     /// Extracts dependencies with the gate's domain filled in.
     #[must_use]
-    pub fn dependencies_of_with_domain(&self, command: &[u8]) -> Option<ImmutableDependencies> {
-        let mut deps = Self::dependencies_of(command)?;
-        deps.domain = self.domain;
-        Some(deps)
+    pub fn dependencies_of_with_domain(&self, command: &[u8]) -> Vec<ImmutableDependencies> {
+        Self::dependencies_of(command)
+            .into_iter()
+            .map(|mut deps| {
+                deps.domain = self.domain;
+                deps
+            })
+            .collect()
     }
 
     /// Ensures one root is locally durable, fetching missing sidecars from
@@ -240,11 +265,11 @@ impl SidecarGate {
         let result = async {
             let mut seen: HashSet<(ManifestId, u64)> = HashSet::new();
             for command in commands {
-                if let Some(deps) = self.dependencies_of_with_domain(command)
-                    && seen.insert((deps.manifest, deps.logical_len))
-                {
-                    self.ensure_root(deps.manifest, deps.logical_len, hint)
-                        .await?;
+                for deps in self.dependencies_of_with_domain(command) {
+                    if seen.insert((deps.manifest, deps.logical_len)) {
+                        self.ensure_root(deps.manifest, deps.logical_len, hint)
+                            .await?;
+                    }
                 }
             }
             Ok(())

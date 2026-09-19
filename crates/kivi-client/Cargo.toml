@@ -13,6 +13,7 @@ bytes.workspace = true
 arc-swap.workspace = true
 crossbeam-channel.workspace = true
 getrandom.workspace = true
+hdrhistogram.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

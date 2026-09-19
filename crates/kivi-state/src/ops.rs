@@ -179,6 +179,10 @@ pub enum Operation {
         coordinator: TabletId,
         /// Prepared write (key, kind, OCC expectation).
         write: TxnWrite,
+        /// Digest over the full write set (binds this reservation to the
+        /// exact transaction; a conflicting digest under one `TxnId` is
+        /// rejected, never overwritten).
+        digest: [u8; 32],
     },
     /// Resolve one key's transaction intent: commit applies the prepared
     /// write, abort discards it. Idempotent by `TxnId`.
@@ -189,6 +193,203 @@ pub enum Operation {
         key: Key,
         /// Whether to apply (`true`) or discard (`false`) the intent.
         commit: bool,
+        /// Digest the intent was prepared for (must match the reservation;
+        /// mismatches finalize nothing and report conflict).
+        digest: [u8; 32],
+    },
+    /// Commit a same-tablet write set as one ordered atomic mutation: every
+    /// write validates and applies together, or nothing does. Only drivers
+    /// construct this, and only for write sets already proven single-tablet
+    /// (non-empty; all keys route to one tablet); cross-tablet sets use
+    /// 2PC intents instead. The key drivers route on is the first write's
+    /// key — all keys share its tablet by construction.
+    TxnCommitLocal {
+        /// Transaction identity (idempotency key for the whole batch).
+        txn: TxnId,
+        /// Writes in request order (non-empty; duplicates collapse
+        /// last-wins, matching the 2PC intent-overwrite rule).
+        writes: Vec<TxnWrite>,
+    },
+    /// Add `delta` to a commutative counter, creating it at `delta` when
+    /// absent. Overflow fails without mutation. The result is `Applied`:
+    /// no ordinal is ever exposed, so additions commute observably and a
+    /// future unordered fast path can execute them safely.
+    CommutativeAdd {
+        /// Key to update.
+        key: Key,
+        /// Signed addend.
+        delta: i64,
+    },
+    /// Fetch a commutative counter's current sum (`None` when absent; a
+    /// state query, not an ordinal).
+    CommutativeGet {
+        /// Key to read.
+        key: Key,
+    },
+    /// Create a bounded counter with global `capacity` and a full local
+    /// escrow share `[0, capacity]` held by `holder` (the tablet executing
+    /// the create, filled by the driver after routing). Fails without
+    /// mutation when the key already holds live state.
+    BoundedCounterCreate {
+        /// Key to create.
+        key: Key,
+        /// Global capacity (inclusive upper bound).
+        capacity: u64,
+        /// Tablet holding the initial full share.
+        holder: TabletId,
+    },
+    /// Add `delta` to a bounded counter within locally owned escrow rights:
+    /// the result must satisfy both `0 <= value <= capacity` and
+    /// `share.min <= value <= share.max`, else [`BoundedExceeded`](OpError::BoundedExceeded)
+    /// without mutation. Rights transfers (not global checks) move the share.
+    BoundedCounterAdd {
+        /// Key to update.
+        key: Key,
+        /// Signed addend.
+        delta: i64,
+    },
+    /// Read a bounded counter's value and capacity (`None` when absent).
+    BoundedCounterGet {
+        /// Key to read.
+        key: Key,
+    },
+    /// Narrow or widen one bounded counter's escrow share durably. Narrowing
+    /// (giving rights away) is unilateral; widening (taking rights) must pair
+    /// with a matching narrow in the same atomic batch/transaction so total
+    /// rights are conserved — see
+    /// [`verify_escrow_widths`](crate::txn::verify_escrow_widths).
+    /// Requires the live value inside the new share and the new share inside
+    /// `[0, capacity]`.
+    EscrowTransfer {
+        /// Key whose share moves.
+        key: Key,
+        /// New share lower bound (inclusive).
+        new_min: i64,
+        /// New share upper bound (inclusive).
+        new_max: i64,
+    },
+    /// Create a semaphore with `capacity` total permits. Fails without
+    /// mutation when the key already holds live state.
+    SemaphoreCreate {
+        /// Key to create.
+        key: Key,
+        /// Total capacity (outstanding never exceeds this).
+        capacity: u64,
+    },
+    /// Acquire `qty` permits under `permit`: idempotent by permit id (retry
+    /// with the same id returns the original outcome, never a second
+    /// acquisition). Fails with [`SemaphoreExhausted`](OpError::SemaphoreExhausted)
+    /// when `outstanding + qty > capacity`.
+    SemaphoreAcquire {
+        /// Key of the semaphore.
+        key: Key,
+        /// Permit identity (client-minted, stable across retries).
+        permit: crate::PermitId,
+        /// Owner/session identity acquiring.
+        owner: u64,
+        /// Quantity to acquire.
+        qty: u64,
+    },
+    /// Release the permits held under `permit`. Idempotent: releasing an
+    /// unknown or already-released id reports `released: false` and mints no
+    /// capacity. A release can never create capacity beyond the declared
+    /// maximum.
+    SemaphoreRelease {
+        /// Key of the semaphore.
+        key: Key,
+        /// Permit identity to release.
+        permit: crate::PermitId,
+    },
+    /// Inspect a semaphore's load: outstanding permits and total capacity.
+    /// Never mutates.
+    SemaphoreInspect {
+        /// Key of the semaphore.
+        key: Key,
+    },
+    /// Acquire (or re-acquire after expiry) the lease for `owner` with a
+    /// logical TTL. Success issues a fresh fencing token (`next_fencing`,
+    /// strictly increasing) and records `expires_at = now + ttl`. A live
+    /// holder blocks other owners with [`LeaseConflict`](OpError::LeaseConflict);
+    /// retrying the winning acquisition (same owner, same request identity
+    /// at the engine layer) returns the original grant.
+    LeaseAcquire {
+        /// Key of the lease.
+        key: Key,
+        /// Owner/session identity acquiring.
+        owner: u64,
+        /// Logical time-to-live in micros from `now`.
+        ttl_micros: u64,
+    },
+    /// Extend a live holding: requires the exact current fencing token and a
+    /// live, unexpired grant for `owner`. A stale token fails with
+    /// [`StaleFencing`](OpError::StaleFencing) and can never revive a
+    /// replaced/expired lease.
+    LeaseRenew {
+        /// Key of the lease.
+        key: Key,
+        /// Owner/session identity renewing.
+        owner: u64,
+        /// Fencing token of the grant being renewed.
+        fencing: crate::FencingToken,
+        /// Logical time-to-live in micros from `now`.
+        ttl_micros: u64,
+    },
+    /// Release a live holding: requires the exact current fencing token for
+    /// `owner`. A stale token fails with [`StaleFencing`](OpError::StaleFencing)
+    /// and can never free a newer holder's lease.
+    LeaseRelease {
+        /// Key of the lease.
+        key: Key,
+        /// Owner/session identity releasing.
+        owner: u64,
+        /// Fencing token of the grant being released.
+        fencing: crate::FencingToken,
+    },
+    /// Inspect the lease: current holder (if live at `now`) and the next
+    /// fencing token to be issued. Never mutates.
+    LeaseInspect {
+        /// Key of the lease.
+        key: Key,
+    },
+    /// Create one shard of a sharded stream. Shards are independent ordered
+    /// logs: total order within the shard, no global order across shards.
+    StreamCreate {
+        /// Key holding this shard's log.
+        key: Key,
+        /// Stream identity (shared by all shards of the stream).
+        stream: [u8; 16],
+        /// Shard index within the stream.
+        shard: u32,
+    },
+    /// Append one entry to a shard: routed by explicit `partition_key`
+    /// (stable/deterministic shard selection by the caller), assigned the
+    /// shard's next offset. Idempotent under the engine's request identity;
+    /// the offset is shard-local and monotonic, never global.
+    StreamAppend {
+        /// Key holding this shard's log.
+        key: Key,
+        /// Partition key that routed this entry here (retained for audit).
+        partition: Vec<u8>,
+        /// Entry payload bytes (bounded by [`MAX_STREAM_ENTRY_BYTES`](crate::MAX_STREAM_ENTRY_BYTES)).
+        payload: Bytes,
+    },
+    /// Read a shard's entries from `from_offset` (inclusive), up to
+    /// `max_entries`. Never implies anything about other shards.
+    StreamRead {
+        /// Key holding this shard's log.
+        key: Key,
+        /// First offset to return (inclusive).
+        from_offset: u64,
+        /// Maximum entries to return.
+        max_entries: u32,
+    },
+    /// Trim a shard's retained prefix through `through_offset` (inclusive).
+    /// `next_offset` never rewinds: trimmed offsets are gone, not reusable.
+    StreamTrim {
+        /// Key holding this shard's log.
+        key: Key,
+        /// Trim retained entries with `offset <= through_offset`.
+        through_offset: u64,
     },
 }
 
@@ -218,9 +419,19 @@ pub enum ExpiryPolicy {
 }
 
 impl Operation {
-    /// Returns the single key this operation touches. Every operation in
-    /// this stage is single-key, which is what makes batch-local overlays
-    /// sound: preparation reads no state beyond this key.
+    /// Returns the single key this operation touches. Every operation is
+    /// single-key except [`TxnCommitLocal`](Self::TxnCommitLocal), which
+    /// answers its first write's key (all its keys share one tablet by
+    /// driver construction, so routing on the first is exact). Single-key
+    /// soundness is what makes batch-local overlays work: preparation reads
+    /// no state beyond the op key, and local commits stage every touched
+    /// key explicitly.
+    ///
+    /// # Panics
+    ///
+    /// Panics on [`TxnCommitLocal`](Self::TxnCommitLocal) with an empty
+    /// write list: drivers never construct one, so an empty commit here
+    /// is a caller bug.
     #[must_use]
     pub fn key(&self) -> &Key {
         match self {
@@ -240,8 +451,29 @@ impl Operation {
             | Self::GetVersion { key }
             | Self::SetConditional { key, .. }
             | Self::SetConditionalChunked { key, .. }
-            | Self::TxnFinalize { key, .. } => key,
+            | Self::TxnFinalize { key, .. }
+            | Self::CommutativeAdd { key, .. }
+            | Self::CommutativeGet { key, .. }
+            | Self::BoundedCounterCreate { key, .. }
+            | Self::BoundedCounterAdd { key, .. }
+            | Self::BoundedCounterGet { key, .. }
+            | Self::EscrowTransfer { key, .. }
+            | Self::SemaphoreCreate { key, .. }
+            | Self::SemaphoreAcquire { key, .. }
+            | Self::SemaphoreRelease { key, .. }
+            | Self::SemaphoreInspect { key, .. }
+            | Self::LeaseAcquire { key, .. }
+            | Self::LeaseRenew { key, .. }
+            | Self::LeaseRelease { key, .. }
+            | Self::LeaseInspect { key, .. }
+            | Self::StreamCreate { key, .. }
+            | Self::StreamAppend { key, .. }
+            | Self::StreamRead { key, .. }
+            | Self::StreamTrim { key, .. } => key,
             Self::TxnPrepare { write, .. } => &write.key,
+            Self::TxnCommitLocal { writes, .. } => {
+                &writes.first().expect("local commits are never empty").key
+            }
         }
     }
 
@@ -262,14 +494,33 @@ impl Operation {
             | Self::SetConditional { .. }
             | Self::SetConditionalChunked { .. }
             | Self::TxnPrepare { .. }
-            | Self::TxnFinalize { .. } => true,
+            | Self::TxnFinalize { .. }
+            | Self::TxnCommitLocal { .. }
+            | Self::CommutativeAdd { .. }
+            | Self::BoundedCounterCreate { .. }
+            | Self::BoundedCounterAdd { .. }
+            | Self::EscrowTransfer { .. }
+            | Self::SemaphoreCreate { .. }
+            | Self::SemaphoreAcquire { .. }
+            | Self::SemaphoreRelease { .. }
+            | Self::LeaseAcquire { .. }
+            | Self::LeaseRenew { .. }
+            | Self::LeaseRelease { .. }
+            | Self::StreamCreate { .. }
+            | Self::StreamAppend { .. }
+            | Self::StreamTrim { .. } => true,
             Self::Get { .. }
             | Self::Exists { .. }
             | Self::CounterGet { .. }
             | Self::GetExpiry { .. }
             | Self::GetRange { .. }
             | Self::GetVersion { .. }
-            | Self::BytesLength { .. } => false,
+            | Self::BytesLength { .. }
+            | Self::CommutativeGet { .. }
+            | Self::BoundedCounterGet { .. }
+            | Self::LeaseInspect { .. }
+            | Self::SemaphoreInspect { .. }
+            | Self::StreamRead { .. } => false,
         }
     }
 }
@@ -353,6 +604,100 @@ pub enum OperationResult {
         /// Version after the applied write (`None` when nothing applied).
         version: Option<crate::object::ObjectVersion>,
     },
+    /// Same-tablet atomic commit outcome: resulting versions in request
+    /// order (`None` for deletes). Shapes as `AtomicCommitted` on the wire.
+    TxnLocalCommitted {
+        /// Resulting versions in request order.
+        versions: Vec<Option<crate::object::ObjectVersion>>,
+    },
+    /// `CommutativeAdd` outcome: applied, with no ordinal. The absence of a
+    /// value here is the semantic point: permutations of applied additions
+    /// produce identical observable histories.
+    CommutativeApplied,
+    /// `CommutativeGet` value (`None` when absent).
+    CommutativeValue(Option<i64>),
+    /// Bounded-counter write outcome with the post-apply value and version.
+    BoundedUpdated {
+        /// Value after the addition.
+        value: i64,
+        /// Version after the update.
+        version: crate::object::ObjectVersion,
+    },
+    /// `BoundedCounterGet` answer (`None`s when absent).
+    BoundedValue {
+        /// Current value (`None` when absent).
+        value: Option<i64>,
+        /// Global capacity (`None` when absent).
+        capacity: Option<u64>,
+        /// Locally owned escrow share `[min, max]` (`None` when absent;
+        /// read-only planning input for rights transfers).
+        share: Option<(i64, i64)>,
+    },
+    /// `SemaphoreAcquire` outcome: the permit is live (or the identical
+    /// retry was recognized).
+    SemaphoreAcquired,
+    /// `SemaphoreRelease` outcome.
+    SemaphoreReleased {
+        /// Whether a live permit was actually released (`false` for unknown
+        /// or already-released ids: idempotent, mints nothing).
+        released: bool,
+    },
+    /// Semaphore load answer: outstanding permits and total capacity.
+    SemaphoreLoad {
+        /// Total outstanding quantity.
+        outstanding: u64,
+        /// Total capacity.
+        capacity: u64,
+    },
+    /// `LeaseAcquire` outcome: the grant with its fencing token. The token
+    /// — not the expiry — is what external systems must compare.
+    LeaseAcquired {
+        /// Fencing token issued with this grant (strictly increasing).
+        fencing: crate::FencingToken,
+        /// Logical expiry of the grant.
+        expires_at: UnixMicros,
+    },
+    /// `LeaseRenew` outcome: the extended grant (same fencing token).
+    LeaseRenewed {
+        /// Fencing token of the continuing grant.
+        fencing: crate::FencingToken,
+        /// New logical expiry of the grant.
+        expires_at: UnixMicros,
+    },
+    /// `LeaseRelease` outcome.
+    LeaseReleased {
+        /// Whether a live holding was actually released (`false` when no
+        /// live holding existed: idempotent).
+        released: bool,
+    },
+    /// `LeaseInspect` answer: the live holder at `now` (`None` when free or
+    /// expired) plus the next fencing token to be issued.
+    LeaseInfo {
+        /// Live holder (`None` when free or expired-but-unreclaimed).
+        holder: Option<crate::LeaseHolder>,
+        /// Next fencing token to be issued.
+        next_fencing: crate::FencingToken,
+    },
+    /// `StreamCreate` outcome.
+    StreamCreated,
+    /// `StreamAppend` outcome: the shard-local offset assigned.
+    StreamAppended {
+        /// Assigned offset (shard-local, monotonic, never global).
+        offset: u64,
+    },
+    /// `StreamRead` answer: entries in shard order plus the shard's next
+    /// offset (the read cursor for the following page).
+    StreamEntries {
+        /// Entries in offset order.
+        entries: Vec<crate::StreamEntry>,
+        /// Shard's next offset (exclusive upper bound of the log).
+        next_offset: u64,
+    },
+    /// `StreamTrim` outcome: how many retained entries were dropped.
+    StreamTrimmed {
+        /// Entries removed.
+        removed: u64,
+    },
 }
 
 /// Native operation failure. Reads and validations fail; validated writes
@@ -387,6 +732,30 @@ pub enum OpError {
     /// attempt.
     #[error("transaction conflict: expected version moved or key reserved")]
     TxnConflict,
+    /// A bounded-counter addition would leave locally owned escrow rights
+    /// (or the global `[0, capacity]` bound). Nothing was mutated; move
+    /// rights first, then retry.
+    #[error("bounded counter would exceed owned escrow rights")]
+    BoundedExceeded,
+    /// A semaphore acquisition would exceed capacity. Nothing was mutated.
+    #[error("semaphore capacity exhausted")]
+    SemaphoreExhausted,
+    /// A lease acquisition met a live holder owned by someone else, or a
+    /// create met existing live state. Nothing was mutated.
+    #[error("lease held by another live owner")]
+    LeaseConflict,
+    /// A lease renew/release named a fencing token that is not the current
+    /// grant's. Nothing was mutated; the stale holder must re-acquire.
+    #[error("stale fencing token: not the current lease grant")]
+    StaleFencing,
+    /// A stream append would exceed the shard's entry or payload bounds, or
+    /// a fencing/lease token space is exhausted. Nothing was mutated.
+    #[error("stream shard full")]
+    StreamFull,
+    /// The key holds no live value of the required type (a semaphore or
+    /// stream shard must be created before use). Nothing was mutated.
+    #[error("no live value under the key")]
+    NotFound,
 }
 
 /// Canonical wire tags. Fixed forever within framing version 1.
@@ -396,12 +765,32 @@ const TAG_OP_OVERFLOW: u8 = 2;
 const TAG_OP_STALE_RANGE_BASE: u8 = 3;
 /// Transaction-conflict tag. New tags never reuse old ones.
 const TAG_OP_TXN_CONFLICT: u8 = 4;
+/// Bounded-rights exceeded tag. New tags never reuse old ones.
+const TAG_OP_BOUNDED_EXCEEDED: u8 = 5;
+/// Semaphore-exhausted tag. New tags never reuse old ones.
+const TAG_OP_SEMAPHORE_EXHAUSTED: u8 = 6;
+/// Lease-held-by-other tag. New tags never reuse old ones.
+const TAG_OP_LEASE_CONFLICT: u8 = 7;
+/// Stale-fencing tag. New tags never reuse old ones.
+const TAG_OP_STALE_FENCING: u8 = 8;
+/// Stream-full tag. New tags never reuse old ones.
+const TAG_OP_STREAM_FULL: u8 = 9;
+/// Not-found tag. New tags never reuse old ones.
+const TAG_OP_NOT_FOUND: u8 = 10;
 
 impl Encode for OpError {
     fn encoded_len(&self) -> usize {
         match self {
             Self::WrongType { .. } => 1 + 1 + 1,
-            Self::CounterOverflow | Self::StaleRangeBase | Self::TxnConflict => 1,
+            Self::CounterOverflow
+            | Self::StaleRangeBase
+            | Self::TxnConflict
+            | Self::BoundedExceeded
+            | Self::SemaphoreExhausted
+            | Self::LeaseConflict
+            | Self::StaleFencing
+            | Self::StreamFull
+            | Self::NotFound => 1,
         }
     }
 
@@ -415,6 +804,12 @@ impl Encode for OpError {
             Self::CounterOverflow => out.push(TAG_OP_OVERFLOW),
             Self::StaleRangeBase => out.push(TAG_OP_STALE_RANGE_BASE),
             Self::TxnConflict => out.push(TAG_OP_TXN_CONFLICT),
+            Self::BoundedExceeded => out.push(TAG_OP_BOUNDED_EXCEEDED),
+            Self::SemaphoreExhausted => out.push(TAG_OP_SEMAPHORE_EXHAUSTED),
+            Self::LeaseConflict => out.push(TAG_OP_LEASE_CONFLICT),
+            Self::StaleFencing => out.push(TAG_OP_STALE_FENCING),
+            Self::StreamFull => out.push(TAG_OP_STREAM_FULL),
+            Self::NotFound => out.push(TAG_OP_NOT_FOUND),
         }
     }
 }
@@ -431,6 +826,12 @@ impl Decode for OpError {
             TAG_OP_OVERFLOW => Ok((Self::CounterOverflow, first)),
             TAG_OP_STALE_RANGE_BASE => Ok((Self::StaleRangeBase, first)),
             TAG_OP_TXN_CONFLICT => Ok((Self::TxnConflict, first)),
+            TAG_OP_BOUNDED_EXCEEDED => Ok((Self::BoundedExceeded, first)),
+            TAG_OP_SEMAPHORE_EXHAUSTED => Ok((Self::SemaphoreExhausted, first)),
+            TAG_OP_LEASE_CONFLICT => Ok((Self::LeaseConflict, first)),
+            TAG_OP_STALE_FENCING => Ok((Self::StaleFencing, first)),
+            TAG_OP_STREAM_FULL => Ok((Self::StreamFull, first)),
+            TAG_OP_NOT_FOUND => Ok((Self::NotFound, first)),
             other => Err(CodecError::InvalidTag {
                 kind: "op-error",
                 tag: other,
@@ -465,25 +866,100 @@ const TAG_RES_TXN_PREPARED: u8 = 13;
 const TAG_RES_TXN_CONFLICT: u8 = 14;
 /// Transaction-finalized outcome tag. New tags never reuse old ones.
 const TAG_RES_TXN_FINALIZED: u8 = 15;
+/// Commutative-applied tag (no ordinal carried, by design).
+const TAG_RES_COMMUTATIVE_APPLIED: u8 = 17;
+/// Commutative-value tag.
+const TAG_RES_COMMUTATIVE_VALUE: u8 = 18;
+/// Bounded-updated tag.
+const TAG_RES_BOUNDED_UPDATED: u8 = 19;
+/// Bounded-value tag.
+const TAG_RES_BOUNDED_VALUE: u8 = 20;
+/// Semaphore-acquired tag.
+const TAG_RES_SEMAPHORE_ACQUIRED: u8 = 21;
+/// Semaphore-released tag.
+const TAG_RES_SEMAPHORE_RELEASED: u8 = 22;
+/// Semaphore-load tag.
+const TAG_RES_SEMAPHORE_LOAD: u8 = 23;
+/// Lease-acquired tag.
+const TAG_RES_LEASE_ACQUIRED: u8 = 24;
+/// Lease-renewed tag.
+const TAG_RES_LEASE_RENEWED: u8 = 25;
+/// Lease-released tag.
+const TAG_RES_LEASE_RELEASED: u8 = 26;
+/// Lease-info tag.
+const TAG_RES_LEASE_INFO: u8 = 27;
+/// Stream-created tag.
+const TAG_RES_STREAM_CREATED: u8 = 28;
+/// Stream-appended tag.
+const TAG_RES_STREAM_APPENDED: u8 = 29;
+/// Stream-entries tag.
+const TAG_RES_STREAM_ENTRIES: u8 = 30;
+/// Stream-trimmed tag.
+const TAG_RES_STREAM_TRIMMED: u8 = 31;
+/// Same-tablet atomic commit tag. New tags never reuse old ones.
+const TAG_RES_TXN_LOCAL_COMMITTED: u8 = 32;
 
 impl Encode for OperationResult {
     fn encoded_len(&self) -> usize {
         match self {
             Self::Value(value) => 1 + 1 + value.as_ref().map_or(0, |bytes| 4 + bytes.len()),
             Self::ChunkedValue { .. } => 1 + 32 + 8,
-            Self::Stored { .. } => 1 + 8,
+            Self::Stored { .. } | Self::StreamAppended { .. } | Self::StreamTrimmed { .. } => 1 + 8,
             Self::Deleted { .. }
             | Self::Exists(_)
             | Self::ExpirySet { .. }
-            | Self::ExpiryPersisted { .. } => 1 + 1,
-            Self::Counter(value) => 1 + 1 + usize::from(value.is_some()) * 8,
-            Self::CounterUpdated { .. } => 1 + 8 + 8,
+            | Self::ExpiryPersisted { .. }
+            | Self::SemaphoreReleased { .. }
+            | Self::LeaseReleased { .. } => 1 + 1,
+            Self::Counter(value) | Self::CommutativeValue(value) => {
+                1 + 1 + usize::from(value.is_some()) * 8
+            }
+            Self::CounterUpdated { .. }
+            | Self::BoundedUpdated { .. }
+            | Self::SemaphoreLoad { .. } => 1 + 8 + 8,
             Self::Expiry(value) => 1 + 1 + value.as_ref().map_or(0, Expiry::encoded_len),
             Self::Length(value) => 1 + 1 + usize::from(value.is_some()) * 8,
             Self::Version(value) => 1 + 1 + usize::from(value.is_some()) * 8,
             Self::ConditionalSet { version, .. } => 1 + 1 + 1 + version.as_ref().map_or(0, |_| 8),
-            Self::TxnPrepared | Self::TxnConflict => 1,
+            Self::TxnPrepared
+            | Self::TxnConflict
+            | Self::CommutativeApplied
+            | Self::SemaphoreAcquired
+            | Self::StreamCreated => 1,
             Self::TxnFinalized { version, .. } => 1 + 1 + 1 + version.as_ref().map_or(0, |_| 8),
+            Self::BoundedValue {
+                value,
+                capacity,
+                share,
+            } => {
+                1 + 1
+                    + usize::from(value.is_some()) * 8
+                    + 1
+                    + usize::from(capacity.is_some()) * 8
+                    + 1
+                    + usize::from(share.is_some()) * 16
+            }
+            Self::LeaseAcquired { .. } | Self::LeaseRenewed { .. } => {
+                1 + 8 + UnixMicros::from_micros(0).encoded_len()
+            }
+            Self::LeaseInfo { holder, .. } => {
+                1 + 1 + holder.map_or(0, |holder| holder.encoded_len()) + 8
+            }
+            Self::StreamEntries { entries, .. } => {
+                1 + 4
+                    + 8
+                    + entries
+                        .iter()
+                        .map(crate::StreamEntry::encoded_len)
+                        .sum::<usize>()
+            }
+            Self::TxnLocalCommitted { versions } => {
+                1 + 2
+                    + versions
+                        .iter()
+                        .map(|version| 1 + usize::from(version.is_some()) * 8)
+                        .sum::<usize>()
+            }
         }
     }
 
@@ -594,6 +1070,133 @@ impl Encode for OperationResult {
                     Some(version) => {
                         out.push(1);
                         version.encode(out);
+                    }
+                }
+            }
+            Self::CommutativeApplied => out.push(TAG_RES_COMMUTATIVE_APPLIED),
+            Self::CommutativeValue(value) => {
+                out.push(TAG_RES_COMMUTATIVE_VALUE);
+                match value {
+                    None => out.push(0),
+                    Some(counter) => {
+                        out.push(1);
+                        out.extend_from_slice(&counter.to_le_bytes());
+                    }
+                }
+            }
+            Self::BoundedUpdated { value, version } => {
+                out.push(TAG_RES_BOUNDED_UPDATED);
+                out.extend_from_slice(&value.to_le_bytes());
+                version.encode(out);
+            }
+            Self::BoundedValue {
+                value,
+                capacity,
+                share,
+            } => {
+                out.push(TAG_RES_BOUNDED_VALUE);
+                match value {
+                    None => out.push(0),
+                    Some(value) => {
+                        out.push(1);
+                        out.extend_from_slice(&value.to_le_bytes());
+                    }
+                }
+                match capacity {
+                    None => out.push(0),
+                    Some(capacity) => {
+                        out.push(1);
+                        capacity.encode(out);
+                    }
+                }
+                match share {
+                    None => out.push(0),
+                    Some((min, max)) => {
+                        out.push(1);
+                        out.extend_from_slice(&min.to_le_bytes());
+                        out.extend_from_slice(&max.to_le_bytes());
+                    }
+                }
+            }
+            Self::SemaphoreAcquired => out.push(TAG_RES_SEMAPHORE_ACQUIRED),
+            Self::SemaphoreReleased { released } => {
+                out.push(TAG_RES_SEMAPHORE_RELEASED);
+                released.encode(out);
+            }
+            Self::SemaphoreLoad {
+                outstanding,
+                capacity,
+            } => {
+                out.push(TAG_RES_SEMAPHORE_LOAD);
+                outstanding.encode(out);
+                capacity.encode(out);
+            }
+            Self::LeaseAcquired {
+                fencing,
+                expires_at,
+            } => {
+                out.push(TAG_RES_LEASE_ACQUIRED);
+                fencing.encode(out);
+                expires_at.encode(out);
+            }
+            Self::LeaseRenewed {
+                fencing,
+                expires_at,
+            } => {
+                out.push(TAG_RES_LEASE_RENEWED);
+                fencing.encode(out);
+                expires_at.encode(out);
+            }
+            Self::LeaseReleased { released } => {
+                out.push(TAG_RES_LEASE_RELEASED);
+                released.encode(out);
+            }
+            Self::LeaseInfo {
+                holder,
+                next_fencing,
+            } => {
+                out.push(TAG_RES_LEASE_INFO);
+                match holder {
+                    None => out.push(0),
+                    Some(holder) => {
+                        out.push(1);
+                        holder.encode(out);
+                    }
+                }
+                next_fencing.encode(out);
+            }
+            Self::StreamCreated => out.push(TAG_RES_STREAM_CREATED),
+            Self::StreamAppended { offset } => {
+                out.push(TAG_RES_STREAM_APPENDED);
+                offset.encode(out);
+            }
+            Self::StreamEntries {
+                entries,
+                next_offset,
+            } => {
+                out.push(TAG_RES_STREAM_ENTRIES);
+                let count = u32::try_from(entries.len()).unwrap_or(u32::MAX);
+                count.encode(out);
+                for entry in entries {
+                    entry.encode(out);
+                }
+                next_offset.encode(out);
+            }
+            Self::StreamTrimmed { removed } => {
+                out.push(TAG_RES_STREAM_TRIMMED);
+                removed.encode(out);
+            }
+            Self::TxnLocalCommitted { versions } => {
+                out.push(TAG_RES_TXN_LOCAL_COMMITTED);
+                let count = u16::try_from(versions.len()).unwrap_or(u16::MAX);
+                out.extend_from_slice(&count.to_le_bytes());
+                for version in versions {
+                    match version {
+                        None => out.push(0),
+                        Some(version) => {
+                            out.push(1);
+                            version.encode(out);
+                        }
                     }
                 }
             }
@@ -738,6 +1341,191 @@ impl Decode for OperationResult {
                     first + second + third + fourth,
                 ))
             }
+            TAG_RES_COMMUTATIVE_APPLIED => Ok((Self::CommutativeApplied, first)),
+            TAG_RES_COMMUTATIVE_VALUE => {
+                let (present, second) = bool::decode(&input[first..])?;
+                if !present {
+                    return Ok((Self::CommutativeValue(None), first + second));
+                }
+                let (raw, third) = <[u8; 8]>::decode(&input[first + second..])?;
+                Ok((
+                    Self::CommutativeValue(Some(i64::from_le_bytes(raw))),
+                    first + second + third,
+                ))
+            }
+            TAG_RES_BOUNDED_UPDATED => {
+                let (raw_value, second) = <[u8; 8]>::decode(&input[first..])?;
+                let (version, third) = ObjectVersion::decode(&input[first + second..])?;
+                Ok((
+                    Self::BoundedUpdated {
+                        value: i64::from_le_bytes(raw_value),
+                        version,
+                    },
+                    first + second + third,
+                ))
+            }
+            TAG_RES_BOUNDED_VALUE => {
+                let (value_present, second) = bool::decode(&input[first..])?;
+                let (value, third) = if value_present {
+                    let (raw, used) = <[u8; 8]>::decode(&input[first + second..])?;
+                    (Some(i64::from_le_bytes(raw)), used)
+                } else {
+                    (None, 0)
+                };
+                let (cap_present, fourth) = bool::decode(&input[first + second + third..])?;
+                let (capacity, fifth) = if cap_present {
+                    let (cap, used) = u64::decode(&input[first + second + third + fourth..])?;
+                    (Some(cap), used)
+                } else {
+                    (None, 0)
+                };
+                let (share_present, sixth) =
+                    bool::decode(&input[first + second + third + fourth + fifth..])?;
+                let (share, seventh) = if share_present {
+                    let (min_raw, used_a) = <[u8; 8]>::decode(
+                        &input[first + second + third + fourth + fifth + sixth..],
+                    )?;
+                    let (max_raw, used_b) = <[u8; 8]>::decode(
+                        &input[first + second + third + fourth + fifth + sixth + used_a..],
+                    )?;
+                    (
+                        Some((i64::from_le_bytes(min_raw), i64::from_le_bytes(max_raw))),
+                        used_a + used_b,
+                    )
+                } else {
+                    (None, 0)
+                };
+                Ok((
+                    Self::BoundedValue {
+                        value,
+                        capacity,
+                        share,
+                    },
+                    first + second + third + fourth + fifth + sixth + seventh,
+                ))
+            }
+            TAG_RES_SEMAPHORE_ACQUIRED => Ok((Self::SemaphoreAcquired, first)),
+            TAG_RES_SEMAPHORE_RELEASED => {
+                let (released, second) = bool::decode(&input[first..])?;
+                Ok((Self::SemaphoreReleased { released }, first + second))
+            }
+            TAG_RES_SEMAPHORE_LOAD => {
+                let (outstanding, second) = u64::decode(&input[first..])?;
+                let (capacity, third) = u64::decode(&input[first + second..])?;
+                Ok((
+                    Self::SemaphoreLoad {
+                        outstanding,
+                        capacity,
+                    },
+                    first + second + third,
+                ))
+            }
+            TAG_RES_LEASE_ACQUIRED => {
+                let (fencing, second) = crate::FencingToken::decode(&input[first..])?;
+                let (expires_at, third) = UnixMicros::decode(&input[first + second..])?;
+                Ok((
+                    Self::LeaseAcquired {
+                        fencing,
+                        expires_at,
+                    },
+                    first + second + third,
+                ))
+            }
+            TAG_RES_LEASE_RENEWED => {
+                let (fencing, second) = crate::FencingToken::decode(&input[first..])?;
+                let (expires_at, third) = UnixMicros::decode(&input[first + second..])?;
+                Ok((
+                    Self::LeaseRenewed {
+                        fencing,
+                        expires_at,
+                    },
+                    first + second + third,
+                ))
+            }
+            TAG_RES_LEASE_RELEASED => {
+                let (released, second) = bool::decode(&input[first..])?;
+                Ok((Self::LeaseReleased { released }, first + second))
+            }
+            TAG_RES_LEASE_INFO => {
+                let (present, second) = bool::decode(&input[first..])?;
+                let (holder, third) = if present {
+                    let (holder, used) = crate::LeaseHolder::decode(&input[first + second..])?;
+                    (Some(holder), used)
+                } else {
+                    (None, 0)
+                };
+                let (next_fencing, fourth) =
+                    crate::FencingToken::decode(&input[first + second + third..])?;
+                Ok((
+                    Self::LeaseInfo {
+                        holder,
+                        next_fencing,
+                    },
+                    first + second + third + fourth,
+                ))
+            }
+            TAG_RES_STREAM_CREATED => Ok((Self::StreamCreated, first)),
+            TAG_RES_STREAM_APPENDED => {
+                let (offset, second) = u64::decode(&input[first..])?;
+                Ok((Self::StreamAppended { offset }, first + second))
+            }
+            TAG_RES_STREAM_ENTRIES => {
+                let (count, mut at) = u32::decode(&input[first..])?;
+                at += first;
+                let count = usize::try_from(count).map_err(|_| CodecError::InvalidTag {
+                    kind: "operation-result",
+                    tag: TAG_RES_STREAM_ENTRIES,
+                })?;
+                if count > crate::MAX_STREAM_SHARD_ENTRIES + 1 {
+                    return Err(CodecError::InvalidTag {
+                        kind: "operation-result",
+                        tag: TAG_RES_STREAM_ENTRIES,
+                    });
+                }
+                let mut entries = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let (entry, used) = crate::StreamEntry::decode(&input[at..])?;
+                    at += used;
+                    entries.push(entry);
+                }
+                let (next_offset, used) = u64::decode(&input[at..])?;
+                at += used;
+                Ok((
+                    Self::StreamEntries {
+                        entries,
+                        next_offset,
+                    },
+                    at,
+                ))
+            }
+            TAG_RES_STREAM_TRIMMED => {
+                let (removed, second) = u64::decode(&input[first..])?;
+                Ok((Self::StreamTrimmed { removed }, first + second))
+            }
+            TAG_RES_TXN_LOCAL_COMMITTED => {
+                let (count_raw, mut at) = <[u8; 2]>::decode(&input[first..])?;
+                at += first;
+                let count = usize::from(u16::from_le_bytes(count_raw));
+                if count > crate::txn::MAX_TXN_KEYS {
+                    return Err(CodecError::InvalidTag {
+                        kind: "operation-result",
+                        tag: TAG_RES_TXN_LOCAL_COMMITTED,
+                    });
+                }
+                let mut versions = Vec::with_capacity(count.min(16));
+                for _ in 0..count {
+                    let (present, used) = bool::decode(&input[at..])?;
+                    at += used;
+                    if !present {
+                        versions.push(None);
+                        continue;
+                    }
+                    let (version, used) = ObjectVersion::decode(&input[at..])?;
+                    at += used;
+                    versions.push(Some(version));
+                }
+                Ok((Self::TxnLocalCommitted { versions }, at))
+            }
             other => Err(CodecError::InvalidTag {
                 kind: "operation-result",
                 tag: other,
@@ -830,6 +1618,9 @@ pub fn outcome_for(
     outcome: &ApplyOutcome,
     is_persist_expiry: bool,
 ) -> OperationResult {
+    if let Some(result) = outcome_for_semantic(mutation, outcome) {
+        return result;
+    }
     match (mutation, outcome) {
         // Inline, chunked, and spliced stores answer identically: the
         // result names the new version either way, never the representation.
@@ -896,6 +1687,87 @@ pub fn outcome_for(
     }
 }
 
+/// Maps one applied semantic mutation to its operation result (`None` when
+/// the mutation is not semantic: the caller falls back to the legacy
+/// mapping). Split from [`outcome_for`] so each half stays reviewable.
+fn outcome_for_semantic(mutation: &Mutation, outcome: &ApplyOutcome) -> Option<OperationResult> {
+    let result = match (mutation, outcome) {
+        // Commutative additions converge to `Applied`: the post-apply sum
+        // verifies durability prediction but never reaches the client, so
+        // no history can distinguish operation order.
+        (Mutation::CommutativeAdd { .. }, ApplyOutcome::Commutative { .. }) => {
+            OperationResult::CommutativeApplied
+        }
+        // Bounded creates, share moves, and semaphore creates answer like
+        // ordinary stores (new version either way, never the rights); adds
+        // answer with values.
+        (
+            Mutation::BoundedCreate { .. }
+            | Mutation::EscrowSetShare { .. }
+            | Mutation::SemaphoreCreate { .. },
+            ApplyOutcome::Put { version },
+        ) => OperationResult::Stored { version: *version },
+        (Mutation::BoundedAdd { .. }, ApplyOutcome::Bounded { value, version }) => {
+            OperationResult::BoundedUpdated {
+                value: *value,
+                version: *version,
+            }
+        }
+        // Semaphore acquires/releases answer id.
+        (Mutation::SemaphoreAcquire { .. }, ApplyOutcome::SemaphoreAcquired) => {
+            OperationResult::SemaphoreAcquired
+        }
+        (Mutation::SemaphoreRelease { .. }, ApplyOutcome::SemaphoreReleased { released }) => {
+            OperationResult::SemaphoreReleased {
+                released: *released,
+            }
+        }
+        // Lease grants answer with the authoritative token; releases with
+        // whether a live holding was freed.
+        (
+            Mutation::LeaseAcquire { .. },
+            ApplyOutcome::LeaseGranted {
+                fencing,
+                expires_at,
+            },
+        ) => OperationResult::LeaseAcquired {
+            fencing: *fencing,
+            expires_at: *expires_at,
+        },
+        (
+            Mutation::LeaseRenew { .. },
+            ApplyOutcome::LeaseGranted {
+                fencing,
+                expires_at,
+            },
+        ) => OperationResult::LeaseRenewed {
+            fencing: *fencing,
+            expires_at: *expires_at,
+        },
+        (Mutation::LeaseRelease { .. }, ApplyOutcome::LeaseReleased { released }) => {
+            OperationResult::LeaseReleased {
+                released: *released,
+            }
+        }
+        // Stream creates answer created; appends answer with the assigned
+        // shard-local offset; trims answer with the dropped count.
+        (Mutation::StreamCreate { .. }, ApplyOutcome::Put { .. }) => OperationResult::StreamCreated,
+        (Mutation::StreamAppend { .. }, ApplyOutcome::StreamAppended { offset }) => {
+            OperationResult::StreamAppended { offset: *offset }
+        }
+        (Mutation::StreamTrim { .. }, ApplyOutcome::StreamTrimmed { removed }) => {
+            OperationResult::StreamTrimmed { removed: *removed }
+        }
+        (Mutation::TxnCommitLocal { .. }, ApplyOutcome::TxnLocalCommitted { versions }) => {
+            OperationResult::TxnLocalCommitted {
+                versions: versions.clone(),
+            }
+        }
+        _ => return None,
+    };
+    Some(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -959,6 +1831,63 @@ mod tests {
             applied: false,
             version: None,
         });
+        round_trip(&OperationResult::TxnLocalCommitted {
+            versions: vec![Some(version), None],
+        });
+        round_trip(&OperationResult::TxnLocalCommitted { versions: vec![] });
+        round_trip(&OperationResult::CommutativeApplied);
+        round_trip(&OperationResult::CommutativeValue(None));
+        round_trip(&OperationResult::CommutativeValue(Some(-7)));
+        round_trip(&OperationResult::BoundedUpdated { value: 3, version });
+        round_trip(&OperationResult::BoundedValue {
+            value: None,
+            capacity: None,
+            share: None,
+        });
+        round_trip(&OperationResult::BoundedValue {
+            value: Some(3),
+            capacity: Some(10),
+            share: Some((0, 10)),
+        });
+        round_trip(&OperationResult::SemaphoreAcquired);
+        round_trip(&OperationResult::SemaphoreReleased { released: true });
+        round_trip(&OperationResult::SemaphoreReleased { released: false });
+        round_trip(&OperationResult::SemaphoreLoad {
+            outstanding: 2,
+            capacity: 5,
+        });
+        round_trip(&OperationResult::LeaseAcquired {
+            fencing: crate::FencingToken::from_u64(4),
+            expires_at: UnixMicros::from_micros(99),
+        });
+        round_trip(&OperationResult::LeaseRenewed {
+            fencing: crate::FencingToken::from_u64(4),
+            expires_at: UnixMicros::from_micros(199),
+        });
+        round_trip(&OperationResult::LeaseReleased { released: true });
+        round_trip(&OperationResult::LeaseInfo {
+            holder: None,
+            next_fencing: crate::FencingToken::from_u64(2),
+        });
+        round_trip(&OperationResult::LeaseInfo {
+            holder: Some(crate::LeaseHolder {
+                owner: 11,
+                fencing: crate::FencingToken::from_u64(3),
+                expires_at: UnixMicros::from_micros(77),
+            }),
+            next_fencing: crate::FencingToken::from_u64(4),
+        });
+        round_trip(&OperationResult::StreamCreated);
+        round_trip(&OperationResult::StreamAppended { offset: 41 });
+        round_trip(&OperationResult::StreamEntries {
+            entries: vec![crate::StreamEntry {
+                offset: 0,
+                partition: vec![0x70],
+                payload: Bytes::from_static(b"e0"),
+            }],
+            next_offset: 1,
+        });
+        round_trip(&OperationResult::StreamTrimmed { removed: 9 });
     }
 
     #[test]
@@ -969,6 +1898,12 @@ mod tests {
         });
         round_trip(&OpError::CounterOverflow);
         round_trip(&OpError::TxnConflict);
+        round_trip(&OpError::BoundedExceeded);
+        round_trip(&OpError::SemaphoreExhausted);
+        round_trip(&OpError::LeaseConflict);
+        round_trip(&OpError::StaleFencing);
+        round_trip(&OpError::StreamFull);
+        round_trip(&OpError::NotFound);
         round_trip(&DurableOutcome::Completed(OperationResult::Stored {
             version: ObjectVersion::FIRST,
         }));

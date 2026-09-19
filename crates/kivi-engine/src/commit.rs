@@ -230,8 +230,9 @@ pub(crate) struct PendingEntry {
     /// Staging pins for a chunked upload, held admission→apply so chunk
     /// GC cannot collect staged-but-uncommitted packs underneath this
     /// entry. Dropped (unpinning) on every exit path, including
-    /// preparation failure.
-    pinned: Option<crate::chunk_lane::PinnedUpload>,
+    /// preparation failure. One entry per staged value: ordinary writes
+    /// stage at most one, transactional batches stage several.
+    pinned: Vec<crate::chunk_lane::PinnedUpload>,
 }
 
 impl PendingEntry {
@@ -256,14 +257,23 @@ impl PendingEntry {
             identity,
             respond,
             admitted_at: Instant::now(),
-            pinned: None,
+            pinned: Vec::new(),
         }
     }
 
     /// Attaches a staging-pin guard carried admission→apply (see the
     /// field docs). `None` (the default) is every inline request.
     pub(crate) fn with_pinned(mut self, pinned: Option<crate::chunk_lane::PinnedUpload>) -> Self {
-        self.pinned = pinned;
+        if let Some(pinned) = pinned {
+            self.pinned.push(pinned);
+        }
+        self
+    }
+
+    /// Attaches several staging-pin guards (transactional batches stage
+    /// one value per large put; all ride admission→apply together).
+    pub(crate) fn with_pins(mut self, pins: Vec<crate::chunk_lane::PinnedUpload>) -> Self {
+        self.pinned.extend(pins);
         self
     }
 }
@@ -301,8 +311,9 @@ struct ApplyData {
     respond: Sender<WorkerResponse>,
     /// Staging pins, moved from the admission and held through the apply:
     /// the journal records the commit before this drops, so GC always sees
-    /// staged data as either pinned or journaled, never neither.
-    pinned: Option<crate::chunk_lane::PinnedUpload>,
+    /// staged data as either pinned or journaled, never neither. One entry
+    /// per staged value (transactional batches stage several).
+    pinned: Vec<crate::chunk_lane::PinnedUpload>,
 }
 
 /// Batch-local overlay for one tablet: pending state for touched keys only
@@ -372,6 +383,77 @@ impl TabletOverlay {
                 .insert(key.clone(), scratch.cloned_intent_for_key(mutation.key()));
         }
         Ok(prepared)
+    }
+
+    /// Prepares a same-tablet atomic commit against committed-plus-pending
+    /// state: stages every touched key into a scratch store (overlay roots
+    /// win, otherwise committed roots, plus both intent layers), runs the
+    /// atomic [`commit_local`](kivi_state::ObjectStore::commit_local) there,
+    /// and stages every post-commit root back into the overlay so later
+    /// batch items observe the commit. Prediction and later committed apply
+    /// agree by construction on identical state.
+    fn prepare_local_commit(
+        &mut self,
+        committed: &ObjectStore,
+        txn: kivi_state::TxnId,
+        writes: &[kivi_state::TxnWrite],
+        now: kivi_types::UnixMicros,
+    ) -> Result<StorePrepared, TabletError> {
+        use kivi_state::{LocalCommitError, OperationResult};
+        if writes.is_empty() {
+            return Err(TabletError::Op(kivi_state::OpError::TxnConflict));
+        }
+        let mut touched: std::collections::BTreeSet<Key> = std::collections::BTreeSet::new();
+        for write in writes {
+            touched.insert(write.key.clone());
+        }
+        let mut scratch = ObjectStore::new();
+        for key in &touched {
+            match self.pending.get(key) {
+                Some(Some(object)) => scratch.put_stored(key.clone(), object.clone()),
+                Some(None) => {}
+                None => {
+                    if let Some(object) = committed.get_stored(key) {
+                        scratch.put_stored(key.clone(), object.clone());
+                    }
+                }
+            }
+            match self.intents.get(key) {
+                Some(Some(intent)) => scratch.restore_intent(intent.clone()),
+                Some(None) => {}
+                None => {
+                    if let Some(intent) = committed.cloned_intent_for_key(key) {
+                        scratch.restore_intent(intent);
+                    }
+                }
+            }
+        }
+        match scratch.commit_local(writes, now) {
+            Ok(_) => {
+                for key in &touched {
+                    self.pending
+                        .insert(key.clone(), scratch.get_stored(key).cloned());
+                    self.intents
+                        .insert(key.clone(), scratch.cloned_intent_for_key(key));
+                }
+                Ok(StorePrepared::Write {
+                    mutation: kivi_state::Mutation::TxnCommitLocal {
+                        txn,
+                        writes: writes.to_vec(),
+                    },
+                    expected: OperationResult::TxnLocalCommitted {
+                        versions: kivi_state::local_versions(&scratch, writes, now),
+                    },
+                })
+            }
+            Err(LocalCommitError::Validation(op)) => Err(TabletError::Op(op)),
+            Err(LocalCommitError::Exhausted) => {
+                Err(TabletError::Apply(kivi_state::ApplyError::VersionExhausted))
+            }
+            Err(LocalCommitError::Diverged(error)) => Err(TabletError::Apply(error)),
+            // Future validation failures fail closed as divergence.
+            Err(_) => Err(TabletError::Apply(kivi_state::ApplyError::TxnDiverged)),
+        }
     }
 }
 
@@ -873,7 +955,7 @@ impl CommitCoordinator {
             for apply in &inflight.applies {
                 match &apply.kind {
                     PreparedKind::Mutation { mutation, .. } => {
-                        keys.insert(mutation.key().clone());
+                        keys.extend(mutation.keys().into_iter().cloned());
                     }
                     PreparedKind::Terminal { .. } => {}
                 }
@@ -1353,7 +1435,12 @@ impl CommitCoordinator {
             });
             open.oldest_admitted = open.oldest_admitted.min(entry.admitted_at);
             let overlay = open.overlays.entry(tablet_id).or_default();
-            overlay.prepare(committed, &entry.op, entry.now)
+            match &entry.op {
+                Operation::TxnCommitLocal { txn, writes } => {
+                    overlay.prepare_local_commit(committed, *txn, writes, entry.now)
+                }
+                _ => overlay.prepare(committed, &entry.op, entry.now),
+            }
         };
         let prepared = match prepared {
             Ok(prepared) => prepared,

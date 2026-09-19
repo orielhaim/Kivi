@@ -34,7 +34,7 @@ pub use clock::SystemClock;
 pub use commit::{BatchPolicy, CommitCoordinator, CommitMetricsSnapshot, LaneMaintenance};
 pub use engine::{
     AdminHandle, ChunkFabricConfig, DurabilityMode, DurableConfig, EngineConfig, EngineDurability,
-    EngineError, LocalClient, LocalEngine, ShutdownReport,
+    EngineError, LocalClient, LocalEngine, ShutdownReport, TxnStatusReport,
 };
 pub use net::{ConnLimits, EngineNetwork, NetConfig, NetStartError, TurnBudget};
 pub use routing::{Placement, RoutingSnapshot};

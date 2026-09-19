@@ -1048,6 +1048,13 @@ fn run(
                             String::from_utf8_lossy(&entry.key)
                         );
                     }
+                    kivi_client::ordered::ClientScanValue::Semantic { object, descriptor } => {
+                        println!(
+                            "{}\t(semantic type {object}, {} descriptor bytes)",
+                            String::from_utf8_lossy(&entry.key),
+                            descriptor.len()
+                        );
+                    }
                 }
             }
         }

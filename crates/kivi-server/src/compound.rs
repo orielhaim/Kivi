@@ -4,10 +4,11 @@
 //! A `Scan` answers the slice of `[start, end)` owned by the routed tablet
 //! through a linearizable (`Latest`) or weak (`Any`) group read; the client
 //! fans out across tablets and resumes by logical key. An `AtomicBatch`
-//! runs the uniform 2PC machinery (record + prepares + decide + finalizes)
-//! with coordinator == sole participant through the normal propose path.
-//! Multi-tablet batches are rejected with `TxnTooLarge`; the client driver
-//! runs those over `TxnPrepare`/`TxnFinalize`.
+//! commits as one ordered atomic record (`TxnCommitLocal`) through the
+//! normal propose path: one validation, one consensus round, one ordered
+//! apply — no coordinator record, no prepare/finalize waves. Multi-tablet
+//! batches are rejected with `TxnTooLarge`; the client driver runs those
+//! over `TxnPrepare`/`TxnFinalize`.
 //!
 //! `TxnPrepare`/`TxnFinalize` need no special handling here: they translate
 //! to single-key operations and flow through the standard propose path with
@@ -16,7 +17,7 @@
 use kivi_protocol::{Opcode, Request, Response, ResponseBody, Status};
 use kivi_state::{
     Operation, OperationResult, ScanDirection, ScanProjection, ScanSpec, TxnDriverPlan, TxnError,
-    TxnId, TxnState, plan_transaction, txn_record_key, txn_write_from_wire,
+    TxnId, plan_transaction, txn_write_from_wire,
 };
 use kivi_tablet::{DirectorySnapshot, PartitionRange};
 use kivi_types::{MutationIdentity, NamespaceId, ReadContract, RequestSeq, SessionId, TabletId};
@@ -182,6 +183,26 @@ fn scan_value_body(value: Option<&kivi_state::ScannedValue>) -> kivi_protocol::S
                 logical_len: *logical_len,
             }
         }
+        Some(kivi_state::ScannedValue::Semantic { object, descriptor }) => {
+            kivi_protocol::ScanValueBody::Semantic {
+                object: object_to_tag(*object),
+                descriptor: descriptor.to_vec(),
+            }
+        }
+    }
+}
+
+/// Maps a semantic object type to its stable scan tag (mirrors the
+/// embedded engine's mapping; tags mirror `ObjectType` wire tags).
+fn object_to_tag(object: kivi_state::ObjectType) -> u8 {
+    match object {
+        kivi_state::ObjectType::Bytes => 1,
+        kivi_state::ObjectType::StrictCounter => 2,
+        kivi_state::ObjectType::CommutativeCounter => 3,
+        kivi_state::ObjectType::BoundedCounter => 4,
+        kivi_state::ObjectType::Semaphore => 5,
+        kivi_state::ObjectType::Lease => 6,
+        kivi_state::ObjectType::StreamShard => 7,
     }
 }
 
@@ -392,7 +413,7 @@ pub async fn handle_batch(shared: &ClusterShared, request: &Request) -> (Respons
         return (
             Response {
                 proof: None,
-                status: Status::TxnTooLarge,
+                status: Status::TxnCrossTablet,
                 body: ResponseBody::Diagnostic(format!(
                     "batch spans {} tablets; drive it over TxnPrepare/TxnFinalize",
                     plan.groups.len()
@@ -401,24 +422,10 @@ pub async fn handle_batch(shared: &ClusterShared, request: &Request) -> (Respons
             Opcode::AtomicBatch,
         );
     }
-    if shared
-        .node
-        .tablet_intent_count(plan.coordinator)
-        .await
-        .is_some_and(|count| count > 0)
-    {
-        return (
-            Response {
-                proof: None,
-                status: Status::TxnCoordinatorUnavailable,
-                body: ResponseBody::Diagnostic(
-                    "tablet holds unresolved intents; retry after recovery".to_owned(),
-                ),
-            },
-            Opcode::AtomicBatch,
-        );
-    }
-    run_single_tablet_plan(shared, &plan, request).await
+    // No blanket intent fence: the atomic record validates per-key intents
+    // precisely, so free keys stay servable while other transactions
+    // resolve. Topology cutover still fences on unresolved intents.
+    run_single_tablet_plan(shared, &plan).await
 }
 
 /// Routes one batch key through the directory by the unified rule
@@ -455,337 +462,52 @@ fn route_normal_key(
     directory.lookup_by_hash(hash)
 }
 
-/// Executes a validated single-participant plan through proposes:
-/// prepares, guarded decide, finalizes. No `Begun` record exists in V1
-/// (orphans without records abort by lease). Recovery-first: an existing
-/// durable decision resolves without re-preparing.
+/// Executes a validated single-participant plan as one ordered atomic
+/// record through the normal propose path: a single `TxnCommitLocal`
+/// proposal carries the whole write set through one consensus round and
+/// one ordered apply. No coordinator record, no prepare/finalize waves.
+/// The step identity is stable per transaction (session = txn bytes,
+/// seq = 1), so retries replay through dedup instead of re-executing.
 async fn run_single_tablet_plan(
     shared: &ClusterShared,
     plan: &TxnDriverPlan,
-    _request: &Request,
 ) -> (Response, Opcode) {
     let session = SessionId::from_u128(u128::from_le_bytes(plan.txn.as_bytes()));
-    let tablet = plan.coordinator;
-    let mut seq: u64 = 1;
-    // Per-step identities derive from the TxnId session (stable across
-    // transport retries → idempotent re-drive through dedup).
-    let mut step_identity = || {
-        let identity = MutationIdentity::new(
-            kivi_types::RequestIdentity::new(session, RequestSeq::from_u64(seq)),
-            RequestSeq::from_u64(0),
-        );
-        seq += 1;
-        identity
+    let identity = MutationIdentity::new(
+        kivi_types::RequestIdentity::new(session, RequestSeq::from_u64(1)),
+        RequestSeq::from_u64(0),
+    );
+    let op = Operation::TxnCommitLocal {
+        txn: plan.txn,
+        writes: plan.writes.clone(),
     };
-    let record_key = txn_record_key(plan.coordinator, plan.txn);
-    if let Some(record) = read_record(shared, tablet, &record_key).await {
-        match record.state {
-            TxnState::Committed => {
-                return finalize_wave(shared, tablet, plan, &mut step_identity).await;
-            }
-            TxnState::Aborted => {
-                return (
-                    Response {
-                        proof: None,
-                        status: Status::TxnAborted,
-                        body: ResponseBody::Diagnostic("transaction aborted".to_owned()),
-                    },
-                    Opcode::AtomicBatch,
-                );
-            }
-            TxnState::Begun => {}
-        }
-    }
-    let prepared = match prepare_wave(shared, plan, &mut step_identity).await {
-        Ok(prepared) => prepared,
-        Err(abort) => {
-            let (partial, abort) = *abort;
-            return abort_then(shared, plan, &partial, session, &mut step_identity, abort).await;
-        }
-    };
-    let mut decided = plan.record.clone();
-    decided.state = TxnState::Committed;
-    if !decide_commit(shared, tablet, plan, &decided).await {
-        // Re-read: an ambiguous decide may actually have committed (never
-        // blind-overwrite a decision with an abort).
-        if let Some(record) = read_record(shared, tablet, &record_key).await
-            && record.state == TxnState::Committed
-        {
-            return finalize_wave(shared, tablet, plan, &mut step_identity).await;
-        }
-        return abort_then(
-            shared,
-            plan,
-            &prepared,
-            session,
-            &mut step_identity,
+    match propose_step(shared, plan.coordinator, &op, identity).await {
+        Ok(OperationResult::TxnLocalCommitted { versions }) => (
             Response {
                 proof: None,
-                status: Status::TxnAborted,
-                body: ResponseBody::Diagnostic("commit undecided; aborted".to_owned()),
+                status: Status::Ok,
+                body: ResponseBody::AtomicCommitted {
+                    versions: versions
+                        .iter()
+                        .map(|version| version.map(kivi_state::ObjectVersion::as_u64))
+                        .collect(),
+                },
             },
-        )
-        .await;
-    }
-    finalize_wave(shared, tablet, plan, &mut step_identity).await
-}
-
-/// Prepare every key in request order (deterministic). Returns the
-/// prepared indexes; on the first failure returns the partial prepared
-/// set (the caller finalize-aborts those) plus the abort response. The
-/// failure side is boxed: responses are large and failures are cold.
-async fn prepare_wave(
-    shared: &ClusterShared,
-    plan: &TxnDriverPlan,
-    step_identity: &mut impl FnMut() -> MutationIdentity,
-) -> Result<Vec<usize>, Box<(Vec<usize>, Response)>> {
-    let tablet = plan.coordinator;
-    let mut prepared: Vec<usize> = Vec::with_capacity(plan.writes.len());
-    for (index, write) in plan.writes.iter().enumerate() {
-        let op = Operation::TxnPrepare {
-            txn: plan.txn,
-            coordinator: tablet,
-            write: write.clone(),
-        };
-        match propose_step(shared, tablet, &op, step_identity()).await {
-            Ok(OperationResult::TxnPrepared) => prepared.push(index),
-            Ok(OperationResult::TxnConflict) => {
-                return Err(Box::new((
-                    prepared,
-                    Response {
-                        proof: None,
-                        status: Status::TxnConflict,
-                        body: ResponseBody::Diagnostic("transaction conflict".to_owned()),
-                    },
-                )));
-            }
-            Ok(_) => {
-                return Err(Box::new((
-                    prepared,
-                    Response {
-                        proof: None,
-                        status: Status::Internal,
-                        body: ResponseBody::Diagnostic("unexpected prepare outcome".to_owned()),
-                    },
-                )));
-            }
-            Err(response) => {
-                return Err(Box::new((prepared, response)));
-            }
-        }
-    }
-    Ok(prepared)
-}
-
-/// Finalize-commit wave shared by fresh drives and recovery re-drives.
-async fn finalize_wave(
-    shared: &ClusterShared,
-    tablet: TabletId,
-    plan: &TxnDriverPlan,
-    step_identity: &mut impl FnMut() -> MutationIdentity,
-) -> (Response, Opcode) {
-    let mut versions: Vec<Option<u64>> = vec![None; plan.writes.len()];
-    for (order, write) in plan.writes.iter().enumerate() {
-        let op = Operation::TxnFinalize {
-            txn: plan.txn,
-            key: write.key.clone(),
-            commit: true,
-        };
-        match propose_step(shared, tablet, &op, step_identity()).await {
-            // `applied:false` after a successful prepare + durable commit
-            // means the resolver already finalized this intent
-            // (idempotent convergence): success with no version.
-            Ok(OperationResult::TxnFinalized {
-                applied: true,
-                version,
-            }) => {
-                versions[order] = version.map(kivi_state::ObjectVersion::as_u64);
-            }
-            Ok(OperationResult::TxnFinalized { applied: false, .. }) => {}
-            Ok(_) => {
-                return (
-                    Response {
-                        proof: None,
-                        status: Status::Internal,
-                        body: ResponseBody::Diagnostic("unexpected finalize outcome".to_owned()),
-                    },
-                    Opcode::AtomicBatch,
-                );
-            }
-            Err(response) => return (response, Opcode::AtomicBatch),
-        }
-    }
-    (
-        Response {
-            proof: None,
-            status: Status::Ok,
-            body: ResponseBody::AtomicCommitted { versions },
-        },
-        Opcode::AtomicBatch,
-    )
-}
-
-/// Reads and decodes the coordinator record (`None` when absent or
-/// undecodable). Transaction records are always lease-ineligible: the
-/// 2PC outcome must integrate with the final committed participant
-/// outcome, so coordinator reads run Lazy-ALR/conservative until
-/// responder coverage integrates with transactions.
-async fn read_record(
-    shared: &ClusterShared,
-    tablet: TabletId,
-    record_key: &kivi_state::Key,
-) -> Option<kivi_state::TxnRecord> {
-    let ctx = super::cluster::read_ctx();
-    match shared
-        .node
-        .read(
-            tablet,
-            &Operation::Get {
-                key: record_key.clone(),
+            Opcode::AtomicBatch,
+        ),
+        Ok(_) => (
+            Response {
+                proof: None,
+                status: Status::Internal,
+                body: ResponseBody::Diagnostic("unexpected local-commit outcome".to_owned()),
             },
-            kivi_types::ReadContract::Latest,
-            ctx,
-            kivi_types::LeaseEligibility::ConservativeOnly,
-        )
-        .await
-    {
-        Ok(served) => match served.outcome {
-            OperationResult::Value(Some(bytes)) => kivi_state::TxnRecord::decode(&bytes).ok(),
-            _ => None,
-        },
-        _ => None,
+            Opcode::AtomicBatch,
+        ),
+        // Terminal rejections and propose errors already shaped by
+        // `propose_step`; ambiguous delivery is retryable under the same
+        // transaction identity.
+        Err(response) => (response, Opcode::AtomicBatch),
     }
-}
-
-/// Persists the Commit decision guarded on absence (CAS): the record key
-/// is unique per transaction, so a present record means a previous drive
-/// already decided. The decide steps use dedicated sequence numbers
-/// (8000/8001): the abort decide uses a different pair (9000/9001),
-/// because dedup keys on (session, seq) alone and the two decisions must
-/// never alias each other.
-async fn decide_commit(
-    shared: &ClusterShared,
-    tablet: TabletId,
-    plan: &TxnDriverPlan,
-    decided: &kivi_state::TxnRecord,
-) -> bool {
-    decide_record(shared, tablet, plan, decided, 8000).await
-}
-
-/// Persists one terminal decision through an absence-guarded prepare +
-/// commit-finalize on the record key (CAS — never a blind overwrite).
-/// `seq_base`/`seq_base + 1` name the decide step identities.
-async fn decide_record(
-    shared: &ClusterShared,
-    tablet: TabletId,
-    plan: &TxnDriverPlan,
-    decided: &kivi_state::TxnRecord,
-    seq_base: u64,
-) -> bool {
-    let session = SessionId::from_u128(u128::from_le_bytes(plan.txn.as_bytes()));
-    let prepare = Operation::TxnPrepare {
-        txn: plan.txn,
-        coordinator: tablet,
-        write: kivi_state::TxnWrite {
-            key: txn_record_key(plan.coordinator, plan.txn),
-            kind: kivi_state::TxnWriteKind::Put(bytes::Bytes::from(decided.encode())),
-            expect: kivi_state::TxnExpect::Absent,
-        },
-    };
-    let identity = MutationIdentity::new(
-        kivi_types::RequestIdentity::new(session, RequestSeq::from_u64(seq_base)),
-        RequestSeq::from_u64(0),
-    );
-    if !matches!(
-        propose_step(shared, tablet, &prepare, identity).await,
-        Ok(OperationResult::TxnPrepared)
-    ) {
-        return false;
-    }
-    let finalize = Operation::TxnFinalize {
-        txn: plan.txn,
-        key: txn_record_key(plan.coordinator, plan.txn),
-        commit: true,
-    };
-    let identity = MutationIdentity::new(
-        kivi_types::RequestIdentity::new(session, RequestSeq::from_u64(seq_base + 1)),
-        RequestSeq::from_u64(0),
-    );
-    matches!(
-        propose_step(shared, tablet, &finalize, identity).await,
-        Ok(OperationResult::TxnFinalized { .. })
-    )
-}
-
-/// Which decision the coordinator record converged to after the guarded
-/// abort path.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum AbortOutcome {
-    Aborted,
-    Committed,
-}
-
-/// Runs the guarded abort path and maps its outcome: `Aborted` yields the
-/// caller's abort response; `Committed` (a racing drive committed this
-/// transaction) converges through the commit wave instead of reporting a
-/// false abort.
-async fn abort_then(
-    shared: &ClusterShared,
-    plan: &TxnDriverPlan,
-    prepared: &[usize],
-    session: SessionId,
-    step_identity: &mut impl FnMut() -> MutationIdentity,
-    abort: Response,
-) -> (Response, Opcode) {
-    match abort_prepared(shared, plan, prepared, session).await {
-        AbortOutcome::Aborted => (abort, Opcode::AtomicBatch),
-        AbortOutcome::Committed => {
-            finalize_wave(shared, plan.coordinator, plan, step_identity).await
-        }
-    }
-}
-
-/// Finalize-abort every prepared key plus a guarded Aborted decision
-/// (CAS on absence — never a blind overwrite: a racing drive may have
-/// committed this transaction, and an abort must not clobber that).
-/// On a lost race the record is re-read: `Committed` means the caller
-/// must converge via the commit wave instead.
-async fn abort_prepared(
-    shared: &ClusterShared,
-    plan: &TxnDriverPlan,
-    prepared: &[usize],
-    session: SessionId,
-) -> AbortOutcome {
-    let tablet = plan.coordinator;
-    let mut aborted = plan.record.clone();
-    aborted.state = TxnState::Aborted;
-    // Abort decide identities (9000/9001) never alias the commit decide
-    // pair (8000/8001): dedup keys on (session, seq) alone.
-    if decide_record(shared, tablet, plan, &aborted, 9000).await {
-        for (seq, index) in (9100_u64..).zip(prepared.iter()) {
-            let op = Operation::TxnFinalize {
-                txn: plan.txn,
-                key: plan.writes[*index].key.clone(),
-                commit: false,
-            };
-            let identity = MutationIdentity::new(
-                kivi_types::RequestIdentity::new(session, RequestSeq::from_u64(seq)),
-                RequestSeq::from_u64(0),
-            );
-            let _ = propose_step(shared, tablet, &op, identity).await;
-        }
-        return AbortOutcome::Aborted;
-    }
-    // Lost the decide race: re-read (an ambiguous decide may actually
-    // have committed — never finalize-abort a committed transaction).
-    let record_key = txn_record_key(plan.coordinator, plan.txn);
-    if read_record(shared, tablet, &record_key)
-        .await
-        .is_some_and(|record| record.state == TxnState::Committed)
-    {
-        return AbortOutcome::Committed;
-    }
-    AbortOutcome::Aborted
 }
 
 /// One validated propose: outcomes pass through, rejections and routing
@@ -813,9 +535,11 @@ async fn propose_step(
             | ProposeOutcome::Duplicate { outcome }
             | ProposeOutcome::Read { outcome },
         ) => Ok(outcome),
-        Ok(ProposeOutcome::Rejected { outcome }) => {
-            Err(super::cluster::shape_durable(&outcome, Opcode::AtomicBatch))
-        }
+        Ok(ProposeOutcome::Rejected { outcome }) => Err(super::cluster::shape_durable(
+            &outcome,
+            Opcode::AtomicBatch,
+            tablet,
+        )),
         Err(error) => Err(super::cluster::shape_propose_error(shared, tablet, &error).await),
     }
 }
@@ -837,7 +561,10 @@ pub async fn handle_guard_abort(
         return;
     };
     // Deterministic abort-transaction id (re-drives idempotently).
-    let abort_txn = TxnId::derive(u128::from_le_bytes(txn.as_bytes()), 0, 0);
+    // Salt 3 never aliases driver decide-transactions (commit 0 / abort
+    // 1) or the absent-record CAS (salt 2): distinct intents, genuine OCC
+    // on the key.
+    let abort_txn = TxnId::derive(u128::from_le_bytes(txn.as_bytes()), 0, 3);
     let session = SessionId::from_u128(u128::from_le_bytes(abort_txn.as_bytes()));
     let now = super::cluster::wall_now();
     let mut seq: u64 = 1;
@@ -857,6 +584,8 @@ pub async fn handle_guard_abort(
             kind: TxnWriteKind::Put(bytes::Bytes::from(record_bytes.clone())),
             expect: TxnExpect::Version(expected),
         },
+        // Record-key steps bind the zero digest (no user write set).
+        digest: [0u8; 32],
     };
     let prepared = matches!(
         node.propose(tablet, &prepare, Some(identity()), None, now)
@@ -876,6 +605,7 @@ pub async fn handle_guard_abort(
         txn: abort_txn,
         key: record_key,
         commit: true,
+        digest: [0u8; 32],
     };
     let _ = node
         .propose(tablet, &finalize, Some(identity()), None, now)
