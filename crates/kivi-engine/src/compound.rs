@@ -60,6 +60,7 @@ pub async fn handle_compound(
     worker: WorkerId,
     endpoint_of: impl Fn(WorkerId) -> String,
     durability: Option<&Rc<RefCell<WorkerDurability>>>,
+    fabric: &Rc<RefCell<crate::fabric::TabletFabric>>,
     request: &Request,
 ) -> (Response, Opcode) {
     match request.opcode {
@@ -68,7 +69,16 @@ pub async fn handle_compound(
             Opcode::Scan,
         ),
         Opcode::AtomicBatch => (
-            drive_batch(tablets, routing, worker, &endpoint_of, durability, request).await,
+            drive_batch(
+                tablets,
+                routing,
+                worker,
+                &endpoint_of,
+                durability,
+                fabric,
+                request,
+            )
+            .await,
             Opcode::AtomicBatch,
         ),
         _ => (
@@ -603,6 +613,15 @@ fn scan_value_body(value: &kivi_state::ScannedValue) -> kivi_protocol::ScanValue
             manifest: *manifest.as_bytes(),
             logical_len: *logical_len,
         },
+        kivi_state::ScannedValue::Fabric {
+            fabric_id,
+            logical_len,
+            version,
+        } => kivi_protocol::ScanValueBody::Fabric {
+            fabric_id: *fabric_id,
+            logical_len: *logical_len,
+            version: *version,
+        },
         kivi_state::ScannedValue::Oversize { logical_len } => {
             kivi_protocol::ScanValueBody::Oversize {
                 logical_len: *logical_len,
@@ -636,6 +655,71 @@ fn object_to_tag(object: kivi_state::ObjectType) -> u8 {
 // Atomic batch (single-tablet fast path)
 // ---------------------------------------------------------------------------
 
+/// Stages medium batch puts into the fabric, rewriting them as
+/// `PutFabric` and collecting the seal payloads the later `Commit` must
+/// persist. Values past the chunk threshold stay caller's problem
+/// (explicit streaming uploads); saturation fails the batch, never the
+/// commit that would follow. The single caller returns the response
+/// immediately, so the large error never sits in a `Result` chain.
+#[allow(clippy::result_large_err)]
+fn stage_batch_medium(
+    plan: kivi_state::TxnDriverPlan,
+    fabric: &Rc<RefCell<crate::fabric::TabletFabric>>,
+) -> Result<(kivi_state::TxnDriverPlan, Vec<crate::fabric::StagedSeal>), Response> {
+    let coordinator = plan.coordinator;
+    let mut writes = Vec::with_capacity(plan.writes.len());
+    let mut seals = Vec::new();
+    for write in plan.writes {
+        match write.kind {
+            kivi_state::TxnWriteKind::Put(value)
+                if value.len() > crate::fabric::FABRIC_INLINE_MAX =>
+            {
+                // Cap medium staging at the chunk threshold: larger
+                // values ride the chunked path via explicit uploads.
+                if (value.len() as u64) > kivi_chunk::policy::DEFAULT_INLINE_THRESHOLD {
+                    return Err(Response {
+                        proof: None,
+                        status: Status::TxnTooLarge,
+                        body: ResponseBody::Diagnostic(
+                            "batch value exceeds the inline bound; stage through streaming upload"
+                                .to_owned(),
+                        ),
+                    });
+                }
+                match fabric.borrow_mut().stage(coordinator, value.clone(), true) {
+                    Ok((fabric_id, logical_len)) => {
+                        seals.push(crate::fabric::StagedSeal {
+                            fabric_id,
+                            key: write.key.clone(),
+                            bytes: value,
+                        });
+                        writes.push(kivi_state::TxnWrite {
+                            key: write.key,
+                            kind: kivi_state::TxnWriteKind::PutFabric {
+                                fabric_id,
+                                logical_len,
+                                version: 0,
+                            },
+                            expect: write.expect,
+                        });
+                    }
+                    Err(_) => {
+                        return Err(Response {
+                            proof: None,
+                            status: Status::TxnCoordinatorUnavailable,
+                            body: ResponseBody::Diagnostic(
+                                "memory fabric saturated; retry".to_owned(),
+                            ),
+                        });
+                    }
+                }
+            }
+            _ => writes.push(write),
+        }
+    }
+    Ok((kivi_state::TxnDriverPlan { writes, ..plan }, seals))
+}
+
 /// Drives one single-tablet atomic batch: plans (bounds, grouping,
 /// coordinator, digest), rejects multi-tablet batches for the client 2PC
 /// driver, then commits the whole set as one atomic record with a stable
@@ -647,6 +731,7 @@ async fn drive_batch(
     worker: WorkerId,
     endpoint_of: impl Fn(WorkerId) -> String,
     durability: Option<&Rc<RefCell<WorkerDurability>>>,
+    fabric: &Rc<RefCell<crate::fabric::TabletFabric>>,
     request: &Request,
 ) -> Response {
     use Status as S;
@@ -730,12 +815,20 @@ async fn drive_batch(
             };
         }
     }
+    // Stage medium transactional puts into the fabric before planning
+    // (synchronous inserts): later `Commit` can never meet a durable
+    // root with unavailable payload. Staging is tablet-agnostic here;
+    // routing below may still reject cross-tablet sets.
+    let (plan, seals) = match stage_batch_medium(plan, fabric) {
+        Ok(staged) => staged,
+        Err(response) => return response,
+    };
     // No blanket intent fence: the atomic record validates per-key intents
     // precisely (a foreign reservation on key K conflicts only writes to
     // K), so free keys stay servable while other transactions resolve.
     // Topology cutover (split/merge/retire) still fences on unresolved
     // intents at the control layer.
-    run_single_tablet_plan(tablets, durability, &plan).await
+    run_single_tablet_plan(tablets, durability, fabric, &plan, seals).await
 }
 
 /// Routes one batch key through the directory by namespace layout.
@@ -804,7 +897,9 @@ fn route_normal_key(
 async fn run_single_tablet_plan(
     tablets: &TabletMap,
     durability: Option<&Rc<RefCell<WorkerDurability>>>,
+    fabric: &Rc<RefCell<crate::fabric::TabletFabric>>,
     plan: &TxnDriverPlan,
+    seals: Vec<crate::fabric::StagedSeal>,
 ) -> Response {
     use Status as S;
     let session = SessionId::from_u128(u128::from_le_bytes(plan.txn.as_bytes()));
@@ -816,7 +911,17 @@ async fn run_single_tablet_plan(
         txn: plan.txn,
         writes: plan.writes.clone(),
     };
-    match drive_one(tablets, durability, plan.coordinator, &op, identity).await {
+    match drive_one(
+        tablets,
+        durability,
+        fabric,
+        plan.coordinator,
+        &op,
+        identity,
+        seals,
+    )
+    .await
+    {
         Ok(OperationResult::TxnLocalCommitted { versions }) => Response {
             proof: None,
             status: S::Ok,
@@ -883,9 +988,11 @@ fn map_local_rejection(outcome: &DurableOutcome) -> Response {
 async fn drive_one(
     tablets: &TabletMap,
     durability: Option<&Rc<RefCell<WorkerDurability>>>,
+    fabric: &Rc<RefCell<crate::fabric::TabletFabric>>,
     tablet: TabletId,
     op: &Operation,
     identity: MutationIdentity,
+    seals: Vec<crate::fabric::StagedSeal>,
 ) -> Result<OperationResult, StepFault> {
     let Some(durable) = durability else {
         let now = SystemClock::wall_now();
@@ -900,14 +1007,21 @@ async fn drive_one(
     {
         let mut guard = durable.borrow_mut();
         let namespace = guard.namespace;
-        guard.commit.admit(PendingEntry::new(
-            tablet,
-            op.clone(),
-            SystemClock::wall_now(),
-            Some(identity),
-            respond,
-        ));
-        guard.commit.poll(&mut tablets.borrow_mut(), namespace);
+        guard.commit.admit(
+            PendingEntry::new(
+                tablet,
+                op.clone(),
+                SystemClock::wall_now(),
+                Some(identity),
+                respond,
+            )
+            .with_fabric_staged(seals),
+        );
+        guard.commit.poll(
+            &mut tablets.borrow_mut(),
+            namespace,
+            &mut fabric.borrow_mut(),
+        );
     }
     let start = Instant::now();
     loop {
@@ -915,7 +1029,11 @@ async fn drive_one(
         {
             let mut guard = durable.borrow_mut();
             let namespace = guard.namespace;
-            guard.commit.poll(&mut tablets.borrow_mut(), namespace);
+            guard.commit.poll(
+                &mut tablets.borrow_mut(),
+                namespace,
+                &mut fabric.borrow_mut(),
+            );
         }
         match receive.try_recv() {
             Ok(Ok(result)) => return Ok(result),
@@ -987,6 +1105,7 @@ fn step_worker_error(error: crate::worker::WorkerRequestError) -> StepFault {
         E::UnknownTablet { .. }
         | E::Storage(_)
         | E::ChunkStore(_)
+        | E::Fabric(_)
         | E::DedupExpired
         | E::SessionOverloaded
         | E::InvalidRequest { .. } => StepFault::Unavailable,
@@ -1092,6 +1211,14 @@ mod tests {
     fn compound_scan_serves_local_slice() {
         let (tablets, routing) = tablet_map();
         let request = scan_request(None, None, 100);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = crate::fabric::FabricPaths {
+            root: dir.path().to_owned(),
+        };
+        let (fabric, guard) =
+            crate::fabric::TabletFabric::open(WorkerId::from_u64(0), &paths, 1 << 20, 16 << 20)
+                .expect("fabric opens");
+        let fabric = std::rc::Rc::new(std::cell::RefCell::new(fabric));
         let (response, opcode) =
             compio::runtime::Runtime::new()
                 .expect("runtime")
@@ -1101,8 +1228,10 @@ mod tests {
                     WorkerId::from_u64(0),
                     |_| String::new(),
                     None,
+                    &fabric,
                     &request,
                 ));
+        guard.shutdown();
         assert_eq!(opcode, Opcode::Scan);
         match response.body {
             ResponseBody::ScanPage {

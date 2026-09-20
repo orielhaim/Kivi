@@ -233,6 +233,11 @@ pub(crate) struct PendingEntry {
     /// preparation failure. One entry per staged value: ordinary writes
     /// stage at most one, transactional batches stage several.
     pinned: Vec<crate::chunk_lane::PinnedUpload>,
+    /// Staged fabric seals: medium values staged into the worker fabric
+    /// at admission. Preparation converts them into seal payloads with
+    /// predicted versions; failure paths retire the ids immediately so
+    /// uncommitted stages never accumulate.
+    fabric_staged: Vec<crate::fabric::StagedSeal>,
 }
 
 impl PendingEntry {
@@ -258,6 +263,7 @@ impl PendingEntry {
             respond,
             admitted_at: Instant::now(),
             pinned: Vec::new(),
+            fabric_staged: Vec::new(),
         }
     }
 
@@ -275,6 +281,57 @@ impl PendingEntry {
     pub(crate) fn with_pins(mut self, pins: Vec<crate::chunk_lane::PinnedUpload>) -> Self {
         self.pinned.extend(pins);
         self
+    }
+
+    /// Attaches staged fabric seals (medium values staged into the worker
+    /// fabric at admission; all ride admission→seal together).
+    pub(crate) fn with_fabric_staged(mut self, staged: Vec<crate::fabric::StagedSeal>) -> Self {
+        self.fabric_staged.extend(staged);
+        self
+    }
+}
+
+/// One committed-state read suspended on promotion: the linearization
+/// (root id + version at prepare time) plus the fabric park sequence.
+/// Resume re-fences against the live root before answering, so a
+/// delayed promotion can never serve bytes the read was not authorized
+/// to observe.
+#[derive(Debug)]
+struct SuspendedRead {
+    /// Tablet the read runs against.
+    tablet: TabletId,
+    /// Key being read (root re-validation on resume).
+    key: kivi_state::Key,
+    /// Logical wall time of the read (expiry evaluation on resume).
+    now: kivi_types::UnixMicros,
+    /// `GetRange` window (`None` for full `Get`): applied after a
+    /// resolved root, so range reads never serve more than asked.
+    range: Option<(u64, u64)>,
+    /// Fabric park sequence holding the lane reply.
+    park: u64,
+    /// Where the outcome goes (bounded to one message).
+    respond: Sender<WorkerResponse>,
+}
+
+/// Extracts a `GetRange` window (`None` for every other opcode): applied
+/// after a fabric root resolves, so range reads slice the exact bytes
+/// the read was authorized to observe.
+fn read_range(op: &kivi_state::Operation) -> Option<(u64, u64)> {
+    match op {
+        kivi_state::Operation::GetRange { offset, len, .. } => Some((*offset, *len)),
+        _ => None,
+    }
+}
+
+/// Slices resolved bytes through a `GetRange` window (full bytes for
+/// `Get`): the single shaping point for fabric reads, so hit, park, and
+/// bridge paths cannot disagree.
+fn shape_resolved(bytes: bytes::Bytes, range: Option<(u64, u64)>) -> kivi_state::OperationResult {
+    match range {
+        Some((offset, len)) => {
+            kivi_state::OperationResult::Value(Some(kivi_state::slice_range(&bytes, offset, len)))
+        }
+        None => kivi_state::OperationResult::Value(Some(bytes)),
     }
 }
 
@@ -457,6 +514,81 @@ impl TabletOverlay {
     }
 }
 
+/// Builds seal payloads for every staged fabric id the prepared mutation
+/// references, stamping predicted authoritative versions from the
+/// expected outcome. Predict/apply agreement makes these versions exact;
+/// unreferenced staged ids are the caller's to retire (unmet conditions,
+/// terminal outcomes).
+///
+/// 2PC intents seal twice: `TxnPrepare` persists the staged bytes under
+/// the staging version (`0`, never a root) so a crash cannot strand a
+/// prepared intent without payload, and pins the id until the intent
+/// resolves; `TxnFinalize` re-seals the same bytes under the predicted
+/// authoritative version, superseding the staging record.
+fn fabric_payloads_for(
+    tablet: TabletId,
+    mutation: &Mutation,
+    expected: &kivi_state::OperationResult,
+    staged: &[crate::fabric::StagedSeal],
+) -> Vec<crate::fabric::FabricSealPayload> {
+    use kivi_state::{Mutation as M, OperationResult as R};
+    let sealed: Vec<(u64, u64)> = match (mutation, expected) {
+        (M::ReplaceFabricRoot { fabric_id, .. }, R::Stored { version }) => {
+            vec![(*fabric_id, version.as_u64())]
+        }
+        (
+            M::ReplaceFabricRootWithExpiry { fabric_id, .. },
+            R::ConditionalSet {
+                applied: true,
+                version: Some(version),
+            },
+        ) => vec![(*fabric_id, version.as_u64())],
+        (M::TxnCommitLocal { writes, .. }, R::TxnLocalCommitted { versions }) => writes
+            .iter()
+            .zip(versions.iter())
+            .filter_map(|(write, version)| match (&write.kind, version) {
+                (kivi_state::TxnWriteKind::PutFabric { fabric_id, .. }, Some(version)) => {
+                    Some((*fabric_id, version.as_u64()))
+                }
+                _ => None,
+            })
+            .collect(),
+        (
+            M::TxnPrepare {
+                write: kivi_state::TxnWriteKind::PutFabric { fabric_id, .. },
+                ..
+            },
+            _,
+        ) => vec![(*fabric_id, 0)],
+        (
+            M::TxnFinalize { .. },
+            R::TxnFinalized {
+                applied: true,
+                version: Some(version),
+            },
+        ) => staged
+            .iter()
+            .map(|seal| (seal.fabric_id, version.as_u64()))
+            .collect(),
+        _ => Vec::new(),
+    };
+    sealed
+        .into_iter()
+        .filter_map(|(fabric_id, version)| {
+            staged
+                .iter()
+                .find(|seal| seal.fabric_id == fabric_id)
+                .map(|seal| crate::fabric::FabricSealPayload {
+                    fabric_id,
+                    tablet,
+                    key: mutation.key().clone(),
+                    version,
+                    bytes: seal.bytes.clone(),
+                })
+        })
+        .collect()
+}
+
 /// Estimated wire length of one WAL record body contribution, mirroring
 /// `encode_record_body` (8-byte frame + fixed prefix + identity + blobs).
 /// Used for the `max_bytes` close rule; the lane's authoritative
@@ -491,6 +623,10 @@ struct OpenBatch {
     /// Pre-batch commit positions per touched tablet (rollback on failure).
     commit_base: HashMap<TabletId, CommitPosition>,
     oldest_admitted: Instant,
+    /// Staged fabric payloads sealed with this batch (durable-before-
+    /// reference): the lane persists every payload plus its journal entry
+    /// before the WAL barrier.
+    fabric_payloads: Vec<crate::fabric::FabricSealPayload>,
     /// When formation started (bounds the formation window: under
     /// continuous arrivals a batch must still seal instead of growing
     /// while the queue never drains).
@@ -507,6 +643,10 @@ struct InflightBatch {
     commit_base: HashMap<TabletId, CommitPosition>,
     submitted_at: Instant,
     oldest_admitted: Instant,
+    /// Staged fabric ids sealed with this batch: retired when the batch
+    /// fails (nothing references them), live when it commits (roots name
+    /// them and seal locators reconstruct them).
+    fabric_staged: Vec<u64>,
 }
 
 /// One sealed unit of work for the lane thread.
@@ -514,6 +654,10 @@ struct InflightBatch {
 pub(crate) struct SealJob {
     batch_seq: u64,
     records: Vec<WalRecord>,
+    /// Staged fabric payloads: the lane persists every payload and its
+    /// journal entry BEFORE the WAL barrier, establishing
+    /// durable-before-reference ordering for fabric roots in `records`.
+    fabric_payloads: Vec<crate::fabric::FabricSealPayload>,
 }
 
 /// Lane-thread commands: seals plus infrequent checkpoint-time
@@ -571,16 +715,204 @@ pub(crate) struct SealOutcome {
     batch_seq: u64,
     result: Result<CommitProof, DurabilityError>,
     lane_stats: WorkerLaneStats,
+    /// Durable locators for the sealed fabric payloads (empty when the
+    /// batch staged nothing): the worker mirrors these into memory as
+    /// the reconstruction sources for the new roots.
+    fabric_locators: Vec<crate::fabric::FabricSealLocator>,
+}
+
+/// Fabric seal store: the durability lane's single-writer handle over
+/// the worker's `materializations.dat` plus the fabric journal. Lives on
+/// the lane thread; the worker thread never touches these files.
+#[derive(Debug)]
+pub struct FabricSealStore {
+    provider: kivi_memory::NvmeProvider,
+    journal_path: std::path::PathBuf,
+}
+
+impl FabricSealStore {
+    /// Opens (creating) the material provider and journal parent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurabilityError`] when directories or files cannot be
+    /// opened, or the record format is newer than this build.
+    pub(crate) fn open(paths: &crate::fabric::FabricPaths) -> Result<Self, DurabilityError> {
+        std::fs::create_dir_all(paths.material_dir()).map_err(|error| DurabilityError::Io {
+            op: "create fabric material dir",
+            message: error.to_string(),
+            code: None,
+        })?;
+        let provider = kivi_memory::NvmeProvider::open(
+            &paths.material_dir(),
+            kivi_memory::NvmeOptions::default(),
+        )
+        .map_err(|error| DurabilityError::Io {
+            op: "open fabric material provider",
+            message: error.to_string(),
+            code: None,
+        })?;
+        Ok(Self {
+            provider,
+            journal_path: paths.journal(),
+        })
+    }
+
+    /// Persists every payload plus its journal entry under one barrier,
+    /// returning locators in input order. The caller seals the WAL only
+    /// after this returns success (durable-before-reference).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DurabilityError`] on any filesystem failure; partial
+    /// prefixes stay in the files and are validated or truncated by
+    /// recovery (torn tails) and journal load (CRC per record).
+    pub(crate) fn seal_payloads(
+        &mut self,
+        payloads: &[crate::fabric::FabricSealPayload],
+    ) -> Result<Vec<crate::fabric::FabricSealLocator>, DurabilityError> {
+        let map_io = |op: &'static str| {
+            move |error: std::io::Error| DurabilityError::Io {
+                op,
+                message: error.to_string(),
+                code: None,
+            }
+        };
+        let mut locators = Vec::with_capacity(payloads.len());
+        let mut entries = Vec::with_capacity(payloads.len());
+        for payload in payloads {
+            let (offset, len, checksum) =
+                self.provider
+                    .append(&payload.bytes)
+                    .map_err(|error| DurabilityError::Io {
+                        op: "append fabric material record",
+                        message: error.to_string(),
+                        code: None,
+                    })?;
+            entries.push(crate::fabric::JournalEntry {
+                fabric_id: payload.fabric_id,
+                tablet: payload.tablet,
+                key: payload.key.as_bytes().to_vec(),
+                version: payload.version,
+                file: crate::fabric::JournalFile::Material,
+                offset,
+                len,
+                checksum,
+            });
+            locators.push(crate::fabric::FabricSealLocator {
+                fabric_id: payload.fabric_id,
+                tablet: payload.tablet,
+                key: payload.key.clone(),
+                version: payload.version,
+                offset,
+                len,
+                checksum,
+            });
+        }
+        if !entries.is_empty() {
+            crate::fabric::journal_append_batch(&self.journal_path, &entries)
+                .map_err(map_io("append fabric journal"))?;
+        }
+        Ok(locators)
+    }
+}
+
+/// Runs one closure under the WAL lane, exclusive or shared.
+type LaneRunner<'a> = &'a mut dyn FnMut(&mut dyn FnMut(&mut kivi_durability::LocalWalLane));
+
+/// Reports one failed seal: builds the outcome under the lane (for
+/// lane stats) and sends it. Kept beside
+/// [`seal_one_batch`] so the seal arm stays reviewable.
+fn fail_seal(
+    job: &SealJob,
+    error: &DurabilityError,
+    with_lane: LaneRunner<'_>,
+    complete: &Sender<SealOutcome>,
+) {
+    let mut outcome: Option<SealOutcome> = None;
+    with_lane(&mut |inner| {
+        outcome = Some(SealOutcome {
+            batch_seq: job.batch_seq,
+            result: Err(error.clone()),
+            lane_stats: inner.lane_stats(),
+            fabric_locators: Vec::new(),
+        });
+    });
+    let _ = complete.send(outcome.expect("seal always reports"));
+}
+
+/// Seals one batch: fabric payloads first (durable-before-reference),
+/// then the WAL barrier. A fabric failure retires nothing here — the
+/// coordinator retires staged ids when it collects the failed proof —
+/// but unreferenced records never accumulate because every staged id
+/// rides exactly one seal.
+fn seal_one_batch(
+    job: &SealJob,
+    with_lane: LaneRunner<'_>,
+    seal_store: &mut Option<FabricSealStore>,
+    complete: &Sender<SealOutcome>,
+) {
+    // Fabric payloads first (durable-before-reference): a seal failure
+    // below then also retires the staged ids on the worker, so
+    // unreferenced records never accumulate behind a failed batch.
+    let fabric_sealed = match seal_store.as_mut() {
+        Some(store) if !job.fabric_payloads.is_empty() => {
+            Some(store.seal_payloads(&job.fabric_payloads))
+        }
+        _ => None,
+    };
+    if !job.fabric_payloads.is_empty() && seal_store.is_none() {
+        fail_seal(
+            job,
+            &DurabilityError::Io {
+                op: "seal fabric payloads",
+                message: "no fabric seal store on this lane".to_owned(),
+                code: None,
+            },
+            with_lane,
+            complete,
+        );
+        return;
+    }
+    let fabric_locators = match fabric_sealed {
+        Some(Err(error)) => {
+            fail_seal(job, &error, with_lane, complete);
+            return;
+        }
+        Some(Ok(locators)) => locators,
+        None => Vec::new(),
+    };
+    let mut outcome: Option<SealOutcome> = None;
+    with_lane(&mut |inner| {
+        let result = inner.append_batch(&PersistIntent {
+            records: &job.records,
+            level: DurabilityLevel::Sync,
+        });
+        outcome = Some(SealOutcome {
+            batch_seq: job.batch_seq,
+            result,
+            lane_stats: inner.lane_stats(),
+            fabric_locators: fabric_locators.clone(),
+        });
+    });
+    // The coordinator always waits for every seal it submits
+    // (poll or flush); a gone waiter only happens past a
+    // fail-closed panic, in which case dropping the proof is
+    // moot.
+    let _ = complete.send(outcome.expect("seal always reports"));
 }
 
 /// Dedicated durability-lane thread: owns the WAL lane, appends sealed
 /// batches, syncs, and reports. The `DataWorker` never touches the
 /// filesystem; the lane thread never touches tablet state. Maintenance
-/// commands run between seals in arrival order.
+/// commands run between seals in arrival order. When a fabric seal store
+/// is present, staged fabric payloads persist (records plus journal,
+/// one barrier) before the WAL barrier of the same seal.
 fn lane_thread_main(
     lane: LaneAccess,
     submit: Receiver<LaneCommand>,
     complete: &Sender<SealOutcome>,
+    mut seal_store: Option<FabricSealStore>,
 ) {
     let mut lane = lane;
     let mut with_lane = |job: &mut dyn FnMut(&mut kivi_durability::LocalWalLane)| {
@@ -601,23 +933,7 @@ fn lane_thread_main(
     for command in submit {
         match command {
             LaneCommand::Seal(job) => {
-                let mut outcome: Option<SealOutcome> = None;
-                with_lane(&mut |inner| {
-                    let result = inner.append_batch(&PersistIntent {
-                        records: &job.records,
-                        level: DurabilityLevel::Sync,
-                    });
-                    outcome = Some(SealOutcome {
-                        batch_seq: job.batch_seq,
-                        result,
-                        lane_stats: inner.lane_stats(),
-                    });
-                });
-                // The coordinator always waits for every seal it submits
-                // (poll or flush); a gone waiter only happens past a
-                // fail-closed panic, in which case dropping the proof is
-                // moot.
-                let _ = complete.send(outcome.expect("seal always reports"));
+                seal_one_batch(&job, &mut with_lane, &mut seal_store, complete);
             }
             LaneCommand::SealActive { reply } => {
                 let mut result = Ok(());
@@ -697,12 +1013,13 @@ impl LaneHandle {
     pub(crate) fn spawn(
         lane: LaneAccess,
         complete: &Sender<SealOutcome>,
+        seal_store: Option<FabricSealStore>,
     ) -> Result<Self, DurabilityError> {
         let (submit, receive) = bounded::<LaneCommand>(LANE_SUBMIT_DEPTH);
         let complete_thread = complete.clone();
         let thread = thread::Builder::new()
             .name("kivi-durability-lane".to_owned())
-            .spawn(move || lane_thread_main(lane, receive, &complete_thread))
+            .spawn(move || lane_thread_main(lane, receive, &complete_thread, seal_store))
             .map_err(|error| DurabilityError::Io {
                 op: "spawn durability lane thread",
                 message: error.to_string(),
@@ -774,6 +1091,9 @@ pub struct CommitCoordinator {
     unapplied_sessions: HashMap<SessionId, usize>,
     health: StorageHealth,
     lane_stats: WorkerLaneStats,
+    /// Committed-state reads suspended on promotion (polled, never
+    /// blocking): linearization captured at prepare, re-fenced on resume.
+    suspended: VecDeque<SuspendedRead>,
     logical_mutations: u64,
     physical_batches: u64,
     barriers: u64,
@@ -827,6 +1147,7 @@ impl CommitCoordinator {
         policy: BatchPolicy,
         lane: LaneAccess,
         initial_stats: WorkerLaneStats,
+        seal_store: Option<FabricSealStore>,
     ) -> Result<Self, DurabilityError> {
         policy
             .validate()
@@ -838,11 +1159,12 @@ impl CommitCoordinator {
             open: None,
             inflight: None,
             next_batch_seq: 1,
-            lane: LaneHandle::spawn(lane, &complete_tx)?,
+            lane: LaneHandle::spawn(lane, &complete_tx, seal_store)?,
             complete,
             unapplied_identities: HashSet::new(),
             unapplied_sessions: HashMap::new(),
             health: StorageHealth::Healthy,
+            suspended: VecDeque::new(),
             lane_stats: initial_stats,
             logical_mutations: 0,
             physical_batches: 0,
@@ -883,6 +1205,7 @@ impl CommitCoordinator {
             unapplied_identities: HashSet::new(),
             unapplied_sessions: HashMap::new(),
             health: StorageHealth::Healthy,
+            suspended: VecDeque::new(),
             lane_stats: initial_stats,
             logical_mutations: 0,
             physical_batches: 0,
@@ -915,11 +1238,15 @@ impl CommitCoordinator {
         self.lane.maintenance()
     }
 
-    /// Whether any request is admitted-but-unanswered or any batch is on
-    /// the lane: what the worker's park logic consults.
+    /// Whether any request is admitted-but-unanswered, suspended on
+    /// promotion, or any batch is on the lane: what the worker's park
+    /// logic consults.
     #[must_use]
     pub(crate) fn has_pending(&self) -> bool {
-        !self.queue.is_empty() || self.open.is_some() || self.inflight.is_some()
+        !self.queue.is_empty()
+            || self.open.is_some()
+            || self.inflight.is_some()
+            || !self.suspended.is_empty()
     }
 
     /// Current coarse lane health (cached from the last seal outcome).
@@ -934,10 +1261,11 @@ impl CommitCoordinator {
         self.lane_stats
     }
 
-    /// Keys currently touched by queued, open, or in-flight mutations.
-    /// Sweeps consult this to avoid deleting a key whose prediction is
-    /// already staged — a sweep/delete race would otherwise diverge the
-    /// post-durability verification.
+    /// Keys currently touched by queued, open, in-flight, or suspended
+    /// operations. Sweeps consult this to avoid deleting a key whose
+    /// prediction is already staged - a sweep/delete race would otherwise
+    /// diverge the post-durability verification. Suspended reads join the
+    /// set: a sweep must not delete a key whose promotion is in flight.
     #[must_use]
     pub(crate) fn touched_keys(&self) -> HashSet<Key> {
         let mut keys = HashSet::new();
@@ -961,7 +1289,25 @@ impl CommitCoordinator {
                 }
             }
         }
+        for suspended in &self.suspended {
+            keys.insert(suspended.key.clone());
+        }
         keys
+    }
+
+    /// Fabric ids in the open or in-flight batch (sealed or sealing):
+    /// checkpoint journal GC must retain their records until the batch
+    /// applies, even though no live root names them yet.
+    #[must_use]
+    pub(crate) fn pending_fabric_ids(&self) -> Vec<u64> {
+        let mut ids = Vec::new();
+        if let Some(open) = &self.open {
+            ids.extend(open.fabric_payloads.iter().map(|payload| payload.fabric_id));
+        }
+        if let Some(inflight) = &self.inflight {
+            ids.extend(inflight.fabric_staged.iter().copied());
+        }
+        ids
     }
 
     /// Pumps the pipeline once: drains ready completions, answers every
@@ -971,16 +1317,20 @@ impl CommitCoordinator {
     /// bridge cycle, connection waiter).
     ///
     /// Fast paths run even with a batch in flight: committed-state reads
-    /// and settled identities never wait on a barrier.
+    /// and settled identities never wait on a barrier. Fabric reads that
+    /// miss residency suspend into the coordinator's parked set instead
+    /// of blocking; later polls resume them.
     pub(crate) fn poll(
         &mut self,
         tablets: &mut HashMap<TabletId, LiveTablet>,
         namespace: NamespaceId,
+        fabric: &mut crate::fabric::TabletFabric,
     ) {
-        self.drain_completions(tablets);
-        self.answer_fast_paths(tablets);
+        self.drain_completions(tablets, fabric);
+        self.poll_suspended(tablets, fabric);
+        self.answer_fast_paths(tablets, fabric);
         if self.inflight.is_none() {
-            self.prepare_mutations(tablets, namespace);
+            self.prepare_mutations(tablets, namespace, fabric);
         }
     }
 
@@ -996,16 +1346,17 @@ impl CommitCoordinator {
         &mut self,
         tablets: &mut HashMap<TabletId, LiveTablet>,
         namespace: NamespaceId,
+        fabric: &mut crate::fabric::TabletFabric,
     ) {
         loop {
-            self.poll(tablets, namespace);
+            self.poll(tablets, namespace, fabric);
             if !self.has_pending() {
                 return;
             }
             let Ok(outcome) = self.complete.recv_timeout(FLUSH_PROOF_TIMEOUT) else {
                 panic!("durability lane died during shutdown flush");
             };
-            self.apply_completion(tablets, outcome);
+            self.apply_completion(tablets, outcome, fabric);
         }
     }
 }
@@ -1153,19 +1504,26 @@ impl CommitCoordinator {
     }
 
     /// Applies every ready completion waiting on the lane channel.
-    fn drain_completions(&mut self, tablets: &mut HashMap<TabletId, LiveTablet>) {
+    fn drain_completions(
+        &mut self,
+        tablets: &mut HashMap<TabletId, LiveTablet>,
+        fabric: &mut crate::fabric::TabletFabric,
+    ) {
         while let Ok(outcome) = self.complete.try_recv() {
-            self.apply_completion(tablets, outcome);
+            self.apply_completion(tablets, outcome, fabric);
         }
     }
 
     /// Applies one seal outcome: on proof, ordered verified apply plus
     /// dedup install and replies; on storage failure, position rollback
-    /// and per-request failure with committed state untouched.
+    /// and per-request failure with committed state untouched. Seal
+    /// locators mirror into the fabric as durable reconstruction sources;
+    /// staged ids retire when the batch fails (nothing references them).
     fn apply_completion(
         &mut self,
         tablets: &mut HashMap<TabletId, LiveTablet>,
         outcome: SealOutcome,
+        fabric: &mut crate::fabric::TabletFabric,
     ) {
         let inflight = self.inflight.take().expect("completion without a batch");
         assert_eq!(
@@ -1185,10 +1543,22 @@ impl CommitCoordinator {
                 let size = inflight.applies.len();
                 self.logical_mutations += size as u64;
                 self.record_batch_size(size, inflight.oldest_admitted.elapsed());
+                for locator in outcome.fabric_locators {
+                    fabric.note_sealed(crate::fabric::JournalEntry {
+                        fabric_id: locator.fabric_id,
+                        tablet: locator.tablet,
+                        key: locator.key.as_bytes().to_vec(),
+                        version: locator.version,
+                        file: crate::fabric::JournalFile::Material,
+                        offset: locator.offset,
+                        len: locator.len,
+                        checksum: locator.checksum,
+                    });
+                }
                 for apply in inflight.applies {
                     self.forget_identity(apply.identity.as_ref());
                     let live = tablets.get_mut(&apply.tablet).expect("tablet live");
-                    apply_item(live, apply);
+                    apply_item(live, apply, fabric);
                 }
             }
             Err(error) => {
@@ -1198,7 +1568,23 @@ impl CommitCoordinator {
                     _ => StorageHealth::Failed,
                 };
                 // Nothing persisted, so pre-batch positions are reusable:
-                // restore them and recovery chains stay contiguous.
+                // restore them and recovery chains stay contiguous. Staged
+                // fabric ids retire: no root will ever name them. Prepared
+                // intents never formed here, so their pins release first
+                // (otherwise the pin would outlive the intent it protects).
+                for apply in &inflight.applies {
+                    if let PreparedKind::Mutation {
+                        mutation: Mutation::TxnPrepare { write, .. },
+                        ..
+                    } = &apply.kind
+                        && let kivi_state::TxnWriteKind::PutFabric { fabric_id, .. } = write
+                    {
+                        fabric.unpin_and_sweep(*fabric_id);
+                    }
+                }
+                for id in inflight.fabric_staged {
+                    fabric.retire_or_defer(id);
+                }
                 for apply in &inflight.applies {
                     self.forget_identity(apply.identity.as_ref());
                     if let Some(base) = inflight.commit_base.get(&apply.tablet)
@@ -1233,8 +1619,13 @@ impl CommitCoordinator {
     /// unknown tablets, and settled identities (expired, hit,
     /// overloaded). Admit-gated mutations stay queued for the prepare
     /// phase. Always runs — even with a batch in flight — because none of
-    /// these observe uncommitted state.
-    fn answer_fast_paths(&mut self, tablets: &mut HashMap<TabletId, LiveTablet>) {
+    /// these observe uncommitted state. Fabric reads that miss residency
+    /// suspend into the parked set (never block); later polls resume them.
+    fn answer_fast_paths(
+        &mut self,
+        tablets: &mut HashMap<TabletId, LiveTablet>,
+        fabric: &mut crate::fabric::TabletFabric,
+    ) {
         let mut cursor = 0usize;
         while cursor < self.queue.len() {
             let tablet_id = self.queue[cursor].tablet;
@@ -1248,12 +1639,34 @@ impl CommitCoordinator {
             if !self.queue[cursor].is_mutating {
                 // Committed-state reads linearize before any uncommitted
                 // batch: always safe, never gated, never persisted.
+                // Fabric references resolve here (synchronous hit) or
+                // suspend into the parked set (promotion miss); either
+                // way the queue position releases.
                 let entry = self.queue.remove(cursor).expect("cursor valid");
                 let live = tablets.get_mut(&tablet_id).expect("presence checked");
-                let outcome = live
+                match live
                     .execute(&entry.op, entry.now)
-                    .map_err(WorkerRequestError::Tablet);
-                let _ = entry.respond.try_send(outcome);
+                    .map_err(WorkerRequestError::Tablet)
+                {
+                    Ok(kivi_state::OperationResult::FabricValue {
+                        fabric_id,
+                        logical_len,
+                        version,
+                    }) => self.answer_fast_read(
+                        tablets,
+                        fabric,
+                        tablet_id,
+                        entry,
+                        kivi_state::FabricRef {
+                            id: fabric_id,
+                            logical_len,
+                            version,
+                        },
+                    ),
+                    outcome => {
+                        let _ = entry.respond.try_send(outcome);
+                    }
+                }
                 continue;
             }
             let gate = self.queue[cursor]
@@ -1287,6 +1700,107 @@ impl CommitCoordinator {
         }
     }
 
+    /// Answers one fast-path read that prepared a fabric reference:
+    /// synchronous residency answers inline, a promotion miss suspends
+    /// into the parked set (polled, never blocking). The entry's queue
+    /// position is already released.
+    fn answer_fast_read(
+        &mut self,
+        tablets: &mut HashMap<TabletId, LiveTablet>,
+        fabric: &mut crate::fabric::TabletFabric,
+        tablet: TabletId,
+        entry: PendingEntry,
+        reference: kivi_state::FabricRef,
+    ) {
+        let current = tablets
+            .get(&tablet)
+            .and_then(|live| live.store().get(entry.op.key(), entry.now));
+        let range = read_range(&entry.op);
+        match fabric.resolve_sync(&reference, current) {
+            Ok(Some(bytes)) => {
+                let _ = entry.respond.try_send(Ok(shape_resolved(bytes, range)));
+            }
+            Ok(None) => {
+                // Promotion miss: submit the lane promotion and park.
+                // A missing locator means the root moved mid-answer.
+                match fabric.submit_parked_promote(
+                    tablet,
+                    entry.op.key().clone(),
+                    &reference,
+                    current,
+                ) {
+                    Ok(park) => {
+                        self.suspended.push_back(SuspendedRead {
+                            tablet,
+                            key: entry.op.key().clone(),
+                            now: entry.now,
+                            range,
+                            park,
+                            respond: entry.respond,
+                        });
+                    }
+                    Err(error) => {
+                        let _ = entry.respond.try_send(Err(map_fabric_error(error)));
+                    }
+                }
+            }
+            Err(error) => {
+                let _ = entry.respond.try_send(Err(map_fabric_error(error)));
+            }
+        }
+    }
+
+    /// Polls suspended promotion reads: ready replies re-fence against
+    /// the live root and answer; stale roots count and fail closed.
+    /// Expiry re-checks at the request's `now`: fenced bytes are only
+    /// servable while the root is still live, so an expired or deleted
+    /// key answers absence even when the promotion succeeded.
+    fn poll_suspended(
+        &mut self,
+        tablets: &mut HashMap<TabletId, LiveTablet>,
+        fabric: &mut crate::fabric::TabletFabric,
+    ) {
+        let mut cursor = 0usize;
+        while cursor < self.suspended.len() {
+            let tablet = self.suspended[cursor].tablet;
+            let key = self.suspended[cursor].key.clone();
+            let park = self.suspended[cursor].park;
+            let now = self.suspended[cursor].now;
+            let current = tablets
+                .get(&tablet)
+                .and_then(|live| live.store().get(&key, now));
+            match fabric.poll_parked(park, current) {
+                Ok(None) => {
+                    cursor += 1;
+                }
+                Ok(Some(bytes)) => {
+                    let suspended = self.suspended.remove(cursor).expect("cursor valid");
+                    let answer = match current {
+                        None => kivi_state::OperationResult::Value(None),
+                        Some(_) => shape_resolved(bytes, suspended.range),
+                    };
+                    let _ = suspended.respond.try_send(Ok(answer));
+                }
+                Err(error) => {
+                    let suspended = self.suspended.remove(cursor).expect("cursor valid");
+                    match current {
+                        // Expired or deleted while parked: absence, not a
+                        // stale-completion error (the fence agrees: no
+                        // root names the pinned version anymore).
+                        None => {
+                            let _ = suspended
+                                .respond
+                                .try_send(Ok(kivi_state::OperationResult::Value(None)));
+                        }
+                        Some(_) => {
+                            let _ = suspended.respond.try_send(Err(map_fabric_error(error)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Prepares admit-gated mutations into the open batch in deterministic
     /// arrival order, then seals and submits. Runs only with no batch in
     /// flight (single-in-flight invariant): same-tablet mutations hold
@@ -1300,6 +1814,7 @@ impl CommitCoordinator {
         &mut self,
         tablets: &mut HashMap<TabletId, LiveTablet>,
         namespace: NamespaceId,
+        fabric: &mut crate::fabric::TabletFabric,
     ) {
         let mut cursor = 0usize;
         while cursor < self.queue.len() {
@@ -1340,7 +1855,7 @@ impl CommitCoordinator {
             // across same-tablet entries, so hot keys batch together).
             let entry = self.queue.remove(cursor).expect("cursor valid");
             let live = tablets.get_mut(&tablet_id).expect("tablet live");
-            match self.prepare_into_open(namespace, live, entry) {
+            match self.prepare_into_open(namespace, live, entry, fabric) {
                 PrepareOutcome::Prepared => {}
                 PrepareOutcome::RequestFailed { respond, error } => {
                     let _ = respond.try_send(Err(error));
@@ -1416,6 +1931,7 @@ impl CommitCoordinator {
         namespace: NamespaceId,
         live: &mut LiveTablet,
         entry: PendingEntry,
+        fabric: &mut crate::fabric::TabletFabric,
     ) -> PrepareOutcome {
         debug_assert!(entry.is_mutating);
         let tablet_id = live.id();
@@ -1431,6 +1947,7 @@ impl CommitCoordinator {
                 overlays: HashMap::new(),
                 commit_base: HashMap::new(),
                 oldest_admitted: entry.admitted_at,
+                fabric_payloads: Vec::new(),
                 formed_at: Instant::now(),
             });
             open.oldest_admitted = open.oldest_admitted.min(entry.admitted_at);
@@ -1445,6 +1962,9 @@ impl CommitCoordinator {
         let prepared = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
+                for staged in &entry.fabric_staged {
+                    fabric.retire_or_defer(staged.fabric_id);
+                }
                 return PrepareOutcome::RequestFailed {
                     respond: entry.respond,
                     error: WorkerRequestError::Tablet(error),
@@ -1459,6 +1979,9 @@ impl CommitCoordinator {
         let commit = match live.assign_commit() {
             Ok(commit) => commit,
             Err(error) => {
+                for staged in &entry.fabric_staged {
+                    fabric.retire_or_defer(staged.fabric_id);
+                }
                 return PrepareOutcome::RequestFailed {
                     respond: entry.respond,
                     error: WorkerRequestError::Tablet(error),
@@ -1466,17 +1989,30 @@ impl CommitCoordinator {
             }
         };
         let is_persist_expiry = matches!(entry.op, Operation::PersistExpiry { .. });
+        // Fabric seal payloads are derived inside the Write arm (where the
+        // mutation and expected outcome are both bound); terminal outcomes
+        // reference nothing, so their staged ids retire just below.
+        let mut fabric_payloads = Vec::new();
+        // Prepared intents pin their staged ids until the intent resolves
+        // (finalize-commit re-seals under the authoritative version,
+        // finalize-abort releases): a later Commit always finds bytes.
+        let mut prepare_pins: Vec<u64> = Vec::new();
         let (record, kind) = match prepared {
             StorePrepared::Read(_) => {
                 // Mutating opcodes never prepare reads (the store
                 // guarantees it with a panic of its own). Reaching here
                 // means the store contract broke after a commit was
-                // already assigned — fail the whole worker loudly rather
+                // already assigned - fail the whole worker loudly rather
                 // than burn a position silently. The process dies; nothing
                 // persisted, so recovery stays contiguous.
                 panic!("mutating opcode prepared a read after commit assignment");
             }
             StorePrepared::Write { mutation, expected } => {
+                fabric_payloads =
+                    fabric_payloads_for(tablet_id, &mutation, &expected, &entry.fabric_staged);
+                if matches!(mutation, Mutation::TxnPrepare { .. }) {
+                    prepare_pins.extend(fabric_payloads.iter().map(|payload| payload.fabric_id));
+                }
                 let record = WalRecord::Mutation(MutationRecord {
                     namespace,
                     tablet: tablet_id,
@@ -1527,7 +2063,24 @@ impl CommitCoordinator {
                 .entry(marker.client.session())
                 .or_insert(0) += 1;
         }
+        // Fabric seal payloads: every staged id the mutation references
+        // rides the seal with its predicted version; staged ids the
+        // mutation dropped (unmet conditions, terminal outcomes) retire
+        // immediately — nothing will ever reference them.
         let open = self.open.as_mut().expect("open batch");
+        let referenced: std::collections::HashSet<u64> = fabric_payloads
+            .iter()
+            .map(|payload| payload.fabric_id)
+            .collect();
+        for staged in &entry.fabric_staged {
+            if !referenced.contains(&staged.fabric_id) {
+                fabric.retire_or_defer(staged.fabric_id);
+            }
+        }
+        open.fabric_payloads.extend(fabric_payloads);
+        for pinned in prepare_pins {
+            fabric.pin(pinned);
+        }
         open.bytes += record_wire_len(&record);
         open.records.push(record);
         open.applies.push(ApplyData {
@@ -1545,7 +2098,7 @@ impl CommitCoordinator {
     /// Seals the open batch (if it holds anything) and submits it to the
     /// lane. An empty open batch is simply dropped.
     fn seal_open(&mut self) {
-        let Some(open) = self.open.take() else {
+        let Some(mut open) = self.open.take() else {
             return;
         };
         if open.applies.is_empty() {
@@ -1561,12 +2114,18 @@ impl CommitCoordinator {
         // With at most one batch in flight and a 16-deep submit channel,
         // this never blocks unless the lane thread died — which fails
         // closed below instead of queuing into the void.
+        let fabric_payloads = std::mem::take(&mut open.fabric_payloads);
+        let fabric_staged: Vec<u64> = fabric_payloads
+            .iter()
+            .map(|payload| payload.fabric_id)
+            .collect();
         if self
             .lane
             .submit
             .send(LaneCommand::Seal(SealJob {
                 batch_seq,
                 records: open.records,
+                fabric_payloads,
             }))
             .is_err()
         {
@@ -1579,6 +2138,7 @@ impl CommitCoordinator {
             commit_base: open.commit_base,
             submitted_at: Instant::now(),
             oldest_admitted: open.oldest_admitted,
+            fabric_staged,
         });
     }
 
@@ -1632,6 +2192,16 @@ fn map_terminal(outcome: kivi_state::DurableOutcome) -> WorkerResponse {
     }
 }
 
+/// Maps a fabric failure onto the request error surface: saturation is
+/// retryable backpressure, everything else fails the single operation
+/// closed with logical state untouched.
+fn map_fabric_error(error: crate::fabric::FabricError) -> WorkerRequestError {
+    match error {
+        crate::fabric::FabricError::Overloaded => WorkerRequestError::SessionOverloaded,
+        other => WorkerRequestError::Fabric(other),
+    }
+}
+
 /// Applies one proven item in batch order: verified apply, floor advance,
 /// reply.
 ///
@@ -1640,7 +2210,7 @@ fn map_terminal(outcome: kivi_state::DurableOutcome) -> WorkerResponse {
 /// Panics when the post-durability apply fails: durable truth exists at
 /// this point, so a normal request error would be dishonest (spec H).
 /// Verification mismatch already panics inside `commit_persisted`.
-fn apply_item(live: &mut LiveTablet, apply: ApplyData) {
+fn apply_item(live: &mut LiveTablet, apply: ApplyData, fabric: &mut crate::fabric::TabletFabric) {
     // Held through the reply: the journal records this commit during the
     // apply below, so pins release only after journaling is done.
     let _pinned = apply.pinned;
@@ -1650,6 +2220,28 @@ fn apply_item(live: &mut LiveTablet, apply: ApplyData) {
             expected,
             is_persist_expiry,
         } => {
+            // Pre-image for post-apply retirement: when this mutation
+            // supersedes a fabric root, the old materialization retires
+            // (or defers while pinned) after success.
+            let previous = live
+                .store()
+                .get(mutation.key(), apply.now)
+                .and_then(kivi_state::StoredObject::fabric_ref);
+            // Prepared-intent pins release here: commit and abort both
+            // end the reservation (commit's re-sealed record now protects
+            // reconstruction; aborts also retire the staged id).
+            let intent_pin = match &mutation {
+                Mutation::TxnFinalize { key, commit, .. } => live
+                    .store()
+                    .intent_for_key(key)
+                    .and_then(|intent| match &intent.write.kind {
+                        kivi_state::TxnWriteKind::PutFabric { fabric_id, .. } => {
+                            Some((*fabric_id, *commit))
+                        }
+                        _ => None,
+                    }),
+                _ => None,
+            };
             let outcome = live
                 .commit_persisted(
                     &mutation,
@@ -1666,6 +2258,15 @@ fn apply_item(live: &mut LiveTablet, apply: ApplyData) {
                         apply.commit.as_u64(),
                     )
                 });
+            if let Some(post) = live.store().get(mutation.key(), apply.now) {
+                fabric.retire_superseded(previous, post);
+            }
+            if let Some((fabric_id, commit)) = intent_pin {
+                fabric.unpin_and_sweep(fabric_id);
+                if !commit {
+                    fabric.retire_or_defer(fabric_id);
+                }
+            }
             if let Some(marker) = &apply.identity {
                 live.advance_session_floor(marker.client.session(), marker.ack_floor);
             }
@@ -1729,9 +2330,13 @@ mod tests {
         (LaneAccess::Exclusive(lane), stats)
     }
 
-    fn drive(coord: &mut CommitCoordinator, tablets: &mut HashMap<TabletId, LiveTablet>) {
+    fn drive(
+        coord: &mut CommitCoordinator,
+        tablets: &mut HashMap<TabletId, LiveTablet>,
+        fabric: &mut crate::fabric::TabletFabric,
+    ) {
         for _ in 0..300 {
-            coord.poll(tablets, NS);
+            coord.poll(tablets, NS, fabric);
             if !coord.has_pending() {
                 return;
             }
@@ -1740,12 +2345,32 @@ mod tests {
         panic!("coordinator did not drain");
     }
 
+    fn test_fabric() -> (
+        crate::fabric::TabletFabric,
+        kivi_memory::OffcoreLaneGuard,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().expect("scratch");
+        let paths = crate::fabric::FabricPaths {
+            root: dir.path().to_owned(),
+        };
+        let (fabric, guard) = crate::fabric::TabletFabric::open(
+            kivi_types::WorkerId::from_u64(0),
+            &paths,
+            1 << 20,
+            16 << 20,
+        )
+        .expect("fabric opens");
+        (fabric, guard, dir)
+    }
+
     #[test]
     fn three_counters_commit_in_one_batch() {
+        let (mut fabric, _fabric_guard, _fabric_dir) = test_fabric();
         let scratch = tempfile::tempdir().expect("scratch");
         let (lane, stats) = test_lane(scratch.path());
-        let mut coord =
-            CommitCoordinator::spawn(BatchPolicy::default_policy(), lane, stats).expect("spawn");
+        let mut coord = CommitCoordinator::spawn(BatchPolicy::default_policy(), lane, stats, None)
+            .expect("spawn");
         let mut tablets = HashMap::new();
         tablets.insert(TabletId::from_u64(1), live_tablet());
         let mut receivers = Vec::new();
@@ -1763,7 +2388,7 @@ mod tests {
             ));
             receivers.push(receive);
         }
-        drive(&mut coord, &mut tablets);
+        drive(&mut coord, &mut tablets, &mut fabric);
         for receive in receivers {
             let outcome = receive.try_recv().expect("answered");
             assert!(matches!(
@@ -1860,6 +2485,7 @@ mod tests {
                     fsyncs: 1,
                 }),
                 lane_stats: stats,
+                fabric_locators: Vec::new(),
             })
             .expect("coordinator waits");
         records
@@ -1878,6 +2504,7 @@ mod tests {
                     code: None,
                 }),
                 lane_stats: stats,
+                fabric_locators: Vec::new(),
             })
             .expect("coordinator waits");
     }
@@ -1894,12 +2521,13 @@ mod tests {
 
     #[test]
     fn failed_batch_burns_no_positions_and_touches_no_state() {
+        let (mut fabric, _fabric_guard, _fabric_dir) = test_fabric();
         let (mut coord, mut tablets, seals, complete) = manual_coordinator();
         let first = admit_counter(&mut coord, "n", 1, None);
         let second = admit_counter(&mut coord, "n", 1, None);
-        coord.poll(&mut tablets, NS);
+        coord.poll(&mut tablets, NS, &mut fabric);
         fail(&seals, &complete, lane_stats());
-        coord.poll(&mut tablets, NS);
+        coord.poll(&mut tablets, NS, &mut fabric);
         // Both requests fail explicitly...
         assert!(matches!(
             first.try_recv(),
@@ -1918,9 +2546,9 @@ mod tests {
         // ...and the burned positions are reusable: the retry assigns 1,2
         // and recovery chains stay contiguous.
         let retry = admit_counter(&mut coord, "n", 5, None);
-        coord.poll(&mut tablets, NS);
+        coord.poll(&mut tablets, NS, &mut fabric);
         prove(&seals, &complete, lane_stats());
-        coord.poll(&mut tablets, NS);
+        coord.poll(&mut tablets, NS, &mut fabric);
         assert!(matches!(
             retry.try_recv(),
             Ok(Ok(OperationResult::CounterUpdated { value: 5, .. }))
@@ -1932,14 +2560,15 @@ mod tests {
 
     #[test]
     fn reads_answer_committed_state_while_a_batch_is_in_flight() {
+        let (mut fabric, _fabric_guard, _fabric_dir) = test_fabric();
         let (mut coord, mut tablets, seals, complete) = manual_coordinator();
         let write = admit_counter(&mut coord, "n", 7, None);
-        coord.poll(&mut tablets, NS);
+        coord.poll(&mut tablets, NS, &mut fabric);
         assert_eq!(seals.len(), 1, "write sealed and submitted"); // The batch is on the (manual) lane, unproven: an arriving read
         // must answer from committed state immediately — never wait, never
         // see speculation.
         let read = admit_get(&mut coord, "n");
-        coord.poll(&mut tablets, NS);
+        coord.poll(&mut tablets, NS, &mut fabric);
         assert!(
             matches!(read.try_recv(), Ok(Ok(OperationResult::Counter(None)))),
             "committed state has no counter yet"
@@ -1947,7 +2576,7 @@ mod tests {
         assert!(write.try_recv().is_err(), "write still unproven");
         // Prove the batch: the write applies afterwards, exactly once.
         prove(&seals, &complete, lane_stats());
-        coord.poll(&mut tablets, NS);
+        coord.poll(&mut tablets, NS, &mut fabric);
         assert!(matches!(
             write.try_recv(),
             Ok(Ok(OperationResult::CounterUpdated { value: 7, .. }))
@@ -1959,18 +2588,19 @@ mod tests {
 
     #[test]
     fn same_tablet_holds_position_behind_its_inflight_batch() {
+        let (mut fabric, _fabric_guard, _fabric_dir) = test_fabric();
         let (mut coord, mut tablets, seals, complete) = manual_coordinator();
         let first = admit_counter(&mut coord, "n", 1, None);
-        coord.poll(&mut tablets, NS);
+        coord.poll(&mut tablets, NS, &mut fabric);
         assert_eq!(seals.len(), 1, "first batch submitted");
         // Same tablet, still unproven: the second mutation holds its queue
         // position instead of overtaking into a racy second batch.
         let second = admit_counter(&mut coord, "n", 10, None);
-        coord.poll(&mut tablets, NS);
+        coord.poll(&mut tablets, NS, &mut fabric);
         assert!(second.try_recv().is_err(), "held behind in-flight");
         assert_eq!(seals.len(), 1, "no second seal while gated");
         prove(&seals, &complete, lane_stats());
-        coord.poll(&mut tablets, NS);
+        coord.poll(&mut tablets, NS, &mut fabric);
         // First applies; second is still queued (it forms the next batch).
         assert!(matches!(
             first.try_recv(),
@@ -1978,9 +2608,9 @@ mod tests {
         ));
         assert!(second.try_recv().is_err(), "second not yet applied");
         // Pump until the second batch seals and prove it.
-        coord.poll(&mut tablets, NS);
+        coord.poll(&mut tablets, NS, &mut fabric);
         prove(&seals, &complete, lane_stats());
-        coord.poll(&mut tablets, NS);
+        coord.poll(&mut tablets, NS, &mut fabric);
         assert!(matches!(
             second.try_recv(),
             Ok(Ok(OperationResult::CounterUpdated { value: 11, .. }))
@@ -1990,6 +2620,7 @@ mod tests {
     #[test]
     fn retry_of_inflight_identity_holds_then_dedup_hits() {
         use kivi_types::{RequestIdentity, SessionId};
+        let (mut fabric, _fabric_guard, _fabric_dir) = test_fabric();
         let (mut coord, mut tablets, seals, complete) = manual_coordinator();
         let session = SessionId::from_u128(0xA1);
         let marker = MutationIdentity::new(
@@ -1997,16 +2628,16 @@ mod tests {
             kivi_types::RequestSeq::from_u64(0),
         );
         let first = admit_counter(&mut coord, "n", 1, Some(marker));
-        coord.poll(&mut tablets, NS);
+        coord.poll(&mut tablets, NS, &mut fabric);
         assert_eq!(seals.len(), 1, "original submitted");
         // The reply is "lost": the client retries the same identity while
         // the original is unproven. It must hold, not prepare twice.
         let retry = admit_counter(&mut coord, "n", 1, Some(marker));
-        coord.poll(&mut tablets, NS);
+        coord.poll(&mut tablets, NS, &mut fabric);
         assert!(retry.try_recv().is_err(), "retry holds its position");
         assert_eq!(seals.len(), 1, "no duplicate seal");
         prove(&seals, &complete, lane_stats());
-        coord.poll(&mut tablets, NS);
+        coord.poll(&mut tablets, NS, &mut fabric);
         // Original applied once; the retry dedup-hits the same outcome.
         let original = first.try_recv().expect("original answered");
         let repeated = retry.try_recv().expect("retry answered");
@@ -2021,6 +2652,7 @@ mod tests {
 
     #[test]
     fn immediate_policy_seals_every_mutation_alone() {
+        let (mut fabric, _fabric_guard, _fabric_dir) = test_fabric();
         let stats = lane_stats();
         let (mut coord, seals, complete) =
             CommitCoordinator::with_manual_lane(BatchPolicy::immediate(), stats);
@@ -2032,9 +2664,9 @@ mod tests {
         }
         // Same pipeline, max_ops 1: three seals, three proofs.
         for _ in 0..3 {
-            coord.poll(&mut tablets, NS);
+            coord.poll(&mut tablets, NS, &mut fabric);
             prove(&seals, &complete, lane_stats());
-            coord.poll(&mut tablets, NS);
+            coord.poll(&mut tablets, NS, &mut fabric);
         }
         for receive in receivers {
             assert!(receive.try_recv().is_ok(), "all answered");

@@ -708,6 +708,17 @@ pub enum ScanValueBody {
         /// Total logical bytes across the manifest.
         logical_len: u64,
     },
+    /// Fabric bytes by reference (resolve via point `get`, which
+    /// promotes transparently). The id is worker-local to the serving
+    /// node; clients must not cache it across topology changes.
+    Fabric {
+        /// Fabric-scoped object id assigned at staging.
+        fabric_id: u64,
+        /// Total logical bytes of the materialized value.
+        logical_len: u64,
+        /// Logical version the bytes were published at.
+        version: u64,
+    },
     /// Resident bytes exceeding the page budget on an otherwise empty
     /// page: length only, fetch via point `get`/`get_stream`.
     Oversize {
@@ -736,6 +747,8 @@ pub const SCAN_VALUE_CHUNKED: u8 = 3;
 pub const SCAN_VALUE_OVERSIZE: u8 = 4;
 /// Typed semantic descriptor tag. Fixed, never reused.
 pub const SCAN_VALUE_SEMANTIC: u8 = 5;
+/// Fabric reference tag. Fixed, never reused.
+pub const SCAN_VALUE_FABRIC: u8 = 6;
 
 /// One typed native request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1049,16 +1062,19 @@ impl Request {
 
 /// Maps a typed operation back to its opcode. Inverse of the operation
 /// half of [`Request::into_operation`] with one deliberate many-to-one:
-/// [`SetChunked`](Operation::SetChunked) shares [`Set`](Opcode::Set)'s
-/// shape. Both store bytes and both answer `Stored{version}`; the response
-/// carries no representation, and chunked commits arrive over the
-/// streaming COMMIT frame (never as legacy `Set` frames), so no decoder
-/// can confuse the two. Response shaping and WAL records never guess.
+/// [`SetChunked`](Operation::SetChunked) and [`SetFabric`](Operation::SetFabric)
+/// share [`Set`](Opcode::Set)'s shape. All three store bytes and all
+/// answer `Stored{version}`; the response carries no representation, and
+/// staged commits arrive over internal paths (never as legacy `Set`
+/// frames), so no decoder can confuse them. Response shaping and WAL
+/// records never guess.
 #[must_use]
 pub fn operation_opcode(operation: &Operation) -> Opcode {
     match operation {
         Operation::Get { .. } => Opcode::Get,
-        Operation::Set { .. } | Operation::SetChunked { .. } => Opcode::Set,
+        Operation::Set { .. } | Operation::SetChunked { .. } | Operation::SetFabric { .. } => {
+            Opcode::Set
+        }
         Operation::Delete { .. } => Opcode::Delete,
         Operation::Exists { .. } => Opcode::Exists,
         Operation::CounterGet { .. } => Opcode::CounterGet,
@@ -1070,9 +1086,9 @@ pub fn operation_opcode(operation: &Operation) -> Opcode {
         Operation::GetRange { .. } => Opcode::GetRange,
         Operation::BytesLength { .. } => Opcode::BytesLength,
         Operation::GetVersion { .. } => Opcode::GetVersion,
-        Operation::SetConditional { .. } | Operation::SetConditionalChunked { .. } => {
-            Opcode::SetConditional
-        }
+        Operation::SetConditional { .. }
+        | Operation::SetConditionalChunked { .. }
+        | Operation::SetConditionalFabric { .. } => Opcode::SetConditional,
         // Transaction steps ride the normal propose path with dedup and
         // response shaping; each shapes as its own opcode. Local commits
         // shape as their parent batch opcode.
@@ -1110,13 +1126,15 @@ pub fn operation_opcode(operation: &Operation) -> Opcode {
 #[must_use]
 pub fn mutation_opcode(mutation: &Mutation, is_persist_expiry: bool) -> Opcode {
     match mutation {
-        // Chunked roots answer exactly like inline stores: the response
-        // shapes `Stored{version}` either way. Range patches answer the
-        // same `Stored{version}` shape.
-        Mutation::PutBytes { .. } | Mutation::ReplaceChunkedRoot { .. } => Opcode::Set,
-        Mutation::PutBytesWithExpiry { .. } | Mutation::ReplaceChunkedRootWithExpiry { .. } => {
-            Opcode::SetConditional
-        }
+        // Chunked and fabric roots answer exactly like inline stores:
+        // the response shapes `Stored{version}` either way. Range patches
+        // answer the same `Stored{version}` shape.
+        Mutation::PutBytes { .. }
+        | Mutation::ReplaceChunkedRoot { .. }
+        | Mutation::ReplaceFabricRoot { .. } => Opcode::Set,
+        Mutation::PutBytesWithExpiry { .. }
+        | Mutation::ReplaceChunkedRootWithExpiry { .. }
+        | Mutation::ReplaceFabricRootWithExpiry { .. } => Opcode::SetConditional,
         Mutation::SpliceBytes { .. } => Opcode::SetRange,
         Mutation::Delete { .. } => Opcode::Delete,
         Mutation::CounterAdd { .. } => Opcode::CounterAdd,
@@ -2317,6 +2335,16 @@ impl Response {
                             out.extend_from_slice(manifest);
                             push_u64(&mut out, *logical_len);
                         }
+                        ScanValueBody::Fabric {
+                            fabric_id,
+                            logical_len,
+                            version,
+                        } => {
+                            push_u8(&mut out, SCAN_VALUE_FABRIC);
+                            push_u64(&mut out, *fabric_id);
+                            push_u64(&mut out, *logical_len);
+                            push_u64(&mut out, *version);
+                        }
                         ScanValueBody::Oversize { logical_len } => {
                             push_u8(&mut out, SCAN_VALUE_OVERSIZE);
                             push_u64(&mut out, *logical_len);
@@ -2475,6 +2503,11 @@ impl Response {
                             }
                             SCAN_VALUE_OVERSIZE => ScanValueBody::Oversize {
                                 logical_len: cursor.u64(CONTEXT)?,
+                            },
+                            SCAN_VALUE_FABRIC => ScanValueBody::Fabric {
+                                fabric_id: cursor.u64(CONTEXT)?,
+                                logical_len: cursor.u64(CONTEXT)?,
+                                version: cursor.u64(CONTEXT)?,
                             },
                             SCAN_VALUE_SEMANTIC => ScanValueBody::Semantic {
                                 object: cursor.u8(CONTEXT)?,

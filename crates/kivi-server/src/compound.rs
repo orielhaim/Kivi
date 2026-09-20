@@ -178,6 +178,15 @@ fn scan_value_body(value: Option<&kivi_state::ScannedValue>) -> kivi_protocol::S
             manifest: *manifest.as_bytes(),
             logical_len: *logical_len,
         },
+        Some(kivi_state::ScannedValue::Fabric {
+            fabric_id,
+            logical_len,
+            version,
+        }) => kivi_protocol::ScanValueBody::Fabric {
+            fabric_id: *fabric_id,
+            logical_len: *logical_len,
+            version: *version,
+        },
         Some(kivi_state::ScannedValue::Oversize { logical_len }) => {
             kivi_protocol::ScanValueBody::Oversize {
                 logical_len: *logical_len,

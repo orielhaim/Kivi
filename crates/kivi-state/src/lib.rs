@@ -36,10 +36,10 @@ pub use index::{
 use kivi_types::TabletId;
 pub use mutation::{ApplyError, ApplyOutcome, Mutation};
 pub use object::{
-    BoundedCounterState, ChunkedRef, EscrowShare, FencingToken, Key, LeaseHolder, LeaseState,
-    LogicalValue, MAX_SEMAPHORE_PERMITS, MAX_STREAM_ENTRY_BYTES, MAX_STREAM_SHARD_ENTRIES,
-    ObjectType, ObjectVersion, PermitId, PermitRecord, SemaphoreState, StoredObject, StreamEntry,
-    StreamShardState, VersionExhausted,
+    BoundedCounterState, ChunkedRef, EscrowShare, FabricRef, FencingToken, Key, LeaseHolder,
+    LeaseState, LogicalValue, MAX_SEMAPHORE_PERMITS, MAX_STREAM_ENTRY_BYTES,
+    MAX_STREAM_SHARD_ENTRIES, ObjectType, ObjectVersion, PermitId, PermitRecord, SemaphoreState,
+    StoredObject, StreamEntry, StreamShardState, VersionExhausted,
 };
 pub use ops::{
     DurableOutcome, ExpiryPolicy, OpError, Operation, OperationResult, SetCondition, outcome_for,

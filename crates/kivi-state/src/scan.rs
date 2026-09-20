@@ -140,6 +140,17 @@ pub enum ScannedValue {
         /// Total logical bytes across the manifest.
         logical_len: u64,
     },
+    /// Fabric bytes by reference: resolve through the Memory Fabric, never
+    /// inlined no matter how small (materialized values must never be
+    /// copied into scan responses; resolution may suspend).
+    Fabric {
+        /// Fabric-scoped object id assigned at staging.
+        fabric_id: u64,
+        /// Total logical bytes of the materialized value.
+        logical_len: u64,
+        /// Logical version the bytes were published at (pins reads).
+        version: u64,
+    },
     /// Resident bytes that exceeded the page budget on an otherwise empty
     /// page: length only, fetch through a point `get`/`get_stream`.
     Oversize {

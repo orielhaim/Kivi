@@ -59,6 +59,23 @@ pub enum Mutation {
         /// Total logical bytes across the manifest.
         logical_len: u64,
     },
+    /// Point `key` at a Memory Fabric value: the fabric-scoped object id
+    /// plus the total logical length and the published version. The WAL
+    /// carries this small root transition only — staged bytes live in the
+    /// fabric whose durability precedes this record (same chunks-first
+    /// rule as [`ReplaceChunkedRoot`](Self::ReplaceChunkedRoot)).
+    /// Overwrites any type and clears expiry, exactly like
+    /// [`PutBytes`](Self::PutBytes).
+    ReplaceFabricRoot {
+        /// Target key.
+        key: Key,
+        /// Fabric-scoped object id assigned at staging.
+        fabric_id: u64,
+        /// Total logical bytes of the materialized value.
+        logical_len: u64,
+        /// Logical version the bytes were published at (pins reads).
+        version: u64,
+    },
     /// Patch a byte range of `key`'s value at `offset` with `patch`,
     /// zero-padding past-the-end gaps (Redis `SETRANGE` semantics). Unlike
     /// [`PutBytes`](Self::PutBytes), a splice preserves the live expiry:
@@ -101,6 +118,21 @@ pub enum Mutation {
         manifest: ManifestId,
         /// Total logical bytes across the manifest.
         logical_len: u64,
+        /// Resolved expiry to attach.
+        expiry: Expiry,
+    },
+    /// Point `key` at a fabric value with an explicit expiry: the fabric
+    /// spelling of [`PutBytesWithExpiry`](Self::PutBytesWithExpiry) for
+    /// conditional stores whose staged value exceeded the inline bound.
+    ReplaceFabricRootWithExpiry {
+        /// Target key.
+        key: Key,
+        /// Fabric-scoped object id assigned at staging.
+        fabric_id: u64,
+        /// Total logical bytes of the materialized value.
+        logical_len: u64,
+        /// Logical version the bytes were published at (pins reads).
+        version: u64,
         /// Resolved expiry to attach.
         expiry: Expiry,
     },
@@ -321,6 +353,10 @@ const TAG_STREAM_APPEND: u8 = 22;
 const TAG_STREAM_TRIM: u8 = 23;
 /// Same-tablet atomic commit tag. New tags never reuse old ones.
 const TAG_TXN_COMMIT_LOCAL: u8 = 24;
+/// Fabric-root mutation tag. New tags never reuse old ones.
+const TAG_REPLACE_FABRIC_ROOT: u8 = 25;
+/// Conditional fabric-root mutation tag. New tags never reuse old ones.
+const TAG_REPLACE_FABRIC_ROOT_WITH_EXPIRY: u8 = 26;
 
 impl Mutation {
     /// Returns the single key this mutation touches. Every mutation is
@@ -342,9 +378,11 @@ impl Mutation {
             | Self::CounterAdd { key, .. }
             | Self::SetExpiry { key, .. }
             | Self::ReplaceChunkedRoot { key, .. }
+            | Self::ReplaceFabricRoot { key, .. }
             | Self::SpliceBytes { key, .. }
             | Self::PutBytesWithExpiry { key, .. }
             | Self::ReplaceChunkedRootWithExpiry { key, .. }
+            | Self::ReplaceFabricRootWithExpiry { key, .. }
             | Self::TxnPrepare { key, .. }
             | Self::TxnFinalize { key, .. }
             | Self::CommutativeAdd { key, .. }
@@ -416,6 +454,12 @@ impl Mutation {
         if let Some(operation) = self.as_semaphore_stream_operation() {
             return operation;
         }
+        if let Some(operation) = self.as_root_operation() {
+            return operation;
+        }
+        if let Some(operation) = self.as_lease_operation() {
+            return operation;
+        }
         if let Some(operation) = self.as_conditional_operation() {
             return operation;
         }
@@ -441,21 +485,17 @@ impl Mutation {
                     }
                 }
             }
-            Self::ReplaceChunkedRoot {
-                key,
-                manifest,
-                logical_len,
-            } => Operation::SetChunked {
-                key: key.clone(),
-                manifest: *manifest,
-                logical_len: *logical_len,
-            },
+            Self::ReplaceChunkedRoot { .. } | Self::ReplaceFabricRoot { .. } => {
+                unreachable!("root replacements dispatch above")
+            }
             Self::SpliceBytes { key, offset, patch } => Operation::SetRange {
                 key: key.clone(),
                 offset: *offset,
                 patch: patch.clone(),
             },
-            Self::PutBytesWithExpiry { .. } | Self::ReplaceChunkedRootWithExpiry { .. } => {
+            Self::PutBytesWithExpiry { .. }
+            | Self::ReplaceChunkedRootWithExpiry { .. }
+            | Self::ReplaceFabricRootWithExpiry { .. } => {
                 unreachable!("conditional mutations dispatch above")
             }
             Self::TxnPrepare { .. } | Self::TxnFinalize { .. } | Self::TxnCommitLocal { .. } => {
@@ -491,12 +531,25 @@ impl Mutation {
                 new_min: *min,
                 new_max: *max,
             },
-            // Lease mutations carry prepare-resolved fencing/expiry while
-            // operations carry caller TTLs; like the chunked-conditional
-            // precedent above, the mutation is the truth and the operation
-            // is only the replay-mapping key (never used to re-derive).
-            // Both grant shapes replay identically: a renew under the same
-            // identity is indistinguishable from its grant.
+            Self::LeaseAcquire { .. } | Self::LeaseRenew { .. } | Self::LeaseRelease { .. } => {
+                unreachable!("lease mutations dispatch above")
+            }
+        }
+    }
+
+    /// Reconstructs a lease originating operation (`Some` for the three
+    /// lease shapes, `None` otherwise): dispatches first in
+    /// [`as_operation`](Self::as_operation) so the shared match stays
+    /// reviewable.
+    fn as_lease_operation(&self) -> Option<crate::ops::Operation> {
+        use crate::ops::Operation;
+        // Lease mutations carry prepare-resolved fencing/expiry while
+        // operations carry caller TTLs; like the chunked-conditional
+        // precedent, the mutation is the truth and the operation
+        // is only the replay-mapping key (never used to re-derive).
+        // Both grant shapes replay identically: a renew under the same
+        // identity is indistinguishable from its grant.
+        match self {
             Self::LeaseAcquire {
                 key,
                 owner,
@@ -508,21 +561,22 @@ impl Mutation {
                 owner,
                 fencing,
                 ..
-            } => Operation::LeaseRenew {
+            } => Some(Operation::LeaseRenew {
                 key: key.clone(),
                 owner: *owner,
                 fencing: *fencing,
                 ttl_micros: 0,
-            },
+            }),
             Self::LeaseRelease {
                 key,
                 owner,
                 fencing,
-            } => Operation::LeaseRelease {
+            } => Some(Operation::LeaseRelease {
                 key: key.clone(),
                 owner: *owner,
                 fencing: *fencing,
-            },
+            }),
+            _ => None,
         }
     }
 
@@ -568,6 +622,38 @@ impl Mutation {
             _ => None,
         }
     }
+
+    /// Reconstructs a root-replacement originating operation (`Some` for
+    /// the chunked/fabric shapes, `None` otherwise): dispatches first in
+    /// [`as_operation`](Self::as_operation) so the shared match stays
+    /// reviewable.
+    fn as_root_operation(&self) -> Option<crate::ops::Operation> {
+        use crate::ops::Operation;
+        match self {
+            Self::ReplaceChunkedRoot {
+                key,
+                manifest,
+                logical_len,
+            } => Some(Operation::SetChunked {
+                key: key.clone(),
+                manifest: *manifest,
+                logical_len: *logical_len,
+            }),
+            Self::ReplaceFabricRoot {
+                key,
+                fabric_id,
+                logical_len,
+                version,
+            } => Some(Operation::SetFabric {
+                key: key.clone(),
+                fabric_id: *fabric_id,
+                logical_len: *logical_len,
+                version: *version,
+            }),
+            _ => None,
+        }
+    }
+
     /// Reconstructs a conditional originating operation (`Some` for the
     /// two conditional shapes, `None` otherwise): dispatches first in
     /// [`as_operation`](Self::as_operation) so the shared match stays
@@ -590,6 +676,22 @@ impl Mutation {
                 // Chunked conditional roots replay through the same
                 // conditional shape; the manifest itself is the mutation's
                 // truth, the operation is only the replay-mapping key.
+                Some(Operation::SetConditional {
+                    key: key.clone(),
+                    value: bytes::Bytes::new(),
+                    condition: crate::ops::SetCondition::Always,
+                    expiry: Self::conditional_policy(expiry),
+                })
+            }
+            Self::ReplaceFabricRootWithExpiry {
+                key,
+                fabric_id: _,
+                logical_len: _,
+                version: _,
+                expiry,
+            } => {
+                // Fabric conditional roots replay like chunked ones: the
+                // reference is the mutation's truth.
                 Some(Operation::SetConditional {
                     key: key.clone(),
                     value: bytes::Bytes::new(),
@@ -664,12 +766,16 @@ impl Encode for Mutation {
             | Self::StreamTrim { key, .. } => 1 + (4 + key.len()) + 8,
             Self::SetExpiry { key, expiry } => 1 + (4 + key.len()) + expiry.encoded_len(),
             Self::ReplaceChunkedRoot { key, .. } => 1 + (4 + key.len()) + 32 + 8,
+            Self::ReplaceFabricRoot { key, .. } => 1 + (4 + key.len()) + 8 + 8 + 8,
             Self::SpliceBytes { key, patch, .. } => 1 + (4 + key.len()) + 8 + (4 + patch.len()),
             Self::PutBytesWithExpiry { key, value, expiry } => {
                 1 + (4 + key.len()) + (4 + value.len()) + expiry.encoded_len()
             }
             Self::ReplaceChunkedRootWithExpiry { key, expiry, .. } => {
                 1 + (4 + key.len()) + 32 + 8 + expiry.encoded_len()
+            }
+            Self::ReplaceFabricRootWithExpiry { key, expiry, .. } => {
+                1 + (4 + key.len()) + 8 + 8 + 8 + expiry.encoded_len()
             }
             Self::TxnPrepare {
                 key, expect, write, ..
@@ -724,16 +830,10 @@ impl Encode for Mutation {
                 encode_bytes(out, key.as_bytes());
                 expiry.encode(out);
             }
-            Self::ReplaceChunkedRoot {
-                key,
-                manifest,
-                logical_len,
-            } => {
-                out.push(TAG_REPLACE_CHUNKED_ROOT);
-                encode_bytes(out, key.as_bytes());
-                out.extend_from_slice(manifest.as_bytes());
-                logical_len.encode(out);
-            }
+            Self::ReplaceChunkedRoot { .. }
+            | Self::ReplaceChunkedRootWithExpiry { .. }
+            | Self::ReplaceFabricRoot { .. }
+            | Self::ReplaceFabricRootWithExpiry { .. } => self.encode_root_mutation(out),
             Self::SpliceBytes { key, offset, patch } => {
                 out.push(TAG_SPLICE_BYTES);
                 encode_bytes(out, key.as_bytes());
@@ -744,18 +844,6 @@ impl Encode for Mutation {
                 out.push(TAG_PUT_BYTES_WITH_EXPIRY);
                 encode_bytes(out, key.as_bytes());
                 encode_bytes(out, value);
-                expiry.encode(out);
-            }
-            Self::ReplaceChunkedRootWithExpiry {
-                key,
-                manifest,
-                logical_len,
-                expiry,
-            } => {
-                out.push(TAG_REPLACE_CHUNKED_ROOT_WITH_EXPIRY);
-                encode_bytes(out, key.as_bytes());
-                out.extend_from_slice(manifest.as_bytes());
-                logical_len.encode(out);
                 expiry.encode(out);
             }
             Self::TxnPrepare {
@@ -792,7 +880,14 @@ impl Encode for Mutation {
                 fencing,
                 expires_at,
             } => {
-                Self::encode_lease_grant(out, TAG_LEASE_ACQUIRE, key, *owner, *fencing, *expires_at)
+                Self::encode_lease_grant(
+                    out,
+                    TAG_LEASE_ACQUIRE,
+                    key,
+                    *owner,
+                    *fencing,
+                    *expires_at,
+                );
             }
             Self::LeaseRenew {
                 key,
@@ -824,6 +919,48 @@ impl Mutation {
         out.push(tag);
         encode_bytes(out, key.as_bytes());
         out.extend_from_slice(&delta.to_le_bytes());
+    }
+
+    /// Encodes one chunked-root replacement: manifest plus logical length,
+    /// with the resolved expiry for conditional shapes (`None` stores no
+    /// expiry, exactly like the inline `Set` twin).
+    fn encode_chunked_root(
+        out: &mut Vec<u8>,
+        tag: u8,
+        key: &Key,
+        manifest: &ManifestId,
+        logical_len: u64,
+        expiry: Option<&Expiry>,
+    ) {
+        out.push(tag);
+        encode_bytes(out, key.as_bytes());
+        out.extend_from_slice(manifest.as_bytes());
+        logical_len.encode(out);
+        if let Some(expiry) = expiry {
+            expiry.encode(out);
+        }
+    }
+
+    /// Encodes one fabric-root replacement: staged reference triple, with
+    /// the resolved expiry for conditional shapes (same contract as
+    /// [`encode_chunked_root`](Self::encode_chunked_root)).
+    fn encode_fabric_root(
+        out: &mut Vec<u8>,
+        tag: u8,
+        key: &Key,
+        fabric_id: u64,
+        logical_len: u64,
+        version: u64,
+        expiry: Option<&Expiry>,
+    ) {
+        out.push(tag);
+        encode_bytes(out, key.as_bytes());
+        fabric_id.encode(out);
+        logical_len.encode(out);
+        version.encode(out);
+        if let Some(expiry) = expiry {
+            expiry.encode(out);
+        }
     }
 
     /// Encodes one 2PC prepare: coordinator, key, expectation, write, and
@@ -895,6 +1032,70 @@ impl Mutation {
         owner.encode(out);
         fencing.encode(out);
         expires_at.encode(out);
+    }
+
+    /// Encodes one root-replacement shape (chunked or fabric, plain or
+    /// conditional): manifest or staged-reference triple, plus the
+    /// resolved expiry for conditional shapes. Dispatches on the variant
+    /// so the shared tag match stays reviewable.
+    fn encode_root_mutation(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::ReplaceChunkedRoot {
+                key,
+                manifest,
+                logical_len,
+            } => Self::encode_chunked_root(
+                out,
+                TAG_REPLACE_CHUNKED_ROOT,
+                key,
+                manifest,
+                *logical_len,
+                None,
+            ),
+            Self::ReplaceChunkedRootWithExpiry {
+                key,
+                manifest,
+                logical_len,
+                expiry,
+            } => Self::encode_chunked_root(
+                out,
+                TAG_REPLACE_CHUNKED_ROOT_WITH_EXPIRY,
+                key,
+                manifest,
+                *logical_len,
+                Some(expiry),
+            ),
+            Self::ReplaceFabricRoot {
+                key,
+                fabric_id,
+                logical_len,
+                version,
+            } => Self::encode_fabric_root(
+                out,
+                TAG_REPLACE_FABRIC_ROOT,
+                key,
+                *fabric_id,
+                *logical_len,
+                *version,
+                None,
+            ),
+            Self::ReplaceFabricRootWithExpiry {
+                key,
+                fabric_id,
+                logical_len,
+                version,
+                expiry,
+            } => Self::encode_fabric_root(
+                out,
+                TAG_REPLACE_FABRIC_ROOT_WITH_EXPIRY,
+                key,
+                *fabric_id,
+                *logical_len,
+                *version,
+                Some(expiry),
+            ),
+            _ => unreachable!("root replacements only"),
+        }
     }
 
     /// Encodes one bounded-counter shape (create, add, or share move):
@@ -1083,6 +1284,39 @@ impl Decode for Mutation {
                         expiry,
                     },
                     first + second + third + fourth + fifth,
+                ))
+            }
+            TAG_REPLACE_FABRIC_ROOT => {
+                let (key, second) = decode_byte_vec(&input[first..])?;
+                let (fabric_id, third) = u64::decode(&input[first + second..])?;
+                let (logical_len, fourth) = u64::decode(&input[first + second + third..])?;
+                let (version, fifth) = u64::decode(&input[first + second + third + fourth..])?;
+                Ok((
+                    Self::ReplaceFabricRoot {
+                        key: Key::from(key),
+                        fabric_id,
+                        logical_len,
+                        version,
+                    },
+                    first + second + third + fourth + fifth,
+                ))
+            }
+            TAG_REPLACE_FABRIC_ROOT_WITH_EXPIRY => {
+                let (key, second) = decode_byte_vec(&input[first..])?;
+                let (fabric_id, third) = u64::decode(&input[first + second..])?;
+                let (logical_len, fourth) = u64::decode(&input[first + second + third..])?;
+                let (version, fifth) = u64::decode(&input[first + second + third + fourth..])?;
+                let (expiry, sixth) =
+                    Expiry::decode(&input[first + second + third + fourth + fifth..])?;
+                Ok((
+                    Self::ReplaceFabricRootWithExpiry {
+                        key: Key::from(key),
+                        fabric_id,
+                        logical_len,
+                        version,
+                        expiry,
+                    },
+                    first + second + third + fourth + fifth + sixth,
                 ))
             }
             TAG_TXN_PREPARE => {

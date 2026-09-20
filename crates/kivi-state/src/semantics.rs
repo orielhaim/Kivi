@@ -191,12 +191,14 @@ pub const fn semantics_of(operation: &Operation) -> OperationSemantics {
         | Operation::SemaphoreInspect { .. } => READ,
         Operation::Set { .. }
         | Operation::SetChunked { .. }
+        | Operation::SetFabric { .. }
         | Operation::SetRange { .. }
         | Operation::Delete { .. }
         | Operation::ExpireAt { .. }
         | Operation::PersistExpiry { .. }
         | Operation::SetConditional { .. }
-        | Operation::SetConditionalChunked { .. } => STRICT_WRITE,
+        | Operation::SetConditionalChunked { .. }
+        | Operation::SetConditionalFabric { .. } => STRICT_WRITE,
         Operation::CounterAdd { .. } => STRICT_COUNTER_ADD,
         Operation::CommutativeAdd { .. } => COMMUTATIVE_ADD,
         Operation::BoundedCounterCreate { .. }

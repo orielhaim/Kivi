@@ -121,6 +121,17 @@ pub enum ClientScanValue {
         /// Total logical bytes.
         logical_len: u64,
     },
+    /// Fabric bytes by reference (resolve via point `get`, which
+    /// promotes transparently). Worker-local to the serving node;
+    /// re-route by key after any topology change.
+    Fabric {
+        /// Fabric-scoped object id assigned at staging.
+        fabric_id: u64,
+        /// Total logical bytes.
+        logical_len: u64,
+        /// Logical version the bytes were published at.
+        version: u64,
+    },
     /// Resident bytes exceeding the page budget (length only).
     Oversize {
         /// Logical length.
@@ -328,6 +339,15 @@ impl NativeClient {
                             } => ClientScanValue::Chunked {
                                 manifest,
                                 logical_len,
+                            },
+                            kivi_protocol::ScanValueBody::Fabric {
+                                fabric_id,
+                                logical_len,
+                                version,
+                            } => ClientScanValue::Fabric {
+                                fabric_id,
+                                logical_len,
+                                version,
                             },
                             kivi_protocol::ScanValueBody::Oversize { logical_len } => {
                                 ClientScanValue::Oversize { logical_len }

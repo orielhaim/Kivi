@@ -1042,6 +1042,12 @@ fn run(
                             String::from_utf8_lossy(&entry.key)
                         );
                     }
+                    kivi_client::ordered::ClientScanValue::Fabric { logical_len, .. } => {
+                        println!(
+                            "{}\t(fabric {logical_len} bytes; use get)",
+                            String::from_utf8_lossy(&entry.key)
+                        );
+                    }
                     kivi_client::ordered::ClientScanValue::Oversize { logical_len } => {
                         println!(
                             "{}\t(oversize {logical_len} bytes; use get)",

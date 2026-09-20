@@ -26,7 +26,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use kivi_types::{Expiry, TabletId, UnixMicros};
 
 use crate::mutation::{ApplyError, ApplyOutcome, Mutation};
-use crate::object::{ChunkedRef, Key, LogicalValue, ObjectType, ObjectVersion, StoredObject};
+use crate::object::{
+    ChunkedRef, FabricRef, Key, LogicalValue, ObjectType, ObjectVersion, StoredObject,
+};
 use crate::ops::{DurableOutcome, OpError, Operation, OperationResult};
 use crate::scan::{
     ScanDirection, ScanEntry, ScanError, ScanPage, ScanProjection, ScanSpec, ScannedValue,
@@ -92,7 +94,10 @@ fn check_txn_expectation(expect: &TxnExpect, live: Option<&StoredObject>) -> Res
 /// paths exactly). Pure helper shared by prepare and apply.
 fn check_txn_writable(kind: &TxnWriteKind, live: Option<&StoredObject>) -> Result<(), OpError> {
     match kind {
-        TxnWriteKind::Put(_) | TxnWriteKind::PutChunked { .. } | TxnWriteKind::Delete => Ok(()),
+        TxnWriteKind::Put(_)
+        | TxnWriteKind::PutChunked { .. }
+        | TxnWriteKind::PutFabric { .. }
+        | TxnWriteKind::Delete => Ok(()),
         TxnWriteKind::CounterAdd(delta) => match live.map(StoredObject::value) {
             None => Ok(()),
             Some(LogicalValue::StrictCounter(value)) => {
@@ -289,7 +294,9 @@ impl From<OpError> for LocalCommitError {
 fn local_result_for(mutation: &Mutation, outcome: &ApplyOutcome) -> OperationResult {
     match (mutation, outcome) {
         (
-            Mutation::PutBytes { .. } | Mutation::ReplaceChunkedRoot { .. },
+            Mutation::PutBytes { .. }
+            | Mutation::ReplaceChunkedRoot { .. }
+            | Mutation::ReplaceFabricRoot { .. },
             ApplyOutcome::Put { version },
         ) => OperationResult::Stored { version: *version },
         (Mutation::Delete { .. }, ApplyOutcome::Deleted { existed }) => {
@@ -524,6 +531,17 @@ impl ObjectStore {
                             logical_len: chunked.logical_len,
                         }))
                     }
+                    // Fabric bytes read identically; the engine resolves
+                    // the reference through the Memory Fabric (suspending
+                    // for promotion when off-core) — this layer never
+                    // touches providers.
+                    LogicalValue::Fabric(fabric) => {
+                        Ok(Prepared::Read(OperationResult::FabricValue {
+                            fabric_id: fabric.id,
+                            logical_len: fabric.logical_len,
+                            version: fabric.version,
+                        }))
+                    }
                     LogicalValue::StrictCounter(_)
                     | LogicalValue::CommutativeCounter(_)
                     | LogicalValue::BoundedCounter(_)
@@ -548,6 +566,17 @@ impl ObjectStore {
                 manifest: *manifest,
                 logical_len: *logical_len,
             })),
+            Operation::SetFabric {
+                key,
+                fabric_id,
+                logical_len,
+                version,
+            } => Ok(Prepared::Write(Mutation::ReplaceFabricRoot {
+                key: key.clone(),
+                fabric_id: *fabric_id,
+                logical_len: *logical_len,
+                version: *version,
+            })),
             Operation::SetRange { key, offset, patch } => {
                 self.prepare_set_range(key, *offset, patch, now)
             }
@@ -569,6 +598,7 @@ impl ObjectStore {
                     // promise of `CommutativeAdd`.
                     LogicalValue::Bytes(_)
                     | LogicalValue::Chunked(_)
+                    | LogicalValue::Fabric(_)
                     | LogicalValue::CommutativeCounter(_)
                     | LogicalValue::BoundedCounter(_)
                     | LogicalValue::Semaphore(_)
@@ -594,6 +624,7 @@ impl ObjectStore {
                     }
                     LogicalValue::Bytes(_)
                     | LogicalValue::Chunked(_)
+                    | LogicalValue::Fabric(_)
                     | LogicalValue::CommutativeCounter(_)
                     | LogicalValue::BoundedCounter(_)
                     | LogicalValue::Semaphore(_)
@@ -639,6 +670,9 @@ impl ObjectStore {
                     LogicalValue::Chunked(chunked) => Ok(Prepared::Read(OperationResult::Length(
                         Some(chunked.logical_len),
                     ))),
+                    LogicalValue::Fabric(fabric) => Ok(Prepared::Read(OperationResult::Length(
+                        Some(fabric.logical_len),
+                    ))),
                     LogicalValue::StrictCounter(_)
                     | LogicalValue::CommutativeCounter(_)
                     | LogicalValue::BoundedCounter(_)
@@ -669,6 +703,24 @@ impl ObjectStore {
                 key,
                 *manifest,
                 *logical_len,
+                *condition,
+                *expiry,
+                now,
+            )),
+            Operation::SetConditionalFabric {
+                key,
+                fabric_id,
+                logical_len,
+                version,
+                condition,
+                expiry,
+            } => Ok(self.prepare_set_conditional_fabric(
+                key,
+                FabricRef {
+                    id: *fabric_id,
+                    logical_len: *logical_len,
+                    version: *version,
+                },
                 *condition,
                 *expiry,
                 now,
@@ -899,9 +951,9 @@ impl ObjectStore {
 
     /// Validates a range read against current state: absent answers `None`,
     /// inline slices `[offset, offset + len)` clamped to the logical length
-    /// (empty when past the end), counters reject, and chunked roots answer
-    /// as [`ChunkedValue`](OperationResult::ChunkedValue) so the engine can
-    /// resolve and slice without this layer touching the filesystem.
+    /// (empty when past the end), counters reject, and chunked/fabric roots
+    /// answer as descriptors so the engine can resolve and slice without
+    /// this layer touching payload stores.
     fn prepare_get_range(
         &self,
         key: &Key,
@@ -921,6 +973,11 @@ impl ObjectStore {
                         logical_len: chunked.logical_len,
                     }))
                 }
+                LogicalValue::Fabric(fabric) => Ok(Prepared::Read(OperationResult::FabricValue {
+                    fabric_id: fabric.id,
+                    logical_len: fabric.logical_len,
+                    version: fabric.version,
+                })),
                 LogicalValue::StrictCounter(_)
                 | LogicalValue::CommutativeCounter(_)
                 | LogicalValue::BoundedCounter(_)
@@ -1081,6 +1138,43 @@ impl ObjectStore {
             key: key.clone(),
             manifest,
             logical_len,
+            expiry,
+        })
+    }
+
+    /// Validates a staged conditional fabric store: same condition/expiry
+    /// resolution as inline, but produces a fabric root mutation. Total
+    /// like its inline twin.
+    fn prepare_set_conditional_fabric(
+        &self,
+        key: &Key,
+        reference: FabricRef,
+        condition: crate::ops::SetCondition,
+        policy: crate::ops::ExpiryPolicy,
+        now: UnixMicros,
+    ) -> Prepared {
+        let live = self.get(key, now);
+        let holds = match condition {
+            crate::ops::SetCondition::Always => true,
+            crate::ops::SetCondition::IfAbsent => live.is_none(),
+            crate::ops::SetCondition::IfPresent => live.is_some(),
+        };
+        if !holds {
+            return Prepared::Read(OperationResult::ConditionalSet {
+                applied: false,
+                version: None,
+            });
+        }
+        let expiry = match policy {
+            crate::ops::ExpiryPolicy::Clear => Expiry::NEVER,
+            crate::ops::ExpiryPolicy::Keep => live.map_or(Expiry::NEVER, StoredObject::expiry),
+            crate::ops::ExpiryPolicy::ExpireAt(stamp) => Expiry::at(stamp),
+        };
+        Prepared::Write(Mutation::ReplaceFabricRootWithExpiry {
+            key: key.clone(),
+            fabric_id: reference.id,
+            logical_len: reference.logical_len,
+            version: reference.version,
             expiry,
         })
     }
@@ -1377,10 +1471,10 @@ impl ObjectStore {
 
     /// Validates a range patch against current state: absent, expired, and
     /// inline bases become [`SpliceBytes`](Mutation::SpliceBytes) writes;
-    /// counters reject without mutation; chunked bases report
-    /// [`StaleRangeBase`](OpError::StaleRangeBase) (the engine restages
-    /// those through the lane before preparing, so meeting one means the
-    /// root changed representation under admission).
+    /// counters reject without mutation; chunked and fabric bases report
+    /// [`StaleRangeBase`](OpError::StaleRangeBase) (the engine resolves and
+    /// restages those through the lane/fabric before preparing, so meeting
+    /// one means the root changed representation under admission).
     fn prepare_set_range(
         &self,
         key: &Key,
@@ -1408,7 +1502,7 @@ impl ObjectStore {
                     expected: ObjectType::Bytes,
                     found: object.object_type(),
                 }),
-                LogicalValue::Chunked(_) => Err(OpError::StaleRangeBase),
+                LogicalValue::Chunked(_) | LogicalValue::Fabric(_) => Err(OpError::StaleRangeBase),
             },
         }
     }
@@ -1518,16 +1612,36 @@ impl ObjectStore {
                 },
                 Err(outcome) => StorePrepared::Terminal(outcome),
             }),
+            Operation::SetFabric {
+                key,
+                fabric_id,
+                logical_len,
+                version: staged_version,
+            } => Ok(match self.predict_version(key, now) {
+                Ok(version) => StorePrepared::Write {
+                    mutation: Mutation::ReplaceFabricRoot {
+                        key: key.clone(),
+                        fabric_id: *fabric_id,
+                        logical_len: *logical_len,
+                        version: *staged_version,
+                    },
+                    expected: OperationResult::Stored { version },
+                },
+                Err(outcome) => StorePrepared::Terminal(outcome),
+            }),
             Operation::SetRange { key, offset, patch } => {
                 // Type gate first: counters and semantic objects reject
                 // without mutation (terminal client errors, retry-safe to
-                // persist), chunked bases answer directly (transient: never
-                // persisted, the retry re-plans against the new root).
+                // persist), chunked/fabric bases answer directly
+                // (transient: never persisted, the retry re-plans against
+                // the new root).
                 match self.get(key, now) {
                     Some(object)
                         if !matches!(
                             object.value(),
-                            LogicalValue::Bytes(_) | LogicalValue::Chunked(_)
+                            LogicalValue::Bytes(_)
+                                | LogicalValue::Chunked(_)
+                                | LogicalValue::Fabric(_)
                         ) =>
                     {
                         return Ok(StorePrepared::Terminal(DurableOutcome::Rejected(
@@ -1537,7 +1651,12 @@ impl ObjectStore {
                             },
                         )));
                     }
-                    Some(object) if matches!(object.value(), LogicalValue::Chunked(_)) => {
+                    Some(object)
+                        if matches!(
+                            object.value(),
+                            LogicalValue::Chunked(_) | LogicalValue::Fabric(_)
+                        ) =>
+                    {
                         return Err(OpError::StaleRangeBase);
                     }
                     _ => {}
@@ -1637,6 +1756,24 @@ impl ObjectStore {
                 key,
                 *manifest,
                 *logical_len,
+                *condition,
+                *expiry,
+                now,
+            )),
+            Operation::SetConditionalFabric {
+                key,
+                fabric_id,
+                logical_len,
+                version,
+                condition,
+                expiry,
+            } => Ok(self.predict_set_conditional_fabric(
+                key,
+                FabricRef {
+                    id: *fabric_id,
+                    logical_len: *logical_len,
+                    version: *version,
+                },
                 *condition,
                 *expiry,
                 now,
@@ -1745,6 +1882,53 @@ impl ObjectStore {
         }
     }
 
+    /// Predicts a staged conditional fabric store (see
+    /// [`predict_set_conditional`](Self::predict_set_conditional)).
+    fn predict_set_conditional_fabric(
+        &self,
+        key: &Key,
+        reference: FabricRef,
+        condition: crate::ops::SetCondition,
+        policy: crate::ops::ExpiryPolicy,
+        now: UnixMicros,
+    ) -> StorePrepared {
+        let live = self.get(key, now);
+        let holds = match condition {
+            crate::ops::SetCondition::Always => true,
+            crate::ops::SetCondition::IfAbsent => live.is_none(),
+            crate::ops::SetCondition::IfPresent => live.is_some(),
+        };
+        if !holds {
+            return StorePrepared::Terminal(DurableOutcome::Completed(
+                OperationResult::ConditionalSet {
+                    applied: false,
+                    version: None,
+                },
+            ));
+        }
+        let expiry = match policy {
+            crate::ops::ExpiryPolicy::Clear => Expiry::NEVER,
+            crate::ops::ExpiryPolicy::Keep => live.map_or(Expiry::NEVER, StoredObject::expiry),
+            crate::ops::ExpiryPolicy::ExpireAt(stamp) => Expiry::at(stamp),
+        };
+        match self.predict_version(key, now) {
+            Ok(version) => StorePrepared::Write {
+                mutation: Mutation::ReplaceFabricRootWithExpiry {
+                    key: key.clone(),
+                    fabric_id: reference.id,
+                    logical_len: reference.logical_len,
+                    version: reference.version,
+                    expiry,
+                },
+                expected: OperationResult::ConditionalSet {
+                    applied: true,
+                    version: Some(version),
+                },
+            },
+            Err(outcome) => StorePrepared::Terminal(outcome),
+        }
+    }
+
     /// Predicts a finalize: missing, foreign, or digest-mismatched intents
     /// answer without touching state, aborts discard, and commits predict
     /// the inner write with the same version arithmetic [`apply`](Self::apply)
@@ -1807,9 +1991,9 @@ impl ObjectStore {
                     version: None,
                 },
             },
-            TxnWriteKind::Put(_) | TxnWriteKind::PutChunked { .. } => {
-                self.finalized_applied(mutation, key, now)
-            }
+            TxnWriteKind::Put(_)
+            | TxnWriteKind::PutChunked { .. }
+            | TxnWriteKind::PutFabric { .. } => self.finalized_applied(mutation, key, now),
             TxnWriteKind::CounterAdd(delta) => {
                 self.predict_counted_finalize(mutation, key, *delta, ObjectType::StrictCounter, now)
             }
@@ -2637,7 +2821,10 @@ impl ObjectStore {
             return Ok(ApplyOutcome::TxnConflict);
         }
         match &write.kind {
-            TxnWriteKind::Put(_) | TxnWriteKind::PutChunked { .. } | TxnWriteKind::Delete => {}
+            TxnWriteKind::Put(_)
+            | TxnWriteKind::PutChunked { .. }
+            | TxnWriteKind::PutFabric { .. }
+            | TxnWriteKind::Delete => {}
             TxnWriteKind::CounterAdd(delta) => {
                 preview_counter_add(live, *delta, ObjectType::StrictCounter)?;
             }
@@ -2729,6 +2916,16 @@ impl ObjectStore {
                 key: key.clone(),
                 manifest: *manifest,
                 logical_len: *logical_len,
+            },
+            TxnWriteKind::PutFabric {
+                fabric_id,
+                logical_len,
+                version,
+            } => Mutation::ReplaceFabricRoot {
+                key: key.clone(),
+                fabric_id: *fabric_id,
+                logical_len: *logical_len,
+                version: *version,
             },
             TxnWriteKind::Delete => Mutation::Delete { key: key.clone() },
             TxnWriteKind::CounterAdd(delta) => Mutation::CounterAdd {
@@ -2861,6 +3058,56 @@ impl ObjectStore {
                 );
                 Ok(ApplyOutcome::Put { version })
             }
+            Mutation::ReplaceFabricRoot {
+                key,
+                fabric_id,
+                logical_len,
+                ..
+            } => {
+                // The authoritative version wins over the staged pin: the
+                // root names the new logical version, so delayed
+                // promotions compare against exactly this version.
+                let version = self
+                    .next_version(key, now)
+                    .map_err(|_| ApplyError::VersionExhausted)?;
+                self.objects.insert(
+                    key.clone(),
+                    StoredObject::new(
+                        LogicalValue::Fabric(FabricRef {
+                            id: *fabric_id,
+                            logical_len: *logical_len,
+                            version: version.as_u64(),
+                        }),
+                        version,
+                        Expiry::NEVER,
+                    ),
+                );
+                Ok(ApplyOutcome::Put { version })
+            }
+            Mutation::ReplaceFabricRootWithExpiry {
+                key,
+                fabric_id,
+                logical_len,
+                expiry,
+                ..
+            } => {
+                let version = self
+                    .next_version(key, now)
+                    .map_err(|_| ApplyError::VersionExhausted)?;
+                self.objects.insert(
+                    key.clone(),
+                    StoredObject::new(
+                        LogicalValue::Fabric(FabricRef {
+                            id: *fabric_id,
+                            logical_len: *logical_len,
+                            version: version.as_u64(),
+                        }),
+                        version,
+                        *expiry,
+                    ),
+                );
+                Ok(ApplyOutcome::Put { version })
+            }
             Mutation::SpliceBytes { key, offset, patch } => {
                 // Admission guarantees an absent, expired, or inline base
                 // with validated arithmetic; anything else is divergent
@@ -2872,7 +3119,9 @@ impl ObjectStore {
                     None => (&[], Expiry::NEVER),
                     Some(current) => match current.value() {
                         LogicalValue::Bytes(value) => (value, current.expiry()),
-                        LogicalValue::Chunked(_) => return Err(ApplyError::UnresolvableSplice),
+                        LogicalValue::Chunked(_) | LogicalValue::Fabric(_) => {
+                            return Err(ApplyError::UnresolvableSplice);
+                        }
                         _ => {
                             return Err(ApplyError::TypeMismatch {
                                 expected: ObjectType::Bytes,
@@ -3439,10 +3688,59 @@ impl ObjectStore {
     /// intent-overwrite rule), and validation runs in sorted key order so
     /// every replica reaches the same verdict.
     ///
+    /// Maps one validated local-commit write to its mutation: the
+    /// write-kind spelling of the originating operation. Kept beside
+    /// [`commit_local`](Self::commit_local) so that match stays reviewable.
+    fn local_commit_mutation(key: &Key, kind: &crate::txn::TxnWriteKind) -> Mutation {
+        use crate::txn::TxnWriteKind as Kind;
+        match kind {
+            Kind::Put(value) => Mutation::PutBytes {
+                key: key.clone(),
+                value: value.clone(),
+            },
+            Kind::PutChunked {
+                manifest,
+                logical_len,
+            } => Mutation::ReplaceChunkedRoot {
+                key: key.clone(),
+                manifest: *manifest,
+                logical_len: *logical_len,
+            },
+            Kind::PutFabric {
+                fabric_id,
+                logical_len,
+                version,
+            } => Mutation::ReplaceFabricRoot {
+                key: key.clone(),
+                fabric_id: *fabric_id,
+                logical_len: *logical_len,
+                version: *version,
+            },
+            Kind::Delete => Mutation::Delete { key: key.clone() },
+            Kind::CounterAdd(delta) => Mutation::CounterAdd {
+                key: key.clone(),
+                delta: *delta,
+            },
+            Kind::CommutativeAdd(delta) => Mutation::CommutativeAdd {
+                key: key.clone(),
+                delta: *delta,
+            },
+            Kind::BoundedAdd(delta) => Mutation::BoundedAdd {
+                key: key.clone(),
+                delta: *delta,
+            },
+            Kind::EscrowSetShare { min, max } => Mutation::EscrowSetShare {
+                key: key.clone(),
+                min: *min,
+                max: *max,
+            },
+        }
+    }
+
     /// # Errors
     ///
     /// Returns [`LocalCommitError::Validation`] when any write conflicts
-    /// (nothing is applied — validation completes before the first apply),
+    /// (nothing is applied - validation completes before the first apply),
     /// [`LocalCommitError::Exhausted`] when a version cannot advance, or
     /// [`LocalCommitError::Diverged`] when a pre-validated apply fails
     /// (unreachable on identical state: a logic bug, never a retry).
@@ -3457,7 +3755,6 @@ impl ObjectStore {
         writes: &[TxnWrite],
         now: UnixMicros,
     ) -> Result<Vec<OperationResult>, LocalCommitError> {
-        use crate::txn::TxnWriteKind as Kind;
         // Collapse duplicates last-wins in request order, then validate in
         // sorted key order (deterministic across replicas).
         let mut collapsed: BTreeMap<Key, &TxnWrite> = BTreeMap::new();
@@ -3478,39 +3775,7 @@ impl ObjectStore {
             let live = self.get(key, now);
             check_txn_expectation(&write.expect, live).map_err(LocalCommitError::Validation)?;
             check_txn_writable(&write.kind, live).map_err(LocalCommitError::Validation)?;
-            let mutation = match &write.kind {
-                Kind::Put(value) => Mutation::PutBytes {
-                    key: key.clone(),
-                    value: value.clone(),
-                },
-                Kind::PutChunked {
-                    manifest,
-                    logical_len,
-                } => Mutation::ReplaceChunkedRoot {
-                    key: key.clone(),
-                    manifest: *manifest,
-                    logical_len: *logical_len,
-                },
-                Kind::Delete => Mutation::Delete { key: key.clone() },
-                Kind::CounterAdd(delta) => Mutation::CounterAdd {
-                    key: key.clone(),
-                    delta: *delta,
-                },
-                Kind::CommutativeAdd(delta) => Mutation::CommutativeAdd {
-                    key: key.clone(),
-                    delta: *delta,
-                },
-                Kind::BoundedAdd(delta) => Mutation::BoundedAdd {
-                    key: key.clone(),
-                    delta: *delta,
-                },
-                Kind::EscrowSetShare { min, max } => Mutation::EscrowSetShare {
-                    key: key.clone(),
-                    min: *min,
-                    max: *max,
-                },
-            };
-            planned.push((key.clone(), mutation));
+            planned.push((key.clone(), Self::local_commit_mutation(key, &write.kind)));
         }
         // Paired share moves must conserve: the summed widths after equal
         // the summed widths before, or rights would be minted/destroyed.
@@ -3860,6 +4125,11 @@ impl ObjectStore {
                     LogicalValue::Chunked(chunked) => ScannedValue::Chunked {
                         manifest: chunked.manifest,
                         logical_len: chunked.logical_len,
+                    },
+                    LogicalValue::Fabric(fabric) => ScannedValue::Fabric {
+                        fabric_id: fabric.id,
+                        logical_len: fabric.logical_len,
+                        version: fabric.version,
                     },
                     // Semantic values project with their type tag: a scan
                     // consumer can always tell a commutative sum from a
@@ -4798,6 +5068,87 @@ mod tests {
     }
 
     #[test]
+    fn fabric_roots_pin_reads_to_the_authoritative_version() {
+        use bytes::Bytes;
+        let mut store = ObjectStore::new();
+        // Staging publishes at pin 0; apply stamps the authoritative
+        // version into both the root and the reference.
+        let prepared = store
+            .prepare(
+                &Operation::SetFabric {
+                    key: key("f"),
+                    fabric_id: 7,
+                    logical_len: 100,
+                    version: 0,
+                },
+                NOW,
+            )
+            .expect("fabric set prepares");
+        let Prepared::Write(mutation) = prepared else {
+            panic!("fabric set must prepare a write");
+        };
+        let outcome = store.apply(&mutation, NOW).expect("fabric root");
+        let ApplyOutcome::Put { version } = outcome else {
+            panic!("fabric set applies as put");
+        };
+        let object = store.get(&key("f"), NOW).expect("present");
+        assert!(object.is_fabric());
+        let reference = object.fabric_ref().expect("fabric ref");
+        assert_eq!(reference.id, 7);
+        assert_eq!(reference.logical_len, 100);
+        assert_eq!(reference.version, version.as_u64());
+        assert_eq!(object.version(), version);
+        // Reads carry the pin for engine-side version fencing.
+        let Prepared::Read(OperationResult::FabricValue {
+            fabric_id,
+            logical_len,
+            version: pin,
+        }) = store
+            .prepare(&Operation::Get { key: key("f") }, NOW)
+            .expect("fabric get")
+        else {
+            panic!("fabric get must read a fabric value");
+        };
+        assert_eq!((fabric_id, logical_len, pin), (7, 100, version.as_u64()));
+        // Length answers from the root without payload reads.
+        let Prepared::Read(OperationResult::Length(Some(100))) = store
+            .prepare(&Operation::BytesLength { key: key("f") }, NOW)
+            .expect("fabric length")
+        else {
+            panic!("fabric length must answer 100");
+        };
+        // Range writes against a fabric base report stale like chunked.
+        assert_eq!(
+            store
+                .prepare(
+                    &Operation::SetRange {
+                        key: key("f"),
+                        offset: 0,
+                        patch: Bytes::from_static(b"x"),
+                    },
+                    NOW,
+                )
+                .expect_err("fabric base is stale"),
+            OpError::StaleRangeBase
+        );
+        // Overwriting with inline bytes replaces the root entirely.
+        let Prepared::Write(overwrite) = store
+            .prepare(
+                &Operation::Set {
+                    key: key("f"),
+                    value: Bytes::from_static(b"tiny"),
+                },
+                NOW,
+            )
+            .expect("overwrite prepares")
+        else {
+            panic!("overwrite must prepare a write");
+        };
+        store.apply(&overwrite, NOW).expect("overwrite applies");
+        assert!(!store.get(&key("f"), NOW).expect("present").is_fabric());
+    }
+
+    #[test]
     fn set_range_durable_prediction_matches_live_apply() {
         use bytes::Bytes;
         let mut store = ObjectStore::new();
@@ -4826,6 +5177,7 @@ mod tests {
             LogicalValue::Bytes(value) => value.to_vec(),
             LogicalValue::StrictCounter(_)
             | LogicalValue::Chunked(_)
+            | LogicalValue::Fabric(_)
             | LogicalValue::CommutativeCounter(_)
             | LogicalValue::BoundedCounter(_)
             | LogicalValue::Semaphore(_)
@@ -5826,10 +6178,71 @@ mod tests {
     }
 
     /// Expiry hands over without revival: the lapsed token cannot renew,
-    /// a new owner acquires the next token, the old token cannot free the
-    /// new lease, and exact release frees with the next token pending.
+    /// and a new owner acquires with the next token.
     #[test]
-    fn lease_expiry_handover_and_exact_release() {
+    fn lease_expiry_hands_over_to_new_owner() {
+        let (_, fencing1, fencing2, _) = handover_store();
+        assert!(fencing2 > fencing1);
+    }
+
+    /// After handover the old token cannot free the new lease; exact
+    /// release frees with the next token pending.
+    #[test]
+    fn stale_token_cannot_release_and_exact_release_frees() {
+        let (mut store, fencing1, fencing2, t2) = handover_store();
+        // The old token cannot release the new holder's lease.
+        assert!(matches!(
+            store.prepare(
+                &Operation::LeaseRelease {
+                    key: key("lock"),
+                    owner: 7,
+                    fencing: fencing1,
+                },
+                t2
+            ),
+            Err(OpError::StaleFencing)
+        ));
+        // The current holder releases exactly.
+        assert_eq!(
+            execute(
+                &mut store,
+                &Operation::LeaseRelease {
+                    key: key("lock"),
+                    owner: 8,
+                    fencing: fencing2,
+                },
+                t2
+            )
+            .expect("release"),
+            OperationResult::LeaseReleased { released: true }
+        );
+        // Inspect reports freedom with the next token to be issued.
+        match execute(
+            &mut store,
+            &Operation::LeaseInspect { key: key("lock") },
+            t2,
+        )
+        .expect("inspect")
+        {
+            OperationResult::LeaseInfo {
+                holder,
+                next_fencing,
+            } => {
+                assert_eq!(holder, None);
+                assert!(next_fencing > fencing2);
+            }
+            _ => panic!("info"),
+        }
+    }
+
+    /// Replays acquire → renew → expiry → stale-renew refusal → re-acquire
+    /// by a new owner, returning the store and both fencing tokens.
+    fn handover_store() -> (
+        ObjectStore,
+        crate::FencingToken,
+        crate::FencingToken,
+        UnixMicros,
+    ) {
         let mut store = ObjectStore::new();
         let t0 = UnixMicros::from_micros(1_000_000);
         let t1 = UnixMicros::from_micros(2_000_000);
@@ -5893,50 +6306,7 @@ mod tests {
         else {
             panic!("grant")
         };
-        assert!(fencing2 > fencing1);
-        // The old token cannot release the new holder's lease.
-        assert!(matches!(
-            store.prepare(
-                &Operation::LeaseRelease {
-                    key: key("lock"),
-                    owner: 7,
-                    fencing: fencing1,
-                },
-                t2
-            ),
-            Err(OpError::StaleFencing)
-        ));
-        // The current holder releases exactly.
-        assert_eq!(
-            execute(
-                &mut store,
-                &Operation::LeaseRelease {
-                    key: key("lock"),
-                    owner: 8,
-                    fencing: fencing2,
-                },
-                t2
-            )
-            .expect("release"),
-            OperationResult::LeaseReleased { released: true }
-        );
-        // Inspect reports freedom with the next token to be issued.
-        match execute(
-            &mut store,
-            &Operation::LeaseInspect { key: key("lock") },
-            t2,
-        )
-        .expect("inspect")
-        {
-            OperationResult::LeaseInfo {
-                holder,
-                next_fencing,
-            } => {
-                assert_eq!(holder, None);
-                assert!(next_fencing > fencing2);
-            }
-            _ => panic!("info"),
-        }
+        (store, fencing1, fencing2, t2)
     }
 
     /// Stream shards order independently: appends assign shard-local

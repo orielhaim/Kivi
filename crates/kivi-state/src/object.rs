@@ -298,6 +298,14 @@ pub enum LogicalValue {
     /// same overwrites. Only the physical representation differs, and only
     /// the engine (never this layer) resolves it into bytes.
     Chunked(ChunkedRef),
+    /// Opaque byte string managed by the Memory Fabric. Logically identical
+    /// to [`Bytes`](Self::Bytes) of the same content: same type, same reads,
+    /// same overwrites. The reference names a fabric object (worker-local
+    /// physical name, meaningless across nodes, like a chunk manifest id);
+    /// arena slots, `NVMe` offsets, and provider placement never appear
+    /// here. Only the engine (never this layer) resolves it into bytes,
+    /// possibly suspending for asynchronous promotion.
+    Fabric(FabricRef),
     /// Exact counter value.
     StrictCounter(i64),
     /// Order-free counter value: the sum of all applied addends. Reads
@@ -315,12 +323,12 @@ pub enum LogicalValue {
 }
 
 impl LogicalValue {
-    /// Returns the value's logical type. Chunked bytes are bytes: type
-    /// checks never distinguish representation.
+    /// Returns the value's logical type. Chunked and fabric bytes are
+    /// bytes: type checks never distinguish representation.
     #[must_use]
     pub const fn object_type(&self) -> ObjectType {
         match self {
-            Self::Bytes(_) | Self::Chunked(_) => ObjectType::Bytes,
+            Self::Bytes(_) | Self::Chunked(_) | Self::Fabric(_) => ObjectType::Bytes,
             Self::StrictCounter(_) => ObjectType::StrictCounter,
             Self::CommutativeCounter(_) => ObjectType::CommutativeCounter,
             Self::BoundedCounter(_) => ObjectType::BoundedCounter,
@@ -339,7 +347,7 @@ impl LogicalValue {
     #[must_use]
     pub fn scan_descriptor(&self) -> Option<(ObjectType, Bytes)> {
         match self {
-            Self::Bytes(_) | Self::Chunked(_) | Self::StrictCounter(_) => None,
+            Self::Bytes(_) | Self::Chunked(_) | Self::Fabric(_) | Self::StrictCounter(_) => None,
             Self::CommutativeCounter(value) => Some((
                 ObjectType::CommutativeCounter,
                 Bytes::copy_from_slice(&value.to_le_bytes()),
@@ -381,6 +389,7 @@ impl LogicalValue {
         match self {
             Self::Bytes(value) => value.len() as u64,
             Self::Chunked(chunked) => chunked.logical_len,
+            Self::Fabric(fabric) => fabric.logical_len,
             Self::StrictCounter(_) | Self::CommutativeCounter(_) => 8,
             Self::BoundedCounter(state) => state.encoded_len() as u64,
             Self::Semaphore(state) => state.encoded_len() as u64,
@@ -422,6 +431,55 @@ impl Decode for ChunkedRef {
                 logical_len,
             },
             first + second,
+        ))
+    }
+}
+
+/// Reference to a Memory Fabric byte string: the fabric-scoped object id
+/// plus the total logical length and the logical version the bytes were
+/// published at. Small (`Copy`): tablet roots, checkpoints, and WAL
+/// records carry this instead of bulk bytes, exactly like [`ChunkedRef`].
+///
+/// The `id` is a worker-local physical name (like a manifest id without
+/// content addressing): it reveals no placement and is meaningless on
+/// another node. Topology transfer moves logical bytes, never this id.
+/// The `version` pins reads: the engine serves the reference only when it
+/// matches the root's logical version, so a delayed promotion can never
+/// resurrect an older value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FabricRef {
+    /// Fabric-scoped object id assigned at staging.
+    pub id: u64,
+    /// Total logical bytes of the materialized value.
+    pub logical_len: u64,
+    /// Logical version the bytes were published at.
+    pub version: u64,
+}
+
+impl Encode for FabricRef {
+    fn encoded_len(&self) -> usize {
+        8 + 8 + 8
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.id.encode(out);
+        self.logical_len.encode(out);
+        self.version.encode(out);
+    }
+}
+
+impl Decode for FabricRef {
+    fn decode(input: &[u8]) -> Result<(Self, usize), CodecError> {
+        let (id, first) = u64::decode(input)?;
+        let (logical_len, second) = u64::decode(&input[first..])?;
+        let (version, third) = u64::decode(&input[first + second..])?;
+        Ok((
+            Self {
+                id,
+                logical_len,
+                version,
+            },
+            first + second + third,
         ))
     }
 }
@@ -980,11 +1038,12 @@ impl Decode for StreamShardState {
 
 /// Physical representation tag. Private: logical semantics never branch on
 /// it (matches go through [`LogicalValue`]); it exists so debugging,
-/// checkpoints, and future tiering can name what a root physically is.
+/// checkpoints, and tiering can name what a root physically is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Representation {
     Inline,
     Chunked,
+    Fabric,
 }
 
 /// A stored logical object: value, version, expiry, and representation.
@@ -999,7 +1058,7 @@ pub struct StoredObject {
 impl StoredObject {
     /// Builds an object. Only the store constructs these; callers go through
     /// typed operations and mutations. The representation derives from the
-    /// value, so a chunked root can never masquerade as inline or reverse.
+    /// value, so a fabric root can never masquerade as inline or reverse.
     pub(crate) fn new(value: LogicalValue, version: ObjectVersion, expiry: Expiry) -> Self {
         let representation = match &value {
             LogicalValue::Bytes(_)
@@ -1010,6 +1069,7 @@ impl StoredObject {
             | LogicalValue::Lease(_)
             | LogicalValue::StreamShard(_) => Representation::Inline,
             LogicalValue::Chunked(_) => Representation::Chunked,
+            LogicalValue::Fabric(_) => Representation::Fabric,
         };
         Self {
             value,
@@ -1023,6 +1083,7 @@ impl StoredObject {
     /// recovery is the only production caller: versions are logical
     /// history and must be restored exactly, never recomputed. Chunked
     /// roots restore as chunk references (bulk bytes stay in chunk packs);
+    /// fabric roots restore as fabric references (bytes stay materialized);
     /// dependency validation proves them before serving.
     #[must_use]
     pub fn restore(value: LogicalValue, version: ObjectVersion, expiry: Expiry) -> Self {
@@ -1070,13 +1131,32 @@ impl StoredObject {
         }
     }
 
+    /// Whether this root names a Memory Fabric materialization instead of
+    /// resident bytes. Diagnostics, checkpoints, and GC use this; reads
+    /// resolve through the engine either way.
+    #[must_use]
+    pub const fn is_fabric(&self) -> bool {
+        matches!(self.value, LogicalValue::Fabric(_))
+    }
+
+    /// Returns the fabric reference of a fabric root, if fabric.
+    #[must_use]
+    pub const fn fabric_ref(&self) -> Option<FabricRef> {
+        match &self.value {
+            LogicalValue::Fabric(fabric) => Some(*fabric),
+            _ => None,
+        }
+    }
+
     /// Returns the physical representation name for `EXPLAIN`-style
-    /// diagnostics (`"inline"` or `"chunked"`). Informational only.
+    /// diagnostics (`"inline"`, `"chunked"`, or `"fabric"`).
+    /// Informational only.
     #[must_use]
     pub const fn representation_name(&self) -> &'static str {
         match self.representation {
             Representation::Inline => "inline",
             Representation::Chunked => "chunked",
+            Representation::Fabric => "fabric",
         }
     }
 

@@ -135,6 +135,10 @@ pub struct EngineConfig {
     /// Chunk fabric policy and lane resources (both modes stage large
     /// values through per-worker chunk lanes).
     pub chunks: ChunkFabricConfig,
+    /// Memory Fabric policy and lane resources (both modes stage medium
+    /// values through the per-worker fabric; durable mode additionally
+    /// journals seal locators for recovery).
+    pub fabric: crate::fabric::FabricConfig,
     /// Network serving. `None` keeps channel-only workers (embedded use,
     /// tests); `Some` binds one native endpoint per worker with CPU affinity.
     pub network: Option<crate::net::EngineNetwork>,
@@ -328,6 +332,11 @@ pub enum EngineError {
     /// repair it, instead of serving wrong bytes.
     #[error("chunk fabric failed: {0}")]
     Chunk(#[from] kivi_chunk::ChunkError),
+    /// Memory Fabric failure: staging, promotion, or resolution failed.
+    /// Saturation answers backpressure upstream; corruption quarantines
+    /// the representation while other sources still stand.
+    #[error("memory fabric failed: {0}")]
+    Fabric(#[from] crate::fabric::FabricError),
     /// A retried identity fell below the session floor.
     #[error("mutation identity expired below the session floor")]
     DedupExpired,
@@ -353,6 +362,7 @@ impl From<WorkerRequestError> for EngineError {
             WorkerRequestError::SessionOverloaded => Self::SessionOverloaded,
             WorkerRequestError::Storage(error) => Self::Durability(error),
             WorkerRequestError::ChunkStore(error) => Self::Chunk(error),
+            WorkerRequestError::Fabric(error) => Self::Fabric(error),
             WorkerRequestError::InvalidRequest { detail } => Self::InvalidRequest { detail },
         }
     }
@@ -390,10 +400,16 @@ pub struct LocalEngine {
     /// (shutdown after workers join: no worker submits once it exits).
     chunk_lanes: Vec<crate::chunk_lane::ChunkLaneHandle>,
     chunk_guards: Vec<crate::chunk_lane::ChunkLaneGuard>,
+    /// Offcore lane join guards (shutdown after workers join, like chunk
+    /// lanes: no worker submits once it exits).
+    fabric_guards: Vec<kivi_memory::offcore_lane::OffcoreLaneGuard>,
     /// Ephemeral-mode chunk root: per-process `TempDir` auto-removed on
     /// clean shutdown (`None` in durable mode, which stages under the
     /// data directory). Held for its `Drop`, never otherwise touched.
     _ephemeral_chunks: Option<tempfile::TempDir>,
+    /// Ephemeral-mode fabric roots, one `TempDir` per worker (same
+    /// lifecycle rule as chunks; `None` in durable mode).
+    _ephemeral_fabric: Vec<tempfile::TempDir>,
 }
 
 /// Read-only admin/query handle to a running engine.
@@ -538,6 +554,28 @@ impl AdminHandle {
             .map(|(id, lane)| (*id, lane.stats_blocking()))
             .collect()
     }
+
+    /// Snapshots every worker's Memory Fabric: counters, per-tablet
+    /// footprints, and queue depths (blocking control rendezvous per
+    /// worker; serve from `spawn_blocking`). Exited workers are absent
+    /// from the result.
+    #[must_use]
+    pub fn fabric_stats_snapshot(&self) -> Vec<(WorkerId, crate::worker::FabricWorkerReport)> {
+        let mut out = Vec::new();
+        for (id, control) in &self.controls {
+            let (respond, receive) = crossbeam_channel::bounded(1);
+            if control
+                .try_send(crate::worker::WorkerControl::FabricStats { respond })
+                .is_err()
+            {
+                continue;
+            }
+            if let Ok(report) = receive.recv() {
+                out.push((*id, report));
+            }
+        }
+        out
+    }
 }
 
 impl LocalEngine {
@@ -670,6 +708,49 @@ impl LocalEngine {
             chunk_lanes.push(handle);
             chunk_guards.push(guard);
         }
+        // Memory Fabrics open next, one per worker: arenas, planning,
+        // and the demotion lane thread. Durable mode journals seal
+        // locators under per-worker fabric directories; ephemeral mode
+        // stages under per-worker TempDirs (removed on clean shutdown).
+        // Like chunk lanes, fabrics open before recovery: journal imports
+        // must populate cold objects before the WAL tail re-links roots
+        // to their ids.
+        let mut ephemeral_fabric: Vec<tempfile::TempDir> = Vec::new();
+        let mut fabric_paths = Vec::with_capacity(config.worker_count);
+        for index in 0..config.worker_count {
+            match &config.durability {
+                DurabilityMode::Ephemeral => {
+                    let dir = tempfile::TempDir::new().map_err(|error| {
+                        EngineError::Durability(kivi_durability::DurabilityError::Io {
+                            op: "create ephemeral fabric dir",
+                            message: error.to_string(),
+                            code: None,
+                        })
+                    })?;
+                    fabric_paths.push(crate::fabric::FabricPaths {
+                        root: dir.path().to_owned(),
+                    });
+                    ephemeral_fabric.push(dir);
+                }
+                DurabilityMode::Durable(cfg) => {
+                    fabric_paths.push(crate::fabric::FabricPaths::worker(&cfg.data_dir, index));
+                }
+            }
+        }
+        let mut fabrics = Vec::with_capacity(config.worker_count);
+        let mut fabric_guards = Vec::with_capacity(config.worker_count);
+        for (index, paths) in fabric_paths.iter().enumerate() {
+            let worker = WorkerId::from_u64(index as u64);
+            let (fabric, guard) = crate::fabric::TabletFabric::open(
+                worker,
+                paths,
+                config.fabric.arena_bytes_per_worker,
+                config.fabric.demotion_bytes_per_worker,
+            )
+            .map_err(EngineError::Fabric)?;
+            fabrics.push(fabric);
+            fabric_guards.push(guard);
+        }
         // Durable mode recovers BEFORE any worker spawns (and therefore
         // before any listener binds): checkpoints restore first, then the
         // WAL tail replays after the cuts. A corrupt database never serves
@@ -686,6 +767,12 @@ impl LocalEngine {
                 ((0..config.worker_count).map(|_| None).collect(), None, None)
             }
             DurabilityMode::Durable(cfg) => {
+                // Fabric journal recovery runs BEFORE the WAL tail
+                // re-links roots to fabric ids: every journaled record is
+                // validated against its device file and imported cold
+                // (off-core residence, hydrate lazily) into its owning
+                // worker's fabric. Corrupt records fail startup loudly.
+                Self::recover_fabrics(&routing, &fabric_paths, &mut fabrics)?;
                 let DurableBootstrap {
                     lanes,
                     maintenance,
@@ -749,12 +836,15 @@ impl LocalEngine {
                 )
             }
         };
-        // Dependency gate (§30, §31): every live chunked root — restored
-        // from checkpoints, replayed from the WAL tail, or fresh — proves
-        // its manifest and chunks in its owner's lane before serving. A
-        // committed root without its immutable data fails startup loudly,
-        // never serves absence. Obsolete WAL records (at or below a cut)
-        // need no proof: they never replay.
+        // Dependency gate (§30, §31), extended to fabric roots: every
+        // live chunked root — restored from checkpoints, replayed from
+        // the WAL tail, or fresh — proves its manifest and chunks in its
+        // owner's lane before serving. Every live fabric root proves a
+        // resolvable materialization in its owner's fabric (journal
+        // import above plus seals below cover the live set). A committed
+        // root without its data fails startup loudly, never serves
+        // absence. Obsolete WAL records (at or below a cut) need no
+        // proof: they never replay.
         for (index, lives) in by_worker.iter().enumerate() {
             for live in lives {
                 for (_, object) in live.store().snapshot_entries() {
@@ -762,6 +852,11 @@ impl LocalEngine {
                         chunk_access[index]
                             .lane
                             .check_root_blocking(chunked.manifest, chunked.logical_len)?;
+                    }
+                    if let Some(fabric_ref) = object.fabric_ref() {
+                        fabrics[index].read_anywhere(fabric_ref.id).map_err(|_| {
+                            EngineError::Fabric(crate::fabric::FabricError::Corrupt)
+                        })?;
                     }
                 }
             }
@@ -775,6 +870,7 @@ impl LocalEngine {
                     by_worker,
                     lanes,
                     chunk_access,
+                    fabrics,
                 );
                 (workers, senders, Vec::new())
             }
@@ -787,6 +883,7 @@ impl LocalEngine {
                     &routing,
                     lanes,
                     chunk_access,
+                    fabrics,
                 )?;
                 (workers, senders, bound)
             }
@@ -836,6 +933,11 @@ impl LocalEngine {
                 installed: spawn.installed,
                 pins: spawn.pins,
                 chunk_lanes: spawn.chunk_lanes,
+                fabric_journals: fabric_paths
+                    .iter()
+                    .enumerate()
+                    .map(|(index, paths)| (WorkerId::from_u64(index as u64), paths.journal()))
+                    .collect(),
                 admin: Arc::clone(&checkpoint_admin),
             };
             crate::checkpoint::CheckpointWorkerHandle::spawn(context)
@@ -857,8 +959,119 @@ impl LocalEngine {
             checkpoint_admin,
             chunk_lanes,
             chunk_guards,
+            fabric_guards,
             _ephemeral_chunks: ephemeral_chunks,
+            _ephemeral_fabric: ephemeral_fabric,
         })
+    }
+
+    /// Recovers fabric journals before the WAL tail re-links roots:
+    /// validates every journaled record against its device file and
+    /// imports cold objects (off-core residences, hydrate lazily) into
+    /// their owning worker's fabric. Journal entries for tablets the
+    /// startup directory no longer covers are skipped with a warning
+    /// (their WAL history fails startup first if still referenced).
+    /// Corrupt records fail startup loudly - a committed root without
+    /// its bytes must never serve absence. One id seals twice across a
+    /// prepared transaction (staging record at prepare, authoritative
+    /// record at finalize-commit): the journal is append-ordered, so the
+    /// last entry per id wins and earlier ones never import.
+    fn recover_fabrics(
+        routing: &RoutingSnapshot,
+        paths: &[crate::fabric::FabricPaths],
+        fabrics: &mut [crate::fabric::TabletFabric],
+    ) -> Result<(), EngineError> {
+        use crate::fabric::{JournalFile, journal_load, open_material_provider};
+        let map_io = |error: std::io::Error| {
+            if error.kind() == std::io::ErrorKind::InvalidData {
+                EngineError::Fabric(crate::fabric::FabricError::Corrupt)
+            } else {
+                EngineError::Fabric(crate::fabric::FabricError::Unavailable)
+            }
+        };
+        for (index, paths) in paths.iter().enumerate() {
+            let entries = journal_load(&paths.journal()).map_err(map_io)?;
+            if entries.is_empty() {
+                continue;
+            }
+            let provider = open_material_provider(&paths.material_dir())
+                .map_err(|_| EngineError::Fabric(crate::fabric::FabricError::Unavailable))?;
+            let mut imported = 0usize;
+            let mut skipped = 0usize;
+            // Last entry per id wins (prepare stages under version 0,
+            // finalize-commit re-seals under the authoritative version).
+            let mut latest: std::collections::HashMap<u64, &crate::fabric::JournalEntry> =
+                std::collections::HashMap::new();
+            for entry in &entries {
+                latest.insert(entry.fabric_id, entry);
+            }
+            let mut ordered: Vec<&crate::fabric::JournalEntry> = latest.into_values().collect();
+            ordered.sort_by_key(|entry| (entry.tablet.as_u64(), entry.fabric_id));
+            for entry in ordered {
+                // Owner at startup serves this tablet; imports land there.
+                // (Journal-owner and current owner agree absent a move
+                // whose migration re-staged and re-sealed already.)
+                let owner = routing.placement().worker_of(entry.tablet);
+                let Some(owner) = owner else {
+                    tracing::warn!(
+                        tablet = entry.tablet.as_u64(),
+                        fabric_id = entry.fabric_id,
+                        "fabric journal names a forgotten tablet; skipping"
+                    );
+                    skipped += 1;
+                    continue;
+                };
+                let owner_index = usize::try_from(owner.as_u64()).unwrap_or(usize::MAX);
+                if owner_index != index {
+                    continue;
+                }
+                if !matches!(entry.file, JournalFile::Material) {
+                    continue;
+                }
+                // Validate bytes before trusting the locator.
+                let bytes = provider
+                    .read_at(entry.offset, entry.len)
+                    .map_err(|_| EngineError::Fabric(crate::fabric::FabricError::Corrupt))?;
+                if bytes.len() as u64 != entry.len || crc32c::crc32c(&bytes) != entry.checksum {
+                    return Err(EngineError::Fabric(crate::fabric::FabricError::Corrupt));
+                }
+                // Copy the validated bytes onto the demotion device
+                // through the worker's lane and import that locator: the
+                // live fabric only reads the demotion device (lane
+                // promotions, backend reads), so importing
+                // material-device offsets would strand the id behind an
+                // unreadable residence and fail startup below. The
+                // journal keeps naming the material record (the durable
+                // source); the demotion copy is a device-coherent shadow.
+                let record = fabrics[index]
+                    .lane()
+                    .demote_blocking(entry.fabric_id, entry.version, bytes)
+                    .map_err(crate::fabric::FabricError::from)
+                    .map_err(EngineError::Fabric)?;
+                fabrics[index]
+                    .fabric_mut()
+                    .import_offcore(kivi_memory::OffcoreImport {
+                        id: entry.fabric_id,
+                        version: entry.version,
+                        offset: record.offset,
+                        len: record.len,
+                        checksum: record.checksum,
+                        intent: kivi_memory::MaterializationIntent::cold(),
+                        class: kivi_memory::BehaviorClass::ColdCandidate,
+                    })
+                    .map_err(|_| EngineError::Fabric(crate::fabric::FabricError::Corrupt))?;
+                // Mirror the durable locator for GC and observability.
+                fabrics[index].note_sealed(entry.clone());
+                imported += 1;
+            }
+            tracing::info!(
+                worker = index,
+                imported,
+                skipped,
+                "fabric journal recovered"
+            );
+        }
+        Ok(())
     }
 
     /// Opens every WAL lane, restores installed checkpoints, repairs torn
@@ -936,7 +1149,10 @@ impl LocalEngine {
         // Hand lanes to workers: exclusive per worker, or one shared lane.
         // Each lane moves into its worker's coordinator lane thread here;
         // the initial stats snapshot seeds the admin plane before the
-        // first seal reports back.
+        // first seal reports back. Each worker also gets a fabric seal
+        // store (durable material records plus journal) moving into the
+        // same lane thread: one single writer per worker, seals ordered
+        // with the WAL barrier.
         let shared = if cfg.shared_wal {
             let lane = lanes.remove(&0).expect("shared lane open");
             let stats = lane.lane_stats();
@@ -965,7 +1181,15 @@ impl LocalEngine {
             for live in &mut by_worker[index] {
                 live.enable_band_tracking(namespace);
             }
-            let durable = WorkerDurability::spawn(namespace, worker, cfg.batch, access, initial)?;
+            let seal_store = Some(
+                crate::commit::FabricSealStore::open(&crate::fabric::FabricPaths::worker(
+                    &cfg.data_dir,
+                    index,
+                ))
+                .map_err(EngineError::Durability)?,
+            );
+            let durable =
+                WorkerDurability::spawn(namespace, worker, cfg.batch, access, initial, seal_store)?;
             maintenance.push((worker, durable.maintenance()));
             out.push(durable);
         }
@@ -1298,14 +1522,20 @@ impl LocalEngine {
         by_worker: Vec<Vec<LiveTablet>>,
         lanes: Vec<Option<WorkerDurability>>,
         chunks: Vec<crate::worker::WorkerChunks>,
+        fabrics: Vec<crate::fabric::TabletFabric>,
     ) -> (Vec<WorkerHandle>, Vec<RequestIngress>) {
         let mut workers = Vec::with_capacity(worker_count);
         let mut senders = Vec::with_capacity(worker_count);
-        for (((index, tablets), durability), chunks) in
-            by_worker.into_iter().enumerate().zip(lanes).zip(chunks)
+        for ((((index, tablets), durability), chunks), fabric) in by_worker
+            .into_iter()
+            .enumerate()
+            .zip(lanes)
+            .zip(chunks)
+            .zip(fabrics)
         {
             let id = WorkerId::from_u64(index as u64);
-            let handle = WorkerHandle::spawn(id, tablets, request_capacity, durability, chunks);
+            let handle =
+                WorkerHandle::spawn(id, tablets, request_capacity, durability, chunks, fabric);
             senders.push(handle_sender(&handle));
             workers.push(handle);
         }
@@ -1323,6 +1553,7 @@ impl LocalEngine {
         routing: &Arc<ArcSwap<RoutingSnapshot>>,
         lanes: Vec<Option<WorkerDurability>>,
         chunks: Vec<crate::worker::WorkerChunks>,
+        fabrics: Vec<crate::fabric::TabletFabric>,
     ) -> Result<NetworkSpawn, EngineError> {
         let endpoints = Arc::new(ArcSwap::new(Arc::new(crate::net::EndpointMap::new())));
         // Lanes present means durable mode (start() builds all-or-none);
@@ -1338,8 +1569,12 @@ impl LocalEngine {
         let mut senders = Vec::with_capacity(worker_count);
         let mut bound: Vec<(WorkerId, String)> = Vec::with_capacity(worker_count);
         let mut addrs: Vec<std::net::SocketAddr> = Vec::with_capacity(worker_count);
-        for (((index, tablets), durability), chunks) in
-            by_worker.into_iter().enumerate().zip(lanes).zip(chunks)
+        for ((((index, tablets), durability), chunks), fabric) in by_worker
+            .into_iter()
+            .enumerate()
+            .zip(lanes)
+            .zip(chunks)
+            .zip(fabrics)
         {
             let id = WorkerId::from_u64(index as u64);
             let port = if network.ports.is_empty() {
@@ -1393,6 +1628,7 @@ impl LocalEngine {
                 request_capacity,
                 durability,
                 chunks,
+                fabric,
                 crate::net::NetLaunch {
                     routing: Arc::clone(routing),
                     net,
@@ -1779,8 +2015,12 @@ impl LocalEngine {
         // Chunk lanes stop after every worker joined: no worker submits
         // once it exits, so no chunk work is abandoned mid-flight (queued
         // lane jobs fail their severed replies instead of hanging).
+        // Offcore lanes follow the same rule for the same reason.
         for (guard, lane) in self.chunk_guards.iter_mut().zip(self.chunk_lanes.iter()) {
             guard.shutdown(lane);
+        }
+        for guard in self.fabric_guards {
+            guard.shutdown();
         }
         match panic {
             Some(error) => Err(error),

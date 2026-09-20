@@ -1434,7 +1434,8 @@ mod fuzz {
                     kivi_state::OperationResult::Length(None)
                 }
                 kivi_state::Operation::SetConditional { .. }
-                | kivi_state::Operation::SetConditionalChunked { .. } => {
+                | kivi_state::Operation::SetConditionalChunked { .. }
+                | kivi_state::Operation::SetConditionalFabric { .. } => {
                     kivi_state::OperationResult::ConditionalSet {
                         applied: false,
                         version: None,
@@ -1442,6 +1443,7 @@ mod fuzz {
                 }
                 kivi_state::Operation::Set { .. }
                 | kivi_state::Operation::SetChunked { .. }
+                | kivi_state::Operation::SetFabric { .. }
                 | kivi_state::Operation::SetRange { .. }
                 | kivi_state::Operation::BoundedCounterCreate { .. }
                 | kivi_state::Operation::EscrowTransfer { .. }

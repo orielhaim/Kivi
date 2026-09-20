@@ -2299,10 +2299,17 @@ fn shape_result(
         },
         // Chunked roots never replicate in this stage; reaching the wire
         // unresolved is a serving bug, answered loudly, never wrong bytes.
+        // Fabric references never replicate at any stage (worker-local
+        // ids); reaching the wire is likewise a serving bug.
         R::ChunkedValue { .. } => Response {
             proof: None,
             status: Status::Internal,
             body: ResponseBody::Diagnostic("chunked value reached the wire unresolved".to_owned()),
+        },
+        R::FabricValue { .. } => Response {
+            proof: None,
+            status: Status::Internal,
+            body: ResponseBody::Diagnostic("fabric value reached the wire unresolved".to_owned()),
         },
         // Tablet-naming prepare outcomes shape at the call site that knows
         // the tablet (see `handle_request`); reaching here is a serving

@@ -272,7 +272,7 @@ pub async fn reconcile_loop_shared(
         // Transaction resolution runs on every node (not just the control
         // leader): each node resolves intents on tablets it leads.
         // Bounded per pass; failures simply retry next pass.
-        resolve_transactions(&node).await;
+        resolve_transactions(&node, &directory).await;
         // Ordered-index enforcement likewise runs everywhere: each replica
         // maintains its own index, driven from the namespace layout.
         ensure_ordered_indexing(&node, &directory).await;
@@ -458,10 +458,13 @@ async fn ensure_ordered_indexing(
 /// Runs on all nodes (not just the control leader): each node resolves
 /// tablets it leads, skipping others via `NotLeader`. Per intent: a durable
 /// Commit/Abort decision finalizes accordingly; undecided records past
-/// the lease CAS-abort through the record (never unilaterally — the CAS
+/// the lease CAS-abort through the record (never unilaterally - the CAS
 /// proves no commit won the race); live intents wait. Bounded per pass;
 /// the next pass retries the rest.
-async fn resolve_transactions(node: &Arc<ConsensusNode>) {
+async fn resolve_transactions(
+    node: &Arc<ConsensusNode>,
+    directory: &Arc<arc_swap::ArcSwap<kivi_tablet::DirectorySnapshot>>,
+) {
     let namespace = node.namespace();
     for tablet in node.tablets() {
         let intents = node.tablet_intents(tablet).await.unwrap_or_default();
@@ -469,8 +472,45 @@ async fn resolve_transactions(node: &Arc<ConsensusNode>) {
             continue;
         }
         for intent in intents {
-            resolve_one_intent(node, namespace, tablet, &intent).await;
+            resolve_one_intent(node, namespace, directory, tablet, &intent).await;
         }
+    }
+}
+
+/// Routes a transaction decision record by the unified rule (mirrors
+/// `cluster::route_key`: fiat to the embedded coordinator while it is
+/// writable, normal layout routing after retirement). `None` when no
+/// tablet owns the key: the record is homeless (coordinator retired
+/// without migrating it), so no driver can decide through this routing
+/// either.
+fn route_record_tablet(
+    snapshot: &kivi_tablet::DirectorySnapshot,
+    namespace: kivi_types::NamespaceId,
+    coordinator: TabletId,
+    record_key: &kivi_state::Key,
+) -> Option<TabletId> {
+    if snapshot
+        .get(coordinator)
+        .is_some_and(|descriptor| descriptor.state().is_writable())
+    {
+        return Some(coordinator);
+    }
+    if let Some(tablet) = snapshot.lookup_by_key(record_key.as_bytes()) {
+        return Some(tablet);
+    }
+    // Hash-layout fallback (mirrors `cluster::route_normal_key`).
+    let hash = kivi_state::PartitionHasher::V1.hash(namespace, record_key.as_bytes())?;
+    snapshot.lookup_by_hash(hash)
+}
+
+/// Builds the participant abort-finalize for an intent (shared by the
+/// homeless-record and undecided-record paths).
+fn abort_finalize_op(intent: &kivi_state::TxnIntent) -> kivi_state::Operation {
+    kivi_state::Operation::TxnFinalize {
+        txn: intent.id,
+        key: intent.key.clone(),
+        commit: false,
+        digest: intent.digest,
     }
 }
 
@@ -482,21 +522,41 @@ async fn resolve_transactions(node: &Arc<ConsensusNode>) {
 async fn resolve_one_intent(
     node: &Arc<ConsensusNode>,
     namespace: kivi_types::NamespaceId,
+    directory: &Arc<arc_swap::ArcSwap<kivi_tablet::DirectorySnapshot>>,
     tablet: TabletId,
     intent: &kivi_state::TxnIntent,
 ) {
     use kivi_state::{Operation, OperationResult, TxnRecord, TxnState};
-    let _ = namespace;
     let record_key = kivi_state::txn_record_key(intent.coordinator, intent.id);
     let now = super::cluster::wall_now();
     let ctx = super::cluster::read_ctx();
+    // Route the decision record by the unified rule: fiat while the
+    // coordinator is writable, normal layout routing after retirement
+    // (records migrate with splits). A pinned-coordinator read would
+    // wedge intents whose coordinator retired.
+    let snapshot = directory.load();
+    let Some(record_tablet) =
+        route_record_tablet(&snapshot, namespace, intent.coordinator, &record_key)
+    else {
+        // Homeless record: no tablet owns the key, so no driver can
+        // decide through this routing either (decisions are record
+        // writes through the same rule). Past the lease, abort the
+        // participant directly; the directory could be stale, so the
+        // lease bound (a minute) dwarfs propagation (seconds).
+        if lease_expired(intent.prepared_at, now) {
+            let _ = node
+                .propose(tablet, &abort_finalize_op(intent), None, None, now)
+                .await;
+        }
+        return;
+    };
     // Read the decision record (fiat-routed to the coordinator tablet;
     // followers redirect and this pass skips). Lease-ineligible: 2PC
     // decisions integrate with final participant outcomes, never with a
     // roster fast path.
     let record = match node
         .read(
-            intent.coordinator,
+            record_tablet,
             &Operation::Get {
                 key: record_key.clone(),
             },
@@ -514,28 +574,19 @@ async fn resolve_one_intent(
                 }
             } else {
                 // Missing record with an expired lease: fence first, then
-                // discard. The fence CASes an Aborted decision on absence;
-                // a slow driver racing to decide CASes the same key, so
-                // exactly one wins and the loser follows the winner on
-                // re-read (next pass / re-drive). Without the fence a slow
-                // commit could land after this discard and report success
-                // for a write that never applied.
+                // discard. The fence CASes an Aborted decision on absence
+                // at the record's current home; a slow driver racing to
+                // decide CASes the same key, so exactly one wins and the
+                // loser follows the winner on re-read (next pass /
+                // re-drive). Without the fence a slow commit could land
+                // after this discard and report success for a write that
+                // never applied.
                 if lease_expired(intent.prepared_at, now)
-                    && cas_abort_absent_record(node, intent.coordinator, intent.id).await
+                    && cas_abort_absent_record(node, intent.coordinator, record_tablet, intent.id)
+                        .await
                 {
                     let _ = node
-                        .propose(
-                            tablet,
-                            &Operation::TxnFinalize {
-                                txn: intent.id,
-                                key: intent.key.clone(),
-                                commit: false,
-                                digest: intent.digest,
-                            },
-                            None,
-                            None,
-                            now,
-                        )
+                        .propose(tablet, &abort_finalize_op(intent), None, None, now)
                         .await;
                 }
                 return;
@@ -587,7 +638,7 @@ async fn resolve_one_intent(
         }
         TxnState::Begun => {
             if lease_expired(intent.prepared_at, now) {
-                cas_abort_record(node, &record).await;
+                cas_abort_record(node, record_tablet, &record).await;
             }
         }
     }
@@ -607,15 +658,17 @@ fn intent_fresh(prepared_at: u64, now: kivi_types::UnixMicros) -> bool {
 
 /// CAS-aborts a record-absent expired transaction: an absence-guarded
 /// prepare + commit-finalize of a skeletal Aborted record on the
-/// coordinator tablet. Wins only when no driver decided concurrently (a
-/// concurrent commit conflicts instead, and the resolver follows that
-/// decision next pass). Readers only match on `state`, so the skeletal
-/// payload (no participants, zero digest) is safe: Aborted carries no
-/// obligations beyond "discard intents", which every pass converges.
-/// Best-effort: any failure simply retries later.
+/// record's current home tablet (the coordinator while writable, its
+/// routing successor after retirement). Wins only when no driver
+/// decided concurrently (a concurrent commit conflicts instead, and the
+/// resolver follows that decision next pass). Readers only match on
+/// `state`, so the skeletal payload (no participants, zero digest) is
+/// safe: Aborted carries no obligations beyond "discard intents", which
+/// every pass converges. Best-effort: any failure simply retries later.
 async fn cas_abort_absent_record(
     node: &Arc<ConsensusNode>,
     coordinator: kivi_types::TabletId,
+    record_tablet: TabletId,
     txn: kivi_state::TxnId,
 ) -> bool {
     use kivi_consensus::ProposeOutcome;
@@ -647,7 +700,7 @@ async fn cas_abort_absent_record(
         digest: [0u8; 32],
     };
     if !matches!(
-        node.propose(coordinator, &prepare, None, None, now).await,
+        node.propose(record_tablet, &prepare, None, None, now).await,
         Ok(ProposeOutcome::Applied {
             outcome: OperationResult::TxnPrepared,
             ..
@@ -665,7 +718,8 @@ async fn cas_abort_absent_record(
         digest: [0u8; 32],
     };
     matches!(
-        node.propose(coordinator, &finalize, None, None, now).await,
+        node.propose(record_tablet, &finalize, None, None, now)
+            .await,
         Ok(ProposeOutcome::Applied {
             outcome: OperationResult::TxnFinalized { applied: true, .. },
             ..
@@ -680,12 +734,16 @@ async fn cas_abort_absent_record(
 /// write wins only when no commit landed concurrently (losers re-read the
 /// decision and follow it next pass). Runs as a guarded single-key batch
 /// on the record tablet (same fast-path machinery, driven internally).
-async fn cas_abort_record(node: &Arc<ConsensusNode>, record: &kivi_state::TxnRecord) {
+async fn cas_abort_record(
+    node: &Arc<ConsensusNode>,
+    record_tablet: TabletId,
+    record: &kivi_state::TxnRecord,
+) {
     let record_key = kivi_state::txn_record_key(record.coordinator, record.id);
     let ctx = super::cluster::read_ctx();
     let Ok(served) = node
         .read(
-            record.coordinator,
+            record_tablet,
             &kivi_state::Operation::GetVersion {
                 key: record_key.clone(),
             },
@@ -704,7 +762,7 @@ async fn cas_abort_record(node: &Arc<ConsensusNode>, record: &kivi_state::TxnRec
     aborted.state = kivi_state::TxnState::Aborted;
     let () = super::compound::handle_guard_abort(
         node,
-        record.coordinator,
+        record_tablet,
         record_key,
         aborted.encode(),
         version,

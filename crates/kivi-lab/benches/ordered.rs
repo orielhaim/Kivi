@@ -52,6 +52,7 @@ fn start_ordered() -> LocalEngine {
         worker_count: 2,
         request_capacity: 4096,
         chunks: kivi_engine::ChunkFabricConfig::default(),
+        fabric: kivi_engine::FabricConfig::default(),
         network: Some(EngineNetwork {
             base_port: 0,
             ports: Vec::new(),

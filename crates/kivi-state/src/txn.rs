@@ -213,6 +213,9 @@ const TAG_WRITE_COMMUTATIVE_ADD: u8 = 5;
 const TAG_WRITE_BOUNDED_ADD: u8 = 6;
 /// Escrow share-move tag (one side of a paired transfer).
 const TAG_WRITE_ESCROW_SHARE: u8 = 7;
+/// Fabric-put tag: a medium value staged in the fabric before prepare,
+/// referenced by id. New tags never reuse old ones.
+const TAG_WRITE_PUT_FABRIC: u8 = 8;
 
 impl Encode for TxnWriteKind {
     fn encoded_len(&self) -> usize {
@@ -221,6 +224,7 @@ impl Encode for TxnWriteKind {
             Self::Delete => 1,
             Self::CounterAdd(_) | Self::CommutativeAdd(_) | Self::BoundedAdd(_) => 1 + 8,
             Self::PutChunked { .. } => 1 + 32 + 8,
+            Self::PutFabric { .. } => 1 + 8 + 8 + 8,
             Self::EscrowSetShare { .. } => 1 + 8 + 8,
         }
     }
@@ -243,6 +247,16 @@ impl Encode for TxnWriteKind {
                 out.push(TAG_WRITE_PUT_CHUNKED);
                 out.extend_from_slice(manifest.as_bytes());
                 out.extend_from_slice(&logical_len.to_le_bytes());
+            }
+            Self::PutFabric {
+                fabric_id,
+                logical_len,
+                version,
+            } => {
+                out.push(TAG_WRITE_PUT_FABRIC);
+                out.extend_from_slice(&fabric_id.to_le_bytes());
+                out.extend_from_slice(&logical_len.to_le_bytes());
+                out.extend_from_slice(&version.to_le_bytes());
             }
             Self::CommutativeAdd(delta) => {
                 out.push(TAG_WRITE_COMMUTATIVE_ADD);
@@ -283,6 +297,19 @@ impl Decode for TxnWriteKind {
                         logical_len: u64::from_le_bytes(len_raw),
                     },
                     first + second + third,
+                ))
+            }
+            TAG_WRITE_PUT_FABRIC => {
+                let (id_raw, second) = <[u8; 8]>::decode(&input[first..])?;
+                let (len_raw, third) = <[u8; 8]>::decode(&input[first + second..])?;
+                let (ver_raw, fourth) = <[u8; 8]>::decode(&input[first + second + third..])?;
+                Ok((
+                    Self::PutFabric {
+                        fabric_id: u64::from_le_bytes(id_raw),
+                        logical_len: u64::from_le_bytes(len_raw),
+                        version: u64::from_le_bytes(ver_raw),
+                    },
+                    first + second + third + fourth,
                 ))
             }
             TAG_WRITE_COMMUTATIVE_ADD => {
@@ -354,6 +381,19 @@ pub enum TxnWriteKind {
         /// Total logical bytes across the manifest.
         logical_len: u64,
     },
+    /// Store a staged medium value by fabric reference (the fabric
+    /// spelling of [`Put`](Self::Put)). The engine stages the bytes into
+    /// the fabric and proves the materialization *before* prepare, so a
+    /// later Commit can never meet a durable root with unavailable
+    /// payload.
+    PutFabric {
+        /// Fabric-scoped object id assigned at staging.
+        fabric_id: u64,
+        /// Total logical bytes of the materialized value.
+        logical_len: u64,
+        /// Logical version the bytes were published at (pins reads).
+        version: u64,
+    },
     /// Remove the key.
     Delete,
     /// Add to a strict counter (prepared deterministically: overflow fails at
@@ -384,6 +424,7 @@ impl TxnWrite {
         let payload = match &self.kind {
             TxnWriteKind::Put(value) => value.len(),
             TxnWriteKind::PutChunked { .. } => 40,
+            TxnWriteKind::PutFabric { .. } => 24,
             TxnWriteKind::Delete
             | TxnWriteKind::CounterAdd(_)
             | TxnWriteKind::CommutativeAdd(_)
@@ -691,6 +732,16 @@ pub fn write_set_digest(writes: &[TxnWrite], namespace: NamespaceId) -> [u8; 32]
                 hasher.update(manifest.as_bytes());
                 hasher.update(&logical_len.to_le_bytes());
             }
+            TxnWriteKind::PutFabric {
+                fabric_id,
+                logical_len,
+                version,
+            } => {
+                hasher.update(&[8]);
+                hasher.update(&fabric_id.to_le_bytes());
+                hasher.update(&logical_len.to_le_bytes());
+                hasher.update(&version.to_le_bytes());
+            }
             TxnWriteKind::Delete => {
                 hasher.update(&[2]);
             }
@@ -881,6 +932,9 @@ pub fn txn_write_from_wire(
         // Wire tags mirror `BATCH_*` in kivi-protocol (1/2/3); matched
         // numerically so kivi-state never depends on the protocol crate.
         // 4/5/6 extend the same space for chunked and semantic counters.
+        // There is deliberately no wire tag for staged fabric values:
+        // fabric ids are worker-local names and must never cross the
+        // wire (staging happens past the boundary, on the owner).
         1 => TxnWriteKind::Put(Bytes::from(value)),
         2 => TxnWriteKind::Delete,
         3 => TxnWriteKind::CounterAdd(delta),

@@ -29,6 +29,7 @@ use crate::chunk_lane::{
     split_large_set,
 };
 use crate::commit::{BatchPolicy, CommitCoordinator, PendingEntry};
+use crate::fabric::TabletFabric;
 use crate::net::NetStartError;
 
 use crate::tablet::{LiveTablet, TabletError};
@@ -144,12 +145,20 @@ fn admit_drained(
     metrics: &core::cell::Cell<WorkerMetrics>,
     durability: &mut Option<WorkerDurability>,
     chunks: &WorkerChunks,
+    fabric: &mut TabletFabric,
     requests: &Receiver<TabletRequest>,
 ) {
-    handle_request(first, tablets, metrics, durability.as_mut(), chunks);
+    handle_request(first, tablets, metrics, durability.as_mut(), chunks, fabric);
     for _ in 0..REQUEST_DRAIN_PER_WAKE {
         match requests.try_recv() {
-            Ok(request) => handle_request(request, tablets, metrics, durability.as_mut(), chunks),
+            Ok(request) => handle_request(
+                request,
+                tablets,
+                metrics,
+                durability.as_mut(),
+                chunks,
+                fabric,
+            ),
             Err(_) => break,
         }
     }
@@ -204,6 +213,12 @@ pub enum WorkerRequestError {
     /// continue where safe.
     #[error("chunk fabric failed: {0}")]
     ChunkStore(#[source] kivi_chunk::ChunkError),
+    /// Memory Fabric staging, promotion, or resolution failed; logical
+    /// state is untouched (staging precedes admission) or reads continue
+    /// where safe. Saturation surfaces upstream as backpressure, never
+    /// as a logical error.
+    #[error("memory fabric failed: {0}")]
+    Fabric(#[source] crate::fabric::FabricError),
     /// The request is not admittable (absurd range, oversize patch):
     /// caller bug, state untouched, never persisted — fix and retry.
     #[error("invalid request: {detail}")]
@@ -252,11 +267,12 @@ impl WorkerDurability {
         policy: BatchPolicy,
         lane: LaneAccess,
         initial_stats: WorkerLaneStats,
+        seal_store: Option<crate::commit::FabricSealStore>,
     ) -> Result<Self, DurabilityError> {
         Ok(Self {
             namespace,
             worker,
-            commit: CommitCoordinator::spawn(policy, lane, initial_stats)?,
+            commit: CommitCoordinator::spawn(policy, lane, initial_stats, seal_store)?,
         })
     }
 
@@ -355,6 +371,38 @@ pub enum WorkerControl {
         /// Where the intent pairs go.
         respond: Sender<Vec<(TabletId, kivi_state::TxnIntent)>>,
     },
+    /// Report live fabric ids on owned tablets: live roots plus prepared
+    /// intent references plus open/in-flight batch payloads. The
+    /// checkpoint worker compacts fabric journals against the union
+    /// across workers (plus band-referenced ids it reads itself), so
+    /// records for ids nothing names anymore can be reclaimed.
+    FabricLiveRoots {
+        /// Where the live id set goes.
+        respond: Sender<std::collections::HashSet<u64>>,
+    },
+    /// Report the worker's fabric observability: snapshot, per-tablet
+    /// footprints, and queue depths. Served from the control channel;
+    /// per-tablet attribution covers roots and prepared intents (sealed
+    /// but unapplied payloads count in worker totals only).
+    FabricStats {
+        /// Where the report goes.
+        respond: Sender<FabricWorkerReport>,
+    },
+}
+
+/// Per-worker fabric observability for the admin plane.
+#[derive(Debug, Clone)]
+pub struct FabricWorkerReport {
+    /// Fabric counters and gauges.
+    pub fabric: crate::fabric::FabricStatsSnapshot,
+    /// Per-tablet footprints `(tablet, bytes by residence)`.
+    pub tablets: Vec<(TabletId, kivi_memory::Footprint)>,
+    /// Off-core planner queue depth `(queued, submitted)`.
+    pub offcore_depth: (usize, usize),
+    /// Background move queue depth.
+    pub move_depth: usize,
+    /// Arena pressure in `[0, 1]`.
+    pub arena_pressure: f64,
 }
 
 /// Chunk lane access for one worker: the lane handle, the representation
@@ -418,7 +466,9 @@ impl WorkerHandle {
     /// queue of `request_capacity`. `durability` is `None` in ephemeral
     /// mode; in durable mode the worker owns its WAL lane exclusively.
     /// `chunks` is this worker's chunk lane access plus the representation
-    /// policy (both modes stage large values through it).
+    /// policy (both modes stage large values through it). `fabric` is
+    /// this worker's Memory Fabric integration (medium values stage,
+    /// resolve, and retire through it on the owner thread).
     ///
     /// # Panics
     ///
@@ -431,6 +481,7 @@ impl WorkerHandle {
         request_capacity: usize,
         durability: Option<WorkerDurability>,
         chunks: WorkerChunks,
+        fabric: TabletFabric,
     ) -> Self {
         let (request_tx, request_rx) = bounded::<TabletRequest>(request_capacity.max(1));
         let (control_tx, control_rx) = bounded::<WorkerControl>(CONTROL_CAPACITY);
@@ -440,7 +491,11 @@ impl WorkerHandle {
         let (bridge, _unbridged) = BridgeWaker::channel();
         let thread = thread::Builder::new()
             .name(format!("kivi-worker-{}", id.as_u64()))
-            .spawn(move || run(id, tablets, request_rx, control_rx, durability, chunks))
+            .spawn(move || {
+                run(
+                    id, tablets, request_rx, control_rx, durability, chunks, fabric,
+                );
+            })
             .expect("worker thread spawns");
         Self {
             id,
@@ -542,6 +597,7 @@ impl WorkerHandle {
         request_capacity: usize,
         durability: Option<WorkerDurability>,
         chunks: WorkerChunks,
+        fabric: TabletFabric,
         launch: crate::net::NetLaunch,
     ) -> Result<(Self, SocketAddr), NetStartError> {
         let (request_tx, request_rx) = bounded::<TabletRequest>(request_capacity.max(1));
@@ -555,7 +611,7 @@ impl WorkerHandle {
             .name(format!("kivi-worker-{}", id.as_u64()))
             .spawn(move || {
                 crate::net::run_net(
-                    id, tablets, request_rx, control_rx, durability, chunks, launch, woken,
+                    id, tablets, request_rx, control_rx, durability, chunks, fabric, launch, woken,
                     ready_tx,
                 );
             })
@@ -612,7 +668,7 @@ impl fmt::Debug for WorkerHandle {
 /// Requests drain boundedly per wake (not one per wake) so concurrent
 /// embedded clients accumulate into shared batches instead of sealing
 /// alone one wake at a time.
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 fn run(
     id: WorkerId,
     tablets: Vec<LiveTablet>,
@@ -620,6 +676,7 @@ fn run(
     control: Receiver<WorkerControl>,
     mut durability: Option<WorkerDurability>,
     chunks: WorkerChunks,
+    mut fabric: TabletFabric,
 ) {
     let _ = id;
     let metrics = core::cell::Cell::new(WorkerMetrics::default());
@@ -627,22 +684,31 @@ fn run(
         .into_iter()
         .map(|tablet| (tablet.id(), tablet))
         .collect();
-    // Pumps the coordinator once (no-op in ephemeral mode).
+    // Pumps the coordinator once (no-op in ephemeral mode) plus amortized
+    // fabric maintenance (planning slice, lane submissions, retire sweep).
     let pump = |tablets: &mut HashMap<TabletId, LiveTablet>,
-                durability: Option<&mut WorkerDurability>| {
+                durability: Option<&mut WorkerDurability>,
+                fabric: &mut TabletFabric| {
         if let Some(durable) = durability {
             let namespace = durable.namespace;
-            durable.commit.poll(tablets, namespace);
+            durable.commit.poll(tablets, namespace, fabric);
         }
+        fabric.maintenance_if_due();
     };
     loop {
         // Control fast path: administration never waits behind requests.
         if let Ok(message) = control.try_recv() {
-            if !handle_control(message, &mut tablets, &metrics, durability.as_ref()) {
-                flush_for_shutdown(&mut tablets, durability.as_mut());
+            if !handle_control(
+                message,
+                &mut tablets,
+                &metrics,
+                durability.as_ref(),
+                &mut fabric,
+            ) {
+                flush_for_shutdown(&mut tablets, durability.as_mut(), &mut fabric);
                 break;
             }
-            pump(&mut tablets, durability.as_mut());
+            pump(&mut tablets, durability.as_mut(), &mut fabric);
             continue;
         }
         if durability
@@ -653,8 +719,8 @@ fn run(
                 recv(control) -> message => {
                     match message {
                         Ok(message) => {
-                            if !handle_control(message, &mut tablets, &metrics, durability.as_ref()) {
-                                flush_for_shutdown(&mut tablets, durability.as_mut());
+                            if !handle_control(message, &mut tablets, &metrics, durability.as_ref(), &mut fabric) {
+                                flush_for_shutdown(&mut tablets, durability.as_mut(), &mut fabric);
                                 break;
                             }
                         }
@@ -664,7 +730,7 @@ fn run(
                 }
                 recv(requests) -> message => {
                     match message {
-                        Ok(request) => admit_drained(request, &mut tablets, &metrics, &mut durability, &chunks, &requests),
+                        Ok(request) => admit_drained(request, &mut tablets, &metrics, &mut durability, &chunks, &mut fabric, &requests),
                         // All clients gone: exit cleanly.
                         Err(_) => break,
                     }
@@ -676,8 +742,8 @@ fn run(
                 recv(control) -> message => {
                     match message {
                         Ok(message) => {
-                            if !handle_control(message, &mut tablets, &metrics, durability.as_ref()) {
-                                flush_for_shutdown(&mut tablets, durability.as_mut());
+                            if !handle_control(message, &mut tablets, &metrics, durability.as_ref(), &mut fabric) {
+                                flush_for_shutdown(&mut tablets, durability.as_mut(), &mut fabric);
                                 break;
                             }
                         }
@@ -687,14 +753,14 @@ fn run(
                 }
                 recv(requests) -> message => {
                     match message {
-                        Ok(request) => admit_drained(request, &mut tablets, &metrics, &mut durability, &chunks, &requests),
+                        Ok(request) => admit_drained(request, &mut tablets, &metrics, &mut durability, &chunks, &mut fabric, &requests),
                         // All clients gone: exit cleanly.
                         Err(_) => break,
                     }
                 }
             }
         }
-        pump(&mut tablets, durability.as_mut());
+        pump(&mut tablets, durability.as_mut(), &mut fabric);
     }
 }
 
@@ -704,10 +770,77 @@ fn run(
 fn flush_for_shutdown(
     tablets: &mut HashMap<TabletId, LiveTablet>,
     durability: Option<&mut WorkerDurability>,
+    fabric: &mut TabletFabric,
 ) {
     if let Some(durable) = durability {
         let namespace = durable.namespace;
-        durable.commit.flush_blocking(tablets, namespace);
+        durable.commit.flush_blocking(tablets, namespace, fabric);
+    }
+}
+
+/// Live fabric ids per owned tablet: committed roots plus prepared
+/// intent references. Shared by journal GC marking and observability;
+/// in-flight batch payloads (sealed but unapplied) join at the call
+/// site that can see the commit coordinator.
+fn tablet_fabric_roots(
+    tablets: &HashMap<TabletId, LiveTablet>,
+) -> HashMap<TabletId, std::collections::HashSet<u64>> {
+    let mut out: HashMap<TabletId, std::collections::HashSet<u64>> = HashMap::new();
+    for live in tablets.values() {
+        let entry = out.entry(live.id()).or_default();
+        for (_, object) in live.store().snapshot_entries() {
+            if let Some(reference) = object.fabric_ref() {
+                entry.insert(reference.id);
+            }
+        }
+        for intent in live.store().snapshot_intents() {
+            if let kivi_state::TxnWriteKind::PutFabric { fabric_id, .. } = &intent.write.kind {
+                entry.insert(*fabric_id);
+            }
+        }
+    }
+    out
+}
+
+/// Live fabric ids across owned tablets for journal GC: committed
+/// roots plus prepared intent references plus open/in-flight batch
+/// payloads. The union is exactly what journal GC must keep.
+fn fabric_live_roots(
+    tablets: &HashMap<TabletId, LiveTablet>,
+    durability: Option<&WorkerDurability>,
+) -> std::collections::HashSet<u64> {
+    // Roots name committed ids; prepared intents name staged ids
+    // whose seal rides an upcoming finalize; open/in-flight batch
+    // payloads name sealed-but-unapplied ids.
+    let mut live: std::collections::HashSet<u64> = tablet_fabric_roots(tablets)
+        .into_values()
+        .flatten()
+        .collect();
+    if let Some(durable) = durability {
+        live.extend(durable.commit.pending_fabric_ids());
+    }
+    live
+}
+
+/// Builds one worker's fabric observability report: snapshot,
+/// per-tablet footprints, and queue depths.
+fn fabric_stats_report(
+    tablets: &HashMap<TabletId, LiveTablet>,
+    fabric: &mut crate::fabric::TabletFabric,
+) -> FabricWorkerReport {
+    let roots = tablet_fabric_roots(tablets);
+    let snapshot = fabric.stats_snapshot();
+    let memory = fabric.fabric_mut();
+    let tablets_report = roots
+        .iter()
+        .map(|(tablet, ids)| (*tablet, memory.footprint_for(ids)))
+        .collect();
+    FabricWorkerReport {
+        fabric: snapshot,
+        tablets: tablets_report,
+        offcore_depth: memory.offcore_depth(),
+        move_depth: memory.move_depth(),
+        arena_pressure: memory.pressure(),
     }
 }
 
@@ -717,6 +850,7 @@ pub(crate) fn handle_control(
     tablets: &mut HashMap<TabletId, LiveTablet>,
     metrics: &core::cell::Cell<WorkerMetrics>,
     durability: Option<&WorkerDurability>,
+    fabric: &mut crate::fabric::TabletFabric,
 ) -> bool {
     match message {
         WorkerControl::Shutdown => false,
@@ -798,6 +932,14 @@ pub(crate) fn handle_control(
             let _ = respond.try_send(intents);
             true
         }
+        WorkerControl::FabricLiveRoots { respond } => {
+            let _ = respond.try_send(fabric_live_roots(tablets, durability));
+            true
+        }
+        WorkerControl::FabricStats { respond } => {
+            let _ = respond.try_send(fabric_stats_report(tablets, fabric));
+            true
+        }
     }
 }
 
@@ -827,6 +969,11 @@ pub(crate) fn peek_range_base(
             kivi_state::LogicalValue::Chunked(chunked) => RangeBase::Chunked {
                 manifest: chunked.manifest,
                 logical_len: chunked.logical_len,
+            },
+            kivi_state::LogicalValue::Fabric(fabric) => RangeBase::Fabric {
+                fabric_id: fabric.id,
+                logical_len: fabric.logical_len,
+                version: fabric.version,
             },
         },
     }
@@ -967,6 +1114,179 @@ fn stage_value_work(
     }
 }
 
+/// Maps a fabric failure onto the request error surface: saturation is
+/// retryable backpressure, everything else fails the single operation
+/// closed with logical state untouched.
+fn map_fabric_error(error: crate::fabric::FabricError) -> WorkerRequestError {
+    match error {
+        crate::fabric::FabricError::Overloaded => WorkerRequestError::SessionOverloaded,
+        other => WorkerRequestError::Fabric(other),
+    }
+}
+
+/// Stages one transactional write's medium inline payload into the
+/// fabric, rewriting it as a `PutFabric` reference. Carried `PutFabric`
+/// references pass through for proving below. Returns the rewritten
+/// write plus its seal when staging happened; `None` means the request
+/// already answered with state untouched.
+#[allow(clippy::too_many_arguments)]
+fn stage_txn_write(
+    tablet: TabletId,
+    write: kivi_state::TxnWrite,
+    chunks: &WorkerChunks,
+    fabric: &mut crate::fabric::TabletFabric,
+    metrics: &core::cell::Cell<WorkerMetrics>,
+    respond: &Sender<WorkerResponse>,
+) -> Result<Option<(kivi_state::TxnWrite, Option<crate::fabric::StagedSeal>)>, ()> {
+    fn failed(
+        metrics: &core::cell::Cell<WorkerMetrics>,
+        respond: &Sender<WorkerResponse>,
+        error: WorkerRequestError,
+    ) -> Result<Option<(kivi_state::TxnWrite, Option<crate::fabric::StagedSeal>)>, ()> {
+        let mut snapshot = metrics.get();
+        snapshot.channel_ops += 1;
+        metrics.set(snapshot);
+        let _ = respond.try_send(Err(error));
+        Err(())
+    }
+    match write.kind {
+        kivi_state::TxnWriteKind::Put(value)
+            if value.len() > crate::fabric::FABRIC_INLINE_MAX
+                && (value.len() as u64) <= chunks.inline_threshold =>
+        {
+            let (fabric_id, logical_len) = match fabric.stage(tablet, value.clone(), true) {
+                Ok(staged) => staged,
+                Err(error) => return failed(metrics, respond, map_fabric_error(error)),
+            };
+            Ok(Some((
+                kivi_state::TxnWrite {
+                    key: write.key.clone(),
+                    kind: kivi_state::TxnWriteKind::PutFabric {
+                        fabric_id,
+                        logical_len,
+                        version: 0,
+                    },
+                    expect: write.expect,
+                },
+                Some(crate::fabric::StagedSeal {
+                    fabric_id,
+                    key: write.key.clone(),
+                    bytes: value,
+                }),
+            )))
+        }
+        _ => Ok(Some((write, None))),
+    }
+}
+
+/// Attaches a commit-finalize's prepared intent bytes as a seal payload:
+/// the intent's staged fabric id re-seals under the predicted
+/// authoritative version at prepare time, superseding the staging record
+/// from `TxnPrepare`. Reads through any valid residence (prepared ids
+/// stay pinned arena-resident, so this is synchronous on the common
+/// path). Aborts, non-fabric intents, and missing intents attach nothing
+/// (prepare resolves those terminally). Returns `None` when the request
+/// already answered: a dangling intent reference fails closed, never
+/// commits.
+fn seal_finalize_intent(
+    op: Operation,
+    tablets: &HashMap<TabletId, LiveTablet>,
+    tablet: TabletId,
+    fabric: &mut crate::fabric::TabletFabric,
+    metrics: &core::cell::Cell<WorkerMetrics>,
+    respond: &Sender<WorkerResponse>,
+) -> Option<(
+    Operation,
+    Vec<crate::chunk_lane::PinnedUpload>,
+    Vec<crate::fabric::StagedSeal>,
+)> {
+    let (commit, key) = match &op {
+        Operation::TxnFinalize { commit, key, .. } => (*commit, key.clone()),
+        _ => return Some((op, Vec::new(), Vec::new())),
+    };
+    if !commit {
+        // Aborts publish nothing; apply releases the prepared pin.
+        return Some((op, Vec::new(), Vec::new()));
+    }
+    let fabric_id = tablets
+        .get(&tablet)
+        .and_then(|live| live.store().intent_for_key(&key))
+        .and_then(|intent| match &intent.write.kind {
+            kivi_state::TxnWriteKind::PutFabric { fabric_id, .. } => Some(*fabric_id),
+            _ => None,
+        });
+    let Some(fabric_id) = fabric_id else {
+        // No fabric intent here: prepare resolves missing/conflicting
+        // intents terminally without touching the fabric.
+        return Some((op, Vec::new(), Vec::new()));
+    };
+    match fabric.read_anywhere(fabric_id) {
+        Ok(bytes) => Some((
+            op,
+            Vec::new(),
+            vec![crate::fabric::StagedSeal {
+                fabric_id,
+                key: key.clone(),
+                bytes,
+            }],
+        )),
+        Err(error) => {
+            let mut snapshot = metrics.get();
+            snapshot.channel_ops += 1;
+            metrics.set(snapshot);
+            let _ = respond.try_send(Err(map_fabric_error(error)));
+            None
+        }
+    }
+}
+
+/// Proves every fabric reference a transaction carries names live local
+/// bytes (staged uploads and committed materializations alike): a
+/// dangling root is rejected loudly before any participant may say
+/// Prepared, so a later Commit can never meet missing payload.
+fn verify_txn_fabric_refs(
+    op: &Operation,
+    fabric: &mut crate::fabric::TabletFabric,
+    metrics: &core::cell::Cell<WorkerMetrics>,
+    respond: &Sender<WorkerResponse>,
+) -> Result<(), ()> {
+    fn failed(
+        metrics: &core::cell::Cell<WorkerMetrics>,
+        respond: &Sender<WorkerResponse>,
+        detail: String,
+    ) -> Result<(), ()> {
+        let mut snapshot = metrics.get();
+        snapshot.channel_ops += 1;
+        metrics.set(snapshot);
+        let _ = respond.try_send(Err(WorkerRequestError::InvalidRequest { detail }));
+        Err(())
+    }
+    let refs: Vec<u64> = match op {
+        Operation::TxnPrepare { write, .. } => match &write.kind {
+            kivi_state::TxnWriteKind::PutFabric { fabric_id, .. } => vec![*fabric_id],
+            _ => Vec::new(),
+        },
+        Operation::TxnCommitLocal { writes, .. } => writes
+            .iter()
+            .filter_map(|write| match &write.kind {
+                kivi_state::TxnWriteKind::PutFabric { fabric_id, .. } => Some(*fabric_id),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    for fabric_id in refs {
+        if fabric.read_anywhere(fabric_id).is_err() {
+            return failed(
+                metrics,
+                respond,
+                format!("transactional fabric write references unavailable payload: {fabric_id}"),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Proves every chunked reference a transaction carries names durable
 /// local payload (staged uploads and committed packs alike): a dangling
 /// root is rejected loudly before any participant may say Prepared, so a
@@ -1042,6 +1362,167 @@ fn stage_restaged(
     )
 }
 
+/// Stages one medium value into the fabric (blocking lane-free call —
+/// plain worker threads only; the reactor bridge defers through its
+/// continuation queue instead) and rewrites it as a small `SetFabric`
+/// root. Answers the failure and reports `Err(())` with state untouched
+/// when staging fails (usually bounded-capacity backpressure).
+#[allow(clippy::too_many_arguments)]
+fn stage_fabric_value(
+    tablet: TabletId,
+    key: &kivi_state::Key,
+    value: bytes::Bytes,
+    hot: bool,
+    fabric: &mut crate::fabric::TabletFabric,
+    metrics: &core::cell::Cell<WorkerMetrics>,
+    respond: &Sender<WorkerResponse>,
+) -> Result<(Operation, crate::fabric::StagedSeal), ()> {
+    fn failed(
+        metrics: &core::cell::Cell<WorkerMetrics>,
+        respond: &Sender<WorkerResponse>,
+        error: WorkerRequestError,
+    ) -> Result<(Operation, crate::fabric::StagedSeal), ()> {
+        let mut snapshot = metrics.get();
+        snapshot.channel_ops += 1;
+        metrics.set(snapshot);
+        let _ = respond.try_send(Err(error));
+        Err(())
+    }
+    let (fabric_id, logical_len) = match fabric.stage(tablet, value.clone(), hot) {
+        Ok(staged) => staged,
+        Err(crate::fabric::FabricError::Overloaded) => {
+            return failed(metrics, respond, WorkerRequestError::SessionOverloaded);
+        }
+        Err(_) => {
+            return failed(
+                metrics,
+                respond,
+                WorkerRequestError::InvalidRequest {
+                    detail: "memory fabric staging unavailable".to_owned(),
+                },
+            );
+        }
+    };
+    Ok((
+        Operation::SetFabric {
+            key: key.clone(),
+            fabric_id,
+            logical_len,
+            version: 0,
+        },
+        crate::fabric::StagedSeal {
+            fabric_id,
+            key: key.clone(),
+            bytes: value,
+        },
+    ))
+}
+
+/// Stages one medium conditional value, preserving condition and expiry
+/// policy for atomic evaluation at prepare.
+#[allow(clippy::too_many_arguments)]
+fn stage_fabric_conditional(
+    tablet: TabletId,
+    key: &kivi_state::Key,
+    value: bytes::Bytes,
+    condition: kivi_state::SetCondition,
+    expiry: kivi_state::ExpiryPolicy,
+    fabric: &mut crate::fabric::TabletFabric,
+    metrics: &core::cell::Cell<WorkerMetrics>,
+    respond: &Sender<WorkerResponse>,
+) -> Result<(Operation, crate::fabric::StagedSeal), ()> {
+    fn failed(
+        metrics: &core::cell::Cell<WorkerMetrics>,
+        respond: &Sender<WorkerResponse>,
+        error: WorkerRequestError,
+    ) -> Result<(Operation, crate::fabric::StagedSeal), ()> {
+        let mut snapshot = metrics.get();
+        snapshot.channel_ops += 1;
+        metrics.set(snapshot);
+        let _ = respond.try_send(Err(error));
+        Err(())
+    }
+    let (fabric_id, logical_len) = match fabric.stage(tablet, value.clone(), true) {
+        Ok(staged) => staged,
+        Err(crate::fabric::FabricError::Overloaded) => {
+            return failed(metrics, respond, WorkerRequestError::SessionOverloaded);
+        }
+        Err(_) => {
+            return failed(
+                metrics,
+                respond,
+                WorkerRequestError::InvalidRequest {
+                    detail: "memory fabric staging unavailable".to_owned(),
+                },
+            );
+        }
+    };
+    Ok((
+        Operation::SetConditionalFabric {
+            key: key.clone(),
+            fabric_id,
+            logical_len,
+            version: 0,
+            condition,
+            expiry,
+        },
+        crate::fabric::StagedSeal {
+            fabric_id,
+            key: key.clone(),
+            bytes: value,
+        },
+    ))
+}
+
+/// Resolves one prepared outcome for the channel path: fabric references
+/// serve through the lane (blocking promotion on plain threads), every
+/// other outcome passes through untouched. Synchronous with the prepare
+/// on this thread, so the root cannot move underneath the resolve; a
+/// mismatch fails closed as a retryable error. `GetRange` windows slice
+/// the resolved bytes, exactly like the durable fast path.
+fn resolve_channel_outcome(
+    tablet: TabletId,
+    key: &kivi_state::Key,
+    now: UnixMicros,
+    op: &Operation,
+    outcome: OperationResult,
+    tablets: &HashMap<TabletId, LiveTablet>,
+    fabric: &mut crate::fabric::TabletFabric,
+) -> WorkerResponse {
+    let OperationResult::FabricValue {
+        fabric_id, version, ..
+    } = outcome
+    else {
+        return Ok(outcome);
+    };
+    let range = match op {
+        Operation::GetRange { offset, len, .. } => Some((*offset, *len)),
+        _ => None,
+    };
+    let current = tablets
+        .get(&tablet)
+        .and_then(|live| live.store().get(key, now));
+    let reference = kivi_state::FabricRef {
+        id: fabric_id,
+        logical_len: current
+            .as_ref()
+            .and_then(|object| object.fabric_ref())
+            .map_or(0, |live| live.logical_len),
+        version,
+    };
+    match fabric.promote_blocking(&reference, current) {
+        Ok(bytes) => {
+            let shaped = match range {
+                Some((offset, len)) => kivi_state::slice_range(&bytes, offset, len),
+                None => bytes,
+            };
+            Ok(OperationResult::Value(Some(shaped)))
+        }
+        Err(crate::fabric::FabricError::Overloaded) => Err(WorkerRequestError::SessionOverloaded),
+        Err(error) => Err(WorkerRequestError::Fabric(error)),
+    }
+}
+
 /// Namespace for checkpoint captures (durable workers serve exactly one).
 fn capture_namespace(durability: Option<&WorkerDurability>) -> NamespaceId {
     durability.map_or(NamespaceId::from_u64(0), |durable| durable.namespace)
@@ -1050,73 +1531,265 @@ fn capture_namespace(durability: Option<&WorkerDurability>) -> NamespaceId {
 /// Executes one request: ephemeral tablets run inline; durable requests
 /// join the commit coordinator's admission queue and complete when their
 /// batch proves durable. Large legacy `Set`s convert to staged chunked
-/// roots first (blocking lane call — plain worker threads only; the
-/// reactor bridge defers through its continuation queue instead). Reads
-/// may complete as [`ChunkedValue`](OperationResult::ChunkedValue): the
-/// caller resolves those through the lane (async on the reactor, blocking
-/// on caller threads). A dropped responder (client gone) only drops the
+/// roots first, medium `Set`s to staged fabric roots (blocking calls —
+/// plain worker threads only; the reactor bridge defers through its
+/// continuation queue instead). Reads may complete as
+/// [`ChunkedValue`](OperationResult::ChunkedValue) or
+/// [`FabricValue`](OperationResult::FabricValue): the caller resolves
+/// those through the lane/fabric (async on the reactor, blocking on
+/// caller threads). A dropped responder (client gone) only drops the
 /// outcome.
+/// Resolves a range base for planning: fabric bases read through
+/// directly (blocking direct read on plain threads: no promotion, no
+/// placement change), everything else plans as-is. `None` means the
+/// request already answered with state untouched.
+fn resolve_range_base(
+    tablets: &HashMap<TabletId, LiveTablet>,
+    tablet: TabletId,
+    key: &kivi_state::Key,
+    now: UnixMicros,
+    fabric: &mut crate::fabric::TabletFabric,
+    metrics: &core::cell::Cell<WorkerMetrics>,
+    respond: &Sender<WorkerResponse>,
+) -> Option<RangeBase> {
+    match peek_range_base(tablets, tablet, key, now) {
+        RangeBase::Fabric { fabric_id, .. } => match fabric.read_anywhere(fabric_id) {
+            Ok(bytes) => Some(RangeBase::Inline(bytes)),
+            Err(error) => {
+                let mut snapshot = metrics.get();
+                snapshot.channel_ops += 1;
+                metrics.set(snapshot);
+                let _ = respond.try_send(Err(map_fabric_error(error)));
+                None
+            }
+        },
+        other => Some(other),
+    }
+}
+
+/// Stages one `SetRange` request: resolves a fabric base first (blocking
+/// direct read on plain threads: no promotion, no placement change),
+/// plans against the resolved bytes, and stages the result back through
+/// the size split. `None` means the request already answered with state
+/// untouched.
+#[allow(clippy::too_many_arguments)]
+fn stage_range_request(
+    tablet: TabletId,
+    key: kivi_state::Key,
+    offset: u64,
+    patch: bytes::Bytes,
+    tablets: &HashMap<TabletId, LiveTablet>,
+    now: UnixMicros,
+    chunks: &WorkerChunks,
+    fabric: &mut crate::fabric::TabletFabric,
+    metrics: &core::cell::Cell<WorkerMetrics>,
+    respond: &Sender<WorkerResponse>,
+) -> Option<(
+    Operation,
+    Vec<crate::chunk_lane::PinnedUpload>,
+    Vec<crate::fabric::StagedSeal>,
+)> {
+    let base = resolve_range_base(tablets, tablet, &key, now, fabric, metrics, respond)?;
+    match plan_set_range(key, offset, patch, base, chunks.inline_threshold) {
+        SetRangePlan::Inline(op) => Some((op, Vec::new(), Vec::new())),
+        SetRangePlan::Reject { detail } => {
+            let mut snapshot = metrics.get();
+            snapshot.channel_ops += 1;
+            metrics.set(snapshot);
+            let _ = respond.try_send(Err(WorkerRequestError::InvalidRequest { detail }));
+            None
+        }
+        SetRangePlan::RestageSet { key, value } => {
+            stage_restaged_set(tablet, &key, value, chunks, fabric, metrics, respond)
+        }
+        SetRangePlan::Splice {
+            key,
+            manifest,
+            logical_len,
+            offset,
+            patch,
+        } => match stage_value_work(
+            &key,
+            StageWork::Splice {
+                manifest,
+                logical_len,
+                offset,
+                patch,
+            },
+            chunks,
+            metrics,
+            respond,
+        ) {
+            Ok((staged, pin)) => Some((staged, pin.into_iter().collect(), Vec::new())),
+            Err(()) => None,
+        },
+    }
+}
+
+/// Stages one restaged range result back through the size split: a
+/// medium result stages into the fabric (preserving expiry exactly like
+/// the chunked restage does), anything else rides the chunk path.
+/// `None` means the request already answered with state untouched.
+fn stage_restaged_set(
+    tablet: TabletId,
+    key: &kivi_state::Key,
+    value: bytes::Bytes,
+    chunks: &WorkerChunks,
+    fabric: &mut crate::fabric::TabletFabric,
+    metrics: &core::cell::Cell<WorkerMetrics>,
+    respond: &Sender<WorkerResponse>,
+) -> Option<(
+    Operation,
+    Vec<crate::chunk_lane::PinnedUpload>,
+    Vec<crate::fabric::StagedSeal>,
+)> {
+    // Restaged results re-enter the size split so a
+    // medium result stages into the fabric (preserving
+    // expiry exactly like the chunked restage does).
+    if value.len() > crate::fabric::FABRIC_INLINE_MAX
+        && (value.len() as u64) <= chunks.inline_threshold
+    {
+        match stage_fabric_conditional(
+            tablet,
+            key,
+            value,
+            SetCondition::Always,
+            ExpiryPolicy::Keep,
+            fabric,
+            metrics,
+            respond,
+        ) {
+            Ok((staged, seal)) => Some((staged, Vec::new(), vec![seal])),
+            Err(()) => None,
+        }
+    } else {
+        match stage_restaged(key, value, chunks, metrics, respond) {
+            Ok((staged, pin)) => Some((staged, pin.into_iter().collect(), Vec::new())),
+            Err(()) => None,
+        }
+    }
+}
+
+/// Stages every write of a same-tablet atomic batch, collecting the
+/// fabric seals the later `Commit` must persist. Any single staging
+/// failure answers and rejects the whole batch (`None`). Kept beside
+/// [`stage_request_representation`] so the admission match stays
+/// reviewable.
+fn stage_txn_batch(
+    tablet: TabletId,
+    writes: Vec<kivi_state::TxnWrite>,
+    chunks: &WorkerChunks,
+    fabric: &mut crate::fabric::TabletFabric,
+    metrics: &core::cell::Cell<WorkerMetrics>,
+    respond: &Sender<WorkerResponse>,
+) -> Option<(Vec<kivi_state::TxnWrite>, Vec<crate::fabric::StagedSeal>)> {
+    let mut staged_writes = Vec::with_capacity(writes.len());
+    let mut seals = Vec::new();
+    for write in writes {
+        match stage_txn_write(tablet, write, chunks, fabric, metrics, respond) {
+            Ok(Some((write, seal))) => {
+                seals.extend(seal);
+                staged_writes.push(write);
+            }
+            Ok(None) | Err(()) => return None,
+        }
+    }
+    Some((staged_writes, seals))
+}
+
 /// Stages one request's representation before admission, answering
 /// rejections and lane failures inline: `None` means the request already
-/// answered with state untouched; `Some` carries the admitted operation
-/// plus its upload pins.
+/// answered with state untouched; `Some` carries the admitted operation,
+/// its chunk pins, and its staged fabric seals.
+#[allow(clippy::too_many_arguments)]
 fn stage_request_representation(
     op: Operation,
     tablets: &mut HashMap<TabletId, LiveTablet>,
     tablet: TabletId,
     now: UnixMicros,
     chunks: &WorkerChunks,
+    fabric: &mut crate::fabric::TabletFabric,
     metrics: &core::cell::Cell<WorkerMetrics>,
     respond: &Sender<WorkerResponse>,
-) -> Option<(Operation, Vec<crate::chunk_lane::PinnedUpload>)> {
+) -> Option<(
+    Operation,
+    Vec<crate::chunk_lane::PinnedUpload>,
+    Vec<crate::fabric::StagedSeal>,
+)> {
+    // Medium transactional puts stage into the fabric before prepare so
+    // a later Commit can never meet a durable root with unavailable
+    // payload; chunked references ride the existing chunk path. Staged
+    // seals ride the admission.
     let staged = match op {
-        Operation::SetRange { key, offset, patch } => {
-            let base = peek_range_base(tablets, tablet, &key, now);
-            match plan_set_range(key, offset, patch, base, chunks.inline_threshold) {
-                SetRangePlan::Inline(op) => (op, Vec::new()),
-                SetRangePlan::Reject { detail } => {
-                    let mut snapshot = metrics.get();
-                    snapshot.channel_ops += 1;
-                    metrics.set(snapshot);
-                    let _ = respond.try_send(Err(WorkerRequestError::InvalidRequest { detail }));
-                    return None;
-                }
-                SetRangePlan::RestageSet { key, value } => {
-                    match stage_restaged(&key, value, chunks, metrics, respond) {
-                        Ok((staged, pin)) => (staged, pin.into_iter().collect()),
-                        Err(()) => return None,
-                    }
-                }
-                SetRangePlan::Splice {
-                    key,
-                    manifest,
-                    logical_len,
-                    offset,
-                    patch,
-                } => {
-                    match stage_value_work(
-                        &key,
-                        StageWork::Splice {
-                            manifest,
-                            logical_len,
-                            offset,
-                            patch,
-                        },
-                        chunks,
-                        metrics,
-                        respond,
-                    ) {
-                        Ok((staged, pin)) => (staged, pin.into_iter().collect()),
-                        Err(()) => return None,
-                    }
-                }
+        Operation::TxnPrepare {
+            txn,
+            coordinator,
+            write,
+            digest,
+        } => match stage_txn_write(tablet, write, chunks, fabric, metrics, respond) {
+            Ok(Some((write, seal))) => {
+                let mut seals = Vec::new();
+                seals.extend(seal);
+                (
+                    Operation::TxnPrepare {
+                        txn,
+                        coordinator,
+                        write,
+                        digest,
+                    },
+                    Vec::new(),
+                    seals,
+                )
+            }
+            Ok(None) | Err(()) => return None,
+        },
+        Operation::TxnCommitLocal { txn, writes } => {
+            let (staged_writes, seals) =
+                stage_txn_batch(tablet, writes, chunks, fabric, metrics, respond)?;
+            (
+                Operation::TxnCommitLocal {
+                    txn,
+                    writes: staged_writes,
+                },
+                Vec::new(),
+                seals,
+            )
+        }
+        Operation::Set { key, value }
+            if value.len() > crate::fabric::FABRIC_INLINE_MAX
+                && (value.len() as u64) <= chunks.inline_threshold =>
+        {
+            match stage_fabric_value(tablet, &key, value, true, fabric, metrics, respond) {
+                Ok((staged, seal)) => (staged, Vec::new(), vec![seal]),
+                Err(()) => return None,
             }
         }
+        Operation::SetConditional {
+            key,
+            value,
+            condition,
+            expiry,
+        } if value.len() > crate::fabric::FABRIC_INLINE_MAX
+            && (value.len() as u64) <= chunks.inline_threshold =>
+        {
+            match stage_fabric_conditional(
+                tablet, &key, value, condition, expiry, fabric, metrics, respond,
+            ) {
+                Ok((staged, seal)) => (staged, Vec::new(), vec![seal]),
+                Err(()) => return None,
+            }
+        }
+        Operation::SetRange { key, offset, patch } => stage_range_request(
+            tablet, key, offset, patch, tablets, now, chunks, fabric, metrics, respond,
+        )?,
+        op @ Operation::TxnFinalize { .. } => {
+            seal_finalize_intent(op, tablets, tablet, fabric, metrics, respond)?
+        }
         other => match split_large_set(other, chunks.inline_threshold) {
-            LargeSetSplit::Inline(op) => (op, Vec::new()),
+            LargeSetSplit::Inline(op) => (op, Vec::new(), Vec::new()),
             LargeSetSplit::Stage { key, value } => {
                 match stage_value_work(&key, StageWork::Value(value), chunks, metrics, respond) {
-                    Ok((staged, pin)) => (staged, pin.into_iter().collect()),
+                    Ok((staged, pin)) => (staged, pin.into_iter().collect(), Vec::new()),
                     Err(()) => return None,
                 }
             }
@@ -1136,7 +1809,7 @@ fn stage_request_representation(
                 metrics,
                 respond,
             ) {
-                Ok((staged, pin)) => (staged, pin.into_iter().collect()),
+                Ok((staged, pin)) => (staged, pin.into_iter().collect(), Vec::new()),
                 Err(()) => return None,
             },
         },
@@ -1150,6 +1823,7 @@ pub(crate) fn handle_request(
     metrics: &core::cell::Cell<WorkerMetrics>,
     durability: Option<&mut WorkerDurability>,
     chunks: &WorkerChunks,
+    fabric: &mut crate::fabric::TabletFabric,
 ) {
     let TabletRequest {
         tablet,
@@ -1159,25 +1833,31 @@ pub(crate) fn handle_request(
         respond,
     } = request;
     // Representation split before anything else: values over the threshold
-    // stage (chunks, manifest, one sync barrier) and re-enter as small
-    // chunked roots. Range patches plan against the peeked base first
-    // (small inline results WAL as splices, chunked bases restage through
-    // the lane splice). Transactional writes pass through unstaged: large
-    // inline puts stay inline (bounded by the transaction byte cap), while
-    // every chunked reference a transaction carries is proven below before
+    // stage (chunks, manifest, one sync barrier) or into the fabric (DRAM
+    // residency plus seal payloads) and re-enter as small roots. Range
+    // patches plan against the peeked base first (small inline results
+    // WAL as splices, chunked bases restage through the lane splice,
+    // fabric bases resolve then re-plan). Transactional writes pass
+    // through unstaged except medium inline puts, which stage into the
+    // fabric here; every carried reference is proven below before
     // admission, so a later Commit can never meet a durable root with
     // unavailable payload. Staging precedes admission, so a lane failure
     // or a rejected range answers here with state untouched.
-    let Some((op, pins)) =
-        stage_request_representation(op, tablets, tablet, now, chunks, metrics, &respond)
+    let Some((op, pins, staged)) =
+        stage_request_representation(op, tablets, tablet, now, chunks, fabric, metrics, &respond)
     else {
         return;
     };
-    // Prove every chunked reference a transaction carries: staged values
-    // pass (just proven above and still pinned), as do copies of live
-    // committed roots (their packs are indexed); anything else is a dangling
-    // root and the prepare is rejected loudly, never committed.
+    // Prove every chunked and fabric reference a transaction carries:
+    // staged values pass (just proven above and still alive), as do
+    // copies of live committed roots; anything else is a dangling root
+    // and the prepare is rejected loudly, never committed.
     if let Err(()) = verify_txn_chunk_refs(&op, chunks, metrics, &respond) {
+        retire_staged(fabric, staged);
+        return;
+    }
+    if let Err(()) = verify_txn_fabric_refs(&op, fabric, metrics, &respond) {
+        retire_staged(fabric, staged);
         return;
     }
     // Attribute escrow ownership: a bounded-counter create takes its
@@ -1187,16 +1867,53 @@ pub(crate) fn handle_request(
     if let Operation::BoundedCounterCreate { holder, .. } = &mut op {
         *holder = TabletId::from_u64(tablet.as_u64());
     }
-    let outcome = match durability {
+    match durability {
         None => match tablets.get_mut(&tablet) {
-            None => Err(WorkerRequestError::UnknownTablet { tablet }),
-            Some(live) => live.execute(&op, now).map_err(WorkerRequestError::Tablet),
+            None => {
+                let _ = respond.try_send(Err(WorkerRequestError::UnknownTablet { tablet }));
+            }
+            Some(live) => {
+                let key = op.key().clone();
+                // Pre-image for post-write retirement: when this write
+                // supersedes a fabric root, the old materialization
+                // retires (or defers while pinned) after success.
+                let previous = live
+                    .store()
+                    .get(&key, now)
+                    .and_then(kivi_state::StoredObject::fabric_ref);
+                match live.execute(&op, now) {
+                    Err(error) => {
+                        retire_staged(fabric, staged);
+                        let _ = respond.try_send(Err(WorkerRequestError::Tablet(error)));
+                    }
+                    Ok(result) => {
+                        if let Some(post) = tablets
+                            .get(&tablet)
+                            .and_then(|live| live.store().get(&key, now))
+                        {
+                            fabric.retire_superseded(previous, post);
+                        }
+                        match resolve_channel_outcome(
+                            tablet, &key, now, &op, result, tablets, fabric,
+                        ) {
+                            Ok(resolved) => {
+                                let _ = respond.try_send(Ok(resolved));
+                            }
+                            Err(error) => {
+                                let _ = respond.try_send(Err(error));
+                            }
+                        }
+                    }
+                }
+            }
         },
         Some(durable) => {
-            durable
-                .commit
-                .admit(PendingEntry::new(tablet, op, now, identity, respond).with_pins(pins));
-            durable.commit.poll(tablets, durable.namespace);
+            durable.commit.admit(
+                PendingEntry::new(tablet, op, now, identity, respond)
+                    .with_pins(pins)
+                    .with_fabric_staged(staged),
+            );
+            durable.commit.poll(tablets, durable.namespace, fabric);
             // Admission itself is the outcome; the reply arrives through
             // the responder once the batch completes.
             let mut snapshot = metrics.get();
@@ -1204,11 +1921,19 @@ pub(crate) fn handle_request(
             metrics.set(snapshot);
             return;
         }
-    };
+    }
     let mut snapshot = metrics.get();
     snapshot.channel_ops += 1;
     metrics.set(snapshot);
-    let _ = respond.try_send(outcome);
+}
+
+/// Retires staged fabric ids that never committed (prepare failure,
+/// ephemeral execute failure): they are fresh, unpinned, and referenced
+/// nowhere, so retirement always succeeds — failures are ignored.
+fn retire_staged(fabric: &mut crate::fabric::TabletFabric, staged: Vec<crate::fabric::StagedSeal>) {
+    for seal in staged {
+        fabric.retire_or_defer(seal.fabric_id);
+    }
 }
 
 /// Builds a one-shot response rendezvous for tests and the engine.
@@ -1265,6 +1990,21 @@ mod tests {
         }
     }
 
+    fn test_fabric() -> (
+        crate::fabric::TabletFabric,
+        kivi_memory::OffcoreLaneGuard,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().expect("scratch");
+        let paths = crate::fabric::FabricPaths {
+            root: dir.path().to_owned(),
+        };
+        let (fabric, guard) =
+            crate::fabric::TabletFabric::open(WorkerId::from_u64(0), &paths, 1 << 20, 16 << 20)
+                .expect("fabric opens");
+        (fabric, guard, dir)
+    }
+
     fn live_tablet(id: u64) -> LiveTablet {
         let tablet = TabletId::from_u64(id);
         let authority =
@@ -1298,12 +2038,14 @@ mod tests {
     #[test]
     fn worker_executes_requests_and_reports_unknown_tablets() {
         let chunks = TestChunks::open();
+        let (fabric, _fabric_guard, _fabric_dir) = test_fabric();
         let mut handle = WorkerHandle::spawn(
             WorkerId::from_u64(0),
             vec![live_tablet(1)],
             16,
             None,
             chunks.chunks.clone(),
+            fabric,
         );
         let set = round_trip(
             &handle,
@@ -1523,12 +2265,14 @@ mod tests {
     #[test]
     fn sweep_control_reclaims_without_request_queue() {
         let chunks = TestChunks::open();
+        let (fabric, _fabric_guard, _fabric_dir) = test_fabric();
         let mut handle = WorkerHandle::spawn(
             WorkerId::from_u64(0),
             vec![live_tablet(1)],
             16,
             None,
             chunks.chunks.clone(),
+            fabric,
         );
         round_trip(
             &handle,

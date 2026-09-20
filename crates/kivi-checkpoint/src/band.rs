@@ -65,6 +65,11 @@ pub const REPR_INLINE: u8 = 0;
 /// Chunked-root representation tag: the record carries a manifest id plus
 /// logical length, never bulk bytes. Fixed forever within band version 1.
 pub const REPR_CHUNKED: u8 = 1;
+/// Fabric-root representation tag: the record carries a fabric object id
+/// plus logical length and published version, never bulk bytes. Fixed
+/// forever within band version 1. The bytes stay materialized in the
+/// fabric; recovery re-links by id and validates version + checksum.
+pub const REPR_FABRIC: u8 = 2;
 /// Bytes value tag.
 pub const TYPE_BYTES: u8 = 0;
 /// Counter value tag.
@@ -510,6 +515,19 @@ fn encode_record(record: &BandRecord, out: &mut Vec<u8>) -> Result<(), Checkpoin
             out.extend_from_slice(chunked.manifest.as_bytes());
             out.extend_from_slice(&chunked.logical_len.to_le_bytes());
         }
+        // Fabric roots serialize as their small root (fabric id plus
+        // logical length and published version), never the materialized
+        // bytes: the fabric owns bulk information, the checkpoint owns
+        // the logical reference. Recovery re-links and revalidates.
+        LogicalValue::Fabric(fabric) => {
+            out.push(REPR_FABRIC);
+            out.push(TYPE_BYTES);
+            out.extend_from_slice(&record.object.version().as_u64().to_le_bytes());
+            record.object.expiry().encode(out);
+            out.extend_from_slice(&fabric.id.to_le_bytes());
+            out.extend_from_slice(&fabric.logical_len.to_le_bytes());
+            out.extend_from_slice(&fabric.version.to_le_bytes());
+        }
         LogicalValue::Bytes(value) => {
             out.push(REPR_INLINE);
             out.push(TYPE_BYTES);
@@ -600,7 +618,7 @@ fn decode_record(input: &[u8]) -> Result<(BandRecord, usize), CodecError> {
     let key = Key::from(input[at..at + key_len].to_vec());
     at += key_len;
     let repr = band_take::<1>(input, &mut at)?[0];
-    if repr != REPR_INLINE && repr != REPR_CHUNKED {
+    if repr != REPR_INLINE && repr != REPR_CHUNKED && repr != REPR_FABRIC {
         return Err(CodecError::InvalidTag {
             kind: "band representation",
             tag: repr,
@@ -625,6 +643,32 @@ fn decode_record(input: &[u8]) -> Result<(BandRecord, usize), CodecError> {
         let value = LogicalValue::Chunked(kivi_state::ChunkedRef {
             manifest: kivi_types::ManifestId::from_bytes(raw),
             logical_len,
+        });
+        return Ok((
+            BandRecord {
+                hash,
+                key,
+                object: StoredObject::restore(value, version, expiry),
+            },
+            at,
+        ));
+    }
+    // Fabric roots decode to references: recovery re-links the fabric id
+    // and proves version plus integrity before serving.
+    if repr == REPR_FABRIC {
+        if value_tag != TYPE_BYTES {
+            return Err(CodecError::InvalidTag {
+                kind: "fabric band value type",
+                tag: value_tag,
+            });
+        }
+        let id = u64::from_le_bytes(band_take(input, &mut at)?);
+        let logical_len = u64::from_le_bytes(band_take(input, &mut at)?);
+        let fabric_version = u64::from_le_bytes(band_take(input, &mut at)?);
+        let value = LogicalValue::Fabric(kivi_state::FabricRef {
+            id,
+            logical_len,
+            version: fabric_version,
         });
         return Ok((
             BandRecord {

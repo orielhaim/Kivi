@@ -173,6 +173,8 @@ pub(crate) struct CheckpointContext {
     pub pins: Arc<crate::chunk_lane::StagingPins>,
     /// Chunk lane per worker for GC planning and reclamation.
     pub chunk_lanes: Vec<(kivi_types::WorkerId, crate::chunk_lane::ChunkLaneHandle)>,
+    /// Fabric journal path per worker for journal GC.
+    pub fabric_journals: Vec<(kivi_types::WorkerId, std::path::PathBuf)>,
     /// Shared admin state.
     pub admin: Arc<Mutex<CheckpointAdminState>>,
 }
@@ -418,6 +420,10 @@ fn checkpoint_tablet(
             // without failing the checkpoint that just succeeded.
             collect_chunk_journals(context, chunk_journals);
             run_chunk_gc(context, chunk_journals);
+            // Fabric journal GC under the same retention promise:
+            // superseded seals and aborted prepares compact away once
+            // the checkpoint covers their versions.
+            run_fabric_journal_gc(context);
             context
                 .admin
                 .lock()
@@ -584,10 +590,84 @@ fn retained_band_chunk_refs(
     Some(out)
 }
 
-/// Mark-and-reclaim chunk packs under the new retention promise: live
-/// roots are retained-checkpoint band refs plus journaled commits, united
-/// with in-flight staging pins. Fully-dead sealed packs go; anything else
-/// stays. Failures warn without failing the checkpoint that succeeded.
+/// Fabric ids referenced by the retained checkpoints (current plus
+/// previous per tablet), read from installed band files. `None` when any
+/// link in the chain is unreadable: GC then skips the round entirely
+/// (keep-on-doubt - disk usage, never corruption).
+fn retained_band_fabric_refs(
+    context: &CheckpointContext,
+) -> Option<std::collections::HashSet<u64>> {
+    use kivi_checkpoint::{ArtifactKind, artifact::artifact_path, load_band, load_manifest};
+    let mut out = std::collections::HashSet::new();
+    for (tablet, current) in &context.installed {
+        let mut hashes = vec![current.manifest];
+        if let Some(previous) = current.previous {
+            hashes.push(previous);
+        }
+        for hash in hashes {
+            let path = artifact_path(&context.data_dir, *tablet, ArtifactKind::Manifest, hash);
+            let bytes = std::fs::read(&path).ok()?;
+            let manifest = load_manifest(hash, &bytes).ok()?;
+            for band in &manifest.bands {
+                let path = artifact_path(&context.data_dir, *tablet, ArtifactKind::Band, band.hash);
+                let bytes = std::fs::read(&path).ok()?;
+                let loaded =
+                    load_band(*tablet, band.band, manifest.layout, band.hash, &bytes).ok()?;
+                for record in &loaded.records {
+                    if let Some(fabric) = record.object.fabric_ref() {
+                        out.insert(fabric.id);
+                    }
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Compacts fabric journals under the new retention promise: live ids
+/// are worker-reported roots, intents, and in-flight payloads united
+/// with retained-checkpoint band refs. Superseded records (older seals
+/// for a live id) and orphaned records (aborted prepares) go; anything
+/// else stays. Failures warn without failing the checkpoint that
+/// succeeded. A worker that does not answer keeps its previous remainder
+/// (a missed round retains longer, never shorter): journals compact
+/// against their own worker's live set, never a partial union.
+fn run_fabric_journal_gc(context: &CheckpointContext) {
+    let Some(band_refs) = retained_band_fabric_refs(context) else {
+        tracing::warn!("fabric journal GC skipped: retained checkpoint unreadable");
+        return;
+    };
+    let mut live_by_worker: std::collections::HashMap<
+        kivi_types::WorkerId,
+        std::collections::HashSet<u64>,
+    > = std::collections::HashMap::new();
+    for (worker, control) in &context.controls {
+        let (respond, receive) = bounded::<std::collections::HashSet<u64>>(1);
+        if control
+            .try_send(crate::worker::WorkerControl::FabricLiveRoots { respond })
+            .is_err()
+        {
+            continue;
+        }
+        if let Ok(live) = receive.recv_timeout(Duration::from_secs(5)) {
+            live_by_worker.insert(*worker, live);
+        }
+    }
+    for (worker, journal) in &context.fabric_journals {
+        let Some(live) = live_by_worker.get(worker) else {
+            continue;
+        };
+        let keep: std::collections::HashSet<u64> = live.union(&band_refs).copied().collect();
+        match crate::fabric::compact_journal(journal, &keep) {
+            Ok(kept) => {
+                tracing::info!(worker = %worker, kept, "fabric journal compacted");
+            }
+            Err(error) => {
+                tracing::warn!(worker = %worker, ?error, "fabric journal compact failed; kept");
+            }
+        }
+    }
+}
 fn run_chunk_gc(
     context: &CheckpointContext,
     retained: &HashMap<TabletId, Vec<(u64, kivi_types::ManifestId)>>,

@@ -43,6 +43,23 @@ pub enum Operation {
         /// Total logical bytes across the manifest.
         logical_len: u64,
     },
+    /// Store a medium byte string by Memory Fabric reference, overwriting
+    /// any type and clearing any expiry — the fabric spelling of
+    /// [`Set`](Self::Set). The engine stages the bytes into the fabric
+    /// and proves the materialization *before* admitting this; the store
+    /// trusts the reference exactly as it trusts an inline value.
+    /// Produced by medium `Set`s the engine converts at admission, never
+    /// by end users directly.
+    SetFabric {
+        /// Key to write.
+        key: Key,
+        /// Fabric-scoped object id assigned at staging.
+        fabric_id: u64,
+        /// Total logical bytes of the materialized value.
+        logical_len: u64,
+        /// Logical version the bytes were published at (pins reads).
+        version: u64,
+    },
     /// Patch a byte range of a value (partial update). Against absent or
     /// expired state the base is the empty string; past-the-end gaps
     /// zero-pad (Redis `SETRANGE` semantics). Against byte strings the
@@ -163,6 +180,24 @@ pub enum Operation {
         manifest: ManifestId,
         /// Total logical bytes across the manifest.
         logical_len: u64,
+        /// Presence condition evaluated atomically.
+        condition: SetCondition,
+        /// Expiry policy for the stored object.
+        expiry: ExpiryPolicy,
+    },
+    /// Conditionally store a medium byte string by fabric reference: the
+    /// fabric spelling of [`SetConditional`](Self::SetConditional). Same
+    /// staging contract as [`SetFabric`](Self::SetFabric), produced by
+    /// medium conditional stores the engine converts at admission.
+    SetConditionalFabric {
+        /// Key to write.
+        key: Key,
+        /// Fabric-scoped object id assigned at staging.
+        fabric_id: u64,
+        /// Total logical bytes of the materialized value.
+        logical_len: u64,
+        /// Logical version the bytes were published at (pins reads).
+        version: u64,
         /// Presence condition evaluated atomically.
         condition: SetCondition,
         /// Expiry policy for the stored object.
@@ -438,6 +473,7 @@ impl Operation {
             Self::Get { key }
             | Self::Set { key, .. }
             | Self::SetChunked { key, .. }
+            | Self::SetFabric { key, .. }
             | Self::SetRange { key, .. }
             | Self::Delete { key }
             | Self::Exists { key }
@@ -451,6 +487,7 @@ impl Operation {
             | Self::GetVersion { key }
             | Self::SetConditional { key, .. }
             | Self::SetConditionalChunked { key, .. }
+            | Self::SetConditionalFabric { key, .. }
             | Self::TxnFinalize { key, .. }
             | Self::CommutativeAdd { key, .. }
             | Self::CommutativeGet { key, .. }
@@ -486,6 +523,7 @@ impl Operation {
         match self {
             Self::Set { .. }
             | Self::SetChunked { .. }
+            | Self::SetFabric { .. }
             | Self::SetRange { .. }
             | Self::Delete { .. }
             | Self::CounterAdd { .. }
@@ -493,6 +531,7 @@ impl Operation {
             | Self::PersistExpiry { .. }
             | Self::SetConditional { .. }
             | Self::SetConditionalChunked { .. }
+            | Self::SetConditionalFabric { .. }
             | Self::TxnPrepare { .. }
             | Self::TxnFinalize { .. }
             | Self::TxnCommitLocal { .. }
@@ -545,6 +584,20 @@ pub enum OperationResult {
         manifest: ManifestId,
         /// Total logical bytes across the manifest.
         logical_len: u64,
+    },
+    /// `Get` hit a fabric root: the engine must resolve these bytes
+    /// through the Memory Fabric before replying, suspending for
+    /// asynchronous promotion when the primary is off-core. Same
+    /// never-wire/never-persist contract as
+    /// [`ChunkedValue`](Self::ChunkedValue). The `version` pins the read:
+    /// only a materialization published at this version may serve it.
+    FabricValue {
+        /// Fabric-scoped object id assigned at staging.
+        fabric_id: u64,
+        /// Total logical bytes of the materialized value.
+        logical_len: u64,
+        /// Logical version the bytes were published at.
+        version: u64,
     },
     /// `Set` completed with the new version.
     Stored {
@@ -898,12 +951,16 @@ const TAG_RES_STREAM_ENTRIES: u8 = 30;
 const TAG_RES_STREAM_TRIMMED: u8 = 31;
 /// Same-tablet atomic commit tag. New tags never reuse old ones.
 const TAG_RES_TXN_LOCAL_COMMITTED: u8 = 32;
+/// Engine-internal fabric-read marker. New tag, never reused; same
+/// never-persists contract as [`TAG_RES_CHUNKED`].
+const TAG_RES_FABRIC: u8 = 33;
 
 impl Encode for OperationResult {
     fn encoded_len(&self) -> usize {
         match self {
             Self::Value(value) => 1 + 1 + value.as_ref().map_or(0, |bytes| 4 + bytes.len()),
             Self::ChunkedValue { .. } => 1 + 32 + 8,
+            Self::FabricValue { .. } => 1 + 8 + 8 + 8,
             Self::Stored { .. } | Self::StreamAppended { .. } | Self::StreamTrimmed { .. } => 1 + 8,
             Self::Deleted { .. }
             | Self::Exists(_)
@@ -1028,6 +1085,16 @@ impl Encode for OperationResult {
                 out.push(TAG_RES_CHUNKED);
                 out.extend_from_slice(manifest.as_bytes());
                 logical_len.encode(out);
+            }
+            Self::FabricValue {
+                fabric_id,
+                logical_len,
+                version,
+            } => {
+                out.push(TAG_RES_FABRIC);
+                fabric_id.encode(out);
+                logical_len.encode(out);
+                version.encode(out);
             }
             Self::Length(value) => {
                 out.push(TAG_RES_LENGTH);
@@ -1279,6 +1346,19 @@ impl Decode for OperationResult {
                         logical_len,
                     },
                     first + second + third,
+                ))
+            }
+            TAG_RES_FABRIC => {
+                let (fabric_id, second) = u64::decode(&input[first..])?;
+                let (logical_len, third) = u64::decode(&input[first + second..])?;
+                let (version, fourth) = u64::decode(&input[first + second + third..])?;
+                Ok((
+                    Self::FabricValue {
+                        fabric_id,
+                        logical_len,
+                        version,
+                    },
+                    first + second + third + fourth,
                 ))
             }
             TAG_RES_LENGTH => {
@@ -1622,11 +1702,13 @@ pub fn outcome_for(
         return result;
     }
     match (mutation, outcome) {
-        // Inline, chunked, and spliced stores answer identically: the
-        // result names the new version either way, never the representation.
+        // Inline, chunked, fabric, and spliced stores answer identically:
+        // the result names the new version either way, never the
+        // representation.
         (
             Mutation::PutBytes { .. }
             | Mutation::ReplaceChunkedRoot { .. }
+            | Mutation::ReplaceFabricRoot { .. }
             | Mutation::SpliceBytes { .. },
             ApplyOutcome::Put { version },
         ) => OperationResult::Stored { version: *version },
@@ -1634,7 +1716,9 @@ pub fn outcome_for(
         // only exists when the condition held, so reaching here means
         // applied with the new version.
         (
-            Mutation::PutBytesWithExpiry { .. } | Mutation::ReplaceChunkedRootWithExpiry { .. },
+            Mutation::PutBytesWithExpiry { .. }
+            | Mutation::ReplaceChunkedRootWithExpiry { .. }
+            | Mutation::ReplaceFabricRootWithExpiry { .. },
             ApplyOutcome::Put { version },
         ) => OperationResult::ConditionalSet {
             applied: true,

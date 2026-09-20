@@ -624,6 +624,138 @@ async fn checkpoints(State(state): State<AdminState>) -> Json<CheckpointsDto> {
     })
 }
 
+/// Per-tablet Memory Fabric footprint.
+#[derive(Serialize)]
+struct FabricTabletDto {
+    tablet: u64,
+    objects: usize,
+    inline_bytes: u64,
+    dram_bytes: u64,
+    compressed_bytes: u64,
+    nvme_bytes: u64,
+}
+
+/// Per-worker Memory Fabric report: counters, gauges, queue depths, and
+/// per-tablet footprints. Answers "why is this object in `NVMe`"
+/// (residence breakdown) and "why can this memory not be reclaimed"
+/// (`pinned`, `retire_pending`, `locators`).
+#[derive(Serialize)]
+struct FabricWorkerDto {
+    worker: u64,
+    objects: usize,
+    inline_bytes: u64,
+    dram_bytes: u64,
+    compressed_bytes: u64,
+    nvme_bytes: u64,
+    hits: u64,
+    promotion_misses: u64,
+    demotions: u64,
+    promotions: u64,
+    migration_bytes: u64,
+    compression_ratio_bps: u64,
+    cancelled: u64,
+    compactions: u64,
+    pinned: usize,
+    parked: usize,
+    retire_pending: usize,
+    stale_completions: u64,
+    parked_resumes: u64,
+    admission_rejects: u64,
+    locators: usize,
+    offcore_queued: usize,
+    offcore_inflight: usize,
+    moves_queued: usize,
+    arena_pressure: f64,
+    tablets: Vec<FabricTabletDto>,
+}
+
+/// Memory Fabric observability rollup across workers plus summed totals.
+#[derive(Serialize)]
+struct FabricDto {
+    workers: Vec<FabricWorkerDto>,
+    total_objects: usize,
+    total_dram_bytes: u64,
+    total_compressed_bytes: u64,
+    total_nvme_bytes: u64,
+    total_pinned: usize,
+    total_parked: usize,
+    total_admission_rejects: u64,
+}
+
+async fn fabric(State(state): State<AdminState>) -> Result<Json<FabricDto>, StatusCode> {
+    // Control-channel rendezvous blocks: keep it off the async executor.
+    let engine = state.engine.clone();
+    let reports = tokio::task::spawn_blocking(move || engine.fabric_stats_snapshot())
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut workers = Vec::with_capacity(reports.len());
+    let mut total_objects = 0usize;
+    let mut total_dram_bytes = 0u64;
+    let mut total_compressed_bytes = 0u64;
+    let mut total_nvme_bytes = 0u64;
+    let mut total_pinned = 0usize;
+    let mut total_parked = 0usize;
+    let mut total_admission_rejects = 0u64;
+    for (id, report) in reports {
+        let snap = &report.fabric;
+        total_objects += snap.objects;
+        total_dram_bytes += snap.dram_bytes;
+        total_compressed_bytes += snap.compressed_bytes;
+        total_nvme_bytes += snap.nvme_bytes;
+        total_pinned += snap.pinned;
+        total_parked += snap.parked;
+        total_admission_rejects += snap.admission_rejects;
+        workers.push(FabricWorkerDto {
+            worker: id.as_u64(),
+            objects: snap.objects,
+            inline_bytes: snap.inline_bytes,
+            dram_bytes: snap.dram_bytes,
+            compressed_bytes: snap.compressed_bytes,
+            nvme_bytes: snap.nvme_bytes,
+            hits: snap.hits,
+            promotion_misses: snap.promotion_misses,
+            demotions: snap.demotions,
+            promotions: snap.promotions,
+            migration_bytes: snap.migration_bytes,
+            compression_ratio_bps: snap.compression_ratio_bps,
+            cancelled: snap.cancelled,
+            compactions: snap.compactions,
+            pinned: snap.pinned,
+            parked: snap.parked,
+            retire_pending: snap.retire_pending,
+            stale_completions: snap.stale_completions,
+            parked_resumes: snap.parked_resumes,
+            admission_rejects: snap.admission_rejects,
+            locators: snap.locators,
+            offcore_queued: report.offcore_depth.0,
+            offcore_inflight: report.offcore_depth.1,
+            moves_queued: report.move_depth,
+            arena_pressure: report.arena_pressure,
+            tablets: report
+                .tablets
+                .iter()
+                .map(|(tablet, footprint)| FabricTabletDto {
+                    tablet: tablet.as_u64(),
+                    objects: footprint.objects,
+                    inline_bytes: footprint.inline_bytes,
+                    dram_bytes: footprint.dram_bytes,
+                    compressed_bytes: footprint.compressed_bytes,
+                    nvme_bytes: footprint.nvme_bytes,
+                })
+                .collect(),
+        });
+    }
+    Ok(Json(FabricDto {
+        workers,
+        total_objects,
+        total_dram_bytes,
+        total_compressed_bytes,
+        total_nvme_bytes,
+        total_pinned,
+        total_parked,
+        total_admission_rejects,
+    }))
+}
 async fn tablets(State(state): State<AdminState>) -> Json<Vec<TabletDto>> {
     let routing = state.engine.routing();
     Json(
@@ -657,6 +789,7 @@ pub fn router(state: AdminState) -> axum::Router {
         .route("/v1/tablets", get(tablets))
         .route("/v1/durability", get(durability))
         .route("/v1/checkpoints", get(checkpoints))
+        .route("/v1/fabric", get(fabric))
         .route("/v1/redis", get(redis))
         .layer(
             tower::ServiceBuilder::new()
@@ -717,6 +850,7 @@ mod tests {
             worker_count: 2,
             request_capacity: 16,
             chunks: kivi_engine::ChunkFabricConfig::default(),
+            fabric: kivi_engine::FabricConfig::default(),
             network: None,
             durability: DurabilityMode::Ephemeral,
         })

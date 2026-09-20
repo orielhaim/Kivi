@@ -56,6 +56,7 @@ fn root_engine() -> LocalEngine {
         worker_count: 1,
         request_capacity: 1024,
         chunks: kivi_engine::ChunkFabricConfig::default(),
+        fabric: kivi_engine::FabricConfig::default(),
         network: None,
         durability: DurabilityMode::Ephemeral,
     })
@@ -189,6 +190,7 @@ fn net_engine() -> LocalEngine {
         worker_count: 1,
         request_capacity: 1024,
         chunks: kivi_engine::ChunkFabricConfig::default(),
+        fabric: kivi_engine::FabricConfig::default(),
         network: Some(kivi_engine::EngineNetwork {
             base_port: 0,
             ports: Vec::new(),
@@ -243,6 +245,33 @@ fn client_set_range_inline(bencher: Bencher) {
     bencher.counter(ItemsCount::new(1u64)).bench_local(|| {
         client.set_range(&key, 4, patch.clone()).expect("patch");
         black_box(());
+    });
+}
+
+/// Medium-value round trip through the integrated fabric: a 2 KiB value
+/// stages in the per-worker memory fabric on set (arena path, not the
+/// 16 B inline `PutBytes` fast path) and resolves on get. Compare
+/// against `client_get` for the fabric staging overhead.
+///
+/// Overhead ratio (DEBUG dev-profile run, `--bench --sample-count 5`
+/// `--sample-size 10`; NOT for publication, release re-measures):
+/// `set_get_medium_fabric` median ≈ 39.6 µs per 2-op pair
+/// (≈19.8 µs/op) vs `client_get` median ≈ 23.2 µs per 16 B get →
+/// ≈0.9× per op (a repeat run measured ≈1.0×; debug noise dominates).
+/// In debug builds the fixed engine round-trip cost (channel plus
+/// tablet execute) dwarfs the 2 KiB fabric staging delta; release runs
+/// separate the memcpy and arena-insert terms.
+const MEDIUM_LEN: usize = 2048;
+
+#[divan::bench]
+fn set_get_medium_fabric(bencher: Bencher) {
+    let engine = root_engine();
+    let client = engine.client();
+    let key = Key::from(KEY);
+    let value = Bytes::from(vec![0xABu8; MEDIUM_LEN]);
+    bencher.counter(ItemsCount::new(2u64)).bench_local(|| {
+        client.set(&key, value.clone()).expect("set");
+        black_box(client.get(&key).expect("get"));
     });
 }
 

@@ -2045,13 +2045,16 @@ impl<'a> ReadFront<'a> {
 }
 
 /// Reads local applied state, mapping machine faults honestly. Shared by
-/// both fronts.
+/// both fronts. Fabric references fail closed here: consensus stores
+/// never hold them (replicated IR carries bytes, never worker-local
+/// ids), so a `FabricValue` means a foreign reference slipped past
+/// install validation — Unavailable, never absence.
 pub(crate) async fn read_applied_on(
     machine: &ReplicatedStateMachine,
     op: &Operation,
     now: UnixMicros,
 ) -> Result<OperationResult, ReadError> {
-    machine
+    let outcome = machine
         .read_local(op, now)
         .await
         .map_err(|error| match error {
@@ -2059,20 +2062,38 @@ pub(crate) async fn read_applied_on(
             other => ReadError::Consensus(ConsensusError::Unavailable {
                 reason: other.to_string(),
             }),
-        })
+        })?;
+    if let OperationResult::FabricValue { fabric_id, .. } = &outcome {
+        return Err(ReadError::Consensus(ConsensusError::Unavailable {
+            reason: format!("worker-local fabric reference {fabric_id} not servable here"),
+        }));
+    }
+    Ok(outcome)
 }
 
-/// Scans local applied state, mapping machine faults honestly.
+/// Scans local applied state, mapping machine faults honestly. Pages
+/// naming worker-local fabric references fail closed (same rule as
+/// [`read_applied_on`]): consensus scans never project foreign ids.
 pub(crate) async fn scan_applied_on(
     machine: &ReplicatedStateMachine,
     spec: &kivi_state::ScanSpec,
     now: UnixMicros,
 ) -> Result<kivi_state::ScanPage, ReadError> {
-    machine.scan_local(spec, now).await.map_err(|error| {
+    let page = machine.scan_local(spec, now).await.map_err(|error| {
         ReadError::Consensus(ConsensusError::Unavailable {
             reason: error.to_string(),
         })
-    })
+    })?;
+    if page
+        .entries
+        .iter()
+        .any(|entry| matches!(entry.value, Some(kivi_state::ScannedValue::Fabric { .. })))
+    {
+        return Err(ReadError::Consensus(ConsensusError::Unavailable {
+            reason: "worker-local fabric reference not servable here".to_owned(),
+        }));
+    }
+    Ok(page)
 }
 
 /// Spawns the Compio owner thread driving one node's consensus work.
@@ -3677,6 +3698,9 @@ where
         // missing immutable objects before installing, so the install never
         // lands a root it cannot reconstruct. Transfer is content-addressed:
         // a follower holding 95% of chunks downloads only the missing 5%.
+        // Fabric references never cross nodes (worker-local ids): a
+        // snapshot naming one is refused — the leader must ship bytes
+        // (or chunked sidecars), never foreign fabric names.
         if let Ok(decoded) = crate::state_machine::ReplicatedTablet::decode_snapshot(
             &partial.bytes,
             self.namespace,
@@ -3691,6 +3715,12 @@ where
                         .map_err(|error| {
                             refused(format!("snapshot sidecar unavailable: {error}"))
                         })?;
+                }
+                if let kivi_state::LogicalValue::Fabric(fabric) = object.value() {
+                    return Err(refused(format!(
+                        "snapshot names foreign fabric reference {}: leader must ship bytes",
+                        fabric.id
+                    )));
                 }
             }
         }
@@ -3962,12 +3992,21 @@ fn client_write_error(
 /// proceed with a restaged operation instead.
 #[allow(clippy::too_many_lines)]
 /// Proves one transactional write's chunked reference names durable local
-/// payload. Plain writes carry no references and pass trivially.
+/// payload. Plain writes carry no references and pass trivially. Fabric
+/// references never validate here: ids are worker-local, so a `PutFabric`
+/// on the propose path is a foreign name and fails closed.
 async fn check_txn_write_sidecars(
     sidecar: &SidecarStore,
     write: &kivi_state::TxnWrite,
 ) -> Result<(), ProposeError> {
     use crate::types::ConsensusError;
+    if let kivi_state::TxnWriteKind::PutFabric { fabric_id, .. } = &write.kind {
+        return Err(ProposeError::Consensus(ConsensusError::Unavailable {
+            reason: format!(
+                "transactional fabric write references worker-local payload {fabric_id}: replicate bytes"
+            ),
+        }));
+    }
     let kivi_state::TxnWriteKind::PutChunked {
         manifest,
         logical_len,
@@ -4017,12 +4056,153 @@ async fn check_chunked_root(
     Ok(())
 }
 
+/// Stages one transactional medium `Put` into chunked sidecars,
+/// returning the rewritten write. Every other write kind passes through
+/// after the usual sidecar proof (chunked references must name durable
+/// local payload; fabric references fail closed as foreign names).
+async fn stage_txn_put(
+    sidecar: &SidecarStore,
+    write: &kivi_state::TxnWrite,
+) -> Result<kivi_state::TxnWrite, ProposeError> {
+    if let kivi_state::TxnWriteKind::Put(value) = &write.kind
+        && value.len() > 256
+        && (value.len() as u64) <= kivi_chunk::policy::DEFAULT_INLINE_THRESHOLD
+    {
+        let staged = sidecar.stage_value(value).await.map_err(|error| {
+            ProposeError::Consensus(ConsensusError::Unavailable {
+                reason: format!("medium stage failed: {error}"),
+            })
+        })?;
+        return Ok(kivi_state::TxnWrite {
+            key: write.key.clone(),
+            kind: kivi_state::TxnWriteKind::PutChunked {
+                manifest: staged.manifest,
+                logical_len: staged.logical_len,
+            },
+            expect: write.expect,
+        });
+    }
+    check_txn_write_sidecars(sidecar, write).await?;
+    Ok(write.clone())
+}
+
+/// Stages one medium `Set`/`SetConditional` into chunked sidecars,
+/// returning the restaged operation (`None` when the op is not a medium
+/// write). The Raft log carries only tiny deterministic roots while the
+/// content-addressed sidecars move through the durability gate (same
+/// contract as explicit uploads). Bounds mirror the engine's size split
+/// (tiny inline below, chunk threshold above): tiny values stay inline,
+/// large values ride explicit streaming uploads.
+async fn stage_medium_set(
+    sidecar: &SidecarStore,
+    op: &Operation,
+) -> Result<Option<Operation>, ProposeError> {
+    // Medium values replicate as chunked sidecars, never inline bytes.
+    const MEDIUM_INLINE_MAX: usize = 256;
+    if let Operation::Set { key, value } = op
+        && value.len() > MEDIUM_INLINE_MAX
+        && (value.len() as u64) <= kivi_chunk::policy::DEFAULT_INLINE_THRESHOLD
+    {
+        let staged = sidecar.stage_value(value).await.map_err(|error| {
+            ProposeError::Consensus(ConsensusError::Unavailable {
+                reason: format!("medium stage failed: {error}"),
+            })
+        })?;
+        return Ok(Some(Operation::SetChunked {
+            key: key.clone(),
+            manifest: staged.manifest,
+            logical_len: staged.logical_len,
+        }));
+    }
+    if let Operation::SetConditional {
+        key,
+        value,
+        condition,
+        expiry,
+    } = op
+        && value.len() > MEDIUM_INLINE_MAX
+        && (value.len() as u64) <= kivi_chunk::policy::DEFAULT_INLINE_THRESHOLD
+    {
+        let staged = sidecar.stage_value(value).await.map_err(|error| {
+            ProposeError::Consensus(ConsensusError::Unavailable {
+                reason: format!("medium stage failed: {error}"),
+            })
+        })?;
+        return Ok(Some(Operation::SetConditionalChunked {
+            key: key.clone(),
+            manifest: staged.manifest,
+            logical_len: staged.logical_len,
+            condition: *condition,
+            expiry: *expiry,
+        }));
+    }
+    Ok(None)
+}
+
+/// Stages medium transactional `Put`s into chunked sidecars, returning
+/// the rewritten operation (`None` when nothing changed). Chunked
+/// references still prove the usual durability contract; fabric
+/// references fail closed as foreign names.
+async fn stage_txn_sidecars(
+    sidecar: &SidecarStore,
+    op: &Operation,
+) -> Result<Option<Operation>, ProposeError> {
+    if let Operation::TxnPrepare { write, .. } = op {
+        let staged = stage_txn_put(sidecar, write).await?;
+        if staged.kind == write.kind {
+            return Ok(None);
+        }
+        let Operation::TxnPrepare {
+            txn,
+            coordinator,
+            digest,
+            ..
+        } = op
+        else {
+            unreachable!("matched TxnPrepare above");
+        };
+        return Ok(Some(Operation::TxnPrepare {
+            txn: *txn,
+            coordinator: *coordinator,
+            write: staged,
+            digest: *digest,
+        }));
+    }
+    if let Operation::TxnCommitLocal { writes, .. } = op {
+        let mut staged_writes = Vec::with_capacity(writes.len());
+        let mut changed = false;
+        for write in writes {
+            let staged = stage_txn_put(sidecar, write).await?;
+            changed |= staged.kind != write.kind;
+            staged_writes.push(staged);
+        }
+        if !changed {
+            return Ok(None);
+        }
+        let Operation::TxnCommitLocal { txn, .. } = op else {
+            unreachable!("matched TxnCommitLocal above");
+        };
+        return Ok(Some(Operation::TxnCommitLocal {
+            txn: *txn,
+            writes: staged_writes,
+        }));
+    }
+    Ok(None)
+}
+
 async fn ensure_proposal_sidecars_for(
     sidecar: &SidecarStore,
     machine: &ReplicatedStateMachine,
     op: &Operation,
     now: UnixMicros,
 ) -> Result<Option<Operation>, ProposeError> {
+    // Medium values replicate as chunked sidecars, never inline bytes.
+    if let Some(restaged) = stage_medium_set(sidecar, op).await? {
+        return Ok(Some(restaged));
+    }
+    if let Some(restaged) = stage_txn_sidecars(sidecar, op).await? {
+        return Ok(Some(restaged));
+    }
     match op {
         Operation::SetChunked {
             manifest,
@@ -4037,11 +4217,19 @@ async fn ensure_proposal_sidecars_for(
             check_chunked_root(sidecar, *manifest, *logical_len).await?;
             Ok(None)
         }
-        // Transactional chunked writes prove the same contract before a
-        // participant may say Prepared: every `PutChunked` reference must
-        // name durable local payload (staged uploads and committed packs
-        // alike), or the prepare fails loudly — a later Commit can never
-        // meet a durable root with unavailable payload.
+        // Fabric references never enter replicated proposals: ids are
+        // worker-local names, meaningless on any other replica. Medium
+        // values replicate as chunked sidecars (staged above); each
+        // replica manages its own physical materialization locally.
+        Operation::SetFabric { .. } | Operation::SetConditionalFabric { .. } => {
+            Err(ProposeError::Unsupported {
+                reason: "fabric references never enter consensus proposals; replicate bytes"
+                    .to_owned(),
+            })
+        }
+        // Transactional writes stage medium `Put`s above; chunked
+        // references prove the same durability contract as plain roots
+        // before a participant may say Prepared.
         Operation::TxnPrepare { write, .. } => {
             check_txn_write_sidecars(sidecar, write).await?;
             Ok(None)
@@ -5412,6 +5600,205 @@ mod tests {
                 "truncate record must survive restart"
             );
             reopened.shutdown().await;
+        });
+    }
+
+    /// Medium values replicate as chunked sidecars, never inline bytes,
+    /// never fabric ids: a 2 KiB plain `Set` restages to `SetChunked` with
+    /// a deterministic manifest, every replica stores a chunked root (no
+    /// 2 KiB inline `Bytes`, no `Fabric` in the snapshot), sidecars resolve
+    /// exact bytes on every replica, and the value survives leader death
+    /// plus a follower restart through the sidecar fetch path.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn medium_set_replicates_as_chunked_sidecar() {
+        use kivi_state::LogicalValue;
+
+        // Deterministic 2 KiB value (chunk-boundary agnostic fill).
+        fn medium_value() -> Vec<u8> {
+            (0..2048u32)
+                .map(|i| u8::try_from(i % 251).expect("remainder fits in u8"))
+                .collect()
+        }
+
+        block_on(async {
+            let (mut nodes, dirs, topology) = cluster().await;
+            let leader = wait_leader(&nodes).await;
+            let value = medium_value();
+            assert_eq!(value.len(), 2048);
+            let key = Key::from("medium");
+            let op = Operation::Set {
+                key: key.clone(),
+                value: bytes::Bytes::from(value.clone()),
+            };
+            let outcome = nodes[leader]
+                .propose(&op, None, None, NOW)
+                .await
+                .expect("medium Set proposes");
+            let index = match outcome {
+                ProposeOutcome::Applied { index, .. } => index.get(),
+                other => panic!("medium Set must apply, got {other:?}"),
+            };
+            wait_applied(&nodes, index).await;
+            // Every replica stores a chunked root, never inline bytes or a
+            // worker-local fabric id. `Any` serves local applied state
+            // without a barrier (already converged above).
+            let get = Operation::Get { key: key.clone() };
+            let mut manifests = Vec::new();
+            for node in &nodes {
+                let served = node
+                    .read(&get, ReadContract::Any, CTX, ELIGIBLE)
+                    .await
+                    .expect("follower serves Any")
+                    .outcome;
+                match served {
+                    OperationResult::ChunkedValue {
+                        manifest,
+                        logical_len,
+                    } => {
+                        assert_eq!(logical_len, 2048, "chunked root names 2 KiB");
+                        manifests.push(manifest);
+                        // Sidecar fetch path: every replica (leader and both
+                        // followers) reconstructs the exact bytes.
+                        let resolved = node
+                            .sidecar()
+                            .read_value(manifest, logical_len)
+                            .await
+                            .expect("sidecar resolves");
+                        assert_eq!(resolved, value, "sidecar bytes exact");
+                    }
+                    OperationResult::Value(_) | OperationResult::FabricValue { .. } => {
+                        panic!("medium must store as Chunked, got {served:?}");
+                    }
+                    other => panic!("Get of a medium must be chunked, got {other:?}"),
+                }
+            }
+            assert_eq!(manifests.len(), 3);
+            assert_eq!(manifests[0], manifests[1], "manifest replicates");
+            assert_eq!(manifests[1], manifests[2], "manifest replicates");
+            // Deterministic manifest: the same bytes proposed again (new key)
+            // stage to the same manifest instead of fresh sidecars.
+            let key_b = Key::from("medium-b");
+            nodes[leader]
+                .propose(
+                    &Operation::Set {
+                        key: key_b.clone(),
+                        value: bytes::Bytes::from(value.clone()),
+                    },
+                    None,
+                    None,
+                    NOW,
+                )
+                .await
+                .expect("second medium proposes");
+            let second_index = nodes[leader].status().await.applied.get();
+            wait_applied(&nodes, second_index).await;
+            let served_b = nodes[leader]
+                .read(
+                    &Operation::Get { key: key_b },
+                    ReadContract::Any,
+                    CTX,
+                    ELIGIBLE,
+                )
+                .await
+                .expect("second medium reads")
+                .outcome;
+            match served_b {
+                OperationResult::ChunkedValue { manifest, .. } => {
+                    assert_eq!(manifest, manifests[0], "same bytes stage same manifest");
+                }
+                other => panic!("second medium must be chunked, got {other:?}"),
+            }
+            // Snapshot decode: the durable image holds a chunked root, no
+            // 2 KiB inline `Bytes`, and no `Fabric` anywhere.
+            let base = nodes[leader]
+                .snapshot_and_purge()
+                .await
+                .expect("snapshot seals");
+            assert!(base.get() >= index, "purge covers the medium write");
+            let snapshots_dir = dirs[leader]
+                .path()
+                .join("consensus-sm")
+                .join(TABLET.as_u64().to_string())
+                .join("snapshots");
+            let name =
+                std::fs::read_to_string(snapshots_dir.join("CURRENT")).expect("CURRENT readable");
+            let image =
+                std::fs::read(snapshots_dir.join(name.trim())).expect("snapshot image readable");
+            let decoded =
+                crate::state_machine::ReplicatedTablet::decode_snapshot(&image, NS, TABLET)
+                    .expect("snapshot decodes");
+            let mut found_chunked = false;
+            for (stored_key, object) in &decoded.objects {
+                match object.value() {
+                    LogicalValue::Bytes(inline) => {
+                        assert_ne!(inline.len(), 2048, "no inline 2 KiB bytes in the snapshot");
+                    }
+                    LogicalValue::Fabric(fabric) => {
+                        panic!("no fabric ids in the snapshot, got {fabric:?}");
+                    }
+                    LogicalValue::Chunked(chunked) if stored_key.as_bytes() == b"medium" => {
+                        assert_eq!(chunked.logical_len, 2048);
+                        assert_eq!(chunked.manifest, manifests[0]);
+                        found_chunked = true;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(found_chunked, "medium stored as a chunked root");
+            // Kill the leader: the survivors serve the exact bytes from
+            // their durable sidecars without the dead leader.
+            nodes[leader].shutdown().await;
+            let elected = wait_leader(&nodes).await;
+            assert_ne!(elected, leader, "a new leader emerges");
+            let served = nodes[elected]
+                .read(&get, ReadContract::Any, CTX, ELIGIBLE)
+                .await
+                .expect("survivor serves")
+                .outcome;
+            match served {
+                OperationResult::ChunkedValue {
+                    manifest,
+                    logical_len,
+                } => {
+                    assert_eq!(manifest, manifests[0]);
+                    let resolved = nodes[elected]
+                        .sidecar()
+                        .read_value(manifest, logical_len)
+                        .await
+                        .expect("survivor sidecar resolves");
+                    assert_eq!(resolved, value);
+                }
+                other => panic!("survivor must serve chunked, got {other:?}"),
+            }
+            // Restart the dead leader from its directory: it catches up
+            // (snapshot + tail) and its sidecars resolve the same bytes.
+            drop(nodes.remove(leader));
+            nodes.insert(leader, restart(&dirs, &topology, leader).await);
+            wait_applied(&nodes, second_index).await;
+            let served = nodes[leader]
+                .read(&get, ReadContract::Any, CTX, ELIGIBLE)
+                .await
+                .expect("restarted replica serves")
+                .outcome;
+            match served {
+                OperationResult::ChunkedValue {
+                    manifest,
+                    logical_len,
+                } => {
+                    assert_eq!(manifest, manifests[0]);
+                    let resolved = nodes[leader]
+                        .sidecar()
+                        .read_value(manifest, logical_len)
+                        .await
+                        .expect("restarted sidecar resolves");
+                    assert_eq!(resolved, value);
+                }
+                other => panic!("restarted replica must serve chunked, got {other:?}"),
+            }
+            for node in &nodes {
+                node.shutdown().await;
+            }
         });
     }
 

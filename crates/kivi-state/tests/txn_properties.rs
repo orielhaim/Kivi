@@ -138,6 +138,7 @@ proptest! {
                 | TxnWriteKind::BoundedAdd(delta) => *delta += 1,
                 TxnWriteKind::EscrowSetShare { max, .. } => *max += 1,
                 TxnWriteKind::PutChunked { .. } => unreachable!("generator never emits chunked"),
+                TxnWriteKind::PutFabric { .. } => unreachable!("generator never emits fabric"),
             }
         }
         prop_assert_ne!(before, write_set_digest(&rebound, NS));
@@ -162,6 +163,9 @@ proptest! {
                     TxnWriteKind::EscrowSetShare { max, .. } => *max += 2,
                     TxnWriteKind::PutChunked { .. } => {
                         unreachable!("generator never emits chunked")
+                    }
+                    TxnWriteKind::PutFabric { .. } => {
+                        unreachable!("generator never emits fabric")
                     }
                 }
             }

@@ -8,8 +8,8 @@
 //! streaming-protocol coverage lives in `kivi-server` process tests.
 
 use kivi_engine::{
-    ChunkFabricConfig, DurabilityMode, DurableConfig, EngineConfig, EngineError, LocalEngine,
-    Placement,
+    ChunkFabricConfig, DurabilityMode, DurableConfig, EngineConfig, EngineError, FabricConfig,
+    LocalEngine, Placement,
 };
 use kivi_state::Key;
 use kivi_tablet::{DirectorySnapshot, HashPrefix, PartitionRange};
@@ -61,6 +61,7 @@ fn ephemeral(chunks: ChunkFabricConfig) -> LocalEngine {
         worker_count: 2,
         request_capacity: 64,
         chunks,
+        fabric: kivi_engine::FabricConfig::default(),
         network: None,
         durability: DurabilityMode::Ephemeral,
     })
@@ -89,6 +90,7 @@ fn durable(dir: &std::path::Path, chunks: ChunkFabricConfig) -> LocalEngine {
         worker_count: 2,
         request_capacity: 64,
         chunks,
+        fabric: kivi_engine::FabricConfig::default(),
         network: None,
         durability: durable_config(dir),
     })
@@ -241,6 +243,7 @@ fn missing_chunk_packs_fail_startup_loudly() {
         worker_count: 2,
         request_capacity: 64,
         chunks: ChunkFabricConfig::default(),
+        fabric: FabricConfig::default(),
         network: None,
         durability: durable_config(scratch.path()),
     })

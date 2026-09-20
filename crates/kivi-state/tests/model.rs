@@ -60,9 +60,9 @@ impl RefStore {
         let key = op.key().to_vec();
         match op {
             GenOp::Get(_) => self.read(&key, now),
-            // Inline and chunked stores are logically identical: the
-            // reference never learns representations.
-            GenOp::Set(_, value) | GenOp::SetChunked(_, value) => {
+            // Inline, chunked, and fabric stores are logically identical:
+            // the reference never learns representations.
+            GenOp::Set(_, value) | GenOp::SetChunked(_, value) | GenOp::SetFabric(_, value) => {
                 let version = self.live(&key, now).map_or(1, |obj| obj.version + 1);
                 self.map.insert(
                     key,
@@ -256,6 +256,10 @@ enum GenOp {
     /// semantics — while the Kivi side stores a chunked root the driver
     /// resolves through the manifest registry below.
     SetChunked(usize, Vec<u8>),
+    /// Fabric spelling of `Set`: overwrites any type with a fabric
+    /// reference naming `Vec<u8>` bytes. Same contract as `SetChunked`
+    /// through the fabric registry below.
+    SetFabric(usize, Vec<u8>),
     SetRange(usize, u64, Vec<u8>),
     Delete(usize),
     Exists(usize),
@@ -272,6 +276,7 @@ impl GenOp {
             Self::Get(i)
             | Self::Set(i, _)
             | Self::SetChunked(i, _)
+            | Self::SetFabric(i, _)
             | Self::SetRange(i, _, _)
             | Self::Delete(i)
             | Self::Exists(i)
@@ -299,6 +304,20 @@ fn fake_manifest_id(key: &[u8], value: &[u8]) -> kivi_types::ManifestId {
     id
 }
 
+/// Deterministic synthetic fabric id for model bytes: stands in for the
+/// engine's staging (which this layer never sees). The registry below
+/// maps these back to bytes, mirroring engine resolution.
+fn fake_fabric_id(key: &[u8], value: &[u8]) -> u64 {
+    let mut input = Vec::with_capacity(12 + key.len() + value.len());
+    input.extend_from_slice(b"model-fabric");
+    input.extend_from_slice(key);
+    input.extend_from_slice(value);
+    let digest = blake3::hash(&input);
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(&digest.as_bytes()[..8]);
+    u64::from_le_bytes(raw).max(1)
+}
+
 fn arb_delta() -> impl Strategy<Value = i64> {
     prop_oneof![-10i64..10i64, Just(i64::MAX), Just(i64::MIN), Just(0i64),]
 }
@@ -309,6 +328,8 @@ fn arb_step() -> impl Strategy<Value = (GenOp, u64)> {
         (0usize..6, prop::collection::vec(any::<u8>(), 0..8)).prop_map(|(k, v)| GenOp::Set(k, v)),
         (0usize..6, prop::collection::vec(any::<u8>(), 0..8))
             .prop_map(|(k, v)| GenOp::SetChunked(k, v)),
+        (0usize..6, prop::collection::vec(any::<u8>(), 0..8))
+            .prop_map(|(k, v)| GenOp::SetFabric(k, v)),
         // Small offsets and patches: covers in-place patches, truncation
         // past the end, and zero-padded gaps past the end.
         (
@@ -336,11 +357,15 @@ fn kivi_key(index: usize) -> Key {
     Key::from(KEYS[index])
 }
 
-fn norm_result(result: &OperationResult, registry: &BTreeMap<[u8; 32], Vec<u8>>) -> Out {
+fn norm_result(
+    result: &OperationResult,
+    registry: &BTreeMap<[u8; 32], Vec<u8>>,
+    fabric: &BTreeMap<u64, Vec<u8>>,
+) -> Out {
     match result {
         OperationResult::Value(value) => Out::Val(value.clone().map(|b| b.to_vec())),
-        // Engine resolution, mirrored: the test registry stands in for
-        // the chunk lane (which this layer never touches).
+        // Engine resolution, mirrored: the test registries stand in for
+        // the chunk lane and fabric (which this layer never touches).
         OperationResult::ChunkedValue {
             manifest,
             logical_len,
@@ -348,6 +373,21 @@ fn norm_result(result: &OperationResult, registry: &BTreeMap<[u8; 32], Vec<u8>>)
             let bytes = registry
                 .get(manifest.as_bytes())
                 .expect("chunked reads name planted manifests");
+            assert_eq!(
+                u64::try_from(bytes.len()).expect("model values fit u64"),
+                *logical_len,
+                "logical length matches resolved bytes"
+            );
+            Out::Val(Some(bytes.clone()))
+        }
+        OperationResult::FabricValue {
+            fabric_id,
+            logical_len,
+            version: _,
+        } => {
+            let bytes = fabric
+                .get(fabric_id)
+                .expect("fabric reads name planted ids");
             assert_eq!(
                 u64::try_from(bytes.len()).expect("model values fit u64"),
                 *logical_len,
@@ -431,6 +471,7 @@ fn norm_error(error: &OpError) -> RefErr {
 fn kivi_dump(
     store: &ObjectStore,
     registry: &BTreeMap<[u8; 32], Vec<u8>>,
+    fabric: &BTreeMap<u64, Vec<u8>>,
 ) -> BTreeMap<Vec<u8>, Row> {
     store
         .snapshot_sorted()
@@ -443,6 +484,14 @@ fn kivi_dump(
                     registry
                         .get(chunked.manifest.as_bytes())
                         .expect("dump resolves planted manifests")
+                        .clone(),
+                    0,
+                ),
+                LogicalValue::Fabric(fabric_ref) => (
+                    0,
+                    fabric
+                        .get(&fabric_ref.id)
+                        .expect("dump resolves planted fabric ids")
                         .clone(),
                     0,
                 ),
@@ -489,6 +538,18 @@ fn kivi_op(step: &GenOp) -> Operation {
                 logical_len: u64::try_from(value.len()).expect("model values fit u64"),
             }
         }
+        GenOp::SetFabric(i, value) => {
+            let key = KEYS[*i];
+            Operation::SetFabric {
+                key: kivi_key(*i),
+                fabric_id: fake_fabric_id(key, value),
+                logical_len: u64::try_from(value.len()).expect("model values fit u64"),
+                // The model pins reads by root version, not by staged
+                // pin: any pin applies identically here (apply overwrites
+                // it with the authoritative version).
+                version: 0,
+            }
+        }
         GenOp::SetRange(i, offset, patch) => Operation::SetRange {
             key: kivi_key(*i),
             offset: *offset,
@@ -518,10 +579,12 @@ proptest! {
     fn operations_match_reference_model(steps in prop::collection::vec(arb_step(), 1..64)) {
         let mut store = ObjectStore::new();
         let mut reference = RefStore::default();
-        // Manifest registry: stands in for the chunk lane when the Kivi
-        // side names chunked bytes. Planted before each chunked store so
-        // reads and dumps resolve exactly like engine resolution would.
+        // Manifest/fabric registries: stand in for the chunk lane and
+        // fabric when the Kivi side names non-inline bytes. Planted
+        // before each referenced store so reads and dumps resolve
+        // exactly like engine resolution would.
         let mut registry: BTreeMap<[u8; 32], Vec<u8>> = BTreeMap::new();
+        let mut fabric: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
         let mut now: u64 = 1_000_000;
         for (step, advance) in &steps {
             now = now.checked_add(*advance).expect("test clock fits");
@@ -535,15 +598,20 @@ proptest! {
                 let key = KEYS[*i];
                 registry.insert(*fake_manifest_id(key, value).as_bytes(), value.clone());
             }
-            // Engine mirror: a `SetRange` against a chunked root never
-            // reaches `prepare` as a splice — the engine restages through
-            // the lane and stores the patched bytes. Resolve here through
-            // the registry and run a plain `Set` on both sides instead.
+            if let GenOp::SetFabric(i, value) = &step {
+                let key = KEYS[*i];
+                fabric.insert(fake_fabric_id(key, value), value.clone());
+            }
+            // Engine mirror: a `SetRange` against a chunked or fabric root
+            // never reaches `prepare` as a splice — the engine resolves
+            // through the registry and stores the patched bytes. Resolve
+            // here through the registries and run a plain `Set` on both
+            // sides instead.
             let step = match &step {
                 GenOp::SetRange(i, offset, patch)
                     if matches!(
                         store.get(&kivi_key(*i), stamp).map(kivi_state::StoredObject::value),
-                        Some(LogicalValue::Chunked(_))
+                        Some(LogicalValue::Chunked(_) | LogicalValue::Fabric(_))
                     ) =>
                 {
                     let base = match store.get(&kivi_key(*i), stamp) {
@@ -553,6 +621,10 @@ proptest! {
                             LogicalValue::Chunked(chunked) => registry
                                 .get(chunked.manifest.as_bytes())
                                 .expect("driver resolves planted manifests")
+                                .clone(),
+                            LogicalValue::Fabric(fabric_ref) => fabric
+                                .get(&fabric_ref.id)
+                                .expect("driver resolves planted fabric ids")
                                 .clone(),
                             // Unreachable: the generator never creates
                             // semantic objects.
@@ -583,7 +655,7 @@ proptest! {
             let expected = reference.run(&step, now);
             let actual = match store.prepare(&kivi_op(&step), stamp) {
                 Err(error) => Err(norm_error(&error)),
-                Ok(Prepared::Read(result)) => Ok(norm_result(&result, &registry)),
+                Ok(Prepared::Read(result)) => Ok(norm_result(&result, &registry, &fabric)),
                 Ok(Prepared::Write(mutation)) => {
                     let outcome = store.apply(&mutation, stamp).expect("valid writes apply");
                     Ok(norm_apply(&step, &outcome))
@@ -591,7 +663,7 @@ proptest! {
             };
             prop_assert_eq!(actual, expected, "divergence on {:?} at t={}", step, now);
         }
-        prop_assert_eq!(kivi_dump(&store, &registry), reference.dump());
+        prop_assert_eq!(kivi_dump(&store, &registry, &fabric), reference.dump());
     }
 }
 

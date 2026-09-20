@@ -143,6 +143,15 @@ struct Args {
     /// eviction at any time).
     #[arg(long, default_value_t = kivi_engine::ChunkFabricConfig::DEFAULT_CACHE_BYTES)]
     chunk_cache_bytes: u64,
+    /// DRAM arena bound in bytes per worker for medium values (both
+    /// durability modes). Smaller bounds demote cold data to `NVMe`
+    /// sooner; the commit path fails fast with overload past it.
+    #[arg(long, default_value_t = kivi_engine::FabricConfig::DEFAULT_ARENA_BYTES)]
+    fabric_arena_bytes: u64,
+    /// Demotion capacity in bytes per worker (optimization copies to
+    /// `NVMe`; durable records live in the material file regardless).
+    #[arg(long, default_value_t = kivi_engine::FabricConfig::DEFAULT_DEMOTION_BYTES)]
+    fabric_demotion_bytes: u64,
     /// Admin/control HTTP listen address (loopback by default; `:0` selects
     /// an ephemeral port and prints it).
     #[arg(long, default_value = "127.0.0.1:19080")]
@@ -604,6 +613,10 @@ fn main() -> anyhow::Result<()> {
             inline_threshold: args.inline_threshold,
             pack_target_bytes: args.chunk_pack_target,
             cache_bytes: args.chunk_cache_bytes,
+        },
+        fabric: kivi_engine::FabricConfig {
+            arena_bytes_per_worker: args.fabric_arena_bytes,
+            demotion_bytes_per_worker: args.fabric_demotion_bytes,
         },
         network: Some(EngineNetwork {
             base_port: args.port,

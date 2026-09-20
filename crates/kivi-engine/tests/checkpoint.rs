@@ -61,6 +61,7 @@ fn start(dir: &std::path::Path) -> LocalEngine {
         worker_count: 2,
         request_capacity: 256,
         chunks: kivi_engine::ChunkFabricConfig::default(),
+        fabric: kivi_engine::FabricConfig::default(),
         network: None,
         durability: durable_config(dir),
     })

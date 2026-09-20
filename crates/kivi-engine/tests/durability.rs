@@ -63,6 +63,7 @@ fn start(dir: &std::path::Path) -> (LocalEngine, NodeIncarnation) {
         worker_count: 2,
         request_capacity: 64,
         chunks: kivi_engine::ChunkFabricConfig::default(),
+        fabric: kivi_engine::FabricConfig::default(),
         network: None,
         durability,
     })
@@ -121,6 +122,7 @@ fn recovery_rejects_forgotten_tablet() {
         worker_count: 2,
         request_capacity: 64,
         chunks: kivi_engine::ChunkFabricConfig::default(),
+        fabric: kivi_engine::FabricConfig::default(),
         network: None,
         durability,
     })

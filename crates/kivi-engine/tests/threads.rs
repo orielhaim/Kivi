@@ -111,6 +111,7 @@ fn concurrent_counter_is_exact() {
         worker_count: 1,
         request_capacity: 16,
         chunks: kivi_engine::ChunkFabricConfig::default(),
+        fabric: kivi_engine::FabricConfig::default(),
         network: None,
         durability: DurabilityMode::Ephemeral,
     })
@@ -150,6 +151,7 @@ fn multi_tablet_parallelism_makes_independent_progress() {
         worker_count: 2,
         request_capacity: 64,
         chunks: kivi_engine::ChunkFabricConfig::default(),
+        fabric: kivi_engine::FabricConfig::default(),
         network: None,
         durability: DurabilityMode::Ephemeral,
     })
@@ -239,6 +241,7 @@ fn mixed_workload_matches_sequential_reference() {
         worker_count: 2,
         request_capacity: 64,
         chunks: kivi_engine::ChunkFabricConfig::default(),
+        fabric: kivi_engine::FabricConfig::default(),
         network: None,
         durability: DurabilityMode::Ephemeral,
     })
@@ -312,9 +315,9 @@ fn mixed_workload_matches_sequential_reference() {
             }
             // Unreachable here: the scripted ops are inline-only (Set,
             // CounterAdd, expiry, delete) on an empty store, so no chunked
-            // root can exist. Chunked equivalence is covered by the state
-            // model test and the chunked engine tests.
-            kivi_state::LogicalValue::Chunked(_) => {
+            // or fabric root can exist. Chunked equivalence is covered by
+            // the state model test and the chunked engine tests.
+            kivi_state::LogicalValue::Chunked(_) | kivi_state::LogicalValue::Fabric(_) => {
                 panic!("no scripted op produces chunked roots for {key}")
             }
             kivi_state::LogicalValue::StrictCounter(value) => {

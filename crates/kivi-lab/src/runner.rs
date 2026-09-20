@@ -178,11 +178,15 @@ pub fn run<T: BenchTarget + 'static>(
 }
 
 /// Seeds every key the workload touches through `target` (byte keys at
-/// `value_len`, counters at their creation point).
+/// `value_len`, counters at their creation point). Overload retries with
+/// bounded backoff, the way production loaders pace bursts: pressure
+/// scenarios establish their working set instead of failing the burst.
+/// Any other seeding failure aborts loudly.
 ///
 /// # Errors
 ///
-/// Returns the first seeding failure, labeled by thread.
+/// Returns the first non-overload seeding failure, labeled by thread, or
+/// overload that outlasts the retry budget.
 pub fn seed<T: BenchTarget>(
     target: &mut T,
     space: KeySpace,
@@ -194,10 +198,29 @@ pub fn seed<T: BenchTarget>(
     use crate::workload::seed_ops_for;
     for thread in 0..threads {
         for op in seed_ops_for(space, thread, workload, value_len, prefix) {
-            target
-                .seed_one(&op)
-                .map_err(|error| anyhow::anyhow!("seed thread {thread} keyspace: {error}"))?;
+            let mut attempt = 0u32;
+            loop {
+                match target.seed_one(&op) {
+                    Ok(()) => break,
+                    Err(error) if is_overload(&error) && attempt < 30 => {
+                        attempt += 1;
+                        thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    Err(error) => {
+                        return Err(anyhow::anyhow!("seed thread {thread} keyspace: {error}"));
+                    }
+                }
+            }
         }
     }
     Ok(())
+}
+
+/// Whether a seed failure is backpressure (retryable) rather than a
+/// logical error (fatal): overload surfaces through several shapings.
+fn is_overload(error: &str) -> bool {
+    error.contains("overload")
+        || error.contains("Overload")
+        || error.contains("window exhausted")
+        || error.contains("busy")
 }

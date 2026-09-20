@@ -7,7 +7,7 @@ use bytes::Bytes;
 use kivi_client::{ClientConfig, ClientError, NativeClient};
 use kivi_engine::{
     BatchPolicy, CheckpointConfig, ChunkFabricConfig, ConnLimits, DurabilityMode, DurableConfig,
-    EngineConfig, EngineNetwork, LocalEngine, Placement, TurnBudget,
+    EngineConfig, EngineNetwork, FabricConfig, LocalEngine, Placement, TurnBudget,
 };
 use kivi_state::Key;
 use kivi_tablet::{DirectorySnapshot, HashPrefix, PartitionRange};
@@ -56,6 +56,7 @@ fn start_ephemeral(chunks: ChunkFabricConfig) -> LocalEngine {
         worker_count: 2,
         request_capacity: 128,
         chunks,
+        fabric: FabricConfig::default(),
         network: Some(network()),
         durability: DurabilityMode::Ephemeral,
     })
@@ -71,6 +72,7 @@ fn start_durable(dir: &std::path::Path) -> LocalEngine {
         worker_count: 2,
         request_capacity: 128,
         chunks: ChunkFabricConfig::default(),
+        fabric: FabricConfig::default(),
         network: Some(network()),
         durability: DurabilityMode::Durable(DurableConfig {
             data_dir: dir.to_owned(),

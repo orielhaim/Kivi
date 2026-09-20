@@ -174,6 +174,13 @@ const VALUE_SEMAPHORE: u8 = 6;
 const VALUE_LEASE: u8 = 7;
 /// Stream-shard tag (cursor plus retained entries).
 const VALUE_STREAM_SHARD: u8 = 8;
+/// Fabric-root tag: fabric reference only (id, length, version), never
+/// bulk bytes. Fabric ids are worker-local names: a snapshot carrying
+/// one only restores on a worker whose fabric staged it (same-process
+/// restart via the journal); cross-node installs must resolve foreign
+/// ids through sidecar bytes first, and serve paths fail closed on
+/// unresolvable references instead of serving absence.
+const VALUE_FABRIC: u8 = 9;
 
 /// Converts an applied Raft log index into its [`CommitPosition`]
 /// (task D, Option 1: `CommitPosition = raft_index + 1`; the `+1` preserves
@@ -1069,6 +1076,7 @@ enum ImageFault {
     BadVersion,
     BadExpiry,
     BadChunkedRef,
+    BadFabricRef,
     BadAddress,
 }
 
@@ -1177,6 +1185,10 @@ fn encode_object(out: &mut Vec<u8>, object: &StoredObject) {
             out.push(VALUE_CHUNKED);
             chunked.encode(out);
         }
+        LogicalValue::Fabric(fabric) => {
+            out.push(VALUE_FABRIC);
+            fabric.encode(out);
+        }
         LogicalValue::StrictCounter(value) => {
             out.push(VALUE_COUNTER);
             out.extend_from_slice(&value.to_le_bytes());
@@ -1221,6 +1233,11 @@ fn decode_object(input: &[u8]) -> Result<(StoredObject, usize), ImageFault> {
             let (chunked, used) =
                 kivi_state::ChunkedRef::decode(&input[1..]).map_err(|_| Fault::BadChunkedRef)?;
             (LogicalValue::Chunked(chunked), 1 + used)
+        }
+        VALUE_FABRIC => {
+            let (fabric, used) =
+                kivi_state::FabricRef::decode(&input[1..]).map_err(|_| Fault::BadFabricRef)?;
+            (LogicalValue::Fabric(fabric), 1 + used)
         }
         VALUE_COUNTER => {
             if input.len() < 1 + 8 {
@@ -2274,6 +2291,9 @@ impl ReplicatedStateMachine {
             Some(object) => match object.value() {
                 kivi_state::LogicalValue::Bytes(_) => RangeBase::Inline,
                 kivi_state::LogicalValue::Chunked(_) => RangeBase::Chunked,
+                // Defensive: consensus stores never hold fabric roots
+                // (replicated IR carries bytes, never worker-local ids),
+                // so any other value fails closed downstream.
                 _ => RangeBase::NonBytes,
             },
         })

@@ -18,6 +18,7 @@ pub mod clock;
 pub mod commit;
 pub mod compound;
 pub mod engine;
+pub mod fabric;
 pub mod net;
 pub mod routing;
 pub mod tablet;
@@ -36,11 +37,22 @@ pub use engine::{
     AdminHandle, ChunkFabricConfig, DurabilityMode, DurableConfig, EngineConfig, EngineDurability,
     EngineError, LocalClient, LocalEngine, ShutdownReport, TxnStatusReport,
 };
+pub use fabric::{
+    FABRIC_INLINE_MAX, FabricConfig, FabricError, FabricPaths, FabricSealLocator,
+    FabricSealPayload, FabricStatsSnapshot, JournalEntry, JournalFile, StagedSeal, TabletFabric,
+    import_from_entry, journal_append_batch, journal_compact, journal_load, open_material_provider,
+};
+pub use kivi_memory::Footprint;
+pub use kivi_memory::offcore_lane::{
+    DemotedRecord, OFFCORE_JOB_DEPTH, OffcoreLaneGuard, OffcoreLaneHandle, OffcoreLaneStats,
+    OffcoreReply, PromotedBytes, spawn_offcore_lane,
+};
 pub use net::{ConnLimits, EngineNetwork, NetConfig, NetStartError, TurnBudget};
 pub use routing::{Placement, RoutingSnapshot};
 pub use tablet::{
     DedupEntry, DurablePrepared, LiveTablet, SessionDedup, TabletError, TabletMetrics,
 };
 pub use worker::{
-    LaneAccess, TabletCheckpointStatus, WorkerControl, WorkerDurability, WorkerMetrics,
+    FabricWorkerReport, LaneAccess, TabletCheckpointStatus, WorkerControl, WorkerDurability,
+    WorkerMetrics,
 };

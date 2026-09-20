@@ -83,6 +83,7 @@ fn restart_on_ports(ports: &[u16], placement: Placement) -> LocalEngine {
         worker_count: 2,
         request_capacity: 128,
         chunks: kivi_engine::ChunkFabricConfig::default(),
+        fabric: kivi_engine::FabricConfig::default(),
         network: Some(EngineNetwork {
             ports: ports.to_vec(),
             ..network()
@@ -103,6 +104,7 @@ fn start_split() -> LocalEngine {
         worker_count: 2,
         request_capacity: 128,
         chunks: kivi_engine::ChunkFabricConfig::default(),
+        fabric: kivi_engine::FabricConfig::default(),
         network: Some(network()),
         durability: DurabilityMode::Ephemeral,
     })

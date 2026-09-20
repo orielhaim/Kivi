@@ -118,9 +118,11 @@ impl TabletMetrics {
             | M::CounterAdd { .. }
             | M::SetExpiry { .. }
             | M::ReplaceChunkedRoot { .. }
+            | M::ReplaceFabricRoot { .. }
             | M::SpliceBytes { .. }
             | M::PutBytesWithExpiry { .. }
-            | M::ReplaceChunkedRootWithExpiry { .. } => {}
+            | M::ReplaceChunkedRootWithExpiry { .. }
+            | M::ReplaceFabricRootWithExpiry { .. } => {}
         }
     }
 

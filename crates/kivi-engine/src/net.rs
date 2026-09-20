@@ -268,6 +268,12 @@ struct WorkerNet {
     /// connection tasks and bridge like durability above. Staging and
     /// resolution suspend the awaiting task only — never the reactor.
     chunks: crate::worker::WorkerChunks,
+    /// Memory Fabric integration. Shared across connection tasks and
+    /// bridge like durability above. Staging is synchronous (arena
+    /// insert, never blocking); promotion suspends the awaiting task
+    /// (connection tasks) or parks on the frontier (bridge) — the
+    /// reactor thread itself never blocks on storage.
+    fabric: Rc<RefCell<crate::fabric::TabletFabric>>,
 }
 
 /// Launch bundle for one networked worker: everything `spawn_net` needs
@@ -300,6 +306,7 @@ pub(crate) fn run_net(
     control: crossbeam_channel::Receiver<WorkerControl>,
     durability: Option<WorkerDurability>,
     chunks: crate::worker::WorkerChunks,
+    fabric: crate::fabric::TabletFabric,
     launch: NetLaunch,
     bridge_wake: async_channel::Receiver<()>,
     ready: std::sync::mpsc::Sender<Result<SocketAddr, NetStartError>>,
@@ -325,6 +332,7 @@ pub(crate) fn run_net(
         net: launch.net,
         durability: durability.map(|durable| Rc::new(RefCell::new(durable))),
         chunks,
+        fabric: Rc::new(RefCell::new(fabric)),
     });
     let runtime = match Runtime::new() {
         Ok(runtime) => runtime,
@@ -370,6 +378,7 @@ async fn serve(
         let shutdown = Rc::clone(&shared.shutdown);
         let durability = shared.durability.clone();
         let chunks = shared.chunks.clone();
+        let fabric = Rc::clone(&shared.fabric);
         compio::runtime::spawn(async move {
             bridge_loop(BridgeContext {
                 requests,
@@ -379,6 +388,7 @@ async fn serve(
                 metrics,
                 durability,
                 chunks,
+                fabric,
                 shutdown,
             })
             .await;
@@ -426,9 +436,11 @@ async fn serve(
         for _ in 0..300 {
             let pending = {
                 let mut durable = cell.borrow_mut();
-                durable
-                    .commit
-                    .poll(&mut shared.tablets.borrow_mut(), namespace);
+                durable.commit.poll(
+                    &mut shared.tablets.borrow_mut(),
+                    namespace,
+                    &mut shared.fabric.borrow_mut(),
+                );
                 durable.commit.has_pending()
             };
             if !pending {
@@ -456,6 +468,7 @@ struct BridgeContext {
     metrics: Rc<Cell<WorkerMetrics>>,
     durability: Option<Rc<RefCell<WorkerDurability>>>,
     chunks: crate::worker::WorkerChunks,
+    fabric: Rc<RefCell<crate::fabric::TabletFabric>>,
     shutdown: Rc<Cell<bool>>,
 }
 
@@ -465,6 +478,26 @@ struct BridgeContext {
 /// drops every sender (which also flips the listener shutdown so the
 /// thread can join).
 ///
+/// Handle one bridge control message (`false` = shut down). Split out so
+/// the bridge loop stays reviewable; borrows end with the call.
+fn bridge_control(
+    message: WorkerControl,
+    tablets: &Rc<RefCell<HashMap<TabletId, LiveTablet>>>,
+    metrics: &Rc<Cell<WorkerMetrics>>,
+    durability: Option<&Rc<RefCell<WorkerDurability>>>,
+    fabric: &Rc<RefCell<crate::fabric::TabletFabric>>,
+) -> bool {
+    let durable = durability.map(|cell| cell.borrow());
+    let durable_ref = durable.as_deref();
+    handle_control(
+        message,
+        &mut tablets.borrow_mut(),
+        metrics,
+        durable_ref,
+        &mut fabric.borrow_mut(),
+    )
+}
+
 /// Wakeups are event-driven: every ingress send pings `bridge_wake`, so an
 /// idle bridge parks in `recv()` with no poll quantum, no latency floor,
 /// and no idle CPU. A short backstop bounds a lost ping (which cannot
@@ -481,6 +514,7 @@ async fn bridge_loop(context: BridgeContext) {
         metrics,
         durability,
         chunks,
+        fabric,
         shutdown,
     } = context;
     let mut requests_dead = false;
@@ -489,13 +523,15 @@ async fn bridge_loop(context: BridgeContext) {
     // bridge shares the reactor thread, so it polls completions per turn
     // instead of blocking like plain worker threads do).
     let mut frontier: VecDeque<BridgeStage> = VecDeque::new();
+    // Fabric reads parked while the offcore lane promotes them. Same
+    // poll-per-turn discipline; resume re-checks residency synchronously
+    // before serving so the reactor never blocks on storage.
+    let mut fabric_parks: VecDeque<FabricReadPark> = VecDeque::new();
     loop {
         loop {
             match control.try_recv() {
                 Ok(message) => {
-                    let durable = durability.as_ref().map(|cell| cell.borrow());
-                    let durable_ref = durable.as_deref();
-                    if !handle_control(message, &mut tablets.borrow_mut(), &metrics, durable_ref) {
+                    if !bridge_control(message, &tablets, &metrics, durability.as_ref(), &fabric) {
                         shutdown.set(true);
                         return;
                     }
@@ -520,7 +556,9 @@ async fn bridge_loop(context: BridgeContext) {
                         &metrics,
                         durability.as_ref(),
                         &chunks,
+                        &fabric,
                         &mut frontier,
+                        &mut fabric_parks,
                     );
                     drained += 1;
                     if drained.is_multiple_of(64) {
@@ -538,13 +576,22 @@ async fn bridge_loop(context: BridgeContext) {
             shutdown.set(true);
             return;
         }
-        // Complete staged large Sets whose lane proofs arrived, then pump
-        // the commit coordinator so embedded durable requests keep
-        // flowing, then park: short quantum while batches are admitted or
-        // in flight (reply latency tracks proofs), event-driven sleep
+        // Complete staged large Sets whose lane proofs arrived, resume
+        // parked fabric reads whose promotions arrived, then pump the
+        // commit coordinator so embedded durable requests keep flowing,
+        // then park: short quantum while batches are admitted or in
+        // flight (reply latency tracks proofs), event-driven sleep
         // otherwise (bounded CPU, immediate wake on traffic).
-        poll_bridge_stages(&mut frontier, &tablets, &metrics, durability.as_ref());
+        poll_bridge_stages(
+            &mut frontier,
+            &tablets,
+            &metrics,
+            durability.as_ref(),
+            &fabric,
+        );
+        poll_fabric_parks(&mut fabric_parks, &tablets, &metrics, &fabric);
         let pending = !frontier.is_empty()
+            || !fabric_parks.is_empty()
             || durability.as_ref().is_some_and(|cell| {
                 // Synchronous borrow: ends before any `.await` below.
                 cell.borrow().commit.has_pending()
@@ -553,8 +600,16 @@ async fn bridge_loop(context: BridgeContext) {
             if let Some(cell) = durability.as_ref() {
                 let mut durable = cell.borrow_mut();
                 let namespace = durable.namespace;
-                durable.commit.poll(&mut tablets.borrow_mut(), namespace);
+                durable.commit.poll(
+                    &mut tablets.borrow_mut(),
+                    namespace,
+                    &mut fabric.borrow_mut(),
+                );
             }
+            // Amortized fabric maintenance (planning slice, lane
+            // submissions, retire sweep): runs on bridge turns, never
+            // per request.
+            fabric.borrow_mut().maintenance_if_due();
         }
         if pending {
             compio::time::sleep(crate::commit::COMPLETION_PARK).await;
@@ -598,17 +653,52 @@ struct BridgeStage {
     conditional: Option<(kivi_state::SetCondition, kivi_state::ExpiryPolicy)>,
 }
 
+/// One embedded fabric read parked while the offcore lane promotes it.
+/// Resume re-checks residency synchronously before serving (the reactor
+/// never blocks on storage); bounded re-parks absorb races, then the
+/// request answers backpressure instead of wedging the bridge.
+/// Medium-tier routing outcome: staged, already answered, or not a
+/// medium write (caller falls through to the chunk path).
+#[derive(Debug)]
+enum RoutedMedium {
+    /// Staged: admitted op plus its seal payloads (caller attaches its pin).
+    Staged(Operation, Vec<crate::fabric::StagedSeal>),
+    /// Saturation: the request already answered overload.
+    Answered,
+    /// Not a medium write: caller continues to the chunk path.
+    Pass,
+}
+
+struct FabricReadPark {
+    /// Owning tablet (routed before parking; placement is static).
+    tablet: TabletId,
+    /// Full read operation to answer on resume (`Get`/`GetRange`).
+    op: Operation,
+    /// Logical wall time captured at the client boundary (expiry
+    /// re-check on resume: never resurrect expired state).
+    now: kivi_types::UnixMicros,
+    /// Where the outcome goes.
+    respond: crossbeam_channel::Sender<crate::worker::WorkerResponse>,
+    /// Fabric park sequence holding the lane reply.
+    park: u64,
+}
+
 /// Embedded intake on the reactor bridge: inline ops serve synchronously
 /// (no lane traffic, no block); large `Set`s park on the frontier and
-/// complete on later turns. Lane saturation answers `Overloaded` at once.
-#[allow(clippy::needless_pass_by_value)]
+/// complete on later turns; medium `Set`s stage into the fabric
+/// synchronously (arena insert, never blocking). Fabric reads that miss
+/// residency park on the fabric frontier; everything else serves inline.
+/// Lane saturation answers `Overloaded` at once.
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 fn bridge_intake(
     request: crate::worker::TabletRequest,
     tablets: &Rc<RefCell<HashMap<TabletId, LiveTablet>>>,
     metrics: &Rc<Cell<WorkerMetrics>>,
     durability: Option<&Rc<RefCell<WorkerDurability>>>,
     chunks: &WorkerChunks,
+    fabric: &Rc<RefCell<crate::fabric::TabletFabric>>,
     frontier: &mut VecDeque<BridgeStage>,
+    fabric_parks: &mut VecDeque<FabricReadPark>,
 ) {
     let crate::worker::TabletRequest {
         tablet,
@@ -617,18 +707,69 @@ fn bridge_intake(
         identity,
         respond,
     } = request;
+    // Fabric reads pre-check residency synchronously: a hit flows into
+    // the normal path below (whose internal resolve will also hit —
+    // check and act share one synchronous turn, so no race); a miss
+    // parks here instead of entering `handle_request`, whose blocking
+    // resolve must never run on the reactor.
+    if let Operation::Get { key } | Operation::GetRange { key, .. } = &op
+        && let Some(reference) = tablets
+            .borrow()
+            .get(&tablet)
+            .and_then(|live| live.store().get(key, now))
+            .and_then(kivi_state::StoredObject::fabric_ref)
+    {
+        let resident = fabric
+            .borrow_mut()
+            .resolve_sync(
+                &reference,
+                tablets
+                    .borrow()
+                    .get(&tablet)
+                    .and_then(|live| live.store().get(key, now)),
+            )
+            .ok()
+            .and_then(|outcome| outcome);
+        if resident.is_none() {
+            park_fabric_read(
+                tablet,
+                op,
+                now,
+                respond,
+                reference,
+                tablets,
+                metrics,
+                fabric,
+                fabric_parks,
+            );
+            return;
+        }
+    }
     // Range patches plan against the peeked base before the
     // representation split: small inline results serve synchronously
     // below, restaged results re-enter as ordinary large `Set`s, chunked
-    // bases park a lane splice on the frontier, and absurd ranges reject
-    // with state untouched. A parked or rejected patch returns here (its
-    // responder is consumed by the frontier or the answer).
+    // bases park a lane splice on the frontier, fabric bases resolve or
+    // park, and absurd ranges reject with state untouched. A parked or
+    // rejected patch returns here (its responder is consumed by the
+    // frontier or the answer).
     let (planned, respond) = bridge_plan_range(
-        tablet, op, now, identity, respond, tablets, metrics, chunks, frontier,
+        tablet, op, now, identity, respond, tablets, metrics, chunks, fabric, frontier,
     );
     let (Some(op), Some(respond)) = (planned, respond) else {
         return;
     };
+    // Medium values stage into the fabric synchronously (arena insert,
+    // never blocking on the reactor); large values park chunk staging
+    // on the frontier below.
+    if let Operation::Set { value, .. } | Operation::SetConditional { value, .. } = &op
+        && value.len() > crate::fabric::FABRIC_INLINE_MAX
+        && (value.len() as u64) <= chunks.inline_threshold
+    {
+        bridge_stage_fabric(
+            tablet, &op, now, identity, respond, tablets, metrics, durability, fabric,
+        );
+        return;
+    }
     match crate::chunk_lane::split_large_set(op, chunks.inline_threshold) {
         crate::chunk_lane::LargeSetSplit::Inline(op) => {
             let mut durable = durability.map(|cell| cell.borrow_mut());
@@ -645,38 +786,75 @@ fn bridge_intake(
                 metrics,
                 durable_ref,
                 chunks,
+                &mut fabric.borrow_mut(),
             );
         }
-        crate::chunk_lane::LargeSetSplit::Stage { key, value } => {
-            let pinned =
-                match crate::chunk_lane::PinnedUpload::begin(&chunks.pins, chunks.domain, &value) {
-                    Ok(pinned) => Some(pinned),
-                    Err(error) => {
-                        let mut snapshot = metrics.get();
-                        snapshot.channel_ops += 1;
-                        metrics.set(snapshot);
-                        let _ = respond.try_send(Err(WorkerRequestError::ChunkStore(error)));
-                        return;
-                    }
-                };
-            match chunks.lane.submit_stage(value) {
-                Ok(reply) => frontier.push_back(BridgeStage {
-                    tablet,
-                    key,
-                    identity,
-                    respond,
-                    reply,
-                    pinned,
-                    pins: None,
-                    conditional: None,
-                }),
+        split => bridge_chunk_stage(tablet, split, identity, respond, metrics, chunks, frontier),
+    }
+}
+
+/// Parks one chunk staging on the bridge frontier: begins the pinned
+/// upload, submits the lane stage, and answers lane failures inline.
+/// Kept beside [`bridge_intake`] so the intake match stays reviewable.
+fn bridge_chunk_stage(
+    tablet: TabletId,
+    split: crate::chunk_lane::LargeSetSplit,
+    identity: Option<MutationIdentity>,
+    respond: crossbeam_channel::Sender<crate::worker::WorkerResponse>,
+    metrics: &Rc<Cell<WorkerMetrics>>,
+    chunks: &WorkerChunks,
+    frontier: &mut VecDeque<BridgeStage>,
+) {
+    #[allow(clippy::too_many_arguments)]
+    fn push_stage(
+        tablet: TabletId,
+        key: Key,
+        value: Bytes,
+        conditional: Option<(kivi_state::SetCondition, kivi_state::ExpiryPolicy)>,
+        identity: Option<MutationIdentity>,
+        respond: crossbeam_channel::Sender<crate::worker::WorkerResponse>,
+        metrics: &Rc<Cell<WorkerMetrics>>,
+        chunks: &WorkerChunks,
+        frontier: &mut VecDeque<BridgeStage>,
+    ) {
+        let pinned =
+            match crate::chunk_lane::PinnedUpload::begin(&chunks.pins, chunks.domain, &value) {
+                Ok(pinned) => Some(pinned),
                 Err(error) => {
                     let mut snapshot = metrics.get();
                     snapshot.channel_ops += 1;
                     metrics.set(snapshot);
                     let _ = respond.try_send(Err(WorkerRequestError::ChunkStore(error)));
+                    return;
                 }
+            };
+        match chunks.lane.submit_stage(value) {
+            Ok(reply) => frontier.push_back(BridgeStage {
+                tablet,
+                key,
+                identity,
+                respond,
+                reply,
+                pinned,
+                pins: None,
+                conditional,
+            }),
+            Err(error) => {
+                let mut snapshot = metrics.get();
+                snapshot.channel_ops += 1;
+                metrics.set(snapshot);
+                let _ = respond.try_send(Err(WorkerRequestError::ChunkStore(error)));
             }
+        }
+    }
+    match split {
+        crate::chunk_lane::LargeSetSplit::Inline(_) => {
+            unreachable!("inline sets serve above")
+        }
+        crate::chunk_lane::LargeSetSplit::Stage { key, value } => {
+            push_stage(
+                tablet, key, value, None, identity, respond, metrics, chunks, frontier,
+            );
         }
         crate::chunk_lane::LargeSetSplit::StageConditional {
             key,
@@ -684,48 +862,178 @@ fn bridge_intake(
             condition,
             expiry,
         } => {
-            let pinned =
-                match crate::chunk_lane::PinnedUpload::begin(&chunks.pins, chunks.domain, &value) {
-                    Ok(pinned) => Some(pinned),
-                    Err(error) => {
-                        let mut snapshot = metrics.get();
-                        snapshot.channel_ops += 1;
-                        metrics.set(snapshot);
-                        let _ = respond.try_send(Err(WorkerRequestError::ChunkStore(error)));
-                        return;
-                    }
-                };
-            match chunks.lane.submit_stage(value) {
-                Ok(reply) => frontier.push_back(BridgeStage {
-                    tablet,
-                    key,
-                    identity,
-                    respond,
-                    reply,
-                    pinned,
-                    pins: None,
-                    conditional: Some((condition, expiry)),
-                }),
-                Err(error) => {
-                    let mut snapshot = metrics.get();
-                    snapshot.channel_ops += 1;
-                    metrics.set(snapshot);
-                    let _ = respond.try_send(Err(WorkerRequestError::ChunkStore(error)));
-                }
-            }
+            push_stage(
+                tablet,
+                key,
+                value,
+                Some((condition, expiry)),
+                identity,
+                respond,
+                metrics,
+                chunks,
+                frontier,
+            );
         }
     }
 }
 
-/// Plans one range patch on the bridge: inline results and restaged
-/// `Set`s return for synchronous serving below; splices park on the
-/// frontier; rejections answer at once. The responder travels in and
-/// back out: parked requests consume it into the frontier (`None`), all
-/// other outcomes hand it back for the synchronous path below.
-// Nine parameters: the routed request envelope plus the bridge state the
-// plan consults (tablets, metrics, lane policy, frontier). Grouping
-// would hide the intake order the surrounding code documents; the sole
-// caller builds it explicitly.
+/// Parks one fabric read on the bridge frontier: submits the lane
+/// promotion (non-blocking) and parks the full read for a later turn.
+/// The resume path re-checks residency synchronously before serving.
+#[allow(clippy::too_many_arguments)]
+fn park_fabric_read(
+    tablet: TabletId,
+    op: Operation,
+    now: kivi_types::UnixMicros,
+    respond: crossbeam_channel::Sender<crate::worker::WorkerResponse>,
+    reference: kivi_state::FabricRef,
+    tablets: &Rc<RefCell<HashMap<TabletId, LiveTablet>>>,
+    metrics: &Rc<Cell<WorkerMetrics>>,
+    fabric: &Rc<RefCell<crate::fabric::TabletFabric>>,
+    fabric_parks: &mut VecDeque<FabricReadPark>,
+) {
+    let current = tablets
+        .borrow()
+        .get(&tablet)
+        .and_then(|live| live.store().get(op.key(), now).cloned());
+    let park = fabric.borrow_mut().submit_parked_promote(
+        tablet,
+        op.key().clone(),
+        &reference,
+        current.as_ref(),
+    );
+    let mut snapshot = metrics.get();
+    snapshot.channel_ops += 1;
+    metrics.set(snapshot);
+    match park {
+        Ok(park) => {
+            fabric_parks.push_back(FabricReadPark {
+                tablet,
+                op,
+                now,
+                respond,
+                park,
+            });
+        }
+        Err(error) => {
+            let _ = respond.try_send(Err(match error {
+                crate::fabric::FabricError::Overloaded => {
+                    crate::worker::WorkerRequestError::SessionOverloaded
+                }
+                other => crate::worker::WorkerRequestError::Fabric(other),
+            }));
+        }
+    }
+}
+
+/// Stages one medium `Set`/`SetConditional` into the fabric on the
+/// bridge (synchronous arena insert), then admits (durable) or executes
+/// (ephemeral) the resulting small root. Staging failures answer at
+/// once with state untouched.
+#[allow(clippy::too_many_arguments)]
+fn bridge_stage_fabric(
+    tablet: TabletId,
+    op: &Operation,
+    now: kivi_types::UnixMicros,
+    identity: Option<MutationIdentity>,
+    respond: crossbeam_channel::Sender<crate::worker::WorkerResponse>,
+    tablets: &Rc<RefCell<HashMap<TabletId, LiveTablet>>>,
+    metrics: &Rc<Cell<WorkerMetrics>>,
+    durability: Option<&Rc<RefCell<WorkerDurability>>>,
+    fabric: &Rc<RefCell<crate::fabric::TabletFabric>>,
+) {
+    let (key, value, conditional) = match op {
+        Operation::Set { key, value } => (key.clone(), value.clone(), None),
+        Operation::SetConditional {
+            key,
+            value,
+            condition,
+            expiry,
+        } => (key.clone(), value.clone(), Some((*condition, *expiry))),
+        _ => unreachable!("bridge stages medium sets only"),
+    };
+    let staged = fabric.borrow_mut().stage(tablet, value.clone(), true);
+    let mut snapshot = metrics.get();
+    snapshot.channel_ops += 1;
+    metrics.set(snapshot);
+    let (fabric_id, logical_len) = match staged {
+        Ok(staged) => staged,
+        Err(error) => {
+            let _ = respond.try_send(Err(match error {
+                crate::fabric::FabricError::Overloaded => {
+                    crate::worker::WorkerRequestError::SessionOverloaded
+                }
+                other => crate::worker::WorkerRequestError::Fabric(other),
+            }));
+            return;
+        }
+    };
+    let staged_op = match conditional {
+        None => Operation::SetFabric {
+            key: key.clone(),
+            fabric_id,
+            logical_len,
+            version: 0,
+        },
+        Some((condition, expiry)) => Operation::SetConditionalFabric {
+            key: key.clone(),
+            fabric_id,
+            logical_len,
+            version: 0,
+            condition,
+            expiry,
+        },
+    };
+    let seal = crate::fabric::StagedSeal {
+        fabric_id,
+        key: key.clone(),
+        bytes: value,
+    };
+    match durability {
+        None => {
+            let mut tablets = tablets.borrow_mut();
+            let outcome = match tablets.get_mut(&tablet) {
+                None => Err(crate::worker::WorkerRequestError::UnknownTablet { tablet }),
+                Some(live) => {
+                    let previous = live
+                        .store()
+                        .get(&key, now)
+                        .and_then(kivi_state::StoredObject::fabric_ref);
+                    match live.execute(&staged_op, now) {
+                        Err(error) => {
+                            fabric.borrow_mut().retire_or_defer(fabric_id);
+                            Err(crate::worker::WorkerRequestError::Tablet(error))
+                        }
+                        Ok(result) => {
+                            if let Some(post) = live.store().get(&key, now) {
+                                fabric.borrow_mut().retire_superseded(previous, post);
+                            }
+                            Ok(result)
+                        }
+                    }
+                }
+            };
+            let _ = respond.try_send(outcome);
+        }
+        Some(cell) => {
+            let mut durable = cell.borrow_mut();
+            let namespace = durable.namespace;
+            durable.commit.admit(
+                crate::commit::PendingEntry::new(tablet, staged_op, now, identity, respond)
+                    .with_fabric_staged(vec![seal]),
+            );
+            durable.commit.poll(
+                &mut tablets.borrow_mut(),
+                namespace,
+                &mut fabric.borrow_mut(),
+            );
+        }
+    }
+}
+// Ten parameters: the routed request envelope plus the bridge state the
+// plan consults (tablets, metrics, lane policy, fabric, frontier).
+// Grouping would hide the intake order the surrounding code documents;
+// the sole caller builds it explicitly.
 #[allow(clippy::too_many_arguments)]
 fn bridge_plan_range(
     tablet: TabletId,
@@ -736,6 +1044,7 @@ fn bridge_plan_range(
     tablets: &Rc<RefCell<HashMap<TabletId, LiveTablet>>>,
     metrics: &Rc<Cell<WorkerMetrics>>,
     chunks: &WorkerChunks,
+    fabric: &Rc<RefCell<crate::fabric::TabletFabric>>,
     frontier: &mut VecDeque<BridgeStage>,
 ) -> (
     Option<Operation>,
@@ -745,6 +1054,25 @@ fn bridge_plan_range(
         return (Some(op), Some(respond));
     };
     let base = crate::worker::peek_range_base(&tablets.borrow(), tablet, &key, now);
+    // Fabric bases resolve synchronously when resident (arenas only,
+    // never blocking the reactor). A miss answers backpressure for this
+    // turn: the client retries once residency returns (promotions
+    // complete on later turns), which keeps bridge turns bounded
+    // instead of chaining a resume-replan.
+    let base = match base {
+        crate::chunk_lane::RangeBase::Fabric { fabric_id, .. } => {
+            if let Ok(bytes) = fabric.borrow_mut().try_resolve_sync(fabric_id) {
+                crate::chunk_lane::RangeBase::Inline(bytes)
+            } else {
+                let mut snapshot = metrics.get();
+                snapshot.channel_ops += 1;
+                metrics.set(snapshot);
+                let _ = respond.try_send(Err(crate::worker::WorkerRequestError::SessionOverloaded));
+                return (None, Some(respond));
+            }
+        }
+        other => other,
+    };
     match crate::chunk_lane::plan_set_range(key, offset, patch, base, chunks.inline_threshold) {
         crate::chunk_lane::SetRangePlan::Inline(op) => (Some(op), Some(respond)),
         crate::chunk_lane::SetRangePlan::Reject { detail } => {
@@ -801,7 +1129,72 @@ fn bridge_plan_range(
     }
 }
 
-/// Polls parked stagings: completions admit (durable) or execute
+/// Polls parked fabric reads: ready promotions answer (the park reply
+/// already re-fenced id+version and installed a shadow); expiry
+/// re-checks against the request's `now` so resumed reads never
+/// resurrect; stale roots and lane failures answer closed for client
+/// retry. Pending parks stay.
+fn poll_fabric_parks(
+    parks: &mut VecDeque<FabricReadPark>,
+    tablets: &Rc<RefCell<HashMap<TabletId, LiveTablet>>>,
+    metrics: &Rc<Cell<WorkerMetrics>>,
+    fabric: &Rc<RefCell<crate::fabric::TabletFabric>>,
+) {
+    let mut cursor = 0usize;
+    while cursor < parks.len() {
+        let (tablet, key, now, park) = {
+            let parked = &parks[cursor];
+            (
+                parked.tablet,
+                parked.op.key().clone(),
+                parked.now,
+                parked.park,
+            )
+        };
+        let current = tablets
+            .borrow()
+            .get(&tablet)
+            .and_then(|live| live.store().get(&key, now).cloned());
+        match fabric.borrow_mut().poll_parked(park, current.as_ref()) {
+            Ok(None) => {
+                cursor += 1;
+            }
+            Ok(Some(bytes)) => {
+                let parked = parks.remove(cursor).expect("cursor valid");
+                let mut snapshot = metrics.get();
+                snapshot.channel_ops += 1;
+                metrics.set(snapshot);
+                // Expiry re-check at the request's `now`: the fenced
+                // bytes are only servable while the root is still live.
+                let live = tablets
+                    .borrow()
+                    .get(&tablet)
+                    .and_then(|live| live.store().get(&key, now).cloned());
+                let answer = match (live, &parked.op) {
+                    (None, _) => OperationResult::Value(None),
+                    (Some(_), Operation::GetRange { offset, len, .. }) => {
+                        OperationResult::Value(Some(kivi_state::slice_range(&bytes, *offset, *len)))
+                    }
+                    _ => OperationResult::Value(Some(bytes)),
+                };
+                let _ = parked.respond.try_send(Ok(answer));
+            }
+            Err(error) => {
+                let parked = parks.remove(cursor).expect("cursor valid");
+                let mut snapshot = metrics.get();
+                snapshot.channel_ops += 1;
+                metrics.set(snapshot);
+                let _ = parked.respond.try_send(Err(match error {
+                    crate::fabric::FabricError::Overloaded => {
+                        crate::worker::WorkerRequestError::SessionOverloaded
+                    }
+                    other => crate::worker::WorkerRequestError::Fabric(other),
+                }));
+            }
+        }
+    }
+}
+/// Polls parked chunk stagings: completions admit (durable) or execute
 /// (ephemeral) with the commit timestamp taken at completion — the
 /// logical commit happens at admission, not at the original arrival.
 fn poll_bridge_stages(
@@ -809,6 +1202,7 @@ fn poll_bridge_stages(
     tablets: &Rc<RefCell<HashMap<TabletId, LiveTablet>>>,
     metrics: &Rc<Cell<WorkerMetrics>>,
     durability: Option<&Rc<RefCell<WorkerDurability>>>,
+    fabric: &Rc<RefCell<crate::fabric::TabletFabric>>,
 ) {
     use async_channel::TryRecvError;
     let mut cursor = 0;
@@ -880,7 +1274,11 @@ fn poll_bridge_stages(
                     PendingEntry::new(staged.tablet, op, now, staged.identity, staged.respond)
                         .with_pinned(pinned),
                 );
-                durable.commit.poll(&mut tablets.borrow_mut(), namespace);
+                durable.commit.poll(
+                    &mut tablets.borrow_mut(),
+                    namespace,
+                    &mut fabric.borrow_mut(),
+                );
             }
         }
     }
@@ -936,6 +1334,11 @@ struct Conn {
     /// Chunk lane access plus the representation policy (large-`Set`
     /// conversion and chunked-read resolution, always off-reactor).
     chunks: WorkerChunks,
+    /// Memory Fabric integration (medium-`Set` conversion and
+    /// fabric-read resolution). Staging is synchronous (arena insert);
+    /// promotion suspends the awaiting task only — never the reactor.
+    /// Every borrow is synchronous and ends before any `.await`.
+    fabric: Rc<RefCell<crate::fabric::TabletFabric>>,
     /// Parser state (post-handshake; moved to the reader task on split).
     reader: Option<FrameReader>,
     /// Inbound frames from the reader task (bounded by `max_pipelined`).
@@ -1478,6 +1881,7 @@ impl Conn {
                     &operation,
                     kivi_protocol::Opcode::Set,
                     Some(guard),
+                    Vec::new(),
                     false,
                 )
                 .await;
@@ -1555,6 +1959,7 @@ impl Conn {
                 self.worker,
                 endpoint_of,
                 self.durability.as_ref(),
+                &self.fabric,
                 &request,
             )
             .await;
@@ -1718,107 +2123,53 @@ impl Conn {
                 )
                 .await;
         };
-        // Representation split on the owner: values over the threshold
-        // stage (chunks, manifest, one sync barrier) before admission, so
-        // the WAL only ever carries the small root. Range patches plan
-        // against the peeked base first (the peek is synchronous; the
-        // staging below suspends only this task, and the split passes the
-        // resulting `SetChunked` straight through). Staging precedes
+        // Representation split on the owner: medium values stage into
+        // the fabric synchronously (arena insert, suspends nothing),
+        // large legacy `Set`s stage through the chunk lane first
+        // (suspending only this task) and re-enter as small roots, so
+        // the WAL only ever carries small roots. Range patches plan
+        // against the peeked base first (the peek is synchronous; fabric
+        // promotion below suspends only this task, and the split passes
+        // the resulting roots straight through). Staging precedes
         // admission, so a lane failure or a rejected range answers here
         // with state untouched. A handled patch (`None`) already answered.
-        let Some((operation, pinned)) = self
+        let Some((operation, pinned, mut seals)) = self
             .plan_routed_range(request_id, tablet, operation)
             .await?
         else {
             return Ok(());
         };
-        let (operation, pinned) =
-            match crate::chunk_lane::split_large_set(operation, self.chunks.inline_threshold) {
-                crate::chunk_lane::LargeSetSplit::Inline(op) => (op, pinned),
-                crate::chunk_lane::LargeSetSplit::Stage { key, value } => {
-                    let mut guard = match crate::chunk_lane::PinnedUpload::begin(
-                        &self.chunks.pins,
-                        self.chunks.domain,
-                        &value,
-                    ) {
-                        Ok(guard) => guard,
-                        Err(error) => {
-                            return self
-                                .respond_chunk_error(request_id, kivi_protocol::Opcode::Set, &error)
-                                .await;
-                        }
-                    };
-                    match self.chunks.lane.stage_value_async(value).await {
-                        Ok(staged) => {
-                            guard.set_manifest(staged.manifest);
-                            (
-                                Operation::SetChunked {
-                                    key,
-                                    manifest: staged.manifest,
-                                    logical_len: staged.logical_len,
-                                },
-                                Some(guard),
-                            )
-                        }
-                        Err(error) => {
-                            return self
-                                .respond_chunk_error(request_id, kivi_protocol::Opcode::Set, &error)
-                                .await;
-                        }
-                    }
-                }
-                crate::chunk_lane::LargeSetSplit::StageConditional {
-                    key,
-                    value,
-                    condition,
-                    expiry,
-                } => {
-                    let mut guard = match crate::chunk_lane::PinnedUpload::begin(
-                        &self.chunks.pins,
-                        self.chunks.domain,
-                        &value,
-                    ) {
-                        Ok(guard) => guard,
-                        Err(error) => {
-                            return self
-                                .respond_chunk_error(
-                                    request_id,
-                                    kivi_protocol::Opcode::SetConditional,
-                                    &error,
-                                )
-                                .await;
-                        }
-                    };
-                    match self.chunks.lane.stage_value_async(value).await {
-                        Ok(staged) => {
-                            guard.set_manifest(staged.manifest);
-                            (
-                                Operation::SetConditionalChunked {
-                                    key,
-                                    manifest: staged.manifest,
-                                    logical_len: staged.logical_len,
-                                    condition,
-                                    expiry,
-                                },
-                                Some(guard),
-                            )
-                        }
-                        Err(error) => {
-                            return self
-                                .respond_chunk_error(
-                                    request_id,
-                                    kivi_protocol::Opcode::SetConditional,
-                                    &error,
-                                )
-                                .await;
-                        }
-                    }
-                }
-            };
-        // Prove every chunked reference a transaction carries before
-        // admission (mirrors the worker path's blocking check): a dangling
-        // root is rejected loudly, never committed.
+        let Some((operation, pinned, staged)) = self
+            .split_routed_set(request_id, tablet, operation, pinned)
+            .await?
+        else {
+            return Ok(());
+        };
+        seals.extend(staged);
+        // Prove every chunked and fabric reference a transaction carries
+        // before admission: a dangling root is rejected loudly, never
+        // committed. Medium transactional puts stage here (synchronous
+        // fabric insert); their seals ride the durable admit below.
+        let Some((operation, txn_seals)) =
+            self.stage_routed_txn(request_id, tablet, operation).await?
+        else {
+            return Ok(());
+        };
+        seals.extend(txn_seals);
         if let Err(detail) = self.verify_txn_chunk_refs(&operation).await {
+            return self
+                .respond(
+                    request_id,
+                    requested,
+                    kivi_protocol::Response {
+                        proof: None,
+                        status: kivi_protocol::Status::InvalidRequest,
+                        body: kivi_protocol::ResponseBody::Diagnostic(detail),
+                    },
+                )
+                .await;
+        }
+        if let Err(detail) = self.verify_txn_fabric_refs(&operation) {
             return self
                 .respond(
                     request_id,
@@ -1871,7 +2222,7 @@ impl Conn {
         if self.durability.is_some() {
             return self
                 .handle_request_durable(
-                    request_id, identity, ack_floor, tablet, &operation, requested, pinned,
+                    request_id, identity, ack_floor, tablet, &operation, requested, pinned, seals,
                     streamed,
                 )
                 .await;
@@ -1892,6 +2243,63 @@ impl Conn {
                 .await
             }
             Some(Ok(result)) => {
+                // Fabric references resolve here (suspending only this
+                // task); superseded materializations retire afterwards.
+                // All borrows end before the promotion await below.
+                let key = operation.key().clone();
+                let now = SystemClock::wall_now();
+                let (previous, reference) = {
+                    let tablets = self.tablets.borrow();
+                    let previous = tablets
+                        .get(&tablet)
+                        .and_then(|live| live.store().get(&key, now))
+                        .and_then(kivi_state::StoredObject::fabric_ref);
+                    let reference = match &result {
+                        OperationResult::FabricValue {
+                            fabric_id,
+                            logical_len,
+                            version,
+                        } => Some(kivi_state::FabricRef {
+                            id: *fabric_id,
+                            logical_len: *logical_len,
+                            version: *version,
+                        }),
+                        _ => None,
+                    };
+                    (previous, reference)
+                };
+                let result = match reference {
+                    Some(reference) => {
+                        match self.promote_value(tablet, &key, now, reference).await {
+                            Ok(bytes) => {
+                                let shaped = match &operation {
+                                    Operation::GetRange { offset, len, .. } => {
+                                        kivi_state::slice_range(&bytes, *offset, *len)
+                                    }
+                                    _ => bytes,
+                                };
+                                OperationResult::Value(Some(shaped))
+                            }
+                            Err(error) => {
+                                return self
+                                    .respond_fabric_error(request_id, requested, &error)
+                                    .await;
+                            }
+                        }
+                    }
+                    None => result,
+                };
+                if previous.is_some() {
+                    let now = SystemClock::wall_now();
+                    let post = self
+                        .tablets
+                        .borrow()
+                        .get(&tablet)
+                        .and_then(|live| live.store().get(&key, now).cloned());
+                    if let Some(post) = post {
+                        self.fabric.borrow_mut().retire_superseded(previous, &post);
+                    }
+                }
                 let range = match &operation {
                     Operation::GetRange { offset, len, .. } => Some((*offset, *len)),
                     _ => None,
@@ -1914,16 +2322,35 @@ impl Conn {
         request_id: u64,
         tablet: TabletId,
         operation: Operation,
-    ) -> Result<Option<(Operation, Option<crate::chunk_lane::PinnedUpload>)>, ConnExit> {
+    ) -> Result<
+        Option<(
+            Operation,
+            Option<crate::chunk_lane::PinnedUpload>,
+            Vec<crate::fabric::StagedSeal>,
+        )>,
+        ConnExit,
+    > {
         let Operation::SetRange { key, offset, patch } = operation else {
-            return Ok(Some((operation, None)));
+            return Ok(Some((operation, None, Vec::new())));
         };
-        let base = crate::worker::peek_range_base(
-            &self.tablets.borrow(),
-            tablet,
-            &key,
-            SystemClock::wall_now(),
-        );
+        let now = SystemClock::wall_now();
+        let base = crate::worker::peek_range_base(&self.tablets.borrow(), tablet, &key, now);
+        // Fabric bases resolve synchronously when resident; otherwise the
+        // lane promotion suspends only this task, then planning continues
+        // against the resolved inline bytes. Each borrow ends before any
+        // `.await` below.
+        let base = match base {
+            crate::chunk_lane::RangeBase::Fabric { fabric_id, .. } => {
+                let resolved = self
+                    .resolve_range_fabric_base(request_id, tablet, &key, now, fabric_id)
+                    .await?;
+                let Some(base) = resolved else {
+                    return Ok(None);
+                };
+                base
+            }
+            other => other,
+        };
         match crate::chunk_lane::plan_set_range(
             key,
             offset,
@@ -1931,33 +2358,20 @@ impl Conn {
             base,
             self.chunks.inline_threshold,
         ) {
-            crate::chunk_lane::SetRangePlan::Inline(op) => Ok(Some((op, None))),
+            crate::chunk_lane::SetRangePlan::Inline(op) => Ok(Some((op, None, Vec::new()))),
             crate::chunk_lane::SetRangePlan::Reject { detail } => {
-                self.respond(
+                self.respond_diagnostic(
                     request_id,
                     kivi_protocol::Opcode::SetRange,
-                    kivi_protocol::Response {
-                        proof: None,
-                        status: kivi_protocol::Status::InvalidRequest,
-                        body: kivi_protocol::ResponseBody::Diagnostic(detail),
-                    },
+                    kivi_protocol::Status::InvalidRequest,
+                    detail,
                 )
                 .await?;
                 Ok(None)
             }
             crate::chunk_lane::SetRangePlan::RestageSet { key, value } => {
-                // Restaged patches keep the conditional/Keep spelling so a
-                // large result preserves expiry exactly like the inline
-                // splice does.
-                Ok(Some((
-                    Operation::SetConditional {
-                        key,
-                        value,
-                        condition: SetCondition::Always,
-                        expiry: ExpiryPolicy::Keep,
-                    },
-                    None,
-                )))
+                self.plan_routed_restage(request_id, tablet, key, value)
+                    .await
             }
             crate::chunk_lane::SetRangePlan::Splice {
                 key,
@@ -1984,6 +2398,7 @@ impl Conn {
                             expiry: ExpiryPolicy::Keep,
                         },
                         Some(guard),
+                        Vec::new(),
                     )))
                 }
                 Err(error) => {
@@ -2068,6 +2483,23 @@ impl Conn {
                 }
                 Err(error) => self.respond_chunk_error(request_id, opcode, &error).await,
             },
+            // Unreachable: every producer resolves fabric references
+            // before responding (ephemeral execute resolves inline,
+            // durable reads suspend in the coordinator). Fails closed
+            // rather than serving an unresolved reference.
+            OperationResult::FabricValue { .. } => {
+                use kivi_protocol::{Response, ResponseBody, Status};
+                self.respond(
+                    request_id,
+                    opcode,
+                    Response {
+                        proof: None,
+                        status: Status::Internal,
+                        body: ResponseBody::Diagnostic("unresolved fabric reference".to_owned()),
+                    },
+                )
+                .await
+            }
             other => self.respond_ok(request_id, opcode, tablet, other).await,
         }
     }
@@ -2162,8 +2594,9 @@ impl Conn {
                 self.write_frame(kivi_protocol::FrameKind::ValueStreamEnd, request_id, &[])
                     .await
             }
-            // Unreachable: `Get` executes to values or chunked values (or
-            // errors, which never reach here). Fail closed, never guess.
+            // Unreachable: `Get` executes to values or chunked values
+            // (fabric references resolve before responding), or errors,
+            // which never reach here. Fail closed, never guess.
             other => {
                 tracing::error!(%request_id, result = ?other, "streamed read executed to a non-value");
                 self.respond(
@@ -2272,11 +2705,629 @@ impl Conn {
         .await
     }
 
-    /// Proves every chunked reference a transaction carries names durable
-    /// local payload (async twin of the worker path's blocking check):
-    /// staged uploads and committed packs alike pass; anything else is a
-    /// dangling root and the prepare is rejected loudly, never committed.
+    /// Answers a plain diagnostic failure: builds the `Response` so call
+    /// sites stay one line. Kept beside [`respond_chunk_error`] so the
+    /// routed planners stay reviewable.
+    async fn respond_diagnostic(
+        &mut self,
+        request_id: u64,
+        opcode: kivi_protocol::Opcode,
+        status: kivi_protocol::Status,
+        diagnostic: String,
+    ) -> Result<(), ConnExit> {
+        self.respond(
+            request_id,
+            opcode,
+            kivi_protocol::Response {
+                proof: None,
+                status,
+                body: kivi_protocol::ResponseBody::Diagnostic(diagnostic),
+            },
+        )
+        .await
+    }
+
+    /// Plans one restaged range result: medium results stage into the
+    /// fabric, large ones keep the conditional/Keep spelling so expiry
+    /// preserves exactly like the inline splice does. Returns `None`
+    /// when the request already answered (fabric saturation).
+    async fn plan_routed_restage(
+        &mut self,
+        request_id: u64,
+        tablet: TabletId,
+        key: Key,
+        value: Bytes,
+    ) -> Result<
+        Option<(
+            Operation,
+            Option<crate::chunk_lane::PinnedUpload>,
+            Vec<crate::fabric::StagedSeal>,
+        )>,
+        ConnExit,
+    > {
+        // Restaged patches keep the conditional/Keep spelling so a
+        // large result preserves expiry exactly like the inline
+        // splice does. Medium results stage into the fabric.
+        if value.len() > crate::fabric::FABRIC_INLINE_MAX
+            && (value.len() as u64) <= self.chunks.inline_threshold
+        {
+            let staged = self.fabric.borrow_mut().stage(tablet, value.clone(), true);
+            let Ok((fabric_id, logical_len)) = staged else {
+                self.respond_diagnostic(
+                    request_id,
+                    kivi_protocol::Opcode::SetRange,
+                    kivi_protocol::Status::SessionOverloaded,
+                    "memory fabric saturated; retry".to_owned(),
+                )
+                .await?;
+                return Ok(None);
+            };
+            Ok(Some((
+                Operation::SetConditionalFabric {
+                    key: key.clone(),
+                    fabric_id,
+                    logical_len,
+                    version: 0,
+                    condition: SetCondition::Always,
+                    expiry: ExpiryPolicy::Keep,
+                },
+                None,
+                vec![crate::fabric::StagedSeal {
+                    fabric_id,
+                    key,
+                    bytes: value,
+                }],
+            )))
+        } else {
+            Ok(Some((
+                Operation::SetConditional {
+                    key,
+                    value,
+                    condition: SetCondition::Always,
+                    expiry: ExpiryPolicy::Keep,
+                },
+                None,
+                Vec::new(),
+            )))
+        }
+    }
+
+    /// Resolves one fabric range base: synchronous residency serves
+    /// inline, otherwise the lane promotion suspends only this task and
+    /// the reply plans against the promoted bytes. Returns `None` when
+    /// the request already answered (stale root, saturation, or a lost
+    /// base). Split into synchronous phases around the await so no
+    /// tablet or fabric borrow is ever held across it.
+    async fn resolve_range_fabric_base(
+        &mut self,
+        request_id: u64,
+        tablet: TabletId,
+        key: &Key,
+        now: kivi_types::UnixMicros,
+        fabric_id: u64,
+    ) -> Result<Option<crate::chunk_lane::RangeBase>, ConnExit> {
+        let resident = self.fabric.borrow_mut().try_resolve_sync(fabric_id);
+        if let Ok(bytes) = resident {
+            return Ok(Some(crate::chunk_lane::RangeBase::Inline(bytes)));
+        }
+        let reference = self
+            .tablets
+            .borrow()
+            .get(&tablet)
+            .and_then(|live| live.store().get(key, now).cloned())
+            .and_then(|object| object.fabric_ref());
+        let Some(reference) = reference else {
+            self.respond_diagnostic(
+                request_id,
+                kivi_protocol::Opcode::SetRange,
+                kivi_protocol::Status::Internal,
+                "range base changed under admission; retry".to_owned(),
+            )
+            .await?;
+            return Ok(None);
+        };
+        match self.promote_value(tablet, key, now, reference).await {
+            Ok(bytes) => Ok(Some(crate::chunk_lane::RangeBase::Inline(bytes))),
+            Err(crate::fabric::FabricError::Overloaded) => {
+                self.respond_diagnostic(
+                    request_id,
+                    kivi_protocol::Opcode::SetRange,
+                    kivi_protocol::Status::SessionOverloaded,
+                    "offcore lane saturated; retry".to_owned(),
+                )
+                .await?;
+                Ok(None)
+            }
+            Err(_) => {
+                self.respond_diagnostic(
+                    request_id,
+                    kivi_protocol::Opcode::SetRange,
+                    kivi_protocol::Status::Internal,
+                    "range base unavailable; retry".to_owned(),
+                )
+                .await?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Promotes one fabric reference on behalf of this connection task:
+    /// synchronous residency serves inline, otherwise the lane promotion
+    /// suspends only this task and the reply re-fences id+version before
+    /// serving. Split into synchronous phases around the await so no
+    /// fabric or tablet borrow is ever held across it.
+    async fn promote_value(
+        &mut self,
+        tablet: TabletId,
+        key: &Key,
+        now: kivi_types::UnixMicros,
+        reference: kivi_state::FabricRef,
+    ) -> Result<Bytes, crate::fabric::FabricError> {
+        use crate::fabric::FabricError;
+        // Phase 1: synchronous check + submit (borrows end here).
+        let reply = {
+            let current = self
+                .tablets
+                .borrow()
+                .get(&tablet)
+                .and_then(|live| live.store().get(key, now).cloned());
+            let mut fabric = self.fabric.borrow_mut();
+            match fabric.resolve_sync(&reference, current.as_ref()) {
+                Ok(Some(bytes)) => return Ok(bytes),
+                Ok(None) => {
+                    let live_version = current
+                        .as_ref()
+                        .and_then(kivi_state::StoredObject::fabric_ref)
+                        .map_or(u64::MAX, |live| live.version);
+                    fabric.begin_promote(&reference, live_version)?
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        // Phase 2: suspend only this task (no borrows held).
+        let outcome = reply
+            .recv_async()
+            .await
+            .map_err(|_| FabricError::Overloaded)?;
+        // Phase 3: re-read the root, fence, and install (synchronous).
+        let current = self
+            .tablets
+            .borrow()
+            .get(&tablet)
+            .and_then(|live| live.store().get(key, now).cloned());
+        self.fabric
+            .borrow_mut()
+            .finish_promote(&reference, current.as_ref(), outcome)
+    }
+
+    /// Stages one medium routed `Set`/`SetConditional` into the fabric
+    /// synchronously (arena insert, suspends nothing) and re-enters it
+    /// as a small root. Saturation answers overload at once; small and
+    /// large values pass through untouched.
+    async fn stage_routed_medium(
+        &mut self,
+        request_id: u64,
+        tablet: TabletId,
+        operation: &Operation,
+    ) -> Result<RoutedMedium, ConnExit> {
+        let (key, value, opcode, conditional) = match operation {
+            Operation::Set { key, value } => (key, value, kivi_protocol::Opcode::Set, None),
+            Operation::SetConditional {
+                key,
+                value,
+                condition,
+                expiry,
+            } => (
+                key,
+                value,
+                kivi_protocol::Opcode::SetConditional,
+                Some((*condition, *expiry)),
+            ),
+            _ => return Ok(RoutedMedium::Pass),
+        };
+        if value.len() <= crate::fabric::FABRIC_INLINE_MAX
+            || (value.len() as u64) > self.chunks.inline_threshold
+        {
+            return Ok(RoutedMedium::Pass);
+        }
+        let staged = self.fabric.borrow_mut().stage(tablet, value.clone(), true);
+        let Ok((fabric_id, logical_len)) = staged else {
+            self.respond_diagnostic(
+                request_id,
+                opcode,
+                kivi_protocol::Status::SessionOverloaded,
+                "memory fabric saturated; retry".to_owned(),
+            )
+            .await?;
+            return Ok(RoutedMedium::Answered);
+        };
+        let seals = vec![crate::fabric::StagedSeal {
+            fabric_id,
+            key: key.clone(),
+            bytes: value.clone(),
+        }];
+        let staged = match conditional {
+            None => Operation::SetFabric {
+                key: key.clone(),
+                fabric_id,
+                logical_len,
+                version: 0,
+            },
+            Some((condition, expiry)) => Operation::SetConditionalFabric {
+                key: key.clone(),
+                fabric_id,
+                logical_len,
+                version: 0,
+                condition,
+                expiry,
+            },
+        };
+        Ok(RoutedMedium::Staged(staged, seals))
+    }
+
+    /// Splits one routed operation by size on the connection task:
+    /// medium `Set`s stage into the fabric synchronously (arena insert,
+    /// suspends nothing) and re-enter as small `SetFabric` roots; large
+    /// values stage through the chunk lane (suspending only this task).
+    /// Returns the admitted operation, its chunk pin, and fabric seals.
+    /// `None` means already answered (staging failure, state untouched).
+    async fn split_routed_set(
+        &mut self,
+        request_id: u64,
+        tablet: TabletId,
+        operation: Operation,
+        pinned: Option<crate::chunk_lane::PinnedUpload>,
+    ) -> Result<
+        Option<(
+            Operation,
+            Option<crate::chunk_lane::PinnedUpload>,
+            Vec<crate::fabric::StagedSeal>,
+        )>,
+        ConnExit,
+    > {
+        // Medium tier first (synchronous, never suspends). Each stage
+        // completes (ending its borrow) before any `.await` below.
+        match self
+            .stage_routed_medium(request_id, tablet, &operation)
+            .await?
+        {
+            RoutedMedium::Staged(op, seals) => return Ok(Some((op, pinned, seals))),
+            RoutedMedium::Answered => return Ok(None),
+            RoutedMedium::Pass => {}
+        }
+        match crate::chunk_lane::split_large_set(operation, self.chunks.inline_threshold) {
+            crate::chunk_lane::LargeSetSplit::Inline(op) => Ok(Some((op, pinned, Vec::new()))),
+            crate::chunk_lane::LargeSetSplit::Stage { key, value } => {
+                let mut guard = match crate::chunk_lane::PinnedUpload::begin(
+                    &self.chunks.pins,
+                    self.chunks.domain,
+                    &value,
+                ) {
+                    Ok(guard) => guard,
+                    Err(error) => {
+                        return self
+                            .respond_chunk_error(request_id, kivi_protocol::Opcode::Set, &error)
+                            .await
+                            .map(|()| None);
+                    }
+                };
+                match self.chunks.lane.stage_value_async(value).await {
+                    Ok(staged) => {
+                        guard.set_manifest(staged.manifest);
+                        Ok(Some((
+                            Operation::SetChunked {
+                                key,
+                                manifest: staged.manifest,
+                                logical_len: staged.logical_len,
+                            },
+                            Some(guard),
+                            Vec::new(),
+                        )))
+                    }
+                    Err(error) => self
+                        .respond_chunk_error(request_id, kivi_protocol::Opcode::Set, &error)
+                        .await
+                        .map(|()| None),
+                }
+            }
+            crate::chunk_lane::LargeSetSplit::StageConditional {
+                key,
+                value,
+                condition,
+                expiry,
+            } => {
+                let mut guard = match crate::chunk_lane::PinnedUpload::begin(
+                    &self.chunks.pins,
+                    self.chunks.domain,
+                    &value,
+                ) {
+                    Ok(guard) => guard,
+                    Err(error) => {
+                        return self
+                            .respond_chunk_error(
+                                request_id,
+                                kivi_protocol::Opcode::SetConditional,
+                                &error,
+                            )
+                            .await
+                            .map(|()| None);
+                    }
+                };
+                match self.chunks.lane.stage_value_async(value).await {
+                    Ok(staged) => {
+                        guard.set_manifest(staged.manifest);
+                        Ok(Some((
+                            Operation::SetConditionalChunked {
+                                key,
+                                manifest: staged.manifest,
+                                logical_len: staged.logical_len,
+                                condition,
+                                expiry,
+                            },
+                            Some(guard),
+                            Vec::new(),
+                        )))
+                    }
+                    Err(error) => self
+                        .respond_chunk_error(
+                            request_id,
+                            kivi_protocol::Opcode::SetConditional,
+                            &error,
+                        )
+                        .await
+                        .map(|()| None),
+                }
+            }
+        }
+    }
+
+    /// Stages medium transactional puts into the fabric on the connection
+    /// task (synchronous inserts), rewriting them as `PutFabric`
+    /// references. Returns the rewritten operation plus seals. `None`
+    /// means already answered (staging failure, state untouched).
+    async fn stage_routed_txn(
+        &mut self,
+        request_id: u64,
+        tablet: TabletId,
+        operation: Operation,
+    ) -> Result<Option<(Operation, Vec<crate::fabric::StagedSeal>)>, ConnExit> {
+        match operation {
+            Operation::TxnPrepare {
+                txn,
+                coordinator,
+                write,
+                digest,
+            } => {
+                if let Some((write, seal)) = self.stage_routed_txn_write(tablet, write) {
+                    Ok(Some((
+                        Operation::TxnPrepare {
+                            txn,
+                            coordinator,
+                            write,
+                            digest,
+                        },
+                        seal.into_iter().collect(),
+                    )))
+                } else {
+                    self.respond(
+                        request_id,
+                        kivi_protocol::Opcode::TxnPrepare,
+                        kivi_protocol::Response {
+                            proof: None,
+                            status: kivi_protocol::Status::SessionOverloaded,
+                            body: kivi_protocol::ResponseBody::Diagnostic(
+                                "memory fabric saturated; retry".to_owned(),
+                            ),
+                        },
+                    )
+                    .await?;
+                    Ok(None)
+                }
+            }
+            Operation::TxnCommitLocal { txn, writes } => {
+                let mut staged_writes = Vec::with_capacity(writes.len());
+                let mut seals = Vec::new();
+                for write in writes {
+                    if let Some((write, seal)) = self.stage_routed_txn_write(tablet, write) {
+                        seals.extend(seal);
+                        staged_writes.push(write);
+                    } else {
+                        self.respond(
+                            request_id,
+                            kivi_protocol::Opcode::AtomicBatch,
+                            kivi_protocol::Response {
+                                proof: None,
+                                status: kivi_protocol::Status::SessionOverloaded,
+                                body: kivi_protocol::ResponseBody::Diagnostic(
+                                    "memory fabric saturated; retry".to_owned(),
+                                ),
+                            },
+                        )
+                        .await?;
+                        return Ok(None);
+                    }
+                }
+                Ok(Some((
+                    Operation::TxnCommitLocal {
+                        txn,
+                        writes: staged_writes,
+                    },
+                    seals,
+                )))
+            }
+            op @ Operation::TxnFinalize { .. } => {
+                self.seal_routed_finalize(request_id, tablet, op).await
+            }
+            other => Ok(Some((other, Vec::new()))),
+        }
+    }
+
+    /// Attaches a routed commit-finalize's prepared intent bytes as a seal
+    /// payload (reactor twin of the worker path): synchronous residency
+    /// serves inline, otherwise the lane promotion suspends only this
+    /// task. Aborts and non-fabric intents attach nothing (prepare
+    /// resolves those terminally). `None` means already answered: a
+    /// dangling intent reference fails closed, never commits.
+    async fn seal_routed_finalize(
+        &mut self,
+        request_id: u64,
+        tablet: TabletId,
+        op: Operation,
+    ) -> Result<Option<(Operation, Vec<crate::fabric::StagedSeal>)>, ConnExit> {
+        let now = SystemClock::wall_now();
+        let finalize_key = op.key().clone();
+        let commit = matches!(&op, Operation::TxnFinalize { commit: true, .. });
+        let fabric_id = commit
+            .then(|| {
+                self.tablets
+                    .borrow()
+                    .get(&tablet)
+                    .and_then(|live| live.store().intent_for_key(&finalize_key))
+                    .and_then(|intent| match &intent.write.kind {
+                        kivi_state::TxnWriteKind::PutFabric { fabric_id, .. } => Some(*fabric_id),
+                        _ => None,
+                    })
+            })
+            .flatten();
+        let Some(fabric_id) = fabric_id else {
+            return Ok(Some((op, Vec::new())));
+        };
+        let bytes = {
+            if let Ok(bytes) = self.fabric.borrow().try_resolve_sync(fabric_id) {
+                bytes
+            } else {
+                let reference = self
+                    .tablets
+                    .borrow()
+                    .get(&tablet)
+                    .and_then(|live| live.store().get(&finalize_key, now).cloned())
+                    .and_then(|object| object.fabric_ref())
+                    .filter(|reference| reference.id == fabric_id);
+                let Some(reference) = reference else {
+                    return self
+                        .respond(
+                            request_id,
+                            kivi_protocol::Opcode::TxnFinalize,
+                            kivi_protocol::Response {
+                                proof: None,
+                                status: kivi_protocol::Status::InvalidRequest,
+                                body: kivi_protocol::ResponseBody::Diagnostic(
+                                    "finalize references unavailable payload".to_owned(),
+                                ),
+                            },
+                        )
+                        .await
+                        .map(|()| None);
+                };
+                match self
+                    .promote_value(tablet, &finalize_key, now, reference)
+                    .await
+                {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        return self
+                            .respond(
+                                request_id,
+                                kivi_protocol::Opcode::TxnFinalize,
+                                kivi_protocol::Response {
+                                    proof: None,
+                                    status: kivi_protocol::Status::SessionOverloaded,
+                                    body: kivi_protocol::ResponseBody::Diagnostic(
+                                        "offcore lane saturated; retry".to_owned(),
+                                    ),
+                                },
+                            )
+                            .await
+                            .map(|()| None);
+                    }
+                }
+            }
+        };
+        Ok(Some((
+            op,
+            vec![crate::fabric::StagedSeal {
+                fabric_id,
+                key: finalize_key,
+                bytes,
+            }],
+        )))
+    }
+
+    /// Stages one transactional write's medium inline payload (sync).
+    /// Returns the rewritten write plus its seal; `None` on saturation.
+    fn stage_routed_txn_write(
+        &mut self,
+        tablet: TabletId,
+        write: kivi_state::TxnWrite,
+    ) -> Option<(kivi_state::TxnWrite, Option<crate::fabric::StagedSeal>)> {
+        match write.kind {
+            kivi_state::TxnWriteKind::Put(value)
+                if value.len() > crate::fabric::FABRIC_INLINE_MAX
+                    && (value.len() as u64) <= self.chunks.inline_threshold =>
+            {
+                let (fabric_id, logical_len) = self
+                    .fabric
+                    .borrow_mut()
+                    .stage(tablet, value.clone(), true)
+                    .ok()?;
+                Some((
+                    kivi_state::TxnWrite {
+                        key: write.key.clone(),
+                        kind: kivi_state::TxnWriteKind::PutFabric {
+                            fabric_id,
+                            logical_len,
+                            version: 0,
+                        },
+                        expect: write.expect,
+                    },
+                    Some(crate::fabric::StagedSeal {
+                        fabric_id,
+                        key: write.key.clone(),
+                        bytes: value,
+                    }),
+                ))
+            }
+            _ => Some((write, None)),
+        }
+    }
+
+    /// Proves every fabric reference a transaction carries names live
+    /// local bytes (synchronous check, never blocks the reactor):
+    /// staged uploads and committed materializations alike pass.
     /// Returns the diagnostic for the rejection response.
+    fn verify_txn_fabric_refs(&self, operation: &Operation) -> Result<(), String> {
+        let refs: Vec<u64> = match operation {
+            Operation::TxnPrepare { write, .. } => match &write.kind {
+                kivi_state::TxnWriteKind::PutFabric { fabric_id, .. } => vec![*fabric_id],
+                _ => Vec::new(),
+            },
+            Operation::TxnCommitLocal { writes, .. } => writes
+                .iter()
+                .filter_map(|write| match &write.kind {
+                    kivi_state::TxnWriteKind::PutFabric { fabric_id, .. } => Some(*fabric_id),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        // Availability without I/O: a synchronous residence or a device
+        // locator proves the bytes exist locally. Staged uploads pass
+        // (just inserted above and still alive).
+        let fabric = self.fabric.borrow_mut();
+        for fabric_id in refs {
+            let resident = fabric.try_resolve_sync(fabric_id).is_ok()
+                || fabric.offcore_locator(fabric_id).is_some();
+            if !resident {
+                return Err(format!(
+                    "transactional fabric write references unavailable payload: {fabric_id}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Proves every chunked reference a transaction carries names durable
+    /// local payload (async twin of the worker path's blocking check).
     async fn verify_txn_chunk_refs(&self, operation: &Operation) -> Result<(), String> {
         let refs: Vec<(kivi_types::ManifestId, u64)> = match operation {
             Operation::TxnPrepare { write, .. } => match &write.kind {
@@ -2319,9 +3370,11 @@ impl Conn {
         if let Some(cell) = self.durability.as_ref() {
             let mut durable = cell.borrow_mut();
             let namespace = durable.namespace;
-            durable
-                .commit
-                .poll(&mut self.tablets.borrow_mut(), namespace);
+            durable.commit.poll(
+                &mut self.tablets.borrow_mut(),
+                namespace,
+                &mut self.fabric.borrow_mut(),
+            );
         }
     }
 
@@ -2371,6 +3424,44 @@ impl Conn {
             }
         }
         Ok(())
+    }
+
+    /// Answers a Memory Fabric failure with its stable status.
+    /// Saturation is retryable backpressure (`SessionOverloaded`, like
+    /// chunk-lane saturation); corruption fails the single read closed;
+    /// unavailability (moved root, retired id) asks for a retry that
+    /// re-linearizes.
+    async fn respond_fabric_error(
+        &mut self,
+        request_id: u64,
+        opcode: kivi_protocol::Opcode,
+        error: &crate::fabric::FabricError,
+    ) -> Result<(), ConnExit> {
+        use kivi_protocol::{Response, ResponseBody, Status};
+        let (status, detail) = match error {
+            crate::fabric::FabricError::Overloaded => (
+                Status::SessionOverloaded,
+                "memory fabric saturated; retry".to_owned(),
+            ),
+            crate::fabric::FabricError::Corrupt => (
+                Status::Internal,
+                "fabric record failed verification".to_owned(),
+            ),
+            crate::fabric::FabricError::Unavailable => (
+                Status::Internal,
+                "fabric reference unavailable; retry".to_owned(),
+            ),
+        };
+        self.respond(
+            request_id,
+            opcode,
+            Response {
+                proof: None,
+                status,
+                body: ResponseBody::Diagnostic(detail),
+            },
+        )
+        .await
     }
 
     /// Maps a worker-side request failure onto the wire (shared by inline
@@ -2429,6 +3520,9 @@ impl Conn {
             WorkerRequestError::ChunkStore(error) => {
                 self.respond_chunk_error(request_id, opcode, error).await
             }
+            WorkerRequestError::Fabric(error) => {
+                self.respond_fabric_error(request_id, opcode, error).await
+            }
             WorkerRequestError::InvalidRequest { detail } => {
                 self.respond(
                     request_id,
@@ -2454,9 +3548,9 @@ impl Conn {
     /// proves. All borrows end before any `.await`, so connection tasks on
     /// this thread cannot interleave a persist-apply sequence.
     // Nine parameters: routing, identity, payload, opcode, the pin guard
-    // this stage adds, plus the stream flag completions answer with.
-    // Grouping would hide the intake order the surrounding code
-    // documents; the callers build it explicitly.
+    // this stage adds, fabric seals for medium values, plus the stream
+    // flag completions answer with. Grouping would hide the intake order
+    // the surrounding code documents; the callers build it explicitly.
     #[allow(clippy::too_many_arguments)]
     async fn handle_request_durable(
         &mut self,
@@ -2467,6 +3561,7 @@ impl Conn {
         operation: &Operation,
         opcode: kivi_protocol::Opcode,
         pinned: Option<crate::chunk_lane::PinnedUpload>,
+        seals: Vec<crate::fabric::StagedSeal>,
         streamed: bool,
     ) -> Result<(), ConnExit> {
         use kivi_protocol::{Response, ResponseBody, Status};
@@ -2526,16 +3621,20 @@ impl Conn {
         {
             let mut durable = durability.borrow_mut();
             let namespace = durable.namespace;
-            // The coordinator entry owns the upload's pins until after
-            // its apply journals the commit; the journal then covers the
-            // response window, so the outbox needs no guard of its own.
+            // The coordinator entry owns the upload's pins and fabric
+            // seals until after its apply journals the commit; the
+            // journal then covers the response window, so the outbox
+            // needs no guard of its own.
             durable.commit.admit(
                 crate::commit::PendingEntry::new(tablet, operation.clone(), now, identity, respond)
-                    .with_pinned(pinned),
+                    .with_pinned(pinned)
+                    .with_fabric_staged(seals),
             );
-            durable
-                .commit
-                .poll(&mut self.tablets.borrow_mut(), namespace);
+            durable.commit.poll(
+                &mut self.tablets.borrow_mut(),
+                namespace,
+                &mut self.fabric.borrow_mut(),
+            );
         }
         let range = match operation {
             Operation::GetRange { offset, len, .. } => Some((*offset, *len)),
@@ -2987,15 +4086,23 @@ impl Conn {
                 body: ResponseBody::StreamTrimmed { removed: *removed },
             },
             // Unreachable by construction: the engine resolves chunked
-            // reads through the chunk lane before responding, so a
-            // `ChunkedValue` here is a missed resolution path. Answer
-            // loudly retriable `Internal` (never wrong bytes, never a
-            // crash) — and the resolution tests below pin the real paths.
+            // reads through the chunk lane (and fabric reads through the
+            // Memory Fabric) before responding, so a reference value here
+            // is a missed resolution path. Answer loudly retriable
+            // `Internal` (never wrong bytes, never a crash) — and the
+            // resolution tests below pin the real paths.
             R::ChunkedValue { .. } => Response {
                 proof: None,
                 status: Status::Internal,
                 body: ResponseBody::Diagnostic(
                     "chunked value reached the wire unresolved".to_owned(),
+                ),
+            },
+            R::FabricValue { .. } => Response {
+                proof: None,
+                status: Status::Internal,
+                body: ResponseBody::Diagnostic(
+                    "fabric value reached the wire unresolved".to_owned(),
                 ),
             },
         };
@@ -3165,6 +4272,7 @@ async fn serve_conn(stream: TcpStream, peer: SocketAddr, shared: Rc<WorkerNet>) 
         advertised_caps: shared.net.advertised_caps,
         durability: shared.durability.clone(),
         chunks: shared.chunks.clone(),
+        fabric: Rc::clone(&shared.fabric),
         reader: Some(FrameReader::new(shared.net.conn.max_frame)),
         frames: frames_rx,
         max_input,

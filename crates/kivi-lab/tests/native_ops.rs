@@ -5,8 +5,8 @@
 use bytes::Bytes;
 use kivi_client::{ClientConfig, NativeClient};
 use kivi_engine::{
-    ChunkFabricConfig, ConnLimits, DurabilityMode, EngineConfig, EngineNetwork, LocalEngine,
-    Placement, TurnBudget,
+    ChunkFabricConfig, ConnLimits, DurabilityMode, EngineConfig, EngineNetwork, FabricConfig,
+    LocalEngine, Placement, TurnBudget,
 };
 use kivi_state::{ExpiryPolicy, Key, SetCondition};
 use kivi_tablet::{DirectorySnapshot, HashPrefix, PartitionRange};
@@ -36,6 +36,7 @@ fn start_ephemeral() -> LocalEngine {
         worker_count: 2,
         request_capacity: 128,
         chunks: ChunkFabricConfig::default(),
+        fabric: FabricConfig::default(),
         network: Some(EngineNetwork {
             base_port: 0,
             ports: Vec::new(),

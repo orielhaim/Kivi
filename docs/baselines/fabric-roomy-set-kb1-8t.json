@@ -1,0 +1,27 @@
+{
+  "schema": "kivi-lab-bench/1",
+  "target": "native",
+  "endpoint": "127.0.0.1:9200",
+  "workload": "Set",
+  "keys": "uniform:256",
+  "prefix": "base:fab:room8:",
+  "value_len": 1024,
+  "threads": 8,
+  "pipeline": 1,
+  "ops_per_thread": 5000,
+  "completed": 40000,
+  "errors": 0,
+  "ops_per_sec": 48109.275408162095,
+  "latency_unit": "ns/op",
+  "p50_ns": 139007,
+  "p95_ns": 189695,
+  "p99_ns": 285439,
+  "p999_ns": 955903,
+  "max_ns": 9166847,
+  "elapsed_secs": 0.8314405,
+  "bytes_out": null,
+  "bytes_in": null,
+  "extra": {
+    "redirects": "0"
+  }
+}

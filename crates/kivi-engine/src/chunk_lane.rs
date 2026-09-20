@@ -1702,6 +1702,18 @@ pub enum RangeBase {
         /// Total logical bytes the root claims.
         logical_len: u64,
     },
+    /// Live fabric root: callers resolve the bytes through the Memory
+    /// Fabric first (synchronous residence, promotion, or direct read),
+    /// then re-plan against `Inline`. The planner never sees this
+    /// variant: reaching `plan_set_range` with it rejects loudly.
+    Fabric {
+        /// Fabric-scoped object id assigned at staging.
+        fabric_id: u64,
+        /// Total logical bytes the root claims.
+        logical_len: u64,
+        /// Logical version the bytes were published at.
+        version: u64,
+    },
 }
 
 /// Outcome of [`plan_set_range`]: where a range patch goes next.
@@ -1774,6 +1786,9 @@ pub fn plan_set_range(
             logical_len,
             offset,
             patch,
+        },
+        RangeBase::Fabric { .. } => SetRangePlan::Reject {
+            detail: "fabric base must resolve through the Memory Fabric before planning".to_owned(),
         },
         RangeBase::Absent => {
             if patch_end > legacy_max {

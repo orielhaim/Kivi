@@ -148,8 +148,8 @@ impl SidecarGate {
                 manifest,
                 logical_len,
                 ..
-            } => vec![ImmutableDependencies::new(*manifest, *logical_len, domain)],
-            kivi_state::Mutation::TxnPrepare {
+            }
+            | kivi_state::Mutation::TxnPrepare {
                 write:
                     kivi_state::TxnWriteKind::PutChunked {
                         manifest,
