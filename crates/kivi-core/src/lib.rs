@@ -30,7 +30,9 @@ pub mod machine;
 pub mod rng;
 pub mod schedule;
 
-pub use clock::{Clock, ManualClock};
+pub use clock::{
+    Clock, ManualClock, ManualWallClock, SystemClock, WallClock, WallError, wall_now_or_max,
+};
 pub use fault::{EventView, FaultDecision, FaultPolicy};
 pub use machine::{EffectOverflow, EffectSink, Effects, StateMachine};
 pub use rng::RandomSource;

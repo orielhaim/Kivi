@@ -257,7 +257,7 @@ pub enum Mutation {
         /// Fencing token issued with this grant.
         fencing: crate::FencingToken,
         /// Logical expiry of the grant.
-        expires_at: kivi_types::UnixMicros,
+        expires_at: kivi_types::WallTimestamp,
     },
     /// Extend a live grant to the resolved expiry (same fencing token).
     LeaseRenew {
@@ -268,7 +268,7 @@ pub enum Mutation {
         /// Fencing token of the grant being renewed.
         fencing: crate::FencingToken,
         /// New logical expiry of the grant.
-        expires_at: kivi_types::UnixMicros,
+        expires_at: kivi_types::WallTimestamp,
     },
     /// Release the grant named by (`owner`, `fencing`).
     LeaseRelease {
@@ -435,7 +435,7 @@ impl Mutation {
             crate::ops::ExpiryPolicy::ExpireAt(
                 expiry
                     .as_stamp()
-                    .unwrap_or(kivi_types::UnixMicros::from_micros(0)),
+                    .unwrap_or(kivi_types::WallTimestamp::from_micros(0)),
             )
         }
     }
@@ -481,7 +481,7 @@ impl Mutation {
                         key: key.clone(),
                         expires_at: expiry
                             .as_stamp()
-                            .unwrap_or(kivi_types::UnixMicros::from_micros(0)),
+                            .unwrap_or(kivi_types::WallTimestamp::from_micros(0)),
                     }
                 }
             }
@@ -799,7 +799,10 @@ impl Encode for Mutation {
             Self::SemaphoreAcquire { key, .. } => 1 + (4 + key.len()) + 16 + 8 + 8,
             Self::SemaphoreRelease { key, .. } => 1 + (4 + key.len()) + 16,
             Self::LeaseAcquire { key, .. } | Self::LeaseRenew { key, .. } => {
-                1 + (4 + key.len()) + 8 + 8 + kivi_types::UnixMicros::from_micros(0).encoded_len()
+                1 + (4 + key.len())
+                    + 8
+                    + 8
+                    + kivi_types::WallTimestamp::from_micros(0).encoded_len()
             }
             Self::LeaseRelease { key, .. } => 1 + (4 + key.len()) + 8 + 8,
             Self::StreamCreate { key, .. } => 1 + (4 + key.len()) + 16 + 4,
@@ -1025,7 +1028,7 @@ impl Mutation {
         key: &Key,
         owner: u64,
         fencing: crate::FencingToken,
-        expires_at: kivi_types::UnixMicros,
+        expires_at: kivi_types::WallTimestamp,
     ) {
         out.push(tag);
         encode_bytes(out, key.as_bytes());
@@ -1477,7 +1480,7 @@ impl Decode for Mutation {
                 let (fencing, fourth) =
                     crate::FencingToken::decode(&input[first + second + third..])?;
                 let (expires_at, fifth) =
-                    kivi_types::UnixMicros::decode(&input[first + second + third + fourth..])?;
+                    kivi_types::WallTimestamp::decode(&input[first + second + third + fourth..])?;
                 Ok((
                     Self::LeaseAcquire {
                         key: Key::from(key),
@@ -1494,7 +1497,7 @@ impl Decode for Mutation {
                 let (fencing, fourth) =
                     crate::FencingToken::decode(&input[first + second + third..])?;
                 let (expires_at, fifth) =
-                    kivi_types::UnixMicros::decode(&input[first + second + third + fourth..])?;
+                    kivi_types::WallTimestamp::decode(&input[first + second + third + fourth..])?;
                 Ok((
                     Self::LeaseRenew {
                         key: Key::from(key),
@@ -1638,7 +1641,7 @@ pub enum ApplyOutcome {
         /// Fencing token of the grant.
         fencing: crate::FencingToken,
         /// Logical expiry of the grant.
-        expires_at: kivi_types::UnixMicros,
+        expires_at: kivi_types::WallTimestamp,
     },
     /// Lease release applied.
     LeaseReleased {
@@ -1721,7 +1724,7 @@ pub enum ApplyError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kivi_types::UnixMicros;
+    use kivi_types::WallTimestamp;
 
     #[test]
     fn mutation_codecs_round_trip() {
@@ -1752,7 +1755,7 @@ mod tests {
             },
             Mutation::SetExpiry {
                 key: key.clone(),
-                expiry: Expiry::at(UnixMicros::from_micros(99)),
+                expiry: Expiry::at(WallTimestamp::from_micros(99)),
             },
             Mutation::SetExpiry {
                 key: key.clone(),
@@ -1781,7 +1784,7 @@ mod tests {
             Mutation::PutBytesWithExpiry {
                 key: key.clone(),
                 value: bytes::Bytes::from_static(b"v"),
-                expiry: Expiry::at(UnixMicros::from_micros(7)),
+                expiry: Expiry::at(WallTimestamp::from_micros(7)),
             },
             Mutation::ReplaceChunkedRootWithExpiry {
                 key: key.clone(),
@@ -1872,13 +1875,13 @@ mod tests {
                 key: key.clone(),
                 owner: 11,
                 fencing: crate::FencingToken::from_u64(2),
-                expires_at: kivi_types::UnixMicros::from_micros(99),
+                expires_at: kivi_types::WallTimestamp::from_micros(99),
             },
             Mutation::LeaseRenew {
                 key: key.clone(),
                 owner: 11,
                 fencing: crate::FencingToken::from_u64(2),
-                expires_at: kivi_types::UnixMicros::from_micros(199),
+                expires_at: kivi_types::WallTimestamp::from_micros(199),
             },
             Mutation::LeaseRelease {
                 key: key.clone(),

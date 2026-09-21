@@ -24,7 +24,7 @@
 //! pack header (64 bytes, fixed):
 //!   magic u32 "KVCP", major u16 = 1, minor u16 = 0,
 //!   lane u16, reserved u16,
-//!   seq u64, created_wall_micros u64, target_bytes u64,
+//!   seq u64, created_wall_micros i64 (signed Unix micros), target_bytes u64,
 //!   reserved [24],
 //!   header_crc u32 over bytes [..60]
 //!
@@ -193,9 +193,16 @@ pub fn encode_manifest_record(id: ManifestId, body: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Encodes a pack header for (`lane`, `seq`).
+/// Encodes a pack header for (`lane`, `seq`). The creation stamp is the
+/// project-owned signed Unix micros (same 8 bytes as before; values that
+/// fit `i64` encode identically).
 #[must_use]
-pub fn encode_pack_header(lane: u16, seq: u64, wall_micros: u64, target_bytes: u64) -> [u8; 64] {
+pub fn encode_pack_header(
+    lane: u16,
+    seq: u64,
+    created_at: kivi_types::WallTimestamp,
+    target_bytes: u64,
+) -> [u8; 64] {
     let mut header = [0u8; PACK_HEADER_LEN];
     header[0..4].copy_from_slice(&PACK_MAGIC.to_le_bytes());
     header[4..6].copy_from_slice(&PACK_MAJOR.to_le_bytes());
@@ -203,7 +210,7 @@ pub fn encode_pack_header(lane: u16, seq: u64, wall_micros: u64, target_bytes: u
     header[8..10].copy_from_slice(&lane.to_le_bytes());
     header[10..12].copy_from_slice(&0u16.to_le_bytes());
     header[12..20].copy_from_slice(&seq.to_le_bytes());
-    header[20..28].copy_from_slice(&wall_micros.to_le_bytes());
+    header[20..28].copy_from_slice(&created_at.as_micros().to_le_bytes());
     header[28..36].copy_from_slice(&target_bytes.to_le_bytes());
     // bytes [36..60] stay zero (reserved).
     let crc = kivi_codec::integrity::crc32c_checksum(&header[..60]);

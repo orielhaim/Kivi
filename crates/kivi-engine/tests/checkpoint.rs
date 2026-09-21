@@ -239,8 +239,8 @@ fn checkpoint_captures_dedup_state_for_retry_safety() {
 fn live_state_at_cut_equals_restored_checkpoint_state() {
     use kivi_engine::LiveTablet;
     use kivi_state::{Operation, StoredObject};
-    use kivi_types::{TabletAuthority, UnixMicros};
-    let now = UnixMicros::from_micros(1_000_000);
+    use kivi_types::{TabletAuthority, WallTimestamp};
+    let now = WallTimestamp::from_micros(1_000_000);
     let authority =
         TabletAuthority::new(TABLET, TabletEpoch::INITIAL, WriteGuardGeneration::INITIAL);
     let descriptor = directory().get(TABLET).expect("descriptor").clone();
@@ -267,7 +267,7 @@ fn live_state_at_cut_equals_restored_checkpoint_state() {
     live.execute(
         &Operation::ExpireAt {
             key: Key::from("a"),
-            expires_at: UnixMicros::from_micros(9_000_000),
+            expires_at: WallTimestamp::from_micros(9_000_000),
         },
         now,
     )

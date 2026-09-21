@@ -8,7 +8,7 @@ use bytes::Bytes;
 use clap::{Parser, Subcommand};
 use kivi_client::{ClientConfig, NativeClient};
 use kivi_state::Key;
-use kivi_types::{NamespaceId, UnixMicros};
+use kivi_types::{NamespaceId, WallTimestamp};
 
 #[derive(Debug, Parser)]
 #[command(name = "kivi-cli", about = "Native Kivi development client")]
@@ -64,12 +64,12 @@ enum Command {
         /// Signed addend.
         delta: i64,
     },
-    /// Attach an absolute expiry (microseconds since the Unix epoch).
+    /// Attach an absolute expiry (signed microseconds since the Unix epoch).
     ExpireAt {
         /// Key to expire.
         key: String,
         /// Expiration timestamp in microseconds.
-        micros: u64,
+        micros: i64,
     },
     /// Clear any expiry.
     Persist {
@@ -920,7 +920,8 @@ fn run(
             println!(
                 "{}",
                 u8::from(
-                    client.expire_at(&Key::from(key.clone()), UnixMicros::from_micros(*micros))?
+                    client
+                        .expire_at(&Key::from(key.clone()), WallTimestamp::from_micros(*micros))?
                 )
             );
         }
@@ -935,12 +936,15 @@ fn run(
             Some(expiry) => match expiry.as_stamp() {
                 None => println!("immortal"),
                 Some(stamp) => {
-                    let now = kivi_engine_clock_now();
-                    if stamp.as_micros() <= now {
+                    let now = kivi_core::wall_now_or_max(&kivi_core::SystemClock);
+                    let remaining = stamp
+                        .signed_duration_since(now)
+                        .map_or(i128::from(i64::MIN), |gap| gap.as_micros());
+                    if remaining <= 0 {
                         println!("expired");
                     } else {
                         #[allow(clippy::cast_precision_loss)]
-                        let secs = (stamp.as_micros() - now) as f64 / 1_000_000.0;
+                        let secs = remaining as f64 / 1_000_000.0;
                         println!("{secs:.3}");
                     }
                 }
@@ -970,10 +974,10 @@ fn run(
             };
             let expiry = match expiry.strip_prefix("at:") {
                 Some(stamp) => {
-                    let Ok(micros) = stamp.parse::<u64>() else {
+                    let Ok(micros) = stamp.parse::<i64>() else {
                         return Err(kivi_client::ClientError::InvalidRequest);
                     };
-                    kivi_state::ExpiryPolicy::ExpireAt(UnixMicros::from_micros(micros))
+                    kivi_state::ExpiryPolicy::ExpireAt(WallTimestamp::from_micros(micros))
                 }
                 None => match expiry.as_str() {
                     "clear" => kivi_state::ExpiryPolicy::Clear,
@@ -1097,14 +1101,6 @@ fn run(
         },
     }
     Ok(())
-}
-
-fn kivi_engine_clock_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |span| {
-            u64::try_from(span.as_micros()).unwrap_or(u64::MAX)
-        })
 }
 
 #[cfg(test)]

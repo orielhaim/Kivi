@@ -1484,7 +1484,7 @@ mod tests {
     use super::*;
     use kivi_state::Key;
     use kivi_types::{
-        CommitPosition, ReadContract, Ticks, UnixMicros, consistency::AT_LEAST_WAIT_CAP,
+        CommitPosition, ReadContract, Ticks, WallTimestamp, consistency::AT_LEAST_WAIT_CAP,
     };
     use std::time::Duration;
 
@@ -1520,7 +1520,7 @@ mod tests {
 
     fn ctx(ticks: u64) -> ReadContext {
         ReadContext::new(
-            UnixMicros::from_micros(ticks),
+            WallTimestamp::from_micros(i64::try_from(ticks).expect("test ticks fit")),
             Ticks::from_micros(ticks),
             Duration::from_secs(1),
         )

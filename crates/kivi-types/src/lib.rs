@@ -53,4 +53,4 @@ pub use roster::{
     RosterEngine, RosterError, RosterEvidence, RosterGeneration, RosterId, RosterTerm,
     StableRoster, majority_of,
 };
-pub use time::{Expiry, Ticks, UnixMicros};
+pub use time::{Expiry, Ticks, TimeError, WallTimestamp};

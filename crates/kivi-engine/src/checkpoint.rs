@@ -85,8 +85,8 @@ pub struct CheckpointInfo {
     pub cut: u64,
     /// Manifest content hash.
     pub manifest: Option<ArtifactHash>,
-    /// Wall micros at publication (age reporting).
-    pub created_wall_micros: u64,
+    /// Wall time at publication (age reporting).
+    pub created_wall_micros: kivi_types::WallTimestamp,
     /// Bands referenced.
     pub bands: usize,
     /// Bands reused from the previous checkpoint.

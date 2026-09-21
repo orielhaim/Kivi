@@ -13,11 +13,11 @@ use kivi_state::{Key, Operation};
 use kivi_tablet::{DirectorySnapshot, HashPrefix, PartitionRange};
 use kivi_types::{
     ClusterId, NamespaceId, NodeId, NodeIncarnation, TabletAuthority, TabletEpoch, TabletId,
-    UnixMicros, WorkerId, WriteGuardGeneration,
+    WallTimestamp, WorkerId, WriteGuardGeneration,
 };
 
 const NS: NamespaceId = NamespaceId::from_u64(1);
-const NOW: UnixMicros = UnixMicros::from_micros(1_000_000);
+const NOW: WallTimestamp = WallTimestamp::from_micros(1_000_000);
 const KEY: &str = "bench:key";
 const VALUE_16: &[u8] = b"0123456789abcdef";
 

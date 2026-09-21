@@ -36,7 +36,7 @@
 
 use kivi_codec::{Decode, Encode};
 use kivi_state::{MutationEnvelope, OperationResult};
-use kivi_types::{RequestSeq, UnixMicros};
+use kivi_types::{RequestSeq, WallTimestamp};
 /// Framing version of [`ReplicatedMutation`].
 pub const REPLICATED_MUTATION_VERSION: u16 = 2;
 
@@ -47,7 +47,7 @@ pub const REPLICATED_MUTATION_VERSION: u16 = 2;
 pub struct ReplicatedMutation {
     envelope: MutationEnvelope,
     expected: OperationResult,
-    now: UnixMicros,
+    now: WallTimestamp,
     ack_floor: RequestSeq,
 }
 
@@ -104,7 +104,7 @@ impl ReplicatedMutation {
     pub const fn new(
         envelope: MutationEnvelope,
         expected: OperationResult,
-        now: UnixMicros,
+        now: WallTimestamp,
         ack_floor: RequestSeq,
     ) -> Self {
         Self {
@@ -129,7 +129,7 @@ impl ReplicatedMutation {
 
     /// Returns the leader-materialized wall time replicas apply at.
     #[must_use]
-    pub const fn now(&self) -> UnixMicros {
+    pub const fn now(&self) -> WallTimestamp {
         self.now
     }
 
@@ -172,7 +172,7 @@ impl ReplicatedMutation {
         if version != REPLICATED_MUTATION_VERSION {
             return Err(Fault::UnsupportedVersion { found: version });
         }
-        let now = UnixMicros::from_micros(u64::from_le_bytes(
+        let now = WallTimestamp::from_micros(i64::from_le_bytes(
             input[2..10].try_into().unwrap_or([0; 8]),
         ));
         let ack_floor = RequestSeq::from_u64(u64::from_le_bytes(
@@ -272,7 +272,7 @@ mod tests {
     use kivi_state::{Key, Mutation, ObjectVersion};
     use kivi_types::{
         NamespaceId, RequestIdentity, RequestSeq, SessionId, TabletAuthority, TabletEpoch,
-        TabletId, UnixMicros, WriteGuardGeneration,
+        TabletId, WallTimestamp, WriteGuardGeneration,
     };
 
     use super::*;
@@ -299,7 +299,7 @@ mod tests {
                 value: 41,
                 version: ObjectVersion::from_u64(7),
             },
-            UnixMicros::from_micros(1_000_000),
+            WallTimestamp::from_micros(1_000_000),
             RequestSeq::from_u64(0),
         )
     }
@@ -338,7 +338,7 @@ mod tests {
         }
         // Materialized inputs survive the round trip.
         let back = ReplicatedMutation::decode_exact(&good).expect("decodes");
-        assert_eq!(back.now(), UnixMicros::from_micros(1_000_000));
+        assert_eq!(back.now(), WallTimestamp::from_micros(1_000_000));
         assert_eq!(back.ack_floor(), RequestSeq::from_u64(0));
         // Version bump fails.
         let mut versioned = good.clone();

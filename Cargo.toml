@@ -45,6 +45,10 @@ kivi-memory = { path = "crates/kivi-memory", version = "0.1.0" }
 
 # Mechanism crates borrowed per RFC §209 ("borrow mechanisms, own semantics").
 # The project owns all wire/durable formats; these crates never define them.
+jiff = { version = "0.2", default-features = false, features = [
+    "std",
+    "alloc",
+] }
 blake3 = "1.8"
 crc32c = "0.6"
 # Checkpoint band compression experiment (RFC §217: lz4_flex for hot/warm).
@@ -64,7 +68,14 @@ crossbeam-channel = "0.5"
 # pipelined bytes. No runtime, no I/O of its own.
 async-channel = "2.5"
 getrandom = "0.4"
-compio = { version = "0.19", features = ["net", "time", "quic", "h3", "ring", "fs"] }
+compio = { version = "0.19", features = [
+    "net",
+    "time",
+    "quic",
+    "h3",
+    "ring",
+    "fs",
+] }
 http = "1.5"
 rcgen = "0.14"
 rustls = "0.23"
@@ -82,7 +93,15 @@ bitflags = "2.13"
 
 # Admin/control plane only (Tokio/Axum live in kivi-server, never in the
 # Compio data plane or the state/tablet/codec libraries).
-tokio = { version = "1.53", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", features = [
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
 axum = "0.8"
 tower = "0.5"
 tower-http = { version = "0.7", features = ["limit", "timeout", "trace"] }

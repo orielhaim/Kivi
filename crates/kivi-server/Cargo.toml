@@ -25,6 +25,7 @@ default = []
 redis-compat = ["dep:kivi-resp"]
 
 [dependencies]
+kivi-core.workspace = true
 kivi-types.workspace = true
 kivi-state.workspace = true
 kivi-tablet.workspace = true

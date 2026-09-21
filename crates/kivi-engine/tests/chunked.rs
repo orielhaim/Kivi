@@ -153,7 +153,7 @@ fn large_values_read_identically_whatever_the_representation() {
                 &Key::from("big"),
                 // Far-future stamp: expiry attaches without expiring the key
                 // under the real wall clock this test runs against.
-                kivi_types::UnixMicros::from_micros(9_999_999_999_999_999)
+                kivi_types::WallTimestamp::from_micros(9_999_999_999_999_999)
             )
             .expect("expire")
     );

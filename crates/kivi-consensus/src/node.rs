@@ -113,7 +113,7 @@ use kivi_state::{DurableOutcome, OpError, Operation, OperationResult};
 use kivi_types::{
     ClusterId, CommitPosition, FreshnessReceipt, IdempotencyKey, MutationIdentity, NamespaceId,
     NodeId, NodeIncarnation, ReadAuthorityProvider, ReadContext, ReadContract, ReadReceipt,
-    ReplicaFreshness, ServePath, TabletAuthority, TabletId, Ticks, UnixMicros,
+    ReplicaFreshness, ServePath, TabletAuthority, TabletId, Ticks, WallTimestamp,
 };
 use openraft::storage::RaftStateMachine as _;
 use openraft::type_config::async_runtime::watch::WatchReceiver as _;
@@ -480,7 +480,7 @@ pub(crate) enum OwnerRequest {
         idempotency: Option<IdempotencyKey>,
         /// Client-boundary timestamp (replicas apply the leader's
         /// materialized stamp).
-        now: UnixMicros,
+        now: WallTimestamp,
         /// Mapped proposal outcome.
         reply: Reply<Result<ProposeOutcome, ProposeError>>,
     },
@@ -1192,7 +1192,7 @@ impl ReplicatedNode {
         op: &Operation,
         identity: Option<MutationIdentity>,
         idempotency: Option<IdempotencyKey>,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Result<ProposeOutcome, ProposeError> {
         propose_caller_side(
             &self.machine,
@@ -1505,7 +1505,7 @@ pub(crate) async fn propose_caller_side(
     op: &Operation,
     identity: Option<MutationIdentity>,
     idempotency: Option<IdempotencyKey>,
-    now: UnixMicros,
+    now: WallTimestamp,
 ) -> Result<ProposeOutcome, ProposeError> {
     use kivi_state::StorePrepared;
     // Leader dedup check first: retries answer from any replica's
@@ -2052,7 +2052,7 @@ impl<'a> ReadFront<'a> {
 pub(crate) async fn read_applied_on(
     machine: &ReplicatedStateMachine,
     op: &Operation,
-    now: UnixMicros,
+    now: WallTimestamp,
 ) -> Result<OperationResult, ReadError> {
     let outcome = machine
         .read_local(op, now)
@@ -2077,7 +2077,7 @@ pub(crate) async fn read_applied_on(
 pub(crate) async fn scan_applied_on(
     machine: &ReplicatedStateMachine,
     spec: &kivi_state::ScanSpec,
-    now: UnixMicros,
+    now: WallTimestamp,
 ) -> Result<kivi_state::ScanPage, ReadError> {
     let page = machine.scan_local(spec, now).await.map_err(|error| {
         ReadError::Consensus(ConsensusError::Unavailable {
@@ -2807,7 +2807,7 @@ where
         op: Operation,
         identity: Option<MutationIdentity>,
         idempotency: Option<IdempotencyKey>,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Result<ProposeOutcome, ProposeError> {
         use kivi_state::StorePrepared;
         // Extract the immutable root staged locally by the caller.
@@ -4194,7 +4194,7 @@ async fn ensure_proposal_sidecars_for(
     sidecar: &SidecarStore,
     machine: &ReplicatedStateMachine,
     op: &Operation,
-    now: UnixMicros,
+    now: WallTimestamp,
 ) -> Result<Option<Operation>, ProposeError> {
     // Medium values replicate as chunked sidecars, never inline bytes.
     if let Some(restaged) = stage_medium_set(sidecar, op).await? {
@@ -4333,7 +4333,7 @@ mod tests {
     use kivi_types::{
         ClusterId, MutationIdentity, NamespaceId, NodeId, ReadContext, ReadContract,
         RequestIdentity, RequestSeq, ServePath, SessionId, TabletAuthority, TabletEpoch, TabletId,
-        Ticks, UnixMicros, WriteGuardGeneration,
+        Ticks, WallTimestamp, WriteGuardGeneration,
     };
 
     use super::{NodeConfig, ProposeError, ProposeOutcome, ReadError, ReplicatedNode};
@@ -4343,7 +4343,7 @@ mod tests {
     const CLUSTER: u128 = 0x0C10_57E2;
     const NS: NamespaceId = NamespaceId::from_u64(1);
     const TABLET: TabletId = TabletId::from_u64(9);
-    const NOW: UnixMicros = UnixMicros::from_micros(1_000_000);
+    const NOW: WallTimestamp = WallTimestamp::from_micros(1_000_000);
     const CTX: ReadContext =
         ReadContext::new(NOW, Ticks::from_micros(1_000_000), Duration::from_secs(5));
 

@@ -8,6 +8,7 @@ license = "AGPL-3.0-or-later"
 [dependencies]
 kivi-types.workspace = true
 thiserror.workspace = true
+jiff.workspace = true
 
 [lints]
 workspace = true

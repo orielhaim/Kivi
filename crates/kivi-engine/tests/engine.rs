@@ -166,7 +166,7 @@ fn typed_crud_round_trip_with_ttl() {
     assert_eq!(client.counter_add(&Key::from("n"), -2).expect("add"), 3);
     assert_eq!(client.counter_get(&Key::from("n")).expect("read"), Some(3));
     // Expiry far in the future: live.
-    let far = kivi_types::UnixMicros::from_micros(u64::MAX / 2);
+    let far = kivi_types::WallTimestamp::from_micros(i64::MAX / 2);
     assert!(client.expire_at(&key, far).expect("expire"));
     assert_eq!(
         client.get(&key).expect("live").expect("value"),

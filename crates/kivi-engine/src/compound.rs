@@ -33,11 +33,11 @@ use kivi_types::{
     MutationIdentity, NamespaceId, RequestSeq, SessionId, TabletAuthority, TabletId, WorkerId,
 };
 
-use crate::clock::SystemClock;
 use crate::commit::PendingEntry;
 use crate::routing::RoutingSnapshot;
 use crate::tablet::LiveTablet;
 use crate::worker::WorkerDurability;
+use kivi_core::SystemClock;
 
 /// Server-side per-page caps (client budgets above these are clamped, never
 /// an error: bounded pages are the contract, and callers page anyway).
@@ -204,7 +204,7 @@ fn handle_scan(
     let Ok(spec) = spec else {
         return invalid("invalid scan window");
     };
-    let now = SystemClock::wall_now();
+    let now = kivi_core::wall_now_or_max(&SystemClock);
     let mut borrowed = tablets.borrow_mut();
     let Some(live) = borrowed.get_mut(&tablet) else {
         return Response {
@@ -402,7 +402,7 @@ fn scan_tablet_slice(
     ) else {
         return invalid("invalid scan window");
     };
-    let now = SystemClock::wall_now();
+    let now = kivi_core::wall_now_or_max(&SystemClock);
     let mut borrowed = tablets.borrow_mut();
     let Some(live) = borrowed.get_mut(&tablet) else {
         return Response {
@@ -1003,7 +1003,7 @@ async fn drive_one(
     seals: Vec<crate::fabric::StagedSeal>,
 ) -> Result<OperationResult, StepFault> {
     let Some(durable) = durability else {
-        let now = SystemClock::wall_now();
+        let now = kivi_core::wall_now_or_max(&SystemClock);
         let mut borrowed = tablets.borrow_mut();
         let live = borrowed.get_mut(&tablet).ok_or(StepFault::Unavailable)?;
         return live.execute(op, now).map_err(step_tablet_error);
@@ -1019,7 +1019,7 @@ async fn drive_one(
             PendingEntry::new(
                 tablet,
                 op.clone(),
-                SystemClock::wall_now(),
+                kivi_core::wall_now_or_max(&SystemClock),
                 Some(identity),
                 respond,
             )
@@ -1164,7 +1164,7 @@ mod tests {
                         key: Key::from(key),
                         value: bytes::Bytes::from(value),
                     },
-                    kivi_types::UnixMicros::from_micros(1_000_000),
+                    kivi_types::WallTimestamp::from_micros(1_000_000),
                 )
                 .expect("seed works");
             }

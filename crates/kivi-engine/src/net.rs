@@ -57,7 +57,6 @@ use kivi_types::{
 };
 
 use crate::affinity::{AffinityError, AffinityMode, pin_current_thread};
-use crate::clock::SystemClock;
 use crate::commit::PendingEntry;
 use crate::routing::RoutingSnapshot;
 use crate::tablet::LiveTablet;
@@ -65,6 +64,7 @@ use crate::worker::{
     WorkerChunks, WorkerControl, WorkerDurability, WorkerMetrics, WorkerRequestError,
     WorkerResponse, handle_control, handle_request,
 };
+use kivi_core::SystemClock;
 
 /// Per-connection unparsed-junk bound default (4 MiB). This caps bytes
 /// with no validated meaning yet — never a declared in-progress frame,
@@ -676,7 +676,7 @@ struct FabricReadPark {
     op: Operation,
     /// Logical wall time captured at the client boundary (expiry
     /// re-check on resume: never resurrect expired state).
-    now: kivi_types::UnixMicros,
+    now: kivi_types::WallTimestamp,
     /// Where the outcome goes.
     respond: crossbeam_channel::Sender<crate::worker::WorkerResponse>,
     /// Fabric park sequence holding the lane reply.
@@ -884,7 +884,7 @@ fn bridge_chunk_stage(
 fn park_fabric_read(
     tablet: TabletId,
     op: Operation,
-    now: kivi_types::UnixMicros,
+    now: kivi_types::WallTimestamp,
     respond: crossbeam_channel::Sender<crate::worker::WorkerResponse>,
     reference: kivi_state::FabricRef,
     tablets: &Rc<RefCell<HashMap<TabletId, LiveTablet>>>,
@@ -934,7 +934,7 @@ fn park_fabric_read(
 fn bridge_stage_fabric(
     tablet: TabletId,
     op: &Operation,
-    now: kivi_types::UnixMicros,
+    now: kivi_types::WallTimestamp,
     identity: Option<MutationIdentity>,
     respond: crossbeam_channel::Sender<crate::worker::WorkerResponse>,
     tablets: &Rc<RefCell<HashMap<TabletId, LiveTablet>>>,
@@ -1038,7 +1038,7 @@ fn bridge_stage_fabric(
 fn bridge_plan_range(
     tablet: TabletId,
     op: Operation,
-    now: kivi_types::UnixMicros,
+    now: kivi_types::WallTimestamp,
     identity: Option<MutationIdentity>,
     respond: crossbeam_channel::Sender<crate::worker::WorkerResponse>,
     tablets: &Rc<RefCell<HashMap<TabletId, LiveTablet>>>,
@@ -1256,7 +1256,7 @@ fn poll_bridge_stages(
                 (op, pinned)
             }
         };
-        let now = SystemClock::wall_now();
+        let now = kivi_core::wall_now_or_max(&SystemClock);
         match durability {
             None => {
                 let outcome = match tablets.borrow_mut().get_mut(&staged.tablet) {
@@ -2247,7 +2247,7 @@ impl Conn {
                 // task); superseded materializations retire afterwards.
                 // All borrows end before the promotion await below.
                 let key = operation.key().clone();
-                let now = SystemClock::wall_now();
+                let now = kivi_core::wall_now_or_max(&SystemClock);
                 let (previous, reference) = {
                     let tablets = self.tablets.borrow();
                     let previous = tablets
@@ -2290,7 +2290,7 @@ impl Conn {
                     None => result,
                 };
                 if previous.is_some() {
-                    let now = SystemClock::wall_now();
+                    let now = kivi_core::wall_now_or_max(&SystemClock);
                     let post = self
                         .tablets
                         .borrow()
@@ -2333,7 +2333,7 @@ impl Conn {
         let Operation::SetRange { key, offset, patch } = operation else {
             return Ok(Some((operation, None, Vec::new())));
         };
-        let now = SystemClock::wall_now();
+        let now = kivi_core::wall_now_or_max(&SystemClock);
         let base = crate::worker::peek_range_base(&self.tablets.borrow(), tablet, &key, now);
         // Fabric bases resolve synchronously when resident; otherwise the
         // lane promotion suspends only this task, then planning continues
@@ -2803,7 +2803,7 @@ impl Conn {
         request_id: u64,
         tablet: TabletId,
         key: &Key,
-        now: kivi_types::UnixMicros,
+        now: kivi_types::WallTimestamp,
         fabric_id: u64,
     ) -> Result<Option<crate::chunk_lane::RangeBase>, ConnExit> {
         let resident = self.fabric.borrow_mut().try_resolve_sync(fabric_id);
@@ -2860,7 +2860,7 @@ impl Conn {
         &mut self,
         tablet: TabletId,
         key: &Key,
-        now: kivi_types::UnixMicros,
+        now: kivi_types::WallTimestamp,
         reference: kivi_state::FabricRef,
     ) -> Result<Bytes, crate::fabric::FabricError> {
         use crate::fabric::FabricError;
@@ -3174,7 +3174,7 @@ impl Conn {
         tablet: TabletId,
         op: Operation,
     ) -> Result<Option<(Operation, Vec<crate::fabric::StagedSeal>)>, ConnExit> {
-        let now = SystemClock::wall_now();
+        let now = kivi_core::wall_now_or_max(&SystemClock);
         let finalize_key = op.key().clone();
         let commit = matches!(&op, Operation::TxnFinalize { commit: true, .. });
         let fabric_id = commit
@@ -3587,7 +3587,7 @@ impl Conn {
             }
             _ => None,
         };
-        let now = SystemClock::wall_now();
+        let now = kivi_core::wall_now_or_max(&SystemClock);
         // Resolve the tablet and run the whole pipeline synchronously:
         // both borrows end before any `.await`, so connection tasks on
         // this thread cannot interleave a persist-apply sequence. The
@@ -3703,7 +3703,7 @@ impl Conn {
         tablet: TabletId,
         operation: &Operation,
     ) -> Option<Result<kivi_state::OperationResult, crate::tablet::TabletError>> {
-        let now = SystemClock::wall_now();
+        let now = kivi_core::wall_now_or_max(&SystemClock);
         let mut tablets = self.tablets.borrow_mut();
         tablets
             .get_mut(&tablet)

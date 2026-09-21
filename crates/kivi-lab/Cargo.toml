@@ -19,6 +19,8 @@ name = "kivi-lab"
 path = "src/bin/kivi-lab.rs"
 
 [dependencies]
+jiff.workspace = true
+kivi-core.workspace = true
 kivi-types.workspace = true
 kivi-state.workspace = true
 kivi-tablet.workspace = true

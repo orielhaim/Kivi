@@ -6,6 +6,7 @@ rust-version.workspace = true
 license = "AGPL-3.0-or-later"
 
 [dependencies]
+kivi-core.workspace = true
 kivi-types.workspace = true
 kivi-state.workspace = true
 kivi-codec.workspace = true

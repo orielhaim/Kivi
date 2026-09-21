@@ -12,7 +12,7 @@ use bytes::Bytes;
 use kivi_state::{
     ApplyOutcome, Key, LogicalValue, ObjectStore, OpError, Operation, OperationResult, Prepared,
 };
-use kivi_types::UnixMicros;
+use kivi_types::WallTimestamp;
 use proptest::prelude::*;
 
 // ---------------------------------------------------------------------------
@@ -31,7 +31,7 @@ struct RefObj {
     bytes: Vec<u8>,
     int: i64,
     version: u64,
-    expiry: Option<u64>,
+    expiry: Option<i64>,
 }
 
 #[derive(Debug, Default)]
@@ -40,13 +40,13 @@ struct RefStore {
 }
 
 impl RefStore {
-    fn live(&self, key: &[u8], now: u64) -> Option<&RefObj> {
+    fn live(&self, key: &[u8], now: i64) -> Option<&RefObj> {
         self.map
             .get(key)
             .filter(|obj| obj.expiry.is_none_or(|e| now < e))
     }
 
-    fn read(&self, key: &[u8], now: u64) -> Result<Out, RefErr> {
+    fn read(&self, key: &[u8], now: i64) -> Result<Out, RefErr> {
         match self.live(key, now) {
             None => Ok(Out::Val(None)),
             Some(obj) => match obj.kind {
@@ -56,7 +56,7 @@ impl RefStore {
         }
     }
 
-    fn run(&mut self, op: &GenOp, now: u64) -> Result<Out, RefErr> {
+    fn run(&mut self, op: &GenOp, now: i64) -> Result<Out, RefErr> {
         let key = op.key().to_vec();
         match op {
             GenOp::Get(_) => self.read(&key, now),
@@ -158,7 +158,7 @@ impl RefStore {
     /// Independent spelling of the splice: absent state reads as empty,
     /// counters reject, past-the-end gaps zero-pad, and the live expiry
     /// survives (partial writes never touch the TTL).
-    fn splice(&mut self, key: &[u8], offset: u64, patch: &[u8], now: u64) -> Result<Out, RefErr> {
+    fn splice(&mut self, key: &[u8], offset: u64, patch: &[u8], now: i64) -> Result<Out, RefErr> {
         let (base, expiry) = match self.live(key, now) {
             None => (Vec::new(), None),
             Some(obj) => match obj.kind {
@@ -209,14 +209,14 @@ impl RefStore {
 /// Normalized durable row: (kind tag, bytes, counter, version, expiry).
 /// Tuples keep the reference dump brutally simple; the alias silences
 /// complexity lints without hiding anything.
-type Row = (u8, Vec<u8>, i64, u64, Option<u64>);
+type Row = (u8, Vec<u8>, i64, u64, Option<i64>);
 
 /// Normalized expiry answer: absent key, live key without expiry, or a stamp.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ExpState {
     Absent,
     Never,
-    At(u64),
+    At(i64),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -265,7 +265,7 @@ enum GenOp {
     Exists(usize),
     CounterGet(usize),
     CounterAdd(usize, i64),
-    ExpireAt(usize, u64),
+    ExpireAt(usize, i64),
     Persist(usize),
     GetExpiry(usize),
 }
@@ -342,7 +342,7 @@ fn arb_step() -> impl Strategy<Value = (GenOp, u64)> {
         (0usize..6).prop_map(GenOp::Exists),
         (0usize..6).prop_map(GenOp::CounterGet),
         (0usize..6, arb_delta()).prop_map(|(k, d)| GenOp::CounterAdd(k, d)),
-        (0usize..6, 0u64..2000).prop_map(|(k, rel)| GenOp::ExpireAt(k, rel)),
+        (0usize..6, 0i64..2000).prop_map(|(k, rel)| GenOp::ExpireAt(k, rel)),
         (0usize..6).prop_map(GenOp::Persist),
         (0usize..6).prop_map(GenOp::GetExpiry),
     ];
@@ -406,7 +406,7 @@ fn norm_result(
             None => ExpState::Absent,
             Some(value) => match value.as_stamp() {
                 None => ExpState::Never,
-                Some(stamp) => ExpState::At(kivi_types::UnixMicros::as_micros(stamp)),
+                Some(stamp) => ExpState::At(kivi_types::WallTimestamp::as_micros(stamp)),
             },
         }),
         OperationResult::Length(value) => Out::Len(*value),
@@ -515,7 +515,7 @@ fn kivi_dump(
                     object
                         .expiry()
                         .as_stamp()
-                        .map(kivi_types::UnixMicros::as_micros),
+                        .map(kivi_types::WallTimestamp::as_micros),
                 ),
             )
         })
@@ -565,7 +565,7 @@ fn kivi_op(step: &GenOp) -> Operation {
         GenOp::ExpireAt(i, abs) => Operation::ExpireAt {
             key: kivi_key(*i),
             // Already absolutized by the driver loop; never re-offset here.
-            expires_at: UnixMicros::from_micros(*abs),
+            expires_at: WallTimestamp::from_micros(*abs),
         },
         GenOp::Persist(i) => Operation::PersistExpiry { key: kivi_key(*i) },
         GenOp::GetExpiry(i) => Operation::GetExpiry { key: kivi_key(*i) },
@@ -585,10 +585,10 @@ proptest! {
         // exactly like engine resolution would.
         let mut registry: BTreeMap<[u8; 32], Vec<u8>> = BTreeMap::new();
         let mut fabric: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
-        let mut now: u64 = 1_000_000;
+        let mut now: i64 = 1_000_000;
         for (step, advance) in &steps {
-            now = now.checked_add(*advance).expect("test clock fits");
-            let stamp = UnixMicros::from_micros(now);
+            now = now.checked_add(i64::try_from(*advance).expect("test advance fits")).expect("test clock fits");
+            let stamp = WallTimestamp::from_micros(now);
             // Expiry offsets are relative to the step's timestamp on both sides.
             let step = match step {
                 GenOp::ExpireAt(i, rel) => GenOp::ExpireAt(*i, now.saturating_add(*rel)),

@@ -31,7 +31,7 @@ use kivi_state::{Key, Operation, OperationResult};
 use kivi_types::{
     CommitPosition, CommitToken, FreshnessReceipt, LeaseEligibility, LeaseParams, NodeId,
     NodeIncarnation, ReadAuthorityProvider, ReadContext, ReadContract, ReplicaFreshness,
-    RosterTerm, TabletAuthority, TabletEpoch, TabletId, Ticks, UnixMicros, WriteGuardGeneration,
+    RosterTerm, TabletAuthority, TabletEpoch, TabletId, Ticks, WallTimestamp, WriteGuardGeneration,
 };
 
 const TABLET: TabletId = TabletId::from_u64(3);
@@ -59,7 +59,7 @@ fn fresh() -> ReplicaFreshness {
 
 fn ctx() -> ReadContext {
     ReadContext::new(
-        UnixMicros::from_micros(1_000_000),
+        WallTimestamp::from_micros(1_000_000),
         Ticks::from_micros(50_000),
         Duration::from_secs(1),
     )

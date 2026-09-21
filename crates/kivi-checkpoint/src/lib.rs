@@ -39,7 +39,6 @@ pub use builder::{
 };
 pub use catalog::{
     CurrentRecord, decode_current, decode_wal_floor, encode_current, encode_wal_floor,
-    wall_micros_now,
 };
 pub use dedup::{
     BuiltDedup, LoadedDedup, OutcomeCheckpoint, SessionCheckpoint, build_dedup, load_dedup,

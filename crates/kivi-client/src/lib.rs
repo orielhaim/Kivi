@@ -39,7 +39,7 @@ use kivi_protocol::{
 use kivi_state::{Key, PartitionHasher};
 use kivi_types::{
     CommitToken, NamespaceId, ReadContract, ReadReceipt, RequestIdentity, RequestSeq, SessionId,
-    UnixMicros, WorkerId,
+    WallTimestamp, WorkerId,
 };
 
 pub use ordered::{
@@ -284,7 +284,7 @@ fn status_error(status: Status, body: &ResponseBody) -> ClientError {
 fn encode_conditional(
     condition: kivi_state::SetCondition,
     expiry: kivi_state::ExpiryPolicy,
-) -> (u8, u8, u64) {
+) -> (u8, u8, i64) {
     use kivi_protocol::{COND_ALWAYS, COND_IF_ABSENT, COND_IF_PRESENT};
     use kivi_protocol::{EXPIRY_AT, EXPIRY_CLEAR, EXPIRY_KEEP};
     let condition_wire = match condition {
@@ -2972,7 +2972,7 @@ impl NativeClient {
     /// # Errors
     ///
     /// Returns [`ClientError`] on transport/routing failure.
-    pub fn expire_at(&self, key: &Key, expires_at: UnixMicros) -> Result<bool, ClientError> {
+    pub fn expire_at(&self, key: &Key, expires_at: WallTimestamp) -> Result<bool, ClientError> {
         use kivi_protocol::{Opcode, ResponseBody};
         let response = self.execute(key, Opcode::ExpireAt, || kivi_protocol::Request {
             contract: kivi_types::ReadContract::Latest,
@@ -3124,7 +3124,7 @@ impl NativeClient {
         })?;
         match response.body {
             ResponseBody::ExpiryAt(stamp) => Ok(Some(kivi_types::Expiry::at(
-                kivi_types::UnixMicros::from_micros(stamp),
+                kivi_types::WallTimestamp::from_micros(stamp),
             ))),
             ResponseBody::ExpiryNever => Ok(Some(kivi_types::Expiry::NEVER)),
             ResponseBody::Diagnostic(_) => Ok(None),
@@ -3421,8 +3421,8 @@ impl NativeClient {
 pub struct LeaseGrant {
     /// Fencing token issued with this grant (strictly increasing).
     pub fencing: u64,
-    /// Logical expiry in micros (`u64::MAX` = immortal until released).
-    pub expires_at: u64,
+    /// Logical expiry (`WallTimestamp::MAX` = immortal until released).
+    pub expires_at: WallTimestamp,
 }
 
 /// Lease inspection answer.
@@ -3432,8 +3432,8 @@ pub struct LeaseInfo {
     pub owner: Option<u64>,
     /// Live holder's fencing token (zero when no live holder).
     pub fencing: u64,
-    /// Live holder's logical expiry (zero when no live holder).
-    pub expires_at: u64,
+    /// Live holder's logical expiry (epoch when no live holder).
+    pub expires_at: WallTimestamp,
     /// Next fencing token to be issued.
     pub next_fencing: u64,
 }
@@ -3806,7 +3806,7 @@ impl NativeClient {
                 expires_at,
             } => Ok(LeaseGrant {
                 fencing,
-                expires_at,
+                expires_at: WallTimestamp::from_micros(expires_at),
             }),
             _ => Err(ClientError::Internal(
                 "unexpected lease-acquire body".to_owned(),
@@ -3843,7 +3843,7 @@ impl NativeClient {
                 expires_at,
             } => Ok(LeaseGrant {
                 fencing,
-                expires_at,
+                expires_at: WallTimestamp::from_micros(expires_at),
             }),
             _ => Err(ClientError::Internal(
                 "unexpected lease-renew body".to_owned(),
@@ -3895,7 +3895,7 @@ impl NativeClient {
             } => Ok(LeaseInfo {
                 owner,
                 fencing,
-                expires_at,
+                expires_at: WallTimestamp::from_micros(expires_at),
                 next_fencing,
             }),
             _ => Err(ClientError::Internal(

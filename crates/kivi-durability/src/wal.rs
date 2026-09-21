@@ -211,7 +211,7 @@ pub struct MutationRecord {
     pub commit: kivi_types::CommitPosition,
     /// Commit timestamp (micros): replay re-applies under this `now` so
     /// expiry visibility matches commit time exactly.
-    pub now: kivi_types::UnixMicros,
+    pub now: kivi_types::WallTimestamp,
     /// Originating opcode discriminant (response shaping + replay mapping).
     pub opcode: u8,
     /// Retry identity with acknowledgement floor, if the request had one.
@@ -237,7 +237,7 @@ pub struct OutcomeRecord {
     /// This tablet's commit position (consumed like any completion).
     pub commit: kivi_types::CommitPosition,
     /// Commit timestamp (micros, forensics + replay uniformity).
-    pub now: kivi_types::UnixMicros,
+    pub now: kivi_types::WallTimestamp,
     /// Originating opcode discriminant.
     pub opcode: u8,
     /// Retry identity with acknowledgement floor, if the request had one.
@@ -295,7 +295,7 @@ impl WalRecord {
 
     /// The commit timestamp replay re-applies under.
     #[must_use]
-    pub fn now(&self) -> kivi_types::UnixMicros {
+    pub fn now(&self) -> kivi_types::WallTimestamp {
         match self {
             Self::Mutation(record) => record.now,
             Self::Outcome(record) => record.now,
@@ -597,7 +597,8 @@ impl RecordFault {
 }
 
 /// Fixed-size record prefix: routing identity, fencing, ordering, and the
-/// commit timestamp, all raw little-endian words.
+/// commit timestamp, all raw little-endian words (`now` is signed Unix
+/// micros, matching the project-owned durable representation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RecordPrefix {
     namespace: u64,
@@ -605,7 +606,7 @@ struct RecordPrefix {
     epoch: u64,
     guard: u64,
     commit: u64,
-    now: u64,
+    now: i64,
     opcode: u8,
 }
 
@@ -623,7 +624,7 @@ fn decode_fixed_prefix(input: &[u8]) -> Result<(RecordPrefix, usize), RecordFaul
             epoch: u64::from_le_bytes(input[16..24].try_into().unwrap_or([0; 8])),
             guard: u64::from_le_bytes(input[24..32].try_into().unwrap_or([0; 8])),
             commit: u64::from_le_bytes(input[32..40].try_into().unwrap_or([0; 8])),
-            now: u64::from_le_bytes(input[40..48].try_into().unwrap_or([0; 8])),
+            now: i64::from_le_bytes(input[40..48].try_into().unwrap_or([0; 8])),
             opcode: input[48],
         },
         need,
@@ -687,7 +688,7 @@ fn decode_record_body(kind: u16, version: u16, body: &[u8]) -> Result<WalEntry, 
                     epoch: TabletEpoch::from_u64(prefix.epoch),
                     guard: WriteGuardGeneration::from_u64(prefix.guard),
                     commit: kivi_types::CommitPosition::from_u64(prefix.commit),
-                    now: kivi_types::UnixMicros::from_micros(prefix.now),
+                    now: kivi_types::WallTimestamp::from_micros(prefix.now),
                     opcode: prefix.opcode,
                     identity,
                     mutation,
@@ -716,7 +717,7 @@ fn decode_record_body(kind: u16, version: u16, body: &[u8]) -> Result<WalEntry, 
                     epoch: TabletEpoch::from_u64(prefix.epoch),
                     guard: WriteGuardGeneration::from_u64(prefix.guard),
                     commit: kivi_types::CommitPosition::from_u64(prefix.commit),
-                    now: kivi_types::UnixMicros::from_micros(prefix.now),
+                    now: kivi_types::WallTimestamp::from_micros(prefix.now),
                     opcode: prefix.opcode,
                     identity,
                     outcome,
@@ -1660,7 +1661,7 @@ mod tests {
             epoch: TabletEpoch::from_u64(1),
             guard: WriteGuardGeneration::from_u64(1),
             commit: CommitPosition::from_u64(commit),
-            now: kivi_types::UnixMicros::from_micros(1_000_000),
+            now: kivi_types::WallTimestamp::from_micros(1_000_000),
             opcode: 2,
             identity: None,
             mutation: Mutation::PutBytes {
@@ -1684,7 +1685,7 @@ mod tests {
             epoch: TabletEpoch::from_u64(1),
             guard: WriteGuardGeneration::from_u64(1),
             commit: CommitPosition::from_u64(commit),
-            now: kivi_types::UnixMicros::from_micros(1_000_000),
+            now: kivi_types::WallTimestamp::from_micros(1_000_000),
             opcode: 6,
             identity: None,
             outcome: DurableOutcome::Completed(OperationResult::CounterUpdated {

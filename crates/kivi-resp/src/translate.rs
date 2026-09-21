@@ -8,8 +8,9 @@
 //! are left unsupported rather than faked with a read-then-write loop.
 
 use bytes::Bytes;
+use jiff::SignedDuration;
 use kivi_state::{ExpiryPolicy, Operation, OperationResult, SetCondition};
-use kivi_types::UnixMicros;
+use kivi_types::WallTimestamp;
 
 use crate::command::CompatClass;
 use crate::error::{KiviErrorKind, RespError};
@@ -123,9 +124,9 @@ pub trait Executor: Send + Sync {
     /// unexpected failure occurs.
     fn execute(&self, op: &Operation) -> Result<OperationResult, ExecuteError>;
 
-    /// Wall-clock Unix microseconds (relative expiry computation only;
-    /// never persisted as a decision).
-    fn now_micros(&self) -> u64;
+    /// Current wall time (relative expiry computation only; never
+    /// persisted as a decision — the materialized stamp is).
+    fn now(&self) -> WallTimestamp;
 }
 
 /// Parses an ASCII decimal integer argument (optional leading `+`/`-`,
@@ -204,14 +205,14 @@ pub fn split_command(elements: &[Vec<u8>]) -> Result<(Vec<u8>, Vec<Vec<u8>>), Re
 }
 
 /// Translates one command (name plus raw byte args) into an [`Action`].
-/// `now_micros` anchors relative expiries (`EX`/`PX`) to absolute stamps.
+/// `now` anchors relative expiries (`EX`/`PX`) to absolute stamps.
 ///
 /// # Errors
 ///
 /// Returns [`RespError::InvalidArguments`] on bad arity or values and
 /// [`RespError::Unsupported`] for commands or options outside this profile.
 #[allow(clippy::too_many_lines)]
-pub fn translate(name: &[u8], args: &[Vec<u8>], now_micros: u64) -> Result<Action, RespError> {
+pub fn translate(name: &[u8], args: &[Vec<u8>], now: WallTimestamp) -> Result<Action, RespError> {
     match name {
         b"PING" => match args.len() {
             0 => Ok(Action::Reply(Immediate::Simple("PONG"))),
@@ -245,7 +246,7 @@ pub fn translate(name: &[u8], args: &[Vec<u8>], now_micros: u64) -> Result<Actio
                 reason: "wrong number of arguments for 'get'".to_owned(),
             }),
         },
-        b"SET" => translate_set(args, now_micros),
+        b"SET" => translate_set(args, now),
         b"DEL" => match args {
             [key] => Ok(Action::Execute {
                 op: Operation::Delete {
@@ -268,8 +269,8 @@ pub fn translate(name: &[u8], args: &[Vec<u8>], now_micros: u64) -> Result<Actio
                 reason: "wrong number of arguments for 'exists'".to_owned(),
             }),
         },
-        b"EXPIRE" => translate_expire(args, now_micros, 1_000_000, "expire", RedisOp::Expire),
-        b"PEXPIRE" => translate_expire(args, now_micros, 1_000, "pexpire", RedisOp::Expire),
+        b"EXPIRE" => translate_expire(args, now, 1_000_000, "expire", RedisOp::Expire),
+        b"PEXPIRE" => translate_expire(args, now, 1_000, "pexpire", RedisOp::Expire),
         b"EXPIREAT" => translate_expire_at(args, 1_000_000, "expireat"),
         b"PEXPIREAT" => translate_expire_at(args, 1_000, "pexpireat"),
         b"TTL" => match args {
@@ -364,7 +365,11 @@ pub fn translate(name: &[u8], args: &[Vec<u8>], now_micros: u64) -> Result<Actio
 }
 
 /// Translates `SET key value [options]` onto [`Operation::SetConditional`].
-fn translate_set(args: &[Vec<u8>], now_micros: u64) -> Result<Action, RespError> {
+///
+/// Relative expiries materialize `now + delta` with Jiff arithmetic; an
+/// unrepresentable sum is an invalid expiry (loud error), never a silent
+/// clamp to maximum time.
+fn translate_set(args: &[Vec<u8>], now: WallTimestamp) -> Result<Action, RespError> {
     let [key, value, options @ ..] = args else {
         return Err(RespError::InvalidArguments {
             reason: "wrong number of arguments for 'set'".to_owned(),
@@ -416,37 +421,7 @@ fn translate_set(args: &[Vec<u8>], now_micros: u64) -> Result<Action, RespError>
                 let arg = options.get(index + 1).ok_or(RespError::InvalidArguments {
                     reason: "wrong number of arguments for 'set'".to_owned(),
                 })?;
-                let stamp = match token.as_slice() {
-                    b"EX" => {
-                        let secs = parse_unsigned(arg).map_err(|_| invalid_expire())?;
-                        if secs == 0 {
-                            return Err(invalid_expire());
-                        }
-                        now_micros.saturating_add(secs.saturating_mul(1_000_000))
-                    }
-                    b"PX" => {
-                        let ms = parse_unsigned(arg).map_err(|_| invalid_expire())?;
-                        if ms == 0 {
-                            return Err(invalid_expire());
-                        }
-                        now_micros.saturating_add(ms.saturating_mul(1_000))
-                    }
-                    b"EXAT" => {
-                        let secs = parse_unsigned(arg).map_err(|_| invalid_expire())?;
-                        if secs == 0 {
-                            return Err(invalid_expire());
-                        }
-                        secs.saturating_mul(1_000_000)
-                    }
-                    _ => {
-                        let ms = parse_unsigned(arg).map_err(|_| invalid_expire())?;
-                        if ms == 0 {
-                            return Err(invalid_expire());
-                        }
-                        ms.saturating_mul(1_000)
-                    }
-                };
-                expiry = ExpiryPolicy::ExpireAt(UnixMicros::from_micros(stamp));
+                expiry = ExpiryPolicy::ExpireAt(set_expiry_stamp(&token, arg, now)?);
                 expiry_set = true;
                 index += 2;
             }
@@ -462,6 +437,39 @@ fn translate_set(args: &[Vec<u8>], now_micros: u64) -> Result<Action, RespError>
         },
         redis: RedisOp::Set,
     })
+}
+
+/// Materializes a relative expiry (`now + delta micros`) with Jiff signed
+/// arithmetic. Overflow is an invalid expiry, never a silent clamp.
+fn relative_stamp(now: WallTimestamp, delta_micros: i64) -> Result<WallTimestamp, RespError> {
+    now.checked_add(SignedDuration::from_micros(delta_micros))
+        .map_err(|_| invalid_expire())
+}
+
+/// Computes one `SET` expiry stamp: `EX`/`PX` anchor `now + delta` with
+/// Jiff arithmetic, `EXAT`/`PXAT` are absolute. Zero, overflow, and
+/// unrepresentable sums are all invalid expiries, never silent clamps.
+fn set_expiry_stamp(
+    token: &[u8],
+    arg: &[u8],
+    now: WallTimestamp,
+) -> Result<WallTimestamp, RespError> {
+    let amount = parse_unsigned(arg).map_err(|_| invalid_expire())?;
+    if amount == 0 {
+        return Err(invalid_expire());
+    }
+    let unit_micros: i64 = match token {
+        b"EX" | b"EXAT" => 1_000_000,
+        _ => 1_000,
+    };
+    let micros = i64::try_from(amount)
+        .ok()
+        .and_then(|amount| amount.checked_mul(unit_micros))
+        .ok_or_else(invalid_expire)?;
+    match token {
+        b"EX" | b"PX" => relative_stamp(now, micros),
+        _ => Ok(WallTimestamp::from_micros(micros)),
+    }
 }
 
 fn err_set_syntax() -> Result<Action, RespError> {
@@ -483,8 +491,8 @@ fn invalid_expire() -> RespError {
 /// read-then-write loop.
 fn translate_expire(
     args: &[Vec<u8>],
-    now_micros: u64,
-    unit_micros: u64,
+    now: WallTimestamp,
+    unit_micros: i64,
     name: &'static str,
     redis: RedisOp,
 ) -> Result<Action, RespError> {
@@ -493,11 +501,19 @@ fn translate_expire(
             let units = parse_unsigned(amount).map_err(|_| RespError::InvalidArguments {
                 reason: "value is not an integer or out of range".to_owned(),
             })?;
-            let stamp = now_micros.saturating_add(units.saturating_mul(unit_micros));
+            let delta = i64::try_from(units)
+                .ok()
+                .and_then(|units| units.checked_mul(unit_micros))
+                .ok_or_else(|| RespError::InvalidArguments {
+                    reason: "value is not an integer or out of range".to_owned(),
+                })?;
+            let stamp = relative_stamp(now, delta).map_err(|_| RespError::InvalidArguments {
+                reason: "value is not an integer or out of range".to_owned(),
+            })?;
             Ok(Action::Execute {
                 op: Operation::ExpireAt {
                     key: kivi_state::Key::from(key.clone()),
-                    expires_at: UnixMicros::from_micros(stamp),
+                    expires_at: stamp,
                 },
                 redis,
             })
@@ -515,7 +531,7 @@ fn translate_expire(
 /// as [`translate_expire`].
 fn translate_expire_at(
     args: &[Vec<u8>],
-    unit_micros: u64,
+    unit_micros: i64,
     name: &'static str,
 ) -> Result<Action, RespError> {
     match args {
@@ -523,10 +539,16 @@ fn translate_expire_at(
             let units = parse_unsigned(amount).map_err(|_| RespError::InvalidArguments {
                 reason: "value is not an integer or out of range".to_owned(),
             })?;
+            let micros = i64::try_from(units)
+                .ok()
+                .and_then(|units| units.checked_mul(unit_micros))
+                .ok_or_else(|| RespError::InvalidArguments {
+                    reason: "value is not an integer or out of range".to_owned(),
+                })?;
             Ok(Action::Execute {
                 op: Operation::ExpireAt {
                     key: kivi_state::Key::from(key.clone()),
-                    expires_at: UnixMicros::from_micros(units.saturating_mul(unit_micros)),
+                    expires_at: WallTimestamp::from_micros(micros),
                 },
                 redis: RedisOp::Expire,
             })
@@ -608,7 +630,7 @@ pub enum Reply {
 /// Maps an engine result onto its exact Redis reply for `redis`.
 #[must_use]
 #[allow(clippy::too_many_lines)]
-pub fn map_result(result: &OperationResult, redis: RedisOp, now_micros: u64) -> Reply {
+pub fn map_result(result: &OperationResult, redis: RedisOp, now: WallTimestamp) -> Reply {
     match (result, redis) {
         (OperationResult::Value(Some(value)), RedisOp::Get | RedisOp::GetRange) => {
             Reply::Bulk(value.to_vec())
@@ -642,12 +664,8 @@ pub fn map_result(result: &OperationResult, redis: RedisOp, now_micros: u64) -> 
         (OperationResult::ExpiryPersisted { removed }, RedisOp::Persist) => {
             Reply::Int(i64::from(*removed))
         }
-        (OperationResult::Expiry(expiry), RedisOp::Ttl) => {
-            Reply::Int(ttl_seconds(*expiry, now_micros))
-        }
-        (OperationResult::Expiry(expiry), RedisOp::PTtl) => {
-            Reply::Int(ttl_millis(*expiry, now_micros))
-        }
+        (OperationResult::Expiry(expiry), RedisOp::Ttl) => Reply::Int(ttl_seconds(*expiry, now)),
+        (OperationResult::Expiry(expiry), RedisOp::PTtl) => Reply::Int(ttl_millis(*expiry, now)),
         (OperationResult::Expiry(expiry), RedisOp::ExpireTime) => {
             Reply::Int(expire_seconds(*expiry))
         }
@@ -694,20 +712,20 @@ pub fn map_parse_error(error: &RespError) -> Reply {
 /// Remaining TTL in seconds: `-2` missing, `-1` immortal, else the
 /// ceiling of remaining milliseconds divided by 1000 (Redis rounds up
 /// partial seconds; a 1 ms remainder reports `1`, never `0`).
-fn ttl_seconds(expiry: Option<kivi_types::Expiry>, now_micros: u64) -> i64 {
+fn ttl_seconds(expiry: Option<kivi_types::Expiry>, now: WallTimestamp) -> i64 {
     match expiry {
         None => -2,
         Some(value) => match value.as_stamp() {
             None => -1,
             Some(stamp) => {
-                let remaining = stamp.as_micros().saturating_sub(now_micros);
-                if remaining == 0 {
+                let remaining = stamp.as_micros().saturating_sub(now.as_micros());
+                if remaining <= 0 {
                     // Expired but unreclaimed races as missing downstream;
                     // reaching here means the read saw it live, so one
                     // second of grace keeps the contract total.
                     1
                 } else {
-                    i64::try_from(remaining.saturating_add(999_999) / 1_000_000).unwrap_or(i64::MAX)
+                    remaining.saturating_add(999_999) / 1_000_000
                 }
             }
         },
@@ -715,13 +733,12 @@ fn ttl_seconds(expiry: Option<kivi_types::Expiry>, now_micros: u64) -> i64 {
 }
 
 /// Remaining TTL in milliseconds: `-2` missing, `-1` immortal.
-fn ttl_millis(expiry: Option<kivi_types::Expiry>, now_micros: u64) -> i64 {
+fn ttl_millis(expiry: Option<kivi_types::Expiry>, now: WallTimestamp) -> i64 {
     match expiry {
         None => -2,
         Some(value) => match value.as_stamp() {
             None => -1,
-            Some(stamp) => i64::try_from(stamp.as_micros().saturating_sub(now_micros) / 1_000)
-                .unwrap_or(i64::MAX),
+            Some(stamp) => (stamp.as_micros().saturating_sub(now.as_micros()) / 1_000).max(0),
         },
     }
 }
@@ -732,7 +749,7 @@ fn expire_seconds(expiry: Option<kivi_types::Expiry>) -> i64 {
         None => -2,
         Some(value) => match value.as_stamp() {
             None => -1,
-            Some(stamp) => i64::try_from(stamp.as_micros() / 1_000_000).unwrap_or(i64::MAX),
+            Some(stamp) => stamp.as_micros().div_euclid(1_000_000),
         },
     }
 }
@@ -743,7 +760,7 @@ fn expire_millis(expiry: Option<kivi_types::Expiry>) -> i64 {
         None => -2,
         Some(value) => match value.as_stamp() {
             None => -1,
-            Some(stamp) => i64::try_from(stamp.as_micros() / 1_000).unwrap_or(i64::MAX),
+            Some(stamp) => stamp.as_micros().div_euclid(1_000),
         },
     }
 }
@@ -831,7 +848,7 @@ mod tests {
 
     #[test]
     fn set_options_map_onto_kivi_conditions_atomically() {
-        let now = 1_000_000_000;
+        let now = WallTimestamp::from_micros(1_000_000_000);
         // Bare SET clears expiry.
         let Action::Execute { op, redis } =
             translate(b"SET", &bytes(&[b"k", b"v"]), now).expect("bare set")
@@ -897,7 +914,7 @@ mod tests {
         };
         assert_eq!(
             expiry,
-            ExpiryPolicy::ExpireAt(UnixMicros::from_micros(now + 10_000_000))
+            ExpiryPolicy::ExpireAt(WallTimestamp::from_micros(now.as_micros() + 10_000_000))
         );
         let Action::Execute { op, .. } =
             translate(b"SET", &bytes(&[b"k", b"v", b"PXAT", b"5000"]), now).expect("pxat")
@@ -912,7 +929,7 @@ mod tests {
         // immediately — caught by differential testing against Redis).
         assert_eq!(
             expiry,
-            ExpiryPolicy::ExpireAt(UnixMicros::from_micros(5_000_000))
+            ExpiryPolicy::ExpireAt(WallTimestamp::from_micros(5_000_000))
         );
         let Action::Execute { op, .. } =
             translate(b"SET", &bytes(&[b"k", b"v", b"KEEPTTL"]), now).expect("keepttl")
@@ -931,9 +948,12 @@ mod tests {
     #[test]
     fn getrange_windows_compile_to_one_atomic_read() {
         // Non-negative windows use the native range op directly.
-        let Action::Execute { op, redis } =
-            translate(b"GETRANGE", &bytes(&[b"k", b"0", b"3"]), 0).expect("getrange")
-        else {
+        let Action::Execute { op, redis } = translate(
+            b"GETRANGE",
+            &bytes(&[b"k", b"0", b"3"]),
+            WallTimestamp::EPOCH,
+        )
+        .expect("getrange") else {
             panic!("GETRANGE must execute");
         };
         assert_eq!(redis, RedisOp::GetRange);
@@ -946,9 +966,12 @@ mod tests {
             }
         ));
         // Negative bounds read the full snapshot once and slice locally.
-        let Action::Execute { op, redis } =
-            translate(b"GETRANGE", &bytes(&[b"k", b"-3", b"-1"]), 0).expect("negative getrange")
-        else {
+        let Action::Execute { op, redis } = translate(
+            b"GETRANGE",
+            &bytes(&[b"k", b"-3", b"-1"]),
+            WallTimestamp::EPOCH,
+        )
+        .expect("negative getrange") else {
             panic!("negative GETRANGE must execute");
         };
         assert!(matches!(
@@ -973,15 +996,27 @@ mod tests {
         use kivi_state::{ObjectVersion, OperationResult};
         // GET missing is nil; GETRANGE missing is empty; STRLEN missing is 0.
         assert_eq!(
-            map_result(&OperationResult::Value(None), RedisOp::Get, 0),
+            map_result(
+                &OperationResult::Value(None),
+                RedisOp::Get,
+                WallTimestamp::EPOCH
+            ),
             Reply::Nil
         );
         assert_eq!(
-            map_result(&OperationResult::Value(None), RedisOp::GetRange, 0),
+            map_result(
+                &OperationResult::Value(None),
+                RedisOp::GetRange,
+                WallTimestamp::EPOCH
+            ),
             Reply::Bulk(Vec::new())
         );
         assert_eq!(
-            map_result(&OperationResult::Length(None), RedisOp::StrLen, 0),
+            map_result(
+                &OperationResult::Length(None),
+                RedisOp::StrLen,
+                WallTimestamp::EPOCH
+            ),
             Reply::Int(0)
         );
         // SET applied is +OK; refused is nil.
@@ -992,7 +1027,7 @@ mod tests {
                     version: Some(ObjectVersion::FIRST),
                 },
                 RedisOp::Set,
-                0
+                WallTimestamp::EPOCH
             ),
             Reply::Simple("OK")
         );
@@ -1003,42 +1038,120 @@ mod tests {
                     version: None,
                 },
                 RedisOp::Set,
-                0
+                WallTimestamp::EPOCH
             ),
             Reply::Nil
         );
         // TTL family: -2 missing, -1 immortal, remaining otherwise.
+        let at_sec = WallTimestamp::from_micros(1_000_000);
         assert_eq!(
-            map_result(&OperationResult::Expiry(None), RedisOp::Ttl, 1_000_000),
+            map_result(&OperationResult::Expiry(None), RedisOp::Ttl, at_sec),
             Reply::Int(-2)
         );
         assert_eq!(
             map_result(
                 &OperationResult::Expiry(Some(kivi_types::Expiry::NEVER)),
                 RedisOp::Ttl,
-                1_000_000
+                at_sec
             ),
             Reply::Int(-1)
         );
         assert_eq!(
             map_result(
-                &OperationResult::Expiry(Some(kivi_types::Expiry::at(UnixMicros::from_micros(
+                &OperationResult::Expiry(Some(kivi_types::Expiry::at(WallTimestamp::from_micros(
                     3_500_000
                 )))),
                 RedisOp::Ttl,
-                1_000_000
+                at_sec
             ),
             Reply::Int(3)
         );
         assert_eq!(
             map_result(
-                &OperationResult::Expiry(Some(kivi_types::Expiry::at(UnixMicros::from_micros(
+                &OperationResult::Expiry(Some(kivi_types::Expiry::at(WallTimestamp::from_micros(
+                    3_500_000
+                )))),
+                RedisOp::PTtl,
+                at_sec
+            ),
+            Reply::Int(2_500)
+        );
+        assert_eq!(
+            map_result(
+                &OperationResult::Expiry(Some(kivi_types::Expiry::at(WallTimestamp::from_micros(
                     3_500_000
                 )))),
                 RedisOp::ExpireTime,
-                0
+                WallTimestamp::EPOCH
             ),
             Reply::Int(3)
+        );
+        assert_eq!(
+            map_result(
+                &OperationResult::Expiry(Some(kivi_types::Expiry::at(WallTimestamp::from_micros(
+                    3_500_000
+                )))),
+                RedisOp::PExpireTime,
+                WallTimestamp::EPOCH
+            ),
+            Reply::Int(3_500)
+        );
+    }
+
+    #[test]
+    fn relative_expiry_materializes_once_and_rejects_overflow() {
+        let now = WallTimestamp::from_micros(1_000_000_000);
+        // EXPIRE anchors `now + delta` exactly once at the edge.
+        let Action::Execute { op, .. } =
+            translate(b"EXPIRE", &bytes(&[b"k", b"10"]), now).expect("expire")
+        else {
+            panic!("EXPIRE must execute");
+        };
+        assert!(matches!(
+            op,
+            Operation::ExpireAt {
+                expires_at,
+                ..
+            } if expires_at == WallTimestamp::from_micros(1_010_000_000)
+        ));
+        // Overflow is an error, never a silent clamp to maximum time.
+        let huge = u64::MAX.to_string().into_bytes();
+        assert!(
+            translate(
+                b"SET",
+                &[b"k".to_vec(), b"v".to_vec(), b"EX".to_vec(), huge.clone()],
+                now
+            )
+            .is_err()
+        );
+        assert!(translate(b"EXPIRE", &[b"k".to_vec(), huge], now).is_err());
+        // Absolute expiries accept the full signed range.
+        let Action::Execute { op, .. } =
+            translate(b"PEXPIREAT", &bytes(&[b"k", b"5000"]), WallTimestamp::EPOCH)
+                .expect("pexpireat")
+        else {
+            panic!("PEXPIREAT must execute");
+        };
+        assert!(matches!(
+            op,
+            Operation::ExpireAt { expires_at, .. }
+            if expires_at == WallTimestamp::from_micros(5_000_000)
+        ));
+    }
+
+    #[test]
+    fn ttl_at_exact_boundary_reports_grace() {
+        // Exactly at the deadline the read saw the key live: one second of
+        // grace keeps the contract total; PTTL floors at zero.
+        let at = WallTimestamp::from_micros(2_000_000);
+        let expiry = Some(kivi_types::Expiry::at(at));
+        assert_eq!(
+            map_result(&OperationResult::Expiry(expiry), RedisOp::Ttl, at),
+            Reply::Int(1)
+        );
+        assert_eq!(
+            map_result(&OperationResult::Expiry(expiry), RedisOp::PTtl, at),
+            Reply::Int(0)
         );
     }
 
@@ -1047,7 +1160,8 @@ mod tests {
         let key = vec![0x00, 0xFF, 0x10, 0x00];
         let value = vec![0x00, 0x00, 0xFF, 0xFE, 0x61];
         let Action::Execute { op, .. } =
-            translate(b"SET", &[key.clone(), value.clone()], 0).expect("binary set")
+            translate(b"SET", &[key.clone(), value.clone()], WallTimestamp::EPOCH)
+                .expect("binary set")
         else {
             panic!("binary SET must execute");
         };

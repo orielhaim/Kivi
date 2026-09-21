@@ -11,9 +11,9 @@ use kivi_state::{
     FencingToken, Key, LogicalValue, ObjectStore, ObjectVersion, OpError, Operation,
     OperationResult, PermitId, Prepared, outcome_for,
 };
-use kivi_types::{TabletId, UnixMicros};
+use kivi_types::{TabletId, WallTimestamp};
 
-const NOW: UnixMicros = UnixMicros::from_micros(1_000_000);
+const NOW: WallTimestamp = WallTimestamp::from_micros(1_000_000);
 
 fn key(name: &str) -> Key {
     Key::from(name)
@@ -22,7 +22,7 @@ fn key(name: &str) -> Key {
 fn execute(
     store: &mut ObjectStore,
     op: &Operation,
-    now: UnixMicros,
+    now: WallTimestamp,
 ) -> Result<OperationResult, OpError> {
     match store.prepare(op, now)? {
         Prepared::Read(result) => Ok(result),
@@ -484,7 +484,7 @@ fn lease_expiry_hands_over_without_revival() {
         OperationResult::LeaseAcquired { fencing, .. } => fencing,
         other => panic!("grant, got {other:?}"),
     };
-    let later = UnixMicros::from_micros(NOW.as_micros() + 101);
+    let later = WallTimestamp::from_micros(NOW.as_micros() + 101);
     let fencing2 = match execute(
         &mut store,
         &Operation::LeaseAcquire {

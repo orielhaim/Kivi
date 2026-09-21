@@ -10,7 +10,7 @@ use kivi_types::{
     ChunkId, ClusterId, CommitPosition, CommitToken, CpuId, Expiry, IdempotencyKey, NamespaceId,
     NamespaceName, NodeId, NodeIncarnation, NumaId, PartitionHash, ReadContract, RequestIdentity,
     RequestSeq, SecurityDomainId, SessionId, TabletAuthority, TabletEpoch, TabletId, Ticks,
-    UnixMicros, WorkerId, WriteGuardGeneration,
+    WallTimestamp, WorkerId, WriteGuardGeneration,
 };
 
 use crate::error::CodecError;
@@ -50,7 +50,27 @@ impl_int_encoding!(CommitPosition, u64, 8);
 impl_int_encoding!(RequestSeq, u64, 8);
 impl_int_encoding!(SecurityDomainId, u64, 8);
 impl_int_encoding!(Ticks, u64, 8);
-impl_int_encoding!(UnixMicros, u64, 8);
+
+// Wall-clock stamps encode as 8-byte little-endian _signed_ Unix micros —
+// the Kivi-owned durable representation. Written by hand (not the macro)
+// because `WallTimestamp` deliberately has no `From<i64>`: raw integers
+// cross the boundary only here and at clock edges.
+impl Encode for WallTimestamp {
+    fn encoded_len(&self) -> usize {
+        8
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.as_micros().encode(out);
+    }
+}
+
+impl Decode for WallTimestamp {
+    fn decode(input: &[u8]) -> Result<(Self, usize), CodecError> {
+        let (raw, consumed) = i64::decode(input)?;
+        Ok((Self::from_micros(raw), consumed))
+    }
+}
 
 // `u128`-backed identifiers are 16 bytes little-endian on the wire.
 impl_int_encoding!(ClusterId, u128, 16);
@@ -189,7 +209,7 @@ impl Encode for Expiry {
             None => out.push(0),
             Some(when) => {
                 out.push(1);
-                when.as_micros().encode(out);
+                when.encode(out);
             }
         }
     }
@@ -201,8 +221,8 @@ impl Decode for Expiry {
         match tag {
             0 => Ok((Self::NEVER, first)),
             1 => {
-                let (micros, second) = u64::decode(&input[first..])?;
-                Ok((Self::at(UnixMicros::from_micros(micros)), first + second))
+                let (when, second) = WallTimestamp::decode(&input[first..])?;
+                Ok((Self::at(when), first + second))
             }
             other => Err(CodecError::InvalidTag {
                 kind: "expiry",
@@ -324,6 +344,34 @@ mod tests {
     }
 
     #[test]
+    fn wall_timestamps_round_trip_signed() {
+        for micros in [
+            i64::MIN,
+            -1_000_001,
+            -1,
+            0,
+            1,
+            500,
+            9_000_000_000_000_000,
+            i64::MAX,
+        ] {
+            let stamp = WallTimestamp::from_micros(micros);
+            assert_eq!(stamp.encoded_len(), 8);
+            assert_eq!(
+                WallTimestamp::decode_exact(&stamp.encode_to_vec()).expect("round trip"),
+                stamp,
+                "micros {micros} must round-trip"
+            );
+        }
+        // Signed encoding: -1 is all-ones, observably distinct from the old
+        // unsigned reading of the same bytes.
+        assert_eq!(
+            WallTimestamp::from_micros(-1).encode_to_vec(),
+            [0xFF; 8].to_vec()
+        );
+    }
+
+    #[test]
     fn composites_round_trip() {
         let authority = TabletAuthority::new(
             TabletId::from_u64(918),
@@ -366,7 +414,7 @@ mod tests {
             Expiry::decode_exact(&Expiry::NEVER.encode_to_vec()).expect("never"),
             Expiry::NEVER
         );
-        let dated = Expiry::at(UnixMicros::from_micros(500));
+        let dated = Expiry::at(WallTimestamp::from_micros(500));
         assert_eq!(
             Expiry::decode_exact(&dated.encode_to_vec()).expect("dated"),
             dated

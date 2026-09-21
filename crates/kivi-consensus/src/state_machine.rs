@@ -116,7 +116,7 @@ use kivi_state::{
 };
 use kivi_types::{
     CommitPosition, Expiry, NamespaceId, RequestSeq, SessionId, TabletAuthority, TabletId,
-    UnixMicros,
+    WallTimestamp,
 };
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine, SnapshotMeta};
 use openraft::type_config::alias::{
@@ -595,7 +595,7 @@ impl ReplicatedTablet {
     pub fn scan_local(
         &mut self,
         spec: &kivi_state::ScanSpec,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Result<kivi_state::ScanPage, kivi_state::ScanError> {
         if !self.store.ordered_index_enabled() {
             self.store.rebuild_ordered_index();
@@ -618,7 +618,7 @@ impl ReplicatedTablet {
 
     /// Logical telemetry at `now` for split/merge policy.
     #[must_use]
-    pub fn tablet_stats(&self, now: UnixMicros) -> kivi_state::StoreStats {
+    pub fn tablet_stats(&self, now: WallTimestamp) -> kivi_state::StoreStats {
         self.store.stats(now)
     }
 
@@ -763,7 +763,7 @@ impl ReplicatedTablet {
     pub fn prepare_operation(
         &self,
         op: &Operation,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Result<kivi_state::StorePrepared, kivi_state::OpError> {
         self.store.prepare_durable(op, now)
     }
@@ -780,7 +780,7 @@ impl ReplicatedTablet {
     pub fn read_local(
         &self,
         op: &Operation,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Result<OperationResult, StateMachineFault> {
         match self
             .store
@@ -1106,7 +1106,7 @@ fn encode_intent(out: &mut Vec<u8>, intent: &kivi_state::TxnIntent) {
             version.encode(out);
         }
     }
-    push_u64(out, intent.prepared_at);
+    push_i64(out, intent.prepared_at.as_micros());
 }
 
 /// Decodes one snapshot intent at the cursor.
@@ -1160,7 +1160,7 @@ fn decode_snapshot_intents(
                 });
             }
         };
-        let prepared_at = snap_take_u64(body, at)?;
+        let prepared_at = kivi_types::WallTimestamp::from_micros(snap_take_i64(body, at)?);
         intents.push(kivi_state::TxnIntent {
             id,
             coordinator,
@@ -1359,6 +1359,11 @@ fn decode_membership(
 }
 
 fn push_u64(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+/// Pushes one signed little-endian word (project-owned signed Unix micros).
+fn push_i64(out: &mut Vec<u8>, value: i64) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
@@ -1732,6 +1737,13 @@ fn snap_take<'a>(input: &'a [u8], at: &mut usize, n: usize) -> Result<&'a [u8], 
 /// Takes one little-endian word at the cursor.
 fn snap_take_u64(input: &[u8], at: &mut usize) -> Result<u64, StateMachineFault> {
     Ok(u64::from_le_bytes(
+        snap_take(input, at, 8)?.try_into().unwrap_or([0; 8]),
+    ))
+}
+
+/// Takes one signed little-endian word at the cursor.
+fn snap_take_i64(input: &[u8], at: &mut usize) -> Result<i64, StateMachineFault> {
+    Ok(i64::from_le_bytes(
         snap_take(input, at, 8)?.try_into().unwrap_or([0; 8]),
     ))
 }
@@ -2127,7 +2139,7 @@ impl ReplicatedStateMachine {
     }
 
     /// Logical telemetry of this replica for split/merge policy.
-    pub async fn tablet_stats(&self, now: UnixMicros) -> kivi_state::StoreStats {
+    pub async fn tablet_stats(&self, now: WallTimestamp) -> kivi_state::StoreStats {
         self.shared.lock().await.tablet.tablet_stats(now)
     }
 
@@ -2188,7 +2200,7 @@ impl ReplicatedStateMachine {
     pub async fn scan_local(
         &self,
         spec: &kivi_state::ScanSpec,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Result<kivi_state::ScanPage, StateMachineFault> {
         let mut inner = self.shared.lock().await;
         if !inner.healthy {
@@ -2254,7 +2266,7 @@ impl ReplicatedStateMachine {
     pub async fn prepare_operation(
         &self,
         op: &kivi_state::Operation,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Result<kivi_state::StorePrepared, kivi_state::OpError> {
         self.shared.lock().await.tablet.prepare_operation(op, now)
     }
@@ -2277,7 +2289,7 @@ impl ReplicatedStateMachine {
     pub async fn peek_base(
         &self,
         key: &kivi_state::Key,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Result<RangeBase, String> {
         let inner = self.shared.lock().await;
         if !inner.healthy {
@@ -2326,7 +2338,7 @@ impl ReplicatedStateMachine {
     pub async fn read_local(
         &self,
         op: &Operation,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Result<OperationResult, StateMachineFault> {
         let inner = self.shared.lock().await;
         if !inner.healthy {
@@ -2841,7 +2853,7 @@ mod tests {
     use kivi_state::{Key, Mutation, MutationEnvelope, ObjectVersion, OperationResult};
     use kivi_types::{
         NamespaceId, RequestIdentity, RequestSeq, SessionId, TabletAuthority, TabletEpoch,
-        TabletId, UnixMicros, WriteGuardGeneration,
+        TabletId, WallTimestamp, WriteGuardGeneration,
     };
     use openraft::storage::RaftStateMachine;
 
@@ -2856,7 +2868,7 @@ mod tests {
 
     const NS: NamespaceId = NamespaceId::from_u64(1);
     const TABLET: TabletId = TabletId::from_u64(9);
-    const NOW: UnixMicros = UnixMicros::from_micros(1_000_000);
+    const NOW: WallTimestamp = WallTimestamp::from_micros(1_000_000);
 
     fn authority() -> TabletAuthority {
         TabletAuthority::new(TABLET, TabletEpoch::INITIAL, WriteGuardGeneration::INITIAL)
@@ -3169,7 +3181,7 @@ mod tests {
                 2,
                 Mutation::SetExpiry {
                     key: Key::from("n"),
-                    expiry: kivi_types::Expiry::at(UnixMicros::from_micros(2_000_000)),
+                    expiry: kivi_types::Expiry::at(WallTimestamp::from_micros(2_000_000)),
                 },
                 OperationResult::ExpirySet { applied: true },
             ),

@@ -330,7 +330,7 @@ mod tests {
     use kivi_state::{Key, Mutation, MutationEnvelope, ObjectVersion, OperationResult};
     use kivi_types::{
         NamespaceId, RequestIdentity, RequestSeq, SessionId, TabletAuthority, TabletEpoch,
-        TabletId, UnixMicros, WriteGuardGeneration,
+        TabletId, WallTimestamp, WriteGuardGeneration,
     };
 
     use super::*;
@@ -357,7 +357,7 @@ mod tests {
                 value: 41,
                 version: ObjectVersion::from_u64(7),
             },
-            UnixMicros::from_micros(1_000_000),
+            WallTimestamp::from_micros(1_000_000),
             RequestSeq::from_u64(0),
         ))
     }

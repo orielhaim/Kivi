@@ -27,12 +27,10 @@ static RUN_IDS: AtomicU64 = AtomicU64::new(0);
 /// that prefix is ever cleaned.
 #[must_use]
 pub fn run_scope() -> String {
-    // pid + nanos + counter: unique across parallel test binaries too.
+    // pid + counter: unique across parallel test binaries too. No wall
+    // clock — an atomic process identity is sufficient for uniqueness.
     let id = RUN_IDS.fetch_add(1, Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |span| span.as_nanos());
-    format!("kivi-lab:{nanos}-{id}:")
+    format!("kivi-lab:{}-{id}:", std::process::id())
 }
 
 /// Resolves the reference Redis URL: explicit argument wins, then

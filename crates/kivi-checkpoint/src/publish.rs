@@ -33,7 +33,7 @@ use kivi_durability::fs::{create_dir_all_sync, sync_dir, tmp_path, write_atomic_
 
 use crate::artifact::{ArtifactKind, artifact_path, checkpoints_dir, current_path, tablet_dir};
 use crate::builder::{BuiltBandRef, BuiltTablet};
-use crate::catalog::{CurrentRecord, encode_current, wall_micros_now};
+use crate::catalog::{CurrentRecord, encode_current};
 use crate::error::CheckpointError;
 
 /// Publication accounting for operators and tests.
@@ -180,7 +180,7 @@ pub fn publish_tablet(
         cut: built.cut,
         manifest: built.manifest.hash,
         previous: previous.map(|current| current.manifest),
-        created_wall_micros: wall_micros_now(),
+        created_wall_micros: kivi_core::wall_now_or_max(&kivi_core::SystemClock),
     };
     write_atomic_sync(&current_path(data_dir, tablet), &encode_current(&installed)).map_err(
         |error| {

@@ -22,7 +22,7 @@ use std::thread::{self, JoinHandle};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, select};
 use kivi_durability::{DurabilityError, LaneStats, StorageHealth, WorkerLaneStats};
 use kivi_state::{ExpiryPolicy, Operation, OperationResult, SetCondition};
-use kivi_types::{ManifestId, MutationIdentity, NamespaceId, TabletId, UnixMicros, WorkerId};
+use kivi_types::{ManifestId, MutationIdentity, NamespaceId, TabletId, WallTimestamp, WorkerId};
 
 use crate::chunk_lane::{
     ChunkLaneHandle, LargeSetSplit, RangeBase, SetRangePlan, StagingPins, plan_set_range,
@@ -172,7 +172,7 @@ pub struct TabletRequest {
     /// Typed operation to execute.
     pub op: Operation,
     /// Logical wall time captured at the client boundary.
-    pub now: UnixMicros,
+    pub now: WallTimestamp,
     /// Retry identity with acknowledgement floor. Always `None` on the
     /// embedded path (callers share fate with the process); the native
     /// path fills it from the request.
@@ -312,7 +312,7 @@ pub enum WorkerControl {
     /// tablet), reporting the total reclaimed count.
     Sweep {
         /// Logical wall time for expiry comparison.
-        now: UnixMicros,
+        now: WallTimestamp,
         /// Per-tablet reclaim bound.
         limit: usize,
         /// Where the reclaimed total goes.
@@ -951,7 +951,7 @@ pub(crate) fn peek_range_base(
     tablets: &HashMap<TabletId, LiveTablet>,
     tablet: TabletId,
     key: &kivi_state::Key,
-    now: UnixMicros,
+    now: WallTimestamp,
 ) -> RangeBase {
     let Some(live) = tablets.get(&tablet) else {
         return RangeBase::Absent;
@@ -1483,7 +1483,7 @@ fn stage_fabric_conditional(
 fn resolve_channel_outcome(
     tablet: TabletId,
     key: &kivi_state::Key,
-    now: UnixMicros,
+    now: WallTimestamp,
     op: &Operation,
     outcome: OperationResult,
     tablets: &HashMap<TabletId, LiveTablet>,
@@ -1547,7 +1547,7 @@ fn resolve_range_base(
     tablets: &HashMap<TabletId, LiveTablet>,
     tablet: TabletId,
     key: &kivi_state::Key,
-    now: UnixMicros,
+    now: WallTimestamp,
     fabric: &mut crate::fabric::TabletFabric,
     metrics: &core::cell::Cell<WorkerMetrics>,
     respond: &Sender<WorkerResponse>,
@@ -1579,7 +1579,7 @@ fn stage_range_request(
     offset: u64,
     patch: bytes::Bytes,
     tablets: &HashMap<TabletId, LiveTablet>,
-    now: UnixMicros,
+    now: WallTimestamp,
     chunks: &WorkerChunks,
     fabric: &mut crate::fabric::TabletFabric,
     metrics: &core::cell::Cell<WorkerMetrics>,
@@ -1706,7 +1706,7 @@ fn stage_request_representation(
     op: Operation,
     tablets: &mut HashMap<TabletId, LiveTablet>,
     tablet: TabletId,
-    now: UnixMicros,
+    now: WallTimestamp,
     chunks: &WorkerChunks,
     fabric: &mut crate::fabric::TabletFabric,
     metrics: &core::cell::Cell<WorkerMetrics>,
@@ -1969,8 +1969,14 @@ mod tests {
             use kivi_chunk::{ChunkStore, DEFAULT_INLINE_THRESHOLD};
             let dir = tempfile::tempdir().expect("scratch");
             let domain = kivi_types::SecurityDomainId::from_u64(NS.as_u64());
-            let (store, _) = ChunkStore::open(dir.path(), 0, domain, 1024 * 1024, 1_000_000)
-                .expect("test lane opens");
+            let (store, _) = ChunkStore::open(
+                dir.path(),
+                0,
+                domain,
+                1024 * 1024,
+                kivi_types::WallTimestamp::from_micros(1_000_000),
+            )
+            .expect("test lane opens");
             let (lane, guard) = spawn_lane(WorkerId::from_u64(0), store, DEFAULT_CHUNK_CACHE_BYTES);
             Self {
                 chunks: WorkerChunks {
@@ -2027,7 +2033,7 @@ mod tests {
             .try_send(TabletRequest {
                 tablet,
                 op,
-                now: UnixMicros::from_micros(1_000_000),
+                now: WallTimestamp::from_micros(1_000_000),
                 identity: None,
                 respond,
             })
@@ -2288,14 +2294,14 @@ mod tests {
             TabletId::from_u64(1),
             Operation::ExpireAt {
                 key: Key::from("k"),
-                expires_at: UnixMicros::from_micros(10),
+                expires_at: WallTimestamp::from_micros(10),
             },
         )
         .expect("expiry attaches");
         let (respond, receive) = bounded::<usize>(1);
         handle
             .try_control(WorkerControl::Sweep {
-                now: UnixMicros::from_micros(100),
+                now: WallTimestamp::from_micros(100),
                 limit: 100,
                 respond,
             })

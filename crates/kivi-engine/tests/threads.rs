@@ -14,13 +14,15 @@ use bytes::Bytes;
 use kivi_engine::{DurabilityMode, EngineConfig, EngineError, LocalClient, LocalEngine, Placement};
 use kivi_state::{Key, ObjectStore, Operation};
 use kivi_tablet::{DirectorySnapshot, HashPrefix, PartitionRange};
-use kivi_types::{NamespaceId, TabletEpoch, TabletId, UnixMicros, WorkerId, WriteGuardGeneration};
+use kivi_types::{
+    NamespaceId, TabletEpoch, TabletId, WallTimestamp, WorkerId, WriteGuardGeneration,
+};
 
 const NS: NamespaceId = NamespaceId::from_u64(1);
 const EPOCH: TabletEpoch = TabletEpoch::INITIAL;
 const GUARD: WriteGuardGeneration = WriteGuardGeneration::INITIAL;
-const PAST: UnixMicros = UnixMicros::from_micros(1);
-const FUTURE: UnixMicros = UnixMicros::from_micros(u64::MAX / 2);
+const PAST: WallTimestamp = WallTimestamp::from_micros(1);
+const FUTURE: WallTimestamp = WallTimestamp::from_micros(i64::MAX / 2);
 
 fn hash_range(bits: u128, len: u8) -> PartitionRange {
     PartitionRange::Hash(HashPrefix::new(bits, len).expect("range"))
@@ -349,7 +351,7 @@ fn mixed_workload_matches_sequential_reference() {
 fn apply_reference(store: &mut ObjectStore, key: &Key, tag: u8, bytes: &[u8], number: i64) {
     // Fixed logical timestamp: far from both PAST and FUTURE sentinels used
     // below, so wall-clock drift cannot matter.
-    let now = UnixMicros::from_micros(1_000_000_000);
+    let now = WallTimestamp::from_micros(1_000_000_000);
     let op = match tag {
         0 => Operation::Set {
             key: key.clone(),

@@ -55,15 +55,13 @@ pub trait BenchTarget: Send {
     }
 }
 
-/// Far-future expiry stamp for benchmark expirations.
-fn bench_expiry() -> kivi_types::UnixMicros {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| {
-            elapsed.as_micros().try_into().unwrap_or(u64::MAX)
-        });
-    kivi_types::UnixMicros::from_micros(now.saturating_add(60_000_000))
+/// Far-future expiry stamp for benchmark expirations: one shared
+/// production read plus sixty seconds of Jiff arithmetic.
+fn bench_expiry() -> kivi_types::WallTimestamp {
+    use kivi_core::{SystemClock, wall_now_or_max};
+    wall_now_or_max(&SystemClock)
+        .checked_add(jiff::SignedDuration::from_secs(60))
+        .unwrap_or(kivi_types::WallTimestamp::MAX)
 }
 
 /// Kivi native adapter: [`WorkloadOp`] to [`Key`] plus typed

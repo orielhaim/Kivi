@@ -26,15 +26,17 @@ use kivi_state::{
     plan_transaction, txn_record_key,
 };
 use kivi_tablet::DirectorySnapshot;
-use kivi_types::{ClusterId, NamespaceId, NodeId, NodeIncarnation, TabletId, UnixMicros, WorkerId};
+use kivi_types::{
+    ClusterId, NamespaceId, NodeId, NodeIncarnation, TabletId, WallTimestamp, WorkerId,
+};
 
-use crate::clock::SystemClock;
 use crate::routing::{Placement, RoutingError, RoutingSnapshot};
 use crate::tablet::{LiveTablet, TabletError};
 use crate::worker::{
     ControlIngress, RequestIngress, TabletRequest, WorkerControl, WorkerDurability, WorkerHandle,
     WorkerMetrics, WorkerRequestError,
 };
+use kivi_core::SystemClock;
 
 /// Networked spawn outcome: handles, bundled ingress handles (bounded
 /// sender plus bridge wakeup), and bound addresses.
@@ -648,7 +650,7 @@ impl LocalEngine {
         // bundle below needs lane handles for GC planning.
         let chunk_pins = Arc::new(crate::chunk_lane::StagingPins::default());
         let chunk_domain = kivi_types::SecurityDomainId::from_u64(config.namespace.as_u64());
-        let chunk_wall_micros = SystemClock::wall_now().as_micros();
+        let chunk_wall_micros = kivi_core::wall_now_or_max(&SystemClock);
         let mut ephemeral_chunks: Option<tempfile::TempDir> = None;
         let chunk_root: std::path::PathBuf = match &config.durability {
             DurabilityMode::Ephemeral => {
@@ -1686,7 +1688,7 @@ impl LocalEngine {
         use std::collections::{BTreeMap, BTreeSet};
         let mut prepared: BTreeMap<TabletId, Vec<Vec<u8>>> = BTreeMap::new();
         let mut coordinators: BTreeSet<TabletId> = BTreeSet::new();
-        let mut oldest: Option<u64> = None;
+        let mut oldest: Option<kivi_types::WallTimestamp> = None;
         for worker in &self.workers {
             let (respond, receive) = crossbeam_channel::bounded(1);
             if worker
@@ -1708,12 +1710,12 @@ impl LocalEngine {
                     .entry(tablet)
                     .or_default()
                     .push(intent.key.as_bytes().to_vec());
-                oldest = Some(oldest.map_or(intent.prepared_at, |oldest: u64| {
-                    oldest.min(intent.prepared_at)
-                }));
+                oldest = Some(
+                    oldest.map_or(intent.prepared_at, |oldest| oldest.min(intent.prepared_at)),
+                );
             }
         }
-        let now = crate::clock::SystemClock::wall_now().as_micros();
+        let now = kivi_core::wall_now_or_max(&SystemClock);
         let coordinator = coordinators.iter().next().copied();
         let (decision, digest) = coordinator
             .and_then(|coordinator| {
@@ -1734,7 +1736,14 @@ impl LocalEngine {
             prepared,
             decision,
             digest,
-            oldest_prepared_age_micros: oldest.map(|prepared_at| now.saturating_sub(prepared_at)),
+            oldest_prepared_age_micros: oldest.map(|prepared_at| {
+                u64::try_from(
+                    now.as_micros()
+                        .saturating_sub(prepared_at.as_micros())
+                        .max(0),
+                )
+                .unwrap_or(u64::MAX)
+            }),
         }
     }
 
@@ -1778,7 +1787,7 @@ impl LocalEngine {
                 break;
             }
         }
-        let now = crate::clock::SystemClock::wall_now();
+        let now = kivi_core::wall_now_or_max(&SystemClock);
         let mut committed = 0usize;
         let mut aborted = 0usize;
         for (_tablet, intent) in &intents {
@@ -1789,7 +1798,12 @@ impl LocalEngine {
                 continue;
             };
             let record: Option<TxnRecord> = record.and_then(|bytes| TxnRecord::decode(&bytes).ok());
-            let age = now.as_micros().saturating_sub(intent.prepared_at);
+            let age = u64::try_from(
+                now.as_micros()
+                    .saturating_sub(intent.prepared_at.as_micros())
+                    .max(0),
+            )
+            .unwrap_or(u64::MAX);
             match record {
                 Some(record) if record.state == TxnState::Committed => {
                     if age < RESOLVE_GRACE_MICROS {
@@ -2181,7 +2195,7 @@ impl LocalClient {
         let request = TabletRequest {
             tablet,
             op,
-            now: SystemClock::wall_now(),
+            now: kivi_core::wall_now_or_max(&SystemClock),
             // Embedded callers share fate with the process: no retry
             // identity, so no dedup — durable mode still WALs the write.
             identity: None,
@@ -2810,7 +2824,7 @@ impl LocalClient {
     /// Panics if tablet execution returns an outcome shape that cannot result
     /// from the issued operation (an internal contract violation, never a
     /// runtime condition).
-    pub fn expire_at(&self, key: &Key, expires_at: UnixMicros) -> Result<bool, EngineError> {
+    pub fn expire_at(&self, key: &Key, expires_at: WallTimestamp) -> Result<bool, EngineError> {
         match self.execute(
             key,
             Operation::ExpireAt {
@@ -2956,7 +2970,7 @@ mod tests {
             op: Operation::Exists {
                 key: Key::from("k"),
             },
-            now: UnixMicros::from_micros(0),
+            now: WallTimestamp::from_micros(0),
             identity: None,
             respond,
         }

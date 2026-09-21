@@ -144,7 +144,7 @@ mod tests {
     use crate::manifest::build_manifest;
     use crate::policy::{CHUNKING_V1, Chunking};
     use kivi_codec::integrity::chunk_id;
-    use kivi_types::SecurityDomainId;
+    use kivi_types::{SecurityDomainId, WallTimestamp};
 
     const DOMAIN: SecurityDomainId = SecurityDomainId::from_u64(5);
 
@@ -182,7 +182,14 @@ mod tests {
     fn dead_sealed_packs_are_collected_live_ones_kept() {
         let scratch = tempfile::tempdir().expect("scratch");
         // Tiny packs: one value per pack.
-        let (mut store, _) = ChunkStore::open(scratch.path(), 0, DOMAIN, 512, 1).expect("opens");
+        let (mut store, _) = ChunkStore::open(
+            scratch.path(),
+            0,
+            DOMAIN,
+            512,
+            WallTimestamp::from_micros(1),
+        )
+        .expect("opens");
         let (keep, _) = stage_value(&mut store, 1, 100);
         let (drop_me, _) = stage_value(&mut store, 2, 100);
         store.sync().expect("syncs");
@@ -215,7 +222,14 @@ mod tests {
     #[test]
     fn pins_protect_staged_but_uncommitted_data() {
         let scratch = tempfile::tempdir().expect("scratch");
-        let (mut store, _) = ChunkStore::open(scratch.path(), 0, DOMAIN, 512, 1).expect("opens");
+        let (mut store, _) = ChunkStore::open(
+            scratch.path(),
+            0,
+            DOMAIN,
+            512,
+            WallTimestamp::from_micros(1),
+        )
+        .expect("opens");
         let (keep, _) = stage_value(&mut store, 1, 100);
         // Staged into the first pack, then sealed before any commit.
         store.sync().expect("syncs");
@@ -252,8 +266,14 @@ mod tests {
     #[test]
     fn missing_live_root_fails_the_plan_loudly() {
         let scratch = tempfile::tempdir().expect("scratch");
-        let (store, _) =
-            ChunkStore::open(scratch.path(), 0, DOMAIN, 1024 * 1024, 1).expect("opens");
+        let (store, _) = ChunkStore::open(
+            scratch.path(),
+            0,
+            DOMAIN,
+            1024 * 1024,
+            WallTimestamp::from_micros(1),
+        )
+        .expect("opens");
         let ghost = ManifestId::from_bytes([0x41; 32]);
         let inputs = GcInputs {
             live_manifests: [ghost].into_iter().collect(),

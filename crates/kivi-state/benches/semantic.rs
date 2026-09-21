@@ -11,9 +11,9 @@ use kivi_state::{
     Key, ObjectStore, Operation, OperationResult, PermitId, Prepared, TxnExpect, TxnId, TxnWrite,
     TxnWriteKind, outcome_for, write_set_digest,
 };
-use kivi_types::{NamespaceId, TabletId, UnixMicros};
+use kivi_types::{NamespaceId, TabletId, WallTimestamp};
 
-const NOW: UnixMicros = UnixMicros::from_micros(1_000_000);
+const NOW: WallTimestamp = WallTimestamp::from_micros(1_000_000);
 const NS: NamespaceId = NamespaceId::from_u64(1);
 
 fn main() {

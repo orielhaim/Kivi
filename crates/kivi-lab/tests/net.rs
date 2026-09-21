@@ -18,8 +18,8 @@ use kivi_engine::{
 use kivi_state::Key;
 use kivi_tablet::{DirectorySnapshot, HashPrefix, PartitionRange};
 use kivi_types::{
-    ClusterId, NamespaceId, NodeId, NodeIncarnation, RequestSeq, TabletEpoch, TabletId, UnixMicros,
-    WorkerId, WriteGuardGeneration,
+    ClusterId, NamespaceId, NodeId, NodeIncarnation, RequestSeq, TabletEpoch, TabletId,
+    WallTimestamp, WorkerId, WriteGuardGeneration,
 };
 
 const NS: NamespaceId = NamespaceId::from_u64(1);
@@ -157,7 +157,7 @@ fn full_crud_over_tcp() {
     assert_eq!(client.counter_add(&Key::from("n"), -2).expect("add"), 3);
     assert_eq!(client.counter_get(&Key::from("n")).expect("read"), Some(3));
     assert!(client.counter_get(&key).is_err(), "bytes are not counters");
-    let far = UnixMicros::from_micros(u64::MAX / 2);
+    let far = WallTimestamp::from_micros(i64::MAX / 2);
     assert!(client.expire_at(&key, far).expect("expire"));
     assert!(client.get(&key).expect("live").is_some());
     assert!(client.persist_expiry(&key).expect("persist"));

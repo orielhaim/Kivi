@@ -7,7 +7,7 @@
 
 use bytes::Bytes;
 use kivi_codec::{CodecError, Decode, Encode, decode_byte_vec, encode_bytes};
-use kivi_types::{Expiry, ManifestId, TabletId, UnixMicros};
+use kivi_types::{Expiry, ManifestId, TabletId, WallTimestamp};
 
 use crate::mutation::{ApplyOutcome, Mutation};
 use crate::object::{Key, ObjectType, ObjectVersion};
@@ -105,7 +105,7 @@ pub enum Operation {
         /// Key to expire.
         key: Key,
         /// Logical expiration timestamp.
-        expires_at: UnixMicros,
+        expires_at: WallTimestamp,
     },
     /// Remove any expiry; keys without one report `removed: false`.
     PersistExpiry {
@@ -450,7 +450,7 @@ pub enum ExpiryPolicy {
     /// Preserve the live expiry, or stay immortal when creating.
     Keep,
     /// Attach this absolute logical timestamp on store.
-    ExpireAt(UnixMicros),
+    ExpireAt(WallTimestamp),
 }
 
 impl Operation {
@@ -708,14 +708,14 @@ pub enum OperationResult {
         /// Fencing token issued with this grant (strictly increasing).
         fencing: crate::FencingToken,
         /// Logical expiry of the grant.
-        expires_at: UnixMicros,
+        expires_at: WallTimestamp,
     },
     /// `LeaseRenew` outcome: the extended grant (same fencing token).
     LeaseRenewed {
         /// Fencing token of the continuing grant.
         fencing: crate::FencingToken,
         /// New logical expiry of the grant.
-        expires_at: UnixMicros,
+        expires_at: WallTimestamp,
     },
     /// `LeaseRelease` outcome.
     LeaseReleased {
@@ -997,7 +997,7 @@ impl Encode for OperationResult {
                     + usize::from(share.is_some()) * 16
             }
             Self::LeaseAcquired { .. } | Self::LeaseRenewed { .. } => {
-                1 + 8 + UnixMicros::from_micros(0).encoded_len()
+                1 + 8 + WallTimestamp::from_micros(0).encoded_len()
             }
             Self::LeaseInfo { holder, .. } => {
                 1 + 1 + holder.map_or(0, |holder| holder.encoded_len()) + 8
@@ -1502,7 +1502,7 @@ impl Decode for OperationResult {
             }
             TAG_RES_LEASE_ACQUIRED => {
                 let (fencing, second) = crate::FencingToken::decode(&input[first..])?;
-                let (expires_at, third) = UnixMicros::decode(&input[first + second..])?;
+                let (expires_at, third) = WallTimestamp::decode(&input[first + second..])?;
                 Ok((
                     Self::LeaseAcquired {
                         fencing,
@@ -1513,7 +1513,7 @@ impl Decode for OperationResult {
             }
             TAG_RES_LEASE_RENEWED => {
                 let (fencing, second) = crate::FencingToken::decode(&input[first..])?;
-                let (expires_at, third) = UnixMicros::decode(&input[first + second..])?;
+                let (expires_at, third) = WallTimestamp::decode(&input[first + second..])?;
                 Ok((
                     Self::LeaseRenewed {
                         fencing,
@@ -1856,7 +1856,7 @@ fn outcome_for_semantic(mutation: &Mutation, outcome: &ApplyOutcome) -> Option<O
 mod tests {
     use super::*;
     use kivi_codec::{Decode, Encode};
-    use kivi_types::UnixMicros;
+    use kivi_types::WallTimestamp;
 
     fn round_trip<T>(value: &T) -> T
     where
@@ -1890,7 +1890,7 @@ mod tests {
         round_trip(&OperationResult::ExpiryPersisted { removed: false });
         round_trip(&OperationResult::Expiry(None));
         round_trip(&OperationResult::Expiry(Some(Expiry::at(
-            UnixMicros::from_micros(99),
+            WallTimestamp::from_micros(99),
         ))));
         round_trip(&OperationResult::Expiry(Some(Expiry::NEVER)));
         round_trip(&OperationResult::Length(None));
@@ -1942,11 +1942,11 @@ mod tests {
         });
         round_trip(&OperationResult::LeaseAcquired {
             fencing: crate::FencingToken::from_u64(4),
-            expires_at: UnixMicros::from_micros(99),
+            expires_at: WallTimestamp::from_micros(99),
         });
         round_trip(&OperationResult::LeaseRenewed {
             fencing: crate::FencingToken::from_u64(4),
-            expires_at: UnixMicros::from_micros(199),
+            expires_at: WallTimestamp::from_micros(199),
         });
         round_trip(&OperationResult::LeaseReleased { released: true });
         round_trip(&OperationResult::LeaseInfo {
@@ -1957,7 +1957,7 @@ mod tests {
             holder: Some(crate::LeaseHolder {
                 owner: 11,
                 fencing: crate::FencingToken::from_u64(3),
-                expires_at: UnixMicros::from_micros(77),
+                expires_at: WallTimestamp::from_micros(77),
             }),
             next_fencing: crate::FencingToken::from_u64(4),
         });
@@ -2046,7 +2046,7 @@ mod tests {
             outcome_for(
                 &Mutation::SetExpiry {
                     key: key.clone(),
-                    expiry: Expiry::at(UnixMicros::from_micros(5)),
+                    expiry: Expiry::at(WallTimestamp::from_micros(5)),
                 },
                 &ApplyOutcome::Expiry {
                     applied: true,
@@ -2092,7 +2092,7 @@ mod tests {
     #[test]
     fn conditional_sets_evaluate_atomically_with_policies() {
         use crate::store::ObjectStore;
-        let now = UnixMicros::from_micros(1_000_000);
+        let now = WallTimestamp::from_micros(1_000_000);
         let mut store = ObjectStore::new();
         let key = Key::from("k");
         // IfAbsent stores on missing.
@@ -2132,7 +2132,7 @@ mod tests {
             _ => panic!("IfAbsent on present must not apply"),
         }
         // IfPresent stores and Keep preserves a dated expiry.
-        let deadline = UnixMicros::from_micros(9_000_000);
+        let deadline = WallTimestamp::from_micros(9_000_000);
         match store
             .prepare(
                 &Operation::ExpireAt {
@@ -2179,7 +2179,7 @@ mod tests {
     #[test]
     fn ranges_slice_and_measure_without_payload_reads() {
         use crate::store::ObjectStore;
-        let now = UnixMicros::from_micros(1_000_000);
+        let now = WallTimestamp::from_micros(1_000_000);
         let mut store = ObjectStore::new();
         let key = Key::from("k");
         // Missing reads answer absent.

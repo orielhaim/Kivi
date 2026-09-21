@@ -23,7 +23,7 @@ use core::fmt;
 use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, BTreeSet};
 
-use kivi_types::{Expiry, TabletId, UnixMicros};
+use kivi_types::{Expiry, TabletId, WallTimestamp};
 
 use crate::mutation::{ApplyError, ApplyOutcome, Mutation};
 use crate::object::{
@@ -211,23 +211,21 @@ fn preview_counter_add(
 pub const MAX_LEASE_TTL_MICROS: u64 = 100 * 365 * 24 * 3600 * 1_000_000;
 
 /// Resolves a lease expiry stamp from `now + ttl`: `ttl == 0` means an
-/// immortal grant (`u64::MAX`, never lapsing on its own — fencing still
-/// applies), otherwise the saturating sum. Pure and total.
+/// immortal grant ([`WallTimestamp::MAX`], never lapsing on its own —
+/// fencing still applies), otherwise the saturating sum. Pure and total.
 #[must_use]
-pub fn lease_expires_at(now: UnixMicros, ttl_micros: u64) -> UnixMicros {
+pub fn lease_expires_at(now: WallTimestamp, ttl_micros: u64) -> WallTimestamp {
     if ttl_micros == 0 {
-        return UnixMicros::from_micros(u64::MAX);
+        return WallTimestamp::MAX;
     }
-    UnixMicros::from_micros(
-        now.as_micros()
-            .saturating_add(ttl_micros.min(MAX_LEASE_TTL_MICROS)),
-    )
+    let ttl = i64::try_from(ttl_micros.min(MAX_LEASE_TTL_MICROS)).unwrap_or(i64::MAX);
+    WallTimestamp::from_micros(now.as_micros().saturating_add(ttl))
 }
 
 /// Returns the live lease holder at `now` (`None` when free or expired —
 /// expiry is observed, never eagerly reclaimed, so fencing history stays
 /// monotonic across the lapse).
-fn lease_live(state: &crate::LeaseState, now: UnixMicros) -> Option<crate::LeaseHolder> {
+fn lease_live(state: &crate::LeaseState, now: WallTimestamp) -> Option<crate::LeaseHolder> {
     state
         .holder
         .filter(|holder| now.as_micros() < holder.expires_at.as_micros())
@@ -336,7 +334,7 @@ fn local_result_for(mutation: &Mutation, outcome: &ApplyOutcome) -> OperationRes
 pub fn local_versions(
     store: &ObjectStore,
     writes: &[TxnWrite],
-    now: UnixMicros,
+    now: WallTimestamp,
 ) -> Vec<Option<ObjectVersion>> {
     writes
         .iter()
@@ -410,7 +408,7 @@ impl ObjectStore {
 
     /// Counts logically live objects at `now` (present and unexpired).
     #[must_use]
-    pub fn live_count(&self, now: UnixMicros) -> usize {
+    pub fn live_count(&self, now: WallTimestamp) -> usize {
         self.objects
             .values()
             .filter(|object| !object.is_expired(now))
@@ -420,7 +418,7 @@ impl ObjectStore {
     /// Returns the live object for `key` at `now` (`None` when missing or
     /// expired — reads never mutate, not even to clean up).
     #[must_use]
-    pub fn get(&self, key: &Key, now: UnixMicros) -> Option<&StoredObject> {
+    pub fn get(&self, key: &Key, now: WallTimestamp) -> Option<&StoredObject> {
         self.objects
             .get(key)
             .filter(|object| !object.is_expired(now))
@@ -480,7 +478,7 @@ impl ObjectStore {
     /// [`OpError::CounterOverflow`] for overflowing additions. Neither
     /// mutates anything.
     #[allow(clippy::too_many_lines)]
-    pub fn prepare(&self, op: &Operation, now: UnixMicros) -> Result<Prepared, OpError> {
+    pub fn prepare(&self, op: &Operation, now: WallTimestamp) -> Result<Prepared, OpError> {
         match op {
             Operation::TxnPrepare {
                 txn,
@@ -959,7 +957,7 @@ impl ObjectStore {
         key: &Key,
         offset: u64,
         len: u64,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Result<Prepared, OpError> {
         match self.get(key, now) {
             None => Ok(Prepared::Read(OperationResult::Value(None))),
@@ -1005,7 +1003,7 @@ impl ObjectStore {
         coordinator: TabletId,
         write: &TxnWrite,
         digest: [u8; 32],
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Result<Mutation, OpError> {
         if let Some(intent) = self.intents.get(&write.key)
             && (intent.id != txn || intent.digest != digest)
@@ -1034,7 +1032,7 @@ impl ObjectStore {
         &self,
         txn: TxnId,
         writes: &[TxnWrite],
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Result<Mutation, OpError> {
         if writes.is_empty() {
             return Err(OpError::TxnConflict);
@@ -1079,7 +1077,7 @@ impl ObjectStore {
         value: &bytes::Bytes,
         condition: crate::ops::SetCondition,
         policy: crate::ops::ExpiryPolicy,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Prepared {
         let live = self.get(key, now);
         let holds = match condition {
@@ -1115,7 +1113,7 @@ impl ObjectStore {
         logical_len: u64,
         condition: crate::ops::SetCondition,
         policy: crate::ops::ExpiryPolicy,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Prepared {
         let live = self.get(key, now);
         let holds = match condition {
@@ -1151,7 +1149,7 @@ impl ObjectStore {
         reference: FabricRef,
         condition: crate::ops::SetCondition,
         policy: crate::ops::ExpiryPolicy,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Prepared {
         let live = self.get(key, now);
         let holds = match condition {
@@ -1189,7 +1187,7 @@ impl ObjectStore {
         permit: crate::PermitId,
         owner: u64,
         qty: u64,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Result<Prepared, OpError> {
         let Some(object) = self.get(key, now) else {
             return Err(OpError::NotFound);
@@ -1243,7 +1241,7 @@ impl ObjectStore {
         &self,
         key: &Key,
         permit: crate::PermitId,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Result<Prepared, OpError> {
         let Some(object) = self.get(key, now) else {
             return Ok(Prepared::Read(OperationResult::SemaphoreReleased {
@@ -1276,7 +1274,7 @@ impl ObjectStore {
         key: &Key,
         owner: u64,
         ttl_micros: u64,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Result<Prepared, OpError> {
         let (next_fencing, live) = match self.get(key, now) {
             None => (crate::FencingToken::from_u64(1), None),
@@ -1313,7 +1311,7 @@ impl ObjectStore {
         owner: u64,
         fencing: crate::FencingToken,
         ttl_micros: u64,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Result<Prepared, OpError> {
         let Some(object) = self.get(key, now) else {
             return Err(OpError::StaleFencing);
@@ -1347,7 +1345,7 @@ impl ObjectStore {
         key: &Key,
         owner: u64,
         fencing: crate::FencingToken,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Result<Prepared, OpError> {
         let Some(object) = self.get(key, now) else {
             return Ok(Prepared::Read(OperationResult::LeaseReleased {
@@ -1382,7 +1380,7 @@ impl ObjectStore {
         key: &Key,
         partition: &[u8],
         payload: &bytes::Bytes,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Result<Prepared, OpError> {
         let Some(object) = self.get(key, now) else {
             return Err(OpError::NotFound);
@@ -1416,7 +1414,7 @@ impl ObjectStore {
         key: &Key,
         from_offset: u64,
         max_entries: u32,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Result<Prepared, OpError> {
         let Some(object) = self.get(key, now) else {
             return Ok(Prepared::Read(OperationResult::StreamEntries {
@@ -1450,7 +1448,7 @@ impl ObjectStore {
         &self,
         key: &Key,
         through_offset: u64,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Result<Prepared, OpError> {
         let Some(object) = self.get(key, now) else {
             return Ok(Prepared::Read(OperationResult::StreamTrimmed {
@@ -1480,7 +1478,7 @@ impl ObjectStore {
         key: &Key,
         offset: u64,
         patch: &bytes::Bytes,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Result<Prepared, OpError> {
         let write = || {
             Prepared::Write(Mutation::SpliceBytes {
@@ -1533,7 +1531,7 @@ impl ObjectStore {
     pub fn prepare_durable(
         &self,
         op: &Operation,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Result<StorePrepared, OpError> {
         if let Operation::TxnPrepare {
             txn,
@@ -1798,7 +1796,7 @@ impl ObjectStore {
         value: &bytes::Bytes,
         condition: crate::ops::SetCondition,
         policy: crate::ops::ExpiryPolicy,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> StorePrepared {
         let live = self.get(key, now);
         let holds = match condition {
@@ -1844,7 +1842,7 @@ impl ObjectStore {
         logical_len: u64,
         condition: crate::ops::SetCondition,
         policy: crate::ops::ExpiryPolicy,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> StorePrepared {
         let live = self.get(key, now);
         let holds = match condition {
@@ -1890,7 +1888,7 @@ impl ObjectStore {
         reference: FabricRef,
         condition: crate::ops::SetCondition,
         policy: crate::ops::ExpiryPolicy,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> StorePrepared {
         let live = self.get(key, now);
         let holds = match condition {
@@ -1940,7 +1938,7 @@ impl ObjectStore {
         key: &Key,
         digest: [u8; 32],
         commit: bool,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> StorePrepared {
         let mutation = Mutation::TxnFinalize {
             txn,
@@ -1981,7 +1979,7 @@ impl ObjectStore {
         mutation: Mutation,
         kind: &TxnWriteKind,
         key: &Key,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> StorePrepared {
         match kind {
             TxnWriteKind::Delete => StorePrepared::Write {
@@ -2043,7 +2041,12 @@ impl ObjectStore {
     /// [`apply`](Self::apply) would assign, or the terminal outcome it
     /// would produce instead. Single construction site for every commit
     /// prediction.
-    fn finalized_applied(&self, mutation: Mutation, key: &Key, now: UnixMicros) -> StorePrepared {
+    fn finalized_applied(
+        &self,
+        mutation: Mutation,
+        key: &Key,
+        now: WallTimestamp,
+    ) -> StorePrepared {
         match self.predict_version(key, now) {
             Ok(version) => StorePrepared::Write {
                 mutation,
@@ -2078,7 +2081,7 @@ impl ObjectStore {
         key: &Key,
         delta: i64,
         expected: ObjectType,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> StorePrepared {
         let live = self.get(key, now);
         if live.is_none() {
@@ -2111,7 +2114,7 @@ impl ObjectStore {
         &self,
         txn: TxnId,
         writes: &[TxnWrite],
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> StorePrepared {
         if writes.is_empty() {
             return StorePrepared::Terminal(DurableOutcome::Rejected(OpError::TxnConflict));
@@ -2152,14 +2155,18 @@ impl ObjectStore {
         }
     }
 
-    fn predict_version(&self, key: &Key, now: UnixMicros) -> Result<ObjectVersion, DurableOutcome> {
+    fn predict_version(
+        &self,
+        key: &Key,
+        now: WallTimestamp,
+    ) -> Result<ObjectVersion, DurableOutcome> {
         self.next_version(key, now)
             .map_err(|_| DurableOutcome::VersionExhausted)
     }
 
     /// Predicts a counter addition: fresh creation, validated increment,
     /// or a terminal rejection (overflow, wrong type).
-    fn predict_counter_add(&self, key: &Key, delta: i64, now: UnixMicros) -> StorePrepared {
+    fn predict_counter_add(&self, key: &Key, delta: i64, now: WallTimestamp) -> StorePrepared {
         match self.get(key, now) {
             None => StorePrepared::Write {
                 mutation: Mutation::CounterAdd {
@@ -2204,8 +2211,8 @@ impl ObjectStore {
     fn predict_expiry(
         &self,
         key: &Key,
-        expires_at: Option<UnixMicros>,
-        now: UnixMicros,
+        expires_at: Option<WallTimestamp>,
+        now: WallTimestamp,
     ) -> StorePrepared {
         let live_dated = match self.get(key, now) {
             None => false,
@@ -2239,7 +2246,7 @@ impl ObjectStore {
     /// increment. The expected result is always `Applied`: prediction
     /// verifies the post-apply sum internally (via apply-time agreement)
     /// but never exposes it.
-    fn predict_commutative_add(&self, key: &Key, delta: i64, now: UnixMicros) -> StorePrepared {
+    fn predict_commutative_add(&self, key: &Key, delta: i64, now: WallTimestamp) -> StorePrepared {
         match self.get(key, now) {
             None => StorePrepared::Write {
                 mutation: Mutation::CommutativeAdd {
@@ -2278,7 +2285,7 @@ impl ObjectStore {
         key: &Key,
         capacity: u64,
         holder: TabletId,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> StorePrepared {
         if let Some(object) = self.get(key, now) {
             return StorePrepared::Terminal(DurableOutcome::Rejected(OpError::WrongType {
@@ -2302,7 +2309,7 @@ impl ObjectStore {
     }
 
     /// Predicts a bounded-counter addition with escrow preview.
-    fn predict_bounded_add(&self, key: &Key, delta: i64, now: UnixMicros) -> StorePrepared {
+    fn predict_bounded_add(&self, key: &Key, delta: i64, now: WallTimestamp) -> StorePrepared {
         match self.get(key, now) {
             None => StorePrepared::Terminal(DurableOutcome::Rejected(OpError::BoundedExceeded)),
             Some(object) => match object.value() {
@@ -2332,7 +2339,13 @@ impl ObjectStore {
 
     /// Predicts a single-key escrow narrowing (never a widen: lone
     /// operations cannot mint rights).
-    fn predict_escrow_move(&self, key: &Key, min: i64, max: i64, now: UnixMicros) -> StorePrepared {
+    fn predict_escrow_move(
+        &self,
+        key: &Key,
+        min: i64,
+        max: i64,
+        now: WallTimestamp,
+    ) -> StorePrepared {
         match self.get(key, now) {
             None => StorePrepared::Terminal(DurableOutcome::Rejected(OpError::BoundedExceeded)),
             Some(object) => match object.value() {
@@ -2366,7 +2379,12 @@ impl ObjectStore {
     }
 
     /// Predicts a semaphore create: absent keys gain an empty permit set.
-    fn predict_semaphore_create(&self, key: &Key, capacity: u64, now: UnixMicros) -> StorePrepared {
+    fn predict_semaphore_create(
+        &self,
+        key: &Key,
+        capacity: u64,
+        now: WallTimestamp,
+    ) -> StorePrepared {
         if let Some(object) = self.get(key, now) {
             return StorePrepared::Terminal(DurableOutcome::Rejected(OpError::WrongType {
                 expected: ObjectType::Semaphore,
@@ -2391,7 +2409,7 @@ impl ObjectStore {
         permit: crate::PermitId,
         owner: u64,
         qty: u64,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> StorePrepared {
         let rejected = |error| StorePrepared::Terminal(DurableOutcome::Rejected(error));
         let Some(object) = self.get(key, now) else {
@@ -2450,7 +2468,7 @@ impl ObjectStore {
         &self,
         key: &Key,
         permit: crate::PermitId,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> StorePrepared {
         match self.get(key, now) {
             None => StorePrepared::Terminal(DurableOutcome::Completed(
@@ -2488,7 +2506,7 @@ impl ObjectStore {
         key: &Key,
         owner: u64,
         ttl_micros: u64,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> StorePrepared {
         let rejected = |error| StorePrepared::Terminal(DurableOutcome::Rejected(error));
         let (next_fencing, live, fresh) = match self.get(key, now) {
@@ -2537,7 +2555,7 @@ impl ObjectStore {
         owner: u64,
         fencing: crate::FencingToken,
         ttl_micros: u64,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> StorePrepared {
         let rejected = |error| StorePrepared::Terminal(DurableOutcome::Rejected(error));
         let Some(object) = self.get(key, now) else {
@@ -2578,7 +2596,7 @@ impl ObjectStore {
         key: &Key,
         owner: u64,
         fencing: crate::FencingToken,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> StorePrepared {
         match self.get(key, now) {
             None => {
@@ -2622,7 +2640,7 @@ impl ObjectStore {
         key: &Key,
         stream: [u8; 16],
         shard: u32,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> StorePrepared {
         if let Some(object) = self.get(key, now) {
             return StorePrepared::Terminal(DurableOutcome::Rejected(OpError::WrongType {
@@ -2646,7 +2664,7 @@ impl ObjectStore {
         key: &Key,
         partition: &[u8],
         payload: &bytes::Bytes,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> StorePrepared {
         let rejected = |error| StorePrepared::Terminal(DurableOutcome::Rejected(error));
         let Some(object) = self.get(key, now) else {
@@ -2680,7 +2698,7 @@ impl ObjectStore {
     }
 
     /// Predicts a stream trim with its deterministic dropped count.
-    fn predict_stream_trim(&self, key: &Key, through: u64, now: UnixMicros) -> StorePrepared {
+    fn predict_stream_trim(&self, key: &Key, through: u64, now: WallTimestamp) -> StorePrepared {
         match self.get(key, now) {
             None => {
                 StorePrepared::Terminal(DurableOutcome::Completed(OperationResult::StreamTrimmed {
@@ -2736,7 +2754,7 @@ impl ObjectStore {
     pub fn apply(
         &mut self,
         mutation: &Mutation,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Result<ApplyOutcome, ApplyError> {
         match mutation {
             Mutation::TxnPrepare {
@@ -2807,7 +2825,7 @@ impl ObjectStore {
         coordinator: u64,
         write: &TxnWrite,
         digest: &[u8; 32],
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Result<ApplyOutcome, ApplyError> {
         use ApplyError as Fault;
         let key = &write.key;
@@ -2868,7 +2886,7 @@ impl ObjectStore {
                 write: write.clone(),
                 digest: *digest,
                 observed,
-                prepared_at: now.as_micros(),
+                prepared_at: now,
             },
         );
         Ok(ApplyOutcome::TxnPrepared)
@@ -2884,7 +2902,7 @@ impl ObjectStore {
         key: &Key,
         commit: bool,
         digest: &[u8; 32],
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Result<ApplyOutcome, ApplyError> {
         use ApplyError as Fault;
         let Some(intent) = self.intents.get(key) else {
@@ -2973,7 +2991,7 @@ impl ObjectStore {
     fn apply_local_commit(
         &mut self,
         writes: &[TxnWrite],
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Result<ApplyOutcome, ApplyError> {
         match self.commit_local(writes, now) {
             Ok(_) => Ok(ApplyOutcome::TxnLocalCommitted {
@@ -2992,7 +3010,7 @@ impl ObjectStore {
     fn apply_inner(
         &mut self,
         mutation: &Mutation,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Result<ApplyOutcome, ApplyError> {
         match mutation {
             Mutation::PutBytes { key, value } => {
@@ -3753,7 +3771,7 @@ impl ObjectStore {
     pub fn commit_local(
         &mut self,
         writes: &[TxnWrite],
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Result<Vec<OperationResult>, LocalCommitError> {
         // Collapse duplicates last-wins in request order, then validate in
         // sorted key order (deterministic across replicas).
@@ -3856,7 +3874,7 @@ impl ObjectStore {
         donor: &Key,
         recipient: &Key,
         amount: core::num::NonZeroU64,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Result<(ObjectVersion, ObjectVersion), OpError> {
         if self.intents.contains_key(donor) || self.intents.contains_key(recipient) {
             return Err(OpError::TxnConflict);
@@ -3921,7 +3939,7 @@ impl ObjectStore {
     /// Reclamation itself flows through the normal release mutation, so
     /// `next_fencing` monotonicity survives GC.
     #[must_use]
-    pub fn collect_expired_leases(&self, now: UnixMicros, limit: usize) -> Vec<Key> {
+    pub fn collect_expired_leases(&self, now: WallTimestamp, limit: usize) -> Vec<Key> {
         let mut lapsed: Vec<Key> = self
             .objects
             .iter()
@@ -3945,7 +3963,7 @@ impl ObjectStore {
     /// [`Delete`](Mutation::Delete) mutation — expiration is logical here,
     /// reclamation happens through the same mutation path as everything else.
     #[must_use]
-    pub fn collect_expired(&self, now: UnixMicros, limit: usize) -> Vec<Key> {
+    pub fn collect_expired(&self, now: WallTimestamp, limit: usize) -> Vec<Key> {
         let mut expired: Vec<Key> = self
             .objects
             .iter()
@@ -4079,7 +4097,7 @@ impl ObjectStore {
     /// Panics when a semantic value has no scan descriptor: every semantic
     /// type projects by construction, so a missing descriptor is an
     /// internal logic bug, never a runtime condition.
-    pub fn scan_range(&self, spec: &ScanSpec, now: UnixMicros) -> Result<ScanPage, ScanError> {
+    pub fn scan_range(&self, spec: &ScanSpec, now: WallTimestamp) -> Result<ScanPage, ScanError> {
         let ordered = self
             .ordered
             .as_ref()
@@ -4272,7 +4290,7 @@ impl ObjectStore {
         &self,
         term: &crate::IndexTermCursor,
         spec: &ScanSpec,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Result<ScanPage, ScanError> {
         let ordered = self
             .ordered
@@ -4310,7 +4328,7 @@ impl ObjectStore {
         &self,
         range: &crate::IndexTermRangeCursor,
         spec: &ScanSpec,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Result<ScanPage, ScanError> {
         let ordered = self
             .ordered
@@ -4346,7 +4364,7 @@ impl ObjectStore {
 
     /// Computes logical telemetry at `now` for split/merge policy.
     #[must_use]
-    pub fn stats(&self, now: UnixMicros) -> StoreStats {
+    pub fn stats(&self, now: WallTimestamp) -> StoreStats {
         let mut key_bytes: u64 = 0;
         let mut logical_value_bytes: u64 = 0;
         let mut live_count: usize = 0;
@@ -4455,7 +4473,7 @@ impl ObjectStore {
     }
 
     /// Live object ignoring nothing: present and unexpired at `now`.
-    fn live(&self, key: &Key, now: UnixMicros) -> Option<&StoredObject> {
+    fn live(&self, key: &Key, now: WallTimestamp) -> Option<&StoredObject> {
         self.get(key, now)
     }
     /// Current version of a stored entry (`FIRST` when absent — callers use
@@ -4478,7 +4496,7 @@ impl ObjectStore {
     fn next_version(
         &self,
         key: &Key,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Result<ObjectVersion, crate::object::VersionExhausted> {
         match self.live(key, now) {
             None => Ok(ObjectVersion::FIRST),
@@ -4497,9 +4515,9 @@ impl fmt::Display for ObjectStore {
 mod tests {
     use super::*;
     use crate::object::Key;
-    use kivi_types::UnixMicros;
+    use kivi_types::WallTimestamp;
 
-    const NOW: UnixMicros = UnixMicros::from_micros(1_000_000);
+    const NOW: WallTimestamp = WallTimestamp::from_micros(1_000_000);
 
     fn key(name: &str) -> Key {
         Key::from(name)
@@ -4540,7 +4558,7 @@ mod tests {
             },
             Operation::ExpireAt {
                 key: key("c"),
-                expires_at: UnixMicros::from_micros(9_000_000),
+                expires_at: WallTimestamp::from_micros(9_000_000),
             },
             Operation::PersistExpiry { key: key("c") },
             Operation::PersistExpiry {
@@ -4548,7 +4566,7 @@ mod tests {
             },
             Operation::ExpireAt {
                 key: key("missing"),
-                expires_at: UnixMicros::from_micros(9_000_000),
+                expires_at: WallTimestamp::from_micros(9_000_000),
             },
             Operation::GetExpiry { key: key("c") },
             Operation::Exists { key: key("c") },
@@ -4615,7 +4633,7 @@ mod tests {
     fn execute(
         store: &mut ObjectStore,
         op: &Operation,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Result<OperationResult, String> {
         match store
             .prepare(op, now)
@@ -4861,7 +4879,7 @@ mod tests {
             NOW,
         )
         .expect("set");
-        let deadline = UnixMicros::from_micros(2_000_000);
+        let deadline = WallTimestamp::from_micros(2_000_000);
         assert_eq!(
             execute(
                 &mut store,
@@ -4879,7 +4897,7 @@ mod tests {
             execute(
                 &mut store,
                 &Operation::Get { key: key("t") },
-                UnixMicros::from_micros(1_999_999)
+                WallTimestamp::from_micros(1_999_999)
             )
             .expect("before"),
             OperationResult::Value(Some(bytes::Bytes::from_static(b"v")))
@@ -4892,7 +4910,7 @@ mod tests {
             execute(
                 &mut store,
                 &Operation::Get { key: key("t") },
-                UnixMicros::from_micros(2_000_001)
+                WallTimestamp::from_micros(2_000_001)
             )
             .expect("after"),
             OperationResult::Value(None)
@@ -4902,7 +4920,7 @@ mod tests {
             execute(
                 &mut store,
                 &Operation::GetExpiry { key: key("t") },
-                UnixMicros::from_micros(1_000_000)
+                WallTimestamp::from_micros(1_000_000)
             )
             .expect("getexpiry"),
             OperationResult::Expiry(Some(Expiry::at(deadline)))
@@ -4912,7 +4930,7 @@ mod tests {
             execute(
                 &mut store,
                 &Operation::PersistExpiry { key: key("t") },
-                UnixMicros::from_micros(1_500_000)
+                WallTimestamp::from_micros(1_500_000)
             )
             .expect("persist"),
             OperationResult::ExpiryPersisted { removed: true }
@@ -4921,7 +4939,7 @@ mod tests {
             execute(
                 &mut store,
                 &Operation::Get { key: key("t") },
-                UnixMicros::from_micros(9_999_999)
+                WallTimestamp::from_micros(9_999_999)
             )
             .expect("immortal"),
             OperationResult::Value(Some(bytes::Bytes::from_static(b"v")))
@@ -4950,7 +4968,7 @@ mod tests {
     #[test]
     fn set_range_preserves_live_expiry() {
         let mut store = ObjectStore::new();
-        let deadline = UnixMicros::from_micros(9_000_000);
+        let deadline = WallTimestamp::from_micros(9_000_000);
         execute(
             &mut store,
             &Operation::Set {
@@ -5018,12 +5036,12 @@ mod tests {
             &mut store,
             &Operation::ExpireAt {
                 key: key("t"),
-                expires_at: UnixMicros::from_micros(100),
+                expires_at: WallTimestamp::from_micros(100),
             },
             NOW,
         )
         .expect("expire");
-        let after = UnixMicros::from_micros(200);
+        let after = WallTimestamp::from_micros(200);
         // Reads see absence but perform no deletion (physical entry remains).
         assert_eq!(
             execute(&mut store, &Operation::Get { key: key("t") }, after).expect("absent"),
@@ -5066,13 +5084,13 @@ mod tests {
                 &mut store,
                 &Operation::ExpireAt {
                     key: key(name),
-                    expires_at: UnixMicros::from_micros(50),
+                    expires_at: WallTimestamp::from_micros(50),
                 },
                 NOW,
             )
             .expect("expire");
         }
-        let now = UnixMicros::from_micros(100);
+        let now = WallTimestamp::from_micros(100);
         // Bounded, sorted collection of the expired.
         assert_eq!(store.collect_expired(now, 2).len(), 2);
         let swept = store.collect_expired(now, 1_000);
@@ -5119,7 +5137,7 @@ mod tests {
             &mut store,
             &Operation::ExpireAt {
                 key: key("k"),
-                expires_at: UnixMicros::from_micros(500),
+                expires_at: WallTimestamp::from_micros(500),
             },
             NOW,
         )
@@ -5389,7 +5407,7 @@ mod tests {
             },
             Mutation::SetExpiry {
                 key: key("a"),
-                expiry: Expiry::at(UnixMicros::from_micros(9_999_999)),
+                expiry: Expiry::at(WallTimestamp::from_micros(9_999_999)),
             },
             Mutation::Delete { key: key("n") },
         ];
@@ -5758,7 +5776,7 @@ mod tests {
                 &Mutation::PutBytesWithExpiry {
                     key: key("gone"),
                     value: bytes::Bytes::from_static(b"v"),
-                    expiry: Expiry::at(UnixMicros::from_micros(2_000_000)),
+                    expiry: Expiry::at(WallTimestamp::from_micros(2_000_000)),
                 },
                 NOW,
             )
@@ -5773,7 +5791,7 @@ mod tests {
                 NOW,
             )
             .expect("put");
-        let later = UnixMicros::from_micros(3_000_000);
+        let later = WallTimestamp::from_micros(3_000_000);
         let spec = ScanSpec::new(
             None,
             None,
@@ -6488,8 +6506,8 @@ mod tests {
     #[test]
     fn lease_grant_renew_and_live_conflicts() {
         let mut store = ObjectStore::new();
-        let t0 = UnixMicros::from_micros(1_000_000);
-        let t1 = UnixMicros::from_micros(2_000_000);
+        let t0 = WallTimestamp::from_micros(1_000_000);
+        let t1 = WallTimestamp::from_micros(2_000_000);
         // First grant issues token 1.
         let OperationResult::LeaseAcquired {
             fencing: fencing1, ..
@@ -6613,12 +6631,12 @@ mod tests {
         ObjectStore,
         crate::FencingToken,
         crate::FencingToken,
-        UnixMicros,
+        WallTimestamp,
     ) {
         let mut store = ObjectStore::new();
-        let t0 = UnixMicros::from_micros(1_000_000);
-        let t1 = UnixMicros::from_micros(2_000_000);
-        let t2 = UnixMicros::from_micros(30_000_000);
+        let t0 = WallTimestamp::from_micros(1_000_000);
+        let t1 = WallTimestamp::from_micros(2_000_000);
+        let t2 = WallTimestamp::from_micros(30_000_000);
         let OperationResult::LeaseAcquired {
             fencing: fencing1, ..
         } = execute(

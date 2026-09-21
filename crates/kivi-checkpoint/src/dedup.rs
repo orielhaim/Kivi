@@ -26,7 +26,7 @@
 //!   intent_count u32,
 //!   txn16, coordinator u64, key (Key codec), expect (TxnExpect codec),
 //!     write (TxnWriteKind codec), digest32, observed flag u8 (+ version u64),
-//!     prepared_at u64
+//!     prepared_at i64 (signed Unix micros)
 //! footer (40 bytes): body CRC32C, BLAKE3 of header[0..28] + body
 //! (content identity covers artifact identity), footer CRC32C
 //! (same uniform footer as bands)
@@ -238,7 +238,7 @@ fn encode_intents(
                 version.encode(body);
             }
         }
-        body.extend_from_slice(&intent.prepared_at.to_le_bytes());
+        body.extend_from_slice(&intent.prepared_at.as_micros().to_le_bytes());
     }
     Ok(())
 }
@@ -302,11 +302,11 @@ fn decode_intents(cursor: &[u8]) -> Result<(Vec<kivi_state::TxnIntent>, usize), 
                 return Err(corrupt("dedup intent observed tag invalid".to_owned()));
             }
         };
-        let prepared_at = u64::from_le_bytes(
+        let prepared_at = kivi_types::WallTimestamp::from_micros(i64::from_le_bytes(
             intent_take(cursor, &mut at, 8)?
                 .try_into()
                 .map_err(|_| corrupt("dedup intent timestamp unreadable".to_owned()))?,
-        );
+        ));
         if previous
             .as_ref()
             .is_some_and(|prev| prev >= &key.as_bytes().to_vec())
@@ -615,7 +615,7 @@ mod tests {
             },
             digest: [0xD1; 32],
             observed: None,
-            prepared_at: 99,
+            prepared_at: kivi_types::WallTimestamp::from_micros(99),
         };
         let built = build_dedup(
             TabletId::from_u64(1),
@@ -629,6 +629,9 @@ mod tests {
         // Sorted by key regardless of input order.
         assert_eq!(loaded.intents[0].key, Key::from("a"));
         assert_eq!(loaded.intents[1].key, Key::from("b"));
-        assert_eq!(loaded.intents[0].prepared_at, 99);
+        assert_eq!(
+            loaded.intents[0].prepared_at,
+            kivi_types::WallTimestamp::from_micros(99)
+        );
     }
 }

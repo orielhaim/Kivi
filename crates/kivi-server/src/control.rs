@@ -690,16 +690,19 @@ async fn resolve_one_intent(
     }
 }
 
-/// Whether a prepare lease expired (`prepared_at` micros + max lifetime
-/// below `now`).
-fn lease_expired(prepared_at: u64, now: kivi_types::UnixMicros) -> bool {
-    prepared_at.saturating_add(kivi_state::MAX_TXN_LIFETIME_MICROS) < now.as_micros()
+/// Whether a prepare lease expired (`prepared_at` + max lifetime below
+/// `now`). The lifetime bound fits `i64`, so the fallible conversion is
+/// total in practice and explicit rather than assumed.
+fn lease_expired(prepared_at: kivi_types::WallTimestamp, now: kivi_types::WallTimestamp) -> bool {
+    let lifetime = i64::try_from(kivi_state::MAX_TXN_LIFETIME_MICROS).unwrap_or(i64::MAX);
+    prepared_at.as_micros().saturating_add(lifetime) < now.as_micros()
 }
 
 /// Whether an intent is younger than the resolver grace (its driver is
 /// presumably still live: hands off).
-fn intent_fresh(prepared_at: u64, now: kivi_types::UnixMicros) -> bool {
-    now.as_micros().saturating_sub(prepared_at) < kivi_state::RESOLVE_GRACE_MICROS
+fn intent_fresh(prepared_at: kivi_types::WallTimestamp, now: kivi_types::WallTimestamp) -> bool {
+    let grace = i64::try_from(kivi_state::RESOLVE_GRACE_MICROS).unwrap_or(i64::MAX);
+    now.as_micros().saturating_sub(prepared_at.as_micros()) < grace
 }
 
 /// CAS-aborts a record-absent expired transaction: an absence-guarded

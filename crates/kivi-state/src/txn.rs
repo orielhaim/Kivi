@@ -620,8 +620,8 @@ pub struct TxnIntent {
     pub digest: [u8; 32],
     /// Live version observed at prepare (`None` = absent).
     pub observed: Option<ObjectVersion>,
-    /// Prepare timestamp (micros, leader-materialized; resolver use only).
-    pub prepared_at: u64,
+    /// Prepare timestamp (leader-materialized; resolver use only).
+    pub prepared_at: kivi_types::WallTimestamp,
 }
 
 /// Transaction failure (Kivi-owned; never leaks Raft/storage internals).

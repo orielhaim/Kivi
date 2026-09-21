@@ -10,7 +10,7 @@
 use kivi_core::{EventView, FaultDecision, FaultPolicy, RandomSource};
 use kivi_sim::{AllowAll, DropEveryNth, Scheduler, SimRng, Trace};
 use kivi_state::{Key, Mutation, ObjectStore};
-use kivi_types::UnixMicros;
+use kivi_types::WallTimestamp;
 use rstest::rstest;
 use std::num::NonZeroU64;
 
@@ -37,7 +37,9 @@ fn script(seed: u64, count: u64) -> Vec<Mutation> {
             2 => mutations.push(Mutation::Delete { key }),
             3 => mutations.push(Mutation::SetExpiry {
                 key,
-                expiry: kivi_types::Expiry::at(UnixMicros::from_micros(rng.below_u64(500_000))),
+                expiry: kivi_types::Expiry::at(WallTimestamp::from_micros(
+                    i64::try_from(rng.below_u64(500_000)).expect("tiny fits"),
+                )),
             }),
             _ => mutations.push(Mutation::SetExpiry {
                 key,
@@ -77,7 +79,10 @@ fn drive<P: FaultPolicy>(
                 // Duplicates re-run the identical deterministic apply and
                 // schedule an identical copy: same rule as the cluster.
                 let duplicate = matches!(decision, FaultDecision::Duplicate);
-                let _ = store.apply(&mutation, UnixMicros::from_micros(at.as_micros()));
+                let _ = store.apply(
+                    &mutation,
+                    WallTimestamp::from_micros(i64::try_from(at.as_micros()).expect("tick fits")),
+                );
                 trace.record(id, at, RecordedDecision::Ran, mutation.clone());
                 if duplicate {
                     scheduler.schedule_at(at, mutation).expect("copy fits");

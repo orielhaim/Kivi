@@ -50,7 +50,7 @@ use std::time::Duration;
 use kivi_state::Operation;
 use kivi_types::{
     ClusterId, IdempotencyKey, MutationIdentity, NamespaceId, NodeId, ReadContract,
-    TabletAuthority, TabletEpoch, TabletId, UnixMicros, WriteGuardGeneration,
+    TabletAuthority, TabletEpoch, TabletId, WallTimestamp, WriteGuardGeneration,
 };
 
 use crate::cluster::Bootstrap;
@@ -1146,7 +1146,7 @@ impl ConsensusNode {
         op: &Operation,
         identity: Option<MutationIdentity>,
         idempotency: Option<IdempotencyKey>,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Result<crate::node::ProposeOutcome, ProposeError> {
         let unavailable = || {
             ProposeError::Consensus(ConsensusError::Unavailable {
@@ -2050,7 +2050,7 @@ impl ConsensusNode {
     pub async fn tablet_stats(
         &self,
         tablet: TabletId,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Option<kivi_state::StoreStats> {
         let machine = self.machines.lock().ok()?.get(&tablet).cloned()?;
         Some(machine.tablet_stats(now).await)
@@ -3111,7 +3111,7 @@ mod tests {
     use super::*;
 
     const NS: NamespaceId = NamespaceId::from_u64(1);
-    const NOW: UnixMicros = UnixMicros::from_micros(1_000_000);
+    const NOW: WallTimestamp = WallTimestamp::from_micros(1_000_000);
     const CTX: kivi_types::ReadContext = kivi_types::ReadContext::new(
         NOW,
         kivi_types::Ticks::from_micros(1_000_000),

@@ -62,7 +62,7 @@ use kivi_state::{DurableOutcome, OpError, OperationResult};
 use kivi_tablet::DirectorySnapshot;
 use kivi_types::{
     ClusterId, MutationIdentity, NamespaceId, NodeId, ReadContract, TabletEpoch, TabletId,
-    UnixMicros, WorkerId, WriteGuardGeneration,
+    WallTimestamp, WorkerId, WriteGuardGeneration,
 };
 use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2114,7 +2114,7 @@ async fn handle_write(
     operation: &kivi_state::Operation,
     identity: Option<MutationIdentity>,
     opcode: kivi_protocol::Opcode,
-    now: UnixMicros,
+    now: WallTimestamp,
 ) -> (Response, kivi_protocol::Opcode) {
     // Attribute escrow ownership: a bounded-counter create takes its
     // initial full share on the serving tablet (clients send zero).
@@ -3038,13 +3038,12 @@ fn redirect_or_overloaded(
     }
 }
 
-/// Wall-clock Unix microseconds (client-boundary capture only; replicas
-/// apply the leader's materialized stamp, never their own clock).
-pub(crate) fn wall_now() -> UnixMicros {
-    let elapsed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    UnixMicros::from_micros(elapsed.as_micros().try_into().unwrap_or(u64::MAX))
+/// Wall-clock timestamp (client-boundary capture only; replicas apply
+/// the leader's materialized stamp, never their own clock). One shared
+/// production read, failing closed to `MAX` so a broken clock expires
+/// rather than resurrects.
+pub(crate) fn wall_now() -> WallTimestamp {
+    kivi_core::wall_now_or_max(&kivi_core::SystemClock)
 }
 
 /// Default bounded wait for `AtLeast` catch-up on one read. The
@@ -3066,6 +3065,17 @@ pub(crate) fn mono_now() -> kivi_types::Ticks {
 /// time for proof/lease ages, bounded wait for catch-up.
 pub(crate) fn read_ctx() -> kivi_types::ReadContext {
     kivi_types::ReadContext::new(wall_now(), mono_now(), DEFAULT_READ_WAIT)
+}
+
+/// Intent age for admin diagnostics: `now - prepared_at` floored at zero
+/// (a skewed clock never reports a negative age).
+fn intent_age_micros(now: WallTimestamp, prepared_at: WallTimestamp) -> u64 {
+    u64::try_from(
+        now.as_micros()
+            .saturating_sub(prepared_at.as_micros())
+            .max(0),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 /// Read-only cluster admin plane: per-tablet diagnostics for operators
@@ -3478,12 +3488,12 @@ async fn tablet_row(
         .tablet_intents(TabletId::from_u64(id))
         .await
         .unwrap_or_default();
-    let now = wall_now().as_micros();
+    let now = wall_now();
     let oldest_prepared_age = intents
         .iter()
         .map(|intent| intent.prepared_at)
         .min()
-        .map(|oldest| now.saturating_sub(oldest));
+        .map(|oldest| intent_age_micros(now, oldest));
     // Bounded per-intent identity for stuck-intent forensics (which
     // transaction, which key, which coordinator, how old): the count
     // alone cannot attribute a wedge to its creator.
@@ -3494,7 +3504,7 @@ async fn tablet_row(
             serde_json::json!({
                 "key": hex_bytes(intent.key.as_bytes()),
                 "coordinator": intent.coordinator.as_u64(),
-                "age_micros": now.saturating_sub(intent.prepared_at),
+                "age_micros": intent_age_micros(now, intent.prepared_at),
             })
         })
         .collect();
@@ -3582,12 +3592,12 @@ async fn tablet(State(shared): State<ClusterShared>) -> (StatusCode, Json<serde_
         .tablet_intents(TabletId::from_u64(status.group.tablet().as_u64()))
         .await
         .unwrap_or_default();
-    let now = wall_now().as_micros();
+    let now = wall_now();
     let oldest_prepared_age_micros = intents
         .iter()
         .map(|intent| intent.prepared_at)
         .min()
-        .map(|oldest| now.saturating_sub(oldest));
+        .map(|oldest| intent_age_micros(now, oldest));
     match serde_json::to_value(tablet_dto(
         &status,
         &directory,
@@ -5667,7 +5677,7 @@ impl kivi_resp::Executor for ClusterExecutor {
         self.execute_inner(op)
     }
 
-    fn now_micros(&self) -> u64 {
-        wall_now().as_micros()
+    fn now(&self) -> WallTimestamp {
+        wall_now()
     }
 }

@@ -413,8 +413,8 @@ impl fmt::Display for ReadReceipt {
 /// virtual time for both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ReadContext {
-    /// Logical time for expiry evaluation (Unix micros).
-    pub now: crate::time::UnixMicros,
+    /// Logical time for expiry evaluation (wall-clock micros).
+    pub now: crate::time::WallTimestamp,
     /// Monotonic time for proof/lease ages (simulation-virtualizable).
     pub ticks: Ticks,
     /// Maximum to wait for applied coverage on `AtLeast` reads. Capped by
@@ -426,7 +426,7 @@ impl ReadContext {
     /// Builds a context, capping `wait` at [`AT_LEAST_WAIT_CAP`] so no
     /// caller can request an unbounded block.
     #[must_use]
-    pub const fn new(now: crate::time::UnixMicros, ticks: Ticks, wait: Duration) -> Self {
+    pub const fn new(now: crate::time::WallTimestamp, ticks: Ticks, wait: Duration) -> Self {
         Self { now, ticks, wait }
     }
 
@@ -1030,7 +1030,7 @@ pub const fn next_guard_for_move(
 mod tests {
     use super::*;
     use crate::ids::CommitPosition;
-    use crate::time::UnixMicros;
+    use crate::time::WallTimestamp;
 
     fn tablet(id: u64) -> TabletId {
         TabletId::from_u64(id)
@@ -1308,13 +1308,13 @@ mod tests {
     #[test]
     fn context_caps_unbounded_waits() {
         let ctx = ReadContext::new(
-            UnixMicros::from_micros(1_000),
+            WallTimestamp::from_micros(1_000),
             Ticks::from_micros(2_000),
             Duration::from_secs(3_600),
         );
         assert_eq!(ctx.capped_wait(), AT_LEAST_WAIT_CAP);
         let short = ReadContext::new(
-            UnixMicros::from_micros(1_000),
+            WallTimestamp::from_micros(1_000),
             Ticks::from_micros(2_000),
             Duration::from_millis(50),
         );

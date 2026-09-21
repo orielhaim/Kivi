@@ -206,8 +206,8 @@ impl Executor for LocalExecutor {
         Ok(out)
     }
 
-    fn now_micros(&self) -> u64 {
-        unix_micros_now()
+    fn now(&self) -> kivi_types::WallTimestamp {
+        super::cluster::wall_now()
     }
 }
 
@@ -255,14 +255,6 @@ fn map_engine(error: kivi_engine::EngineError) -> ExecuteError {
         | E::Chunk(_)
         | _ => ExecuteError::Internal,
     }
-}
-
-/// Wall-clock Unix microseconds (relative-expiry anchoring only).
-fn unix_micros_now() -> u64 {
-    let Ok(elapsed) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
-        return 0;
-    };
-    elapsed.as_micros().try_into().unwrap_or(u64::MAX)
 }
 
 /// Serves one RESP listener until `shutdown` resolves: accepts connections,

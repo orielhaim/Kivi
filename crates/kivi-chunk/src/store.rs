@@ -103,7 +103,7 @@ fn open_active_pack(
     lane: u16,
     seqs: &[u64],
     active_seq: u64,
-    wall_micros: u64,
+    created_at: kivi_types::WallTimestamp,
     target_bytes: u64,
 ) -> Result<(File, u64, u64), ChunkError> {
     if active_seq != 0 {
@@ -123,7 +123,7 @@ fn open_active_pack(
     let path = pack_path(dir, seq);
     let mut file = File::create_new(&path)
         .map_err(|error| ChunkError::io("create chunk pack", &path, &error))?;
-    let header = encode_pack_header(lane, seq, wall_micros, target_bytes);
+    let header = encode_pack_header(lane, seq, created_at, target_bytes);
     file.write_all(&header)
         .map_err(|error| ChunkError::io("write pack header", &path, &error))?;
     kivi_durability::fs::sync_file(&file)
@@ -271,7 +271,7 @@ pub struct ChunkStore {
     lane: u16,
     domain: SecurityDomainId,
     target_bytes: u64,
-    wall_micros: u64,
+    wall_micros: kivi_types::WallTimestamp,
     file: File,
     active_seq: u64,
     active_len: u64,
@@ -297,7 +297,7 @@ impl ChunkStore {
         lane: u16,
         domain: SecurityDomainId,
         target_bytes: u64,
-        wall_micros: u64,
+        wall_micros: kivi_types::WallTimestamp,
     ) -> Result<(Self, ChunkRecovery), ChunkError> {
         if target_bytes == 0 {
             return Err(ChunkError::Invalid {
@@ -810,13 +810,20 @@ mod tests {
     use crate::manifest::build_manifest;
     use crate::policy::{Chunking, DEFAULT_CHUNK_SIZE};
     use kivi_codec::integrity::chunk_id;
+    use kivi_types::WallTimestamp;
 
     const DOMAIN: SecurityDomainId = SecurityDomainId::from_u64(3);
 
     fn open_store(dir: &Path) -> ChunkStore {
-        ChunkStore::open(dir, 0, DOMAIN, 1024 * 1024, 1_000_000)
-            .expect("store opens")
-            .0
+        ChunkStore::open(
+            dir,
+            0,
+            DOMAIN,
+            1024 * 1024,
+            WallTimestamp::from_micros(1_000_000),
+        )
+        .expect("store opens")
+        .0
     }
 
     #[test]
@@ -879,8 +886,14 @@ mod tests {
         let mut raw = std::fs::read(&pack).expect("pack readable");
         raw.extend_from_slice(&[0xFF; 37]);
         std::fs::write(&pack, &raw).expect("torn");
-        let (store, summary) =
-            ChunkStore::open(scratch.path(), 0, DOMAIN, 1024 * 1024, 2_000_000).expect("recovers");
+        let (store, summary) = ChunkStore::open(
+            scratch.path(),
+            0,
+            DOMAIN,
+            1024 * 1024,
+            WallTimestamp::from_micros(2_000_000),
+        )
+        .expect("recovers");
         assert_eq!(summary.truncated_bytes, 37);
         assert_eq!(summary.records_verified, 2);
         assert_eq!(
@@ -912,7 +925,16 @@ mod tests {
         let mut raw = std::fs::read(&pack).expect("pack readable");
         raw[100] ^= 0xFF;
         std::fs::write(&pack, &raw).expect("corrupted");
-        assert!(ChunkStore::open(scratch.path(), 0, DOMAIN, 1024 * 1024, 3_000_000).is_err());
+        assert!(
+            ChunkStore::open(
+                scratch.path(),
+                0,
+                DOMAIN,
+                1024 * 1024,
+                WallTimestamp::from_micros(3_000_000)
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -947,8 +969,14 @@ mod tests {
         store.sync().expect("syncs");
         assert!(store.durable_manifest(id).is_some());
         drop(store);
-        let (store, _) =
-            ChunkStore::open(scratch.path(), 0, DOMAIN, 1024 * 1024, 4_000_000).expect("recovers");
+        let (store, _) = ChunkStore::open(
+            scratch.path(),
+            0,
+            DOMAIN,
+            1024 * 1024,
+            WallTimestamp::from_micros(4_000_000),
+        )
+        .expect("recovers");
         let (back, _) = store.read_manifest(id).expect("reads manifest");
         assert_eq!(back, manifest);
     }
@@ -959,8 +987,14 @@ mod tests {
         // Tiny target: two 164-byte chunk records fit per pack past the
         // 64-byte header (64 + 164 + 164 = 392 ≤ 512 < 556), so six chunks
         // span exactly three packs.
-        let (mut store, _) =
-            ChunkStore::open(scratch.path(), 0, DOMAIN, 512, 5_000_000).expect("opens");
+        let (mut store, _) = ChunkStore::open(
+            scratch.path(),
+            0,
+            DOMAIN,
+            512,
+            WallTimestamp::from_micros(5_000_000),
+        )
+        .expect("opens");
         for byte in 0u8..6 {
             let bytes = vec![byte; 100];
             store

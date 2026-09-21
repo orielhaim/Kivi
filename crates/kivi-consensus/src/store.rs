@@ -405,7 +405,7 @@ mod tests {
     pub(crate) fn test_command(value: i64) -> crate::command::ConsensusCommand {
         use kivi_state::{Key, Mutation, MutationEnvelope, ObjectVersion, OperationResult};
         use kivi_types::{
-            RequestIdentity, RequestSeq, SessionId, TabletAuthority, TabletEpoch, UnixMicros,
+            RequestIdentity, RequestSeq, SessionId, TabletAuthority, TabletEpoch, WallTimestamp,
             WriteGuardGeneration,
         };
         let authority = TabletAuthority::new(
@@ -431,7 +431,7 @@ mod tests {
                 value,
                 version: ObjectVersion::from_u64(1),
             },
-            UnixMicros::from_micros(1_000_000),
+            WallTimestamp::from_micros(1_000_000),
             RequestSeq::from_u64(0),
         ))
     }

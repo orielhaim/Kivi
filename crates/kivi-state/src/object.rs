@@ -800,9 +800,9 @@ pub struct LeaseHolder {
     pub owner: u64,
     /// Fencing token issued with this grant (strictly increasing).
     pub fencing: FencingToken,
-    /// Logical expiry in micros (deterministic `UnixMicros`, never a clock
+    /// Logical expiry in micros (deterministic `WallTimestamp`, never a clock
     /// read inside state logic).
-    pub expires_at: kivi_types::UnixMicros,
+    pub expires_at: kivi_types::WallTimestamp,
 }
 
 impl Encode for LeaseHolder {
@@ -821,7 +821,7 @@ impl Decode for LeaseHolder {
     fn decode(input: &[u8]) -> Result<(Self, usize), CodecError> {
         let (owner, first) = u64::decode(input)?;
         let (fencing, second) = FencingToken::decode(&input[first..])?;
-        let (expires_at, third) = kivi_types::UnixMicros::decode(&input[first + second..])?;
+        let (expires_at, third) = kivi_types::WallTimestamp::decode(&input[first + second..])?;
         Ok((
             Self {
                 owner,
@@ -1163,7 +1163,7 @@ impl StoredObject {
     /// Whether the object is logically absent at `now` (`now >= expires_at`).
     /// Pure comparison: the caller supplies time from the clock boundary.
     #[must_use]
-    pub const fn is_expired(&self, now: kivi_types::UnixMicros) -> bool {
+    pub const fn is_expired(&self, now: kivi_types::WallTimestamp) -> bool {
         self.expiry.is_expired(now)
     }
 }
@@ -1244,7 +1244,7 @@ mod tests {
             holder: Some(LeaseHolder {
                 owner: 7,
                 fencing: FencingToken::from_u64(4),
-                expires_at: kivi_types::UnixMicros::from_micros(99),
+                expires_at: kivi_types::WallTimestamp::from_micros(99),
             }),
             next_fencing: FencingToken::from_u64(5),
         };

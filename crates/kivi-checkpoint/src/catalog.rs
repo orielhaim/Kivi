@@ -16,7 +16,7 @@
 //!   24  32 manifest content hash
 //!   56  1  has_prev (0/1)
 //!   57  32 previous manifest content hash (zero when absent)
-//!   89  8  created wall micros (forensics/age only)
+//!   89  8  created wall micros, signed Unix time (forensics/age only)
 //!   97  4  CRC32C of bytes [0..97]
 //!
 //! WAL_FLOOR (variable):
@@ -73,8 +73,8 @@ pub struct CurrentRecord {
     pub manifest: ArtifactHash,
     /// Previous manifest hash (retention chain), if any.
     pub previous: Option<ArtifactHash>,
-    /// Wall micros at publication (age reporting only).
-    pub created_wall_micros: u64,
+    /// Wall time at publication (age reporting only).
+    pub created_wall_micros: kivi_types::WallTimestamp,
 }
 
 /// Encodes one CURRENT record (fixed size, checksummed).
@@ -97,7 +97,7 @@ pub fn encode_current(record: &CurrentRecord) -> Vec<u8> {
             out[57..89].copy_from_slice(hash.as_bytes());
         }
     }
-    out[89..97].copy_from_slice(&record.created_wall_micros.to_le_bytes());
+    out[89..97].copy_from_slice(&record.created_wall_micros.as_micros().to_le_bytes());
     let crc = crc32c_checksum(&out[..97]);
     out[97..101].copy_from_slice(&crc.to_le_bytes());
     out.to_vec()
@@ -191,11 +191,11 @@ pub fn decode_current(tablet: TabletId, bytes: &[u8]) -> Result<CurrentRecord, C
             )));
         }
     };
-    let created_wall_micros = u64::from_le_bytes(
+    let created_wall_micros = kivi_types::WallTimestamp::from_micros(i64::from_le_bytes(
         bytes[89..97]
             .try_into()
             .map_err(|_| corrupt("CURRENT timestamp unreadable".to_owned()))?,
-    );
+    ));
     Ok(CurrentRecord {
         tablet,
         cut,
@@ -346,17 +346,6 @@ pub fn decode_wal_floor(bytes: &[u8]) -> Result<Vec<LaneFloor>, CheckpointError>
     Ok(floors)
 }
 
-/// Current wall micros (CURRENT age reporting only — never cut semantics).
-#[must_use]
-pub fn wall_micros_now() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| {
-            elapsed.as_micros().try_into().unwrap_or(u64::MAX)
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,7 +356,7 @@ mod tests {
             cut: 42,
             manifest: ArtifactHash::of(b"manifest"),
             previous: Some(ArtifactHash::of(b"previous")),
-            created_wall_micros: 1_000,
+            created_wall_micros: kivi_types::WallTimestamp::from_micros(1_000),
         }
     }
 

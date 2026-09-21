@@ -384,7 +384,7 @@ impl<E: Executor> RespConnection<E> {
                 false,
             );
         }
-        let action = match translate(&pending.name, &pending.args, self.executor.now_micros()) {
+        let action = match translate(&pending.name, &pending.args, self.executor.now()) {
             Ok(action) => action,
             Err(error) => {
                 match &error {
@@ -480,7 +480,7 @@ impl<E: Executor> RespConnection<E> {
         } else {
             match self.executor.execute(&op) {
                 Ok(result) => {
-                    let reply = map_result(&result, redis, self.executor.now_micros());
+                    let reply = map_result(&result, redis, self.executor.now());
                     (encode_reply(version, &reply), false)
                 }
                 Err(error) => (encode_reply(version, &map_execute_error(error)), false),
@@ -1043,14 +1043,14 @@ mod tests {
     use kivi_state::{ObjectStore, Operation, OperationResult};
     use std::sync::Mutex;
 
-    #[derive(Debug, Default)]
+    #[derive(Debug)]
     struct FakeExec {
         store: Mutex<ObjectStore>,
-        now: u64,
+        now: kivi_types::WallTimestamp,
     }
 
     impl FakeExec {
-        fn new(now: u64) -> Self {
+        fn new(now: kivi_types::WallTimestamp) -> Self {
             Self {
                 store: Mutex::new(ObjectStore::new()),
                 now,
@@ -1064,7 +1064,7 @@ mod tests {
             op: &Operation,
         ) -> Result<OperationResult, crate::translate::ExecuteError> {
             use kivi_state::Prepared;
-            let now = kivi_types::UnixMicros::from_micros(self.now);
+            let now = self.now;
             let mut store = self.store.lock().expect("fake lock");
             // Mirror the engine: ephemeral prepare/apply, chunked never appears here.
             match store.prepare(op, now) {
@@ -1083,7 +1083,7 @@ mod tests {
             }
         }
 
-        fn now_micros(&self) -> u64 {
+        fn now(&self) -> kivi_types::WallTimestamp {
             self.now
         }
     }
@@ -1101,7 +1101,11 @@ mod tests {
     }
 
     fn conn() -> RespConnection<FakeExec> {
-        RespConnection::new(FakeExec::new(1_000_000_000), ConnConfig::default(), 7)
+        RespConnection::new(
+            FakeExec::new(kivi_types::WallTimestamp::from_micros(1_000_000_000)),
+            ConnConfig::default(),
+            7,
+        )
     }
 
     fn round_trip(connection: &mut RespConnection<FakeExec>, bytes: &[u8]) -> Vec<Vec<u8>> {
@@ -1345,7 +1349,7 @@ mod tests {
         assert!(!quit);
         // Oversized arrays and bulks are rejected before allocation games.
         let mut small = RespConnection::new(
-            FakeExec::new(0),
+            FakeExec::new(kivi_types::WallTimestamp::EPOCH),
             ConnConfig {
                 max_array_elements: 2,
                 max_bulk_bytes: 4,
@@ -1508,8 +1512,8 @@ mod fuzz {
             })
         }
 
-        fn now_micros(&self) -> u64 {
-            0
+        fn now(&self) -> kivi_types::WallTimestamp {
+            kivi_types::WallTimestamp::EPOCH
         }
     }
 
@@ -1554,13 +1558,13 @@ mod fuzz {
                 kivi_state::Operation::LeaseAcquire { .. } => {
                     kivi_state::OperationResult::LeaseAcquired {
                         fencing: kivi_state::FencingToken::from_u64(1),
-                        expires_at: kivi_types::UnixMicros::from_micros(0),
+                        expires_at: kivi_types::WallTimestamp::from_micros(0),
                     }
                 }
                 kivi_state::Operation::LeaseRenew { .. } => {
                     kivi_state::OperationResult::LeaseRenewed {
                         fencing: kivi_state::FencingToken::from_u64(1),
-                        expires_at: kivi_types::UnixMicros::from_micros(0),
+                        expires_at: kivi_types::WallTimestamp::from_micros(0),
                     }
                 }
                 kivi_state::Operation::LeaseRelease { .. } => {

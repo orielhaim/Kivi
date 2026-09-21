@@ -224,7 +224,8 @@ struct CheckpointTabletDto {
     which: &'static str,
     cut: u64,
     manifest: Option<String>,
-    created_wall_micros: u64,
+    /// Signed Unix micros (project-owned integer encoding, not Jiff text).
+    created_wall_micros: i64,
     bands: usize,
     bands_reused: usize,
     stored_bytes: u64,
@@ -589,7 +590,7 @@ async fn checkpoints(State(state): State<AdminState>) -> Json<CheckpointsDto> {
                     .manifest
                     .as_ref()
                     .map(kivi_checkpoint::ArtifactHash::hex),
-                created_wall_micros: info.created_wall_micros,
+                created_wall_micros: info.created_wall_micros.as_micros(),
                 bands: info.bands,
                 bands_reused: info.bands_reused,
                 stored_bytes: info.stored_bytes,
@@ -606,7 +607,7 @@ async fn checkpoints(State(state): State<AdminState>) -> Json<CheckpointsDto> {
                     .manifest
                     .as_ref()
                     .map(kivi_checkpoint::ArtifactHash::hex),
-                created_wall_micros: info.created_wall_micros,
+                created_wall_micros: info.created_wall_micros.as_micros(),
                 bands: info.bands,
                 bands_reused: info.bands_reused,
                 stored_bytes: info.stored_bytes,

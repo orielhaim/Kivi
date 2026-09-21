@@ -14,8 +14,8 @@ use kivi_state::{Key, Mutation, Operation};
 use kivi_tablet::{DirectoryVersion, HashPrefix, OrderedRange, PartitionRange};
 use kivi_types::{
     ClusterId, CommitPosition, CommitToken, NamespaceId, NodeId, NodeIncarnation, ReadContract,
-    ReadReceipt, RequestIdentity, RequestSeq, TabletAuthority, TabletEpoch, TabletId, UnixMicros,
-    WorkerId, WriteGuardGeneration,
+    ReadReceipt, RequestIdentity, RequestSeq, TabletAuthority, TabletEpoch, TabletId,
+    WallTimestamp, WorkerId, WriteGuardGeneration,
 };
 
 use crate::frame::ProtocolError;
@@ -765,9 +765,10 @@ pub struct Request {
     pub value: Option<Vec<u8>>,
     /// Addend (meaningful for `CounterAdd` only).
     pub delta: i64,
-    /// Absolute expiry micros (meaningful for `ExpireAt` only, and for
-    /// `SetConditional` when its expiry policy is `ExpireAt`).
-    pub expiry: u64,
+    /// Absolute expiry micros, signed Unix time (meaningful for
+    /// `ExpireAt` only, and for `SetConditional` when its expiry policy
+    /// is `ExpireAt`).
+    pub expiry: i64,
     /// Patch offset (meaningful for `SetRange` only): the logical byte
     /// index the patch overwrites from, zero-padding past the end.
     /// Reused as the slice start for `GetRange`.
@@ -882,7 +883,7 @@ impl Request {
             },
             Opcode::ExpireAt => Operation::ExpireAt {
                 key,
-                expires_at: UnixMicros::from_micros(self.expiry),
+                expires_at: WallTimestamp::from_micros(self.expiry),
             },
             Opcode::PersistExpiry => Operation::PersistExpiry { key },
             Opcode::GetExpiry => Operation::GetExpiry { key },
@@ -906,7 +907,7 @@ impl Request {
                 };
                 let expiry = match self.expiry_policy {
                     EXPIRY_KEEP => ExpiryPolicy::Keep,
-                    EXPIRY_AT => ExpiryPolicy::ExpireAt(UnixMicros::from_micros(self.expiry)),
+                    EXPIRY_AT => ExpiryPolicy::ExpireAt(WallTimestamp::from_micros(self.expiry)),
                     _ => ExpiryPolicy::Clear,
                 };
                 Operation::SetConditional {
@@ -1203,8 +1204,9 @@ pub enum ResponseBody {
         /// Whether an expiry was removed.
         removed: bool,
     },
-    /// Found expiry timestamp (micros); never `NEVER` (see `ExpiryNever`).
-    ExpiryAt(u64),
+    /// Found expiry timestamp (signed micros); never `NEVER` (see
+    /// `ExpiryNever`).
+    ExpiryAt(i64),
     /// The key is live and immortal (no expiry attached).
     ExpiryNever,
     /// Logical byte length (pairs with `BytesLength`).
@@ -1304,15 +1306,15 @@ pub enum ResponseBody {
     LeaseAcquired {
         /// Fencing token issued with this grant.
         fencing: u64,
-        /// Logical expiry of the grant.
-        expires_at: u64,
+        /// Logical expiry of the grant (signed Unix micros).
+        expires_at: i64,
     },
     /// Lease renewal outcome (pairs with `LeaseRenew`; same token).
     LeaseRenewed {
         /// Fencing token of the continuing grant.
         fencing: u64,
-        /// New logical expiry of the grant.
-        expires_at: u64,
+        /// New logical expiry of the grant (signed Unix micros).
+        expires_at: i64,
     },
     /// Lease release outcome (pairs with `LeaseRelease`).
     LeaseReleased {
@@ -1326,7 +1328,7 @@ pub enum ResponseBody {
         /// Live holder's fencing token (zero when no live holder).
         fencing: u64,
         /// Live holder's logical expiry (zero when no live holder).
-        expires_at: u64,
+        expires_at: i64,
         /// Next fencing token to be issued.
         next_fencing: u64,
     },
@@ -1731,7 +1733,7 @@ impl Request {
             Opcode::CounterAdd | Opcode::CommutativeAdd | Opcode::BoundedCounterAdd => {
                 push_i64(&mut out, self.delta);
             }
-            Opcode::ExpireAt => push_u64(&mut out, self.expiry),
+            Opcode::ExpireAt => push_i64(&mut out, self.expiry),
             Opcode::SetRange => {
                 push_u64(&mut out, self.offset);
                 push_blob(&mut out, self.value.as_deref().unwrap_or_default());
@@ -1748,7 +1750,7 @@ impl Request {
                 // `expiry` rides only for `EXPIRY_AT`; the other policies
                 // ignore it (zero on encode when unused).
                 if self.expiry_policy == EXPIRY_AT {
-                    push_u64(&mut out, self.expiry);
+                    push_i64(&mut out, self.expiry);
                 }
                 push_blob(&mut out, self.value.as_deref().unwrap_or_default());
             }
@@ -1980,7 +1982,7 @@ impl Request {
                 request.delta = cursor.i64(CONTEXT)?;
             }
             Opcode::ExpireAt => {
-                request.expiry = cursor.u64(CONTEXT)?;
+                request.expiry = cursor.i64(CONTEXT)?;
             }
             Opcode::SetRange => {
                 request.offset = cursor.u64(CONTEXT)?;
@@ -2006,7 +2008,7 @@ impl Request {
                     return Err(ProtocolError::Malformed { context: CONTEXT });
                 }
                 if request.expiry_policy == EXPIRY_AT {
-                    request.expiry = cursor.u64(CONTEXT)?;
+                    request.expiry = cursor.i64(CONTEXT)?;
                 }
                 request.value = Some(cursor.blob(CONTEXT)?.to_vec());
             }
@@ -2215,7 +2217,7 @@ impl Response {
             ResponseBody::ExpiryPersisted { removed } => push_u8(&mut out, u8::from(*removed)),
             ResponseBody::ExpiryAt(stamp) => {
                 push_u8(&mut out, 1);
-                push_u64(&mut out, *stamp);
+                push_i64(&mut out, *stamp);
             }
             ResponseBody::ExpiryNever => {
                 push_u8(&mut out, 0);
@@ -2268,7 +2270,7 @@ impl Response {
                 expires_at,
             } => {
                 push_u64(&mut out, *fencing);
-                push_u64(&mut out, *expires_at);
+                push_i64(&mut out, *expires_at);
             }
             ResponseBody::LeaseInfo {
                 owner,
@@ -2284,7 +2286,7 @@ impl Response {
                     }
                 }
                 push_u64(&mut out, *fencing);
-                push_u64(&mut out, *expires_at);
+                push_i64(&mut out, *expires_at);
                 push_u64(&mut out, *next_fencing);
             }
             ResponseBody::StreamAppended { offset } => {
@@ -2473,7 +2475,7 @@ impl Response {
                 },
                 Opcode::GetExpiry => match cursor.u8(CONTEXT)? {
                     0 => ResponseBody::ExpiryNever,
-                    1 => ResponseBody::ExpiryAt(cursor.u64(CONTEXT)?),
+                    1 => ResponseBody::ExpiryAt(cursor.i64(CONTEXT)?),
                     _ => return Err(ProtocolError::Malformed { context: CONTEXT }),
                 },
                 Opcode::Scan => {
@@ -2587,11 +2589,11 @@ impl Response {
                 },
                 Opcode::LeaseAcquire => ResponseBody::LeaseAcquired {
                     fencing: cursor.u64(CONTEXT)?,
-                    expires_at: cursor.u64(CONTEXT)?,
+                    expires_at: cursor.i64(CONTEXT)?,
                 },
                 Opcode::LeaseRenew => ResponseBody::LeaseRenewed {
                     fencing: cursor.u64(CONTEXT)?,
-                    expires_at: cursor.u64(CONTEXT)?,
+                    expires_at: cursor.i64(CONTEXT)?,
                 },
                 Opcode::LeaseRelease => ResponseBody::LeaseReleased {
                     released: flag(&mut cursor)?,
@@ -2605,7 +2607,7 @@ impl Response {
                     ResponseBody::LeaseInfo {
                         owner,
                         fencing: cursor.u64(CONTEXT)?,
-                        expires_at: cursor.u64(CONTEXT)?,
+                        expires_at: cursor.i64(CONTEXT)?,
                         next_fencing: cursor.u64(CONTEXT)?,
                     }
                 }

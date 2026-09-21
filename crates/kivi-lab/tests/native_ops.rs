@@ -10,7 +10,9 @@ use kivi_engine::{
 };
 use kivi_state::{ExpiryPolicy, Key, SetCondition};
 use kivi_tablet::{DirectorySnapshot, HashPrefix, PartitionRange};
-use kivi_types::{ClusterId, NamespaceId, NodeId, NodeIncarnation, TabletId, UnixMicros, WorkerId};
+use kivi_types::{
+    ClusterId, NamespaceId, NodeId, NodeIncarnation, TabletId, WallTimestamp, WorkerId,
+};
 
 const NS: NamespaceId = NamespaceId::from_u64(1);
 
@@ -113,7 +115,7 @@ fn conditional_stores_evaluate_atomically_with_policies() {
     );
     // Present: XX applies; Keep preserves a dated expiry (far future:
     // wall-clock `now` here is real time, not the unit-test stub).
-    let deadline = UnixMicros::from_micros(9_000_000_000_000_000);
+    let deadline = WallTimestamp::from_micros(9_000_000_000_000_000);
     assert!(client.expire_at(&key, deadline).expect("expire"));
     assert_eq!(
         client

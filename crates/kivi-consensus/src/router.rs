@@ -677,7 +677,7 @@ mod tests {
         use kivi_state::{Key, Mutation, MutationEnvelope, ObjectVersion, OperationResult};
         use kivi_types::{
             NamespaceId, RequestIdentity, RequestSeq, SessionId, TabletAuthority, TabletEpoch,
-            TabletId, UnixMicros, WriteGuardGeneration,
+            TabletId, WallTimestamp, WriteGuardGeneration,
         };
         let authority = TabletAuthority::new(
             TabletId::from_u64(9),
@@ -699,7 +699,7 @@ mod tests {
                 value: 2,
                 version: ObjectVersion::FIRST,
             },
-            UnixMicros::from_micros(5),
+            WallTimestamp::from_micros(5),
             RequestSeq::from_u64(0),
         ))
     }

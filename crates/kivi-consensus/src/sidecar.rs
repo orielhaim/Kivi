@@ -527,13 +527,13 @@ impl SidecarStore {
     #[cfg(test)]
     #[must_use]
     pub fn open_ephemeral(domain: SecurityDomainId) -> (Self, JoinHandle<()>) {
+        // Process identity plus an atomic salt uniquely names the scratch
+        // directory across parallel tests — no wall clock needed.
+        static SALT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "kivi-sidecar-test-{}-{}",
             std::process::id(),
-            // Small nanos salt to avoid collisions across parallel tests.
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.subsec_nanos())
+            SALT.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
         ));
         let _ = std::fs::create_dir_all(&dir);
         Self::open(&dir, domain, 64 * 1024 * 1024).expect("ephemeral sidecar opens")
@@ -913,9 +913,9 @@ impl SidecarStore {
         pack_target_bytes: u64,
         receiver: async_channel::Receiver<SidecarJob>,
     ) {
-        let wall = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX));
+        // Pack creation stamp only (diagnostic age ordering, never cut
+        // semantics): one shared production read, failing closed to MAX.
+        let wall = kivi_core::wall_now_or_max(&kivi_core::SystemClock);
         let _root_keep = root.clone();
         let mut store =
             match kivi_chunk::ChunkStore::open(&root, 0, domain, pack_target_bytes, wall) {

@@ -223,7 +223,7 @@ pub(crate) struct PendingEntry {
     op: Operation,
     opcode: u8,
     is_mutating: bool,
-    now: kivi_types::UnixMicros,
+    now: kivi_types::WallTimestamp,
     identity: Option<MutationIdentity>,
     respond: Sender<WorkerResponse>,
     admitted_at: Instant,
@@ -248,7 +248,7 @@ impl PendingEntry {
     pub(crate) fn new(
         tablet: TabletId,
         op: Operation,
-        now: kivi_types::UnixMicros,
+        now: kivi_types::WallTimestamp,
         identity: Option<MutationIdentity>,
         respond: Sender<WorkerResponse>,
     ) -> Self {
@@ -303,7 +303,7 @@ struct SuspendedRead {
     /// Key being read (root re-validation on resume).
     key: kivi_state::Key,
     /// Logical wall time of the read (expiry evaluation on resume).
-    now: kivi_types::UnixMicros,
+    now: kivi_types::WallTimestamp,
     /// `GetRange` window (`None` for full `Get`): applied after a
     /// resolved root, so range reads never serve more than asked.
     range: Option<(u64, u64)>,
@@ -364,7 +364,7 @@ struct ApplyData {
     commit: CommitPosition,
     kind: PreparedKind,
     identity: Option<MutationIdentity>,
-    now: kivi_types::UnixMicros,
+    now: kivi_types::WallTimestamp,
     respond: Sender<WorkerResponse>,
     /// Staging pins, moved from the admission and held through the apply:
     /// the journal records the commit before this drops, so GC always sees
@@ -396,7 +396,7 @@ impl TabletOverlay {
         &mut self,
         committed: &ObjectStore,
         op: &Operation,
-        now: kivi_types::UnixMicros,
+        now: kivi_types::WallTimestamp,
     ) -> Result<StorePrepared, TabletError> {
         let key = op.key();
         // Materialize a scratch store holding exactly this key's current
@@ -454,7 +454,7 @@ impl TabletOverlay {
         committed: &ObjectStore,
         txn: kivi_state::TxnId,
         writes: &[kivi_state::TxnWrite],
-        now: kivi_types::UnixMicros,
+        now: kivi_types::WallTimestamp,
     ) -> Result<StorePrepared, TabletError> {
         use kivi_state::{LocalCommitError, OperationResult};
         if writes.is_empty() {
@@ -2293,7 +2293,7 @@ mod tests {
     };
 
     const NS: NamespaceId = NamespaceId::from_u64(1);
-    const NOW: kivi_types::UnixMicros = kivi_types::UnixMicros::from_micros(1_000_000);
+    const NOW: kivi_types::WallTimestamp = kivi_types::WallTimestamp::from_micros(1_000_000);
 
     fn live_tablet() -> LiveTablet {
         let tablet = TabletId::from_u64(1);

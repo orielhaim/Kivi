@@ -137,6 +137,26 @@ impl Decode for u64 {
     }
 }
 
+impl Encode for i64 {
+    fn encoded_len(&self) -> usize {
+        8
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.to_le_bytes());
+    }
+}
+
+impl Decode for i64 {
+    fn decode(input: &[u8]) -> Result<(Self, usize), CodecError> {
+        let bytes = input.first_chunk().ok_or(CodecError::Truncated {
+            expected: 8,
+            available: input.len(),
+        })?;
+        Ok((Self::from_le_bytes(*bytes), 8))
+    }
+}
+
 impl Encode for u128 {
     fn encoded_len(&self) -> usize {
         16
@@ -265,6 +285,11 @@ mod tests {
 
     #[test]
     fn integers_round_trip_little_endian() {
+        for value in [i64::MIN, -1, 0, 1, 918, i64::MAX] {
+            let bytes = value.encode_to_vec();
+            assert_eq!(bytes, value.to_le_bytes());
+            assert_eq!(i64::decode_exact(&bytes).expect("round trip"), value);
+        }
         for value in [0u64, 1, 918, u64::MAX] {
             let bytes = value.encode_to_vec();
             assert_eq!(bytes, value.to_le_bytes());

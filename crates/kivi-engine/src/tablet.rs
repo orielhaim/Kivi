@@ -26,7 +26,7 @@ use kivi_state::{
 use kivi_tablet::TabletDescriptor;
 use kivi_types::{
     CommitPosition, MutationIdentity, NamespaceId, RequestSeq, SessionId, TabletAuthority,
-    TabletId, UnixMicros,
+    TabletId, WallTimestamp,
 };
 
 /// Local per-tablet counters. Plain integers behind the owner thread —
@@ -476,7 +476,7 @@ impl LiveTablet {
     pub fn scan_local(
         &mut self,
         spec: &kivi_state::ScanSpec,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Result<kivi_state::ScanPage, TabletError> {
         let page = self
             .store
@@ -509,7 +509,7 @@ impl LiveTablet {
 
     /// Logical telemetry at `now` for split/merge policy.
     #[must_use]
-    pub fn tablet_stats(&self, now: UnixMicros) -> kivi_state::StoreStats {
+    pub fn tablet_stats(&self, now: WallTimestamp) -> kivi_state::StoreStats {
         self.store.stats(now)
     }
 
@@ -524,7 +524,7 @@ impl LiveTablet {
     /// # Errors
     ///
     /// Returns [`TabletError::Op`] for validation failures.
-    pub fn prepare(&self, op: &Operation, now: UnixMicros) -> Result<Prepared, TabletError> {
+    pub fn prepare(&self, op: &Operation, now: WallTimestamp) -> Result<Prepared, TabletError> {
         Ok(self.store.prepare(op, now)?)
     }
 
@@ -537,7 +537,7 @@ impl LiveTablet {
     pub fn apply_mutation(
         &mut self,
         mutation: &Mutation,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Result<ApplyOutcome, TabletError> {
         let outcome = self.store.apply(mutation, now)?;
         self.metrics.writes += 1;
@@ -566,7 +566,7 @@ impl LiveTablet {
     pub fn execute(
         &mut self,
         op: &Operation,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Result<OperationResult, TabletError> {
         let prepared = self.store.prepare(op, now).map_err(|error| {
             self.metrics.note_rejection(&error);
@@ -651,7 +651,7 @@ impl LiveTablet {
         &mut self,
         op: &Operation,
         identity: Option<&MutationIdentity>,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Result<DurablePrepared, TabletError> {
         if let Some(marker) = identity {
             match self.check_identity(marker) {
@@ -771,7 +771,7 @@ impl LiveTablet {
         is_persist_expiry: bool,
         identity: Option<&MutationIdentity>,
         commit: CommitPosition,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Result<OperationResult, TabletError> {
         assert_eq!(
             self.applied_commit
@@ -901,7 +901,7 @@ impl LiveTablet {
         is_persist_expiry: bool,
         commit: CommitPosition,
         identity: Option<&MutationIdentity>,
-        now: UnixMicros,
+        now: WallTimestamp,
     ) -> Result<(), kivi_durability::RecoveryError> {
         use kivi_durability::RecoveryError;
         // Recovery assigns and applies in lockstep, so the check runs
@@ -1135,7 +1135,7 @@ impl LiveTablet {
     /// mutations, returning each reclaimed key with its outcome. Bounded by
     /// `limit` so reclamation never starves foreground work; the driver
     /// repeats sweeps until `collect_expired` comes back empty.
-    pub fn sweep_expired(&mut self, now: UnixMicros, limit: usize) -> Vec<(Key, ApplyOutcome)> {
+    pub fn sweep_expired(&mut self, now: WallTimestamp, limit: usize) -> Vec<(Key, ApplyOutcome)> {
         self.sweep_expired_except(now, limit, None)
     }
 
@@ -1146,7 +1146,7 @@ impl LiveTablet {
     /// Skipped keys simply wait for the next sweep.
     pub fn sweep_expired_except(
         &mut self,
-        now: UnixMicros,
+        now: WallTimestamp,
         limit: usize,
         skip: Option<&std::collections::HashSet<Key>>,
     ) -> Vec<(Key, ApplyOutcome)> {
@@ -1230,7 +1230,7 @@ mod tests {
         LiveTablet::from_descriptor(&descriptor, authority).expect("live tablet")
     }
 
-    const NOW: UnixMicros = UnixMicros::from_micros(1_000_000);
+    const NOW: WallTimestamp = WallTimestamp::from_micros(1_000_000);
 
     #[test]
     fn authority_must_name_the_tablet() {
@@ -1336,7 +1336,7 @@ mod tests {
                 .execute(
                     &Operation::ExpireAt {
                         key: Key::from(name),
-                        expires_at: UnixMicros::from_micros(10_000_000),
+                        expires_at: WallTimestamp::from_micros(10_000_000),
                     },
                     NOW,
                 )
@@ -1351,7 +1351,7 @@ mod tests {
                 NOW,
             )
             .expect("persist");
-        let later = UnixMicros::from_micros(20_000_000);
+        let later = WallTimestamp::from_micros(20_000_000);
         let reclaimed = tablet.sweep_expired(later, 1);
         assert_eq!(reclaimed.len(), 1, "sweep honors its bound");
         let reclaimed = tablet.sweep_expired(later, 100);

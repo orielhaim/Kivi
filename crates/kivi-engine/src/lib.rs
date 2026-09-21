@@ -14,7 +14,6 @@
 pub mod affinity;
 pub mod checkpoint;
 pub mod chunk_lane;
-pub mod clock;
 pub mod commit;
 pub mod compound;
 pub mod engine;
@@ -31,7 +30,6 @@ pub use chunk_lane::{
     DEFAULT_CHUNK_CACHE_BYTES, LargeSetSplit, StagedValue, StagingPins, spawn_lane,
     split_large_set,
 };
-pub use clock::SystemClock;
 pub use commit::{BatchPolicy, CommitCoordinator, CommitMetricsSnapshot, LaneMaintenance};
 pub use engine::{
     AdminHandle, ChunkFabricConfig, DurabilityMode, DurableConfig, EngineConfig, EngineDurability,
@@ -42,6 +40,7 @@ pub use fabric::{
     FabricSealPayload, FabricStatsSnapshot, JournalEntry, JournalFile, StagedSeal, TabletFabric,
     import_from_entry, journal_append_batch, journal_compact, journal_load, open_material_provider,
 };
+pub use kivi_core::SystemClock;
 pub use kivi_memory::Footprint;
 pub use kivi_memory::offcore_lane::{
     DemotedRecord, OFFCORE_JOB_DEPTH, OffcoreLaneGuard, OffcoreLaneHandle, OffcoreLaneStats,
