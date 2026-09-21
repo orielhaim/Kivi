@@ -276,6 +276,14 @@ pub async fn reconcile_loop_shared(
         // Ordered-index enforcement likewise runs everywhere: each replica
         // maintains its own index, driven from the namespace layout.
         ensure_ordered_indexing(&node, &directory).await;
+        // Committed-cutover replay runs on every node every pass (not just
+        // the control leader): a freshly admitted member starts from its
+        // genesis tiling and missed every past cutover, and a member down
+        // during a cutover push misses it. Idempotent (no-ops when already
+        // applied; publishes only on change), so this is the backstop that
+        // keeps serving directories converged, while the admin cutover
+        // push stays the same-pass fast path.
+        super::cluster::replay_committed_topology(&node, &directory).await;
         if let Err(reason) = reconcile_once(&node, &snapshot, &mut detector, &directory).await {
             tracing::debug!(%reason, "reconciler pass skipped");
         }
@@ -514,6 +522,45 @@ fn abort_finalize_op(intent: &kivi_state::TxnIntent) -> kivi_state::Operation {
     }
 }
 
+/// Reads one transaction decision record: `Latest` (leader-precise)
+/// first, then the local applied state (`Any`) when this replica hosts
+/// the record tablet but does not lead it. See the call-site comment in
+/// [`resolve_one_intent`] for why the fallback is safe (write-once
+/// terminal decisions) and necessary (reader/proposer role split).
+async fn read_txn_record(
+    node: &Arc<ConsensusNode>,
+    record_tablet: TabletId,
+    record_key: &kivi_state::Key,
+    ctx: kivi_types::ReadContext,
+) -> Result<kivi_consensus::ServedRead, kivi_consensus::ReadError> {
+    match node
+        .read(
+            record_tablet,
+            &kivi_state::Operation::Get {
+                key: record_key.clone(),
+            },
+            kivi_types::ReadContract::Latest,
+            ctx,
+            kivi_types::LeaseEligibility::ConservativeOnly,
+        )
+        .await
+    {
+        Ok(served) => Ok(served),
+        Err(_) => {
+            node.read(
+                record_tablet,
+                &kivi_state::Operation::Get {
+                    key: record_key.clone(),
+                },
+                kivi_types::ReadContract::Any,
+                ctx,
+                kivi_types::LeaseEligibility::ConservativeOnly,
+            )
+            .await
+        }
+    }
+}
+
 /// Resolves one intent: follows the coordinator record's durable
 /// decision, or CAS-aborts an expired undecided transaction. Decided
 /// records converge only intents older than [`kivi_state::RESOLVE_GRACE_MICROS`]:
@@ -550,22 +597,21 @@ async fn resolve_one_intent(
         }
         return;
     };
-    // Read the decision record (fiat-routed to the coordinator tablet;
-    // followers redirect and this pass skips). Lease-ineligible: 2PC
-    // decisions integrate with final participant outcomes, never with a
-    // roster fast path.
-    let record = match node
-        .read(
-            record_tablet,
-            &Operation::Get {
-                key: record_key.clone(),
-            },
-            kivi_types::ReadContract::Latest,
-            ctx,
-            kivi_types::LeaseEligibility::ConservativeOnly,
-        )
-        .await
-    {
+    // Read the decision record (fiat-routed to the coordinator tablet).
+    // Latest first (leader-precise); on any failure fall back to the
+    // local applied state (`Any`: no barrier, no redirect — served from
+    // this replica's committed prefix when it hosts the record tablet).
+    // The fallback is safe exactly because decision records are
+    // write-once-terminal (`TxnState::transition_to` rejects
+    // terminal→terminal and →Begun): a locally applied terminal decision
+    // can never regress, so acting on it cannot contradict a fresher
+    // truth; a stale `Begun`/absence only defers to the lease paths
+    // below. Without the fallback, the reader (coordinator-tablet
+    // leader) is rarely the proposer (participant-tablet leader), and
+    // every known decision stalls to lease expiry. Lease-ineligible:
+    // 2PC decisions integrate with final participant outcomes, never
+    // with a roster fast path.
+    let record = match read_txn_record(node, record_tablet, &record_key, ctx).await {
         Ok(served) => {
             if let OperationResult::Value(Some(bytes)) = served.outcome {
                 match TxnRecord::decode(&bytes) {

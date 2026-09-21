@@ -189,7 +189,20 @@ fn auto_repair_after_hard_kill() {
     // (generation/tombstone fencing at open tombstones removed replicas).
     cluster.restart(victim).expect("victim restarts");
     let _ = cluster.wait_all_leaders();
-    std::thread::sleep(Duration::from_secs(5));
+    // No-resurrection as a quiescence predicate (never a fixed sleep):
+    // poll the invariant itself — the returnee converges with zero
+    // tablets still desiring the repaired node.
+    let resurrection_deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        if tablets_desiring(&cluster, 3) == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < resurrection_deadline,
+            "returned node keeps resurrecting obsolete desired placements"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
     assert_eq!(
         tablets_desiring(&cluster, 3),
         0,
@@ -477,7 +490,29 @@ fn split_survives_leader_failover() {
     // Recover the killed members after the failover registers: the split
     // resumes (founder-only initialize waits for its founder; quorum
     // steps skip repair-worthy replicas) with no orphan active ranges.
-    std::thread::sleep(Duration::from_secs(25));
+    // Semantic failover gate (never a fixed sleep): a live control
+    // leader outside the killed members proves the kills registered and
+    // orchestration moved on, so the restarts below exercise
+    // rejoin-after-detection rather than an unnoticed flap.
+    let failover_deadline = Instant::now() + Duration::from_secs(120);
+    let mut dead = vec![parent_leader];
+    if let Some(control) = control_victim
+        && control != parent_leader
+    {
+        dead.push(control);
+    }
+    loop {
+        if let Some(current) = cluster.control_leader_index()
+            && !dead.contains(&current)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < failover_deadline,
+            "control failover never registered the kills"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
     cluster
         .restart(parent_leader)
         .expect("parent leader restarts");

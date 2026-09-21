@@ -262,12 +262,57 @@ pub enum ReconcileStep {
 /// Pure function of (persisted phase, observed membership): the
 /// reconciler calls it every pass and executes the returned step, so a
 /// retried or reordered pass converges instead of duplicating harmful
-/// work. Leadership transfer is only requested when the departing
-/// source is the observed leader.
+/// work. Leadership transfer is requested both after convergence (the
+/// departing source still leads) and before reconfiguring out from
+/// under a leading source (graceful handoff via [`handoff_successor`]).
 ///
 /// The length is the phase dispatch table itself (one arm per phase);
 /// splitting it would scatter the state machine across helpers for no
 /// readability gain.
+#[allow(clippy::too_many_lines)]
+#[must_use]
+/// Graceful-handoff target when the migration source still leads: the
+/// most caught-up retained desired voter that already votes (desired
+/// order breaks lag ties).
+///
+/// Rationale: changing membership out from under a leading source
+/// removes the only leader — the uniform commit steps the source down
+/// and the group goes leaderless until a fresh election completes,
+/// burning client redirect budgets with `Overloaded` the whole window.
+/// Handing off first keeps a live leader across the reconfiguration, so
+/// migration is hitless. Returns `None` when no established voter can
+/// take over yet (all lagged/unknown): the caller then proceeds with the
+/// membership change rather than stalling migration behind a transfer —
+/// a brief election window beats a stuck plan. The newcomer target is
+/// never chosen: it only becomes a voter through the change itself.
+/// Single-voter moves have no candidate by construction (the outage is
+/// unavoidable there, not a handoff bug).
+fn handoff_successor(
+    observed: &ObservedMembership,
+    desired: &[NodeId],
+    source: NodeId,
+) -> Option<NodeId> {
+    desired
+        .iter()
+        .filter(|node| **node != source && observed.is_voter(**node))
+        .filter(|node| observed.lag_of(**node) <= CATCH_UP_LAG_THRESHOLD)
+        .min_by_key(|node| (observed.lag_of(**node), desired_position(desired, **node)))
+        .copied()
+}
+
+/// Position of `node` in `desired` (desired order breaks lag ties so the
+/// choice is deterministic for a given plan).
+fn desired_position(desired: &[NodeId], node: NodeId) -> usize {
+    desired
+        .iter()
+        .position(|candidate| *candidate == node)
+        .unwrap_or(usize::MAX)
+}
+
+/// Derives the next step for `plan` from `observed` (phase dispatch
+/// table; see the function body for the per-phase rules, including the
+/// graceful leadership handoff before reconfiguring out from under a
+/// leading migration source).
 #[allow(clippy::too_many_lines)]
 #[must_use]
 pub fn next_step(
@@ -340,6 +385,20 @@ pub fn next_step(
                     plan: plan.id,
                     phase: Phase::Committed,
                 }
+            } else if observed
+                .leader
+                .as_ref()
+                .is_some_and(|leader| leader.node() == source)
+                && let Some(to) = handoff_successor(observed, &desired, source)
+            {
+                // The source still leads: hand off to an established
+                // retained voter BEFORE changing membership (see
+                // [`handoff_successor`]), so the reconfiguration never
+                // removes a live leader.
+                ReconcileStep::TransferLeadership {
+                    tablet: plan.tablet,
+                    to,
+                }
             } else {
                 ReconcileStep::ChangeMembership {
                     tablet: plan.tablet,
@@ -357,6 +416,18 @@ pub fn next_step(
                 ReconcileStep::AdvancePlan {
                     plan: plan.id,
                     phase: Phase::Committed,
+                }
+            } else if observed
+                .leader
+                .as_ref()
+                .is_some_and(|leader| leader.node() == source)
+                && let Some(to) = handoff_successor(observed, &desired, source)
+            {
+                // Same graceful handoff on re-drives: never reconfigure
+                // out from under a leading source.
+                ReconcileStep::TransferLeadership {
+                    tablet: plan.tablet,
+                    to,
                 }
             } else {
                 ReconcileStep::ChangeMembership {
@@ -478,10 +549,65 @@ mod tests {
             &observed(&[1, 2, 3], &[4], Some(1)),
         );
         assert!(matches!(step, ReconcileStep::WaitCatchUp { .. }));
-        // Ready with a caught-up learner: change membership.
+        // Ready with a caught-up learner and a non-source leader: change
+        // membership (no handoff needed).
         let step = next_step(
             &plan_at(MigrationPhase::Ready),
             &observed(&[1, 2, 3], &[4], Some(2)),
+        );
+        assert!(matches!(step, ReconcileStep::ChangeMembership { .. }));
+    }
+
+    fn observed_with_lag(
+        voters: &[u64],
+        learners: &[u64],
+        leader: Option<u64>,
+        lag: &[(u64, u64)],
+    ) -> ObservedMembership {
+        ObservedMembership::with_lag(
+            ConsensusGroupId::of_tablet(TabletId::from_u64(17)),
+            voters.iter().copied().collect::<BTreeSet<_>>(),
+            learners.iter().copied().collect::<BTreeSet<_>>(),
+            leader.map(|node| ReplicaId::of_node(NodeId::from_u64(node))),
+            ConsensusTerm::new(3),
+            false,
+            lag.iter().copied().collect(),
+        )
+    }
+
+    #[test]
+    fn ready_hands_off_before_removing_a_leading_source() {
+        // Source still leads with caught-up retained voters: hand off to
+        // the first retained desired voter (2) instead of reconfiguring
+        // out from under the only leader.
+        let step = next_step(
+            &plan_at(MigrationPhase::Ready),
+            &observed_with_lag(&[1, 2, 3], &[4], Some(1), &[(1, 0), (2, 0), (3, 0)]),
+        );
+        assert!(matches!(
+            step,
+            ReconcileStep::TransferLeadership { to, .. } if to == NodeId::from_u64(2)
+        ));
+        // Same handoff on membership re-drives while the source leads.
+        let step = next_step(
+            &plan_at(MigrationPhase::MembershipChanging),
+            &observed_with_lag(&[1, 2, 3], &[4], Some(1), &[(1, 0), (2, 5), (3, 0)]),
+        );
+        assert!(matches!(
+            step,
+            ReconcileStep::TransferLeadership { to, .. } if to == NodeId::from_u64(3)
+        ));
+        // No caught-up established voter (lags unknown): proceed with the
+        // membership change rather than stalling behind a transfer.
+        let step = next_step(
+            &plan_at(MigrationPhase::Ready),
+            &observed(&[1, 2, 3], &[4], Some(1)),
+        );
+        assert!(matches!(step, ReconcileStep::ChangeMembership { .. }));
+        // Non-source leader: no handoff, straight to membership change.
+        let step = next_step(
+            &plan_at(MigrationPhase::Ready),
+            &observed_with_lag(&[1, 2, 3], &[4], Some(2), &[(1, 0), (2, 0), (3, 0)]),
         );
         assert!(matches!(step, ReconcileStep::ChangeMembership { .. }));
     }

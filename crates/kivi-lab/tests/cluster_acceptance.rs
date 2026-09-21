@@ -8,11 +8,16 @@
 //! every model key exactly, covers the range with a scan, and asserts
 //! `total_intents() == 0`. No wall-clock sleeps: only harness waits.
 //!
-//! A true 4-process ordered join (`spawn_ordered` + `add_node`) was tried
-//! first and dropped: without a rebalance warmup the fresh empty member
-//! destabilises single-attempt writes (`TooManyRedirects` in phase 1).
-//! Hash-layout tests cover 4-node joins with rebalance loops; ordered
-//! joins need the same warmup before they can carry load (harness gap).
+//! One long-lived client drives every phase (load, chaos rounds, verify)
+//! over reused pooled connections: retired tablets redirect transitively
+//! through tombstone chains, the client detects redirect non-progress
+//! (`A → B → A`, older generations) and refreshes from seeds, and every
+//! restart waits for exact tiling agreement before traffic resumes.
+//!
+//! Live fourth-node admission is covered by `node_admission` (one
+//! long-lived client through admission, directory catch-up, lineage
+//! churn, and rebalance with no warmup); this driver stays on the
+//! 3-process topology and focuses on split/merge/kill/restart chaos.
 //!
 //! Split targeting is largest-first by design: cross-tablet batches
 //! coordinate on the smallest participant id, so the coordinator tablet
@@ -21,19 +26,6 @@
 //! intents every round to prove it). Smallest-first rotation retires
 //! coordinators; the resolver follows migrated records through unified
 //! routing, covered by `coordinator_retirement_resolves_intents`.
-//!
-//! The driver mints one fresh client per phase (phase 1, each chaos
-//! round, verify): requests naming retired dynamic tablets kill
-//! connections instead of redirecting, so a reused client's cached routes
-//! can pin a dead range and burn whole calls. Fresh caches route by the
-//! live directory; the model (not the session) carries continuity.
-//!
-//! STATUS: red bug catcher (not a gate). The green acceptance gate is
-//! ``cluster_fabric_acceptance`` (failover/restart/checkpoint/equivalence
-//! without split/merge churn). Remaining defects, both pre-existing in the
-//! consensus native plane and unrelated to the fabric: (1) retired-tablet
-//! requests kill connections instead of redirecting; (2) the native plane
-//! can go deaf after repeated kill/restart cycles (rejoin divergence).
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -54,9 +46,6 @@ const MEDIUM_COUNT: usize = 200;
 const COUNTER_COUNT: usize = 20;
 const ROUND_KEYS: usize = 50;
 const ROUNDS: usize = 3;
-
-/// One member's ordered tiling view: `(tablet, range_start, range_end)`.
-type Tiling = Vec<(u64, Vec<u8>, Option<Vec<u8>>)>;
 
 /// Genesis tiling prefixes: `[0,64)`, `[64,128)`, `[128,192)`, `[192,+inf)`.
 fn spread_key(tablet: u8, index: usize) -> Vec<u8> {
@@ -457,58 +446,6 @@ fn pick_split_target(cluster: &Cluster, largest: bool) -> u64 {
     }
 }
 
-/// Waits until every live member reports the same exact ordered tiling at
-/// `width` — starts empty, ends at `+inf`, adjacent boundaries match —
-/// stable across consecutive polls. Plan completion is not cutover
-/// convergence (cutover publishes leader-first, peers after), and version
-/// arithmetic cannot express "every member agrees", so the driver polls
-/// the tiling itself. Loud deadline, no hope-sleeps.
-fn wait_tiling_agreed(cluster: &Cluster, width: usize, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    let mut last: Tiling = Vec::new();
-    let mut stable = 0u32;
-    loop {
-        let mut views: Vec<Tiling> = Vec::new();
-        let mut agreed = true;
-        for index in 0..cluster.member_count() {
-            if !cluster.alive(index) {
-                continue;
-            }
-            let mut ranges = cluster.ordered_ranges(index);
-            ranges.sort_by(|left, right| left.1.cmp(&right.1));
-            let complete = ranges.len() == width
-                && ranges[0].1.is_empty()
-                && ranges.last().expect("tiling nonempty").2.is_none()
-                && ranges
-                    .windows(2)
-                    .all(|pair| pair[0].2.as_deref() == Some(pair[1].1.as_slice()));
-            if !complete {
-                agreed = false;
-                break;
-            }
-            views.push(ranges);
-        }
-        if agreed && !views.is_empty() && views.iter().all(|view| *view == views[0]) {
-            if views[0] == last {
-                stable += 1;
-                if stable >= 2 {
-                    return;
-                }
-            } else {
-                stable = 0;
-                last.clone_from(&views[0]);
-            }
-        } else {
-            stable = 0;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "ordered tiling never agreed at width {width}"
-        );
-        std::thread::sleep(Duration::from_millis(500));
-    }
-}
-
 /// Waits until no live member reports any prepared intent. A leaked abort
 /// (finalize-abort lost under churn, outcome ignored by design) is reaped
 /// by the server resolver only after the transaction lease expires, so
@@ -571,7 +508,7 @@ fn split_then_merge(cluster: &Cluster, parent: u64) {
         "merge accepted: {merge}"
     );
     cluster.wait_merges_done(Duration::from_secs(600));
-    wait_tiling_agreed(cluster, 4, Duration::from_secs(300));
+    cluster.wait_tiling_agreed(4, Instant::now() + Duration::from_secs(300));
 }
 
 fn load_phase1(
@@ -635,12 +572,27 @@ fn chaos_round(
     }
     split_then_merge(cluster, pick_split_target(cluster, largest_first));
     let victim = round % cluster.member_count();
+    let incarnation_before = cluster.incarnation(victim);
+    let dir_before = cluster
+        .directory(victim)
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
     cluster.kill(victim);
     cluster
         .restart(victim)
         .unwrap_or_else(|error| panic!("node {victim} restarts: {error:?}"));
-    let _ = cluster.wait_all_leaders();
-    cluster.wait_converged_all();
+    // One coherent serving-ready predicate (incarnation fencing, stable
+    // leaders, converged applied, exact tiling agreement, replay floor):
+    // traffic resumes only on real directory state, never on a sleep, so
+    // the long-lived client's cached routes cannot outrun a lagging member.
+    cluster.wait_member_rejoined(
+        victim,
+        incarnation_before,
+        dir_before,
+        4,
+        Duration::from_secs(300),
+    );
     // Every round ends with zero intents: attributes any leak to the round
     // that made it (and reaps it via the resolver) instead of letting it
     // wedge a later round's batch from afar. Point writes after the
@@ -745,18 +697,17 @@ fn run_acceptance(largest_first: bool) {
     let mut bytes_model: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
     let mut counter_model: HashMap<Vec<u8>, i64> = HashMap::new();
 
-    // One client per phase (fresh seeds, empty pool/cache/session each
-    // time). A reused client's cached routes can pin retired dynamic
-    // tablets, whose requests kill connections instead of redirecting and
-    // burn the whole call's endpoint budget; a fresh client routes by the
-    // live directory instead. The driver stays single and sequential, and
-    // the model (not the session) carries continuity across phases.
-    let phase1 = cluster.client();
-    load_phase1(&cluster, &phase1, &mut bytes_model, &mut counter_model);
+    // One long-lived client across all phases (same seeds, reused pooled
+    // connections, one route cache, one session): retired tablets redirect
+    // transitively, non-progress redirects refresh from seeds, and every
+    // restart gates on tiling agreement — so cached routes converge
+    // instead of pinning dead ranges. The model (not fresh caches)
+    // carries continuity across phases.
+    let client = cluster.client();
+    load_phase1(&cluster, &client, &mut bytes_model, &mut counter_model);
     cluster.wait_converged_all();
 
     for round in 0..ROUNDS {
-        let client = cluster.client();
         chaos_round(
             &mut cluster,
             &client,
@@ -773,8 +724,7 @@ fn run_acceptance(largest_first: bool) {
     let _ = cluster.snapshot_tablet(live, tablet);
     cluster.wait_converged_all();
 
-    let verify_client = cluster.client();
-    verify_phase3(&cluster, &verify_client, &bytes_model, &counter_model);
+    verify_phase3(&cluster, &client, &bytes_model, &counter_model);
     eprintln!(
         "acceptance: {} byte keys + {} counters verified, {} rounds of chaos",
         bytes_model.len(),

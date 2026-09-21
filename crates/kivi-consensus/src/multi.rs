@@ -1856,12 +1856,14 @@ impl ConsensusNode {
         Some(machine.object_count().await)
     }
 
-    /// Seeds an ordered split child from its local parent: keys strictly
-    /// below `split_key` go left, the rest go right (half-open `[start,
-    /// end)` boundary, never a hash midpoint). System (`\xff`) keys sort
-    /// past every user split point, so transaction decision records land in
-    /// the right child deterministically — and post-cutover record reads
+    /// Seeds an ordered split child from its local parent: routable keys
+    /// partition by the half-open `[start, end)` boundary, never a hash
+    /// midpoint. Routed-by-fiat keys (system `\xff` records) copy to the
+    /// right child deterministically — and post-cutover record reads
     /// route by the same ordered rule, so recovery always finds them.
+    /// Non-unique index entries copy by embedded primary, so each entry
+    /// stays beside the primary the unified router co-locates it with
+    /// (unique entries carry no primary and copy by their own bytes).
     /// Sessions copy wholesale to the child; prepared intents are NOT
     /// copied and never migrate (a copy would fork the reservation):
     /// the reconciler only seals parents with zero unresolved intents, so
@@ -1897,8 +1899,20 @@ impl ConsensusNode {
         let (objects, sessions) = parent_machine.export_topology_copy().await;
         let mut half = Vec::new();
         for (key, object) in objects {
-            let is_left = key.as_bytes() < split_key.as_slice();
-            if is_left == left {
+            let bytes = key.as_bytes();
+            let is_left = if bytes.first().is_some_and(|byte| *byte == 0xFF) {
+                // Routed-by-fiat system keys sort past every user split
+                // point: right child, matching post-cutover routing.
+                !left
+            } else if let Some(primary) = kivi_state::parse_index_primary(bytes) {
+                // Co-located index entries follow their primary across the
+                // boundary; the median never anchors on an index key, so
+                // its own bytes never decide placement.
+                (primary.as_slice() < split_key.as_slice()) == left
+            } else {
+                (bytes < split_key.as_slice()) == left
+            };
+            if is_left {
                 half.push((key, object));
             }
         }

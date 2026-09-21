@@ -1378,18 +1378,24 @@ impl NativeClient {
         // terminates: every seed is tried at most once per call, and
         // the redirect budget backstops everything else.
         // Redirect convergence guard: (tablet, endpoint, dir_version)
-        // triples already followed this call. A redirect carrying no
-        // genuinely new information (same endpoint/generation for the
-        // same tablet) is usually an election/observation window, not a
-        // dead end: back off and retry WITHOUT spending redirect budget
-        // (the retried hop re-reads fresh state and converges when the
-        // election lands). Only a long streak of zero-progress hops
-        // fails over to an untried seed. This structurally fixes the
-        // `TooManyRedirects` ping-pong seen under severe concurrent
-        // load: stale hints wait out the window instead of burning the
-        // budget on identical information.
+        // triples already followed this call, plus per-tablet version
+        // knowledge. A redirect is progress only if routing knowledge
+        // actually improves: a newer directory version, or a never-seen
+        // tablet at the current version (a sibling at the same generation).
+        // Anything else — an exact repeat, a revisited tablet at the same
+        // or older version, or an older version for a new tablet
+        // (`A@v10 → B@v9`) — is non-progress: back off and retry WITHOUT
+        // spending redirect budget (the retried hop re-reads fresh state
+        // and converges when the election/topology lands). Only a long
+        // streak of zero-progress hops fails over to an untried seed by
+        // refreshing routing from the seeds (the trusted source) instead
+        // of burning the normal budget on a cycle like `A → B → A`.
+        // Retries stay bounded: the streak cap times the redirect budget
+        // bounds every call.
         let mut tried: Vec<String> = Vec::new();
         let mut visited_redirects: Vec<(u64, String, u64)> = Vec::new();
+        let mut visited_tablets: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut max_dir_version: u64 = 0;
         let mut stale_repeats: u32 = 0;
         let mut seed_cursor = 0usize;
         // Fresh-redirect follow: a redirect names the authority directly,
@@ -1570,42 +1576,25 @@ impl NativeClient {
                             info.endpoint.clone(),
                             info.dir_version.as_u64(),
                         );
-                        if visited_redirects.contains(&triple) {
-                            // No forward progress: the same authority
-                            // answered the same generation again. That is
-                            // normally an election/observation window (all
-                            // members agree on a stale hint until the new
-                            // leader emerges), NOT a dead end: back off
-                            // and retry without spending redirect budget,
-                            // so the call waits out the window instead of
-                            // burning budget on identical information.
-                            // Only a long zero-progress streak fails over
-                            // (the cluster is genuinely wedged, not
-                            // electing): evict, mark tried, spend one
-                            // redirect, and continue elsewhere. Retries
-                            // stay bounded: the streak cap times the
-                            // redirect budget bounds every call.
-                            stale_repeats += 1;
-                            overloaded_streak = 0;
-                            if stale_repeats > MAX_STALE_REPEATS {
-                                stale_repeats = 0;
-                                self.drop_connection(&endpoint);
-                                self.shared.routes.evict_endpoint(&endpoint);
-                                self.shared.tablet_leaders.evict_endpoint(&endpoint);
-                                if !tried.contains(&endpoint) {
-                                    tried.push(endpoint);
-                                }
-                                redirects += 1;
-                                self.shared.redirects.fetch_add(1, Ordering::Relaxed);
-                                backoff(
-                                    self.shared.dial_backoff,
-                                    u32::try_from(redirects).unwrap_or(u32::MAX).min(6),
-                                );
-                            } else {
-                                backoff(self.shared.dial_backoff, stale_repeats.min(6));
-                            }
-                        } else {
+                        // Progress iff knowledge improves: exact repeats
+                        // never do; newer versions always do; same-version
+                        // siblings (new tablet, version == max) do; older
+                        // versions and same-version revisits do not.
+                        let tablet = info.tablet.as_u64();
+                        let version = info.dir_version.as_u64();
+                        let exact_repeat = visited_redirects.contains(&triple);
+                        let is_progress = !exact_repeat
+                            && (version > max_dir_version
+                                || (version == max_dir_version
+                                    && !visited_tablets.contains(&tablet)));
+                        // The very first redirect establishes the baseline:
+                        // `max_dir_version == 0` means nothing seen yet, so
+                        // any non-repeat is progress (covers version 0/1).
+                        let is_progress = is_progress || (!exact_repeat && max_dir_version == 0);
+                        if is_progress {
                             visited_redirects.push(triple);
+                            visited_tablets.insert(tablet);
+                            max_dir_version = max_dir_version.max(version);
                             stale_repeats = 0;
                             // Invalidate only the affected range/leader:
                             // `insert` evicts overlapping ranges for this
@@ -1636,6 +1625,44 @@ impl NativeClient {
                                 self.shared.dial_backoff,
                                 u32::try_from(redirects).unwrap_or(u32::MAX).min(6),
                             );
+                        } else {
+                            // No forward progress: a cycle (`A → B → A`),
+                            // a stale generation (`A@v10 → B@v9`), or the
+                            // same authority answering the same generation
+                            // again (election/observation window). Back off
+                            // and retry without spending redirect budget;
+                            // only a long zero-progress streak fails over
+                            // by refreshing routing from the seeds (evict,
+                            // mark tried, spend one redirect, continue
+                            // elsewhere). Retries stay bounded: the streak
+                            // cap times the redirect budget bounds calls.
+                            stale_repeats += 1;
+                            overloaded_streak = 0;
+                            if stale_repeats > MAX_STALE_REPEATS {
+                                stale_repeats = 0;
+                                // Refresh from the trusted source: drop the
+                                // suspect connection, evict its routes, and
+                                // re-resolve through untried seeds instead
+                                // of following another stale hint.
+                                self.drop_connection(&endpoint);
+                                self.shared.routes.evict_endpoint(&endpoint);
+                                self.shared.tablet_leaders.evict_endpoint(&endpoint);
+                                if !tried.contains(&endpoint) {
+                                    tried.push(endpoint);
+                                }
+                                // Clear the direct-follow so the next hop
+                                // re-resolves (the stale hint is not
+                                // followed further).
+                                follow = None;
+                                redirects += 1;
+                                self.shared.redirects.fetch_add(1, Ordering::Relaxed);
+                                backoff(
+                                    self.shared.dial_backoff,
+                                    u32::try_from(redirects).unwrap_or(u32::MAX).min(6),
+                                );
+                            } else {
+                                backoff(self.shared.dial_backoff, stale_repeats.min(6));
+                            }
                         }
                     } else {
                         overloaded_streak = 0;
@@ -2075,6 +2102,8 @@ impl NativeClient {
         // long streak.
         let mut tried: Vec<String> = Vec::new();
         let mut visited_redirects: Vec<(u64, String, u64)> = Vec::new();
+        let mut visited_tablets: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut max_dir_version: u64 = 0;
         let mut stale_repeats: u32 = 0;
         let mut seed_cursor = 0usize;
         self.shared.requests.fetch_add(1, Ordering::Relaxed);
@@ -2123,10 +2152,13 @@ impl NativeClient {
             match self.get_stream_attempt(&conn, key, hint) {
                 GetOutcome::Done(value) => return Ok(value),
                 GetOutcome::Reroute(triple) => {
-                    self.note_stream_reroute(
+                    Self::note_stream_reroute_versioned(
+                        self,
                         triple,
                         &endpoint,
                         &mut visited_redirects,
+                        &mut visited_tablets,
+                        &mut max_dir_version,
                         &mut stale_repeats,
                         &mut tried,
                         &mut redirects,
@@ -2165,29 +2197,45 @@ impl NativeClient {
         }
     }
 
-    /// Records one stream reroute: fresh triples spend redirect budget;
-    /// zero-progress repeats back off without spending it (election
-    /// windows), failing over only after [`MAX_STALE_REPEATS`].
-    fn note_stream_reroute(
+    /// Records one stream reroute: progress (newer version, or a new
+    /// tablet at the current version) spends redirect budget;
+    /// non-progress (exact repeats, revisited tablets, older versions —
+    /// `A → B → A`, `A@v10 → B@v9`) backs off without spending it
+    /// (election/topology windows), failing over only after
+    /// [`MAX_STALE_REPEATS`]. Mirrors the point-path convergence guard.
+    #[allow(clippy::too_many_arguments)]
+    fn note_stream_reroute_versioned(
         &self,
         triple: Option<(u64, String, u64)>,
         endpoint: &str,
         visited_redirects: &mut Vec<(u64, String, u64)>,
+        visited_tablets: &mut std::collections::HashSet<u64>,
+        max_dir_version: &mut u64,
         stale_repeats: &mut u32,
         tried: &mut Vec<String>,
         redirects: &mut usize,
     ) {
-        let repeat = triple
-            .as_ref()
-            .is_some_and(|triple| visited_redirects.contains(triple));
-        if repeat {
-            *stale_repeats += 1;
-        } else {
-            if let Some(triple) = triple {
-                visited_redirects.push(triple);
-            }
+        let Some((tablet, _, version)) = triple.as_ref().map(|(t, e, v)| (*t, e.clone(), *v))
+        else {
             *stale_repeats = 0;
+            *redirects += 1;
+            self.shared.redirects.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        let exact_repeat = visited_redirects.contains(triple.as_ref().expect("checked"));
+        let is_progress = !exact_repeat
+            && (version > *max_dir_version
+                || (version == *max_dir_version && !visited_tablets.contains(&tablet))
+                || *max_dir_version == 0);
+        if is_progress {
+            visited_redirects.push(triple.expect("checked"));
+            visited_tablets.insert(tablet);
+            *max_dir_version = (*max_dir_version).max(version);
+            *stale_repeats = 0;
+        } else {
+            *stale_repeats += 1;
         }
+        let repeat = !is_progress;
         if repeat && *stale_repeats <= MAX_STALE_REPEATS {
             backoff(self.shared.dial_backoff, (*stale_repeats).min(10));
         } else {

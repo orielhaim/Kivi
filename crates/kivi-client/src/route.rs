@@ -201,6 +201,29 @@ impl RouteCache {
         });
     }
 
+    /// Evicts every cached route covering `key` (ordered ranges) or
+    /// `hash` (hash ranges). Called when a prepare/finalize proves the
+    /// cache stale by serving on a different tablet than probed: without
+    /// eviction the next attempt re-probes the same dead range and
+    /// conflicts forever. The next probe re-scans fresh and converges.
+    pub fn evict_covering(&self, key: &[u8], hash: PartitionHash) {
+        let current = self.entries.load();
+        let next: Vec<RouteEntry> = current
+            .iter()
+            .filter(|existing| {
+                let covers = match &existing.range {
+                    PartitionRange::Ordered(range) => range.contains(key),
+                    PartitionRange::Hash(prefix) => prefix.contains(hash),
+                };
+                !covers
+            })
+            .cloned()
+            .collect();
+        if next.len() != current.len() {
+            self.entries.store(Arc::new(next));
+        }
+    }
+
     /// Inserts a learned route, evicting same-kind overlaps first so newer
     /// authority information always wins per range.
     pub fn insert(&self, entry: RouteEntry) {

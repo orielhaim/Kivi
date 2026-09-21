@@ -841,13 +841,18 @@ fn route_batch_key(
 }
 
 /// Routes one point key through a directory snapshot by the unified rule
-/// (mirrored in `kivi-server/src/compound.rs`; keep the two in sync):
+/// (mirrored in `kivi-server/src/compound.rs` and
+/// `kivi-server/src/cluster.rs`; keep the three in sync):
 ///
 /// - Transaction record keys route to the embedded coordinator tablet
 ///   while it is active (fiat, not hash: fast paths stay local); after
 ///   it retires, normal routing finds the seeded record object.
 /// - Projection keys route by their stripped primary (always co-located
 ///   with the primary).
+/// - Non-unique index entry keys route by their embedded primary (always
+///   co-located with the primary, so an `indexed_set` batch stays
+///   single-tablet). Unique entries carry no primary in the key and route
+///   by layout; unique indexed writes stay cross-tablet 2PC.
 /// - Everything else routes by layout: ordered ranges by key bytes, hash
 ///   ranges by partition hash (snapshots are single-layout, so exactly one
 ///   lookup can hit).
@@ -866,6 +871,9 @@ pub fn route_point_key(
     }
     if let Some(primary) = kivi_state::parse_projection_primary(key) {
         return route_normal_key(directory, namespace, primary);
+    }
+    if let Some(primary) = kivi_state::parse_index_primary(key) {
+        return route_normal_key(directory, namespace, &primary);
     }
     route_normal_key(directory, namespace, key)
 }

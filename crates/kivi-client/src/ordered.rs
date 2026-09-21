@@ -19,8 +19,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use kivi_state::{
     IndexId, IndexKind, Key, TxnId, TxnRecord, TxnState, decode_entry_value, decode_non_unique_key,
-    decode_unique_key, encode_non_unique_key, encode_non_unique_value, encode_unique_key,
-    encode_unique_value, prefix_successor, projection_key, term_prefix,
+    encode_non_unique_key, encode_non_unique_value, encode_unique_key, encode_unique_value,
+    parse_index_primary, parse_projection_primary, projection_key,
 };
 use kivi_types::{NamespaceId, TabletId};
 
@@ -145,6 +145,43 @@ pub enum ClientScanValue {
         /// Small canonical descriptor bytes for `object`.
         descriptor: Bytes,
     },
+}
+
+/// Maps one wire scan value onto its client shape (shared by page
+/// decoding and per-tablet term fan-out, so both paths project
+/// identically).
+#[must_use]
+fn scan_body_to_client(body: kivi_protocol::ScanValueBody) -> ClientScanValue {
+    match body {
+        kivi_protocol::ScanValueBody::Inline(bytes) => ClientScanValue::Inline(Bytes::from(bytes)),
+        kivi_protocol::ScanValueBody::Counter(counter) => ClientScanValue::Counter(counter),
+        kivi_protocol::ScanValueBody::Chunked {
+            manifest,
+            logical_len,
+        } => ClientScanValue::Chunked {
+            manifest,
+            logical_len,
+        },
+        kivi_protocol::ScanValueBody::Fabric {
+            fabric_id,
+            logical_len,
+            version,
+        } => ClientScanValue::Fabric {
+            fabric_id,
+            logical_len,
+            version,
+        },
+        kivi_protocol::ScanValueBody::Oversize { logical_len } => {
+            ClientScanValue::Oversize { logical_len }
+        }
+        kivi_protocol::ScanValueBody::Semantic { object, descriptor } => {
+            ClientScanValue::Semantic {
+                object,
+                descriptor: Bytes::from(descriptor),
+            }
+        }
+        kivi_protocol::ScanValueBody::None => ClientScanValue::Absent,
+    }
 }
 
 /// One scan page with its routing metadata.
@@ -325,40 +362,7 @@ impl NativeClient {
                     .into_iter()
                     .map(|entry| ClientScanEntry {
                         key: entry.key,
-                        value: match entry.value {
-                            kivi_protocol::ScanValueBody::None => ClientScanValue::Absent,
-                            kivi_protocol::ScanValueBody::Inline(bytes) => {
-                                ClientScanValue::Inline(Bytes::from(bytes))
-                            }
-                            kivi_protocol::ScanValueBody::Counter(counter) => {
-                                ClientScanValue::Counter(counter)
-                            }
-                            kivi_protocol::ScanValueBody::Chunked {
-                                manifest,
-                                logical_len,
-                            } => ClientScanValue::Chunked {
-                                manifest,
-                                logical_len,
-                            },
-                            kivi_protocol::ScanValueBody::Fabric {
-                                fabric_id,
-                                logical_len,
-                                version,
-                            } => ClientScanValue::Fabric {
-                                fabric_id,
-                                logical_len,
-                                version,
-                            },
-                            kivi_protocol::ScanValueBody::Oversize { logical_len } => {
-                                ClientScanValue::Oversize { logical_len }
-                            }
-                            kivi_protocol::ScanValueBody::Semantic { object, descriptor } => {
-                                ClientScanValue::Semantic {
-                                    object,
-                                    descriptor: Bytes::from(descriptor),
-                                }
-                            }
-                        },
+                        value: scan_body_to_client(entry.value),
                     })
                     .collect(),
                 exhausted,
@@ -672,6 +676,13 @@ pub struct AtomicBatchResult {
 const MAX_BATCH_ATTEMPTS: u32 = 3;
 /// Maximum same-transaction re-drives (ambiguous steps) per attempt.
 const MAX_BATCH_REDRIVES: u32 = 3;
+/// Maximum abort-finalize waves per prepared key: the Abort decision is
+/// already durable, so each wave redrives the same idempotent discard
+/// until the intent is observably resolved or the failure is terminal.
+/// Eight waves back off ~2.5s total — past any election/redirection
+/// window, far short of the 60s transaction lease the leak would
+/// otherwise wait out.
+const MAX_ABORT_WAVES: u32 = 8;
 
 impl NativeClient {
     /// Executes an atomic batch: all writes commit or none does.
@@ -912,6 +923,15 @@ impl NativeClient {
         let ready = match self.prepare_wave(namespace, writes, attempt, &drive.probed) {
             Ok(ready) => ready,
             Err((aborted, prepared)) => {
+                tracing::debug!(
+                    probed = ?drive
+                        .probed
+                        .values()
+                        .map(|(tablet, _)| tablet.as_u64())
+                        .collect::<Vec<_>>(),
+                    ?prepared,
+                    "2pc prepare failed; aborting partial reservations",
+                );
                 return self.abort_or_commit(namespace, writes, attempt, &prepared, aborted);
             }
         };
@@ -973,6 +993,24 @@ impl NativeClient {
             ) {
                 Ok(tablet) => {
                     if tablet != expected_tablet {
+                        // The server APPLIED this prepare on `tablet`
+                        // (intent created, `Ok` returned) but the probe
+                        // named a retired tablet: a stale cached route.
+                        // The intent MUST join the abort set (the abort
+                        // wave finalizes it) and the proven-stale cache
+                        // entries covering this key go, so the next
+                        // attempt re-probes fresh. Dropping the index
+                        // here orphans the intent with no record and no
+                        // owner — a wedge until lease expiry.
+                        prepared.push(index);
+                        observed.insert(tablet);
+                        self.evict_covering_for(namespace, &write.key);
+                        tracing::debug!(
+                            key = hex_key_trace(&write.key),
+                            probed = expected_tablet.as_u64(),
+                            served = tablet.as_u64(),
+                            "2pc prepare served-elsewhere; intent kept for abort, route evicted",
+                        );
                         return Err((BatchAttempt::Conflict, prepared));
                     }
                     observed.insert(tablet);
@@ -1017,7 +1055,9 @@ impl NativeClient {
             digest,
         } = attempt;
         // The probed set must equal the observed set: any drift means
-        // routing moved under the attempt.
+        // routing moved under the attempt. Evict the drifted keys'
+        // stale routes so the fresh plan re-probes instead of
+        // conflicting against retired tablets again.
         if prepared
             .observed
             .iter()
@@ -1025,6 +1065,22 @@ impl NativeClient {
             .collect::<std::collections::BTreeSet<_>>()
             != drive.probed.values().map(|(tablet, _)| *tablet).collect()
         {
+            tracing::debug!(
+                probed = ?drive
+                    .probed
+                    .values()
+                    .map(|(tablet, _)| tablet.as_u64())
+                    .collect::<Vec<_>>(),
+                observed = ?prepared
+                    .observed
+                    .iter()
+                    .map(|tablet| tablet.as_u64())
+                    .collect::<Vec<_>>(),
+                "2pc probe drift; evicting plan routes",
+            );
+            for write in writes {
+                self.evict_covering_for(namespace, &write.key);
+            }
             return self.abort_or_commit(
                 namespace,
                 writes,
@@ -1214,22 +1270,51 @@ impl NativeClient {
             .collect()
     }
 
-    /// Discovers one key's tablet: route-cache first (learned ranges need
-    /// no probe — hash ranges by partition hash, ordered ranges by key),
-    /// else a one-entry scan probe (which also warms the cache for the
-    /// waves below). Returns the tablet plus the freshest directory
-    /// version observed.
+    /// Discovers one key's tablet: co-located system/index keys resolve
+    /// through their primary first (route-cache first, one-entry scan
+    /// probes on misses), else the key itself. Returns the tablet plus
+    /// the freshest directory version observed.
     fn probe_tablet(
         &self,
         namespace: NamespaceId,
         key: &[u8],
     ) -> Result<(TabletId, u64), BatchAttempt> {
-        if let Some(hash) = kivi_state::PartitionHasher::V1.hash(namespace, key)
+        // Projection keys and non-unique index entries live beside their
+        // primary: probe the primary's tablet so prepares, probes, and
+        // server routing agree on placement.
+        if let Some(primary) = parse_projection_primary(key) {
+            let owned = primary.to_vec();
+            return self.probe_routable(namespace, &owned);
+        }
+        if let Some(primary) = parse_index_primary(key) {
+            return self.probe_routable(namespace, &primary);
+        }
+        self.probe_routable(namespace, key)
+    }
+
+    /// Evicts cached routes covering `key`: called when a prepare or
+    /// finalize proves the cache stale by serving on an unexpected
+    /// tablet. The next probe re-scans fresh instead of conflicting
+    /// against a retired tablet forever.
+    fn evict_covering_for(&self, namespace: NamespaceId, key: &[u8]) {
+        if let Some(hash) = kivi_state::PartitionHasher::V1.hash(namespace, key) {
+            self.shared.routes.evict_covering(key, hash);
+        }
+    }
+
+    /// Probes `route` for placement (route-cache first, one-entry scan
+    /// probe on miss, which also warms the cache for the waves below).
+    fn probe_routable(
+        &self,
+        namespace: NamespaceId,
+        route: &[u8],
+    ) -> Result<(TabletId, u64), BatchAttempt> {
+        if let Some(hash) = kivi_state::PartitionHasher::V1.hash(namespace, route)
             && let Some(entry) = self.shared.routes.lookup(hash)
         {
             return Ok((entry.tablet, entry.dir_version));
         }
-        if let Some(entry) = self.shared.routes.lookup_key(key) {
+        if let Some(entry) = self.shared.routes.lookup_key(route) {
             return Ok((entry.tablet, entry.dir_version));
         }
         let mut tries: u32 = 0;
@@ -1237,8 +1322,8 @@ impl NativeClient {
             let page = self
                 .scan_page(
                     namespace,
-                    Some(key.to_vec()),
-                    Some(key_successor(key)),
+                    Some(route.to_vec()),
+                    Some(key_successor(route)),
                     ScanDirection::Forward,
                     ScanConsistency::LatestPerTablet,
                     ScanProjection::KeysOnly,
@@ -1295,6 +1380,17 @@ impl NativeClient {
             match self.txn_finalize(namespace, &write.key, txn, commit, digest) {
                 Ok(FinalizeOutcome::Applied(version, tablet)) => {
                     if participant.is_some_and(|expected| expected != tablet) {
+                        // Same stale-probe class as a served-elsewhere
+                        // prepare: evict so the redrive re-probes fresh
+                        // instead of conflicting forever.
+                        self.evict_covering_for(namespace, &write.key);
+                        tracing::debug!(
+                            key = hex_key_trace(&write.key),
+                            expected = ?participant.map(kivi_types::TabletId::as_u64),
+                            served = tablet.as_u64(),
+                            commit,
+                            "2pc finalize lineage drift; evicting route",
+                        );
                         return Err(BatchAttempt::Conflict);
                     }
                     versions[order] = version;
@@ -1361,9 +1457,9 @@ impl NativeClient {
     }
 
     /// Persists the Abort decision (guarded CAS, never a blind overwrite)
-    /// and finalize-aborts every prepared key (best effort; the record
-    /// converges anything missed). Returns which decision the coordinator
-    /// record converged to: a lost race means a concurrent drive of this
+    /// and delivers an abort finalize per prepared key through the
+    /// durable wave. Returns which decision the coordinator record
+    /// converged to: a lost race means a concurrent drive of this
     /// transaction committed, and the caller must converge via commit.
     /// An ambiguous record read propagates as `Redrive` (the state is
     /// unknown — the same-transaction re-drive resolves it recovery-first).
@@ -1391,7 +1487,20 @@ impl NativeClient {
             // actually have committed — never finalize-abort a committed
             // transaction). A foreign digest under one `TxnId` fails the
             // attempt instead of following another transaction.
-            return match self.read_txn_record(namespace, &record_key) {
+            let reread = self.read_txn_record(namespace, &record_key);
+            if let Ok(record) = &reread {
+                tracing::debug!(
+                    coordinator = coordinator.as_u64(),
+                    state = ?record.as_ref().map(|record| record.state),
+                    "2pc abort decide failed; re-read decides the outcome",
+                );
+            } else {
+                tracing::debug!(
+                    coordinator = coordinator.as_u64(),
+                    "2pc abort decide failed and record unreadable; redriving",
+                );
+            }
+            return match reread {
                 Ok(Some(record)) if record.state == TxnState::Committed => {
                     if record.digest != digest {
                         return Err(BatchAttempt::Conflict);
@@ -1403,9 +1512,66 @@ impl NativeClient {
             };
         }
         for index in prepared {
-            let _ = self.txn_finalize(namespace, &writes[*index].key, txn, false, digest);
+            self.finalize_abort_durable(namespace, &writes[*index].key, txn, digest);
         }
         Ok(AbortOutcome::Aborted)
+    }
+
+    /// Delivers one abort finalize durably: the Abort decision is already
+    /// persisted, so a lost finalize would wedge the key behind a foreign
+    /// intent until transaction-lease expiry (the resolver only reaps
+    /// expired or grace-aged intents, and only when its reader/proposer
+    /// roles align). Retry transient failures on the SAME `TxnId`
+    /// (idempotent discard of our own intent — never a fresh identity),
+    /// bounded by [`MAX_ABORT_WAVES`]. Terminal outcomes end the wave:
+    /// `Applied`/`Gone` mean nothing of ours remains (a `Conflict` likewise
+    /// proves our intent is gone — prepares reserve the key, so no foreign
+    /// intent can coexist with ours), and terminal errors leave the
+    /// persisted record for the resolver/lease fallback.
+    fn finalize_abort_durable(
+        &self,
+        namespace: NamespaceId,
+        key: &[u8],
+        txn: TxnId,
+        digest: [u8; 32],
+    ) {
+        let mut waves = 0u32;
+        loop {
+            match self.txn_finalize(namespace, key, txn, false, digest) {
+                Err(error) if Self::retry_abort_wave(&error) && waves + 1 < MAX_ABORT_WAVES => {
+                    waves += 1;
+                    tracing::debug!(
+                        waves,
+                        %error,
+                        "2pc abort finalize transient; redriving same txn id",
+                    );
+                    backoff(Duration::from_millis(20), waves.min(6));
+                }
+                // Applied/Gone/Conflict (nothing of ours remains) and
+                // terminal errors (the persisted record converges the
+                // rest): the wave for this key is over either way.
+                outcome => {
+                    if waves > 0 || outcome.is_err() {
+                        tracing::debug!(
+                            waves,
+                            resolved = outcome.is_ok(),
+                            "2pc abort finalize wave done",
+                        );
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Whether an abort-finalize failure is worth redriving on the same
+    /// `TxnId`: transport/routing failures (the finalize definitely did
+    /// not execute, or may have — both safe under the same idempotent
+    /// discard) plus redirect-budget exhaustion after convergence churn
+    /// (a backed-off redrive lands on the converged directory).
+    /// Semantic rejections are terminal for the wave.
+    fn retry_abort_wave(error: &ClientError) -> bool {
+        is_ambiguous(error) || matches!(error, ClientError::TooManyRedirects)
     }
 
     /// Sends one prepare (OCC + intent reservation, no visible mutation).
@@ -1624,6 +1790,16 @@ impl From<BatchAttempt> for ClientError {
             BatchAttempt::Error(error) => error,
         }
     }
+}
+
+/// Short hex for 2PC debug lines (first key bytes only, no model data).
+fn hex_key_trace(key: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for byte in key.iter().take(8) {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 /// Whether an error is ambiguous (the step may or may not have executed):
@@ -1973,8 +2149,11 @@ impl NativeClient {
     }
 
     /// Equality lookup over a non-unique index: all primaries currently
-    /// indexed under `term`, in primary-key order. Stale entries (primary
-    /// moved or deleted since) are skipped by version validation.
+    /// indexed under `term`, in primary-key order. Entries live beside
+    /// their primaries, so the lookup fans out per tablet: every tablet
+    /// reports the primaries it holds for the term (bounded page each),
+    /// and version validation skips stale entries (primary moved or
+    /// deleted since).
     ///
     /// # Errors
     ///
@@ -1986,21 +2165,8 @@ impl NativeClient {
         term: &[u8],
         limit: usize,
     ) -> Result<Vec<Vec<u8>>, ClientError> {
-        let prefix = term_prefix(index, term, false);
-        let end = prefix_successor(&prefix);
-        let options = ScanOptions {
-            start: Some(prefix),
-            end,
-            direction: ScanDirection::Forward,
-            consistency: ScanConsistency::LatestPerTablet,
-            projection: ScanProjection::KeysAndValues,
-            max_items_per_page: 1000,
-            max_bytes_per_page: 1 << 20,
-            limit: Some(limit.min(INDEX_RESOLVE_LIMIT)),
-        };
-        let entries = self.scan(namespace, &options)?;
         let mut hits: Vec<IndexHit> = Vec::new();
-        for entry in entries {
+        for entry in self.index_term_entries(namespace, index, term, limit)? {
             let (found_index, found_term, primary) = decode_non_unique_key(&entry.key)
                 .map_err(|_| ClientError::Internal("index entry failed to decode".to_owned()))?;
             if found_index != index || found_term != term {
@@ -2018,6 +2184,69 @@ impl NativeClient {
             });
         }
         self.validate_hits(namespace, &hits)
+    }
+
+    /// Lists every tablet's entries for a non-unique term: fans the term
+    /// out per tablet (each tablet answers from the entries beside its
+    /// primaries) and merges the slices in primary-key order. The window
+    /// is the term prefix itself (`[prefix, successor)`), so each
+    /// tablet's `scan_index_term` path answers its own slice directly;
+    /// the per-tablet walk below only advances the tiling cursor.
+    #[allow(clippy::too_many_lines)]
+    fn index_term_entries(
+        &self,
+        namespace: NamespaceId,
+        index: IndexId,
+        term: &[u8],
+        limit: usize,
+    ) -> Result<Vec<ClientScanEntry>, ClientError> {
+        use kivi_protocol::{Opcode, ResponseBody};
+        use kivi_state::{prefix_successor, term_prefix};
+        let bound = limit.min(INDEX_RESOLVE_LIMIT);
+        let prefix = term_prefix(index, term, false);
+        let end = prefix_successor(&prefix);
+        let mut out: Vec<ClientScanEntry> = Vec::new();
+        // The server fans one term window out per tablet internally, so a
+        // single windowed scan covers every tablet's co-located slice.
+        let route_key = Key::from(prefix.clone());
+        let mut request = self.request_base(&route_key, Opcode::Scan);
+        request.namespace = namespace;
+        request.scan_direction = kivi_protocol::SCAN_FORWARD;
+        request.scan_projection = kivi_protocol::SCAN_KEYS_AND_VALUES;
+        request.scan_consistency = kivi_protocol::SCAN_LATEST_PER_TABLET;
+        request.scan_max_items = 1000;
+        request.scan_max_bytes = 1 << 20;
+        request.scan_start = Some(prefix);
+        request.scan_end.clone_from(&end);
+        let response = self.execute_raw(
+            &route_key,
+            Opcode::Scan,
+            || request.clone(),
+            None,
+            kivi_types::ReadContract::Latest,
+        )?;
+        let entries = match (response.status, response.body) {
+            (kivi_protocol::Status::Ok, ResponseBody::ScanPage { entries, .. }) => entries,
+            (status, body) => return Err(status_error(status, &body)),
+        };
+        for entry in entries {
+            let decoded = entry.key.clone();
+            let value = scan_body_to_client(entry.value);
+            if decode_non_unique_key(&decoded)
+                .is_ok_and(|(found, found_term, _)| found == index && found_term == term)
+            {
+                out.push(ClientScanEntry {
+                    key: decoded,
+                    value,
+                });
+                if out.len() >= bound {
+                    break;
+                }
+            }
+        }
+        out.sort_by(|left, right| left.key.cmp(&right.key));
+        out.truncate(bound);
+        Ok(out)
     }
 
     /// Unique-term lookup: the single primary owning `term`, if any and
@@ -2045,8 +2274,10 @@ impl NativeClient {
     }
 
     /// Range lookup over index terms `[start_term, end_term)`: primaries
-    /// for every term in the window, in `(term, primary)` order. Stale
-    /// entries are skipped by version validation.
+    /// for every term in the window, in `(term, primary)` order. Entries
+    /// live beside their primaries; the server fans the whole term range
+    /// out per tablet, so one windowed scan covers every term at once.
+    /// Stale entries are skipped by version validation.
     ///
     /// # Errors
     ///
@@ -2059,29 +2290,44 @@ impl NativeClient {
         end_term: &[u8],
         limit: usize,
     ) -> Result<Vec<Vec<u8>>, ClientError> {
+        use kivi_protocol::{Opcode, ResponseBody};
+        use kivi_state::term_prefix;
+        let bound = limit.min(INDEX_RESOLVE_LIMIT);
+        // One windowed scan: `[prefix(start), prefix(end))` fans out per
+        // tablet server-side, so every term in the range answers at once.
         let start = term_prefix(index, start_term, false);
         let end = term_prefix(index, end_term, false);
-        let options = ScanOptions {
-            start: Some(start),
-            end: Some(end),
-            direction: ScanDirection::Forward,
-            consistency: ScanConsistency::LatestPerTablet,
-            projection: ScanProjection::KeysAndValues,
-            max_items_per_page: 1000,
-            max_bytes_per_page: 1 << 20,
-            limit: Some(limit.min(INDEX_RESOLVE_LIMIT)),
+        let route_key = Key::from(start.clone());
+        let mut request = self.request_base(&route_key, Opcode::Scan);
+        request.namespace = namespace;
+        request.scan_direction = kivi_protocol::SCAN_FORWARD;
+        request.scan_projection = kivi_protocol::SCAN_KEYS_AND_VALUES;
+        request.scan_consistency = kivi_protocol::SCAN_LATEST_PER_TABLET;
+        request.scan_max_items = 1000;
+        request.scan_max_bytes = 1 << 20;
+        request.scan_start = Some(start);
+        request.scan_end = Some(end);
+        let response = self.execute_raw(
+            &route_key,
+            Opcode::Scan,
+            || request.clone(),
+            None,
+            kivi_types::ReadContract::Latest,
+        )?;
+        let entries = match (response.status, response.body) {
+            (kivi_protocol::Status::Ok, ResponseBody::ScanPage { entries, .. }) => entries,
+            (status, body) => return Err(status_error(status, &body)),
         };
-        let entries = self.scan(namespace, &options)?;
         let mut hits: Vec<IndexHit> = Vec::new();
         for entry in entries {
-            // A namespace may mix both spellings per index: try the
-            // non-unique form (primary in key) then the unique form
-            // (primary in value).
-            if let Ok((found_index, _, primary)) = decode_non_unique_key(&entry.key) {
+            if let Ok((found_index, found_term, primary)) = decode_non_unique_key(&entry.key) {
                 if found_index != index {
                     continue;
                 }
-                let bytes = match &entry.value {
+                if found_term.as_slice() < start_term || found_term.as_slice() >= end_term {
+                    continue;
+                }
+                let bytes = match scan_body_to_client(entry.value) {
                     ClientScanValue::Inline(bytes) => bytes.to_vec(),
                     _ => continue,
                 };
@@ -2092,23 +2338,13 @@ impl NativeClient {
                     primary_key: primary,
                     version: version.as_u64(),
                 });
-            } else if let Ok((found_index, _)) = decode_unique_key(&entry.key) {
-                if found_index != index {
-                    continue;
-                }
-                let bytes = match &entry.value {
-                    ClientScanValue::Inline(bytes) => bytes.to_vec(),
-                    _ => continue,
-                };
-                let (version, primary) = decode_entry_value(&bytes).map_err(|_| {
-                    ClientError::Internal("index value failed to decode".to_owned())
-                })?;
-                hits.push(IndexHit {
-                    primary_key: primary.to_vec(),
-                    version: version.as_u64(),
-                });
+            }
+            if hits.len() >= bound {
+                break;
             }
         }
+        hits.sort_by(|left, right| left.primary_key.cmp(&right.primary_key));
+        hits.truncate(bound);
         self.validate_hits(namespace, &hits)
     }
 

@@ -546,26 +546,70 @@ impl DirectorySnapshot {
         covering.into_iter().map(|(_, id)| id).collect()
     }
 
-    /// Successor-set routing for a retired tablet: each recorded successor
-    /// paired with its current active range.
+    /// Successor-set routing for a retired tablet: each live successor
+    /// paired with its current active range, resolved transitively.
     ///
     /// A split redirect names two ranges (`[start, K)`, `[K, end)`); a merge
-    /// names one. Entries whose successor is no longer active are omitted —
-    /// the caller re-resolves through a newer snapshot instead of guessing.
+    /// names one. Topology churn chains tombstones (split children later
+    /// merged, merged tablets later split): a recorded successor may itself
+    /// be retired, so resolution follows the tombstone chain to currently
+    /// active tablets. Entries with no live resolution are omitted — the
+    /// caller re-resolves through a newer snapshot instead of guessing.
+    /// Cycles are impossible by construction (retirement requires active
+    /// successors, so edges always point forward in lineage time), but a
+    /// visited guard bounds traversal regardless.
     #[must_use]
     pub fn successor_ranges(&self, tablet: TabletId) -> Vec<(TabletId, PartitionRange)> {
-        let Some(redirect) = self.redirect_of(tablet) else {
-            return Vec::new();
-        };
-        redirect
-            .successors()
+        let mut out = Vec::new();
+        let mut stack = vec![tablet];
+        let mut visited = std::collections::HashSet::new();
+        while let Some(current) = stack.pop() {
+            if !visited.insert(current) {
+                continue;
+            }
+            let Some(redirect) = self.redirect_of(current) else {
+                continue;
+            };
+            for successor in redirect.successors() {
+                let Some(descriptor) = self.get(*successor) else {
+                    continue;
+                };
+                match descriptor.state() {
+                    TabletState::Active => {
+                        out.push((*successor, descriptor.range().clone()));
+                    }
+                    TabletState::Tombstone => {
+                        stack.push(*successor);
+                    }
+                    TabletState::Allocated | TabletState::Inactive | TabletState::Fenced => {}
+                }
+            }
+        }
+        out.sort_by_key(|(tablet, _)| tablet.as_u64());
+        out.dedup_by_key(|(tablet, _)| tablet.as_u64());
+        out
+    }
+
+    /// Resolves a retired tablet to the single live successor owning `key`,
+    /// following tombstone chains transitively. Returns `None` when no
+    /// active successor covers the key in this snapshot (the caller must
+    /// refresh from a newer snapshot, never guess).
+    #[must_use]
+    pub fn resolve_successor(
+        &self,
+        tablet: TabletId,
+        key: &[u8],
+    ) -> Option<(TabletId, PartitionRange)> {
+        // Key-aware pick first: split children partition the parent range,
+        // so exactly one live successor covers the key. Fall back to the
+        // first live successor only when no range covers (hash layouts
+        // route by hash, not key bytes — the caller handles that case).
+        let successors = self.successor_ranges(tablet);
+        successors
             .iter()
-            .filter_map(|successor| {
-                self.get(*successor)
-                    .filter(|t| t.state() == TabletState::Active)
-                    .map(|descriptor| (*successor, descriptor.range().clone()))
-            })
-            .collect()
+            .find(|(_, range)| range.contains_key(key))
+            .or_else(|| successors.first())
+            .cloned()
     }
 
     /// Whether the active ordered ranges tile `[empty, +∞)` exactly: sorted
@@ -1498,6 +1542,95 @@ mod tests {
         assert!(successors[1].1.contains_key(b"z"));
         // Unknown tablets have no successors.
         assert!(dir.successor_ranges(TabletId::from_u64(99)).is_empty());
+    }
+
+    #[test]
+    fn chained_split_merge_resolves_transitively_to_live() {
+        // Split 1 → 2,3 then merge 2,3 → 4: tablet 1's recorded successors
+        // (2,3) are themselves tombstoned. Transitive resolution must still
+        // reach the live merged tablet for any key in the parent range.
+        use crate::range::OrderedRange;
+        let mut dir = DirectorySnapshot::bootstrap(
+            NS,
+            TabletId::from_u64(1),
+            PartitionRange::Ordered(OrderedRange::new(Vec::new(), None).expect("all")),
+            EPOCH,
+            GUARD,
+        )
+        .expect("genesis");
+        dir = activate_all(&dir, TabletId::from_u64(1));
+        dir = dir
+            .allocate(
+                TabletId::from_u64(2),
+                ordered_range(b"", Some(b"m")),
+                EPOCH,
+                GUARD,
+            )
+            .expect("left");
+        dir = dir
+            .allocate(
+                TabletId::from_u64(3),
+                ordered_range(b"m", None),
+                EPOCH,
+                GUARD,
+            )
+            .expect("right");
+        dir = dir.stage(TabletId::from_u64(2)).expect("stage left");
+        dir = dir.stage(TabletId::from_u64(3)).expect("stage right");
+        dir = dir.seal(TabletId::from_u64(1)).expect("seal parent");
+        dir = dir
+            .cutover_split(
+                TabletId::from_u64(1),
+                TabletId::from_u64(2),
+                TabletId::from_u64(3),
+            )
+            .expect("split cutover");
+        // Merge children into 4.
+        dir = dir
+            .allocate(
+                TabletId::from_u64(4),
+                ordered_range(b"", None),
+                EPOCH,
+                GUARD,
+            )
+            .expect("merged alloc");
+        dir = dir.stage(TabletId::from_u64(4)).expect("merged stage");
+        dir = dir.seal(TabletId::from_u64(2)).expect("seal left");
+        dir = dir.seal(TabletId::from_u64(3)).expect("seal right");
+        dir = dir
+            .cutover_merge(
+                TabletId::from_u64(2),
+                TabletId::from_u64(3),
+                TabletId::from_u64(4),
+            )
+            .expect("merge cutover");
+        // Direct successors of 1 are retired; transitive set is the live 4.
+        let transitive = dir.successor_ranges(TabletId::from_u64(1));
+        assert_eq!(
+            transitive,
+            vec![(
+                TabletId::from_u64(4),
+                PartitionRange::Ordered(OrderedRange::new(Vec::new(), None).expect("all"))
+            )]
+        );
+        // Key-aware resolution picks the live owner on both sides.
+        assert_eq!(
+            dir.resolve_successor(TabletId::from_u64(1), b"a")
+                .map(|(tablet, _)| tablet),
+            Some(TabletId::from_u64(4))
+        );
+        assert_eq!(
+            dir.resolve_successor(TabletId::from_u64(1), b"z")
+                .map(|(tablet, _)| tablet),
+            Some(TabletId::from_u64(4))
+        );
+        // Intermediate tombstones resolve forward too.
+        assert_eq!(
+            dir.resolve_successor(TabletId::from_u64(2), b"a")
+                .map(|(tablet, _)| tablet),
+            Some(TabletId::from_u64(4))
+        );
+        assert_eq!(dir.validate(), Ok(()));
     }
 
     #[test]

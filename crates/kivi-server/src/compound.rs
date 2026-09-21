@@ -41,6 +41,21 @@ pub async fn handle_scan(shared: &ClusterShared, request: &Request) -> (Response
     if directory.namespace() != request.namespace {
         return (invalid("unknown namespace"), Opcode::Scan);
     }
+    // Co-located index term windows bypass tiling routing: the term
+    // prefix is not a user key, so the cursor below would misroute it.
+    // Term lookups fan out per tablet through `scan_index_term`, and the
+    // client walks the tiling itself.
+    if kivi_state::ScanSpec::is_term_window(
+        request.scan_start.as_deref(),
+        request.scan_end.as_deref(),
+        request.scan_direction,
+    ) || kivi_state::ScanSpec::is_term_range_window(
+        request.scan_start.as_deref(),
+        request.scan_end.as_deref(),
+        request.scan_direction,
+    ) {
+        return scan_term_fanout(shared, &directory, request).await;
+    }
     let direction = match request.scan_direction {
         kivi_protocol::SCAN_FORWARD => ScanDirection::Forward,
         kivi_protocol::SCAN_REVERSE => ScanDirection::Reverse,
@@ -363,6 +378,112 @@ fn invalid(detail: &str) -> Response {
     }
 }
 
+/// Fans one co-located term window out per tablet: every active ordered
+/// tablet lists its own `(index, term)` entries and the pages merge
+/// client-side. The term prefix is not a user key, so tiling routing
+/// cannot place it — fan-out replaces routing here.
+async fn scan_term_fanout(
+    shared: &ClusterShared,
+    directory: &DirectorySnapshot,
+    request: &Request,
+) -> (Response, Opcode) {
+    let projection = match request.scan_projection {
+        kivi_protocol::SCAN_KEYS_ONLY => ScanProjection::KeysOnly,
+        kivi_protocol::SCAN_KEYS_AND_VALUES => ScanProjection::KeysAndValues,
+        _ => return (invalid("unknown scan projection"), Opcode::Scan),
+    };
+    let direction = match request.scan_direction {
+        kivi_protocol::SCAN_FORWARD => ScanDirection::Forward,
+        kivi_protocol::SCAN_REVERSE => ScanDirection::Reverse,
+        _ => return (invalid("unknown scan direction"), Opcode::Scan),
+    };
+    let Ok(spec) = ScanSpec::new(
+        request.scan_start.clone(),
+        request.scan_end.clone(),
+        direction,
+        (request.scan_max_items.min(SERVER_SCAN_MAX_ITEMS)) as usize,
+        (request.scan_max_bytes.min(SERVER_SCAN_MAX_BYTES)) as usize,
+        projection,
+    ) else {
+        return (invalid("invalid scan window"), Opcode::Scan);
+    };
+    let contract = match request.scan_consistency {
+        kivi_protocol::SCAN_ANY => ReadContract::Any,
+        _ => ReadContract::Latest,
+    };
+    let ctx = super::cluster::read_ctx();
+    let mut merged: Vec<kivi_protocol::ScanEntryBody> = Vec::new();
+    // First active tablet anchors the page routing fields; entries merge
+    // across all of them.
+    let mut anchor: Option<(u64, Vec<u8>, Option<Vec<u8>>)> = None;
+    for tablet in directory.tablets() {
+        if !tablet.state().is_writable() {
+            continue;
+        }
+        let PartitionRange::Ordered(range) = tablet.range() else {
+            return (invalid("scan requires an ordered namespace"), Opcode::Scan);
+        };
+        let tablet_id = tablet.id();
+        // Term fan-out reads each tablet's leader: followers redirect
+        // like any strong scan (the client follows them per tablet
+        // instead of failing the whole fan-out here).
+        match shared.node.scan(tablet_id, &spec, contract, ctx).await {
+            Err(error) => {
+                return (
+                    super::cluster::shape_read_error(shared, tablet_id, &error).await,
+                    Opcode::Scan,
+                );
+            }
+            Ok(served) => {
+                if anchor.is_none() {
+                    anchor = Some((
+                        tablet_id.as_u64(),
+                        range.start().to_vec(),
+                        range.end().map(<[u8]>::to_vec),
+                    ));
+                }
+                // No early break on the merged cap: per-tablet slices are
+                // individually budgeted, but tablets serve in storage
+                // order, not key order — stopping at the first full slice
+                // would silently omit lower-sorting keys from later
+                // tablets. Query every tablet, then sort + truncate once
+                // for an exact top-N page by key.
+                merged.extend(served.page.entries.iter().map(|entry| {
+                    kivi_protocol::ScanEntryBody {
+                        key: entry.key.as_bytes().to_vec(),
+                        value: scan_value_body(entry.value.as_ref()),
+                    }
+                }));
+            }
+        }
+    }
+    merged.sort_by(|left, right| left.key.cmp(&right.key));
+    merged.truncate((request.scan_max_items.min(SERVER_SCAN_MAX_ITEMS)) as usize);
+    let (tablet, range_start, range_end) = anchor.unwrap_or((0, Vec::new(), None));
+    // Bounded single-shot contract: term scans merge every tablet's
+    // budgeted slice and return the exact top-N by key. There is no
+    // cursor protocol across calls (clients bound with their own limit
+    // at or below the server cap), so `exhausted` is always true and
+    // `last_key` unset — callers must size their bound to their
+    // cardinality, never page a term window.
+    (
+        Response {
+            proof: None,
+            status: Status::Ok,
+            body: ResponseBody::ScanPage {
+                entries: merged,
+                exhausted: true,
+                last_key: None,
+                tablet,
+                range_start,
+                range_end,
+                dir_version: directory.version().as_u64(),
+            },
+        },
+        Opcode::Scan,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Atomic batch (single-tablet fast path over Raft)
 // ---------------------------------------------------------------------------
@@ -438,8 +559,8 @@ pub async fn handle_batch(shared: &ClusterShared, request: &Request) -> (Respons
 }
 
 /// Routes one batch key through the directory by the unified rule
-/// (see `super::cluster::route_key`; record fiat, projection stripping,
-/// then layout routing).
+/// (see `super::cluster::route_key`; record fiat, projection/index-primary
+/// stripping, then layout routing).
 fn route_batch_key(
     directory: &DirectorySnapshot,
     namespace: NamespaceId,
@@ -454,6 +575,9 @@ fn route_batch_key(
     }
     if let Some(primary) = kivi_state::parse_projection_primary(key) {
         return route_normal_key(directory, namespace, primary);
+    }
+    if let Some(primary) = kivi_state::parse_index_primary(key) {
+        return route_normal_key(directory, namespace, &primary);
     }
     route_normal_key(directory, namespace, key)
 }

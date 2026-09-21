@@ -4010,9 +4010,10 @@ impl ObjectStore {
         }
     }
 
-    /// Collects scan candidate keys in scan order, one past the page
-    /// budget (the extra slot tells a full page from an exhausted range).
-    /// Pure index walk: projection and liveness filter later.
+    /// Collects scan candidate keys in scan order. Skipped keys (system,
+    /// expired, out-of-window) still occupy candidate slots: the page
+    /// reports `stopped_on_budget` only when more candidates remain past
+    /// the emitted entries, so cursors never strand mid-range.
     fn scan_candidates<'a>(ordered: &'a BTreeSet<Key>, spec: &ScanSpec) -> Vec<&'a Key> {
         use core::ops::Bound;
         let mut candidates: Vec<&Key> = Vec::new();
@@ -4083,17 +4084,38 @@ impl ObjectStore {
             .ordered
             .as_ref()
             .ok_or(ScanError::OrderedIndexDisabled)?;
+        // Co-located index term cursors: a scan window covered by one
+        // `(index, term)` prefix lists the primaries indexed under that
+        // term from this tablet's co-located entries (term lookups fan
+        // out per tablet, so every tablet answers its own slice).
+        if let Some(term) = spec.index_term() {
+            return self.scan_index_term(&term, spec, now);
+        }
+        // Term ranges fan out identically over `[start_term, end_term)`.
+        if let Some(range) = spec.index_term_range() {
+            return self.scan_index_term_range(&range, spec, now);
+        }
         let candidates = Self::scan_candidates(ordered, spec);
         let mut entries = Vec::new();
         let mut bytes_used: usize = 0;
         let mut last_key: Option<Key> = None;
         let mut stopped_on_budget = false;
+        // Candidates carry the +1 lookahead slot; skipped keys never
+        // emit but still count toward proving more keys remain.
         for key in candidates {
             if entries.len() >= spec.max_items {
                 stopped_on_budget = true;
                 break;
             }
             if key.is_system() {
+                continue;
+            }
+            // Non-unique index entries ride beside their primaries and
+            // never surface in range scans; term lookups enumerate them
+            // through `scan_index_term` below.
+            if crate::is_index_key(key.as_bytes())
+                && crate::parse_index_primary(key.as_bytes()).is_some()
+            {
                 continue;
             }
             if !spec.contains(key.as_bytes()) {
@@ -4148,11 +4170,11 @@ impl ObjectStore {
                     }
                 }),
             };
-            last_key = Some(key.clone());
             entries.push(ScanEntry {
                 key: key.clone(),
                 value,
             });
+            last_key = Some(key.clone());
         }
         // `exhausted` is exact in every case except a page that fills to
         // exactly `max_items` at the range end (one extra empty page may
@@ -4163,6 +4185,163 @@ impl ObjectStore {
             exhausted: !stopped_on_budget,
             last_key,
         })
+    }
+
+    /// Lists this tablet's co-located entries for one non-unique term:
+    /// every `(index, term, primary)` entry stored here whose primary is
+    /// live at the indexed version. Entries ride beside their primaries,
+    /// so each tablet answers its own slice and term lookups fan out per
+    /// tablet instead of by global term bytes. Full ordered iteration
+    /// (not range-seeked): co-located entries sort outside the term
+    /// window by construction, so window containment would reject every
+    /// entry. Primaries sort the result for deterministic pages.
+    #[allow(clippy::too_many_lines)]
+    /// Pages pre-sorted `(key, object)` matches into a [`ScanPage`]
+    /// under the projection/item/byte budgets. Shared by the term and
+    /// term-range index scans, which differ only in matching and sort
+    /// order — never in paging semantics. `matched` carries one extra
+    /// item past `max_items` when more matches exist (the standard
+    /// exhaustion probe): a full page with no remainder still reports
+    /// `exhausted`.
+    fn page_sorted_matches(matched: Vec<(&Key, &StoredObject)>, spec: &ScanSpec) -> ScanPage {
+        let mut entries = Vec::new();
+        let mut bytes_used: usize = 0;
+        let mut last_key: Option<Key> = None;
+        let mut stopped_on_budget = false;
+        for (key, object) in matched {
+            if entries.len() >= spec.max_items {
+                stopped_on_budget = true;
+                break;
+            }
+            let value = match spec.projection {
+                ScanProjection::KeysOnly => None,
+                ScanProjection::KeysAndValues => Some(match object.value() {
+                    LogicalValue::Bytes(value) => {
+                        if bytes_used.saturating_add(value.len()) <= spec.max_bytes {
+                            bytes_used = bytes_used.saturating_add(value.len());
+                            ScannedValue::Inline(value.clone())
+                        } else if entries.is_empty() {
+                            ScannedValue::Oversize {
+                                logical_len: value.len() as u64,
+                            }
+                        } else {
+                            stopped_on_budget = true;
+                            break;
+                        }
+                    }
+                    LogicalValue::StrictCounter(counter) => {
+                        bytes_used = bytes_used.saturating_add(8);
+                        ScannedValue::Counter(*counter)
+                    }
+                    LogicalValue::Chunked(chunked) => ScannedValue::Chunked {
+                        manifest: chunked.manifest,
+                        logical_len: chunked.logical_len,
+                    },
+                    LogicalValue::Fabric(fabric) => ScannedValue::Fabric {
+                        fabric_id: fabric.id,
+                        logical_len: fabric.logical_len,
+                        version: fabric.version,
+                    },
+                    value @ (LogicalValue::CommutativeCounter(_)
+                    | LogicalValue::BoundedCounter(_)
+                    | LogicalValue::Semaphore(_)
+                    | LogicalValue::Lease(_)
+                    | LogicalValue::StreamShard(_)) => {
+                        let (object, descriptor) = value
+                            .scan_descriptor()
+                            .expect("semantic values project as descriptors");
+                        bytes_used = bytes_used.saturating_add(descriptor.len());
+                        ScannedValue::Semantic { object, descriptor }
+                    }
+                }),
+            };
+            last_key = Some(key.clone());
+            entries.push(ScanEntry {
+                key: key.clone(),
+                value,
+            });
+        }
+        ScanPage {
+            entries,
+            exhausted: !stopped_on_budget,
+            last_key,
+        }
+    }
+
+    fn scan_index_term(
+        &self,
+        term: &crate::IndexTermCursor,
+        spec: &ScanSpec,
+        now: UnixMicros,
+    ) -> Result<ScanPage, ScanError> {
+        let ordered = self
+            .ordered
+            .as_ref()
+            .ok_or(ScanError::OrderedIndexDisabled)?;
+        let mut matched: Vec<(&Key, &StoredObject)> = Vec::new();
+        for key in ordered {
+            if key.is_system() {
+                continue;
+            }
+            let Ok((found, found_term, _)) = crate::decode_non_unique_key(key.as_bytes()) else {
+                continue;
+            };
+            if found != term.index || found_term != term.term {
+                continue;
+            }
+            let Some(object) = self.get(key, now) else {
+                continue;
+            };
+            matched.push((key, object));
+        }
+        matched.sort_by(|left, right| left.0.cmp(right.0));
+        matched.truncate(spec.max_items.saturating_add(1));
+        Ok(Self::page_sorted_matches(matched, spec))
+    }
+
+    /// Lists this tablet's co-located entries for one `(index,
+    /// [start_term, end_term))` term range: every entry stored here whose
+    /// term falls in the range, ordered by `(term, primary)`. Same
+    /// co-location contract as [`scan_index_term`](Self::scan_index_term):
+    /// each tablet answers its own slice and range lookups fan out per
+    /// tablet.
+    #[allow(clippy::too_many_lines)]
+    fn scan_index_term_range(
+        &self,
+        range: &crate::IndexTermRangeCursor,
+        spec: &ScanSpec,
+        now: UnixMicros,
+    ) -> Result<ScanPage, ScanError> {
+        let ordered = self
+            .ordered
+            .as_ref()
+            .ok_or(ScanError::OrderedIndexDisabled)?;
+        let mut matched: Vec<(&Key, Vec<u8>, &StoredObject)> = Vec::new();
+        for key in ordered {
+            if key.is_system() {
+                continue;
+            }
+            let Ok((found, found_term, _)) = crate::decode_non_unique_key(key.as_bytes()) else {
+                continue;
+            };
+            if found != range.index {
+                continue;
+            }
+            if found_term < range.start_term || found_term >= range.end_term {
+                continue;
+            }
+            let Some(object) = self.get(key, now) else {
+                continue;
+            };
+            matched.push((key, found_term, object));
+        }
+        matched.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(right.0)));
+        matched.truncate(spec.max_items.saturating_add(1));
+        let matched: Vec<(&Key, &StoredObject)> = matched
+            .into_iter()
+            .map(|(key, _, object)| (key, object))
+            .collect();
+        Ok(Self::page_sorted_matches(matched, spec))
     }
 
     /// Computes logical telemetry at `now` for split/merge policy.
@@ -4194,14 +4373,19 @@ impl ObjectStore {
     /// two user keys — nothing interior to split at). System (`\xff`)
     /// keys are excluded from candidacy: they route by fiat (stripped
     /// remainder / coordinator), not by range, so they may sort outside
-    /// this tablet's range and must never anchor a range split. Leaders
-    /// compute this locally from a scan; no distributed histogram needed
-    /// at this stage.
+    /// this tablet's range and must never anchor a range split. Index
+    /// entry (`KIVI-IDX1`) keys are excluded for the same reason: they
+    /// route by embedded primary, not by their own bytes, so an index
+    /// key must never anchor a range boundary. Leaders compute this
+    /// locally from a scan; no distributed histogram needed at this stage.
     #[must_use]
     pub fn median_split_key(&self) -> Option<Key> {
         let ordered = self.ordered.as_ref()?;
-        // User keys only (index order preserved by the filter).
-        let candidates: Vec<&Key> = ordered.iter().filter(|key| !key.is_system()).collect();
+        // Routable keys only (index order preserved by the filter).
+        let candidates: Vec<&Key> = ordered
+            .iter()
+            .filter(|key| !key.is_system() && !crate::is_index_key(key.as_bytes()))
+            .collect();
         if candidates.len() < 2 {
             return None;
         }
@@ -5255,6 +5439,179 @@ mod tests {
             .collect()
     }
 
+    /// Index-term scan window `[prefix, successor)` for one `(index, term)`.
+    fn term_spec(index: crate::IndexId, term: &[u8], max_items: usize) -> ScanSpec {
+        let prefix = crate::term_prefix(index, term, false);
+        let end = crate::prefix_successor(&prefix).expect("prefix successor");
+        ScanSpec::new(
+            Some(prefix),
+            Some(end),
+            ScanDirection::Forward,
+            max_items,
+            1 << 20,
+            ScanProjection::KeysOnly,
+        )
+        .expect("term spec")
+    }
+
+    /// Index-term-range window `[prefix(start), prefix(end))`.
+    fn term_range_spec(
+        index: crate::IndexId,
+        start_term: &[u8],
+        end_term: &[u8],
+        max_items: usize,
+    ) -> ScanSpec {
+        ScanSpec::new(
+            Some(crate::term_prefix(index, start_term, false)),
+            Some(crate::term_prefix(index, end_term, false)),
+            ScanDirection::Forward,
+            max_items,
+            1 << 20,
+            ScanProjection::KeysOnly,
+        )
+        .expect("term range spec")
+    }
+
+    fn put_index_entry(
+        store: &mut ObjectStore,
+        index: crate::IndexId,
+        term: &[u8],
+        primary: &[u8],
+    ) {
+        store
+            .apply(
+                &Mutation::PutBytes {
+                    key: Key::from(crate::encode_non_unique_key(index, term, primary)),
+                    value: bytes::Bytes::from_static(b"entry"),
+                },
+                NOW,
+            )
+            .expect("index entry put");
+    }
+
+    fn entry_keys(page: &crate::ScanPage) -> Vec<Vec<u8>> {
+        page.entries
+            .iter()
+            .map(|entry| entry.key.as_bytes().to_vec())
+            .collect()
+    }
+
+    #[test]
+    fn index_term_scan_is_exact_ordered_and_filtered() {
+        let index = crate::IndexId::from_u64(7);
+        let mut store = ordered_store(&["plain"]);
+        // Out-of-order primaries under one term, plus decoys: another
+        // term, another index, and a plain key.
+        for primary in [b"c".as_slice(), b"a".as_slice(), b"b".as_slice()] {
+            put_index_entry(&mut store, index, b"t", primary);
+        }
+        put_index_entry(&mut store, index, b"other", b"a");
+        put_index_entry(&mut store, crate::IndexId::from_u64(8), b"t", b"a");
+        let page = store
+            .scan_range(&term_spec(index, b"t", 100), NOW)
+            .expect("term scan");
+        let keys = entry_keys(&page);
+        assert_eq!(keys.len(), 3, "exactly the term's entries, no duplicates");
+        assert!(page.exhausted);
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(keys, sorted, "entries arrive in key order");
+        for (key, primary) in keys.iter().zip([b"a", b"b", b"c"]) {
+            let (_, term, found) = crate::decode_non_unique_key(key).expect("entry key decodes");
+            assert_eq!(term, b"t");
+            assert_eq!(found, primary);
+        }
+    }
+
+    #[test]
+    fn index_term_scan_empty_term_is_exhausted() {
+        let index = crate::IndexId::from_u64(7);
+        let mut store = ordered_store(&["plain"]);
+        put_index_entry(&mut store, index, b"t", b"a");
+        let page = store
+            .scan_range(&term_spec(index, b"absent", 100), NOW)
+            .expect("empty term scan");
+        assert!(page.entries.is_empty());
+        assert!(page.exhausted);
+        assert_eq!(page.last_key, None);
+    }
+
+    #[test]
+    fn index_term_scan_pagination_probe_flags() {
+        let index = crate::IndexId::from_u64(7);
+        let mut store = ObjectStore::new();
+        store.set_ordered_indexing(true);
+        for primary in [b"a".as_slice(), b"b".as_slice(), b"c".as_slice()] {
+            put_index_entry(&mut store, index, b"t", primary);
+        }
+        // Budget below cardinality: full first page, not exhausted, the
+        // +1 probe names the resume boundary.
+        let page = store
+            .scan_range(&term_spec(index, b"t", 2), NOW)
+            .expect("paged term scan");
+        assert_eq!(page.entries.len(), 2);
+        assert!(!page.exhausted);
+        assert_eq!(entry_keys(&page).len(), 2);
+        // Budget above cardinality: everything, exhausted.
+        let full = store
+            .scan_range(&term_spec(index, b"t", 10), NOW)
+            .expect("full term scan");
+        assert_eq!(full.entries.len(), 3);
+        assert!(full.exhausted);
+    }
+
+    #[test]
+    fn index_term_range_respects_half_open_boundaries() {
+        let index = crate::IndexId::from_u64(7);
+        let mut store = ObjectStore::new();
+        store.set_ordered_indexing(true);
+        for term in [b"a".as_slice(), b"b".as_slice(), b"c".as_slice()] {
+            put_index_entry(&mut store, index, term, b"p");
+        }
+        let terms_in = |page: &crate::ScanPage| {
+            page.entries
+                .iter()
+                .map(|entry| {
+                    let (_, term, _) =
+                        crate::decode_non_unique_key(entry.key.as_bytes()).expect("decodes");
+                    term
+                })
+                .collect::<Vec<_>>()
+        };
+        // [a, c): start inclusive, end exclusive.
+        let page = store
+            .scan_range(&term_range_spec(index, b"a", b"c", 100), NOW)
+            .expect("range scan");
+        assert_eq!(terms_in(&page), vec![b"a".to_vec(), b"b".to_vec()]);
+        // [b, c): single term.
+        let page = store
+            .scan_range(&term_range_spec(index, b"b", b"c", 100), NOW)
+            .expect("single-term range");
+        assert_eq!(terms_in(&page), vec![b"b".to_vec()]);
+        // (term, primary) order across terms sharing a prefix tablet.
+        put_index_entry(&mut store, index, b"b", b"a");
+        let page = store
+            .scan_range(&term_range_spec(index, b"a", b"c", 100), NOW)
+            .expect("multi-entry range");
+        let pairs: Vec<(Vec<u8>, Vec<u8>)> = page
+            .entries
+            .iter()
+            .map(|entry| {
+                let (_, term, primary) =
+                    crate::decode_non_unique_key(entry.key.as_bytes()).expect("decodes");
+                (term, primary)
+            })
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                (b"a".to_vec(), b"p".to_vec()),
+                (b"b".to_vec(), b"a".to_vec()),
+                (b"b".to_vec(), b"p".to_vec()),
+            ]
+        );
+    }
+
     #[test]
     fn ordered_index_mirrors_state_and_scans_in_order() {
         let store = ordered_store(&["c", "a", "b"]);
@@ -5326,7 +5683,6 @@ mod tests {
                     if page.exhausted {
                         break;
                     }
-                    // Cursor resumes strictly after the last emitted key.
                     let mut next = last.as_bytes().to_vec();
                     next.push(0x00);
                     start = Some(next);
@@ -5667,8 +6023,24 @@ mod tests {
                 )
                 .expect("put");
         }
+        // Index entries route by embedded primary, not their own bytes:
+        // they must never anchor a range split either.
+        store
+            .apply(
+                &Mutation::PutBytes {
+                    key: Key::from(crate::encode_non_unique_key(
+                        crate::IndexId::from_u64(1),
+                        b"t",
+                        b"a",
+                    )),
+                    value: bytes::Bytes::from_static(b"0123456789abcdef"),
+                },
+                NOW,
+            )
+            .expect("put");
         // Candidates are just a/bb (total 3 bytes, half rounded): the
-        // median stays inside user keyspace despite 32 system bytes.
+        // median stays inside user keyspace despite 32 system bytes plus
+        // the index entry.
         assert_eq!(store.median_split_key(), Some(key("bb")));
         // A tablet holding only system keys has nothing to split.
         let mut systems_only = ObjectStore::new();

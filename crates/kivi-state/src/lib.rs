@@ -30,8 +30,8 @@ pub use index::{
     INDEX_ENCODING_VERSION, INDEX_FORMAT_TAG, IndexCodecError, IndexDefinition, IndexId, IndexKind,
     IndexProjections, IndexState, PROJECTION_PREFIX, decode_entry_value, decode_non_unique_key,
     decode_unique_key, encode_non_unique_key, encode_non_unique_value, encode_unique_key,
-    encode_unique_value, is_index_key, parse_projection_primary, prefix_successor, projection_key,
-    term_prefix,
+    encode_unique_value, is_index_key, parse_index_primary, parse_projection_primary,
+    prefix_successor, projection_key, term_prefix, term_prefix_parts,
 };
 use kivi_types::TabletId;
 pub use mutation::{ApplyError, ApplyOutcome, Mutation};
@@ -45,7 +45,8 @@ pub use ops::{
     DurableOutcome, ExpiryPolicy, OpError, Operation, OperationResult, SetCondition, outcome_for,
 };
 pub use scan::{
-    ScanDirection, ScanEntry, ScanError, ScanPage, ScanProjection, ScanSpec, ScannedValue,
+    IndexTermCursor, IndexTermRangeCursor, ScanDirection, ScanEntry, ScanError, ScanPage,
+    ScanProjection, ScanSpec, ScannedValue,
 };
 pub use semantics::{Caps, ConflictScope, OperationSemantics, semantics_of};
 pub use store::{

@@ -207,7 +207,12 @@ pub(crate) enum RouteError {
 /// Routes key bytes to their tablet through the current directory by the
 /// unified rule (mirrored in `kivi-engine/src/compound.rs` and
 /// `kivi-server/src/compound.rs`; keep the three in sync):
-/// record-key fiat, projection stripping, then layout routing.
+/// record-key fiat, projection/index-primary stripping, then layout routing.
+///
+/// Returns the retired tablet itself when the key's current owner is a
+/// tombstone: the caller redirects through
+/// [`successor_ranges`](kivi_tablet::DirectorySnapshot::successor_ranges)
+/// instead of treating the request as unroutable.
 pub(crate) fn route_key(shared: &ClusterShared, key: &[u8]) -> Result<TabletId, RouteError> {
     let snapshot = shared.directory_snapshot();
     if let Some((coordinator, _)) = kivi_state::parse_txn_record_key(key)
@@ -220,7 +225,67 @@ pub(crate) fn route_key(shared: &ClusterShared, key: &[u8]) -> Result<TabletId, 
     if let Some(primary) = kivi_state::parse_projection_primary(key) {
         return route_normal_key(&snapshot, shared.namespace, primary);
     }
+    if let Some(primary) = kivi_state::parse_index_primary(key) {
+        return route_normal_key(&snapshot, shared.namespace, &primary);
+    }
     route_normal_key(&snapshot, shared.namespace, key)
+}
+
+/// Redirects a request naming a retired tablet through its live
+/// successors: resolves the tombstone chain transitively to the active
+/// successor owning `key` (split children partition the parent range;
+/// chained split→merge→split lineages resolve through intermediate
+/// tombstones). Returns `None` when no live successor covers the key in
+/// this snapshot, letting the caller fall back to a retryable answer
+/// instead of guessing from untrustworthy local state.
+async fn retired_redirect(
+    shared: &ClusterShared,
+    tablet: TabletId,
+    key: &[u8],
+) -> Option<Response> {
+    let directory = shared.directory_snapshot();
+    let (successor, range) = directory.resolve_successor(tablet, key)?;
+    let endpoint = successor_endpoint(shared, successor).await?;
+    Some(Response {
+        proof: None,
+        status: Status::StaleRoute,
+        body: ResponseBody::Redirect(RedirectInfo {
+            dir_version: directory.version(),
+            tablet: successor,
+            epoch: TabletEpoch::INITIAL,
+            worker: WorkerId::from_u64(CLUSTER_WORKER),
+            endpoint: endpoint.to_string(),
+            range: range.clone(),
+        }),
+    })
+}
+
+/// Dialable native endpoint for one tablet's serving replicas: live
+/// migration sources first (voting until the terminal retire step),
+/// then desired voters, then static founders. Mirrors the candidate
+/// order of [`control_plane_redirect`](self::control_plane_redirect):
+/// a migrating successor's desired set names a learner that can never
+/// lead, so naming it would bounce the client into `Overloaded`.
+async fn successor_endpoint(shared: &ClusterShared, tablet: TabletId) -> Option<SocketAddr> {
+    let state = shared.node.control_state().await?;
+    let desired = state.desired(tablet)?;
+    let mut candidates: Vec<NodeId> = Vec::new();
+    for plan in state.live_plans_for(tablet) {
+        if !candidates.contains(&plan.from) {
+            candidates.push(plan.from);
+        }
+    }
+    for voter in &desired.replicas {
+        if !candidates.contains(voter) {
+            candidates.push(*voter);
+        }
+    }
+    candidates.into_iter().find_map(|voter| {
+        state
+            .node(voter)
+            .map(|record| record.native)
+            .or_else(|| shared.natives.get(&voter).copied())
+    })
 }
 
 /// Layout routing for ordinary keys.
@@ -413,79 +478,147 @@ fn build_directory(config: &ClusterServeConfig) -> anyhow::Result<DirectorySnaps
     .context("static tablet directory failed to build")
 }
 
+/// One committed topology cutover awaiting directory replay (splits and
+/// merges share the control `next_plan_id` sequence, so one sorted pass
+/// replays split→merge→split lineages with parents present).
+enum ReplayOp {
+    Split(kivi_control::SplitPlan),
+    Merge(kivi_control::MergePlan),
+}
+
+impl ReplayOp {
+    fn id(&self) -> u64 {
+        match self {
+            ReplayOp::Split(plan) => plan.id.as_u64(),
+            ReplayOp::Merge(plan) => plan.id.as_u64(),
+        }
+    }
+}
+
 /// Replays completed topology cutovers over the genesis tiling so a full
 /// cluster restart recovers the post-split/merge directory. Only plans at
 /// or past `CutoverCommitted` affect the directory (earlier phases keep
 /// children inactive and the parent authoritative); replay applies them in
-/// plan-id order, deterministically rebuilding the same ranges. Old
-/// parents stay retired with redirects — they never reappear as active.
+/// global plan-id order (splits and merges interleave: split→merge→split
+/// lineages only rebuild when each cutover sees its parents), deterministically
+/// rebuilding the same ranges. Old parents stay retired with redirects —
+/// they never reappear as active.
+#[allow(clippy::too_many_lines)]
 async fn replay_topology_from_control(shared: &ClusterShared) {
-    let Some(state) = shared.node.control_state().await else {
+    replay_committed_topology(&shared.node, &shared.directory).await;
+}
+
+/// Replays committed split/merge cutovers into `directory` from the
+/// replicated control image. Idempotent: snapshots that already contain a
+/// cutover re-apply as no-ops, and publication happens only when the
+/// snapshot actually changed.
+///
+/// Runs at startup (restart recovery) AND on every reconciler pass on
+/// every node: a freshly admitted member starts from its genesis tiling
+/// and missed every past cutover, and a member down during a cutover push
+/// misses it — without continuous replay their serving directories diverge
+/// permanently and produce contradictory tombstone redirects. The admin
+/// cutover push stays the fast path (same-pass convergence); this is the
+/// correctness backstop that makes "every member eventually applies every
+/// committed cutover" true rather than hoped-for.
+pub(crate) async fn replay_committed_topology(
+    node: &ConsensusNode,
+    directory: &Arc<arc_swap::ArcSwap<DirectorySnapshot>>,
+) {
+    let Some(state) = node.control_state().await else {
         return;
     };
-    let mut splits: Vec<kivi_control::SplitPlan> = state.splits().cloned().collect();
-    splits.sort_by_key(|plan| plan.id.as_u64());
-    let mut merges: Vec<kivi_control::MergePlan> = state.merges().cloned().collect();
-    merges.sort_by_key(|plan| plan.id.as_u64());
-    let mut directory = shared.directory_snapshot().as_ref().clone();
-    let mut changed = false;
-    for plan in splits {
-        if !matches!(
+    let mut ops: Vec<ReplayOp> = Vec::new();
+    for plan in state.splits().cloned() {
+        if matches!(
             plan.phase,
             kivi_control::SplitPhase::CutoverCommitted
                 | kivi_control::SplitPhase::ParentRetiring
                 | kivi_control::SplitPhase::Completed
         ) {
-            continue;
-        }
-        match apply_completed_split(&directory, &plan) {
-            Ok(next) => {
-                directory = next;
-                changed = true;
-            }
-            Err(reason) => {
-                tracing::warn!(
-                    plan = plan.id.as_u64(),
-                    parent = plan.parent.as_u64(),
-                    %reason,
-                    "topology replay skipped split cutover"
-                );
-            }
+            ops.push(ReplayOp::Split(plan));
         }
     }
-    for plan in merges {
-        if !matches!(
+    for plan in state.merges().cloned() {
+        if matches!(
             plan.phase,
             kivi_control::MergePhase::CutoverCommitted
                 | kivi_control::MergePhase::ParentsRetiring
                 | kivi_control::MergePhase::Completed
         ) {
-            continue;
+            ops.push(ReplayOp::Merge(plan));
         }
-        match apply_completed_merge(&directory, &plan) {
-            Ok(next) => {
-                directory = next;
-                changed = true;
+    }
+    // Global creation order: split and merge ids share the control
+    // `next_plan_id` sequence, so one sorted pass replays lineage chains
+    // (split→merge→split) with parents present. A fixpoint retry covers
+    // any residual ordering skew without masking real gaps.
+    ops.sort_by_key(ReplayOp::id);
+    let mut snapshot = directory.load().as_ref().clone();
+    let mut changed = false;
+    for _ in 0..ops.len().max(1) {
+        let mut progress = false;
+        let mut pending: Vec<ReplayOp> = Vec::new();
+        for op in ops.drain(..) {
+            let result = match &op {
+                ReplayOp::Split(plan) => apply_completed_split(&snapshot, plan)
+                    .map_err(|reason| (plan.id.as_u64(), plan.parent.as_u64(), reason)),
+                ReplayOp::Merge(plan) => apply_completed_merge(&snapshot, plan)
+                    .map_err(|reason| (plan.id.as_u64(), plan.merged.as_u64(), reason)),
+            };
+            match result {
+                Ok(next) => {
+                    // Idempotent replays return the same snapshot; only
+                    // count real transitions as progress to terminate.
+                    if next != snapshot {
+                        snapshot = next;
+                        changed = true;
+                    }
+                    progress = true;
+                }
+                Err((id, tablet, reason)) => {
+                    // Parent unknown yet (later pass may create it);
+                    // defer one round before warning.
+                    pending.push(op);
+                    tracing::debug!(
+                        plan = id,
+                        tablet,
+                        %reason,
+                        "topology replay deferred cutover"
+                    );
+                }
             }
-            Err(reason) => {
-                tracing::warn!(
-                    plan = plan.id.as_u64(),
-                    merged = plan.merged.as_u64(),
-                    %reason,
-                    "topology replay skipped merge cutover"
-                );
+        }
+        ops = pending;
+        if ops.is_empty() {
+            break;
+        }
+        if !progress {
+            for op in &ops {
+                match op {
+                    ReplayOp::Split(plan) => tracing::warn!(
+                        plan = plan.id.as_u64(),
+                        parent = plan.parent.as_u64(),
+                        "topology replay skipped split cutover"
+                    ),
+                    ReplayOp::Merge(plan) => tracing::warn!(
+                        plan = plan.id.as_u64(),
+                        merged = plan.merged.as_u64(),
+                        "topology replay skipped merge cutover"
+                    ),
+                }
             }
+            break;
         }
     }
     if changed {
-        match shared.publish_directory(directory) {
-            Ok(version) => {
-                tracing::info!(dir_version = version, "topology replay published directory");
-            }
-            Err(reason) => {
-                tracing::warn!(%reason, "topology replay publish failed");
-            }
+        if let Err(reason) = snapshot.validate() {
+            tracing::warn!(%reason, "topology replay publish failed");
+            return;
         }
+        let version = snapshot.version().as_u64();
+        directory.store(Arc::new(snapshot));
+        tracing::info!(dir_version = version, "topology replay published directory");
     }
 }
 
@@ -1971,7 +2104,10 @@ async fn handle_request(
 
 /// Serves one mutating request: propose through the tablet's group and
 /// shape the outcome (prepare outcomes name their tablet here, where the
-/// tablet is known rather than in the store).
+/// tablet is known rather than in the store). A request naming a retired
+/// tablet redirects through its live successors instead of failing: stale
+/// routes are normal distributed-system behavior after split/merge
+/// cutover, never a malformed connection.
 async fn handle_write(
     shared: &ClusterShared,
     tablet: TabletId,
@@ -2016,7 +2152,24 @@ async fn handle_write(
                 resolve_durable(shared, tablet, &operation, &outcome, opcode).await
             }
         },
-        Err(error) => shape_propose_error(shared, tablet, &error).await,
+        Err(error) => {
+            // Retired-tablet redirects take precedence over the generic
+            // migration answer: the directory names the live successors,
+            // so the client converges in one hop with transport intact.
+            if let ProposeError::Consensus(ConsensusError::Unavailable { reason }) = &error
+                && reason.contains("not served by this node")
+                && shared
+                    .directory_snapshot()
+                    .get(tablet)
+                    .is_none_or(|descriptor| !descriptor.state().is_writable())
+                && let Some(redirect) =
+                    retired_redirect(shared, tablet, operation.key().as_bytes()).await
+            {
+                redirect
+            } else {
+                shape_propose_error(shared, tablet, &error).await
+            }
+        }
     };
     (response, opcode)
 }
@@ -2027,7 +2180,8 @@ async fn handle_write(
 /// state or escalates, `Any` serves locally. Chunked roots resolve via
 /// sidecars under the same visibility boundary (the manifest comes from
 /// the served state, never newer). The served proof rides the response
-/// for `AtLeast` chaining.
+/// for `AtLeast` chaining. Reads naming a retired tablet redirect through
+/// its live successors like writes.
 async fn handle_read(
     shared: &ClusterShared,
     tablet: TabletId,
@@ -2080,7 +2234,22 @@ async fn handle_read(
             response.proof = Some(served.receipt);
             response
         }
-        Err(error) => shape_read_error(shared, tablet, &error).await,
+        Err(error) => {
+            if let kivi_consensus::ReadError::Consensus(ConsensusError::Unavailable { reason }) =
+                &error
+                && reason.contains("not served by this node")
+                && shared
+                    .directory_snapshot()
+                    .get(tablet)
+                    .is_none_or(|descriptor| !descriptor.state().is_writable())
+                && let Some(redirect) =
+                    retired_redirect(shared, tablet, operation.key().as_bytes()).await
+            {
+                redirect
+            } else {
+                shape_read_error(shared, tablet, &error).await
+            }
+        }
     };
     (response, opcode)
 }
@@ -2561,15 +2730,50 @@ fn replica_node(replica: kivi_consensus::ReplicaId) -> NodeId {
 /// `None` when no desired replica is known, letting the caller fall
 /// back to a retryable answer.
 async fn desired_redirect(shared: &ClusterShared, tablet: TabletId) -> Option<Response> {
+    if let Some(response) = control_plane_redirect(shared, tablet).await {
+        return Some(response);
+    }
+    // No control image or no desired placement yet (a freshly admitted,
+    // still data-empty member): redirect to a static founder instead of
+    // answering `Overloaded`. The founders host every genesis tablet and
+    // every split/merge child inherits a founder replica set until an
+    // explicit migration moves it, so a founder always routes closer to
+    // the authority than this node can. This keeps a non-serving member
+    // from becoming a routing black hole that burns client redirect
+    // budgets: the client follows one authoritative hop and converges.
+    static_founder_redirect(shared, tablet)
+}
+
+/// Redirects through the replicated desired placement (registry native
+/// endpoints first, static flags second).
+///
+/// Candidate order is serving truth, not placement goals: when a live
+/// migration plan moves `tablet`, the desired set already names the
+/// target (a learner that can never lead) while the source voter still
+/// serves. So the plan's source leads, then desired voters, so redirects
+/// always name a replica that can actually reach the leader instead of a
+/// future voter that answers `Overloaded` and burns client budgets.
+async fn control_plane_redirect(shared: &ClusterShared, tablet: TabletId) -> Option<Response> {
     let state = shared.node.control_state().await?;
     let desired = state.desired(tablet)?;
-    // Prefer the first desired voter with a known native endpoint
-    // (registry first, static flags second).
-    desired.replicas.iter().find_map(|voter| {
+    let mut candidates: Vec<NodeId> = Vec::new();
+    // Live migration sources first: they hold voting replicas until the
+    // terminal retire step (which completes the plan immediately after).
+    for plan in state.live_plans_for(tablet) {
+        if !candidates.contains(&plan.from) {
+            candidates.push(plan.from);
+        }
+    }
+    for voter in &desired.replicas {
+        if !candidates.contains(voter) {
+            candidates.push(*voter);
+        }
+    }
+    candidates.into_iter().find_map(|voter| {
         let endpoint = state
-            .node(*voter)
+            .node(voter)
             .map(|record| record.native)
-            .or_else(|| shared.natives.get(voter).copied())?;
+            .or_else(|| shared.natives.get(&voter).copied())?;
         let directory = shared.directory_snapshot();
         let range = directory
             .get(tablet)
@@ -2584,6 +2788,46 @@ async fn desired_redirect(shared: &ClusterShared, tablet: TabletId) -> Option<Re
                 worker: WorkerId::from_u64(CLUSTER_WORKER),
                 endpoint: endpoint.to_string(),
                 range,
+            }),
+        })
+    })
+}
+
+/// Redirects to a statically configured founder (lowest node id first,
+/// never self): the admission-time backstop when this node has no
+/// control image or desired placement for `tablet`. Founders host the
+/// genesis tiling and inherit into every child replica set, so they hold
+/// (or authoritatively redirect from) any tablet this node cannot serve.
+/// The range comes from the local directory (possibly a genesis view);
+/// the founder re-routes by its converged directory, so a stale range
+/// costs one extra hop, never a wrong authority: the client's
+/// version-aware progress treats the founder's newer generation as
+/// progress and converges.
+fn static_founder_redirect(shared: &ClusterShared, tablet: TabletId) -> Option<Response> {
+    let mut founders: Vec<(NodeId, SocketAddr)> = shared
+        .natives
+        .iter()
+        .map(|(node, addr)| (*node, *addr))
+        .collect();
+    founders.sort_by_key(|(node, _)| node.as_u64());
+    let directory = shared.directory_snapshot();
+    let range = directory
+        .get(tablet)
+        .map(|descriptor| descriptor.range().clone())?;
+    founders.into_iter().find_map(|(node, endpoint)| {
+        if node == shared.node.node() {
+            return None;
+        }
+        Some(Response {
+            proof: None,
+            status: Status::StaleRoute,
+            body: ResponseBody::Redirect(RedirectInfo {
+                dir_version: directory.version(),
+                tablet,
+                epoch: TabletEpoch::INITIAL,
+                worker: WorkerId::from_u64(CLUSTER_WORKER),
+                endpoint: endpoint.to_string(),
+                range: range.clone(),
             }),
         })
     })
@@ -3240,6 +3484,20 @@ async fn tablet_row(
         .map(|intent| intent.prepared_at)
         .min()
         .map(|oldest| now.saturating_sub(oldest));
+    // Bounded per-intent identity for stuck-intent forensics (which
+    // transaction, which key, which coordinator, how old): the count
+    // alone cannot attribute a wedge to its creator.
+    let intent_keys: Vec<serde_json::Value> = intents
+        .iter()
+        .take(8)
+        .map(|intent| {
+            serde_json::json!({
+                "key": hex_bytes(intent.key.as_bytes()),
+                "coordinator": intent.coordinator.as_u64(),
+                "age_micros": now.saturating_sub(intent.prepared_at),
+            })
+        })
+        .collect();
     let mut value = serde_json::to_value(tablet_dto(
         status,
         directory,
@@ -3297,6 +3555,10 @@ async fn tablet_row(
         map.insert(
             "migrating".to_owned(),
             serde_json::Value::Bool(item.is_some_and(|item| item.migrating)),
+        );
+        map.insert(
+            "intent_keys".to_owned(),
+            serde_json::Value::Array(intent_keys),
         );
     }
     value
@@ -4722,6 +4984,56 @@ async fn tablet_seed_merge(
     }
 }
 
+/// Serving directory snapshot for operators and semantic waiters:
+/// version, namespace, and every tablet with state, range, and tombstone
+/// successors. Tests wait on exact tiling agreement across members
+/// (same version + same active ranges), never on wall-clock sleeps.
+async fn directory(State(shared): State<ClusterShared>) -> Json<serde_json::Value> {
+    let snapshot = shared.directory_snapshot();
+    let tablets: Vec<serde_json::Value> = snapshot
+        .tablets()
+        .iter()
+        .map(|descriptor| {
+            let (range_kind, range_detail) = match descriptor.range() {
+                kivi_tablet::PartitionRange::Hash(prefix) => (
+                    "hash",
+                    serde_json::json!({
+                        "bits": format!("{:032x}", prefix.bits()),
+                        "len": prefix.prefix_len(),
+                    }),
+                ),
+                kivi_tablet::PartitionRange::Ordered(range) => (
+                    "ordered",
+                    serde_json::json!({
+                        "start": hex_bytes(range.start()),
+                        "end": range.end().map(hex_bytes),
+                    }),
+                ),
+            };
+            serde_json::json!({
+                "tablet": descriptor.id().as_u64(),
+                "state": format!("{:?}", descriptor.state()),
+                "range_kind": range_kind,
+                "range": range_detail,
+                "successors": descriptor
+                    .redirect()
+                    .map(|redirect| redirect
+                        .successors()
+                        .iter()
+                        .map(|tablet| tablet.as_u64())
+                        .collect::<Vec<_>>())
+                    .unwrap_or_default(),
+            })
+        })
+        .collect();
+    Json(serde_json::json!({
+        "version": snapshot.version().as_u64(),
+        "namespace": snapshot.namespace().as_u64(),
+        "ordered_coverage_complete": snapshot.ordered_coverage_complete(),
+        "tablets": tablets,
+    }))
+}
+
 /// Applies one deterministic topology cutover to the local directory
 /// (idempotent). Split body:
 /// `{ "kind": "split", "parent": <u64>, "left": <u64>, "right": <u64>,
@@ -5219,6 +5531,7 @@ async fn serve_admin(listener: tokio::net::TcpListener, shared: ClusterShared) {
         .route("/v1/tablets/{id}/seed-split", post(tablet_seed_split))
         .route("/v1/tablets/{id}/seed-merge", post(tablet_seed_merge))
         .route("/v1/directory/cutover", post(directory_cutover))
+        .route("/v1/directory", get(directory))
         .layer(
             tower::ServiceBuilder::new()
                 .layer(TraceLayer::new_for_http())

@@ -1,9 +1,13 @@
-//! Secondary indexes as ordinary ordered state (RFC §9 + index direction).
+//! Secondary indexes as co-located ordered state (RFC §9 + index direction).
 //!
-//! An index is another ordered representation of primary data: index
-//! entries are ordinary Kivi keys in an ordered index namespace, so they
-//! split, merge, migrate, repair, and scan with the same machinery. No
-//! index-specific replication exists.
+//! A non-unique index entry is an ordinary Kivi key that routes beside its
+//! primary: the entry key carries the primary bytes, routers strip them
+//! back to the primary's tablet, and split seeding copies by primary, so
+//! an `indexed_set` batch (primary + projection + entry) commits on one
+//! tablet while term scans still fan out. Unique entries carry no primary
+//! in the key and route globally by term bytes instead.
+//!
+//! No index-specific replication exists.
 //!
 //! ## Encoding (Kivi-owned format `KIVI-IDX1`, pinned)
 //!
@@ -206,6 +210,30 @@ pub fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
+/// Splits a bare non-unique term prefix into `(index, term)` (`None`
+/// for any other shape, including full entry keys which carry a primary
+/// suffix). Term windows qualify here; entry keys decode through
+/// [`decode_non_unique_key`] instead. A term prefix ends with exactly one
+/// `0x00` terminator after the escaped term; an entry key carries a second
+/// escaped field (the primary) after it.
+#[must_use]
+pub fn term_prefix_parts(input: &[u8]) -> Option<(IndexId, Vec<u8>)> {
+    if input.len() < 18 || &input[..9] != INDEX_FORMAT_TAG || input[17] != 0x00 {
+        return None;
+    }
+    let index = IndexId::from_u64(u64::from_be_bytes(input[9..17].try_into().ok()?));
+    let (term, end) = take_escaped(input, 18).ok()?;
+    if end != input.len() {
+        return None;
+    }
+    // A full entry key decodes here too when its primary is empty, but
+    // primaries are never empty (user keys are nonempty in every index
+    // test and primaries route by bytes); the window check below
+    // (`start == term_prefix`) already rejects suffixed keys. Kept total
+    // here so prefix detection never panics on short inputs.
+    Some((index, term))
+}
+
 /// Decodes a non-unique entry key into `(index, term, primary)`.
 ///
 /// # Errors
@@ -310,10 +338,23 @@ pub fn parse_projection_primary(key: &[u8]) -> Option<&[u8]> {
     Some(&key[11..])
 }
 
+/// Strips a non-unique index entry key to its primary (`None` for any other
+/// key shape, including unique entries whose primary rides in the value).
+/// Routers use this to co-locate non-unique index entries with their
+/// primaries, so an `indexed_set` batch stays single-tablet and split
+/// seeding keeps the entry beside its primary.
+#[must_use]
+pub fn parse_index_primary(key: &[u8]) -> Option<Vec<u8>> {
+    let (_, _, primary) = decode_non_unique_key(key).ok()?;
+    Some(primary)
+}
+
 /// Whether `key` names an index entry (reserved `KIVI-IDX1` prefix).
 /// Direct single-key writes to index entries are rejected at admission
-/// (only the transactional index-maintenance path may write them);
-/// scans include them (index queries are scans).
+/// (only the transactional index-maintenance path may write them).
+/// Range scans skip non-unique entries (they live beside their primaries
+/// and validate per primary, never by global term order); term lookups
+/// resolve through primary reads instead.
 #[must_use]
 pub fn is_index_key(key: &[u8]) -> bool {
     key.len() >= INDEX_FORMAT_TAG.len() && &key[..INDEX_FORMAT_TAG.len()] == INDEX_FORMAT_TAG
@@ -532,5 +573,14 @@ mod tests {
         assert!(is_index_key(&encode_unique_key(IndexId::from_u64(1), b"t")));
         assert!(!is_index_key(b"user:1"));
         assert!(!is_index_key(b"KIVI-IDX"));
+        assert_eq!(
+            parse_index_primary(&encode_non_unique_key(IndexId::from_u64(1), b"t", b"p")),
+            Some(b"p".to_vec())
+        );
+        assert_eq!(
+            parse_index_primary(&encode_unique_key(IndexId::from_u64(1), b"t")),
+            None
+        );
+        assert_eq!(parse_index_primary(b"user:1"), None);
     }
 }

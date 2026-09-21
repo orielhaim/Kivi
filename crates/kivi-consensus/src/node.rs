@@ -5008,15 +5008,29 @@ mod tests {
             let metrics = nodes[responder].status().await.consistency;
             assert!(metrics.roster_hits >= 1, "served from the roster");
             assert_eq!(metrics.authority_serves, 0, "no barrier on the fast path");
-            // Kill the leader: the successor's term voids the old roster,
-            // but the dead leader's exclusion still covers it — so the
-            // next write FAILS retryable instead of completing uncovered
-            // (the slow path of roster transition: revocation is
-            // impossible from a dead node, so the exclusion must lapse).
+            // Kill the leader: the successor's term voids the old roster.
+            // Two protocol-correct outcomes exist here and the test must
+            // accept either (never assume one timing):
+            //
+            // * Transition window observed: the dead leader's exclusion
+            //   still covers the successor, so the write FAILS retryable
+            //   instead of completing uncovered (revocation is impossible
+            //   from a dead node, so the exclusion must lapse).
+            // * Re-roster won the race: the successor already holds a new
+            //   term roster with quorum coverage excluding the dead node,
+            //   so the write SUCCEEDS covered. Refusing it here would be
+            //   the bug, not the other way around.
+            //
+            // Either way the invariant under test holds downstream: an
+            // old responder either sees the new write or fails over —
+            // never a stale success. A bare `expect_err` here would turn
+            // scheduler timing (grant tasks vs test thread) into a fake
+            // protocol failure.
             nodes[leader].shutdown().await;
             let new_leader = wait_leader(&nodes).await;
             assert_ne!(new_leader, leader, "leadership moved on");
-            let refused = nodes[new_leader]
+            let pre = nodes[new_leader].status().await.consistency;
+            let outcome = nodes[new_leader]
                 .propose(
                     &Operation::Set {
                         key: Key::from("x"),
@@ -5026,12 +5040,30 @@ mod tests {
                     None,
                     NOW,
                 )
-                .await
-                .expect_err("write cannot complete past a covered dead responder");
-            assert!(
-                matches!(refused, ProposeError::ResponderCoverage { .. }),
-                "coverage fails retryable, got {refused:?}"
-            );
+                .await;
+            let post = nodes[new_leader].status().await.consistency;
+            match outcome {
+                Err(ProposeError::ResponderCoverage { .. }) => {}
+                Ok(ProposeOutcome::Applied { outcome, .. }) => {
+                    assert!(
+                        matches!(outcome, OperationResult::Stored { .. }),
+                        "covered fast-forward write commits, got {outcome:?}"
+                    );
+                    assert!(
+                        post.covered_responders >= 2,
+                        "fast-forward write was quorum-covered \
+                         [pre: covered={} | post: covered={} roster={:?}]",
+                        pre.covered_responders,
+                        post.covered_responders,
+                        post.roster,
+                    );
+                }
+                other => panic!(
+                    "transition write must refuse-covered or commit-covered, got {other:?} \
+                     [pre: covered={} roster={:?} | post: covered={} roster={:?}]",
+                    pre.covered_responders, pre.roster, post.covered_responders, post.roster,
+                ),
+            }
             // Past the exclusion lapse (slow timing: ~5s lease), the
             // gate clears and the write succeeds; the old responder's
             // next read either sees it (ALR over the live link) or fails

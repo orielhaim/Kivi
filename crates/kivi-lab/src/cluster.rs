@@ -136,6 +136,9 @@ fn free_udp_addr() -> String {
     addr
 }
 
+/// One member's ordered tiling view: `(tablet, range_start, range_end)`.
+type Tiling = Vec<(u64, Vec<u8>, Option<Vec<u8>>)>;
+
 impl Cluster {
     /// Spawns a fresh 3-node single-tablet cluster (new data directories)
     /// and waits for exactly one leader. Retries formation on bind
@@ -1476,6 +1479,138 @@ impl Cluster {
         self.nodes.len()
     }
 
+    /// Coherent serving-ready predicate for a restarted member: the new
+    /// process incarnation must advance past `incarnation_before` (same
+    /// `NodeId`, new process — stale process-local state keyed only by
+    /// `NodeId` is fenced), every tablet must elect one stable leader,
+    /// per-tablet applied indexes must converge across live members, every
+    /// live member must agree on the exact active ordered tiling at
+    /// `width` (stable across polls), and the rejoined member's serving
+    /// directory must reach at least `dir_before` (replay never regresses).
+    /// Process-listening / `KIVI_READY` alone proves none of this: the
+    /// ready line prints before the control image loads, the peer mesh
+    /// heals, leaders emerge, and the reconciler converges the directory.
+    /// One predicate, not test-specific wait soup; polling intervals bound
+    /// the polls, semantic state bounds the wait.
+    ///
+    /// # Panics
+    ///
+    /// Panics past `timeout` or when applied indexes diverge.
+    pub fn wait_member_rejoined(
+        &self,
+        index: usize,
+        incarnation_before: u64,
+        dir_before: u64,
+        width: usize,
+        timeout: Duration,
+    ) {
+        let deadline = Instant::now() + timeout;
+        // New process behind the same endpoint: incarnation fencing first.
+        loop {
+            if self.alive(index) && self.incarnation(index) > incarnation_before {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "member {index} incarnation never advanced past {incarnation_before}"
+            );
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        let _ = self.wait_all_leaders();
+        self.wait_converged_all();
+        self.wait_tiling_agreed(width, deadline);
+        // Replay floor: the rejoined directory must not regress.
+        loop {
+            if self.alive(index) {
+                let current = self
+                    .directory(index)
+                    .get("version")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                if current >= dir_before {
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "member {index} directory never reached {dir_before}"
+            );
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        // Applied convergence across live members (wait_converged_all
+        // ensures it; re-assert here so the predicate owns the proof).
+        let mut per_tablet: std::collections::BTreeMap<u64, std::collections::BTreeSet<u64>> =
+            std::collections::BTreeMap::new();
+        for member in 0..self.nodes.len() {
+            if !self.alive(member) {
+                continue;
+            }
+            for (tablet, applied) in self.tablets_applied(member) {
+                per_tablet.entry(tablet).or_default().insert(applied);
+            }
+        }
+        for (tablet, applied_set) in &per_tablet {
+            assert_eq!(
+                applied_set.len(),
+                1,
+                "tablet {tablet} applied diverged across live members: {applied_set:?}"
+            );
+        }
+    }
+
+    /// Waits until every live member reports the same exact ordered tiling
+    /// at `width` — first range starts empty, last is unbounded, adjacent
+    /// boundaries match — stable across consecutive polls. `deadline` is
+    /// absolute (callers with a multi-stage budget pass theirs through).
+    ///
+    /// # Panics
+    ///
+    /// Panics past the deadline.
+    pub fn wait_tiling_agreed(&self, width: usize, deadline: Instant) {
+        let mut last: Tiling = Vec::new();
+        let mut stable = 0u32;
+        loop {
+            let mut views: Vec<Tiling> = Vec::new();
+            let mut agreed = true;
+            for index in 0..self.nodes.len() {
+                if !self.alive(index) {
+                    continue;
+                }
+                let mut ranges = self.ordered_ranges(index);
+                ranges.sort_by(|left, right| left.1.cmp(&right.1));
+                let complete = ranges.len() == width
+                    && ranges[0].1.is_empty()
+                    && ranges.last().expect("tiling nonempty").2.is_none()
+                    && ranges
+                        .windows(2)
+                        .all(|pair| pair[0].2.as_deref() == Some(pair[1].1.as_slice()));
+                if !complete {
+                    agreed = false;
+                    break;
+                }
+                views.push(ranges);
+            }
+            if agreed && !views.is_empty() && views.iter().all(|view| *view == views[0]) {
+                if views[0] == last {
+                    stable += 1;
+                    if stable >= 2 {
+                        return;
+                    }
+                } else {
+                    stable = 0;
+                    last.clone_from(&views[0]);
+                }
+            } else {
+                stable = 0;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "ordered tiling never agreed at width {width}"
+            );
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
     /// Fetches `/v1/control` from one member (registry, placements,
     /// plans, versions).
     ///
@@ -1747,7 +1882,13 @@ impl Cluster {
         let key = path.rsplit('/').next().unwrap_or(what);
         let deadline = Instant::now() + timeout;
         loop {
-            let mut live = usize::MAX;
+            // Quiescence requires EVERY live member at zero: control
+            // commits replicate asynchronously, so one caught-up member
+            // reporting zero must not mask a lagging member still
+            // retiring (that early return lets the next split/merge fire
+            // while the previous plan is still live elsewhere, breaking
+            // the one-live-topology-plan invariant and width counts).
+            let mut live = 0usize;
             let mut failed = 0;
             let mut probed = false;
             let mut detail = String::new();
@@ -1776,7 +1917,7 @@ impl Cluster {
                         matches!(plan.get("phase").and_then(Value::as_str), Some("Failed"))
                     })
                     .count();
-                live = live.min(node_live);
+                live = live.max(node_live);
             }
             assert!(probed, "no live member serves {what} plans");
             assert_eq!(failed, 0, "{what} plans failed");
@@ -1883,8 +2024,28 @@ impl Cluster {
         }
     }
 
-    /// Waits until no live (non-terminal) migration plans remain and
-    /// none failed.
+    /// Parsed `/v1/directory` for one member: serving directory version,
+    /// namespace, coverage flag, and every tablet with state/range/successors.
+    /// Semantic convergence predicate: equal versions + equal active tilings
+    /// across members means routing agreement (see `wait_dir_version` for
+    /// the version floor and the acceptance `wait_tiling_agreed` for exact
+    /// tiling equality).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the endpoint errors.
+    #[must_use]
+    pub fn directory(&self, index: usize) -> Value {
+        let (status, json) = self.admin_get(index, "/v1/directory");
+        assert_eq!(status, 200, "GET /v1/directory on node {index}");
+        json
+    }
+
+    /// Waits until no live (non-terminal) migration plans remain on ANY
+    /// live member, and none failed. Like
+    /// [`wait_plans_done`](Self::wait_splits_done), quiescence is
+    /// all-members: a single caught-up member at zero never masks a
+    /// lagging one still converging.
     ///
     /// # Panics
     ///
@@ -1893,7 +2054,7 @@ impl Cluster {
         let deadline = Instant::now() + timeout;
         let mut ticks = 0u32;
         loop {
-            let mut live = usize::MAX;
+            let mut live = 0usize;
             let mut failed = 0;
             let mut probed = false;
             let mut detail = String::new();
@@ -1922,7 +2083,7 @@ impl Cluster {
                         matches!(plan.get("phase").and_then(Value::as_str), Some("Failed"))
                     })
                     .count();
-                live = live.min(node_live);
+                live = live.max(node_live);
             }
             assert!(probed, "no live member serves migrations");
             assert_eq!(failed, 0, "migration plans failed");
