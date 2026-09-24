@@ -42,11 +42,11 @@ pub use fabric::{
     import_from_entry, journal_append_batch, journal_compact, journal_load, open_material_provider,
 };
 pub use kivi_core::SystemClock;
-pub use kivi_memory::Footprint;
 pub use kivi_memory::offcore_lane::{
     DemotedRecord, OFFCORE_JOB_DEPTH, OffcoreLaneGuard, OffcoreLaneHandle, OffcoreLaneStats,
     OffcoreReply, PromotedBytes, spawn_offcore_lane,
 };
+pub use kivi_memory::{Footprint, MemoryControlPolicy, MemoryControlPolicyError};
 pub use net::{ConnLimits, EngineNetwork, NetConfig, NetStartError, TurnBudget};
 pub use redundancy::{
     CheckpointProtection, EngineRedundancy, ProtectedArtifact, RedundancyAdminSnapshot,

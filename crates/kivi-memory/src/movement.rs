@@ -68,6 +68,54 @@ impl MovementBudget {
             && self.used_cpu_ns.saturating_add(cpu_ns) <= self.max_cpu_ns_per_tick
     }
 
+    /// Validates the relationship between limits and current usage.
+    ///
+    /// # Errors
+    ///
+    /// Returns the name of the first usage field that exceeds its limit.
+    pub const fn validate(&self) -> Result<(), &'static str> {
+        if self.used_bytes > self.max_bytes_per_tick {
+            return Err("used_bytes");
+        }
+        if self.used_ops > self.max_ops_per_tick {
+            return Err("used_ops");
+        }
+        if self.used_cpu_ns > self.max_cpu_ns_per_tick {
+            return Err("used_cpu_ns");
+        }
+        Ok(())
+    }
+
+    /// Returns a fresh budget whose limits do not exceed `ceiling`.
+    #[must_use]
+    pub fn bounded_by(&self, ceiling: &Self) -> Self {
+        Self {
+            max_bytes_per_tick: self.max_bytes_per_tick.min(ceiling.max_bytes_per_tick),
+            max_ops_per_tick: self.max_ops_per_tick.min(ceiling.max_ops_per_tick),
+            max_cpu_ns_per_tick: self.max_cpu_ns_per_tick.min(ceiling.max_cpu_ns_per_tick),
+            max_concurrent_offcore: self
+                .max_concurrent_offcore
+                .min(ceiling.max_concurrent_offcore),
+            used_bytes: 0,
+            used_ops: 0,
+            used_cpu_ns: 0,
+        }
+    }
+
+    /// Returns the same limits with fresh usage accounting.
+    #[must_use]
+    pub const fn reset_usage(&self) -> Self {
+        Self {
+            max_bytes_per_tick: self.max_bytes_per_tick,
+            max_ops_per_tick: self.max_ops_per_tick,
+            max_cpu_ns_per_tick: self.max_cpu_ns_per_tick,
+            max_concurrent_offcore: self.max_concurrent_offcore,
+            used_bytes: 0,
+            used_ops: 0,
+            used_cpu_ns: 0,
+        }
+    }
+
     /// Charges a completed move. Callers check [`fits`](Self::fits)
     /// first; overcharges saturate instead of wrapping.
     pub const fn charge(&mut self, bytes: u64, cpu_ns: u64) {
@@ -208,6 +256,31 @@ impl MovementScheduler {
     /// Resets the tick budget.
     pub const fn reset_tick(&mut self) {
         self.budget.reset();
+    }
+
+    /// Replaces the scheduler budget with fresh usage accounting.
+    pub fn set_budget(&mut self, budget: MovementBudget) {
+        self.budget = budget.reset_usage();
+    }
+
+    /// Charges work executed outside the bounded queue.
+    ///
+    /// Returns `false` without mutating the budget when the move would
+    /// exceed a byte, operation, CPU, or off-core concurrency limit.
+    pub fn try_charge(
+        &mut self,
+        bytes: u64,
+        cpu_ns: u64,
+        offcore: bool,
+        in_flight_offcore: usize,
+    ) -> bool {
+        let concurrency_ok = !offcore || in_flight_offcore < self.budget.max_concurrent_offcore;
+        if concurrency_ok && self.budget.fits(bytes, cpu_ns) {
+            self.budget.charge(bytes, cpu_ns);
+            true
+        } else {
+            false
+        }
     }
 
     /// Takes the next executable move: the oldest queued move fitting the

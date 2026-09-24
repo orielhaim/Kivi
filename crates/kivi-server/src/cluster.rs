@@ -70,6 +70,10 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
+#[path = "cluster_adaptive.rs"]
+pub mod cluster_adaptive;
+pub use cluster_adaptive::{ClusterAdaptiveConfig, ClusterAdaptiveRuntime};
+
 /// Worker identity reported on cluster native connections. The cluster
 /// exposes one native endpoint per node (not per consensus worker);
 /// every connection reports worker `0`, and redirects name worker `0`,
@@ -174,6 +178,8 @@ pub struct ClusterShared {
     /// Distributed redundancy coordinator (`None` when its lane failed to
     /// open; every redundancy endpoint then answers 503).
     pub redundancy: Option<Arc<kivi_consensus::distcoord::RedundancyCoordinator>>,
+    /// Bounded cluster adaptive controller runtime.
+    pub adaptive: Arc<ClusterAdaptiveRuntime>,
 }
 
 impl ClusterShared {
@@ -1154,14 +1160,25 @@ pub async fn run(config: ClusterServeConfig) -> anyhow::Result<()> {
             None
         }
     };
+    let directory = Arc::new(arc_swap::ArcSwap::from_pointee(directory));
+    let adaptive = Arc::new(ClusterAdaptiveRuntime::new(
+        Arc::clone(&node),
+        Arc::clone(&directory),
+        redundancy.clone(),
+        config.cluster,
+        config.namespace,
+        ClusterAdaptiveConfig::from_env(),
+    ));
+    let (adaptive_shutdown, adaptive_shutdown_rx) = tokio::sync::watch::channel(false);
     let shared = ClusterShared {
         node: Arc::clone(&node),
-        directory: Arc::new(arc_swap::ArcSwap::from_pointee(directory)),
+        directory: Arc::clone(&directory),
         natives: Arc::new(natives),
         native: native_addr,
         namespace: config.namespace,
         policy: Arc::clone(&policy),
         redundancy,
+        adaptive: Arc::clone(&adaptive),
     };
     // Replay completed topology plans over the genesis tiling so a full
     // cluster restart recovers the post-split/merge directory (old parents
@@ -1176,6 +1193,7 @@ pub async fn run(config: ClusterServeConfig) -> anyhow::Result<()> {
         Arc::clone(&shared.directory),
         Arc::clone(&policy),
     );
+    let adaptive_task = Arc::clone(&shared.adaptive).spawn(adaptive_shutdown_rx);
     let redundancy_healer = shared.redundancy.as_ref().map(spawn_redundancy_healer);
     // Native serving (Tokio tasks per connection).
     let native = {
@@ -1223,6 +1241,9 @@ pub async fn run(config: ClusterServeConfig) -> anyhow::Result<()> {
     admin.abort();
     genesis.abort();
     reconciler.abort();
+    let _ = adaptive_shutdown.send(true);
+    adaptive_task.abort();
+    let _ = adaptive_task.await;
     if let Some(coordinator) = shared.redundancy.as_ref() {
         coordinator.stop_healing();
     }
@@ -4055,6 +4076,18 @@ async fn control(State(shared): State<ClusterShared>) -> Json<serde_json::Value>
     }))
 }
 
+/// Bounded cluster adaptive controller status and history.
+async fn control_adaptive(State(shared): State<ClusterShared>) -> Json<serde_json::Value> {
+    Json(
+        serde_json::to_value(shared.adaptive.status()).unwrap_or_else(|error| {
+            serde_json::json!({
+                "enabled": false,
+                "last_error": error.to_string(),
+            })
+        }),
+    )
+}
+
 /// Live migration plans (same objects as `/v1/control`, plan-focused).
 async fn migrations(State(shared): State<ClusterShared>) -> Json<serde_json::Value> {
     let Some(state) = shared.node.control_state().await else {
@@ -5604,6 +5637,7 @@ async fn serve_admin(listener: tokio::net::TcpListener, shared: ClusterShared) {
         .route("/v1/peers/trust", post(peers_trust))
         .route("/v1/snapshot", post(snapshot))
         .route("/v1/control", get(control))
+        .route("/v1/control/adaptive", get(control_adaptive))
         .route("/v1/control/migrations", get(migrations))
         .route(
             "/v1/control/migrations/create",

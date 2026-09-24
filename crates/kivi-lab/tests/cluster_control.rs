@@ -526,7 +526,7 @@ fn resp_serves_during_migration() {
                 }
                 // BUSY (off-leader) or connection reset (kill-free test:
                 // just election churn): try the next member.
-                Ok(Reply::Error(_)) | Err(_) => continue,
+                Ok(Reply::Error(_)) | Err(_) => {}
                 Ok(other) => panic!("unexpected RESP reply: {other:?}"),
             }
         }

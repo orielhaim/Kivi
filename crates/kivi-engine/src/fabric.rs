@@ -944,6 +944,22 @@ impl TabletFabric {
         &mut self.fabric
     }
 
+    /// Applies a validated bounded memory control policy on the worker owner.
+    pub fn set_control_policy(&mut self, policy: kivi_memory::MemoryControlPolicy) {
+        self.fabric.set_control_policy(policy);
+    }
+
+    /// Returns the worker's current bounded memory control policy.
+    #[must_use]
+    pub fn control_policy(&self) -> &kivi_memory::MemoryControlPolicy {
+        self.fabric.control_policy()
+    }
+
+    /// Drains worker-local access telemetry for the observation fabric.
+    pub fn drain_access_signals(&mut self) -> Vec<(u64, kivi_memory::AccessSignals)> {
+        self.fabric.drain_access_signals()
+    }
+
     /// Lane handle for async submission sites.
     #[must_use]
     pub const fn lane(&self) -> &OffcoreLaneHandle {

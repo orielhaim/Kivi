@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use bytes::Bytes;
+use kivi_observation::ExecutionCriticalitySignal;
 
 use crate::arena::WorkerArenas;
 use crate::calibrate::Calibrator;
@@ -32,9 +33,11 @@ use crate::movement::{BoundedMoveQueue, MovementBudget, MovementScheduler};
 use crate::nvme::{Admission, NvmeOptions, NvmeProvider};
 use crate::offcore::{OffcoreCompletion, OffcoreOpId, OffcoreQueue};
 use crate::placement::{CriticalityPlanner, PlacementInput, Planner};
+use crate::policy::MemoryControlPolicy;
 use crate::provider::{ProviderCaps, ProviderDescriptor, ProviderId, ProviderRegistry};
 use crate::repr::{ObjectMaterialization, ReconstructionSource, Residence};
 use crate::sim::{SimFault, SimProvider};
+use crate::telemetry::SoftwareTelemetry;
 use crate::transition::{Transition, TransitionTarget};
 
 /// `NVMe` backend owned by the fabric.
@@ -279,6 +282,8 @@ pub struct MemoryFabric {
     objects: HashMap<u64, ObjectEntry>,
     moves: BoundedMoveQueue,
     scheduler: MovementScheduler,
+    control_policy: MemoryControlPolicy,
+    telemetry: SoftwareTelemetry,
     offcore: OffcoreQueue,
     now_ticks: u64,
     next_object: u64,
@@ -329,6 +334,10 @@ impl MemoryFabric {
                 SimProvider::nvme(nvme_provider, config.nvme_capacity_bytes, 0x00C0_FFEE);
             NvmeBackend::Sim(provider)
         };
+        let control_policy = MemoryControlPolicy::default()
+            .with_movement_budget(config.budget)
+            .unwrap_or_else(|_| MemoryControlPolicy::default())
+            .bounded_by(&config.budget);
         Ok(Self {
             arenas: WorkerArenas::new(config.arena_capacity_bytes),
             registry,
@@ -340,7 +349,9 @@ impl MemoryFabric {
             backend,
             objects: HashMap::new(),
             moves: BoundedMoveQueue::new(config.move_queue_capacity, config.max_bytes_per_tenant),
-            scheduler: MovementScheduler::new(config.budget),
+            scheduler: MovementScheduler::new(control_policy.movement_budget),
+            control_policy,
+            telemetry: SoftwareTelemetry::new(),
             offcore: OffcoreQueue::new(config.offcore_queue_capacity, config.offcore_max_bytes),
             config,
             now_ticks: 0,
@@ -427,10 +438,11 @@ impl MemoryFabric {
         }
         let object = self.next_object;
         self.next_object += 1;
+        let logical_bytes = bytes.len() as u64;
         let signals = AccessSignals {
-            logical_bytes: bytes.len() as u64,
             mutability,
-            ..AccessSignals::cold(bytes.len() as u64)
+            logical_bytes,
+            ..AccessSignals::cold(logical_bytes)
         };
         let criticality = criticality_of(&signals, 90.0);
         let primary = if bytes.len() <= crate::TINY_INLINE_MAX {
@@ -460,8 +472,28 @@ impl MemoryFabric {
                 transition: None,
             },
         );
+        self.telemetry.register(object, mutability, logical_bytes);
         self.stats.objects = self.objects.len();
         Ok(object)
+    }
+
+    fn observe_access(&mut self, object: u64, write: bool, bytes: u64, cpu_ns: u64) {
+        if let Some(entry) = self.objects.get(&object) {
+            self.telemetry.register(
+                object,
+                entry.signals.mutability,
+                entry.signals.logical_bytes,
+            );
+        }
+        self.telemetry.record(object, write, bytes, cpu_ns);
+        if let Some(entry) = self.objects.get_mut(&object) {
+            if write {
+                entry.signals.writes = entry.signals.writes.saturating_add(1);
+            } else {
+                entry.signals.reads = entry.signals.reads.saturating_add(1);
+            }
+            entry.criticality = criticality_of(&entry.signals, 90.0);
+        }
     }
 
     /// Reads an object transparently across representations.
@@ -478,14 +510,17 @@ impl MemoryFabric {
     pub fn get(&mut self, object: u64) -> Result<GetOutcome, MemoryError> {
         // Clone the primary first so resolution borrows only the arenas
         // (disjoint from the object table borrow below).
-        let primary = {
+        let (primary, logical_bytes) = {
             let entry = self
                 .objects
                 .get_mut(&object)
                 .ok_or(MemoryError::NoRepresentation { object })?;
-            entry.signals.reads = entry.signals.reads.saturating_add(1);
-            entry.materialization.primary.clone()
+            (
+                entry.materialization.primary.clone(),
+                entry.signals.logical_bytes,
+            )
         };
+        self.observe_access(object, false, logical_bytes, 100);
         // Fast path: primary synchronous.
         match Self::resolve(&self.arenas, &primary) {
             Ok(bytes) => {
@@ -582,14 +617,14 @@ impl MemoryFabric {
                 context: "fabric mutate: use chunk fabric",
             });
         }
-        let (old, class, signals) = {
+        let logical_bytes = bytes.len() as u64;
+        let (old, class) = {
             let entry = self
                 .objects
                 .get_mut(&object)
                 .ok_or(MemoryError::NoRepresentation { object })?;
             entry.materialization.version += 1;
-            entry.signals.writes = entry.signals.writes.saturating_add(1);
-            entry.signals.logical_bytes = bytes.len() as u64;
+            entry.signals.logical_bytes = logical_bytes;
             entry.transition = None;
             entry.pending_promotion = None;
             let old = std::mem::replace(
@@ -597,7 +632,7 @@ impl MemoryFabric {
                 Residence::Inline(Bytes::new()),
             );
             entry.materialization.shadows.clear();
-            (old, entry.class, entry.signals)
+            (old, entry.class)
         };
         self.moves.cancel_for_object(object);
         self.offcore.cancel_for_object(object);
@@ -615,12 +650,14 @@ impl MemoryFabric {
                 provider: self.dram_provider,
             }
         };
-        let entry = self
-            .objects
-            .get_mut(&object)
-            .ok_or(MemoryError::NoRepresentation { object })?;
-        entry.materialization.primary = primary;
-        entry.criticality = criticality_of(&signals, 90.0);
+        {
+            let entry = self
+                .objects
+                .get_mut(&object)
+                .ok_or(MemoryError::NoRepresentation { object })?;
+            entry.materialization.primary = primary;
+        }
+        self.observe_access(object, true, logical_bytes, 500);
         Ok(())
     }
 
@@ -643,6 +680,7 @@ impl MemoryFabric {
         self.moves.cancel_for_object(object);
         self.offcore.cancel_for_object(object);
         self.pins.remove(&object);
+        self.telemetry.remove(object);
         self.stats.objects = self.objects.len();
         Ok(())
     }
@@ -734,11 +772,17 @@ impl MemoryFabric {
     /// [`MemoryError::CorruptRepresentation`] when no valid residence
     /// remains.
     pub fn read_anywhere(&mut self, object: u64) -> Result<Bytes, MemoryError> {
-        let primary = self
+        let (primary, logical_bytes) = self
             .objects
             .get(&object)
-            .map(|entry| entry.materialization.primary.clone())
+            .map(|entry| {
+                (
+                    entry.materialization.primary.clone(),
+                    entry.signals.logical_bytes,
+                )
+            })
             .ok_or(MemoryError::NoRepresentation { object })?;
+        self.observe_access(object, false, logical_bytes, 100);
         if let Ok(bytes) = Self::resolve(&self.arenas, &primary) {
             return Ok(bytes);
         }
@@ -840,6 +884,7 @@ impl MemoryFabric {
                 transition: None,
             },
         );
+        self.telemetry.register(id, Mutability::Mutable, import.len);
         self.next_object = self.next_object.max(id.saturating_add(1));
         self.stats.objects = self.objects.len();
         Ok(())
@@ -1302,6 +1347,114 @@ impl MemoryFabric {
         &self.config
     }
 
+    /// Returns the active bounded memory control policy.
+    #[must_use]
+    pub const fn control_policy(&self) -> &MemoryControlPolicy {
+        &self.control_policy
+    }
+
+    /// Returns the active bounded memory control policy.
+    #[must_use]
+    pub const fn get_control_policy(&self) -> &MemoryControlPolicy {
+        self.control_policy()
+    }
+
+    /// Returns the active bounded memory control policy.
+    #[must_use]
+    pub const fn get_policy(&self) -> &MemoryControlPolicy {
+        self.control_policy()
+    }
+
+    /// Applies a memory control policy without exceeding configured movement ceilings.
+    pub fn set_control_policy(&mut self, policy: MemoryControlPolicy) {
+        let policy = policy.bounded_by(&self.config.budget);
+        self.scheduler.set_budget(policy.movement_budget);
+        self.control_policy = policy;
+    }
+
+    /// Applies a memory control policy.
+    pub fn set_policy(&mut self, policy: MemoryControlPolicy) {
+        self.set_control_policy(policy);
+    }
+
+    /// Applies a memory control policy.
+    pub fn set_memory_control_policy(&mut self, policy: MemoryControlPolicy) {
+        self.set_control_policy(policy);
+    }
+
+    /// Applies a memory control policy.
+    pub fn set_memory_policy(&mut self, policy: MemoryControlPolicy) {
+        self.set_control_policy(policy);
+    }
+
+    /// Returns the active bounded memory control policy.
+    #[must_use]
+    pub const fn memory_control_policy(&self) -> &MemoryControlPolicy {
+        self.control_policy()
+    }
+
+    /// Returns the stored execution criticality for an object.
+    #[must_use]
+    pub fn criticality(&self, object: u64) -> Option<ExecutionCriticality> {
+        self.objects.get(&object).map(|entry| entry.criticality)
+    }
+
+    /// Returns the worker-local telemetry sampler.
+    #[must_use]
+    pub const fn telemetry(&self) -> &SoftwareTelemetry {
+        &self.telemetry
+    }
+
+    /// Returns the telemetry object bound.
+    #[must_use]
+    pub const fn telemetry_limits(&self) -> crate::telemetry::TelemetryLimits {
+        self.telemetry.limits()
+    }
+
+    /// Returns the telemetry object capacity.
+    #[must_use]
+    pub const fn telemetry_capacity(&self) -> usize {
+        self.telemetry.capacity()
+    }
+
+    /// Replaces the telemetry bound and re-registers live objects in id order.
+    pub fn set_telemetry_capacity(&mut self, capacity: usize) {
+        self.telemetry = SoftwareTelemetry::with_capacity(capacity);
+        let mut objects: Vec<u64> = self.objects.keys().copied().collect();
+        objects.sort_unstable();
+        for object in objects {
+            if let Some(entry) = self.objects.get(&object) {
+                self.telemetry.register(
+                    object,
+                    entry.signals.mutability,
+                    entry.signals.logical_bytes,
+                );
+            }
+        }
+    }
+
+    /// Drains access signals for controller observation.
+    pub fn drain_access_signals(&mut self) -> Vec<(u64, AccessSignals)> {
+        let signals = self.telemetry.drain_access_signals();
+        for (object, _) in &signals {
+            if let Some(entry) = self.objects.get_mut(object) {
+                entry.criticality = criticality_of(&entry.signals, 90.0);
+            }
+        }
+        signals
+    }
+
+    /// Drains typed Phase 12 criticality signals for controller observation.
+    pub fn drain_observation_signals(&mut self) -> Vec<(u64, ExecutionCriticalitySignal)> {
+        let signals = self.telemetry.drain_observation_signals();
+        for (object, _) in &signals {
+            if let Some(entry) = self.objects.get_mut(object) {
+                entry.criticality = criticality_of(&entry.signals, 90.0);
+            }
+        }
+        signals
+    }
+
     /// Current statistics snapshot, refreshed by the last
     /// [`tick`](Self::tick). Call `tick` after bulk inserts for fresh
     /// byte accounting.
@@ -1611,13 +1764,18 @@ impl MemoryFabric {
         {
             return;
         }
+        let actual_pressure = self.arenas.pressure();
+        let weighted_criticality = ExecutionCriticality {
+            score: self.control_policy.weighted_score(criticality.score),
+            ..criticality
+        };
         let input = PlacementInput {
             object,
             intent: &intent,
-            criticality,
+            criticality: weighted_criticality,
             logical_bytes,
             current,
-            pressure: self.arenas.pressure(),
+            pressure: self.control_policy.planning_pressure(actual_pressure),
             migration_cost_ns: migration_cost * 2,
             ticks_since_move,
         };
@@ -1627,15 +1785,39 @@ impl MemoryFabric {
         }
         let target = self.transition_target_for(decision.target);
         let Some(target) = target else { return };
-        // Compression requires a measured win; the planner proposes,
-        // the fabric disposes after measuring the actual block.
-        if target == TransitionTarget::Compressed && !criticality.compression_worthy {
-            // Still allow demotion pressure to compress cold data: check
-            // the class gate instead of the full worthiness flag.
-            let entry = self.objects.get(&object).expect("object present");
-            if !entry.class.compression_candidate() {
-                return;
+        match target {
+            TransitionTarget::Compressed => {
+                let candidate = self
+                    .objects
+                    .get(&object)
+                    .is_some_and(|entry| entry.class.compression_candidate());
+                if !candidate
+                    || !self
+                        .control_policy
+                        .allows_compression(weighted_criticality.score, actual_pressure)
+                {
+                    return;
+                }
             }
+            TransitionTarget::Nvme => {
+                if !self
+                    .control_policy
+                    .allows_demotion(weighted_criticality.score, actual_pressure)
+                {
+                    return;
+                }
+            }
+            TransitionTarget::Dram => {
+                if current.is_some()
+                    && current != Some(self.dram_provider)
+                    && !self
+                        .control_policy
+                        .allows_promotion(weighted_criticality.score, actual_pressure)
+                {
+                    return;
+                }
+            }
+            TransitionTarget::Evicted => {}
         }
         let request = crate::movement::MoveRequest {
             object,
@@ -1739,6 +1921,17 @@ impl MemoryFabric {
     /// whether an operation was queued: unresolvable objects take no
     /// slot, so callers can spend bounded budgets elsewhere.
     fn collect_external_demote(&mut self, object: u64, version: u64) -> bool {
+        let demotion_allowed = self.objects.get(&object).is_some_and(|entry| {
+            entry.materialization.version == version
+                && self.control_policy.allows_demotion(
+                    self.control_policy.weighted_score(entry.criticality.score),
+                    self.arenas.pressure(),
+                )
+        });
+        if !demotion_allowed {
+            self.cancel_transition(object, "policy");
+            return false;
+        }
         let primary = match self.objects.get(&object) {
             Some(entry) if entry.materialization.version == version => {
                 entry.materialization.primary.clone()
@@ -1764,9 +1957,18 @@ impl MemoryFabric {
             // single device byte). The compress path fences versions and
             // clears the transition mark itself.
             let candidate = self.objects.get(&object).is_some_and(|entry| {
-                entry.materialization.version == version && entry.class.compression_candidate()
+                entry.materialization.version == version
+                    && entry.class.compression_candidate()
+                    && self.control_policy.allows_compression(
+                        self.control_policy.weighted_score(entry.criticality.score),
+                        self.arenas.pressure(),
+                    )
             });
-            if candidate {
+            if candidate
+                && self
+                    .scheduler
+                    .try_charge(0, (bytes.len() as u64).saturating_mul(3), false, 0)
+            {
                 self.execute_compress(object, version);
                 return false;
             }
@@ -1796,6 +1998,17 @@ impl MemoryFabric {
 
     /// Resolves a promote locator into the external outbox.
     fn collect_external_promote(&mut self, object: u64, version: u64) {
+        let promotion_allowed = self.objects.get(&object).is_some_and(|entry| {
+            entry.materialization.version == version
+                && self.control_policy.allows_promotion(
+                    self.control_policy.weighted_score(entry.criticality.score),
+                    self.arenas.pressure(),
+                )
+        });
+        if !promotion_allowed {
+            self.cancel_transition(object, "policy");
+            return;
+        }
         let residence = self.objects.get(&object).and_then(|entry| {
             std::iter::once(&entry.materialization.primary)
                 .chain(entry.materialization.shadows.iter())
@@ -1820,6 +2033,18 @@ impl MemoryFabric {
     }
 
     fn execute_compress(&mut self, object: u64, version: u64) {
+        let compression_allowed = self.objects.get(&object).is_some_and(|entry| {
+            entry.materialization.version == version
+                && entry.class.compression_candidate()
+                && self.control_policy.allows_compression(
+                    self.control_policy.weighted_score(entry.criticality.score),
+                    self.arenas.pressure(),
+                )
+        });
+        if !compression_allowed {
+            self.cancel_transition(object, "policy");
+            return;
+        }
         let primary = match self.objects.get(&object) {
             Some(entry) if entry.materialization.version == version => {
                 entry.materialization.primary.clone()
@@ -1897,6 +2122,17 @@ impl MemoryFabric {
     }
 
     fn execute_demote(&mut self, object: u64, version: u64) {
+        let demotion_allowed = self.objects.get(&object).is_some_and(|entry| {
+            entry.materialization.version == version
+                && self.control_policy.allows_demotion(
+                    self.control_policy.weighted_score(entry.criticality.score),
+                    self.arenas.pressure(),
+                )
+        });
+        if !demotion_allowed {
+            self.cancel_transition(object, "policy");
+            return;
+        }
         let primary = match self.objects.get(&object) {
             Some(entry) if entry.materialization.version == version => {
                 entry.materialization.primary.clone()
@@ -1923,9 +2159,18 @@ impl MemoryFabric {
             // single device byte). The compress path fences versions and
             // clears the transition mark itself.
             let candidate = self.objects.get(&object).is_some_and(|entry| {
-                entry.materialization.version == version && entry.class.compression_candidate()
+                entry.materialization.version == version
+                    && entry.class.compression_candidate()
+                    && self.control_policy.allows_compression(
+                        self.control_policy.weighted_score(entry.criticality.score),
+                        self.arenas.pressure(),
+                    )
             });
-            if candidate {
+            if candidate
+                && self
+                    .scheduler
+                    .try_charge(0, (bytes.len() as u64).saturating_mul(3), false, 0)
+            {
                 self.execute_compress(object, version);
                 return;
             }
@@ -1947,6 +2192,17 @@ impl MemoryFabric {
     }
 
     fn execute_promote(&mut self, object: u64, version: u64) {
+        let promotion_allowed = self.objects.get(&object).is_some_and(|entry| {
+            entry.materialization.version == version
+                && self.control_policy.allows_promotion(
+                    self.control_policy.weighted_score(entry.criticality.score),
+                    self.arenas.pressure(),
+                )
+        });
+        if !promotion_allowed {
+            self.cancel_transition(object, "policy");
+            return;
+        }
         let has_offcore = self.objects.get(&object).is_some_and(|entry| {
             std::iter::once(&entry.materialization.primary)
                 .chain(entry.materialization.shadows.iter())
@@ -2111,24 +2367,23 @@ impl MemoryFabric {
             left_score
                 .partial_cmp(&right_score)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.cmp(right))
         });
         let mut reclaimed = 0;
         for object in ids {
             if self.arenas.pressure() <= 0.85 || reclaimed >= 8 {
                 break;
             }
-            let (version, candidate) = match self.objects.get(&object) {
+            let (version, candidate, score, logical_bytes) = match self.objects.get(&object) {
                 Some(entry) => {
-                    // Skip objects with a move already in flight
-                    // (planned or reclaimed): re-pushing them every tick
-                    // burns the bounded budget on duplicates while other
-                    // residents starve.
                     if entry.transition.is_some() {
                         continue;
                     }
                     (
                         entry.materialization.version,
                         entry.class.compression_candidate(),
+                        entry.criticality.score,
+                        entry.signals.logical_bytes,
                     )
                 }
                 None => continue,
@@ -2151,24 +2406,39 @@ impl MemoryFabric {
                 reclaimed += 1;
                 continue;
             }
-            // Prefer compression for candidates, demotion otherwise.
-            // External-executor deployments never pump the internal
-            // off-core queue, so pressure demotions must join the
-            // external outbox like planned moves: queuing them
-            // internally would stall the arena (and the movement
-            // scheduler that counts them in flight) forever.
-            // Unresolvable objects take no budget slot, so reclaimable
-            // residents behind them in the order still get served.
-            if candidate {
-                self.execute_compress(object, version);
-                reclaimed += 1;
-            } else if self.external_executor {
-                if self.collect_external_demote(object, version) {
+            let actual_pressure = self.arenas.pressure();
+            let weighted_score = self.control_policy.weighted_score(score);
+            let can_compress = candidate
+                && self
+                    .control_policy
+                    .allows_compression(weighted_score, actual_pressure);
+            let can_demote = self
+                .control_policy
+                .allows_demotion(weighted_score, actual_pressure);
+            if can_compress {
+                let cpu_ns = logical_bytes.saturating_mul(3);
+                if self.scheduler.try_charge(logical_bytes, cpu_ns, false, 0) {
+                    self.execute_compress(object, version);
                     reclaimed += 1;
                 }
-            } else {
-                self.execute_demote(object, version);
-                reclaimed += 1;
+            } else if can_demote {
+                let in_flight = self
+                    .offcore
+                    .submitted_len()
+                    .saturating_add(self.external_in_flight);
+                if self
+                    .scheduler
+                    .try_charge(logical_bytes, 500, true, in_flight)
+                {
+                    if self.external_executor {
+                        if self.collect_external_demote(object, version) {
+                            reclaimed += 1;
+                        }
+                    } else {
+                        self.execute_demote(object, version);
+                        reclaimed += 1;
+                    }
+                }
             }
         }
     }
@@ -2292,6 +2562,59 @@ mod tests {
             .expect("mutate");
         let outcome = fabric.get(object).expect("get");
         assert_eq!(outcome, GetOutcome::Ready(Bytes::from(vec![2u8; 1024])));
+    }
+
+    #[test]
+    fn read_refreshes_stored_criticality_and_drains_once() {
+        let mut fabric = test_fabric();
+        let object = fabric
+            .insert(
+                Bytes::from(vec![7u8; 1024]),
+                MaterializationIntent::hot(),
+                BehaviorClass::HotReadMostly,
+                Mutability::ReadMostly,
+            )
+            .expect("insert");
+        let before = fabric.criticality(object).expect("criticality");
+        assert_eq!(before.score.to_bits(), 0.0_f64.to_bits());
+        assert_eq!(
+            fabric.get(object).expect("get"),
+            GetOutcome::Ready(Bytes::from(vec![7u8; 1024]))
+        );
+        let after = fabric.criticality(object).expect("criticality");
+        assert!(after.score > before.score);
+        let signals = fabric.drain_access_signals();
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].0, object);
+        assert_eq!(signals[0].1.reads, 1);
+        assert!(fabric.drain_access_signals().is_empty());
+    }
+
+    #[test]
+    fn policy_setter_preserves_configured_movement_ceiling() {
+        let ceiling = MovementBudget::new(128, 2, 100, 1);
+        let mut fabric = MemoryFabric::new(MemoryFabricConfig {
+            arena_capacity_bytes: 1 << 20,
+            nvme_capacity_bytes: 1 << 20,
+            budget: ceiling,
+            ..MemoryFabricConfig::default()
+        })
+        .expect("fabric");
+        let requested = MemoryControlPolicy::new(
+            0.5,
+            0.5,
+            0.5,
+            MovementBudget::new(1_000, 9, 1_000, 8),
+            0.5,
+            0.5,
+        )
+        .expect("policy");
+        fabric.set_control_policy(requested);
+        let applied = fabric.control_policy();
+        assert_eq!(applied.movement_budget().max_bytes_per_tick, 128);
+        assert_eq!(applied.movement_budget().max_ops_per_tick, 2);
+        assert_eq!(applied.movement_budget().max_cpu_ns_per_tick, 100);
+        assert_eq!(applied.movement_budget().max_concurrent_offcore, 1);
     }
 
     #[test]

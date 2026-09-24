@@ -9,6 +9,7 @@
 //!   is locked, node identity loaded or minted, the incarnation advanced,
 //!   WAL lanes recovered and replayed — all before any listener binds.
 
+mod adaptive;
 mod admin;
 mod cluster;
 mod compound;
@@ -17,7 +18,6 @@ mod logging;
 mod redundancy_admin;
 #[cfg(feature = "redis-compat")]
 mod resp;
-#[cfg(feature = "redis-compat")]
 use std::sync::Arc;
 
 use std::io::Write as _;
@@ -690,11 +690,20 @@ fn main() -> anyhow::Result<()> {
             )
         }
     };
+    let adaptive = Arc::new(adaptive::AdaptiveRuntime::new(
+        engine.admin_handle(),
+        cluster,
+        NS,
+        adaptive::AdaptiveRuntimeConfig::default(),
+    ));
+    let (adaptive_shutdown, adaptive_shutdown_rx) = tokio::sync::watch::channel(false);
+    let adaptive_task = Arc::clone(&adaptive).spawn(adaptive_shutdown_rx);
     let state = AdminState {
         node,
         cluster,
         incarnation,
         engine: engine.admin_handle(),
+        adaptive: Some(adaptive),
         #[cfg(feature = "redis-compat")]
         resp: resp_admin.clone(),
     };
@@ -743,6 +752,8 @@ fn main() -> anyhow::Result<()> {
             tracing::warn!(%error, "shutdown signal watch failed; exiting");
         }
     }))?;
+    let _ = adaptive_shutdown.send(true);
+    let _ = runtime.block_on(adaptive_task);
     #[cfg(feature = "redis-compat")]
     drop(resp_shutdown);
     let report = engine.shutdown().context("engine shutdown failed")?;

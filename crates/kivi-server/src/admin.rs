@@ -53,6 +53,8 @@ pub struct AdminState {
     pub incarnation: NodeIncarnation,
     /// Read-only engine query handle (`Send + Sync`, Tokio-safe).
     pub engine: AdminHandle,
+    /// Phase 12 adaptive controller runtime, when enabled for this process.
+    pub adaptive: Option<std::sync::Arc<super::adaptive::AdaptiveRuntime>>,
     /// RESP frontend view (`None` when compiled without the feature or
     /// running native-only).
     #[cfg(feature = "redis-compat")]
@@ -779,6 +781,33 @@ async fn tablets(State(state): State<AdminState>) -> Json<Vec<TabletDto>> {
     )
 }
 
+async fn adaptive(State(state): State<AdminState>) -> Json<serde_json::Value> {
+    let Some(runtime) = state.adaptive.as_ref() else {
+        return Json(serde_json::json!({"enabled": false}));
+    };
+    let snapshot = runtime.snapshot();
+    Json(serde_json::json!({
+        "enabled": true,
+        "mode": snapshot.mode,
+        "active_controller": snapshot.active_controller,
+        "control_interval_ms": u64::try_from(runtime.interval().as_millis()).unwrap_or(u64::MAX),
+        "intervals": snapshot.intervals,
+        "observation_sequence": snapshot.observation_sequence,
+        "observation_window": snapshot.observation_window,
+        "observation_scopes": snapshot.observation_scopes,
+        "observation_freshness": snapshot.observation_freshness,
+        "proposed": snapshot.proposed,
+        "accepted": snapshot.accepted,
+        "rejected": snapshot.rejected,
+        "suppressed": snapshot.suppressed,
+        "completed": snapshot.completed,
+        "failed": snapshot.failed,
+        "active_actions": snapshot.active_actions,
+        "traces": snapshot.traces,
+        "last_error": snapshot.last_error,
+    }))
+}
+
 /// Builds the admin router with its Tower middleware: request tracing,
 /// a small body limit (read-only API), and a per-request timeout.
 pub fn router(state: AdminState) -> axum::Router {
@@ -792,6 +821,7 @@ pub fn router(state: AdminState) -> axum::Router {
         .route("/v1/checkpoints", get(checkpoints))
         .route("/v1/fabric", get(fabric))
         .route("/v1/redis", get(redis))
+        .route("/v1/control/adaptive", get(adaptive))
         .layer(
             tower::ServiceBuilder::new()
                 .layer(TraceLayer::new_for_http())
@@ -866,6 +896,7 @@ mod tests {
             cluster: ClusterId::from_u128(0xC1),
             incarnation: NodeIncarnation::INITIAL,
             engine: engine.admin_handle(),
+            adaptive: None,
             #[cfg(feature = "redis-compat")]
             resp: None,
         }

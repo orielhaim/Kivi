@@ -388,6 +388,18 @@ pub enum WorkerControl {
         /// Where the report goes.
         respond: Sender<FabricWorkerReport>,
     },
+    /// Apply a bounded memory control policy on the worker owner.
+    SetMemoryPolicy {
+        /// Policy to install.
+        policy: kivi_memory::MemoryControlPolicy,
+        /// Whether the policy was installed.
+        respond: Sender<bool>,
+    },
+    /// Drain bounded access telemetry for the asynchronous observation fabric.
+    MemorySignals {
+        /// Where the object signals go.
+        respond: Sender<Vec<(u64, kivi_memory::AccessSignals)>>,
+    },
 }
 
 /// Per-worker fabric observability for the admin plane.
@@ -943,6 +955,15 @@ pub(crate) fn handle_control(
         }
         WorkerControl::FabricStats { respond } => {
             let _ = respond.try_send(fabric_stats_report(tablets, fabric));
+            true
+        }
+        WorkerControl::SetMemoryPolicy { policy, respond } => {
+            fabric.set_control_policy(policy);
+            let _ = respond.try_send(true);
+            true
+        }
+        WorkerControl::MemorySignals { respond } => {
+            let _ = respond.try_send(fabric.drain_access_signals());
             true
         }
     }

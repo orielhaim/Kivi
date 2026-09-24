@@ -102,6 +102,34 @@ pub enum ControlApplyError {
         /// Human-readable cause.
         detail: String,
     },
+    /// A desired placement carries a stale version.
+    #[error("stale placement generation: offered {offered}, current {current}")]
+    StalePlacement {
+        /// Current placement generation.
+        current: u64,
+        /// Offered placement generation.
+        offered: u64,
+    },
+    /// A desired placement skips a placement generation.
+    #[error("placement generation gap: offered {offered}, current {current}")]
+    PlacementGap {
+        /// Current placement generation.
+        current: u64,
+        /// Offered placement generation.
+        offered: u64,
+    },
+    /// A desired placement reuses a generation with different voters.
+    #[error("conflicting placement at generation {generation}")]
+    PlacementConflict {
+        /// Conflicting placement generation.
+        generation: u64,
+    },
+    /// A plan identity already exists.
+    #[error("duplicate plan id {plan}")]
+    DuplicatePlan {
+        /// Existing plan identity.
+        plan: u64,
+    },
     /// A redundancy publish carries a stale generation: older than current,
     /// or the same generation with conflicting bytes.
     #[error("stale redundancy generation: offered {offered}, current is {current}")]
@@ -224,10 +252,14 @@ impl ControlState {
             state.nodes.insert(record.node.as_u64(), record);
         }
         let mut highest_tablet = 0u64;
+        let mut highest_version = PlacementVersion::INITIAL;
         for desired in placements {
             highest_tablet = highest_tablet.max(desired.tablet.as_u64());
+            highest_version =
+                PlacementVersion::from_u64(highest_version.as_u64().max(desired.version.as_u64()));
             state.placements.insert(desired.tablet.as_u64(), desired);
         }
+        state.placement_version = highest_version;
         state.next_tablet_id = highest_tablet.saturating_add(1).max(1);
         state
     }
@@ -445,13 +477,36 @@ impl ControlState {
                 Ok(())
             }
             ControlMutation::SetDesiredPlacement { desired } => {
+                let current = self.placement_version.as_u64();
+                let offered = desired.version.as_u64();
+                if let Some(existing) = self.placements.get(&desired.tablet.as_u64()) {
+                    if offered < existing.version.as_u64() || offered < current {
+                        return Err(Fault::StalePlacement { current, offered });
+                    }
+                    if offered == existing.version.as_u64() {
+                        if existing.replicas == desired.replicas {
+                            return Ok(());
+                        }
+                        return Err(Fault::PlacementConflict {
+                            generation: offered,
+                        });
+                    }
+                    if offered > current.saturating_add(1) {
+                        return Err(Fault::PlacementGap { current, offered });
+                    }
+                } else {
+                    if offered < current {
+                        return Err(Fault::StalePlacement { current, offered });
+                    }
+                    if offered > current.saturating_add(1) {
+                        return Err(Fault::PlacementGap { current, offered });
+                    }
+                }
                 self.placements
                     .insert(desired.tablet.as_u64(), desired.clone());
-                self.placement_version = PlacementVersion::from_u64(
-                    self.placement_version
-                        .as_u64()
-                        .max(desired.version.as_u64()),
-                );
+                self.placement_version = PlacementVersion::from_u64(offered.max(current));
+                self.generation =
+                    ClusterGeneration::from_u64(self.generation.as_u64().saturating_add(1));
                 // Keep the dynamic tablet allocator past every placed
                 // tablet (genesis places static tiles through this path,
                 // so split children never collide with them even though
@@ -462,13 +517,50 @@ impl ControlState {
                 Ok(())
             }
             ControlMutation::CreateMigration { plan } => {
+                if let Some(existing) = self.migrations.get(&plan.id.as_u64()) {
+                    if *existing == *plan {
+                        return Ok(());
+                    }
+                    return Err(Fault::DuplicatePlan {
+                        plan: plan.id.as_u64(),
+                    });
+                }
+                if plan.generation != self.placement_version {
+                    return Err(Fault::StaleGeneration {
+                        plan: plan.id.as_u64(),
+                        carried: plan.generation.as_u64(),
+                        current: self.placement_version.as_u64(),
+                    });
+                }
+                let Some(desired) = self.placements.get(&plan.tablet.as_u64()) else {
+                    return Err(Fault::TopologyConflict {
+                        tablet: plan.tablet.as_u64(),
+                        detail: "migration names an unplaced tablet".to_owned(),
+                    });
+                };
+                if plan.from == plan.to
+                    || desired.contains(plan.from)
+                    || !desired.contains(plan.to)
+                    || plan.desired_voters != desired.replicas
+                {
+                    return Err(Fault::TopologyConflict {
+                        tablet: plan.tablet.as_u64(),
+                        detail: "migration endpoints do not match desired placement".to_owned(),
+                    });
+                }
+                if self
+                    .node(plan.to)
+                    .is_none_or(|node| node.state != NodeState::Active)
+                {
+                    return Err(Fault::TopologyConflict {
+                        tablet: plan.tablet.as_u64(),
+                        detail: "migration target is not active".to_owned(),
+                    });
+                }
                 self.migrations.insert(plan.id.as_u64(), plan.clone());
-                self.placement_version = PlacementVersion::from_u64(
-                    self.placement_version
-                        .as_u64()
-                        .max(plan.generation.as_u64()),
-                );
                 self.next_plan_id = self.next_plan_id.max(plan.id.as_u64() + 1);
+                self.generation =
+                    ClusterGeneration::from_u64(self.generation.as_u64().saturating_add(1));
                 Ok(())
             }
             ControlMutation::AdvanceMigration {
@@ -1103,7 +1195,40 @@ mod tests {
     #[test]
     fn stale_generation_rejected() {
         use crate::migration::MigrationPlanId;
-        let mut state = ControlState::empty();
+        let mut state = ControlState::bootstrap(
+            vec![
+                record(1, NodeState::Active),
+                record(2, NodeState::Active),
+                record(3, NodeState::Active),
+                record(4, NodeState::Active),
+            ],
+            vec![
+                DesiredReplicaSet::new(
+                    TabletId::from_u64(1),
+                    vec![
+                        NodeId::from_u64(1),
+                        NodeId::from_u64(2),
+                        NodeId::from_u64(3),
+                    ],
+                    PlacementVersion::from_u64(4),
+                )
+                .expect("desired"),
+            ],
+        );
+        state
+            .apply(&ControlMutation::SetDesiredPlacement {
+                desired: DesiredReplicaSet::new(
+                    TabletId::from_u64(1),
+                    vec![
+                        NodeId::from_u64(2),
+                        NodeId::from_u64(3),
+                        NodeId::from_u64(4),
+                    ],
+                    PlacementVersion::from_u64(5),
+                )
+                .expect("target desired"),
+            })
+            .expect("target placement");
         let plan = MigrationPlan::new(
             MigrationPlanId::from_u64(1),
             TabletId::from_u64(1),
@@ -1128,6 +1253,82 @@ mod tests {
             }),
             Err(ControlApplyError::StaleGeneration { .. })
         ));
+    }
+
+    #[test]
+    fn duplicate_migration_is_idempotent_and_conflicts_fail_closed() {
+        use crate::migration::{MigrationPlan, MigrationPlanId};
+        let mut state = ControlState::bootstrap(
+            vec![
+                record(1, NodeState::Active),
+                record(2, NodeState::Active),
+                record(3, NodeState::Active),
+                record(4, NodeState::Active),
+            ],
+            vec![
+                DesiredReplicaSet::new(
+                    TabletId::from_u64(1),
+                    vec![
+                        NodeId::from_u64(1),
+                        NodeId::from_u64(2),
+                        NodeId::from_u64(3),
+                    ],
+                    PlacementVersion::from_u64(1),
+                )
+                .expect("desired"),
+            ],
+        );
+        state
+            .apply(&ControlMutation::SetDesiredPlacement {
+                desired: DesiredReplicaSet::new(
+                    TabletId::from_u64(1),
+                    vec![
+                        NodeId::from_u64(2),
+                        NodeId::from_u64(3),
+                        NodeId::from_u64(4),
+                    ],
+                    PlacementVersion::from_u64(2),
+                )
+                .expect("target desired"),
+            })
+            .expect("target placement");
+        let plan = MigrationPlan::new(
+            MigrationPlanId::from_u64(1),
+            TabletId::from_u64(1),
+            PlacementVersion::from_u64(2),
+            NodeId::from_u64(1),
+            NodeId::from_u64(4),
+            vec![
+                NodeId::from_u64(2),
+                NodeId::from_u64(3),
+                NodeId::from_u64(4),
+            ],
+        )
+        .expect("plan");
+        state
+            .apply(&ControlMutation::CreateMigration { plan: plan.clone() })
+            .expect("create");
+        state
+            .apply(&ControlMutation::CreateMigration { plan })
+            .expect("idempotent retry");
+        let conflict = MigrationPlan::new(
+            MigrationPlanId::from_u64(1),
+            TabletId::from_u64(1),
+            PlacementVersion::from_u64(2),
+            NodeId::from_u64(1),
+            NodeId::from_u64(3),
+            vec![
+                NodeId::from_u64(2),
+                NodeId::from_u64(3),
+                NodeId::from_u64(4),
+            ],
+        )
+        .expect("conflict plan");
+        assert!(matches!(
+            state.apply(&ControlMutation::CreateMigration { plan: conflict }),
+            Err(ControlApplyError::DuplicatePlan { plan: 1 })
+        ));
+        assert_eq!(state.migrations().count(), 1);
     }
 
     #[test]

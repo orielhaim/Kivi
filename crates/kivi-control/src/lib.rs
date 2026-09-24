@@ -17,6 +17,7 @@
 //! little-endian encoding. `OpenRaft` Rust structs are never persisted
 //! as canonical control state.
 
+pub mod adaptive;
 pub mod catalog;
 pub mod failure;
 pub mod layouts;
@@ -30,6 +31,21 @@ pub mod redundancy;
 pub mod split;
 pub mod state;
 pub mod topology;
+
+pub use adaptive::{
+    Action, ActionCost, ActionId, ActionKind, ActionObservation, ActionOutcome, ActionRecord,
+    ActionResult, ActionScope, ActionState, ActionTarget, ActuationError, Actuator,
+    ActuatorReceipt, AdaptiveConfig, AdaptiveController, AdaptiveDecision, AdaptiveMode,
+    BaselineConfig, BaselineController, BaselineProposal, ControllerFrame, ControllerSimulation,
+    ControllerSource, ControllerStats, DecisionTrace, ErasureCodingLayout, ExpectedBenefit,
+    LearnedConfig, LearnedController, LearnedDecision, LearnedModel, MaterializationIntent,
+    MemoryBudget, MigrationFence, MigrationRecommendation, ModelDecodeError, ModelDisableReason,
+    ModelLoadReport, ModelLoadStatus, ObjectiveBreakdown, ObjectiveScales, ObjectiveVector,
+    ObjectiveWeights, Ppm, RedundancyPreference, RepairBudget, SafetyContext, SafetyEnvelope,
+    SafetyValidator, SafetyViolation, ScrubBudget, SimulationInput, SimulationReport,
+    SimulationWorkload, TabletMergePolicy, TabletSet, TabletSplitPolicy, TopologyViolation,
+    TraceStatus,
+};
 
 pub use catalog::{
     CatalogError, CatalogIndexKind, CatalogIndexState, CatalogLayout, IndexRecord, NamespaceRecord,

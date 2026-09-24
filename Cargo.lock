@@ -1803,6 +1803,7 @@ name = "kivi-control"
 version = "0.1.0"
 dependencies = [
  "kivi-codec",
+ "kivi-observation",
  "kivi-redundancy",
  "kivi-types",
  "thiserror",
@@ -1876,9 +1877,11 @@ dependencies = [
  "kivi-checkpoint",
  "kivi-client",
  "kivi-codec",
+ "kivi-control",
  "kivi-core",
  "kivi-durability",
  "kivi-engine",
+ "kivi-observation",
  "kivi-protocol",
  "kivi-redundancy",
  "kivi-state",
@@ -1900,11 +1903,19 @@ dependencies = [
  "compio",
  "crc32c",
  "divan",
+ "kivi-observation",
  "kivi-types",
  "lz4_flex",
  "proptest",
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "kivi-observation"
+version = "0.1.0"
+dependencies = [
+ "kivi-types",
 ]
 
 [[package]]
@@ -1933,6 +1944,7 @@ dependencies = [
  "divan",
  "futures",
  "kivi-codec",
+ "kivi-observation",
  "kivi-types",
  "proptest",
  "reed-solomon-simd",
@@ -1976,6 +1988,8 @@ dependencies = [
  "kivi-core",
  "kivi-durability",
  "kivi-engine",
+ "kivi-memory",
+ "kivi-observation",
  "kivi-protocol",
  "kivi-redundancy",
  "kivi-resp",
@@ -1998,7 +2012,9 @@ name = "kivi-sim"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "kivi-control",
  "kivi-core",
+ "kivi-observation",
  "kivi-state",
  "kivi-types",
  "rstest",
@@ -2382,9 +2398,9 @@ dependencies = [
 
 [[package]]
 name = "openraft-macros"
-version = "0.10.0-alpha.34"
+version = "0.10.0-alpha.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5c57259539e016f70d05ea7e264573cc5ddabd651a127a13374e47b165b7664"
+checksum = "67ed78eec74c990817f319d27931dba4523eaa687170b4faa16ee0a412267e82"
 dependencies = [
  "chrono",
  "proc-macro2",
@@ -2405,9 +2421,9 @@ dependencies = [
 
 [[package]]
 name = "openraft-rt"
-version = "0.10.0-alpha.34"
+version = "0.10.0-alpha.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02379ddf29c426905a6e91c5df522003ee2a9a9811b3b8be01e90ab1106ecef6"
+checksum = "4b3eec401d2246dbd7850a927679e8927aa40f5d6793c68d9fff2eec4896feb8"
 dependencies = [
  "futures-channel",
  "futures-util",
@@ -2434,9 +2450,9 @@ dependencies = [
 
 [[package]]
 name = "openraft-rt-tokio"
-version = "0.10.0-alpha.34"
+version = "0.10.0-alpha.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cfeb8c656d8b0e01319aafc70f77b3b312cac56d07adf157d80b49677cc2fcec"
+checksum = "49c332e12c82e4ef28c7c01b04332d3d6a408e94aa2f578a6bc1e7bff7577afa"
 dependencies = [
  "futures-util",
  "openraft-rt",
@@ -4103,18 +4119,18 @@ dependencies = [
 
 [[package]]
 name = "zerocopy"
-version = "0.8.57"
+version = "0.8.58"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d35102a9f36d089ccae9e4c6802bc118be4487b80aaffc0ab4e0cf5ce92d2873"
+checksum = "c17e8fafad82b542ff3717217ecdc736231b59e387768c9630123b4ce4d2db44"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.57"
+version = "0.8.58"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "146c01f5ab44258da43cf276c74a2763db2ff3969c9c652c3f2de07041d0b2bc"
+checksum = "595f56e044df4f46a0c9a626f65c3d99eb8488f7e8a8baa12dd76326d9710bf2"
 dependencies = [
  "proc-macro2",
  "quote",

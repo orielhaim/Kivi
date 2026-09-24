@@ -202,6 +202,7 @@ impl Executor for LocalExecutor {
                 .set_conditional(key, value.clone(), *condition, *expiry)
                 .map(|(applied, version)| OperationResult::ConditionalSet { applied, version })
                 .map_err(map_engine)?,
+            _ => return Err(ExecuteError::Internal),
         };
         Ok(out)
     }

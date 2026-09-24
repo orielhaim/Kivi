@@ -45,6 +45,8 @@ tempfile.workspace = true
 
 [dev-dependencies]
 divan.workspace = true
+kivi-control.workspace = true
+kivi-observation.workspace = true
 # Redundancy suites speak the admin plane's base64 image encoding.
 base64 = "0.23"
 # Ecosystem/reference client: conformance cross-checks and the redis-rs →
@@ -57,4 +59,8 @@ workspace = true
 
 [[bench]]
 name = "ordered"
+harness = false
+
+[[bench]]
+name = "adaptive"
 harness = false

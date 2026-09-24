@@ -44,6 +44,7 @@ pub mod intent;
 pub mod lane;
 pub mod metrics;
 pub mod placement;
+pub mod policy;
 pub mod proto;
 pub mod repair;
 pub mod replication;
@@ -80,6 +81,13 @@ pub use placement::{
 pub use placement::{
     DesiredPlacement, FragmentPlacement, HealthyPlacement, plan_placement_with_locality,
     reconstruction_targets,
+};
+pub use policy::{
+    AssetTemperature, HOT_SMALL_MAX_BYTES, PolicyDecisionReason, PolicyDecisionTrace, PolicyError,
+    PolicyInput, PolicyObservation, PolicyOutcome, PolicyState, SchemePreference,
+    SchemePreferenceDecision, SchemePreferenceReason, SelfHealingPolicy, SelfHealingPolicyAdapter,
+    apply_maintenance_policy, apply_policy, prefer_redundancy_scheme, preferred_scheme,
+    scheme_satisfies_intent, update_maintenance_budgets,
 };
 pub use proto::{
     FragmentInventoryEntry, FragmentKey, FragmentReply, FragmentRpc, MAX_FRAGMENT_WIRE_BYTES,

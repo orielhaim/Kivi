@@ -589,6 +589,52 @@ impl AdminHandle {
         out
     }
 
+    /// Applies one bounded memory control policy to every worker.
+    ///
+    /// The call blocks on each worker's bounded control channel. Serve it
+    /// from `spawn_blocking`; a saturated or exited worker fails closed and
+    /// is reported as `false`.
+    #[must_use]
+    pub fn set_memory_control_policy(&self, policy: kivi_memory::MemoryControlPolicy) -> bool {
+        let mut all = true;
+        for (_, control) in &self.controls {
+            let (respond, receive) = crossbeam_channel::bounded(1);
+            if control
+                .try_send(crate::worker::WorkerControl::SetMemoryPolicy { policy, respond })
+                .is_err()
+            {
+                all = false;
+                continue;
+            }
+            all &= receive.recv().unwrap_or(false);
+        }
+        all
+    }
+
+    /// Drains worker-local access signals for the observation controller.
+    ///
+    /// The call blocks on each worker's bounded control channel. Serve it
+    /// from `spawn_blocking`; exited workers are omitted.
+    #[must_use]
+    pub fn memory_signals_snapshot(
+        &self,
+    ) -> Vec<(WorkerId, Vec<(u64, kivi_memory::AccessSignals)>)> {
+        let mut out = Vec::new();
+        for (id, control) in &self.controls {
+            let (respond, receive) = crossbeam_channel::bounded(1);
+            if control
+                .try_send(crate::worker::WorkerControl::MemorySignals { respond })
+                .is_err()
+            {
+                continue;
+            }
+            if let Ok(signals) = receive.recv() {
+                out.push((*id, signals));
+            }
+        }
+        out
+    }
+
     /// Snapshots the redundancy fabric for the admin plane (`None` in
     /// ephemeral mode, which holds no fabric). Additive: existing admin
     /// DTOs are untouched; a future `kivi-server` `/v1/redundancy`

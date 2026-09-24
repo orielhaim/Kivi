@@ -9,6 +9,7 @@ license = "AGPL-3.0-or-later"
 kivi-types.workspace = true
 kivi-codec.workspace = true
 kivi-redundancy.workspace = true
+kivi-observation.workspace = true
 thiserror.workspace = true
 
 [lints]

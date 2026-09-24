@@ -53,12 +53,15 @@ pub mod nvme;
 pub mod offcore;
 pub mod offcore_lane;
 pub mod placement;
+pub mod policy;
 pub mod provider;
 pub mod repr;
 pub mod sim;
 pub mod tablet;
 pub mod telemetry;
 pub mod transition;
+
+pub use kivi_observation::UnitInterval;
 
 pub use arena::{ArenaStats, WorkerArenas};
 pub use calibrate::{Calibrator, Ewma, ProviderCalibration};
@@ -91,12 +94,18 @@ pub use offcore_lane::{
 pub use placement::{
     CriticalityPlanner, PlacementDecision, Planner, S3FifoBaseline, SieveBaseline,
 };
+pub use policy::{
+    DEFAULT_COMPRESSION_AGGRESSIVENESS, DEFAULT_CRITICALITY_WEIGHTING,
+    DEFAULT_DRAM_RESIDENCY_TARGET, DEFAULT_NVME_DEMOTION_PRESSURE, DEFAULT_PROMOTION_THRESHOLD,
+    MemoryControlPolicy, MemoryControlPolicyError,
+};
 pub use provider::{
     LocalityCaps, ProviderCaps, ProviderDescriptor, ProviderId, ProviderKind, ProviderRegistry,
 };
 pub use repr::{ObjectMaterialization, PhysicalRepr, ReconstructionSource, Residence};
 pub use sim::{SimFault, SimProvider};
 pub use tablet::{TabletEnvelope, TabletMaterializations};
+pub use telemetry::{AccessCounters, DEFAULT_OBJECT_CAPACITY, SoftwareTelemetry, TelemetryLimits};
 
 /// Tiny-value ceiling in bytes: values at or below this stay inline in
 /// the object root with no arena/compression/storage machinery (RFC §25).
