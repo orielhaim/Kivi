@@ -19,12 +19,6 @@ use kivi_types::{ClusterId, NamespaceId, NodeId, NodeIncarnation, TabletId, Work
 
 const NS: NamespaceId = NamespaceId::from_u64(1);
 
-/// Three ordered tablets: 1:[empty, m), 2:[m, t), 3:[t, +inf).
-fn ordered_snapshot() -> DirectorySnapshot {
-    DirectorySnapshot::static_ordered_tiles(NS, &[b"m".to_vec(), b"t".to_vec()])
-        .expect("ordered tiling builds")
-}
-
 fn network() -> EngineNetwork {
     EngineNetwork {
         base_port: 0,
@@ -41,9 +35,14 @@ fn network() -> EngineNetwork {
 }
 
 fn start_ordered() -> LocalEngine {
+    start_ordered_with_boundaries(&[b"m".to_vec(), b"t".to_vec()])
+}
+
+fn start_ordered_with_boundaries(boundaries: &[Vec<u8>]) -> LocalEngine {
     LocalEngine::start(EngineConfig {
         namespace: NS,
-        directory: ordered_snapshot(),
+        directory: DirectorySnapshot::static_ordered_tiles(NS, boundaries)
+            .expect("ordered tiling builds"),
         placement: Placement::new([
             (TabletId::from_u64(1), WorkerId::from_u64(0)),
             (TabletId::from_u64(2), WorkerId::from_u64(1)),
@@ -408,5 +407,48 @@ fn secondary_index_money_flow() {
         .index_equal_unique(NS, IndexId::from_u64(2), b"amy@example.com")
         .expect("unique lookup works");
     assert_eq!(owner, Some(b"user:amy".to_vec()));
+    engine.shutdown().expect("clean shutdown");
+}
+
+#[test]
+fn secondary_index_range_fanout_keeps_global_top_term() {
+    let engine = start_ordered();
+    let client = client_for(&engine);
+    for (user, city) in [("user:amy", "zulu"), ("user:zed", "alpha")] {
+        client
+            .indexed_set(
+                NS,
+                user.as_bytes(),
+                format!("profile:{user}").into_bytes(),
+                &[term_set(1, IndexKind::NonUnique, &[city])],
+            )
+            .expect("indexed set works");
+    }
+    let hits = client
+        .index_range(NS, IndexId::from_u64(1), b"a", b"z", 1)
+        .expect("range works");
+    assert_eq!(hits, vec![b"user:zed".to_vec()]);
+    engine.shutdown().expect("clean shutdown");
+}
+
+#[test]
+fn secondary_index_fanout_starts_at_first_tablet() {
+    let engine = start_ordered_with_boundaries(&[b"a".to_vec(), b"b".to_vec()]);
+    let client = client_for(&engine);
+    for user in ["aa", "zz"] {
+        client
+            .indexed_set(
+                NS,
+                user.as_bytes(),
+                format!("profile:{user}").into_bytes(),
+                &[term_set(1, IndexKind::NonUnique, &["same"])],
+            )
+            .expect("indexed set works");
+    }
+    let mut hits = client
+        .index_equal(NS, IndexId::from_u64(1), b"same", 10)
+        .expect("equality works");
+    hits.sort();
+    assert_eq!(hits, vec![b"aa".to_vec(), b"zz".to_vec()]);
     engine.shutdown().expect("clean shutdown");
 }

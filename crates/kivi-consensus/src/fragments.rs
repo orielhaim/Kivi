@@ -96,6 +96,11 @@ pub(crate) fn handle_fragment_rpc(
             current: local_incarnation,
         }));
     }
+    if rpc.is_mutation() && target == 0 && local_incarnation != 0 {
+        return Ok(refused(RefuseReason::StaleIncarnation {
+            current: local_incarnation,
+        }));
+    }
     let Some(store) = store else {
         return Ok(refused(RefuseReason::ShuttingDown));
     };
@@ -110,7 +115,10 @@ fn refused(reason: RefuseReason) -> PeerResponse {
 /// Returns the incarnation the RPC addresses (`0` is the bootstrap probe).
 fn target_of(rpc: &FragmentRpc) -> u64 {
     match rpc {
-        FragmentRpc::Put {
+        FragmentRpc::Hello {
+            target_incarnation, ..
+        }
+        | FragmentRpc::Put {
             target_incarnation, ..
         }
         | FragmentRpc::Get {
@@ -119,10 +127,16 @@ fn target_of(rpc: &FragmentRpc) -> u64 {
         | FragmentRpc::Has {
             target_incarnation, ..
         }
+        | FragmentRpc::Metadata {
+            target_incarnation, ..
+        }
         | FragmentRpc::Drop {
             target_incarnation, ..
         }
         | FragmentRpc::PutLayout {
+            target_incarnation, ..
+        }
+        | FragmentRpc::AbortLayout {
             target_incarnation, ..
         }
         | FragmentRpc::GetLayout {
@@ -133,14 +147,27 @@ fn target_of(rpc: &FragmentRpc) -> u64 {
         }
         | FragmentRpc::SweepOrphans {
             target_incarnation, ..
+        }
+        | FragmentRpc::Inventory {
+            target_incarnation, ..
+        }
+        | FragmentRpc::InventoryPage {
+            target_incarnation, ..
+        }
+        | FragmentRpc::SweepOrphansGraceful {
+            target_incarnation, ..
         } => *target_incarnation,
     }
 }
 
 /// Executes one decoded fragment RPC against the store, mapping every
 /// store fault to a fencing refusal (callers try alternates, never wait).
+#[allow(clippy::too_many_lines)]
 fn dispatch(store: &LocalFragmentStore, rpc: FragmentRpc) -> FragmentReply {
     match rpc {
+        FragmentRpc::Hello { .. } => FragmentReply::Incarnation {
+            current: store.incarnation(),
+        },
         FragmentRpc::Put {
             key,
             role,
@@ -182,6 +209,13 @@ fn dispatch(store: &LocalFragmentStore, rpc: FragmentRpc) -> FragmentReply {
             let (present, healthy) = store.has_fragment(&key, target_incarnation);
             FragmentReply::Presence { present, healthy }
         }
+        FragmentRpc::Metadata {
+            key,
+            target_incarnation,
+        } => {
+            let (present, healthy) = store.metadata_fragment(&key, target_incarnation);
+            FragmentReply::Presence { present, healthy }
+        }
         FragmentRpc::Drop {
             key,
             target_incarnation,
@@ -196,6 +230,58 @@ fn dispatch(store: &LocalFragmentStore, rpc: FragmentRpc) -> FragmentReply {
                 Err(error) => FragmentReply::Refused {
                     reason: refuse_reason(&error),
                 },
+            }
+        }
+        FragmentRpc::Inventory { target_incarnation } => {
+            if target_incarnation != 0 && target_incarnation != store.incarnation() {
+                FragmentReply::Refused {
+                    reason: RefuseReason::StaleIncarnation {
+                        current: store.incarnation(),
+                    },
+                }
+            } else {
+                FragmentReply::Inventory {
+                    entries: store.inventory(),
+                }
+            }
+        }
+        FragmentRpc::InventoryPage {
+            target_incarnation,
+            offset,
+            limit,
+        } => {
+            if target_incarnation != 0 && target_incarnation != store.incarnation() {
+                FragmentReply::Refused {
+                    reason: RefuseReason::StaleIncarnation {
+                        current: store.incarnation(),
+                    },
+                }
+            } else {
+                let (entries, next_offset) = store.inventory_page(offset, limit);
+                FragmentReply::InventoryPage {
+                    entries,
+                    next_offset,
+                }
+            }
+        }
+        FragmentRpc::SweepOrphansGraceful {
+            target_incarnation,
+            minimum_age_ms,
+            protected,
+        } => {
+            if target_incarnation != 0 && target_incarnation != store.incarnation() {
+                FragmentReply::Refused {
+                    reason: RefuseReason::StaleIncarnation {
+                        current: store.incarnation(),
+                    },
+                }
+            } else {
+                FragmentReply::Swept {
+                    count: store.sweep_orphans_older_than(
+                        std::time::Duration::from_millis(minimum_age_ms),
+                        &protected,
+                    ),
+                }
             }
         }
         other => dispatch_layout(store, other),
@@ -232,6 +318,25 @@ fn dispatch_layout(store: &LocalFragmentStore, rpc: FragmentRpc) -> FragmentRepl
                     reason: refuse_reason(&error),
                 },
             },
+            Err(reason) => FragmentReply::Refused { reason },
+        },
+        FragmentRpc::AbortLayout {
+            asset_kind,
+            asset_domain,
+            asset_hash,
+            generation,
+            control_generation,
+            target_incarnation,
+        } => match layout_asset_id(asset_kind, asset_domain, &asset_hash) {
+            Ok(asset) => {
+                match store.abort_layout(&asset, generation, control_generation, target_incarnation)
+                {
+                    Ok(count) => FragmentReply::Swept { count },
+                    Err(error) => FragmentReply::Refused {
+                        reason: refuse_reason(&error),
+                    },
+                }
+            }
             Err(reason) => FragmentReply::Refused { reason },
         },
         FragmentRpc::GetLayout {
@@ -306,8 +411,12 @@ fn refuse_reason(error: &RedundancyError) -> RefuseReason {
 /// Stamps the believed target incarnation onto the wire RPC, overwriting
 /// the inner field so the two can never disagree (the control registry's
 /// belief in [`PeerTarget::incarnation`] is authoritative).
+#[allow(clippy::too_many_lines)]
 fn stamp_target(rpc: FragmentRpc, incarnation: u64) -> FragmentRpc {
     match rpc {
+        FragmentRpc::Hello { .. } => FragmentRpc::Hello {
+            target_incarnation: incarnation,
+        },
         FragmentRpc::Put {
             key,
             role,
@@ -354,6 +463,21 @@ fn stamp_target(rpc: FragmentRpc, incarnation: u64) -> FragmentRpc {
             layout,
             target_incarnation: incarnation,
         },
+        FragmentRpc::AbortLayout {
+            asset_kind,
+            asset_domain,
+            asset_hash,
+            generation,
+            control_generation,
+            ..
+        } => FragmentRpc::AbortLayout {
+            asset_kind,
+            asset_domain,
+            asset_hash,
+            generation,
+            control_generation,
+            target_incarnation: incarnation,
+        },
         FragmentRpc::GetLayout {
             asset_kind,
             asset_domain,
@@ -379,6 +503,27 @@ fn stamp_target(rpc: FragmentRpc, incarnation: u64) -> FragmentRpc {
             target_incarnation: incarnation,
         },
         FragmentRpc::SweepOrphans { .. } => FragmentRpc::SweepOrphans {
+            target_incarnation: incarnation,
+        },
+        FragmentRpc::Inventory { .. } => FragmentRpc::Inventory {
+            target_incarnation: incarnation,
+        },
+        FragmentRpc::InventoryPage { offset, limit, .. } => FragmentRpc::InventoryPage {
+            target_incarnation: incarnation,
+            offset,
+            limit,
+        },
+        FragmentRpc::SweepOrphansGraceful {
+            minimum_age_ms,
+            protected,
+            ..
+        } => FragmentRpc::SweepOrphansGraceful {
+            target_incarnation: incarnation,
+            minimum_age_ms,
+            protected,
+        },
+        FragmentRpc::Metadata { key, .. } => FragmentRpc::Metadata {
+            key,
             target_incarnation: incarnation,
         },
     }

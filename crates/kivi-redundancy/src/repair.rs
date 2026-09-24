@@ -19,7 +19,7 @@ use std::collections::{HashMap, VecDeque};
 
 use kivi_types::NodeId;
 
-use crate::{AssetHealth, AssetId, RedundancyError, SchemeParams};
+use crate::{AssetHealth, AssetId, RedundancyError, SchemeParams, healing::ScrubMode};
 
 /// Per-fragment integrity verdict (scrubbing hook input).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -98,9 +98,21 @@ pub fn assess(
     verdicts: Vec<(u32, FragmentVerdict)>,
     survivable: u32,
 ) -> AssetAssessment {
+    assess_with_min_available(asset, generation, params, verdicts, survivable, 1)
+}
+
+/// Assesses one asset while honoring its persisted minimum retrievable floor.
+#[must_use]
+pub fn assess_with_min_available(
+    asset: AssetId,
+    generation: u64,
+    params: SchemeParams,
+    verdicts: Vec<(u32, FragmentVerdict)>,
+    survivable: u32,
+    min_available: u32,
+) -> AssetAssessment {
     let total = params.total_fragments();
-    let required = params.required_pieces();
-    // Usable <= total <=40, far below `u32::MAX`.
+    let required = params.required_pieces().max(min_available);
     #[allow(clippy::cast_possible_truncation)]
     let usable = verdicts.iter().filter(|(_, v)| v.is_usable()).count() as u32;
     let reconstructable = usable >= required;
@@ -109,14 +121,17 @@ pub fn assess(
         .filter(|(_, v)| v.needs_repair())
         .map(|(i, _)| *i)
         .collect();
+    let independence_gap = params.tolerance().saturating_sub(survivable);
     let health = if !reconstructable {
         AssetHealth::Unrecoverable
-    } else if usable == total && need_repair.is_empty() {
-        AssetHealth::Healthy
-    } else if survivable == 0 {
-        AssetHealth::Critical
+    } else if independence_gap > 0 || !need_repair.is_empty() {
+        if survivable == 0 {
+            AssetHealth::Critical
+        } else {
+            AssetHealth::Degraded
+        }
     } else {
-        AssetHealth::Degraded
+        AssetHealth::Healthy
     };
     AssetAssessment {
         asset,
@@ -428,6 +443,8 @@ pub struct ScrubReport {
     pub asset: AssetId,
     /// Generation scrubbed.
     pub generation: u64,
+    /// Metadata-only or full-payload pass.
+    pub mode: ScrubMode,
     /// Per-fragment verdicts.
     pub verdicts: Vec<(u32, FragmentVerdict)>,
     /// Corruptions found (checksum mismatches + reconstructable).
@@ -436,6 +453,20 @@ pub struct ScrubReport {
     pub missing: usize,
     /// Stale-generation fragments.
     pub stale: usize,
+    /// Bytes inspected by this pass.
+    pub bytes_checked: u64,
+    /// Whether every holder's layout metadata matched the catalog layout.
+    pub metadata_ok: bool,
+    /// Whether a full reconstructed image passed `AssetId` verification.
+    pub asset_verified: bool,
+    /// Number of physical identities that disagreed with layout records.
+    pub wrong_identity: usize,
+    /// Number of physical generations that disagreed with the catalog.
+    pub wrong_generation: usize,
+    /// Number of malformed holder layout records.
+    pub metadata_corrupt: usize,
+    /// Number of truncated payloads observed during a full pass.
+    pub truncated: usize,
 }
 
 /// Classifies scrub observations into a [`ScrubReport`].
@@ -467,10 +498,18 @@ pub fn scrub_report(
     ScrubReport {
         asset,
         generation,
+        mode: ScrubMode::Metadata,
         verdicts,
         corruptions,
         missing,
         stale,
+        bytes_checked: 0,
+        metadata_ok: true,
+        asset_verified: true,
+        wrong_identity: 0,
+        wrong_generation: 0,
+        metadata_corrupt: 0,
+        truncated: 0,
     }
 }
 
@@ -537,6 +576,24 @@ mod tests {
         );
         assert_eq!(lost.health, AssetHealth::Unrecoverable);
         assert!(!lost.reconstructable);
+    }
+
+    #[test]
+    fn healthy_fragments_still_require_independent_tolerance() {
+        let params = SchemeParams::Replication(crate::ReplicationParams { copies: 3 });
+        let assessment = assess(
+            asset(),
+            1,
+            params,
+            vec![
+                (0, FragmentVerdict::Healthy),
+                (1, FragmentVerdict::Healthy),
+                (2, FragmentVerdict::Healthy),
+            ],
+            0,
+        );
+        assert_eq!(assessment.health, AssetHealth::Critical);
+        assert!(assessment.need_repair.is_empty());
     }
 
     #[test]

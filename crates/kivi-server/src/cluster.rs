@@ -1113,6 +1113,7 @@ async fn open_node(
 /// opens the multi-tablet node, serves native, admin, and optional RESP,
 /// prints the `KIVI_READY` line with bound addresses, and shuts down
 /// orderly.
+#[allow(clippy::too_many_lines)]
 pub async fn run(config: ClusterServeConfig) -> anyhow::Result<()> {
     let directory = build_directory(&config)?;
     let node = open_node(&config, &directory).await?;
@@ -1175,6 +1176,7 @@ pub async fn run(config: ClusterServeConfig) -> anyhow::Result<()> {
         Arc::clone(&shared.directory),
         Arc::clone(&policy),
     );
+    let redundancy_healer = shared.redundancy.as_ref().map(spawn_redundancy_healer);
     // Native serving (Tokio tasks per connection).
     let native = {
         let shared = shared.clone();
@@ -1221,6 +1223,12 @@ pub async fn run(config: ClusterServeConfig) -> anyhow::Result<()> {
     admin.abort();
     genesis.abort();
     reconciler.abort();
+    if let Some(coordinator) = shared.redundancy.as_ref() {
+        coordinator.stop_healing();
+    }
+    if let Some(healer) = redundancy_healer {
+        healer.abort();
+    }
     node.shutdown().await;
     tracing::info!("kivi-server (cluster) stopped");
     Ok(())
@@ -1315,6 +1323,35 @@ fn spawn_control_loops(
         })
     };
     (genesis, reconciler)
+}
+
+fn spawn_redundancy_healer(
+    coordinator: &Arc<kivi_consensus::distcoord::RedundancyCoordinator>,
+) -> tokio::task::JoinHandle<()> {
+    let coordinator = Arc::clone(coordinator);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            if coordinator.healing_stopped() {
+                break;
+            }
+            let owned = Arc::clone(&coordinator);
+            let result = tokio::task::spawn_blocking(move || {
+                let runtime = compio::runtime::Runtime::new().map_err(|error| error.to_string())?;
+                runtime
+                    .block_on(owned.maintenance_tick(false))
+                    .map_err(|error| error.to_string())
+            })
+            .await;
+            match result {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => tracing::warn!(%error, "redundancy maintenance tick deferred"),
+                Err(error) => tracing::warn!(%error, "redundancy maintenance task failed"),
+            }
+        }
+    })
 }
 
 /// Builds the genesis seed from static startup flags: every configured
@@ -1688,6 +1725,41 @@ async fn drain_upload_pieces(
     Ok(())
 }
 
+fn schedule_sidecar_protection(
+    shared: &ClusterShared,
+    manifest: kivi_types::ManifestId,
+    chunks: Vec<(kivi_types::ChunkId, u64)>,
+    _logical_len: u64,
+) {
+    let Some(coordinator) = shared.redundancy.clone() else {
+        return;
+    };
+    let domain = kivi_types::SecurityDomainId::from_u64(shared.namespace.as_u64());
+    tokio::spawn(async move {
+        let owned = Arc::clone(&coordinator);
+        let result = tokio::task::spawn_blocking(move || {
+            let runtime = compio::runtime::Runtime::new().map_err(|error| error.to_string())?;
+            runtime.block_on(async move {
+                for (chunk, len) in chunks {
+                    if let Err(error) = owned.protect_chunk(chunk, domain, len, 1).await {
+                        tracing::warn!(%error, ?chunk, "sidecar chunk protection deferred");
+                        return Err::<(), String>(error.to_string());
+                    }
+                }
+                if let Err(error) = owned.protect_manifest_auto(manifest, domain).await {
+                    tracing::warn!(%error, ?manifest, "sidecar manifest protection deferred");
+                    return Err::<(), String>(error.to_string());
+                }
+                Ok::<(), String>(())
+            })
+        })
+        .await;
+        if let Ok(Err(error)) = result {
+            tracing::warn!(%error, "sidecar protection worker stopped");
+        }
+    });
+}
+
 /// Handles `StreamCommit`: stages the tail, builds the manifest, syncs
 /// once, proposes the tiny root, and answers `Response::Stored` under the
 /// stream id (or `StreamAbort` on failure, pre-apply).
@@ -1833,6 +1905,7 @@ async fn handle_stream_commit(
                     let mut pins = shared.node.sidecar().pins().lock().await;
                     pins.unpin_root(&manifest, &chunk_ids);
                 }
+                schedule_sidecar_protection(shared, manifest, upload.chunks.clone(), total);
                 shape_result(kivi_protocol::Opcode::Set, tablet, &outcome)
             }
             ProposeOutcome::Rejected { outcome } => {

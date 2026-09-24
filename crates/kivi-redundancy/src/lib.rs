@@ -38,6 +38,7 @@ pub mod domain;
 pub mod error;
 pub mod fabric;
 pub mod fragment;
+pub mod healing;
 pub mod integration;
 pub mod intent;
 pub mod lane;
@@ -63,6 +64,11 @@ pub use fabric::{
     FabricConfig, ReconstructionBudgets, RecoveryReport, RedundancyFabric, TransitionState,
 };
 pub use fragment::{FragmentId, FragmentRecord, FragmentRole, RedundancyLayout};
+pub use healing::{
+    ControllerSnapshot, DebtCounters, MaintenanceBudgets, MaintenanceReport, RepairDebt,
+    RepairDebtEntry, RepairRisk, SchemeRequirements, ScrubBatch, ScrubCursor, ScrubMode,
+    ScrubRange, ScrubSchedule, ScrubTarget,
+};
 pub use intent::{LocalityRequirement, RedundancyIntent, RepairConstraints, StorageCost};
 pub use lane::{
     FenceHook, LaneConfig, LaneJoin, LanePriority, LaneStats, LaneValue, RedundancyLane,
@@ -72,15 +78,16 @@ pub use placement::{
     DegradedPlacement, ReconstructionTargets, independent_survivable, plan_placement,
 };
 pub use placement::{
-    DesiredPlacement, FragmentPlacement, HealthyPlacement, reconstruction_targets,
+    DesiredPlacement, FragmentPlacement, HealthyPlacement, plan_placement_with_locality,
+    reconstruction_targets,
 };
 pub use proto::{
-    FragmentKey, FragmentReply, FragmentRpc, MAX_FRAGMENT_WIRE_BYTES, MAX_LAYOUT_WIRE_BYTES,
-    PROTO_MAJOR, PROTO_MINOR, RefuseReason,
+    FragmentInventoryEntry, FragmentKey, FragmentReply, FragmentRpc, MAX_FRAGMENT_WIRE_BYTES,
+    MAX_INVENTORY_ENTRIES, MAX_LAYOUT_WIRE_BYTES, PROTO_MAJOR, PROTO_MINOR, RefuseReason,
 };
 pub use repair::{
     AssetAssessment, FragmentVerdict, RepairBudgets, RepairEngine, RepairReason, RepairTask,
-    ScrubReport, assess, scrub_report,
+    ScrubReport, assess, assess_with_min_available, scrub_report,
 };
 pub use scheme::{
     ReplicationParams, RsParams, SchemeCapabilities, SchemeId, SchemeParams, plan_baseline,

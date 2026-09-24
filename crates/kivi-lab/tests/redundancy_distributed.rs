@@ -188,28 +188,34 @@ fn replication_remote_read_and_repair() {
         unb64(body["bytes_b64"].as_str().expect("image")).as_deref(),
         Some(bytes.as_slice())
     );
-    assert_eq!(
-        body["degraded"],
-        json!(true),
-        "read reports the degraded path"
-    );
 
-    // Health sees the missing piece; repair restores it on the real holder.
-    let degraded = await_health(&cluster, 0, &hash, "degraded");
-    let actual = degraded["actual"].as_array().expect("actual placement");
-    assert!(
-        actual
-            .iter()
-            .any(|entry| entry["node"] == json!(1) && entry["healthy"] == json!(false)),
-        "the wiped holder is reported unhealthy: {actual:?}"
-    );
-    assert!(
-        actual
-            .iter()
-            .filter(|entry| entry["node"] == json!(2) || entry["node"] == json!(3))
-            .all(|entry| entry["healthy"] == json!(true)),
-        "surviving holders stay healthy: {actual:?}"
-    );
+    let observed = await_until("replication health after restart", || {
+        let (status, body) = health(&cluster, 0, &hash);
+        (status == 200 && matches!(body["health"].as_str(), Some("degraded" | "healthy")))
+            .then_some(body)
+    });
+    if observed["health"] == "degraded" {
+        let actual = observed["actual"].as_array().expect("actual placement");
+        assert!(
+            actual
+                .iter()
+                .any(|entry| entry["node"] == json!(1) && entry["healthy"] == json!(false)),
+            "the wiped holder is reported unhealthy: {actual:?}"
+        );
+        assert!(
+            actual
+                .iter()
+                .filter(|entry| entry["node"] == json!(2) || entry["node"] == json!(3))
+                .all(|entry| entry["healthy"] == json!(true)),
+            "surviving holders stay healthy: {actual:?}"
+        );
+    } else {
+        assert_eq!(
+            observed["usable"],
+            json!(3),
+            "automatic repair won the race"
+        );
+    }
     let (status, body) = repair(&cluster, 0, &hash);
     assert_eq!(status, 200, "repair: {body}");
     let healthy = await_health(&cluster, 0, &hash, "healthy");
@@ -403,9 +409,13 @@ fn transition_without_enough_nodes_fails_closed() {
         unb64(body["bytes_b64"].as_str().expect("image")).as_deref(),
         Some(bytes.as_slice())
     );
-    let degraded = await_health(&cluster, 0, &hash, "degraded");
+    let observed = await_until("old layout remains authoritative", || {
+        let (status, body) = health(&cluster, 0, &hash);
+        (status == 200 && matches!(body["health"].as_str(), Some("degraded" | "healthy")))
+            .then_some(body)
+    });
     assert_eq!(
-        degraded["generation"], before["generation"],
+        observed["generation"], before["generation"],
         "failed transition did not publish a new generation"
     );
 }
@@ -437,7 +447,10 @@ fn corrupted_remote_fragment_is_detected_and_repaired() {
             .and_then(|name| name.to_str())
             .is_some_and(|name| {
                 let name = name.to_ascii_lowercase();
-                name.starts_with("frag-") && name.ends_with(".bin")
+                name.starts_with("frag-")
+                    && std::path::Path::new(&name)
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("bin"))
             });
         if !is_fragment {
             continue;
@@ -492,6 +505,96 @@ fn corrupted_remote_fragment_is_detected_and_repaired() {
     assert_eq!(
         restored, bytes,
         "repair rewrote the authoritative bytes on disk, not just the index"
+    );
+}
+
+/// Background maintenance discovers corruption and repairs it without an
+/// operator repair request.
+#[test]
+fn autonomous_corruption_heals_without_admin_call() {
+    let cluster = Cluster::spawn().expect("cluster spawns");
+    let _leader = cluster.wait_leader();
+    let bytes = payload(48 * 1024, 0xA11CE);
+    let hash = asset_hex(&bytes);
+    let (status, body) = protect(&cluster, 0, &bytes, 2);
+    assert_eq!(status, 200, "protect: {body}");
+    let root = fragments_root(&cluster, 1);
+    let fragment = walk(&root)
+        .into_iter()
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("frag-")
+                        && std::path::Path::new(&name)
+                            .extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("bin"))
+                })
+        })
+        .expect("fragment");
+    let mut damaged = std::fs::read(&fragment).expect("fragment bytes");
+    let middle = damaged.len() / 2;
+    damaged[middle] ^= 0xFF;
+    std::fs::write(&fragment, damaged).expect("corrupt write");
+
+    let started = Instant::now();
+    let _healthy = await_until("autonomous healthy", || {
+        let (status, body) = health(&cluster, 0, &hash);
+        if started.elapsed() > Duration::from_secs(30)
+            && status == 200
+            && body["health"] != "healthy"
+        {
+            let metrics = cluster.admin_get(0, "/v1/redundancy/metrics").1;
+            let maintenance = cluster.admin_get(0, "/v1/redundancy/maintenance").1;
+            panic!(
+                "autonomous repair stalled: health={body} metrics={metrics} maintenance={maintenance}"
+            );
+        }
+        (status == 200 && body["health"] == "healthy").then_some(body)
+    });
+    let (status, body) = read(&cluster, 0, &hash);
+    assert_eq!(status, 200, "read after autonomous repair: {body}");
+    assert_eq!(
+        unb64(body["bytes_b64"].as_str().expect("image")).as_deref(),
+        Some(bytes.as_slice())
+    );
+    let (status, metrics) = cluster.admin_get(0, "/v1/redundancy/metrics");
+    assert_eq!(status, 200, "metrics: {metrics}");
+    assert!(metrics["repair_attempts"].as_u64().unwrap_or(0) >= 1);
+    assert!(metrics["scrub_runs"].as_u64().unwrap_or(0) >= 1);
+}
+
+/// Background maintenance discovers a physically missing fragment and heals
+/// it without an operator repair request.
+#[test]
+fn autonomous_missing_fragment_heals_without_admin_call() {
+    let cluster = Cluster::spawn().expect("cluster spawns");
+    let _leader = cluster.wait_leader();
+    let bytes = payload(40 * 1024, 0x0BAD_C0DE);
+    let hash = asset_hex(&bytes);
+    let (status, body) = protect(&cluster, 0, &bytes, 2);
+    assert_eq!(status, 200, "protect: {body}");
+    let fragment = walk(&fragments_root(&cluster, 2))
+        .into_iter()
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("frag-")
+                        && std::path::Path::new(&name)
+                            .extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("bin"))
+                })
+        })
+        .expect("fragment");
+    std::fs::remove_file(&fragment).expect("fragment delete");
+
+    let _healthy = await_health(&cluster, 0, &hash, "healthy");
+    let (status, body) = read(&cluster, 0, &hash);
+    assert_eq!(status, 200, "read after autonomous repair: {body}");
+    assert_eq!(
+        unb64(body["bytes_b64"].as_str().expect("image")).as_deref(),
+        Some(bytes.as_slice())
     );
 }
 
@@ -584,6 +687,93 @@ fn orphan_fragments_never_become_authoritative() {
     // Protection is untouched by the sweep.
     let (status, body) = read(&cluster, 0, &hash);
     assert_eq!(status, 200, "reads still exact after sweep: {body}");
+}
+
+/// Bounded mixed workload: repeated protected writes, a holder restart,
+/// deletion, corruption, and eventual convergence without manual repair.
+#[test]
+fn bounded_self_healing_chaos_converges() {
+    let mut cluster = Cluster::spawn().expect("cluster spawns");
+    let _leader = cluster.wait_leader();
+    let mut assets = Vec::new();
+    for index in 0..4u64 {
+        let bytes = payload(32 * 1024, 0x00C0_FFEE + index);
+        let hash = asset_hex(&bytes);
+        let (status, body) = protect(&cluster, 0, &bytes, 2);
+        assert_eq!(status, 200, "protect {index}: {body}");
+        assets.push((hash, bytes));
+    }
+    cluster.kill(1);
+    cluster.restart(1).expect("holder restart");
+    for (index, (hash, _)) in assets.iter().enumerate() {
+        let root = fragments_root(&cluster, index % 3)
+            .join("assets")
+            .join(format!("generic-immutable-{hash}"));
+        let files = walk(&root);
+        let fragment = files
+            .into_iter()
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with("frag-")
+                            && std::path::Path::new(&name)
+                                .extension()
+                                .is_some_and(|ext| ext.eq_ignore_ascii_case("bin"))
+                    })
+            })
+            .expect("fragment");
+        if index % 2 == 0 {
+            std::fs::remove_file(fragment).expect("delete fragment");
+        } else {
+            let mut bytes = std::fs::read(&fragment).expect("fragment bytes");
+            let middle = bytes.len() / 2;
+            bytes[middle] ^= 0x5A;
+            std::fs::write(fragment, bytes).expect("corrupt fragment");
+        }
+        let _ = hash;
+    }
+    for (hash, bytes) in &assets {
+        let started = Instant::now();
+        let _healthy = await_until("chaos healthy", || {
+            let (status, body) = health(&cluster, 0, hash);
+            if started.elapsed() > Duration::from_secs(90)
+                && status == 200
+                && body["health"] != "healthy"
+            {
+                let metrics = cluster.admin_get(0, "/v1/redundancy/metrics").1;
+                let node_metrics: Vec<_> = (0..3)
+                    .map(|index| cluster.admin_get(index, "/v1/redundancy/metrics").1)
+                    .collect();
+                let ticks: Vec<_> = (0..3)
+                    .map(|index| {
+                        cluster
+                            .admin_post(index, "/v1/redundancy/maintenance/tick", &json!({}))
+                            .1
+                    })
+                    .collect();
+                let tick = ticks;
+                let peers = cluster.admin_get(0, "/v1/peers").1;
+                let maintenance_nodes: Vec<_> = (0..3)
+                    .map(|index| cluster.admin_get(index, "/v1/redundancy/maintenance").1)
+                    .collect();
+                panic!(
+                    "chaos repair stalled for {hash}: health={body} metrics={metrics} nodes={node_metrics:?} tick={tick:?} peers={peers} maintenance={maintenance_nodes:?}"
+                );
+            }
+            (status == 200 && body["health"] == "healthy").then_some(body)
+        });
+        let (status, body) = read(&cluster, 0, hash);
+        assert_eq!(status, 200, "read {hash}: {body}");
+        assert_eq!(
+            unb64(body["bytes_b64"].as_str().expect("image")).as_deref(),
+            Some(bytes.as_slice())
+        );
+    }
+    let (status, metrics) = cluster.admin_get(0, "/v1/redundancy/metrics");
+    assert_eq!(status, 200, "metrics: {metrics}");
+    assert_eq!(metrics["unrecoverable"], json!(0));
+    assert_eq!(metrics["pending_repairs"], json!(0));
 }
 
 /// Yields every regular file under `root` (deterministic order).

@@ -22,6 +22,8 @@ pub const PROTO_MINOR: u16 = 0;
 pub const MAX_FRAGMENT_WIRE_BYTES: usize = 8 * 1024 * 1024;
 /// Maximum layout bytes accepted on the wire (4 MiB).
 pub const MAX_LAYOUT_WIRE_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum physical inventory entries returned by one holder.
+pub const MAX_INVENTORY_ENTRIES: usize = 16_384;
 
 /// Magic word: ASCII `"KVFR"` as little-endian `u32`.
 const WIRE_MAGIC: u32 = 0x5246_564B;
@@ -35,6 +37,10 @@ const MAX_BODY_LEN: usize = MAX_FRAGMENT_WIRE_BYTES + 256;
 /// Encoded [`FragmentKey`] length: kind `u8`, domain `u64`, hash `[u8; 32]`,
 /// generation `u64`, index `u32`.
 const KEY_LEN: usize = 53;
+/// Maximum protected keys carried by one graceful-sweep request.
+pub const MAX_PROTECTED_KEYS: usize = (MAX_FRAGMENT_WIRE_BYTES + 256 - 20) / KEY_LEN;
+/// Encoded physical inventory entry length.
+const INVENTORY_ENTRY_LEN: usize = KEY_LEN + 1 + 4 + 32 + 8 + 1 + 8;
 
 /// Storage coordinates of one fragment: which asset, which generation,
 /// which index. Carries no bytes, no placement, no scheme facts.
@@ -115,9 +121,33 @@ impl FragmentKey {
     }
 }
 
+/// One holder-side physical fragment entry returned by an inventory probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FragmentInventoryEntry {
+    /// Physical coordinates.
+    pub key: FragmentKey,
+    /// Fragment role recorded at stage time.
+    pub role: u8,
+    /// Encoding parameter tag recorded at stage time.
+    pub params_tag: u32,
+    /// Indexed content identity.
+    pub content: [u8; 32],
+    /// Indexed stored length.
+    pub stored_len: u64,
+    /// Whether an accepted local layout names the fragment generation.
+    pub layout_accepted: bool,
+    /// File age in milliseconds; zero means the filesystem did not report it.
+    pub age_ms: u64,
+}
+
 /// One fragment RPC request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FragmentRpc {
+    /// Discover the holder's current incarnation before mutating it.
+    Hello {
+        /// Target incarnation (`0` for discovery).
+        target_incarnation: u64,
+    },
     /// Store fragment bytes (verified by the receiver before storing).
     Put {
         /// Fragment coordinates.
@@ -149,6 +179,13 @@ pub enum FragmentRpc {
         /// Target incarnation (`0` = bootstrap probe).
         target_incarnation: u64,
     },
+    /// Probe indexed fragment metadata without reading the payload.
+    Metadata {
+        /// Fragment coordinates.
+        key: FragmentKey,
+        /// Target incarnation (`0` = bootstrap probe).
+        target_incarnation: u64,
+    },
     /// Remove one fragment (idempotent).
     Drop {
         /// Fragment coordinates.
@@ -170,6 +207,21 @@ pub enum FragmentRpc {
         control_generation: u64,
         /// Exact bytes [`crate::RedundancyLayout::encode`] minted.
         layout: Vec<u8>,
+        /// Target incarnation (`0` = bootstrap probe).
+        target_incarnation: u64,
+    },
+    /// Abort an unpublished generation and release its fragments.
+    AbortLayout {
+        /// Asset family discriminant.
+        asset_kind: u8,
+        /// Raw security-domain value.
+        asset_domain: u64,
+        /// Content hash minted by the owning fabric.
+        asset_hash: [u8; 32],
+        /// Provisional generation to remove.
+        generation: u64,
+        /// Control generation expected to own the abort.
+        control_generation: u64,
         /// Target incarnation (`0` = bootstrap probe).
         target_incarnation: u64,
     },
@@ -204,6 +256,29 @@ pub enum FragmentRpc {
         /// Target incarnation (`0` = bootstrap probe).
         target_incarnation: u64,
     },
+    /// List physical fragment state for anti-entropy reconciliation.
+    Inventory {
+        /// Target incarnation (`0` = bootstrap probe).
+        target_incarnation: u64,
+    },
+    /// Read one bounded inventory page.
+    InventoryPage {
+        /// Target incarnation (`0` = bootstrap probe).
+        target_incarnation: u64,
+        /// Stable entry offset.
+        offset: u32,
+        /// Maximum entries in this page.
+        limit: u32,
+    },
+    /// Reclaim only orphan fragments older than the supplied age.
+    SweepOrphansGraceful {
+        /// Target incarnation (`0` = bootstrap probe).
+        target_incarnation: u64,
+        /// Minimum orphan age in milliseconds.
+        minimum_age_ms: u64,
+        /// Current-authority keys that must never be reclaimed.
+        protected: Vec<FragmentKey>,
+    },
 }
 
 /// One fragment RPC answer.
@@ -213,6 +288,11 @@ pub enum FragmentReply {
     Stored {
         /// BLAKE3 of the stored bytes.
         content: [u8; 32],
+    },
+    /// Current holder incarnation returned by a discovery probe.
+    Incarnation {
+        /// Current incarnation epoch.
+        current: u64,
     },
     /// Fragment bytes with their content hash.
     Bytes {
@@ -246,6 +326,18 @@ pub enum FragmentReply {
     Swept {
         /// How many staged fragments the holder removed.
         count: u64,
+    },
+    /// Physical fragment inventory used for conservative anti-entropy.
+    Inventory {
+        /// Holder-side fragment records, sorted by coordinates.
+        entries: Vec<FragmentInventoryEntry>,
+    },
+    /// One bounded inventory page.
+    InventoryPage {
+        /// Entries in this page.
+        entries: Vec<FragmentInventoryEntry>,
+        /// Offset of the next page, if any.
+        next_offset: Option<u32>,
     },
     /// The holder refused the request (fencing, never silent loss).
     Refused {
@@ -357,14 +449,34 @@ impl FragmentRpc {
     const fn tag(&self) -> u8 {
         match self {
             Self::Put { .. } => 1,
+            Self::Hello { .. } => 12,
             Self::Get { .. } => 2,
             Self::Has { .. } => 3,
             Self::Drop { .. } => 4,
             Self::PutLayout { .. } => 5,
+            Self::AbortLayout { .. } => 13,
             Self::GetLayout { .. } => 6,
             Self::ProbeAsset { .. } => 7,
             Self::SweepOrphans { .. } => 8,
+            Self::Inventory { .. } => 9,
+            Self::InventoryPage { .. } => 14,
+            Self::SweepOrphansGraceful { .. } => 10,
+            Self::Metadata { .. } => 11,
         }
+    }
+
+    /// Whether this request can mutate holder state.
+    #[must_use]
+    pub const fn is_mutation(&self) -> bool {
+        matches!(
+            self,
+            Self::Put { .. }
+                | Self::Drop { .. }
+                | Self::PutLayout { .. }
+                | Self::AbortLayout { .. }
+                | Self::SweepOrphans { .. }
+                | Self::SweepOrphansGraceful { .. }
+        )
     }
 
     /// Encodes the deterministic wire bytes (header, body, CRC32C).
@@ -387,7 +499,18 @@ impl FragmentRpc {
         match tag {
             1 => decode_put(body),
             2..=4 => decode_keyed(tag, body),
+            12 => {
+                if body.len() != 8 {
+                    return Err(RedundancyError::BadLayout {
+                        detail: format!("hello rpc holds {} bytes", body.len()),
+                    });
+                }
+                Ok(Self::Hello {
+                    target_incarnation: u64::from_le_bytes(into8(body)),
+                })
+            }
             5 => decode_put_layout(body),
+            13 => decode_abort_layout(body),
             6 => decode_get_layout(body),
             7 => decode_probe(body),
             8 => {
@@ -400,6 +523,57 @@ impl FragmentRpc {
                     target_incarnation: u64::from_le_bytes(into8(body)),
                 })
             }
+            9 => {
+                if body.len() != 8 {
+                    return Err(RedundancyError::BadLayout {
+                        detail: format!("inventory rpc holds {} bytes", body.len()),
+                    });
+                }
+                Ok(Self::Inventory {
+                    target_incarnation: u64::from_le_bytes(into8(body)),
+                })
+            }
+            10 => {
+                if body.len() < 20 {
+                    return Err(RedundancyError::BadLayout {
+                        detail: format!("graceful sweep rpc holds {} bytes", body.len()),
+                    });
+                }
+                let count = u32::from_le_bytes(into4(&body[16..20])) as usize;
+                if body.len() != 20 + count * KEY_LEN {
+                    return Err(RedundancyError::BadLayout {
+                        detail: "graceful sweep protection shape is invalid".to_owned(),
+                    });
+                }
+                let (chunks, remainder) = body[20..].as_chunks::<KEY_LEN>();
+                if !remainder.is_empty() {
+                    return Err(RedundancyError::BadLayout {
+                        detail: "graceful sweep protection has trailing bytes".to_owned(),
+                    });
+                }
+                let protected = chunks
+                    .iter()
+                    .map(|chunk| FragmentKey::decode(chunk.as_slice()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Self::SweepOrphansGraceful {
+                    target_incarnation: u64::from_le_bytes(into8(&body[..8])),
+                    minimum_age_ms: u64::from_le_bytes(into8(&body[8..16])),
+                    protected,
+                })
+            }
+            14 => {
+                if body.len() != 16 {
+                    return Err(RedundancyError::BadLayout {
+                        detail: format!("inventory page rpc holds {} bytes", body.len()),
+                    });
+                }
+                Ok(Self::InventoryPage {
+                    target_incarnation: u64::from_le_bytes(into8(&body[..8])),
+                    offset: u32::from_le_bytes(into4(&body[8..12])),
+                    limit: u32::from_le_bytes(into4(&body[12..16])),
+                })
+            }
+            11 => decode_keyed(11, body),
             other => Err(RedundancyError::BadLayout {
                 detail: format!("unknown rpc tag {other}"),
             }),
@@ -407,8 +581,10 @@ impl FragmentRpc {
     }
 
     /// Encodes the tag-specific body.
+    #[allow(clippy::too_many_lines)]
     fn encode_body(&self) -> Vec<u8> {
         match self {
+            Self::Hello { target_incarnation } => target_incarnation.to_le_bytes().to_vec(),
             Self::Put {
                 key,
                 role,
@@ -445,6 +621,10 @@ impl FragmentRpc {
             | Self::Drop {
                 key,
                 target_incarnation,
+            }
+            | Self::Metadata {
+                key,
+                target_incarnation,
             } => {
                 let mut out = Vec::with_capacity(KEY_LEN + 8);
                 out.extend_from_slice(&key.encode());
@@ -472,6 +652,24 @@ impl FragmentRpc {
                 out.extend_from_slice(&target_incarnation.to_le_bytes());
                 out.extend_from_slice(&layout_len.to_le_bytes());
                 out.extend_from_slice(layout);
+                out
+            }
+            Self::AbortLayout {
+                asset_kind,
+                asset_domain,
+                asset_hash,
+                generation,
+                control_generation,
+                target_incarnation,
+            } => {
+                let mut out = Vec::with_capacity(66);
+                out.push(*asset_kind);
+                out.push(0);
+                out.extend_from_slice(&asset_domain.to_le_bytes());
+                out.extend_from_slice(asset_hash);
+                out.extend_from_slice(&generation.to_le_bytes());
+                out.extend_from_slice(&control_generation.to_le_bytes());
+                out.extend_from_slice(&target_incarnation.to_le_bytes());
                 out
             }
             Self::GetLayout {
@@ -504,7 +702,35 @@ impl FragmentRpc {
                 out.extend_from_slice(&target_incarnation.to_le_bytes());
                 out
             }
-            Self::SweepOrphans { target_incarnation } => target_incarnation.to_le_bytes().to_vec(),
+            Self::SweepOrphans { target_incarnation } | Self::Inventory { target_incarnation } => {
+                target_incarnation.to_le_bytes().to_vec()
+            }
+            Self::InventoryPage {
+                target_incarnation,
+                offset,
+                limit,
+            } => {
+                let mut out = Vec::with_capacity(16);
+                out.extend_from_slice(&target_incarnation.to_le_bytes());
+                out.extend_from_slice(&offset.to_le_bytes());
+                out.extend_from_slice(&limit.to_le_bytes());
+                out
+            }
+            Self::SweepOrphansGraceful {
+                target_incarnation,
+                minimum_age_ms,
+                protected,
+            } => {
+                let mut out = Vec::with_capacity(20 + protected.len() * KEY_LEN);
+                out.extend_from_slice(&target_incarnation.to_le_bytes());
+                out.extend_from_slice(&minimum_age_ms.to_le_bytes());
+                let count = u32::try_from(protected.len()).unwrap_or(u32::MAX);
+                out.extend_from_slice(&count.to_le_bytes());
+                for key in protected {
+                    out.extend_from_slice(&key.encode());
+                }
+                out
+            }
         }
     }
 }
@@ -515,6 +741,7 @@ impl FragmentReply {
     const fn tag(&self) -> u8 {
         match self {
             Self::Stored { .. } => 1,
+            Self::Incarnation { .. } => 10,
             Self::Bytes { .. } => 2,
             Self::Presence { .. } => 3,
             Self::Dropped => 4,
@@ -522,6 +749,8 @@ impl FragmentReply {
             Self::AssetStatus { .. } => 6,
             Self::Refused { .. } => 7,
             Self::Swept { .. } => 8,
+            Self::Inventory { .. } => 9,
+            Self::InventoryPage { .. } => 11,
         }
     }
 
@@ -530,6 +759,7 @@ impl FragmentReply {
     pub fn encode(&self) -> Vec<u8> {
         let body = match self {
             Self::Stored { content } => content.to_vec(),
+            Self::Incarnation { current } => current.to_le_bytes().to_vec(),
             Self::Bytes { content, bytes } => {
                 #[allow(clippy::cast_possible_truncation)]
                 let bytes_len = bytes.len() as u32;
@@ -562,6 +792,46 @@ impl FragmentReply {
             }
             Self::Refused { reason } => reason.encode(),
             Self::Swept { count } => count.to_le_bytes().to_vec(),
+            Self::InventoryPage {
+                entries,
+                next_offset,
+            } => {
+                let mut out = Vec::with_capacity(9 + entries.len() * INVENTORY_ENTRY_LEN);
+                #[allow(clippy::cast_possible_truncation)]
+                let count = entries.len() as u32;
+                out.extend_from_slice(&count.to_le_bytes());
+                out.push(u8::from(next_offset.is_some()));
+                if let Some(next) = next_offset {
+                    out.extend_from_slice(&next.to_le_bytes());
+                }
+                for entry in entries {
+                    out.extend_from_slice(&entry.key.encode());
+                    out.push(entry.role);
+                    out.extend_from_slice(&entry.params_tag.to_le_bytes());
+                    out.extend_from_slice(&entry.content);
+                    out.extend_from_slice(&entry.stored_len.to_le_bytes());
+                    out.push(u8::from(entry.layout_accepted));
+                    out.extend_from_slice(&entry.age_ms.to_le_bytes());
+                }
+                out
+            }
+            Self::Inventory { entries } => {
+                let entries = entries.iter().take(MAX_INVENTORY_ENTRIES);
+                #[allow(clippy::cast_possible_truncation)]
+                let count = entries.len() as u32;
+                let mut out = Vec::with_capacity(4 + MAX_INVENTORY_ENTRIES * INVENTORY_ENTRY_LEN);
+                out.extend_from_slice(&count.to_le_bytes());
+                for entry in entries {
+                    out.extend_from_slice(&entry.key.encode());
+                    out.push(entry.role);
+                    out.extend_from_slice(&entry.params_tag.to_le_bytes());
+                    out.extend_from_slice(&entry.content);
+                    out.extend_from_slice(&entry.stored_len.to_le_bytes());
+                    out.push(u8::from(entry.layout_accepted));
+                    out.extend_from_slice(&entry.age_ms.to_le_bytes());
+                }
+                out
+            }
         };
         encode_message(self.tag(), &body)
     }
@@ -573,6 +843,7 @@ impl FragmentReply {
     /// Returns [`RedundancyError::BadLayout`] on structural violations or
     /// unsupported versions, [`RedundancyError::CorruptFragment`] on CRC
     /// mismatch, and [`RedundancyError::Overloaded`] on oversize payloads.
+    #[allow(clippy::too_many_lines)]
     pub fn decode(bytes: &[u8]) -> Result<Self, RedundancyError> {
         let (tag, body) = decode_message(bytes)?;
         match tag {
@@ -649,6 +920,107 @@ impl FragmentReply {
                 }
                 Ok(Self::Swept {
                     count: u64::from_le_bytes(into8(body)),
+                })
+            }
+            10 => {
+                if body.len() != 8 {
+                    return Err(RedundancyError::BadLayout {
+                        detail: format!("incarnation reply holds {} bytes", body.len()),
+                    });
+                }
+                Ok(Self::Incarnation {
+                    current: u64::from_le_bytes(into8(body)),
+                })
+            }
+            9 => {
+                if body.len() < 4 {
+                    return Err(RedundancyError::BadLayout {
+                        detail: "inventory reply is missing its count".to_owned(),
+                    });
+                }
+                let count = u32::from_le_bytes(into4(&body[..4])) as usize;
+                if count > MAX_INVENTORY_ENTRIES || body.len() != 4 + count * INVENTORY_ENTRY_LEN {
+                    return Err(RedundancyError::BadLayout {
+                        detail: format!("inventory reply shape holds {count} entries"),
+                    });
+                }
+                let mut entries = Vec::with_capacity(count);
+                for index in 0..count {
+                    let start = 4 + index * INVENTORY_ENTRY_LEN;
+                    let entry = &body[start..start + INVENTORY_ENTRY_LEN];
+                    let key = FragmentKey::decode(&entry[..KEY_LEN])?;
+                    let mut content = [0; 32];
+                    content.copy_from_slice(&entry[58..90]);
+                    let role = entry[KEY_LEN];
+                    if role > 2 || entry[KEY_LEN + 1 + 4 + 32 + 8] > 1 {
+                        return Err(RedundancyError::BadLayout {
+                            detail: format!("inventory entry {index} has invalid flags"),
+                        });
+                    }
+                    entries.push(FragmentInventoryEntry {
+                        key,
+                        role,
+                        params_tag: u32::from_le_bytes(into4(&entry[KEY_LEN + 1..KEY_LEN + 5])),
+                        content,
+                        stored_len: u64::from_le_bytes(into8(
+                            &entry[KEY_LEN + 5 + 32..KEY_LEN + 5 + 32 + 8],
+                        )),
+                        layout_accepted: entry[KEY_LEN + 5 + 32 + 8] == 1,
+                        age_ms: u64::from_le_bytes(into8(&entry[KEY_LEN + 5 + 32 + 9..])),
+                    });
+                }
+                Ok(Self::Inventory { entries })
+            }
+            11 => {
+                if body.len() < 5 {
+                    return Err(RedundancyError::BadLayout {
+                        detail: "inventory page reply is truncated".to_owned(),
+                    });
+                }
+                let count = u32::from_le_bytes(into4(&body[..4])) as usize;
+                let has_next = body[4] == 1;
+                if body[4] > 1 {
+                    return Err(RedundancyError::BadLayout {
+                        detail: "inventory page continuation flag is invalid".to_owned(),
+                    });
+                }
+                let header = 5 + usize::from(has_next) * 4;
+                if count > MAX_INVENTORY_ENTRIES
+                    || body.len() != header + count * INVENTORY_ENTRY_LEN
+                {
+                    return Err(RedundancyError::BadLayout {
+                        detail: format!("inventory page shape holds {count} entries"),
+                    });
+                }
+                let next_offset = has_next.then(|| u32::from_le_bytes(into4(&body[5..9])));
+                let mut entries = Vec::with_capacity(count);
+                for index in 0..count {
+                    let start = header + index * INVENTORY_ENTRY_LEN;
+                    let entry = &body[start..start + INVENTORY_ENTRY_LEN];
+                    let key = FragmentKey::decode(&entry[..KEY_LEN])?;
+                    let role = entry[KEY_LEN];
+                    if role > 2 || entry[KEY_LEN + 1 + 4 + 32 + 8] > 1 {
+                        return Err(RedundancyError::BadLayout {
+                            detail: format!("inventory page entry {index} has invalid flags"),
+                        });
+                    }
+                    let mut content = [0; 32];
+                    content.copy_from_slice(&entry[58..90]);
+                    entries.push(FragmentInventoryEntry {
+                        key,
+                        role,
+                        params_tag: u32::from_le_bytes(into4(&entry[KEY_LEN + 1..KEY_LEN + 5])),
+                        content,
+                        stored_len: u64::from_le_bytes(into8(
+                            &entry[KEY_LEN + 5 + 32..KEY_LEN + 5 + 32 + 8],
+                        )),
+                        layout_accepted: entry[KEY_LEN + 5 + 32 + 8] == 1,
+                        age_ms: u64::from_le_bytes(into8(&entry[KEY_LEN + 5 + 32 + 9..])),
+                    });
+                }
+                Ok(Self::InventoryPage {
+                    entries,
+                    next_offset,
                 })
             }
             other => Err(RedundancyError::BadLayout {
@@ -782,9 +1154,16 @@ fn decode_keyed(tag: u8, body: &[u8]) -> Result<FragmentRpc, RedundancyError> {
             key,
             target_incarnation,
         }),
-        _ => Ok(FragmentRpc::Drop {
+        4 => Ok(FragmentRpc::Drop {
             key,
             target_incarnation,
+        }),
+        11 => Ok(FragmentRpc::Metadata {
+            key,
+            target_incarnation,
+        }),
+        _ => Err(RedundancyError::BadLayout {
+            detail: format!("unknown keyed rpc tag {tag}"),
         }),
     }
 }
@@ -811,6 +1190,24 @@ fn decode_put_layout(body: &[u8]) -> Result<FragmentRpc, RedundancyError> {
         generation: u64::from_le_bytes(into8(&body[42..50])),
         control_generation: u64::from_le_bytes(into8(&body[50..58])),
         layout: blob.to_vec(),
+        target_incarnation: u64::from_le_bytes(into8(&body[58..66])),
+    })
+}
+
+fn decode_abort_layout(body: &[u8]) -> Result<FragmentRpc, RedundancyError> {
+    if body.len() != 66 || body[1] != 0 {
+        return Err(RedundancyError::BadLayout {
+            detail: "abort-layout shape invalid".to_owned(),
+        });
+    }
+    let mut asset_hash = [0; 32];
+    asset_hash.copy_from_slice(&body[10..42]);
+    Ok(FragmentRpc::AbortLayout {
+        asset_kind: body[0],
+        asset_domain: u64::from_le_bytes(into8(&body[2..10])),
+        asset_hash,
+        generation: u64::from_le_bytes(into8(&body[42..50])),
+        control_generation: u64::from_le_bytes(into8(&body[50..58])),
         target_incarnation: u64::from_le_bytes(into8(&body[58..66])),
     })
 }
@@ -886,6 +1283,9 @@ mod tests {
 
     fn rpcs() -> Vec<FragmentRpc> {
         vec![
+            FragmentRpc::Hello {
+                target_incarnation: 0,
+            },
             FragmentRpc::Put {
                 key: key(),
                 role: 1,
@@ -903,9 +1303,21 @@ mod tests {
                 key: key(),
                 target_incarnation: 4,
             },
+            FragmentRpc::Metadata {
+                key: key(),
+                target_incarnation: 4,
+            },
             FragmentRpc::Drop {
                 key: key(),
                 target_incarnation: 4,
+            },
+            FragmentRpc::AbortLayout {
+                asset_kind: 0,
+                asset_domain: 7,
+                asset_hash: [11; 32],
+                generation: 3,
+                control_generation: 9,
+                target_incarnation: 1,
             },
             FragmentRpc::PutLayout {
                 asset_kind: 0,
@@ -932,11 +1344,25 @@ mod tests {
             FragmentRpc::SweepOrphans {
                 target_incarnation: 5,
             },
+            FragmentRpc::Inventory {
+                target_incarnation: 2,
+            },
+            FragmentRpc::InventoryPage {
+                target_incarnation: 2,
+                offset: 4,
+                limit: 128,
+            },
+            FragmentRpc::SweepOrphansGraceful {
+                target_incarnation: 3,
+                minimum_age_ms: 60_000,
+                protected: vec![key()],
+            },
         ]
     }
 
     fn replies() -> Vec<FragmentReply> {
         vec![
+            FragmentReply::Incarnation { current: 6 },
             FragmentReply::Stored { content: [1; 32] },
             FragmentReply::Bytes {
                 content: [2; 32],
@@ -973,6 +1399,29 @@ mod tests {
                 reason: RefuseReason::ShuttingDown,
             },
             FragmentReply::Swept { count: 17 },
+            FragmentReply::Inventory {
+                entries: vec![FragmentInventoryEntry {
+                    key: key(),
+                    role: 1,
+                    params_tag: 9,
+                    content: [8; 32],
+                    stored_len: 12,
+                    layout_accepted: true,
+                    age_ms: 42,
+                }],
+            },
+            FragmentReply::InventoryPage {
+                entries: vec![FragmentInventoryEntry {
+                    key: key(),
+                    role: 1,
+                    params_tag: 9,
+                    content: [8; 32],
+                    stored_len: 12,
+                    layout_accepted: true,
+                    age_ms: 42,
+                }],
+                next_offset: Some(1),
+            },
         ]
     }
 

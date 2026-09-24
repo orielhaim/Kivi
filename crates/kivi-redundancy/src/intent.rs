@@ -74,6 +74,27 @@ impl LocalityRequirement {
     pub const fn default() -> Self {
         Self::None
     }
+
+    /// Frozen wire discriminant.
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::RackSpanning => 1,
+            Self::ZoneSpanning => 2,
+        }
+    }
+
+    /// Decodes a frozen wire discriminant.
+    #[must_use]
+    pub const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::None),
+            1 => Some(Self::RackSpanning),
+            2 => Some(Self::ZoneSpanning),
+            _ => None,
+        }
+    }
 }
 
 /// Declarative protection requirement for one asset (or asset class).

@@ -2186,6 +2186,76 @@ impl NativeClient {
         self.validate_hits(namespace, &hits)
     }
 
+    fn index_window_entries(
+        &self,
+        namespace: NamespaceId,
+        start: &[u8],
+        end: &[u8],
+        limit: usize,
+    ) -> Result<Vec<ClientScanEntry>, ClientError> {
+        use kivi_protocol::{Opcode, ResponseBody};
+        let bound = limit.min(INDEX_RESOLVE_LIMIT);
+        if bound == 0 {
+            return Ok(Vec::new());
+        }
+        let mut request = self.request_base(&Key::from(start.to_vec()), Opcode::Scan);
+        request.namespace = namespace;
+        request.scan_direction = kivi_protocol::SCAN_FORWARD;
+        request.scan_projection = kivi_protocol::SCAN_KEYS_AND_VALUES;
+        request.scan_consistency = kivi_protocol::SCAN_LATEST_PER_TABLET;
+        request.scan_max_items = 1000;
+        request.scan_max_bytes = 1 << 20;
+        request.scan_start = Some(start.to_vec());
+        request.scan_end = Some(end.to_vec());
+        request.key = start.to_vec();
+        let mut cursor = start.to_vec();
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        loop {
+            request.key.clone_from(&cursor);
+            let response = self.execute_raw(
+                &Key::from(cursor.clone()),
+                Opcode::Scan,
+                || request.clone(),
+                None,
+                kivi_types::ReadContract::Latest,
+            )?;
+            let (entries, exhausted, range_end) = match (response.status, response.body) {
+                (
+                    kivi_protocol::Status::Ok,
+                    ResponseBody::ScanPage {
+                        entries,
+                        exhausted,
+                        range_end,
+                        ..
+                    },
+                ) => (entries, exhausted, range_end),
+                (status, body) => return Err(status_error(status, &body)),
+            };
+            out.extend(entries.into_iter().map(|entry| ClientScanEntry {
+                key: entry.key,
+                value: scan_body_to_client(entry.value),
+            }));
+            out.sort_by(|left, right| left.key.cmp(&right.key));
+            out.truncate(bound);
+            if exhausted {
+                break;
+            }
+            let Some(next) = range_end else {
+                break;
+            };
+            if next <= cursor || !seen.insert(next.clone()) {
+                return Err(ClientError::Internal(
+                    "index window did not advance across tablets".to_owned(),
+                ));
+            }
+            cursor = next;
+        }
+        out.sort_by(|left, right| left.key.cmp(&right.key));
+        out.truncate(bound);
+        Ok(out)
+    }
+
     /// Lists every tablet's entries for a non-unique term: fans the term
     /// out per tablet (each tablet answers from the entries beside its
     /// primaries) and merges the slices in primary-key order. The window
@@ -2200,38 +2270,17 @@ impl NativeClient {
         term: &[u8],
         limit: usize,
     ) -> Result<Vec<ClientScanEntry>, ClientError> {
-        use kivi_protocol::{Opcode, ResponseBody};
         use kivi_state::{prefix_successor, term_prefix};
         let bound = limit.min(INDEX_RESOLVE_LIMIT);
         let prefix = term_prefix(index, term, false);
-        let end = prefix_successor(&prefix);
-        let mut out: Vec<ClientScanEntry> = Vec::new();
-        // The server fans one term window out per tablet internally, so a
-        // single windowed scan covers every tablet's co-located slice.
-        let route_key = Key::from(prefix.clone());
-        let mut request = self.request_base(&route_key, Opcode::Scan);
-        request.namespace = namespace;
-        request.scan_direction = kivi_protocol::SCAN_FORWARD;
-        request.scan_projection = kivi_protocol::SCAN_KEYS_AND_VALUES;
-        request.scan_consistency = kivi_protocol::SCAN_LATEST_PER_TABLET;
-        request.scan_max_items = 1000;
-        request.scan_max_bytes = 1 << 20;
-        request.scan_start = Some(prefix);
-        request.scan_end.clone_from(&end);
-        let response = self.execute_raw(
-            &route_key,
-            Opcode::Scan,
-            || request.clone(),
-            None,
-            kivi_types::ReadContract::Latest,
-        )?;
-        let entries = match (response.status, response.body) {
-            (kivi_protocol::Status::Ok, ResponseBody::ScanPage { entries, .. }) => entries,
-            (status, body) => return Err(status_error(status, &body)),
+        let Some(end) = prefix_successor(&prefix) else {
+            return Ok(Vec::new());
         };
+        let entries = self.index_window_entries(namespace, &prefix, &end, bound)?;
+        let mut out = Vec::new();
         for entry in entries {
-            let decoded = entry.key.clone();
-            let value = scan_body_to_client(entry.value);
+            let decoded = entry.key;
+            let value = entry.value;
             if decode_non_unique_key(&decoded)
                 .is_ok_and(|(found, found_term, _)| found == index && found_term == term)
             {
@@ -2290,34 +2339,11 @@ impl NativeClient {
         end_term: &[u8],
         limit: usize,
     ) -> Result<Vec<Vec<u8>>, ClientError> {
-        use kivi_protocol::{Opcode, ResponseBody};
         use kivi_state::term_prefix;
         let bound = limit.min(INDEX_RESOLVE_LIMIT);
-        // One windowed scan: `[prefix(start), prefix(end))` fans out per
-        // tablet server-side, so every term in the range answers at once.
         let start = term_prefix(index, start_term, false);
         let end = term_prefix(index, end_term, false);
-        let route_key = Key::from(start.clone());
-        let mut request = self.request_base(&route_key, Opcode::Scan);
-        request.namespace = namespace;
-        request.scan_direction = kivi_protocol::SCAN_FORWARD;
-        request.scan_projection = kivi_protocol::SCAN_KEYS_AND_VALUES;
-        request.scan_consistency = kivi_protocol::SCAN_LATEST_PER_TABLET;
-        request.scan_max_items = 1000;
-        request.scan_max_bytes = 1 << 20;
-        request.scan_start = Some(start);
-        request.scan_end = Some(end);
-        let response = self.execute_raw(
-            &route_key,
-            Opcode::Scan,
-            || request.clone(),
-            None,
-            kivi_types::ReadContract::Latest,
-        )?;
-        let entries = match (response.status, response.body) {
-            (kivi_protocol::Status::Ok, ResponseBody::ScanPage { entries, .. }) => entries,
-            (status, body) => return Err(status_error(status, &body)),
-        };
+        let entries = self.index_window_entries(namespace, &start, &end, bound)?;
         let mut hits: Vec<IndexHit> = Vec::new();
         for entry in entries {
             if let Ok((found_index, found_term, primary)) = decode_non_unique_key(&entry.key) {
@@ -2327,7 +2353,7 @@ impl NativeClient {
                 if found_term.as_slice() < start_term || found_term.as_slice() >= end_term {
                     continue;
                 }
-                let bytes = match scan_body_to_client(entry.value) {
+                let bytes = match entry.value {
                     ClientScanValue::Inline(bytes) => bytes.to_vec(),
                     _ => continue,
                 };

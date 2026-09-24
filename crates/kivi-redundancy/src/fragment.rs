@@ -12,14 +12,14 @@
 
 use kivi_codec::integrity::{blake3_256, crc32c_checksum};
 
-use crate::{AssetId, AssetKind, RedundancyError, RsParams, SchemeParams};
+use crate::{AssetId, AssetKind, LocalityRequirement, RedundancyError, RsParams, SchemeParams};
 
 /// Magic word: ASCII `"KVRF"` read as little-endian `u32`.
 pub const LAYOUT_MAGIC: u32 = 0x4652_564B;
 /// Layout major version minted here.
 pub const LAYOUT_MAJOR: u16 = 1;
 /// Layout minor version minted here.
-pub const LAYOUT_MINOR: u16 = 0;
+pub const LAYOUT_MINOR: u16 = 1;
 /// Encoded layout header length: magic u32, major u16, minor u16,
 /// kind u8, scheme u8, domain u64, asset hash [32], `logical_len` u64,
 /// generation u64, data u8, parity u8, copies u8, reserved u8,
@@ -30,6 +30,11 @@ pub const LAYOUT_HEADER_LEN: usize = 4 + 2 + 2 + 1 + 1 + 8 + 32 + 8 + 8 + 1 + 1 
 pub const FRAGMENT_RECORD_LEN: usize = 4 + 1 + 1 + 8 + 32 + 8 + 4;
 /// Footer: body CRC u32, BLAKE3(header[..len-4] + body) [32], footer CRC u32.
 pub const LAYOUT_FOOTER_LEN: usize = 4 + 32 + 4;
+/// Contract block magic: ASCII `"KVRC"`.
+pub const CONTRACT_MAGIC: u32 = 0x4352_564B;
+/// Contract block length: magic, version, reserved, minimum available, CRC.
+pub const CONTRACT_HEADER_LEN: usize = 4 + 1 + 1 + 1 + 4 + 2;
+const CONTRACT_CRC_LEN: usize = 4;
 
 /// Which role a fragment plays in its layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -164,6 +169,12 @@ pub struct RedundancyLayout {
     pub generation: u64,
     /// Scheme and bounded parameters.
     pub params: SchemeParams,
+    /// Minimum retrievable fragment count promised by the publisher.
+    pub min_available: u32,
+    /// Placement locality requirement promised by the publisher.
+    pub locality: LocalityRequirement,
+    /// Failure-domain labels permitted by the publisher.
+    pub allowed_domains: Vec<String>,
     /// Fragments in index order.
     pub fragments: Vec<FragmentRecord>,
 }
@@ -181,13 +192,63 @@ impl RedundancyLayout {
         params: SchemeParams,
         fragments: Vec<FragmentRecord>,
     ) -> Result<Self, RedundancyError> {
+        Self::new_with_min_available(asset, logical_len, generation, params, fragments, 1)
+    }
+
+    /// Builds a layout with a persisted minimum retrievable-fragment floor.
+    #[allow(clippy::too_many_arguments, clippy::missing_errors_doc)]
+    pub fn new_with_min_available(
+        asset: AssetId,
+        logical_len: u64,
+        generation: u64,
+        params: SchemeParams,
+        fragments: Vec<FragmentRecord>,
+        min_available: u32,
+    ) -> Result<Self, RedundancyError> {
+        Self::new_with_contract(
+            asset,
+            logical_len,
+            generation,
+            params,
+            fragments,
+            min_available,
+            LocalityRequirement::None,
+            Vec::new(),
+        )
+    }
+
+    /// Builds a layout with its complete semantic placement contract.
+    #[allow(clippy::too_many_arguments, clippy::missing_errors_doc)]
+    pub fn new_with_contract(
+        asset: AssetId,
+        logical_len: u64,
+        generation: u64,
+        params: SchemeParams,
+        fragments: Vec<FragmentRecord>,
+        min_available: u32,
+        locality: LocalityRequirement,
+        mut allowed_domains: Vec<String>,
+    ) -> Result<Self, RedundancyError> {
         params.validate()?;
+        if min_available == 0 || min_available > params.total_fragments() {
+            return Err(RedundancyError::invalid_params(format!(
+                "minimum available {min_available} outside 1..={}",
+                params.total_fragments()
+            )));
+        }
+        if allowed_domains.len() > u16::MAX as usize || allowed_domains.iter().any(String::is_empty)
+        {
+            return Err(RedundancyError::invalid_params(
+                "allowed domain contract is invalid",
+            ));
+        }
+        allowed_domains.sort_unstable();
+        allowed_domains.dedup();
         if generation == 0 {
             return Err(RedundancyError::invalid_asset(
                 "generation 0 is the invalid sentinel",
             ));
         }
-        // Total fragments <=40, far below `u32::MAX`.
         #[allow(clippy::cast_possible_truncation)]
         let have = fragments.len() as u32;
         if have != params.total_fragments() {
@@ -199,7 +260,6 @@ impl RedundancyLayout {
             )));
         }
         for (index, record) in fragments.iter().enumerate() {
-            // Index < total <=40, fits `u32`.
             #[allow(clippy::cast_possible_truncation)]
             let want = index as u32;
             if record.id.index != want
@@ -216,6 +276,9 @@ impl RedundancyLayout {
             logical_len,
             generation,
             params,
+            min_available,
+            locality,
+            allowed_domains,
             fragments,
         })
     }
@@ -261,11 +324,28 @@ impl RedundancyLayout {
             entry[54..58].copy_from_slice(&crc.to_le_bytes());
             body.extend_from_slice(&entry);
         }
-        let body_crc = crc32c_checksum(&body);
+        let mut contract = Vec::with_capacity(CONTRACT_HEADER_LEN + CONTRACT_CRC_LEN);
+        contract.extend_from_slice(&CONTRACT_MAGIC.to_le_bytes());
+        contract.push(1);
+        contract.push(self.locality.as_u8());
+        contract.push(0);
+        contract.extend_from_slice(&self.min_available.to_le_bytes());
+        let domain_count = u16::try_from(self.allowed_domains.len()).unwrap_or(u16::MAX);
+        contract.extend_from_slice(&domain_count.to_le_bytes());
+        for domain in &self.allowed_domains {
+            let length = u32::try_from(domain.len()).unwrap_or(u32::MAX);
+            contract.extend_from_slice(&length.to_le_bytes());
+            contract.extend_from_slice(domain.as_bytes());
+        }
+        let contract_crc = crc32c_checksum(&contract);
+        contract.extend_from_slice(&contract_crc.to_le_bytes());
+        let mut body_with_contract = body;
+        body_with_contract.extend_from_slice(&contract);
+        let body_crc = crc32c_checksum(&body_with_contract);
         let content = {
             let mut hasher = blake3::Hasher::new();
             hasher.update(&header[..78]);
-            hasher.update(&body);
+            hasher.update(&body_with_contract);
             hasher.finalize()
         };
         let mut footer = vec![0u8; LAYOUT_FOOTER_LEN];
@@ -273,7 +353,7 @@ impl RedundancyLayout {
         footer[4..36].copy_from_slice(content.as_bytes());
         let crc = crc32c_checksum(&footer[..36]);
         footer[36..40].copy_from_slice(&crc.to_le_bytes());
-        [header, body, footer].concat()
+        [header, body_with_contract, footer].concat()
     }
 
     /// Decodes and fully verifies durable bytes (identity, CRCs, coherence).
@@ -287,14 +367,16 @@ impl RedundancyLayout {
     #[allow(clippy::too_many_lines)]
     pub fn decode(bytes: &[u8]) -> Result<Self, RedundancyError> {
         let bad = |detail: String| RedundancyError::BadLayout { detail };
-        if bytes.len() < LAYOUT_HEADER_LEN + LAYOUT_FOOTER_LEN {
+        if bytes.len()
+            < LAYOUT_HEADER_LEN + LAYOUT_FOOTER_LEN + CONTRACT_HEADER_LEN + CONTRACT_CRC_LEN
+        {
             return Err(bad(format!(
-                "layout shorter than header + footer: {}",
+                "layout shorter than header + contract + footer: {}",
                 bytes.len()
             )));
         }
         let (header, rest) = bytes.split_at(LAYOUT_HEADER_LEN);
-        let (body, footer) = rest.split_at(rest.len() - LAYOUT_FOOTER_LEN);
+        let (body_with_contract, footer) = rest.split_at(rest.len() - LAYOUT_FOOTER_LEN);
         if u32::from_le_bytes(
             header[0..4]
                 .try_into()
@@ -387,24 +469,79 @@ impl RedundancyLayout {
                 params.total_fragments()
             )));
         }
-        if body.len() != count * FRAGMENT_RECORD_LEN {
+        let body_len = count * FRAGMENT_RECORD_LEN;
+        if body_with_contract.len() < body_len + CONTRACT_HEADER_LEN + CONTRACT_CRC_LEN {
             return Err(bad(format!(
-                "body length {} disagrees with {count} fragments",
-                body.len()
+                "body length {} disagrees with {count} fragments and contract",
+                body_with_contract.len()
             )));
+        }
+        let body = &body_with_contract[..body_len];
+        let contract = &body_with_contract[body_len..];
+        if contract.len() < CONTRACT_HEADER_LEN + CONTRACT_CRC_LEN {
+            return Err(bad("layout contract block is truncated".to_owned()));
+        }
+        let contract_payload = &contract[..contract.len() - CONTRACT_CRC_LEN];
+        let mut contract_crc = [0u8; 4];
+        contract_crc.copy_from_slice(&contract[contract.len() - CONTRACT_CRC_LEN..]);
+        let mut contract_magic = [0u8; 4];
+        contract_magic.copy_from_slice(&contract_payload[0..4]);
+        if u32::from_le_bytes(contract_magic) != CONTRACT_MAGIC
+            || contract_payload[4] != 1
+            || contract_payload[5] > 2
+            || contract_payload[6] != 0
+            || crc32c_checksum(contract_payload) != u32::from_le_bytes(contract_crc)
+        {
+            return Err(bad("layout contract block is invalid".to_owned()));
+        }
+        let locality = LocalityRequirement::from_u8(contract_payload[5])
+            .ok_or_else(|| bad("layout locality is invalid".to_owned()))?;
+        let mut minimum = [0u8; 4];
+        minimum.copy_from_slice(&contract_payload[7..11]);
+        let min_available = u32::from_le_bytes(minimum);
+        let mut domain_count_bytes = [0u8; 2];
+        domain_count_bytes.copy_from_slice(&contract_payload[11..13]);
+        let domain_count = usize::from(u16::from_le_bytes(domain_count_bytes));
+        let mut cursor = CONTRACT_HEADER_LEN;
+        let mut allowed_domains = Vec::with_capacity(domain_count);
+        for _ in 0..domain_count {
+            if cursor + 4 > contract_payload.len() {
+                return Err(bad("layout domain length is truncated".to_owned()));
+            }
+            let mut length_bytes = [0u8; 4];
+            length_bytes.copy_from_slice(&contract_payload[cursor..cursor + 4]);
+            cursor += 4;
+            let length = usize::try_from(u32::from_le_bytes(length_bytes))
+                .map_err(|_| bad("layout domain length is invalid".to_owned()))?;
+            if length == 0 || cursor + length > contract_payload.len() {
+                return Err(bad("layout domain payload is invalid".to_owned()));
+            }
+            let domain = std::str::from_utf8(&contract_payload[cursor..cursor + length])
+                .map_err(|_| bad("layout domain is not UTF-8".to_owned()))?
+                .to_owned();
+            cursor += length;
+            allowed_domains.push(domain);
+        }
+        if cursor != contract_payload.len() {
+            return Err(bad("layout contract has trailing bytes".to_owned()));
+        }
+        if min_available == 0 || min_available > params.total_fragments() {
+            return Err(bad(
+                "layout minimum available is outside scheme bounds".to_owned()
+            ));
         }
         if u32::from_le_bytes(
             footer[0..4]
                 .try_into()
                 .map_err(|_| bad("body CRC unreadable".to_owned()))?,
-        ) != crc32c_checksum(body)
+        ) != crc32c_checksum(body_with_contract)
         {
             return Err(bad("layout body CRC mismatch".to_owned()));
         }
         let expect_content = {
             let mut hasher = blake3::Hasher::new();
             hasher.update(&header[..78]);
-            hasher.update(body);
+            hasher.update(body_with_contract);
             *hasher.finalize().as_bytes()
         };
         if footer[4..36] != expect_content {
@@ -479,8 +616,17 @@ impl RedundancyLayout {
                 stored_len,
             });
         }
-        Self::new(asset, logical_len, generation, params, fragments)
-            .map_err(|e| bad(format!("coherence: {e}")))
+        Self::new_with_contract(
+            asset,
+            logical_len,
+            generation,
+            params,
+            fragments,
+            min_available,
+            locality,
+            allowed_domains,
+        )
+        .map_err(|e| bad(format!("coherence: {e}")))
     }
 }
 
@@ -510,6 +656,39 @@ mod tests {
         let second = RedundancyLayout::decode(&bytes).expect("decodes");
         assert_eq!(first, second);
         assert_eq!(first.encode(), second.encode());
+    }
+
+    #[test]
+    fn minimum_available_floor_round_trips() {
+        let asset = AssetId::new(AssetKind::Chunk, 7, [12; 32]).expect("asset");
+        let params = SchemeParams::Replication(ReplicationParams { copies: 3 });
+        let fragments = (0..3u32)
+            .map(|index| FragmentRecord {
+                id: FragmentId::for_bytes(asset, 1, index, params, b"bytes"),
+                node: NodeId::from_u64(u64::from(index) + 1),
+                stored_len: 5,
+            })
+            .collect();
+        let first = RedundancyLayout::new_with_contract(
+            asset,
+            5,
+            1,
+            params,
+            fragments,
+            2,
+            LocalityRequirement::RackSpanning,
+            vec![
+                "rack-b".to_owned(),
+                "rack-a".to_owned(),
+                "rack-a".to_owned(),
+            ],
+        )
+        .expect("builds");
+        let second = RedundancyLayout::decode(&first.encode()).expect("decodes");
+        assert_eq!(second.min_available, 2);
+        assert_eq!(second.locality, LocalityRequirement::RackSpanning);
+        assert_eq!(second.allowed_domains, ["rack-a", "rack-b"]);
+        assert_eq!(first, second);
     }
 
     #[test]

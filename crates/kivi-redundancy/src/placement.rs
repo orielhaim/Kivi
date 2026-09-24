@@ -12,7 +12,9 @@ use std::collections::{HashMap, HashSet};
 
 use kivi_types::NodeId;
 
-use crate::{AssetId, FailureScope, NodeDescriptor, RedundancyError, SchemeParams};
+use crate::{
+    AssetId, FailureScope, LocalityRequirement, NodeDescriptor, RedundancyError, SchemeParams,
+};
 
 /// Where one fragment should live.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -204,6 +206,52 @@ pub fn plan_placement(
     })
 }
 
+/// Plans placement and enforces an explicit locality contract.
+#[allow(clippy::too_many_arguments, clippy::missing_errors_doc)]
+pub fn plan_placement_with_locality(
+    asset: AssetId,
+    generation: u64,
+    total: u32,
+    scope: FailureScope,
+    nodes: &[NodeDescriptor],
+    allowed: &[String],
+    locality: LocalityRequirement,
+) -> Result<DesiredPlacement, RedundancyError> {
+    let placement = plan_placement(asset, generation, total, scope, nodes, allowed)?;
+    let domains = match locality {
+        LocalityRequirement::None => return Ok(placement),
+        LocalityRequirement::RackSpanning => placement
+            .fragments
+            .iter()
+            .filter_map(|fragment| {
+                nodes
+                    .iter()
+                    .find(|node| node.id == fragment.node)
+                    .map(|node| node.domain.rack.clone())
+            })
+            .collect::<HashSet<_>>(),
+        LocalityRequirement::ZoneSpanning => placement
+            .fragments
+            .iter()
+            .filter_map(|fragment| {
+                nodes
+                    .iter()
+                    .find(|node| node.id == fragment.node)
+                    .map(|node| node.domain.zone.clone())
+            })
+            .collect::<HashSet<_>>(),
+    };
+    if domains.len() < total as usize || domains.iter().any(String::is_empty) {
+        return Err(RedundancyError::Placement {
+            detail: format!(
+                "{locality:?} requires {total} distinct domains, found {}",
+                domains.len()
+            ),
+        });
+    }
+    Ok(placement)
+}
+
 /// Counts how many independent failures a set of healthy fragments survives.
 ///
 /// Only fragments on distinct independence keys count toward protection:
@@ -300,6 +348,46 @@ mod tests {
         let other =
             plan_placement(asset(), 4, 3, FailureScope::Node, &cluster, &[]).expect("plans");
         assert_ne!(first.fragments, other.fragments);
+    }
+
+    #[test]
+    fn locality_contract_rejects_domain_collisions() {
+        let cluster = vec![
+            NodeDescriptor {
+                id: NodeId::from_u64(1),
+                domain: crate::FailureDomain::full(
+                    NodeId::from_u64(1),
+                    "rack-a".to_owned(),
+                    "zone-a".to_owned(),
+                    String::new(),
+                ),
+                health: NodeHealth::Active,
+                weight: 1,
+            },
+            NodeDescriptor {
+                id: NodeId::from_u64(2),
+                domain: crate::FailureDomain::full(
+                    NodeId::from_u64(2),
+                    "rack-a".to_owned(),
+                    "zone-a".to_owned(),
+                    String::new(),
+                ),
+                health: NodeHealth::Active,
+                weight: 1,
+            },
+        ];
+        assert!(
+            plan_placement_with_locality(
+                asset(),
+                1,
+                2,
+                FailureScope::Rack,
+                &cluster,
+                &[],
+                LocalityRequirement::RackSpanning,
+            )
+            .is_err()
+        );
     }
 
     #[test]

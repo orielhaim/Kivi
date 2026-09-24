@@ -184,14 +184,25 @@ impl FragmentTransport for LoopbackTransport {
                     },
                 });
             }
+            if rpc.is_mutation() && target.incarnation == 0 && guard.incarnation() != 0 {
+                return Ok(FragmentReply::Refused {
+                    reason: RefuseReason::StaleIncarnation {
+                        current: guard.incarnation(),
+                    },
+                });
+            }
             Ok(dispatch(&guard, rpc))
         })
     }
 }
 
 /// Executes one RPC against a node-local store.
+#[allow(clippy::too_many_lines)]
 fn dispatch(store: &crate::store::LocalFragmentStore, rpc: FragmentRpc) -> FragmentReply {
     match rpc {
+        FragmentRpc::Hello { .. } => FragmentReply::Incarnation {
+            current: store.incarnation(),
+        },
         FragmentRpc::Put {
             key,
             role,
@@ -229,6 +240,13 @@ fn dispatch(store: &crate::store::LocalFragmentStore, rpc: FragmentRpc) -> Fragm
             let (present, healthy) = store.has_fragment(&key, target_incarnation);
             FragmentReply::Presence { present, healthy }
         }
+        FragmentRpc::Metadata {
+            key,
+            target_incarnation,
+        } => {
+            let (present, healthy) = store.metadata_fragment(&key, target_incarnation);
+            FragmentReply::Presence { present, healthy }
+        }
         FragmentRpc::Drop {
             key,
             target_incarnation,
@@ -240,6 +258,58 @@ fn dispatch(store: &crate::store::LocalFragmentStore, rpc: FragmentRpc) -> Fragm
             match store.sweep_orphans_at(target_incarnation) {
                 Ok(count) => FragmentReply::Swept { count },
                 Err(error) => refuse_or_unreachable(&error),
+            }
+        }
+        FragmentRpc::Inventory { target_incarnation } => {
+            if target_incarnation != 0 && target_incarnation != store.incarnation() {
+                FragmentReply::Refused {
+                    reason: RefuseReason::StaleIncarnation {
+                        current: store.incarnation(),
+                    },
+                }
+            } else {
+                FragmentReply::Inventory {
+                    entries: store.inventory(),
+                }
+            }
+        }
+        FragmentRpc::InventoryPage {
+            target_incarnation,
+            offset,
+            limit,
+        } => {
+            if target_incarnation != 0 && target_incarnation != store.incarnation() {
+                FragmentReply::Refused {
+                    reason: RefuseReason::StaleIncarnation {
+                        current: store.incarnation(),
+                    },
+                }
+            } else {
+                let (entries, next_offset) = store.inventory_page(offset, limit);
+                FragmentReply::InventoryPage {
+                    entries,
+                    next_offset,
+                }
+            }
+        }
+        FragmentRpc::SweepOrphansGraceful {
+            target_incarnation,
+            minimum_age_ms,
+            protected,
+        } => {
+            if target_incarnation != 0 && target_incarnation != store.incarnation() {
+                FragmentReply::Refused {
+                    reason: RefuseReason::StaleIncarnation {
+                        current: store.incarnation(),
+                    },
+                }
+            } else {
+                FragmentReply::Swept {
+                    count: store.sweep_orphans_older_than(
+                        std::time::Duration::from_millis(minimum_age_ms),
+                        &protected,
+                    ),
+                }
             }
         }
         other => dispatch_layout(store, other),
@@ -273,6 +343,28 @@ fn dispatch_layout(store: &crate::store::LocalFragmentStore, rpc: FragmentRpc) -
                             content: blake3_256(&layout),
                         }
                     }
+                    Err(error) => refuse_or_unreachable(&error),
+                },
+                Err(error) => refuse_or_unreachable(&error),
+            }
+        }
+        FragmentRpc::AbortLayout {
+            asset_kind,
+            asset_domain,
+            asset_hash,
+            generation,
+            control_generation,
+            target_incarnation,
+        } => {
+            let asset = asset_coords(asset_kind, asset_domain, &asset_hash);
+            match asset {
+                Ok(asset) => match store.abort_layout(
+                    &asset,
+                    generation,
+                    control_generation,
+                    target_incarnation,
+                ) {
+                    Ok(count) => FragmentReply::Swept { count },
                     Err(error) => refuse_or_unreachable(&error),
                 },
                 Err(error) => refuse_or_unreachable(&error),
@@ -440,6 +532,35 @@ mod tests {
             futures::executor::block_on(transport.call(target, drop, Duration::from_secs(1)))
                 .expect("drops");
         assert_eq!(reply, FragmentReply::Dropped);
+    }
+
+    #[test]
+    fn mutation_requires_discovered_incarnation() {
+        let (transport, _store, _guard) = harness(4);
+        let bytes = b"fenced".to_vec();
+        let reply = futures::executor::block_on(transport.call(
+            PeerTarget {
+                node: NodeId::from_u64(1),
+                incarnation: 0,
+            },
+            FragmentRpc::Put {
+                key: key(),
+                role: 0,
+                params_tag: 0,
+                content: blake3_256(&bytes),
+                stored_len: bytes.len() as u64,
+                target_incarnation: 0,
+                bytes,
+            },
+            Duration::from_secs(1),
+        ))
+        .expect("answers");
+        assert_eq!(
+            reply,
+            FragmentReply::Refused {
+                reason: RefuseReason::StaleIncarnation { current: 4 },
+            }
+        );
     }
 
     #[test]

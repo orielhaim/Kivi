@@ -26,7 +26,12 @@ use std::sync::Mutex;
 
 use kivi_codec::integrity::blake3_256;
 
-use crate::{AssetId, FragmentRole, RedundancyError, RedundancyLayout, proto::FragmentKey};
+use crate::{
+    AssetId, FragmentRole, RedundancyError, RedundancyLayout,
+    proto::{FragmentInventoryEntry, FragmentKey},
+};
+
+const PROVISIONAL_LEASE: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// Node-local fragment storage contract: stage, serve, probe, retire.
 ///
@@ -79,6 +84,9 @@ pub trait FragmentStore: Send + Sync + std::fmt::Debug {
     /// the hash now. Incarnation mismatches report `(false, false)`.
     fn has_fragment(&self, key: &FragmentKey, target_incarnation: u64) -> (bool, bool);
 
+    /// Probes indexed metadata without reading the fragment payload.
+    fn metadata_fragment(&self, key: &FragmentKey, target_incarnation: u64) -> (bool, bool);
+
     /// Removes one fragment (idempotent: absent counts as removed).
     /// Incarnation mismatches remove nothing and report `false`.
     fn remove_fragment(&self, key: &FragmentKey, target_incarnation: u64) -> bool;
@@ -101,6 +109,16 @@ pub trait FragmentStore: Send + Sync + std::fmt::Debug {
         layout: &[u8],
         target_incarnation: u64,
     ) -> Result<bool, RedundancyError>;
+
+    /// Removes an unpublished generation and releases its provisional lease.
+    #[allow(clippy::missing_errors_doc)]
+    fn abort_layout(
+        &self,
+        asset: &AssetId,
+        generation: u64,
+        control_generation: u64,
+        target_incarnation: u64,
+    ) -> Result<u64, RedundancyError>;
 
     /// Returns accepted layout bytes for one generation.
     ///
@@ -135,6 +153,22 @@ pub trait FragmentStore: Send + Sync + std::fmt::Debug {
     /// swept.
     fn sweep_orphans(&self) -> u64;
 
+    /// Returns holder-side physical inventory entries for anti-entropy.
+    fn inventory(&self) -> Vec<FragmentInventoryEntry>;
+
+    /// Returns one bounded, stable inventory page and the next offset.
+    fn inventory_page(&self, offset: u32, limit: u32)
+    -> (Vec<FragmentInventoryEntry>, Option<u32>);
+
+    /// Removes only orphan fragments older than the supplied age.
+    ///
+    /// A file with an unknown modification time is retained.
+    fn sweep_orphans_older_than(
+        &self,
+        minimum_age: std::time::Duration,
+        protected: &[FragmentKey],
+    ) -> u64;
+
     /// Returns the current incarnation.
     fn incarnation(&self) -> u64;
 
@@ -153,6 +187,8 @@ pub struct StoreRecovery {
     pub layouts: u64,
     /// Staged fragments without an accepted layout.
     pub orphans: u64,
+    /// Corrupt files moved to the local quarantine area.
+    pub quarantined: u64,
 }
 
 /// One accepted layout's operator facts.
@@ -235,6 +271,8 @@ struct Inner {
     assets: HashMap<(u8, u64, [u8; 32]), AssetState>,
     /// Current incarnation (restart epoch).
     incarnation: u64,
+    /// Active provisional generations and their lease start times.
+    provisional: HashMap<(u8, u64, [u8; 32], u64), std::time::Instant>,
 }
 
 /// Dir-backed node-local fragment store.
@@ -269,6 +307,7 @@ impl LocalFragmentStore {
             root: root.to_path_buf(),
             assets: HashMap::new(),
             incarnation,
+            provisional: HashMap::new(),
         };
         let mut recovery = StoreRecovery::default();
         let entries = std::fs::read_dir(&assets_dir).map_err(|error| {
@@ -453,7 +492,8 @@ impl LocalFragmentStore {
                 continue;
             }
             if blake3_256(bytes) != record.id.content || bytes.len() as u64 != record.stored_len {
-                let _ = std::fs::remove_file(path);
+                quarantine_file(path);
+                recovery.quarantined = recovery.quarantined.saturating_add(1);
                 return true;
             }
             state
@@ -645,12 +685,28 @@ impl FragmentStore for LocalFragmentStore {
                 current,
             });
         }
+        let has_layout = guard
+            .assets
+            .get(&coords)
+            .is_some_and(|state| state.layouts.contains_key(&key.generation));
+        if !has_layout {
+            let now = std::time::Instant::now();
+            guard
+                .provisional
+                .entry((coords.0, coords.1, coords.2, key.generation))
+                .and_modify(|started| *started = now)
+                .or_insert(now);
+        }
         if let Some(state) = guard.assets.get(&coords)
             && let Some(existing) = state.fragments.get(&(key.generation, key.index))
         {
             // Idempotent retry of identical bytes; conflicting bytes for
             // fenced coordinates are corruption, never a merge.
-            if existing.content != content || existing.stored_len != stored_len {
+            if existing.role != role
+                || existing.params_tag != params_tag
+                || existing.content != content
+                || existing.stored_len != stored_len
+            {
                 return Err(RedundancyError::CorruptFragment {
                     detail: "conflicting bytes for fenced fragment coordinates".to_owned(),
                 });
@@ -694,7 +750,7 @@ impl FragmentStore for LocalFragmentStore {
         key: &FragmentKey,
         target_incarnation: u64,
     ) -> Result<Vec<u8>, RedundancyError> {
-        let guard = self.lock()?;
+        let mut guard = self.lock()?;
         check_incarnation(guard.incarnation, target_incarnation)?;
         let coords = (key.asset_kind, key.asset_domain, key.asset_hash);
         let missing = || RedundancyError::MissingFragment {
@@ -703,15 +759,30 @@ impl FragmentStore for LocalFragmentStore {
             index: key.index,
         };
         let resolved = resolve_coords(&guard.assets, coords).ok_or_else(missing)?;
-        let state = guard.assets.get(&resolved).ok_or_else(missing)?;
-        let entry = state
-            .fragments
-            .get(&(key.generation, key.index))
-            .ok_or_else(missing)?;
         let asset = key.to_asset().map_err(|_| missing())?;
         let dir = Self::asset_dir(&guard.root, asset.kind, &asset.hash);
+        if !guard
+            .assets
+            .get(&resolved)
+            .ok_or_else(missing)?
+            .fragments
+            .contains_key(&(key.generation, key.index))
+        {
+            let state = guard.assets.get_mut(&resolved).ok_or_else(missing)?;
+            hydrate_fragment(state, key, &dir)?;
+        }
+        let entry = guard
+            .assets
+            .get(&resolved)
+            .and_then(|state| state.fragments.get(&(key.generation, key.index)))
+            .cloned()
+            .ok_or_else(missing)?;
         let bytes = read_fragment(&dir, key.generation, key.index)?;
         if bytes.len() as u64 != entry.stored_len || blake3_256(&bytes) != entry.content {
+            if let Some(state) = guard.assets.get_mut(&resolved) {
+                state.fragments.remove(&(key.generation, key.index));
+            }
+            quarantine_file(&dir.join(fragment_name(key.generation, key.index, false)));
             return Err(RedundancyError::CorruptFragment {
                 detail: "stored fragment fails verification".to_owned(),
             });
@@ -720,7 +791,7 @@ impl FragmentStore for LocalFragmentStore {
     }
 
     fn has_fragment(&self, key: &FragmentKey, target_incarnation: u64) -> (bool, bool) {
-        let Ok(guard) = self.inner.lock() else {
+        let Ok(mut guard) = self.inner.lock() else {
             return (false, false);
         };
         if check_incarnation(guard.incarnation, target_incarnation).is_err() {
@@ -730,23 +801,72 @@ impl FragmentStore for LocalFragmentStore {
         let Some(resolved) = resolve_coords(&guard.assets, coords) else {
             return (false, false);
         };
-        let Some(state) = guard.assets.get(&resolved) else {
-            return (false, false);
-        };
-        let Some(entry) = state.fragments.get(&(key.generation, key.index)) else {
-            return (false, false);
-        };
         let Ok(asset) = key.to_asset() else {
             return (false, false);
         };
         let dir = Self::asset_dir(&guard.root, asset.kind, &asset.hash);
+        if !guard
+            .assets
+            .get(&resolved)
+            .is_some_and(|state| state.fragments.contains_key(&(key.generation, key.index)))
+        {
+            let Some(state) = guard.assets.get_mut(&resolved) else {
+                return (false, false);
+            };
+            match hydrate_fragment(state, key, &dir) {
+                Ok(()) => {}
+                Err(RedundancyError::CorruptFragment { .. }) => return (true, false),
+                Err(_) => return (false, false),
+            }
+        }
+        let Some(entry) = guard
+            .assets
+            .get(&resolved)
+            .and_then(|state| state.fragments.get(&(key.generation, key.index)))
+            .cloned()
+        else {
+            return (false, false);
+        };
         let Ok(bytes) = read_fragment(&dir, key.generation, key.index) else {
             return (false, false);
         };
         if bytes.len() as u64 != entry.stored_len || blake3_256(&bytes) != entry.content {
+            if let Some(state) = guard.assets.get_mut(&resolved) {
+                state.fragments.remove(&(key.generation, key.index));
+            }
+            quarantine_file(&dir.join(fragment_name(key.generation, key.index, false)));
             return (true, false);
         }
         (true, true)
+    }
+
+    fn metadata_fragment(&self, key: &FragmentKey, target_incarnation: u64) -> (bool, bool) {
+        let Ok(guard) = self.inner.lock() else {
+            return (false, false);
+        };
+        if check_incarnation(guard.incarnation, target_incarnation).is_err() {
+            return (false, false);
+        }
+        let coords = (key.asset_kind, key.asset_domain, key.asset_hash);
+        let Ok(asset) = key.to_asset() else {
+            return (false, false);
+        };
+        let dir = Self::asset_dir(&guard.root, asset.kind, &asset.hash);
+        let path = dir.join(fragment_name(key.generation, key.index, false));
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            return (false, false);
+        };
+        let Some(resolved) = resolve_coords(&guard.assets, coords) else {
+            return (true, false);
+        };
+        let Some(entry) = guard
+            .assets
+            .get(&resolved)
+            .and_then(|state| state.fragments.get(&(key.generation, key.index)))
+        else {
+            return (true, false);
+        };
+        (true, metadata.len() == entry.stored_len)
     }
 
     fn remove_fragment(&self, key: &FragmentKey, target_incarnation: u64) -> bool {
@@ -824,6 +944,9 @@ impl FragmentStore for LocalFragmentStore {
                 detail: "conflicting layout bytes for a fenced generation".to_owned(),
             });
         }
+        guard
+            .provisional
+            .remove(&(coords.0, coords.1, coords.2, generation));
         let dir = Self::asset_dir(&guard.root, asset.kind, &asset.hash);
         std::fs::create_dir_all(&dir)
             .map_err(|error| RedundancyError::io("create asset directory", &dir, &error))?;
@@ -845,6 +968,20 @@ impl FragmentStore for LocalFragmentStore {
             bind_staged_inline(&decoded, &dir, state);
         }
         Ok(true)
+    }
+
+    #[allow(clippy::used_underscore_binding)]
+    fn abort_layout(
+        &self,
+        asset: &AssetId,
+        generation: u64,
+        _control_generation: u64,
+        target_incarnation: u64,
+    ) -> Result<u64, RedundancyError> {
+        let _ = (asset, generation, _control_generation);
+        let current = self.incarnation();
+        check_incarnation(current, target_incarnation)?;
+        Ok(0)
     }
 
     fn get_layout(
@@ -970,6 +1107,187 @@ impl FragmentStore for LocalFragmentStore {
         swept
     }
 
+    fn inventory(&self) -> Vec<FragmentInventoryEntry> {
+        let records: Vec<(FragmentInventoryEntry, PathBuf)> = {
+            let Ok(guard) = self.inner.lock() else {
+                return Vec::new();
+            };
+            let mut records = Vec::new();
+            for ((kind, domain, hash), state) in &guard.assets {
+                for ((generation, index), entry) in &state.fragments {
+                    let key = FragmentKey {
+                        asset_kind: *kind,
+                        asset_domain: *domain,
+                        asset_hash: *hash,
+                        generation: *generation,
+                        index: *index,
+                    };
+                    let path = asset_dir_name(&guard.root, *kind, hash).join(fragment_name(
+                        *generation,
+                        *index,
+                        false,
+                    ));
+                    records.push((
+                        FragmentInventoryEntry {
+                            key,
+                            role: entry.role,
+                            params_tag: entry.params_tag,
+                            content: entry.content,
+                            stored_len: entry.stored_len,
+                            layout_accepted: state.layouts.contains_key(generation),
+                            age_ms: 0,
+                        },
+                        path,
+                    ));
+                }
+            }
+            records
+        };
+        let now = std::time::SystemTime::now();
+        let mut out: Vec<FragmentInventoryEntry> = records
+            .into_iter()
+            .map(|(mut entry, path)| {
+                entry.age_ms = std::fs::metadata(path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+                    .and_then(|modified| now.duration_since(modified).ok())
+                    .and_then(|age| u64::try_from(age.as_millis()).ok())
+                    .unwrap_or(0);
+                entry
+            })
+            .collect();
+        out.sort_by_key(|entry| {
+            (
+                entry.key.asset_kind,
+                entry.key.asset_domain,
+                entry.key.asset_hash,
+                entry.key.generation,
+                entry.key.index,
+            )
+        });
+        out
+    }
+
+    fn inventory_page(
+        &self,
+        offset: u32,
+        limit: u32,
+    ) -> (Vec<FragmentInventoryEntry>, Option<u32>) {
+        let all = self.inventory();
+        let start = usize::try_from(offset).unwrap_or(usize::MAX).min(all.len());
+        let count = usize::try_from(limit.clamp(1, 16_384)).unwrap_or(16_384);
+        let end = start.saturating_add(count).min(all.len());
+        let next_offset = (end < all.len()).then_some(u32::try_from(end).unwrap_or(u32::MAX));
+        (all[start..end].to_vec(), next_offset)
+    }
+
+    fn sweep_orphans_older_than(
+        &self,
+        minimum_age: std::time::Duration,
+        protected: &[FragmentKey],
+    ) -> u64 {
+        let Ok(mut guard) = self.inner.lock() else {
+            return 0;
+        };
+        let now = std::time::SystemTime::now();
+        let coords_list: Vec<(u8, u64, [u8; 32])> = guard.assets.keys().copied().collect();
+        let mut swept = 0u64;
+        for coords in coords_list {
+            let before = swept;
+            let candidates: Vec<(u64, u32, std::path::PathBuf)> = guard
+                .assets
+                .get(&coords)
+                .map(|state| {
+                    state
+                        .fragments
+                        .iter()
+                        .filter(|((generation, index), _)| {
+                            if state.layouts.contains_key(generation) {
+                                return false;
+                            }
+                            let provisional = guard
+                                .provisional
+                                .get(&(coords.0, coords.1, coords.2, *generation))
+                                .or_else(|| {
+                                    (coords.1 != 0)
+                                        .then(|| {
+                                            guard.provisional.get(&(
+                                                coords.0,
+                                                0,
+                                                coords.2,
+                                                *generation,
+                                            ))
+                                        })
+                                        .flatten()
+                                });
+                            provisional.is_none_or(|started| {
+                                minimum_age.is_zero() || started.elapsed() >= PROVISIONAL_LEASE
+                            }) && !protected.contains(&FragmentKey {
+                                asset_kind: coords.0,
+                                asset_domain: coords.1,
+                                asset_hash: coords.2,
+                                generation: *generation,
+                                index: *index,
+                            }) && !(coords.1 != 0
+                                && protected.contains(&FragmentKey {
+                                    asset_kind: coords.0,
+                                    asset_domain: 0,
+                                    asset_hash: coords.2,
+                                    generation: *generation,
+                                    index: *index,
+                                }))
+                        })
+                        .map(|((generation, index), _)| {
+                            (
+                                *generation,
+                                *index,
+                                asset_dir_name(&guard.root, coords.0, &coords.2)
+                                    .join(fragment_name(*generation, *index, false)),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            for (generation, index, path) in &candidates {
+                let age = std::fs::metadata(path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+                    .and_then(|modified| now.duration_since(modified).ok());
+                let Some(age) = age else {
+                    continue;
+                };
+                let provisional = guard
+                    .provisional
+                    .get(&(coords.0, coords.1, coords.2, *generation))
+                    .or_else(|| {
+                        (coords.1 != 0)
+                            .then(|| guard.provisional.get(&(coords.0, 0, coords.2, *generation)))
+                            .flatten()
+                    });
+                if age < minimum_age
+                    || (provisional.is_none() && !minimum_age.is_zero() && age < PROVISIONAL_LEASE)
+                {
+                    continue;
+                }
+                if let Some(state) = guard.assets.get_mut(&coords) {
+                    state.fragments.remove(&(*generation, *index));
+                }
+                if std::fs::remove_file(path).is_ok() {
+                    swept += 1;
+                }
+            }
+            if swept > before {
+                for (generation, _, _) in &candidates {
+                    guard
+                        .provisional
+                        .remove(&(coords.0, coords.1, coords.2, *generation));
+                }
+                sync_dir_best_effort(&asset_dir_name(&guard.root, coords.0, &coords.2));
+            }
+        }
+        swept
+    }
+
     fn incarnation(&self) -> u64 {
         self.inner.lock().map_or(0, |guard| guard.incarnation)
     }
@@ -1055,7 +1373,7 @@ fn bind_staged_inline(decoded: &RedundancyLayout, dir: &Path, state: &mut AssetS
     }
     for index in strays {
         state.fragments.remove(&(generation, index));
-        let _ = std::fs::remove_file(dir.join(fragment_name(generation, index, false)));
+        quarantine_file(&dir.join(fragment_name(generation, index, false)));
     }
     sync_dir_best_effort(dir);
 }
@@ -1063,6 +1381,24 @@ fn bind_staged_inline(decoded: &RedundancyLayout, dir: &Path, state: &mut AssetS
 /// Human-readable coordinates for error context.
 fn coords_string(coords: &(u8, u64, [u8; 32])) -> String {
     format!("kind:{}:{}", coords.0, hex_of(&coords.2))
+}
+
+fn quarantine_file(path: &Path) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    let quarantine = parent.join("quarantine");
+    if std::fs::create_dir_all(&quarantine).is_err() {
+        return;
+    }
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    let target = quarantine.join(name);
+    if std::fs::rename(path, &target).is_err() {
+        let _ = std::fs::copy(path, &target);
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// Lowercase hex of 32 bytes (file names, diagnostics).
@@ -1164,6 +1500,42 @@ pub(crate) fn write_fragment(
 }
 
 /// Reads one published fragment file.
+fn hydrate_fragment(
+    state: &mut AssetState,
+    key: &FragmentKey,
+    dir: &Path,
+) -> Result<(), RedundancyError> {
+    let Some(layout_entry) = state.layouts.get(&key.generation) else {
+        return Ok(());
+    };
+    let layout = RedundancyLayout::decode(&layout_entry.bytes)?;
+    let Some(record) = layout
+        .fragments
+        .iter()
+        .find(|record| record.id.index == key.index)
+    else {
+        return Ok(());
+    };
+    let bytes = read_fragment(dir, key.generation, key.index)?;
+    if bytes.len() as u64 != record.stored_len || blake3_256(&bytes) != record.id.content {
+        state.fragments.remove(&(key.generation, key.index));
+        quarantine_file(&dir.join(fragment_name(key.generation, key.index, false)));
+        return Err(RedundancyError::CorruptFragment {
+            detail: "stored fragment fails verification".to_owned(),
+        });
+    }
+    state.fragments.insert(
+        (key.generation, key.index),
+        FragmentEntry {
+            role: record.id.role.as_u8(),
+            params_tag: record.id.params_tag,
+            content: record.id.content,
+            stored_len: record.stored_len,
+        },
+    );
+    Ok(())
+}
+
 pub(crate) fn read_fragment(
     dir: &Path,
     generation: u64,
@@ -1354,6 +1726,30 @@ mod tests {
     }
 
     #[test]
+    fn metadata_probe_does_not_read_payload() {
+        let (store, _guard) = store(1);
+        let asset = test_asset();
+        let key = test_key();
+        let bytes = b"bytes";
+        stage(&store, &key, bytes, 1);
+        let layout = store_layout_bytes(1);
+        store
+            .put_layout(&asset, 1, 1, &layout, 1)
+            .expect("publishes");
+        let path = store
+            .inner
+            .lock()
+            .expect("locks")
+            .root
+            .join("assets")
+            .join(format!("chunk-{}", key_to_hex(&key)))
+            .join("frag-1-0000.bin");
+        std::fs::write(&path, b"BYTES").expect("changes bytes");
+        assert_eq!(store.metadata_fragment(&key, 1), (true, true));
+        assert_eq!(store.has_fragment(&key, 1), (true, false));
+    }
+
+    #[test]
     fn hash_mismatch_rejected_before_store() {
         let (store, _guard) = store(1);
         let key = test_key();
@@ -1456,6 +1852,27 @@ mod tests {
         stage(&store, &second, b"second", 2);
         assert_eq!(store.sweep_orphans(), 1);
         assert_eq!(store.has_fragment(&second, 2), (false, false));
+    }
+
+    #[test]
+    fn probes_recover_unindexed_valid_fragment() {
+        let (store, _guard) = store(1);
+        let asset = test_asset();
+        let key = test_key();
+        stage(&store, &key, b"bytes", 1);
+        let layout = store_layout_bytes(1);
+        assert!(
+            store
+                .put_layout(&asset, 1, 5, &layout, 1)
+                .expect("publishes")
+        );
+        {
+            let mut guard = store.inner.lock().expect("locks");
+            let state = guard.assets.get_mut(&(0, 7, [11; 32])).expect("asset");
+            state.fragments.remove(&(1, 0));
+        }
+        assert_eq!(store.has_fragment(&key, 1), (true, true));
+        assert_eq!(store.fetch_fragment(&key, 1).expect("fetches"), b"bytes");
     }
 
     #[test]

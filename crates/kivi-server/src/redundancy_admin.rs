@@ -677,17 +677,22 @@ async fn health(
 
 /// GET `/v1/redundancy/metrics`: fabric counters, local orphans, per-holder
 /// desired bytes, current generations, and background-lane counters.
+#[allow(clippy::too_many_lines)]
 async fn metrics(State(shared): State<ClusterShared>) -> (StatusCode, Json<serde_json::Value>) {
     let Some(coordinator) = coordinator_arc(&shared) else {
         return plane_disabled();
     };
-    let (metrics, lane) = match bridge("metrics", {
+    let (metrics, lane, maintenance) = match bridge("metrics", {
         let job = Arc::clone(&coordinator);
         move || {
             let owned = Arc::clone(&job);
             async move {
                 let metrics = owned.metrics().await;
-                Ok::<_, kivi_redundancy::RedundancyError>((metrics, owned.lane_stats()))
+                Ok::<_, kivi_redundancy::RedundancyError>((
+                    metrics,
+                    owned.lane_stats(),
+                    owned.maintenance_snapshot(),
+                ))
             }
         }
     })
@@ -697,55 +702,249 @@ async fn metrics(State(shared): State<ClusterShared>) -> (StatusCode, Json<serde
         Err(fault) => return fault.into_response(),
     };
     let snapshot = metrics.snapshot;
+    let mut body = serde_json::json!({
+        "assets_replicated": metrics.replicated_assets,
+        "assets_coded": metrics.coded_assets,
+        "logical_bytes": metrics.logical_bytes,
+        "physical_bytes": metrics.physical_bytes,
+        "amplification": metrics.amplification(),
+        "healthy": snapshot.healthy,
+        "degraded": snapshot.degraded,
+        "critical": snapshot.critical,
+        "unrecoverable": snapshot.unrecoverable,
+        "pending_repairs": snapshot.pending_repairs,
+        "repair_bytes_pending": snapshot.repair_bytes_pending,
+        "repair_bytes_done": snapshot.repair_bytes_done,
+        "encodes": snapshot.encodes,
+        "decodes": snapshot.decodes,
+        "corruption_detected": snapshot.corruption_detected,
+        "reconstruction_failures": snapshot.reconstruction_failures,
+        "stale_rejected": snapshot.stale_rejected,
+        "transitions": snapshot.transitions,
+        "remote_bytes_sent": snapshot.remote_bytes_sent,
+        "remote_bytes_received": snapshot.remote_bytes_received,
+        "local_bytes_written": snapshot.local_bytes_written,
+        "local_bytes_read": snapshot.local_bytes_read,
+        "fetch_count": snapshot.fetch_count,
+        "fetch_error_count": snapshot.fetch_error_count,
+        "fetch_latency_us_sum": snapshot.fetch_latency_us_sum,
+        "fetch_latency_us_max": snapshot.fetch_latency_us_max,
+        "degraded_reads": snapshot.degraded_reads,
+        "orphans_seen": snapshot.orphans_seen,
+        "orphans_swept": snapshot.orphans_swept,
+        "incarnation_refusals": snapshot.incarnation_refusals,
+        "desired_vs_actual_mismatches": snapshot.desired_vs_actual_mismatches,
+        "orphans_local": metrics.orphans,
+        "by_node_bytes": metrics.by_node_bytes.iter()
+            .map(|(node, bytes)| serde_json::json!({ "node": node, "bytes": bytes }))
+            .collect::<Vec<_>>(),
+        "current_gens": metrics.current_gens.iter()
+            .map(|(asset, generation)| serde_json::json!({
+                "asset": hex32(&asset.hash),
+                "kind": asset.kind.as_u8(),
+                "domain": asset.domain,
+                "control_generation": generation,
+            }))
+            .collect::<Vec<_>>(),
+        "lane": format!("{lane:?}"),
+    });
+    let object = body.as_object_mut().expect("JSON object");
+    for (name, value) in [
+        ("scrub_runs", serde_json::json!(snapshot.scrub_runs)),
+        ("scrub_assets", serde_json::json!(snapshot.scrub_assets)),
+        ("scrub_bytes", serde_json::json!(snapshot.scrub_bytes)),
+        ("full_scrubs", serde_json::json!(snapshot.full_scrubs)),
+        (
+            "last_scrub_age_ms",
+            serde_json::json!(snapshot.last_scrub_age_ms),
+        ),
+        (
+            "last_verification_age_ms",
+            serde_json::json!(snapshot.last_verification_age_ms),
+        ),
+        (
+            "missing_fragments",
+            serde_json::json!(snapshot.missing_fragments),
+        ),
+        ("degraded_bytes", serde_json::json!(snapshot.degraded_bytes)),
+        (
+            "missing_physical_bytes",
+            serde_json::json!(snapshot.missing_physical_bytes),
+        ),
+        (
+            "degraded_time_ms",
+            serde_json::json!(snapshot.degraded_time_ms),
+        ),
+        (
+            "estimated_reconstruction_bytes",
+            serde_json::json!(snapshot.estimated_reconstruction_bytes),
+        ),
+        (
+            "failure_domain_exposure",
+            serde_json::json!(snapshot.failure_domain_exposure),
+        ),
+        (
+            "repair_attempts",
+            serde_json::json!(snapshot.repair_attempts),
+        ),
+        (
+            "repair_failures",
+            serde_json::json!(snapshot.repair_failures),
+        ),
+        ("repair_retries", serde_json::json!(snapshot.repair_retries)),
+        (
+            "repair_duration_us_sum",
+            serde_json::json!(snapshot.repair_duration_us_sum),
+        ),
+        (
+            "repair_duration_us_max",
+            serde_json::json!(snapshot.repair_duration_us_max),
+        ),
+        ("repair_sources", serde_json::json!(snapshot.repair_sources)),
+        ("repair_targets", serde_json::json!(snapshot.repair_targets)),
+        (
+            "multi_source_fetches",
+            serde_json::json!(snapshot.multi_source_fetches),
+        ),
+        (
+            "multi_source_hedges",
+            serde_json::json!(snapshot.multi_source_hedges),
+        ),
+        (
+            "source_failures",
+            serde_json::json!(snapshot.source_failures),
+        ),
+        (
+            "recovered_bytes",
+            serde_json::json!(snapshot.recovered_bytes),
+        ),
+        (
+            "placement_violations",
+            serde_json::json!(snapshot.placement_violations),
+        ),
+        (
+            "orphans_retained",
+            serde_json::json!(snapshot.orphans_retained),
+        ),
+        (
+            "reclaimed_bytes",
+            serde_json::json!(snapshot.reclaimed_bytes),
+        ),
+        (
+            "maintenance_throttled",
+            serde_json::json!(snapshot.maintenance_throttled),
+        ),
+        (
+            "foreground_pressure_suppressed",
+            serde_json::json!(snapshot.foreground_pressure_suppressed),
+        ),
+        ("scrub_inflight", serde_json::json!(snapshot.scrub_inflight)),
+        (
+            "repair_inflight",
+            serde_json::json!(snapshot.repair_inflight),
+        ),
+    ] {
+        object.insert(name.to_owned(), value);
+    }
+    object.insert(
+        "repair_debt".to_owned(),
+        serde_json::json!({
+            "assets": maintenance.debt.total_assets,
+            "bytes": maintenance.debt.total_bytes,
+            "fragments": maintenance.debt.total_fragments,
+            "critical_assets": maintenance.debt.total_critical_assets,
+            "by_node": maintenance.debt.by_node.iter()
+                .map(|(node, counters)| serde_json::json!({
+                    "node": node.as_u64(), "assets": counters.assets, "bytes": counters.bytes,
+                    "fragments": counters.fragments, "critical_assets": counters.critical_assets,
+                }))
+                .collect::<Vec<_>>(),
+            "by_failure_domain": maintenance.debt.by_failure_domain.iter()
+                .map(|(domain, counters)| serde_json::json!({
+                    "domain": domain, "assets": counters.assets, "bytes": counters.bytes,
+                    "fragments": counters.fragments, "critical_assets": counters.critical_assets,
+                }))
+                .collect::<Vec<_>>(),
+            "by_scheme": maintenance.debt.by_scheme.iter()
+                .map(|(scheme, counters)| serde_json::json!({
+                    "scheme": scheme.scheme().name(), "assets": counters.assets, "bytes": counters.bytes,
+                    "fragments": counters.fragments, "critical_assets": counters.critical_assets,
+                }))
+                .collect::<Vec<_>>(),
+        }),
+    );
+    object.insert(
+        "maintenance_cursor".to_owned(),
+        serde_json::json!({
+            "cycle": maintenance.cursor().cycle,
+            "next_asset": maintenance.cursor().next_asset.map(|asset| hex32(&asset.hash)),
+            "byte_offset": maintenance.cursor().byte_offset,
+            "mode": maintenance.cursor().mode.name(),
+            "cycle_complete": maintenance.cursor().cycle_complete,
+        }),
+    );
+    (StatusCode::OK, Json(body))
+}
+
+/// GET `/v1/redundancy/maintenance`: bounded controller and debt state.
+async fn maintenance(State(shared): State<ClusterShared>) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(coordinator) = coordinator_arc(&shared) else {
+        return plane_disabled();
+    };
+    let snapshot = coordinator.maintenance_snapshot();
     (
         StatusCode::OK,
         Json(serde_json::json!({
-            "assets_replicated": metrics.replicated_assets,
-            "assets_coded": metrics.coded_assets,
-            "logical_bytes": metrics.logical_bytes,
-            "physical_bytes": metrics.physical_bytes,
-            "amplification": metrics.amplification(),
-            "healthy": snapshot.healthy,
-            "degraded": snapshot.degraded,
-            "critical": snapshot.critical,
-            "unrecoverable": snapshot.unrecoverable,
-            "pending_repairs": snapshot.pending_repairs,
-            "repair_bytes_pending": snapshot.repair_bytes_pending,
-            "repair_bytes_done": snapshot.repair_bytes_done,
-            "encodes": snapshot.encodes,
-            "decodes": snapshot.decodes,
-            "corruption_detected": snapshot.corruption_detected,
-            "reconstruction_failures": snapshot.reconstruction_failures,
-            "stale_rejected": snapshot.stale_rejected,
-            "transitions": snapshot.transitions,
-            "remote_bytes_sent": snapshot.remote_bytes_sent,
-            "remote_bytes_received": snapshot.remote_bytes_received,
-            "local_bytes_written": snapshot.local_bytes_written,
-            "local_bytes_read": snapshot.local_bytes_read,
-            "fetch_count": snapshot.fetch_count,
-            "fetch_error_count": snapshot.fetch_error_count,
-            "fetch_latency_us_sum": snapshot.fetch_latency_us_sum,
-            "fetch_latency_us_max": snapshot.fetch_latency_us_max,
-            "degraded_reads": snapshot.degraded_reads,
-            "orphans_seen": snapshot.orphans_seen,
-            "orphans_swept": snapshot.orphans_swept,
-            "incarnation_refusals": snapshot.incarnation_refusals,
-            "desired_vs_actual_mismatches": snapshot.desired_vs_actual_mismatches,
-            "orphans_local": metrics.orphans,
-            "by_node_bytes": metrics.by_node_bytes.iter()
-                .map(|(node, bytes)| serde_json::json!({ "node": node, "bytes": bytes }))
-                .collect::<Vec<_>>(),
-            "current_gens": metrics.current_gens.iter()
-                .map(|(asset, generation)| serde_json::json!({
-                    "asset": hex32(&asset.hash),
-                    "kind": asset.kind.as_u8(),
-                    "domain": asset.domain,
-                    "control_generation": generation,
-                }))
-                .collect::<Vec<_>>(),
-            "lane": format!("{lane:?}"),
+            "queued_work": snapshot.queued_work,
+            "in_flight_reconstructions": snapshot.in_flight_reconstructions,
+            "in_flight_transfers": snapshot.in_flight_transfers,
+            "in_flight_scrubs": snapshot.in_flight_scrubs,
+            "debt": snapshot.debt.total_assets,
+            "debt_bytes": snapshot.debt.total_bytes,
+            "critical_debt": snapshot.debt.total_critical_assets,
+            "last_error": snapshot.last_error,
+            "cursor": {
+                "cycle": snapshot.cursor().cycle,
+                "next_asset": snapshot.cursor().next_asset.map(|asset| hex32(&asset.hash)),
+                "byte_offset": snapshot.cursor().byte_offset,
+                "mode": snapshot.cursor().mode.name(),
+                "complete": snapshot.cursor().cycle_complete,
+            },
         })),
     )
+}
+
+/// POST `/v1/redundancy/maintenance/tick`: deterministic simulation hook.
+async fn maintenance_tick(
+    State(shared): State<ClusterShared>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(coordinator) = coordinator_arc(&shared) else {
+        return plane_disabled();
+    };
+    match bridge("maintenance-tick", {
+        let job = Arc::clone(&coordinator);
+        move || {
+            let owned = Arc::clone(&job);
+            async move { owned.maintenance_tick(false).await }
+        }
+    })
+    .await
+    {
+        Ok(report) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "scrub_assets": report.scrub_assets,
+                "scrub_bytes": report.scrub_bytes,
+                "repair_assets": report.repair_assets,
+                "repair_bytes": report.repair_bytes,
+                "corruption_detected": report.corruption_detected,
+                "repair_failures": report.repair_failures,
+                "debt_assets": report.debt.total_assets,
+                "debt_bytes": report.debt.total_bytes,
+            })),
+        ),
+        Err(fault) => fault.into_response(),
+    }
 }
 
 /// GET `/v1/redundancy/catalog`: every published layout with its generations.
@@ -860,6 +1059,8 @@ pub fn router() -> Router<ClusterShared> {
         .route("/v1/redundancy/read", get(read))
         .route("/v1/redundancy/health", get(health))
         .route("/v1/redundancy/metrics", get(metrics))
+        .route("/v1/redundancy/maintenance", get(maintenance))
+        .route("/v1/redundancy/maintenance/tick", post(maintenance_tick))
         .route("/v1/redundancy/catalog", get(catalog))
         .route("/v1/redundancy/repair", post(repair))
         .route("/v1/redundancy/drain", post(drain))

@@ -105,6 +105,66 @@ pub struct FabricMetrics {
     pub desired_vs_actual_mismatches: AtomicU64,
     /// Fragments re-installed by distributed repair (cumulative).
     pub repair_fragments_rebuilt: AtomicU64,
+    /// Scrub passes started.
+    pub scrub_runs: AtomicU64,
+    /// Assets inspected by scrub passes.
+    pub scrub_assets: AtomicU64,
+    /// Bytes inspected by scrub passes.
+    pub scrub_bytes: AtomicU64,
+    /// Full-payload scrub passes started.
+    pub full_scrubs: AtomicU64,
+    /// Age of the last scrub pass in milliseconds.
+    pub last_scrub_age_ms: AtomicU64,
+    /// Age of the last successful verification in milliseconds.
+    pub last_verification_age_ms: AtomicU64,
+    /// Missing published fragments observed by maintenance.
+    pub missing_fragments: AtomicU64,
+    /// Logical bytes currently degraded.
+    pub degraded_bytes: AtomicU64,
+    /// Physical bytes missing from published layouts.
+    pub missing_physical_bytes: AtomicU64,
+    /// Milliseconds assets have spent degraded.
+    pub degraded_time_ms: AtomicU64,
+    /// Estimated bytes required to reconstruct queued repairs.
+    pub estimated_reconstruction_bytes: AtomicU64,
+    /// Sum of exposed failure-domain multiplicity.
+    pub failure_domain_exposure: AtomicU64,
+    /// Repair attempts started.
+    pub repair_attempts: AtomicU64,
+    /// Repair attempts that failed.
+    pub repair_failures: AtomicU64,
+    /// Repair retries scheduled.
+    pub repair_retries: AtomicU64,
+    /// Sum of repair durations in microseconds.
+    pub repair_duration_us_sum: AtomicU64,
+    /// Maximum repair duration in microseconds.
+    pub repair_duration_us_max: AtomicU64,
+    /// Number of source fragments selected by maintenance.
+    pub repair_sources: AtomicU64,
+    /// Number of target fragments selected by maintenance.
+    pub repair_targets: AtomicU64,
+    /// Fetches that used more than one source candidate.
+    pub multi_source_fetches: AtomicU64,
+    /// Hedged source reads started.
+    pub multi_source_hedges: AtomicU64,
+    /// Source reads rejected or failed during maintenance.
+    pub source_failures: AtomicU64,
+    /// Bytes recovered by completed repairs.
+    pub recovered_bytes: AtomicU64,
+    /// Placement violations observed by maintenance.
+    pub placement_violations: AtomicU64,
+    /// Orphan candidates retained by age or authority ambiguity.
+    pub orphans_retained: AtomicU64,
+    /// Bytes reclaimed by orphan lifecycle work.
+    pub reclaimed_bytes: AtomicU64,
+    /// Maintenance ticks throttled by a budget.
+    pub maintenance_throttled: AtomicU64,
+    /// Maintenance ticks suppressed by foreground pressure.
+    pub foreground_pressure_suppressed: AtomicU64,
+    /// Scrub operations currently executing.
+    pub scrub_inflight: AtomicU64,
+    /// Repair operations currently executing.
+    pub repair_inflight: AtomicU64,
 }
 
 impl FabricMetrics {
@@ -150,6 +210,40 @@ impl FabricMetrics {
             incarnation_refusals: self.incarnation_refusals.load(Ordering::Relaxed),
             desired_vs_actual_mismatches: self.desired_vs_actual_mismatches.load(Ordering::Relaxed),
             repair_fragments_rebuilt: self.repair_fragments_rebuilt.load(Ordering::Relaxed),
+            scrub_runs: self.scrub_runs.load(Ordering::Relaxed),
+            scrub_assets: self.scrub_assets.load(Ordering::Relaxed),
+            scrub_bytes: self.scrub_bytes.load(Ordering::Relaxed),
+            full_scrubs: self.full_scrubs.load(Ordering::Relaxed),
+            last_scrub_age_ms: self.last_scrub_age_ms.load(Ordering::Relaxed),
+            last_verification_age_ms: self.last_verification_age_ms.load(Ordering::Relaxed),
+            missing_fragments: self.missing_fragments.load(Ordering::Relaxed),
+            degraded_bytes: self.degraded_bytes.load(Ordering::Relaxed),
+            missing_physical_bytes: self.missing_physical_bytes.load(Ordering::Relaxed),
+            degraded_time_ms: self.degraded_time_ms.load(Ordering::Relaxed),
+            estimated_reconstruction_bytes: self
+                .estimated_reconstruction_bytes
+                .load(Ordering::Relaxed),
+            failure_domain_exposure: self.failure_domain_exposure.load(Ordering::Relaxed),
+            repair_attempts: self.repair_attempts.load(Ordering::Relaxed),
+            repair_failures: self.repair_failures.load(Ordering::Relaxed),
+            repair_retries: self.repair_retries.load(Ordering::Relaxed),
+            repair_duration_us_sum: self.repair_duration_us_sum.load(Ordering::Relaxed),
+            repair_duration_us_max: self.repair_duration_us_max.load(Ordering::Relaxed),
+            repair_sources: self.repair_sources.load(Ordering::Relaxed),
+            repair_targets: self.repair_targets.load(Ordering::Relaxed),
+            multi_source_fetches: self.multi_source_fetches.load(Ordering::Relaxed),
+            multi_source_hedges: self.multi_source_hedges.load(Ordering::Relaxed),
+            source_failures: self.source_failures.load(Ordering::Relaxed),
+            recovered_bytes: self.recovered_bytes.load(Ordering::Relaxed),
+            placement_violations: self.placement_violations.load(Ordering::Relaxed),
+            orphans_retained: self.orphans_retained.load(Ordering::Relaxed),
+            reclaimed_bytes: self.reclaimed_bytes.load(Ordering::Relaxed),
+            maintenance_throttled: self.maintenance_throttled.load(Ordering::Relaxed),
+            foreground_pressure_suppressed: self
+                .foreground_pressure_suppressed
+                .load(Ordering::Relaxed),
+            scrub_inflight: self.scrub_inflight.load(Ordering::Relaxed),
+            repair_inflight: self.repair_inflight.load(Ordering::Relaxed),
         }
     }
 
@@ -235,6 +329,66 @@ pub struct FabricMetricsSnapshot {
     pub desired_vs_actual_mismatches: u64,
     /// Fragments rebuilt by distributed repair.
     pub repair_fragments_rebuilt: u64,
+    /// Scrub passes started.
+    pub scrub_runs: u64,
+    /// Assets inspected by scrub passes.
+    pub scrub_assets: u64,
+    /// Bytes inspected by scrub passes.
+    pub scrub_bytes: u64,
+    /// Full-payload scrub passes started.
+    pub full_scrubs: u64,
+    /// Age of the last scrub pass in milliseconds.
+    pub last_scrub_age_ms: u64,
+    /// Age of the last successful verification in milliseconds.
+    pub last_verification_age_ms: u64,
+    /// Missing published fragments observed by maintenance.
+    pub missing_fragments: u64,
+    /// Logical bytes currently degraded.
+    pub degraded_bytes: u64,
+    /// Physical bytes missing from published layouts.
+    pub missing_physical_bytes: u64,
+    /// Milliseconds assets have spent degraded.
+    pub degraded_time_ms: u64,
+    /// Estimated bytes required to reconstruct queued repairs.
+    pub estimated_reconstruction_bytes: u64,
+    /// Sum of exposed failure-domain multiplicity.
+    pub failure_domain_exposure: u64,
+    /// Repair attempts started.
+    pub repair_attempts: u64,
+    /// Repair attempts that failed.
+    pub repair_failures: u64,
+    /// Repair retries scheduled.
+    pub repair_retries: u64,
+    /// Sum of repair durations in microseconds.
+    pub repair_duration_us_sum: u64,
+    /// Maximum repair duration in microseconds.
+    pub repair_duration_us_max: u64,
+    /// Number of source fragments selected by maintenance.
+    pub repair_sources: u64,
+    /// Number of target fragments selected by maintenance.
+    pub repair_targets: u64,
+    /// Fetches that used more than one source candidate.
+    pub multi_source_fetches: u64,
+    /// Hedged source reads started.
+    pub multi_source_hedges: u64,
+    /// Source reads rejected or failed during maintenance.
+    pub source_failures: u64,
+    /// Bytes recovered by completed repairs.
+    pub recovered_bytes: u64,
+    /// Placement violations observed by maintenance.
+    pub placement_violations: u64,
+    /// Orphan candidates retained by age or authority ambiguity.
+    pub orphans_retained: u64,
+    /// Bytes reclaimed by orphan lifecycle work.
+    pub reclaimed_bytes: u64,
+    /// Maintenance ticks throttled by a budget.
+    pub maintenance_throttled: u64,
+    /// Maintenance ticks suppressed by foreground pressure.
+    pub foreground_pressure_suppressed: u64,
+    /// Scrub operations currently executing.
+    pub scrub_inflight: u64,
+    /// Repair operations currently executing.
+    pub repair_inflight: u64,
 }
 
 impl FabricMetricsSnapshot {

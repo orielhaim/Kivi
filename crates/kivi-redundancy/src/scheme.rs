@@ -362,6 +362,7 @@ pub fn fit_to_domains(params: SchemeParams, logical_len: u64, domains: usize) ->
 /// # Errors
 ///
 /// Returns [`crate::RedundancyError`] on invalid intents or oversize assets.
+#[allow(clippy::cast_possible_truncation)]
 pub fn plan_baseline(
     intent: &crate::RedundancyIntent,
     logical_len: u64,
@@ -370,15 +371,31 @@ pub fn plan_baseline(
     // or tolerance 1 with balanced cost stay replicated (cheap, fast reads).
     const REPLICATION_THRESHOLD: u64 = 64 * 1024;
     intent.validate()?;
+    let min_available = usize::try_from(intent.min_available).unwrap_or(usize::MAX);
     if intent.tolerance == 0 {
-        return Ok(SchemeParams::Replication(ReplicationParams { copies: 1 }));
+        if min_available > ReplicationParams::MAX_COPIES as usize {
+            return Err(crate::RedundancyError::invalid_params(format!(
+                "minimum available {} exceeds replication cap",
+                intent.min_available
+            )));
+        }
+        return Ok(SchemeParams::Replication(ReplicationParams {
+            copies: min_available.max(1) as u8,
+        }));
     }
     if logical_len <= REPLICATION_THRESHOLD || intent.repair.prefer_direct_reads {
-        let copies = intent
-            .tolerance
+        let copies = usize::from(intent.tolerance)
             .saturating_add(1)
-            .min(ReplicationParams::MAX_COPIES);
-        return Ok(SchemeParams::Replication(ReplicationParams { copies }));
+            .max(min_available);
+        if copies > ReplicationParams::MAX_COPIES as usize {
+            return Err(crate::RedundancyError::invalid_params(format!(
+                "minimum available {} exceeds replication cap",
+                intent.min_available
+            )));
+        }
+        return Ok(SchemeParams::Replication(ReplicationParams {
+            copies: copies as u8,
+        }));
     }
     // Erasure-coded baseline: data width 8 (or fewer for tiny assets so
     // shards stay meaningful), parity = tolerance.
@@ -391,11 +408,24 @@ pub fn plan_baseline(
     }
     if logical_len > RsParams::MAX_ASSET_BYTES {
         // Oversize assets stay replicated rather than blowing memory bounds.
-        let copies = intent
-            .tolerance
+        let copies = usize::from(intent.tolerance)
             .saturating_add(1)
-            .min(ReplicationParams::MAX_COPIES);
-        return Ok(SchemeParams::Replication(ReplicationParams { copies }));
+            .max(min_available);
+        if copies > ReplicationParams::MAX_COPIES as usize {
+            return Err(crate::RedundancyError::invalid_params(format!(
+                "minimum available {} exceeds replication cap",
+                intent.min_available
+            )));
+        }
+        return Ok(SchemeParams::Replication(ReplicationParams {
+            copies: copies as u8,
+        }));
+    }
+    if min_available > RsParams::MAX_DATA as usize {
+        return Err(crate::RedundancyError::invalid_params(format!(
+            "minimum available {} exceeds RS data cap",
+            intent.min_available
+        )));
     }
     let data: u8 = if logical_len <= 256 * 1024 {
         4
@@ -403,7 +433,8 @@ pub fn plan_baseline(
         16
     } else {
         8
-    };
+    }
+    .max(u8::try_from(min_available).unwrap_or(RsParams::MAX_DATA));
     let fragment_len = RsParams::shard_for_len(logical_len, data);
     let params = RsParams {
         data,
@@ -446,6 +477,23 @@ mod tests {
             SchemeParams::ReedSolomon(params) => assert_eq!(params.data, 16),
             SchemeParams::Replication(_) => panic!("expected coding"),
         }
+    }
+
+    #[test]
+    fn planner_honors_minimum_available_floor() {
+        let mut intent = RedundancyIntent::best_effort();
+        intent.min_available = 3;
+        let params = plan_baseline(&intent, 1024).expect("plans");
+        match params {
+            SchemeParams::Replication(params) => {
+                assert!(u32::from(params.copies) >= intent.min_available);
+            }
+            SchemeParams::ReedSolomon(_) => panic!("expected replication"),
+        }
+        let mut coded = RedundancyIntent::survive_two();
+        coded.min_available = 12;
+        let params = plan_baseline(&coded, 4 * 1024 * 1024).expect("plans");
+        assert!(params.required_pieces() >= coded.min_available);
     }
 
     #[test]

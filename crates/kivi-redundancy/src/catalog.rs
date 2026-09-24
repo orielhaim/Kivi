@@ -33,6 +33,14 @@ pub struct PublishedLayout {
 pub trait LayoutCatalog: Send + Sync + std::fmt::Debug {
     /// Returns the current published layout, if any.
     fn get(&self, asset: &AssetId) -> Option<PublishedLayout>;
+
+    /// Returns the current published layouts known to this catalog.
+    ///
+    /// Incremental maintenance callers use this as a bounded refresh source;
+    /// the default keeps small custom catalogs source-compatible.
+    fn list(&self) -> Vec<PublishedLayout> {
+        Vec::new()
+    }
 }
 
 /// Publish side of the catalog: advance or drop the current layout.
@@ -81,6 +89,15 @@ impl LayoutCatalog for MemCatalog {
             return None;
         };
         guard.get(asset).cloned()
+    }
+
+    fn list(&self) -> Vec<PublishedLayout> {
+        let Ok(guard) = self.current.lock() else {
+            return Vec::new();
+        };
+        let mut layouts: Vec<PublishedLayout> = guard.values().cloned().collect();
+        layouts.sort_by_key(|record| record.layout.asset);
+        layouts
     }
 }
 

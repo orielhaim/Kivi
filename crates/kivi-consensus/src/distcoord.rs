@@ -68,6 +68,7 @@
 //! bytes path uses, and checkpoint bands travel as generic bytes under
 //! their whole-file identity.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -152,6 +153,21 @@ impl LayoutCatalog for ControlCatalog {
         let state: Option<ControlState> = futures::executor::block_on(self.node.control_state());
         let state = state?;
         kivi_control::redundancy::published_layout(&state, asset)
+    }
+
+    fn list(&self) -> Vec<PublishedLayout> {
+        let Some(state) = futures::executor::block_on(self.node.control_state()) else {
+            return Vec::new();
+        };
+        let mut layouts: Vec<PublishedLayout> = state
+            .redundancy_entries()
+            .filter_map(|(key, _)| {
+                let asset = key.to_asset().ok()?;
+                kivi_control::redundancy::published_layout(&state, &asset)
+            })
+            .collect();
+        layouts.sort_by_key(|record| record.layout.asset);
+        layouts
     }
 }
 
@@ -350,6 +366,8 @@ pub struct CoordinatorMetrics {
     pub replicated_assets: u64,
     /// Published layouts using erasure coding.
     pub coded_assets: u64,
+    /// Bounded self-healing controller state.
+    pub maintenance: kivi_redundancy::ControllerSnapshot,
 }
 
 impl CoordinatorMetrics {
@@ -382,6 +400,14 @@ pub struct RedundancyCoordinator {
     lane: Arc<Mutex<RedundancyLane>>,
     /// Coordinator bounds.
     config: CoordinatorConfig,
+    /// Last catalog page handed to the incremental maintenance scanner.
+    maintenance_catalog: Mutex<Arc<Vec<PublishedLayout>>>,
+    /// Last catalog refresh time.
+    maintenance_catalog_refresh: Mutex<Option<Instant>>,
+    /// Stops new maintenance work during orderly server shutdown.
+    maintenance_stopped: AtomicBool,
+    /// Last catalog-versus-physical reconciliation time.
+    last_anti_entropy: Mutex<Option<Instant>>,
 }
 
 impl std::fmt::Debug for RedundancyCoordinator {
@@ -438,6 +464,10 @@ impl RedundancyCoordinator {
             fabric,
             lane: Arc::new(Mutex::new(lane)),
             config,
+            maintenance_catalog: Mutex::new(Arc::new(Vec::new())),
+            maintenance_catalog_refresh: Mutex::new(None),
+            maintenance_stopped: AtomicBool::new(false),
+            last_anti_entropy: Mutex::new(None),
         })
     }
 
@@ -463,7 +493,111 @@ impl RedundancyCoordinator {
     pub fn peer_incarnation(&self, node: NodeId) -> u64 {
         self.fabric.peer_incarnation(node)
     }
-    /// Snapshots the placement view from the replicated registry, waiting
+
+    /// Stops accepting new maintenance work during orderly shutdown.
+    pub fn stop_healing(&self) {
+        self.maintenance_stopped.store(true, Ordering::Release);
+    }
+
+    /// Whether maintenance has been stopped.
+    #[must_use]
+    pub fn healing_stopped(&self) -> bool {
+        self.maintenance_stopped.load(Ordering::Acquire)
+    }
+
+    /// Returns the distributed controller snapshot.
+    #[must_use]
+    pub fn maintenance_snapshot(&self) -> kivi_redundancy::ControllerSnapshot {
+        self.fabric.maintenance_snapshot()
+    }
+
+    /// Runs one automatic maintenance window using a bounded catalog cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RedundancyError`] when no control image is available.
+    pub async fn maintenance_tick(
+        &self,
+        foreground_pressure: bool,
+    ) -> Result<kivi_redundancy::MaintenanceReport, RedundancyError> {
+        if self.healing_stopped() {
+            return self
+                .fabric
+                .maintenance_tick_at(&[], &[], foreground_pressure)
+                .await;
+        }
+        let state =
+            self.node
+                .control_state()
+                .await
+                .ok_or_else(|| RedundancyError::Unreachable {
+                    detail: "no local control image for redundancy maintenance".to_owned(),
+                })?;
+        let records: Vec<kivi_control::NodeRecord> = state.nodes().cloned().collect();
+        let view = kivi_control::redundancy::descriptors_from_registry(&records);
+        let refresh = {
+            let last = self.maintenance_catalog_refresh.lock().map_err(|_| {
+                RedundancyError::Unreadable {
+                    detail: "maintenance catalog clock poisoned".to_owned(),
+                }
+            })?;
+            last.is_none_or(|value| value.elapsed() >= Duration::from_secs(10))
+        };
+        if refresh {
+            let mut entries: Vec<PublishedLayout> = state
+                .redundancy_entries()
+                .filter_map(|(key, _)| {
+                    let asset = key.to_asset().ok()?;
+                    kivi_control::redundancy::published_layout(&state, &asset)
+                })
+                .collect();
+            entries.sort_by_key(|entry| entry.layout.asset);
+            let mut cache =
+                self.maintenance_catalog
+                    .lock()
+                    .map_err(|_| RedundancyError::Unreadable {
+                        detail: "maintenance catalog lock poisoned".to_owned(),
+                    })?;
+            *cache = Arc::new(entries);
+            let mut clock = self.maintenance_catalog_refresh.lock().map_err(|_| {
+                RedundancyError::Unreadable {
+                    detail: "maintenance catalog clock poisoned".to_owned(),
+                }
+            })?;
+            *clock = Some(Instant::now());
+        }
+        let entries = self
+            .maintenance_catalog
+            .lock()
+            .map_err(|_| RedundancyError::Unreadable {
+                detail: "maintenance catalog lock poisoned".to_owned(),
+            })?
+            .clone();
+        let report = self
+            .fabric
+            .maintenance_tick_at(entries.as_slice(), &view, foreground_pressure)
+            .await?;
+        let anti_entropy_owner = view
+            .iter()
+            .filter(|node| node.health.serves_reads())
+            .map(|node| node.id)
+            .min();
+        let anti_entropy_due = self
+            .last_anti_entropy
+            .lock()
+            .map_err(|_| RedundancyError::Unreadable {
+                detail: "anti-entropy clock poisoned".to_owned(),
+            })?
+            .is_none_or(|last| last.elapsed() >= Duration::from_secs(30));
+        if anti_entropy_due && anti_entropy_owner == Some(self.node.node()) {
+            let _ = self.fabric.anti_entropy(entries.as_slice(), &view).await;
+            if let Ok(mut last) = self.last_anti_entropy.lock() {
+                *last = Some(Instant::now());
+            }
+        }
+        Ok(report)
+    }
+
     /// until at least `eligible_min` nodes accept new fragments.
     ///
     /// Joins are a normal startup race: the registry admits nodes as
@@ -632,6 +766,63 @@ impl RedundancyCoordinator {
             });
         }
         self.protect_bytes(AssetKind::Chunk.as_u8(), domain.as_u64(), &bytes, tolerance)
+            .await
+    }
+
+    /// Protects a canonical chunk manifest already staged in the local
+    /// sidecar store. The sidecar durability gate remains authoritative; this
+    /// is an additional physical protection layer and is safe to retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RedundancyError`] when the manifest cannot be read or
+    /// protection cannot publish.
+    pub async fn protect_manifest(
+        &self,
+        manifest: kivi_types::ManifestId,
+        domain: SecurityDomainId,
+        len: u64,
+    ) -> Result<PublishedLayout, RedundancyError> {
+        let bytes = self
+            .node
+            .sidecar()
+            .read_manifest(manifest)
+            .await
+            .map_err(|error| RedundancyError::Chunk {
+                detail: format!("sidecar manifest unreadable: {error}"),
+            })?;
+        if bytes.len() as u64 != len {
+            return Err(RedundancyError::VerificationFailed {
+                detail: format!(
+                    "manifest length {} disagrees with declared {len}",
+                    bytes.len()
+                ),
+            });
+        }
+        self.protect_bytes(AssetKind::ChunkManifest.as_u8(), domain.as_u64(), &bytes, 1)
+            .await
+    }
+
+    /// Protects a canonical manifest using its staged byte length.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RedundancyError`] when the manifest is absent or cannot be
+    /// published.
+    pub async fn protect_manifest_auto(
+        &self,
+        manifest: kivi_types::ManifestId,
+        domain: SecurityDomainId,
+    ) -> Result<PublishedLayout, RedundancyError> {
+        let bytes = self
+            .node
+            .sidecar()
+            .read_manifest(manifest)
+            .await
+            .map_err(|error| RedundancyError::Chunk {
+                detail: format!("sidecar manifest unreadable: {error}"),
+            })?;
+        self.protect_bytes(AssetKind::ChunkManifest.as_u8(), domain.as_u64(), &bytes, 1)
             .await
     }
 
@@ -882,6 +1073,7 @@ impl RedundancyCoordinator {
                 physical_bytes: 0,
                 replicated_assets: 0,
                 coded_assets: 0,
+                maintenance: self.fabric.maintenance_snapshot(),
             };
         };
         let mut bytes_by_node: std::collections::BTreeMap<u64, u64> =
@@ -920,6 +1112,7 @@ impl RedundancyCoordinator {
             physical_bytes,
             replicated_assets,
             coded_assets,
+            maintenance: self.fabric.maintenance_snapshot(),
         }
     }
 

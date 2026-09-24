@@ -136,6 +136,17 @@ fn handle_scan(
     {
         return invalid("scan end must exceed start");
     }
+    if ScanSpec::is_term_window(
+        request.scan_start.as_deref(),
+        request.scan_end.as_deref(),
+        request.scan_direction,
+    ) || ScanSpec::is_term_range_window(
+        request.scan_start.as_deref(),
+        request.scan_end.as_deref(),
+        request.scan_direction,
+    ) {
+        return handle_index_term_scan(tablets, routing, worker, &endpoint_of, request);
+    }
     // Route the window cursor: forward pages start at `start` (or the first
     // key); reverse pages end at `end` (or the last key) and descend.
     let cursor: Vec<u8> = match direction {
@@ -246,6 +257,143 @@ fn handle_scan(
             }
         }
     }
+}
+
+#[allow(clippy::too_many_lines)]
+fn handle_index_term_scan(
+    tablets: &TabletMap,
+    routing: &RoutingSnapshot,
+    worker: WorkerId,
+    endpoint_of: impl Fn(WorkerId) -> String,
+    request: &Request,
+) -> Response {
+    use Status as S;
+    let directory = routing.directory();
+    let cursor = if request.key.is_empty() {
+        request.scan_start.as_deref().unwrap_or_default()
+    } else {
+        request.key.as_slice()
+    };
+    let first_page = request.key.is_empty()
+        || request.key.as_slice() == request.scan_start.as_deref().unwrap_or_default();
+    let tablet = if first_page {
+        first_ordered_tablet(directory)
+    } else {
+        request
+            .hint
+            .map(|hint| hint.tablet)
+            .filter(|tablet| {
+                directory
+                    .get(*tablet)
+                    .is_some_and(|descriptor| descriptor.state().is_writable())
+            })
+            .or_else(|| route_cursor(directory, cursor, ScanDirection::Forward))
+    };
+    let Some(tablet) = tablet else {
+        return scan_gap(directory, cursor, request);
+    };
+    match placement_redirect(routing, worker, &endpoint_of, tablets, tablet) {
+        Placement::Local => {}
+        Placement::Redirect(info) => {
+            return Response {
+                proof: None,
+                status: if info.worker == worker {
+                    S::NotLocal
+                } else {
+                    S::StaleRoute
+                },
+                body: ResponseBody::Redirect(info),
+            };
+        }
+        Placement::Nowhere => {
+            return Response {
+                proof: None,
+                status: S::NotLocal,
+                body: ResponseBody::Diagnostic("tablet not live on owner".to_owned()),
+            };
+        }
+    }
+    let Some(descriptor) = directory.get(tablet) else {
+        return invalid("unknown tablet");
+    };
+    let PartitionRange::Ordered(tablet_range) = descriptor.range().clone() else {
+        return Response {
+            proof: None,
+            status: S::InvalidRequest,
+            body: ResponseBody::Diagnostic("scan requires an ordered namespace".to_owned()),
+        };
+    };
+    let projection = match request.scan_projection {
+        SCAN_KEYS_AND_VALUES => ScanProjection::KeysAndValues,
+        SCAN_KEYS_ONLY => ScanProjection::KeysOnly,
+        _ => return invalid("unknown scan projection"),
+    };
+    let Ok(spec) = ScanSpec::new(
+        request.scan_start.clone(),
+        request.scan_end.clone(),
+        ScanDirection::Forward,
+        usize::try_from(request.scan_max_items)
+            .unwrap_or(usize::MAX)
+            .min(SERVER_SCAN_MAX_ITEMS),
+        usize::try_from(request.scan_max_bytes)
+            .unwrap_or(usize::MAX)
+            .min(SERVER_SCAN_MAX_BYTES),
+        projection,
+    ) else {
+        return invalid("invalid scan window");
+    };
+    let now = kivi_core::wall_now_or_max(&SystemClock);
+    let mut borrowed = tablets.borrow_mut();
+    let Some(live) = borrowed.get_mut(&tablet) else {
+        return Response {
+            proof: None,
+            status: S::NotLocal,
+            body: ResponseBody::Diagnostic("tablet not live on owner".to_owned()),
+        };
+    };
+    match live.scan_local(&spec, now) {
+        Err(error) => Response {
+            proof: None,
+            status: S::InvalidRequest,
+            body: ResponseBody::Diagnostic(error.to_string()),
+        },
+        Ok(page) => Response {
+            proof: None,
+            status: S::Ok,
+            body: ResponseBody::ScanPage {
+                entries: page
+                    .entries
+                    .iter()
+                    .map(|entry| kivi_protocol::ScanEntryBody {
+                        key: entry.key.as_bytes().to_vec(),
+                        value: match &entry.value {
+                            None => kivi_protocol::ScanValueBody::None,
+                            Some(value) => scan_value_body(value),
+                        },
+                    })
+                    .collect(),
+                exhausted: tablet_range.end().is_none(),
+                last_key: None,
+                tablet: tablet.as_u64(),
+                range_start: tablet_range.start().to_vec(),
+                range_end: tablet_range.end().map(<[u8]>::to_vec),
+                dir_version: directory.version().as_u64(),
+            },
+        },
+    }
+}
+
+fn first_ordered_tablet(directory: &DirectorySnapshot) -> Option<TabletId> {
+    directory
+        .tablets()
+        .iter()
+        .filter(|tablet| tablet.state().is_writable())
+        .filter_map(|tablet| match tablet.range() {
+            PartitionRange::Ordered(range) => Some((range.start(), tablet.id())),
+            PartitionRange::Hash(_) => None,
+        })
+        .min_by_key(|(start, _)| *start)
+        .map(|(_, tablet)| tablet)
 }
 
 /// Routes a scan cursor to its tablet: forward cursors are inclusive lower
