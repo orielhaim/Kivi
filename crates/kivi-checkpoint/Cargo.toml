@@ -11,6 +11,7 @@ kivi-types.workspace = true
 kivi-codec.workspace = true
 kivi-state.workspace = true
 kivi-durability.workspace = true
+kivi-redundancy.workspace = true
 blake3.workspace = true
 bytes.workspace = true
 thiserror.workspace = true

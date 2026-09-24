@@ -19,6 +19,7 @@ members = [
     "crates/kivi-consensus",
     "crates/kivi-control",
     "crates/kivi-lab",
+    "crates/kivi-redundancy",
 ]
 
 [workspace.package]
@@ -42,6 +43,7 @@ kivi-durability = { path = "crates/kivi-durability", version = "0.1.0" }
 kivi-checkpoint = { path = "crates/kivi-checkpoint", version = "0.1.0" }
 kivi-chunk = { path = "crates/kivi-chunk", version = "0.1.0" }
 kivi-memory = { path = "crates/kivi-memory", version = "0.1.0" }
+kivi-redundancy = { path = "crates/kivi-redundancy", version = "0.1.0" }
 
 # Mechanism crates borrowed per RFC §209 ("borrow mechanisms, own semantics").
 # The project owns all wire/durable formats; these crates never define them.

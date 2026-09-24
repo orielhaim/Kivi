@@ -33,6 +33,17 @@ impl ConsensusGroupId {
         Self(TabletId::from_u64(CONTROL_TABLET_RAW))
     }
 
+    /// Returns the group-independent sentinel for redundancy fragment RPCs.
+    ///
+    /// Fragment traffic is content-addressed, never tablet-scoped, so it
+    /// decodes with tablet `0` (like the immutable sidecars) and the mesh
+    /// routes it to any local replica. Callers pass this sentinel; serving
+    /// ignores it. Tablet `0` is reserved and never a user tablet.
+    #[must_use]
+    pub const fn redundancy_sentinel() -> Self {
+        Self(TabletId::from_u64(0))
+    }
+
     /// Whether this is the system control group.
     #[must_use]
     pub const fn is_control(self) -> bool {
@@ -223,4 +234,21 @@ pub enum ConsensusError {
     /// The replica is shutting down.
     #[error("consensus shutting down")]
     ShuttingDown,
+}
+
+/// Why a control-plane proposal failed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ControlProposeError {
+    /// This replica is not the control-group leader.
+    #[error("not leader (leader: {leader:?})")]
+    NotLeader {
+        /// The leader to retry at, when known.
+        leader: Option<NodeId>,
+    },
+    /// The control proposal could not be attempted or completed.
+    #[error("control proposal unavailable: {detail}")]
+    Unavailable {
+        /// Human-readable cause.
+        detail: String,
+    },
 }

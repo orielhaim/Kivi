@@ -7,6 +7,7 @@
 
 use kivi_types::{NodeId, TabletId};
 
+use crate::layouts::{LAYOUT_KEY_LEN, LayoutKey, LayoutRecord};
 use crate::merge::MergePlan;
 use crate::migration::MigrationPlan;
 use crate::node::NodeRecord;
@@ -117,6 +118,22 @@ pub enum ControlMutation {
     RemoveIndex {
         /// Affected index.
         id: u64,
+    },
+    /// Publish one asset's redundancy layout generation (generation-fenced
+    /// at apply: exactly current + 1, or exactly 1 when absent).
+    PublishRedundancyLayout {
+        /// Map key: parsed asset identity riding alongside the opaque bytes.
+        key: LayoutKey,
+        /// Offered control generation. Duplicates `record.control_generation`
+        /// so fencing never parses the opaque `record.layout` bytes.
+        generation: u64,
+        /// Opaque canonical layout bytes plus their generation.
+        record: LayoutRecord,
+    },
+    /// Drop one asset's published redundancy layout (idempotent).
+    DropRedundancyAsset {
+        /// Map key to remove.
+        key: LayoutKey,
     },
 }
 
@@ -324,6 +341,20 @@ impl ControlMutation {
                 body.extend_from_slice(&id.to_le_bytes());
                 (15u8, body)
             }
+            Self::PublishRedundancyLayout {
+                key,
+                generation,
+                record,
+            } => {
+                let key_bytes = key.encode_to_vec();
+                let record_bytes = record.encode_to_vec();
+                let mut body = Vec::with_capacity(key_bytes.len() + 8 + record_bytes.len());
+                body.extend_from_slice(&key_bytes);
+                body.extend_from_slice(&generation.to_le_bytes());
+                body.extend_from_slice(&record_bytes);
+                (16u8, body)
+            }
+            Self::DropRedundancyAsset { key } => (17u8, key.encode_to_vec()),
         };
         let mut out = Vec::with_capacity(2 + 1 + 4 + body.len());
         out.extend_from_slice(&CONTROL_MUTATION_VERSION.to_le_bytes());
@@ -530,6 +561,49 @@ impl ControlMutation {
                 let id = u64::from_le_bytes(body[..8].try_into().unwrap_or([0; 8]));
                 Ok(Self::RemoveIndex { id })
             }
+            16 => {
+                if body.len() < LAYOUT_KEY_LEN + 8 + 12 {
+                    return Err(Fault::Truncated);
+                }
+                let key = LayoutKey::decode_exact(&body[..LAYOUT_KEY_LEN]).map_err(|error| {
+                    Fault::BadBody {
+                        detail: error.to_string(),
+                    }
+                })?;
+                let generation = u64::from_le_bytes(
+                    body[LAYOUT_KEY_LEN..LAYOUT_KEY_LEN + 8]
+                        .try_into()
+                        .unwrap_or([0; 8]),
+                );
+                let record =
+                    LayoutRecord::decode_exact(&body[LAYOUT_KEY_LEN + 8..]).map_err(|error| {
+                        Fault::BadBody {
+                            detail: error.to_string(),
+                        }
+                    })?;
+                if generation != record.control_generation {
+                    return Err(Fault::BadBody {
+                        detail: format!(
+                            "publish generation {generation} disagrees with record {}",
+                            record.control_generation
+                        ),
+                    });
+                }
+                Ok(Self::PublishRedundancyLayout {
+                    key,
+                    generation,
+                    record,
+                })
+            }
+            17 => {
+                if body.len() != LAYOUT_KEY_LEN {
+                    return Err(Fault::Truncated);
+                }
+                let key = LayoutKey::decode_exact(body).map_err(|error| Fault::BadBody {
+                    detail: error.to_string(),
+                })?;
+                Ok(Self::DropRedundancyAsset { key })
+            }
             _ => Err(Fault::BadTag { tag }),
         }
     }
@@ -554,7 +628,9 @@ impl ControlMutation {
             | Self::RegisterNamespace { .. }
             | Self::CreateIndex { .. }
             | Self::AdvanceIndex { .. }
-            | Self::RemoveIndex { .. } => None,
+            | Self::RemoveIndex { .. }
+            | Self::PublishRedundancyLayout { .. }
+            | Self::DropRedundancyAsset { .. } => None,
         }
     }
 }
@@ -624,6 +700,62 @@ mod tests {
         let create = ControlMutation::CreateMigration { plan };
         let back = ControlMutation::decode_exact(&create.encode_to_vec()).expect("decodes");
         assert_eq!(back, create);
+    }
+
+    #[test]
+    fn redundancy_mutations_round_trip() {
+        use crate::layouts::{LayoutKey, LayoutRecord};
+        let asset = kivi_redundancy::AssetId::new(kivi_redundancy::AssetKind::Chunk, 7, [11; 32])
+            .expect("asset");
+        let key = LayoutKey::from_asset(&asset);
+        let publish = ControlMutation::PublishRedundancyLayout {
+            key,
+            generation: 2,
+            record: LayoutRecord::new(2, vec![9u8; 24]),
+        };
+        let back = ControlMutation::decode_exact(&publish.encode_to_vec()).expect("decodes");
+        assert_eq!(back, publish);
+        let drop = ControlMutation::DropRedundancyAsset { key };
+        let back = ControlMutation::decode_exact(&drop.encode_to_vec()).expect("decodes");
+        assert_eq!(back, drop);
+        assert_eq!(publish.generation(), None);
+        assert_eq!(drop.generation(), None);
+    }
+
+    #[test]
+    fn redundancy_mutation_mismatch_and_shapes_fail() {
+        use crate::layouts::{LayoutKey, LayoutRecord};
+        let asset = kivi_redundancy::AssetId::new(kivi_redundancy::AssetKind::Chunk, 7, [11; 32])
+            .expect("asset");
+        let key = LayoutKey::from_asset(&asset);
+        // Explicit generation must duplicate the record generation.
+        let mismatched = ControlMutation::PublishRedundancyLayout {
+            key,
+            generation: 3,
+            record: LayoutRecord::new(2, vec![9u8; 24]),
+        };
+        assert!(matches!(
+            ControlMutation::decode_exact(&mismatched.encode_to_vec()),
+            Err(ControlMutationError::BadBody { .. })
+        ));
+        // Zero-generation records never decode.
+        let zero = ControlMutation::PublishRedundancyLayout {
+            key,
+            generation: 0,
+            record: LayoutRecord::new(0, vec![9u8; 24]),
+        };
+        assert!(matches!(
+            ControlMutation::decode_exact(&zero.encode_to_vec()),
+            Err(ControlMutationError::BadBody { .. })
+        ));
+        // Wrong drop body length truncates like every other fixed body.
+        let drop = ControlMutation::DropRedundancyAsset { key };
+        let mut short = drop.encode_to_vec();
+        short.pop();
+        assert!(matches!(
+            ControlMutation::decode_exact(&short),
+            Err(ControlMutationError::Oversized { .. } | ControlMutationError::Truncated)
+        ));
     }
 
     #[test]

@@ -99,6 +99,9 @@ struct CheckpointSpawn {
     pins: Arc<crate::chunk_lane::StagingPins>,
     /// Chunk lane per worker for GC planning and reclamation.
     chunk_lanes: Vec<(WorkerId, crate::chunk_lane::ChunkLaneHandle)>,
+    /// Redundancy fabric for best-effort immutable-asset protection
+    /// (checkpoint thread and workers hold clones of the same fabric).
+    redundancy: Option<crate::redundancy::EngineRedundancy>,
 }
 
 /// Checkpoint-restored state staged before WAL-tail replay: cuts (tail
@@ -398,6 +401,10 @@ pub struct LocalEngine {
     durability: Option<EngineDurability>,
     checkpoint: Option<crate::checkpoint::CheckpointWorkerHandle>,
     checkpoint_admin: Arc<std::sync::Mutex<crate::checkpoint::CheckpointAdminState>>,
+    /// Redundancy fabric for immutable-asset protection (`None` in
+    /// ephemeral mode, which stages nothing durable). Clones travel into
+    /// every worker's chunk access and the checkpoint worker.
+    redundancy: Option<crate::redundancy::EngineRedundancy>,
     /// Chunk lane handles (stats, shutdown signaling) plus join guards
     /// (shutdown after workers join: no worker submits once it exits).
     chunk_lanes: Vec<crate::chunk_lane::ChunkLaneHandle>,
@@ -430,6 +437,9 @@ pub struct AdminHandle {
     checkpoint: Arc<std::sync::Mutex<crate::checkpoint::CheckpointAdminState>>,
     /// Chunk lane per worker id, for read-only lane stats snapshots.
     chunk_lanes: Vec<(WorkerId, crate::chunk_lane::ChunkLaneHandle)>,
+    /// Redundancy fabric (`None` in ephemeral mode). Reads snapshot
+    /// lock-free atomics; serve from `spawn_blocking` like other snapshots.
+    redundancy: Option<crate::redundancy::EngineRedundancy>,
 }
 
 impl AdminHandle {
@@ -578,6 +588,29 @@ impl AdminHandle {
         }
         out
     }
+
+    /// Snapshots the redundancy fabric for the admin plane (`None` in
+    /// ephemeral mode, which holds no fabric). Additive: existing admin
+    /// DTOs are untouched; a future `kivi-server` `/v1/redundancy`
+    /// endpoint consumes this directly.
+    #[must_use]
+    pub fn redundancy_snapshot(&self) -> Option<crate::redundancy::RedundancyAdminSnapshot> {
+        self.redundancy
+            .as_ref()
+            .map(crate::redundancy::EngineRedundancy::admin_snapshot)
+    }
+
+    /// Snapshots the redundancy background-lane counters for the admin
+    /// plane (`None` in ephemeral mode, which holds no fabric). Best-effort
+    /// protects report here: `submitted`/`completed` track accepted jobs,
+    /// `rejected_overload` tracks submits the bounded lane refused (each
+    /// one also warn-logged at submit time).
+    #[must_use]
+    pub fn redundancy_lane_stats(&self) -> Option<kivi_redundancy::LaneStats> {
+        self.redundancy
+            .as_ref()
+            .map(crate::redundancy::EngineRedundancy::lane_stats)
+    }
 }
 
 impl LocalEngine {
@@ -667,6 +700,27 @@ impl LocalEngine {
             }
             DurabilityMode::Durable(cfg) => cfg.data_dir.clone(),
         };
+        // Redundancy fabric opens alongside the chunk lanes (durable mode
+        // only): one single-node view under `<data-dir>/redundancy` with the
+        // local node Active. Recovery runs here, before any worker spawns,
+        // and the report logs like the chunk-lane recoveries below.
+        // Ephemeral mode stages nothing durable, so it holds no fabric.
+        let redundancy: Option<crate::redundancy::EngineRedundancy> = match &config.durability {
+            DurabilityMode::Ephemeral => None,
+            DurabilityMode::Durable(cfg) => {
+                let nodes = vec![kivi_redundancy::NodeDescriptor::active(cfg.node)];
+                let (fabric, report) =
+                    crate::redundancy::EngineRedundancy::open(&cfg.data_dir, nodes)?;
+                tracing::info!(
+                    assets = report.assets_recovered,
+                    pending_discarded = report.pending_discarded,
+                    stale_retained = report.stale_retained,
+                    orphans_swept = report.orphans_swept,
+                    "redundancy fabric recovered"
+                );
+                Some(fabric)
+            }
+        };
         let mut chunk_stores = Vec::with_capacity(config.worker_count);
         for index in 0..config.worker_count {
             let lane = u16::try_from(index).map_err(|_| EngineError::InvalidConfig {
@@ -706,6 +760,7 @@ impl LocalEngine {
                 inline_threshold: config.chunks.inline_threshold,
                 domain: chunk_domain,
                 pins: Arc::clone(&chunk_pins),
+                redundancy: redundancy.clone(),
             });
             chunk_lanes.push(handle);
             chunk_guards.push(guard);
@@ -830,6 +885,7 @@ impl LocalEngine {
                             (WorkerId::from_u64(index as u64), access.lane.clone())
                         })
                         .collect(),
+                    redundancy: redundancy.clone(),
                 };
                 (
                     lanes.into_iter().map(Some).collect(),
@@ -941,6 +997,7 @@ impl LocalEngine {
                     .map(|(index, paths)| (WorkerId::from_u64(index as u64), paths.journal()))
                     .collect(),
                 admin: Arc::clone(&checkpoint_admin),
+                redundancy: spawn.redundancy.clone(),
             };
             crate::checkpoint::CheckpointWorkerHandle::spawn(context)
         });
@@ -959,6 +1016,7 @@ impl LocalEngine {
             durability,
             checkpoint,
             checkpoint_admin,
+            redundancy,
             chunk_lanes,
             chunk_guards,
             fabric_guards,
@@ -1905,6 +1963,21 @@ impl LocalEngine {
         self.admin_handle().worker_metrics_snapshot()
     }
 
+    /// Snapshots the redundancy fabric (`None` in ephemeral mode).
+    /// See [`AdminHandle::redundancy_snapshot`] for the admin-plane twin.
+    #[must_use]
+    pub fn redundancy_snapshot(&self) -> Option<crate::redundancy::RedundancyAdminSnapshot> {
+        self.admin_handle().redundancy_snapshot()
+    }
+
+    /// Snapshots the redundancy background-lane counters (`None` in
+    /// ephemeral mode). See [`AdminHandle::redundancy_lane_stats`] for the
+    /// admin-plane twin.
+    #[must_use]
+    pub fn redundancy_lane_stats(&self) -> Option<kivi_redundancy::LaneStats> {
+        self.admin_handle().redundancy_lane_stats()
+    }
+
     /// Returns a clonable read-only handle for the admin/control plane.
     ///
     /// The handle carries no worker threads or queues — only the shared
@@ -1936,6 +2009,7 @@ impl LocalEngine {
                 .collect(),
             durability: self.durability.clone(),
             checkpoint: Arc::clone(&self.checkpoint_admin),
+            redundancy: self.redundancy.clone(),
         }
     }
 

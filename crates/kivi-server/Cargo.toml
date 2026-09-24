@@ -38,6 +38,8 @@ kivi-checkpoint.workspace = true
 kivi-chunk.workspace = true
 kivi-codec.workspace = true
 kivi-control = { path = "../kivi-control", version = "0.1.0" }
+kivi-redundancy.workspace = true
+base64 = "0.23"
 kivi-resp = { workspace = true, optional = true }
 bytes.workspace = true
 arc-swap.workspace = true
@@ -53,9 +55,13 @@ tower.workspace = true
 tower-http.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Compio runtime for polling redundancy futures (Kivi's data plane; the
+# admin surface is Tokio and bridges through a blocking thread).
+compio.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 
 [lints]
 workspace = true
+

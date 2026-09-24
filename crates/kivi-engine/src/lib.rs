@@ -19,6 +19,7 @@ pub mod compound;
 pub mod engine;
 pub mod fabric;
 pub mod net;
+pub mod redundancy;
 pub mod routing;
 pub mod tablet;
 pub mod worker;
@@ -47,6 +48,10 @@ pub use kivi_memory::offcore_lane::{
     OffcoreReply, PromotedBytes, spawn_offcore_lane,
 };
 pub use net::{ConnLimits, EngineNetwork, NetConfig, NetStartError, TurnBudget};
+pub use redundancy::{
+    CheckpointProtection, EngineRedundancy, ProtectedArtifact, RedundancyAdminSnapshot,
+    protect_staged_value,
+};
 pub use routing::{Placement, RoutingSnapshot};
 pub use tablet::{
     DedupEntry, DurablePrepared, LiveTablet, SessionDedup, TabletError, TabletMetrics,

@@ -419,6 +419,11 @@ pub struct WorkerChunks {
     pub domain: kivi_types::SecurityDomainId,
     /// Engine-global in-flight staging pins (GC roots while uncommitted).
     pub pins: Arc<StagingPins>,
+    /// Redundancy fabric for best-effort protection of staged immutable
+    /// bytes (`None` in ephemeral mode, which has no data directory).
+    /// Protection never fails staging: local durability already proved the
+    /// bytes, so a fabric miss only costs redundancy.
+    pub redundancy: Option<crate::redundancy::EngineRedundancy>,
 }
 
 /// Collected chunked-commit journals: `(tablet, [(commit, manifest)])` in
@@ -1041,20 +1046,16 @@ fn stage_value_work(
                         return failed(metrics, respond, WorkerRequestError::ChunkStore(error));
                     }
                 };
-            match chunks.lane.stage_value_blocking(value) {
-                Ok(staged) => {
-                    guard.set_manifest(staged.manifest);
-                    Ok((
-                        Operation::SetChunked {
-                            key: key.clone(),
-                            manifest: staged.manifest,
-                            logical_len: staged.logical_len,
-                        },
-                        Some(guard),
-                    ))
-                }
-                Err(error) => failed(metrics, respond, WorkerRequestError::ChunkStore(error)),
-            }
+            let staged = stage_plain_value(value, chunks, metrics, respond)?;
+            guard.set_manifest(staged.manifest);
+            Ok((
+                Operation::SetChunked {
+                    key: key.clone(),
+                    manifest: staged.manifest,
+                    logical_len: staged.logical_len,
+                },
+                Some(guard),
+            ))
         }
         StageWork::ConditionalValue {
             value,
@@ -1068,22 +1069,18 @@ fn stage_value_work(
                         return failed(metrics, respond, WorkerRequestError::ChunkStore(error));
                     }
                 };
-            match chunks.lane.stage_value_blocking(value) {
-                Ok(staged) => {
-                    guard.set_manifest(staged.manifest);
-                    Ok((
-                        Operation::SetConditionalChunked {
-                            key: key.clone(),
-                            manifest: staged.manifest,
-                            logical_len: staged.logical_len,
-                            condition,
-                            expiry,
-                        },
-                        Some(guard),
-                    ))
-                }
-                Err(error) => failed(metrics, respond, WorkerRequestError::ChunkStore(error)),
-            }
+            let staged = stage_plain_value(value, chunks, metrics, respond)?;
+            guard.set_manifest(staged.manifest);
+            Ok((
+                Operation::SetConditionalChunked {
+                    key: key.clone(),
+                    manifest: staged.manifest,
+                    logical_len: staged.logical_len,
+                    condition,
+                    expiry,
+                },
+                Some(guard),
+            ))
         }
         StageWork::Splice {
             manifest,
@@ -1096,6 +1093,9 @@ fn stage_value_work(
         {
             Ok(staged) => {
                 let guard = crate::chunk_lane::PinnedUpload::staged(&chunks.pins, &staged);
+                // Best-effort redundancy for the spliced sequence (the
+                // manifest is always covered; chunks need a lane re-read).
+                protect_spliced_value(chunks, &staged);
                 // A splice preserves the live expiry like the inline path
                 // does: partial writes touch bytes, never the TTL.
                 Ok((
@@ -1112,6 +1112,54 @@ fn stage_value_work(
             Err(error) => failed(metrics, respond, WorkerRequestError::ChunkStore(error)),
         },
     }
+}
+
+/// Stages one plain value on the owner's lane (blocking lane call — plain
+/// worker threads only) and submits best-effort protection of the staged
+/// bytes to the redundancy lane (fire-and-forget, never blocking). Answers
+/// the failure and reports `Err(())` with state untouched when staging
+/// fails; fabric misses never fail staging (local durability already proved
+/// the bytes).
+fn stage_plain_value(
+    value: bytes::Bytes,
+    chunks: &WorkerChunks,
+    metrics: &core::cell::Cell<WorkerMetrics>,
+    respond: &Sender<WorkerResponse>,
+) -> Result<crate::chunk_lane::StagedValue, ()> {
+    // `Bytes` clones share the allocation: the copy below only feeds the
+    // best-effort lane submission after staging.
+    let bytes = value.clone();
+    match chunks.lane.stage_value_blocking(value) {
+        Ok(staged) => {
+            crate::redundancy::protect_staged_value(
+                chunks.redundancy.as_ref(),
+                chunks.domain,
+                &bytes,
+                &staged,
+            );
+            Ok(staged)
+        }
+        Err(error) => {
+            let mut snapshot = metrics.get();
+            snapshot.channel_ops += 1;
+            metrics.set(snapshot);
+            let _ = respond.try_send(Err(WorkerRequestError::ChunkStore(error)));
+            Err(())
+        }
+    }
+}
+
+/// Best-effort redundancy for a spliced chunk sequence: the lane owns the
+/// fresh bytes (no caller value survives the splice), so one lane job
+/// re-reads the resolved value on the redundancy lane thread and protects
+/// from it. The manifest is always protected from its canonical encoding; a
+/// re-read miss only skips chunks. Never blocks staging and never fails it:
+/// local durability already proved the bytes.
+fn protect_spliced_value(chunks: &WorkerChunks, staged: &crate::chunk_lane::StagedValue) {
+    let Some(fabric) = chunks.redundancy.as_ref() else {
+        return;
+    };
+    fabric.submit_spliced_value(chunks.lane.clone(), chunks.domain, staged);
 }
 
 /// Maps a fabric failure onto the request error surface: saturation is
@@ -1984,6 +2032,7 @@ mod tests {
                     inline_threshold: DEFAULT_INLINE_THRESHOLD,
                     domain,
                     pins: std::sync::Arc::new(crate::chunk_lane::StagingPins::default()),
+                    redundancy: None,
                 },
                 lane,
                 guard,

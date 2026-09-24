@@ -374,7 +374,7 @@ pub struct PeerCoveragePoll {
 }
 
 /// Responder-coverage report: the answering replica's applied pointer
-/// plus whether it can serve the logical contract from it.
+/// plus whether it can serve from it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PeerCoverageReport {
     /// Reporting replica.
@@ -386,6 +386,20 @@ pub struct PeerCoverageReport {
     /// Whether the replica can serve from `applied` (chunked roots
     /// resolve; no latched storage fault).
     pub healthy: bool,
+}
+
+/// A control mutation forwarded to the control-group leader.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerControlForwardRequest {
+    /// Canonical `kivi_control::ControlMutation::encode_to_vec()` bytes.
+    pub mutation: Vec<u8>,
+}
+
+/// The committed index of a forwarded control mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PeerControlForwardResponse {
+    /// Committed control-group log index.
+    pub index: u64,
 }
 
 /// One peer RPC. H3 request streams carry these without any further
@@ -426,6 +440,15 @@ pub enum PeerRequest {
     /// this commit and can you serve from it". Served on the owner thread
     /// from the state machine's applied pointer.
     CoveragePoll(PeerCoveragePoll),
+    /// Forward one control mutation to the control-group leader.
+    ControlForward(PeerControlForwardRequest),
+    /// Redundancy fragment RPC (bulk lane, group-independent). The body
+    /// is opaque project-owned [`kivi_redundancy::proto::FragmentRpc`]
+    /// wire bytes: the peer codec moves them without interpreting them
+    /// (verification lives in the fragment store and coordinator, never
+    /// here), bounded by the bulk body cap plus fragment headroom (see
+    /// [`crate::transport::MAX_FRAGMENT_BODY_BYTES`]).
+    Fragment(Vec<u8>),
 }
 
 /// One consensus RPC response body.
@@ -453,6 +476,14 @@ pub enum PeerResponse {
     /// Responder-coverage answer (control lane): applied pointer plus
     /// servability.
     Coverage(PeerCoverageReport),
+    /// Forwarded control mutation commit answer.
+    ControlForward(PeerControlForwardResponse),
+    /// Redundancy fragment answer (bulk lane, group-independent). The
+    /// body is opaque project-owned
+    /// [`kivi_redundancy::proto::FragmentReply`] wire bytes, including
+    /// application-level refusals (stale incarnation, missing asset):
+    /// the coordinator distinguishes retryable from fenced from them.
+    Fragment(Vec<u8>),
 }
 
 /// Remote-side RPC failure: the peer decoded the request but its Raft
@@ -808,6 +839,15 @@ pub mod route {
     pub const ALR_SYNC: &str = "alr-sync";
     /// Responder-coverage poll route suffix (control lane, per-group route).
     pub const COVERAGE: &str = "coverage";
+    /// Control mutation forward route suffix (control lane, per-group route).
+    pub const CONTROL_FORWARD: &str = "control-forward";
+    /// Redundancy-fragment RPC path (bulk lane, group-independent): the
+    /// full H3 path, not a per-group suffix. Fragment bodies are opaque
+    /// proto bytes; identity rides inside them, never the path.
+    pub const FRAGMENT_PATH: &str = "/_kivi/redundancy/fragment";
+    /// Media type for opaque redundancy-fragment bodies (transport
+    /// metadata only, never durable state).
+    pub const MEDIA_FRAGMENT: &str = "application/vnd.kivi.fragment";
 }
 
 /// Renders the H3 path for one request under `group`'s tablet. Manifest
@@ -834,12 +874,16 @@ pub fn h3_request_path(group_tablet: u64, request: &PeerRequest) -> String {
         PeerRequest::CoveragePoll(_) => {
             format!("/_kivi/raft/{group_tablet}/{}", route::COVERAGE)
         }
+        PeerRequest::ControlForward(_) => {
+            format!("/_kivi/raft/{group_tablet}/{}", route::CONTROL_FORWARD)
+        }
         PeerRequest::Manifest(request) => {
             format!("/_kivi/immutable/manifest/{}", id32_hex(&request.manifest))
         }
         PeerRequest::Chunk(request) => {
             format!("/_kivi/immutable/chunk/{}", id32_hex(&request.chunk))
         }
+        PeerRequest::Fragment(_) => route::FRAGMENT_PATH.to_owned(),
     }
 }
 
@@ -851,13 +895,15 @@ pub const fn h3_media_type(request: &PeerRequest) -> &'static str {
         PeerRequest::Vote(_)
         | PeerRequest::PreVote(_)
         | PeerRequest::Append(_)
-        | PeerRequest::Snapshot(_) => "application/vnd.kivi.raft",
+        | PeerRequest::Snapshot(_)
+        | PeerRequest::ControlForward(_) => "application/vnd.kivi.raft",
         PeerRequest::Prepare(_) => "application/vnd.kivi.prepare",
         PeerRequest::Lease(_) | PeerRequest::AlrSync(_) | PeerRequest::CoveragePoll(_) => {
             "application/vnd.kivi.read"
         }
         PeerRequest::Manifest(_) => "application/vnd.kivi.manifest",
         PeerRequest::Chunk(_) => "application/vnd.kivi.chunk",
+        PeerRequest::Fragment(_) => route::MEDIA_FRAGMENT,
     }
 }
 
@@ -878,13 +924,16 @@ pub fn h3_method(request: &PeerRequest) -> http::Method {
         | PeerRequest::Prepare(_)
         | PeerRequest::Lease(_)
         | PeerRequest::AlrSync(_)
-        | PeerRequest::CoveragePoll(_) => http::Method::POST,
+        | PeerRequest::CoveragePoll(_)
+        | PeerRequest::ControlForward(_)
+        | PeerRequest::Fragment(_) => http::Method::POST,
     }
 }
 
 /// Encodes one request as its H3 `(path, body)`. Manifest/chunk requests
-/// have empty bodies (identity is the path); every other family encodes
-/// its payload codec.
+/// have empty bodies (identity is the path); fragment requests move their
+/// opaque proto bytes as the body; every other family encodes its payload
+/// codec.
 ///
 /// Returns the path plus body bytes.
 #[must_use]
@@ -961,7 +1010,13 @@ pub fn encode_h3_request(request: &PeerRequest, group_tablet: u64) -> (String, V
         PeerRequest::CoveragePoll(request) => {
             push_u64(&mut out, request.commit);
         }
+        PeerRequest::ControlForward(request) => {
+            out.extend_from_slice(&request.mutation);
+        }
         PeerRequest::Manifest(_) | PeerRequest::Chunk(_) => {}
+        PeerRequest::Fragment(bytes) => {
+            out.extend_from_slice(bytes);
+        }
     }
     (path, out)
 }
@@ -1008,13 +1063,18 @@ pub fn decode_h3_request(path: &str, body: &[u8]) -> Result<DecodedH3Request, Pe
             route::COVERAGE => PeerRequest::CoveragePoll(PeerCoveragePoll {
                 commit: reader.u64()?,
             }),
+            route::CONTROL_FORWARD => PeerRequest::ControlForward(PeerControlForwardRequest {
+                mutation: body.to_vec(),
+            }),
             _ => {
                 return Err(PeerCodecError::UnknownRoute {
                     route: path.to_owned(),
                 });
             }
         };
-        reader.finish()?;
+        if !matches!(&request, PeerRequest::ControlForward(_)) {
+            reader.finish()?;
+        }
         (tablet, request)
     } else if let Some(hex) = path.strip_prefix("/_kivi/immutable/manifest/") {
         reader.finish()?;
@@ -1032,6 +1092,10 @@ pub fn decode_h3_request(path: &str, body: &[u8]) -> Result<DecodedH3Request, Pe
                 chunk: parse_id32_hex(hex)?,
             }),
         )
+    } else if path == route::FRAGMENT_PATH {
+        // Group-independent opaque bytes: the fragment proto owns every
+        // bound and shape check downstream; the peer codec only moves them.
+        (0, PeerRequest::Fragment(body.to_vec()))
     } else {
         return Err(PeerCodecError::UnknownRoute {
             route: path.to_owned(),
@@ -1085,11 +1149,17 @@ pub fn encode_h3_response(response: &PeerResponse) -> Vec<u8> {
             push_u64(&mut out, response.applied);
             out.push(u8::from(response.healthy));
         }
+        PeerResponse::ControlForward(response) => {
+            push_u64(&mut out, response.index);
+        }
         PeerResponse::Manifest(response) => {
             out.extend_from_slice(&response.canonical);
         }
         PeerResponse::Chunk(response) => {
             out.extend_from_slice(&response.bytes);
+        }
+        PeerResponse::Fragment(bytes) => {
+            out.extend_from_slice(bytes);
         }
     }
     out
@@ -1141,6 +1211,11 @@ pub fn decode_h3_response(
                 tag => return Err(PeerCodecError::BadTag { tag }),
             },
         }),
+        PeerRequest::ControlForward(_) => {
+            PeerResponse::ControlForward(PeerControlForwardResponse {
+                index: reader.u64()?,
+            })
+        }
         PeerRequest::Manifest(request) => PeerResponse::Manifest(PeerManifestResponse {
             manifest: request.manifest,
             canonical: body.to_vec(),
@@ -1149,11 +1224,15 @@ pub fn decode_h3_response(
             chunk: request.chunk,
             bytes: body.to_vec(),
         }),
+        PeerRequest::Fragment(_) => PeerResponse::Fragment(body.to_vec()),
     };
-    // Manifest/chunk/prepare-ack bodies are fixed-shape and must consume
-    // exactly (prepare acks echo 32 manifest bytes); only manifest/chunk
-    // bulk payloads are raw variable bytes.
-    if !matches!(request, PeerRequest::Manifest(_) | PeerRequest::Chunk(_)) {
+    // Manifest/chunk/fragment bodies are raw variable bytes moved
+    // opaquely; every other family is fixed-shape and must consume
+    // exactly (prepare acks echo 32 manifest bytes).
+    if !matches!(
+        request,
+        PeerRequest::Manifest(_) | PeerRequest::Chunk(_) | PeerRequest::Fragment(_)
+    ) {
         reader.finish()?;
     }
     Ok(response)
@@ -1626,6 +1705,7 @@ mod tests {
                 manifest: [0x33; 32],
                 logical_len: 1234,
             }),
+            PeerRequest::Fragment(vec![0x44, 0x45, 0x46]),
             PeerRequest::Lease(PeerLeaseBatch {
                 messages: vec![lease_guard_fixture(), lease_renew_fixture()],
             }),
@@ -1636,6 +1716,9 @@ mod tests {
                 formation_applied: 41,
             }),
             PeerRequest::CoveragePoll(PeerCoveragePoll { commit: 42 }),
+            PeerRequest::ControlForward(PeerControlForwardRequest {
+                mutation: vec![0x55, 0x66, 0x77],
+            }),
         ];
         for request in &cases {
             // Tablet 9 rides every Raft path (Multi-Raft multiplexing).
@@ -1650,6 +1733,19 @@ mod tests {
                         "fetches are empty-body GETs"
                     );
                     assert!(body.is_empty(), "GETs carry no body");
+                }
+                PeerRequest::Fragment(_) => {
+                    assert_eq!(decoded.tablet, 0, "fragments are group-independent");
+                    assert_eq!(
+                        h3_method(request),
+                        http::Method::POST,
+                        "fragment moves opaque bytes as a POST body"
+                    );
+                    assert_eq!(
+                        h3_media_type(request),
+                        route::MEDIA_FRAGMENT,
+                        "fragment media type"
+                    );
                 }
                 _ => {
                     assert_eq!(decoded.tablet, 9);
@@ -1683,26 +1779,30 @@ mod tests {
                 }),
             ),
             (
-                &cases[7],
+                &cases[8],
                 PeerResponse::Lease(PeerLeaseBatch {
                     messages: vec![lease_guard_reply_fixture()],
                 }),
             ),
             (
-                &cases[8],
+                &cases[9],
                 PeerResponse::AlrSync(PeerAlrSyncResponse {
                     boundary: 43,
                     subsumed: true,
                 }),
             ),
             (
-                &cases[9],
+                &cases[10],
                 PeerResponse::Coverage(PeerCoverageReport {
                     responder: 2,
                     incarnation: 7,
                     applied: 42,
                     healthy: true,
                 }),
+            ),
+            (
+                &cases[11],
+                PeerResponse::ControlForward(PeerControlForwardResponse { index: 43 }),
             ),
         ];
         for (request, response) in cases {
@@ -1712,6 +1812,23 @@ mod tests {
                 response
             );
         }
+        let control_body =
+            encode_h3_response(&PeerResponse::ControlForward(PeerControlForwardResponse {
+                index: 44,
+            }));
+        assert!(
+            decode_h3_response(
+                &PeerRequest::AlrSync(PeerAlrSyncRequest {
+                    fence_tablet: 0,
+                    batch: 0,
+                    requester: 0,
+                    formation_applied: 0,
+                }),
+                &control_body,
+            )
+            .is_err(),
+            "control-forward response must not decode as an ALR response"
+        );
         // Raw sidecar bodies echo byte-for-byte.
         let manifest_request = PeerRequest::Manifest(PeerManifestRequest {
             manifest: [0x11; 32],
@@ -1735,6 +1852,18 @@ mod tests {
         assert_eq!(
             decode_h3_response(&prepare_request, &encode_h3_response(&prepared)).expect("decodes"),
             prepared
+        );
+        // Fragment bodies echo byte-for-byte both directions.
+        let fragment_request = PeerRequest::Fragment(vec![0x44, 0x45]);
+        let fragment = PeerResponse::Fragment(vec![0x46, 0x47, 0x48]);
+        assert_eq!(
+            decode_h3_response(&fragment_request, &encode_h3_response(&fragment)).expect("decodes"),
+            fragment
+        );
+        assert_eq!(
+            h3_request_path(7, &fragment_request),
+            route::FRAGMENT_PATH,
+            "fragment path ignores the tablet"
         );
         // Unknown routes refuse loudly.
         assert!(matches!(

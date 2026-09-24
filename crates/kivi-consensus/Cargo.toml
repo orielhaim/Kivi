@@ -14,6 +14,7 @@ kivi-durability.workspace = true
 kivi-protocol.workspace = true
 kivi-chunk.workspace = true
 kivi-control = { path = "../kivi-control", version = "0.1.0" }
+kivi-redundancy.workspace = true
 tracing.workspace = true
 bytes.workspace = true
 crc32c.workspace = true

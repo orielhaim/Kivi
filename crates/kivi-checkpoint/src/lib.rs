@@ -30,6 +30,7 @@ pub mod load;
 pub mod manifest;
 pub mod publish;
 pub mod reclaim;
+pub mod redundancy;
 pub mod snapshot;
 
 pub use artifact::{ArtifactHash, ArtifactKind};
@@ -51,4 +52,8 @@ pub use manifest::{
 };
 pub use publish::{PublishStats, publish_tablet, read_current, read_wal_floor, write_wal_floor};
 pub use reclaim::{LaneReclaim, plan_reclaim};
+pub use redundancy::{
+    band_asset, dedup_asset, manifest_asset, protect_band, protect_dedup, protect_manifest,
+    read_band_via_fabric, read_dedup_via_fabric, read_manifest_via_fabric, read_via_fabric,
+};
 pub use snapshot::TabletSnapshot;

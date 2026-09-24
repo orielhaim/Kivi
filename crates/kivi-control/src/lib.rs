@@ -19,12 +19,14 @@
 
 pub mod catalog;
 pub mod failure;
+pub mod layouts;
 pub mod merge;
 pub mod migration;
 pub mod mutation;
 pub mod node;
 pub mod placement;
 pub mod planner;
+pub mod redundancy;
 pub mod split;
 pub mod state;
 pub mod topology;
@@ -33,6 +35,7 @@ pub use catalog::{
     CatalogError, CatalogIndexKind, CatalogIndexState, CatalogLayout, IndexRecord, NamespaceRecord,
 };
 pub use failure::{FailureDetector, FailureDetectorConfig, TabletHealth, classify_tablet};
+pub use layouts::{LayoutError, LayoutKey, LayoutRecord};
 pub use merge::{MergeError, MergePhase, MergePlan, MergePlanId};
 pub use migration::{MigrationError, MigrationPhase, MigrationPlan, MigrationPlanId};
 pub use mutation::{CONTROL_MUTATION_VERSION, ControlMutation, ControlMutationError};
@@ -41,6 +44,10 @@ pub use placement::{DesiredReplicaSet, PlacementError, PlacementVersion};
 pub use planner::{
     MigrationIntent, PlannerConfig, PlannerError, intents_to_plans, plan_drain, plan_rebalance,
     plan_repair,
+};
+pub use redundancy::{
+    control_generation_of, descriptors_from_registry, drain_plan, health_of, layout_key,
+    published_layout,
 };
 pub use split::{SplitError, SplitPhase, SplitPlan, SplitPlanId};
 pub use state::{ClusterGeneration, ControlSnapshotError, ControlState};

@@ -4,11 +4,12 @@
 //! Snapshots persist the full registry/placement/plan image with the same
 //! canonical little-endian discipline as every other Kivi durable format.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use kivi_types::{NodeId, TabletId};
 
 use crate::catalog::{CatalogIndexState, IndexRecord, NamespaceRecord};
+use crate::layouts::{LayoutKey, LayoutRecord};
 use crate::merge::{MergePlan, MergePlanId};
 use crate::migration::{MigrationPlan, MigrationPlanId};
 use crate::mutation::{ControlMutation, MergePlanIdAlias, MigrationPlanIdAlias, SplitPlanIdAlias};
@@ -101,6 +102,25 @@ pub enum ControlApplyError {
         /// Human-readable cause.
         detail: String,
     },
+    /// A redundancy publish carries a stale generation: older than current,
+    /// or the same generation with conflicting bytes.
+    #[error("stale redundancy generation: offered {offered}, current is {current}")]
+    RedundancyStale {
+        /// Current published generation.
+        current: u64,
+        /// Offered generation.
+        offered: u64,
+    },
+    /// A redundancy publish skips generations: the coordinator must
+    /// re-derive from the current published layout instead of jumping
+    /// ahead, so no intermediate generation is ever silently skipped.
+    #[error("redundancy generation gap: offered {offered}, current is {current}")]
+    RedundancyGap {
+        /// Current published generation (`0` when the asset is absent).
+        current: u64,
+        /// Offered generation.
+        offered: u64,
+    },
 }
 
 /// Why a control snapshot image was rejected.
@@ -134,6 +154,9 @@ pub enum ControlSnapshotError {
     /// An embedded namespace/index record failed to decode.
     #[error("undecodable catalog record: {0}")]
     BadCatalog(#[from] crate::catalog::CatalogError),
+    /// An embedded redundancy key/record failed to decode.
+    #[error("undecodable redundancy record: {0}")]
+    BadRedundancy(#[from] crate::layouts::LayoutError),
 }
 
 /// Authoritative replicated control image.
@@ -153,6 +176,9 @@ pub struct ControlState {
     namespaces: BTreeMap<u64, NamespaceRecord>,
     /// Secondary index definitions by id.
     indexes: BTreeMap<u64, IndexRecord>,
+    /// Published redundancy layout per asset: exactly one generation per
+    /// asset, stored as opaque canonical bytes (never parsed here).
+    redundancy: HashMap<LayoutKey, LayoutRecord>,
     /// Current placement version (advanced by every desired-placement
     /// change and every plan creation).
     placement_version: PlacementVersion,
@@ -168,8 +194,10 @@ pub struct ControlState {
 
 impl ControlState {
     /// Empty control image at initial versions.
+    ///
+    /// Not `const`: the redundancy map has no const constructor.
     #[must_use]
-    pub const fn empty() -> Self {
+    pub fn empty() -> Self {
         Self {
             nodes: BTreeMap::new(),
             placements: BTreeMap::new(),
@@ -178,6 +206,7 @@ impl ControlState {
             merges: BTreeMap::new(),
             namespaces: BTreeMap::new(),
             indexes: BTreeMap::new(),
+            redundancy: HashMap::new(),
             placement_version: PlacementVersion::INITIAL,
             generation: ClusterGeneration::INITIAL,
             next_plan_id: 1,
@@ -355,6 +384,26 @@ impl ControlState {
     /// Iterates all index definitions in id order.
     pub fn indexes(&self) -> impl Iterator<Item = &IndexRecord> {
         self.indexes.values()
+    }
+
+    /// Looks up one asset's published redundancy record.
+    #[must_use]
+    pub fn redundancy_layout(&self, key: &LayoutKey) -> Option<&LayoutRecord> {
+        self.redundancy.get(key)
+    }
+
+    /// Iterates all published redundancy records. Order is unspecified
+    /// (`HashMap` iteration); snapshots sort by key for determinism.
+    pub fn redundancy_layouts(&self) -> impl Iterator<Item = &LayoutRecord> {
+        self.redundancy.values()
+    }
+
+    /// Iterates all published redundancy entries with their map keys.
+    /// Coordinators enumerate assets through this (the control plane owns
+    /// enumeration; the fabric catalog lists nothing by design). Order is
+    /// unspecified; callers sort when determinism matters.
+    pub fn redundancy_entries(&self) -> impl Iterator<Item = (&LayoutKey, &LayoutRecord)> {
+        self.redundancy.iter()
     }
 
     /// Whether any live topology plan (migration, split, or merge)
@@ -636,6 +685,63 @@ impl ControlState {
                 self.indexes.remove(id);
                 Ok(())
             }
+            ControlMutation::PublishRedundancyLayout {
+                key,
+                generation,
+                record,
+            } => {
+                // The explicit generation duplicates `record.control_generation`
+                // so fencing never parses the opaque layout bytes. A
+                // hand-built mutation that disagrees with its own record is
+                // rejected rather than silently normalized.
+                if *generation != record.control_generation {
+                    return Err(Fault::RedundancyGap {
+                        current: record.control_generation,
+                        offered: *generation,
+                    });
+                }
+                match self.redundancy.get(key) {
+                    None => {
+                        if *generation != 1 {
+                            return Err(Fault::RedundancyGap {
+                                current: 0,
+                                offered: *generation,
+                            });
+                        }
+                        self.redundancy.insert(*key, record.clone());
+                        Ok(())
+                    }
+                    Some(current) => {
+                        if *generation == current.control_generation {
+                            if record.layout == current.layout {
+                                Ok(())
+                            } else {
+                                Err(Fault::RedundancyStale {
+                                    current: current.control_generation,
+                                    offered: *generation,
+                                })
+                            }
+                        } else if current.control_generation.checked_add(1) == Some(*generation) {
+                            self.redundancy.insert(*key, record.clone());
+                            Ok(())
+                        } else if *generation > current.control_generation {
+                            Err(Fault::RedundancyGap {
+                                current: current.control_generation,
+                                offered: *generation,
+                            })
+                        } else {
+                            Err(Fault::RedundancyStale {
+                                current: current.control_generation,
+                                offered: *generation,
+                            })
+                        }
+                    }
+                }
+            }
+            ControlMutation::DropRedundancyAsset { key } => {
+                self.redundancy.remove(key);
+                Ok(())
+            }
         }
     }
 
@@ -670,8 +776,13 @@ impl ControlState {
         drained && self.tablets_desiring(node).is_empty()
     }
 
-    /// Encodes a canonical snapshot image (v2: splits, merges, tablet
-    /// allocator; no legacy v1 compatibility — see stage notes).
+    /// Encodes a canonical snapshot image (v3: splits, merges, tablet
+    /// allocator, redundancy section; no legacy v1 compatibility — see
+    /// stage notes).
+    ///
+    /// Pre-1.0 break-freely choice: the writer always emits the redundancy
+    /// section (empty when absent); the reader accepts both the new form
+    /// and old images that end after the index map.
     #[must_use]
     pub fn encode_snapshot(&self) -> Vec<u8> {
         let mut out = Vec::new();
@@ -700,14 +811,34 @@ impl ControlState {
             &mut out,
             self.indexes.values().map(IndexRecord::encode_to_vec),
         );
+        // Redundancy section, always written: entry count plus per-entry
+        // length-prefixed key/record blobs, sorted by key for determinism.
+        let mut ordered: Vec<(&LayoutKey, &LayoutRecord)> = self.redundancy.iter().collect();
+        ordered.sort_by(|left, right| left.0.cmp(right.0));
+        let count = u32::try_from(ordered.len()).unwrap_or(u32::MAX);
+        out.extend_from_slice(&count.to_le_bytes());
+        for (key, record) in ordered {
+            let key_bytes = key.encode_to_vec();
+            let key_len = u32::try_from(key_bytes.len()).unwrap_or(u32::MAX);
+            out.extend_from_slice(&key_len.to_le_bytes());
+            out.extend_from_slice(&key_bytes);
+            let record_bytes = record.encode_to_vec();
+            let record_len = u32::try_from(record_bytes.len()).unwrap_or(u32::MAX);
+            out.extend_from_slice(&record_len.to_le_bytes());
+            out.extend_from_slice(&record_bytes);
+        }
         out
     }
 
     /// Decodes a canonical snapshot image.
     ///
+    /// Old images that end after the index map (no redundancy section)
+    /// still decode to a state with no published layouts.
+    ///
     /// # Errors
     ///
     /// Returns [`ControlSnapshotError`] on structural failure.
+    #[allow(clippy::too_many_lines)]
     pub fn decode_snapshot(input: &[u8]) -> Result<Self, ControlSnapshotError> {
         use ControlSnapshotError as Fault;
         if input.len() < 32 {
@@ -770,6 +901,34 @@ impl ControlState {
             let record = IndexRecord::decode_exact(blob)?;
             indexes.insert(record.id, record);
         }
+        // Redundancy tail: absent on old images (decode to empty), present
+        // on everything this writer emits.
+        let mut redundancy = HashMap::new();
+        if !rest.is_empty() {
+            if rest.len() < 4 {
+                return Err(Fault::Truncated {
+                    detail: "redundancy section",
+                });
+            }
+            let count = u32::from_le_bytes(rest[..4].try_into().unwrap_or([0; 4])) as usize;
+            if count > MAX_REDUNDANCY_SNAPSHOT_ENTRIES {
+                return Err(Fault::Truncated {
+                    detail: "redundancy map too large",
+                });
+            }
+            rest = &rest[4..];
+            for _ in 0..count {
+                let (key_bytes, tail) =
+                    take_blob(rest).map_err(|detail| Fault::Truncated { detail })?;
+                rest = tail;
+                let key = LayoutKey::decode_exact(key_bytes)?;
+                let (record_bytes, tail) =
+                    take_blob(rest).map_err(|detail| Fault::Truncated { detail })?;
+                rest = tail;
+                let record = LayoutRecord::decode_exact(record_bytes)?;
+                redundancy.insert(key, record);
+            }
+        }
         if !rest.is_empty() {
             return Err(Fault::TrailingBytes);
         }
@@ -781,6 +940,7 @@ impl ControlState {
             migrations,
             namespaces,
             indexes,
+            redundancy,
             placement_version,
             generation,
             next_plan_id: next_plan_id.max(1),
@@ -857,6 +1017,22 @@ fn take_map(mut input: &[u8]) -> Result<(Vec<&[u8]>, &[u8]), &'static str> {
     Ok((out, input))
 }
 
+/// Sanity cap on redundancy entries in one snapshot: fail closed before
+/// unbounded allocation churn on a corrupt count.
+const MAX_REDUNDANCY_SNAPSHOT_ENTRIES: usize = 1_000_000;
+
+fn take_blob(mut input: &[u8]) -> Result<(&[u8], &[u8]), &'static str> {
+    if input.len() < 4 {
+        return Err("truncated snapshot blob");
+    }
+    let len = u32::from_le_bytes(input[..4].try_into().unwrap_or([0; 4])) as usize;
+    input = &input[4..];
+    if input.len() < len {
+        return Err("truncated snapshot blob body");
+    }
+    Ok(input.split_at(len))
+}
+
 /// Returns the set of tablet ids in a desired map (test/diagnostic use).
 #[must_use]
 pub fn tablet_set(state: &ControlState) -> BTreeSet<TabletId> {
@@ -868,6 +1044,7 @@ mod tests {
     use std::net::SocketAddr;
 
     use super::*;
+    use crate::layouts::{LayoutKey, LayoutRecord};
     use crate::migration::MigrationPhase;
     use crate::node::NodeState;
     use crate::placement::PlacementVersion;
@@ -974,5 +1151,174 @@ mod tests {
             .expect("placement");
         let back = ControlState::decode_snapshot(&state.encode_snapshot()).expect("decodes");
         assert_eq!(back, state);
+    }
+
+    fn asset(hash: u8) -> kivi_redundancy::AssetId {
+        kivi_redundancy::AssetId::new(kivi_redundancy::AssetKind::Chunk, 7, [hash; 32])
+            .expect("asset")
+    }
+
+    fn layout_bytes(asset: &kivi_redundancy::AssetId, generation: u64) -> Vec<u8> {
+        let params =
+            kivi_redundancy::SchemeParams::Replication(kivi_redundancy::ReplicationParams {
+                copies: 2,
+            });
+        let fragments = (0..2u32)
+            .map(|index| kivi_redundancy::FragmentRecord {
+                id: kivi_redundancy::FragmentId::for_bytes(
+                    *asset, generation, index, params, b"bytes",
+                ),
+                node: NodeId::from_u64(u64::from(index) + 1),
+                stored_len: 5,
+            })
+            .collect();
+        kivi_redundancy::RedundancyLayout::new(*asset, 5, generation, params, fragments)
+            .expect("builds")
+            .encode()
+    }
+
+    fn publish(key: LayoutKey, generation: u64, bytes: Vec<u8>) -> ControlMutation {
+        ControlMutation::PublishRedundancyLayout {
+            key,
+            generation,
+            record: LayoutRecord::new(generation, bytes),
+        }
+    }
+
+    #[test]
+    fn redundancy_publish_is_generation_fenced() {
+        let asset = asset(11);
+        let key = LayoutKey::from_asset(&asset);
+        let mut state = ControlState::empty();
+        assert!(state.redundancy_layout(&key).is_none());
+        // Absent assets accept exactly generation 1.
+        assert!(matches!(
+            state.apply(&publish(key, 2, layout_bytes(&asset, 2))),
+            Err(ControlApplyError::RedundancyGap {
+                current: 0,
+                offered: 2
+            })
+        ));
+        state
+            .apply(&publish(key, 1, layout_bytes(&asset, 1)))
+            .expect("gen1 publishes");
+        assert_eq!(
+            state
+                .redundancy_layout(&key)
+                .expect("present")
+                .control_generation,
+            1
+        );
+        // Identical republish is an idempotent no-op.
+        state
+            .apply(&publish(key, 1, layout_bytes(&asset, 1)))
+            .expect("republish no-op");
+        // Same generation with different bytes is stale, never a merge.
+        assert!(matches!(
+            state.apply(&publish(key, 1, vec![0xFFu8; 8])),
+            Err(ControlApplyError::RedundancyStale {
+                current: 1,
+                offered: 1
+            })
+        ));
+        // Skipping to generation 3 gaps: the coordinator must re-derive
+        // generation 2 so no intermediate layout is silently skipped.
+        assert!(matches!(
+            state.apply(&publish(key, 3, layout_bytes(&asset, 3))),
+            Err(ControlApplyError::RedundancyGap {
+                current: 1,
+                offered: 3
+            })
+        ));
+        // Exactly current + 1 advances.
+        state
+            .apply(&publish(key, 2, layout_bytes(&asset, 2)))
+            .expect("gen2 advances");
+        assert_eq!(
+            state
+                .redundancy_layout(&key)
+                .expect("present")
+                .control_generation,
+            2
+        );
+        // Older generations stay fenced after the advance.
+        assert!(matches!(
+            state.apply(&publish(key, 1, layout_bytes(&asset, 1))),
+            Err(ControlApplyError::RedundancyStale {
+                current: 2,
+                offered: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn redundancy_drop_removes_and_is_idempotent() {
+        let asset = asset(11);
+        let key = LayoutKey::from_asset(&asset);
+        let mut state = ControlState::empty();
+        // Dropping an absent asset succeeds.
+        state
+            .apply(&ControlMutation::DropRedundancyAsset { key })
+            .expect("absent drop ok");
+        state
+            .apply(&publish(key, 1, layout_bytes(&asset, 1)))
+            .expect("publishes");
+        state
+            .apply(&ControlMutation::DropRedundancyAsset { key })
+            .expect("drops");
+        assert!(state.redundancy_layout(&key).is_none());
+        state
+            .apply(&ControlMutation::DropRedundancyAsset { key })
+            .expect("repeat drop ok");
+        // After a drop the asset is absent again: generation restarts at 1.
+        assert!(matches!(
+            state.apply(&publish(key, 2, layout_bytes(&asset, 2))),
+            Err(ControlApplyError::RedundancyGap {
+                current: 0,
+                offered: 2
+            })
+        ));
+        state
+            .apply(&publish(key, 1, layout_bytes(&asset, 1)))
+            .expect("republishes at gen1");
+    }
+
+    #[test]
+    fn redundancy_snapshot_round_trips() {
+        let first = asset(11);
+        let second = asset(12);
+        let mut state = ControlState::empty();
+        state
+            .apply(&publish(
+                LayoutKey::from_asset(&first),
+                1,
+                layout_bytes(&first, 1),
+            ))
+            .expect("publishes");
+        state
+            .apply(&publish(
+                LayoutKey::from_asset(&second),
+                1,
+                layout_bytes(&second, 1),
+            ))
+            .expect("publishes");
+        let back = ControlState::decode_snapshot(&state.encode_snapshot()).expect("decodes");
+        assert_eq!(back, state);
+        assert_eq!(back.redundancy_layouts().count(), 2);
+        // Deterministic bytes: re-encoding the decoded image matches.
+        assert_eq!(back.encode_snapshot(), state.encode_snapshot());
+    }
+
+    #[test]
+    fn old_snapshot_without_section_still_decodes() {
+        let state = ControlState::empty();
+        let mut new_form = state.encode_snapshot();
+        // The writer always appends the section; an old writer ends after
+        // the index map. An empty section is exactly its 4-byte count, so
+        // stripping it simulates a pre-section image byte-for-byte.
+        new_form.truncate(new_form.len() - 4);
+        let back = ControlState::decode_snapshot(&new_form).expect("old form decodes");
+        assert_eq!(back, state);
+        assert_eq!(back.redundancy_layouts().count(), 0);
     }
 }

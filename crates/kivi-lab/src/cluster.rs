@@ -36,6 +36,10 @@ use super::process::{READY_TIMEOUT, SpawnError, server_binary_path};
 pub const LEADER_TIMEOUT: Duration = Duration::from_secs(45);
 /// How long convergence may take after healing or restart.
 pub const CONVERGE_TIMEOUT: Duration = Duration::from_secs(45);
+/// Admin-plane socket read timeout. Generous because admin routes may
+/// run bounded background work (redundancy protect/read/repair crosses
+/// the peer mesh and a Raft commit) under a 60 s server-side ceiling.
+pub const ADMIN_TIMEOUT: Duration = Duration::from_secs(120);
 /// Cluster formation attempts (bind-conflict retries).
 const SPAWN_ATTEMPTS: usize = 3;
 /// Fixed test cluster identity (deterministic across runs; data
@@ -473,6 +477,14 @@ impl Cluster {
             .ok_or(SpawnError::RespUnavailable)
     }
 
+    /// Data directory of one member (survives kills; reused across
+    /// restarts). Durability tests inspect or corrupt per-node physical
+    /// state through this view; the harness itself keeps ownership.
+    #[must_use]
+    pub fn data_dir(&self, index: usize) -> &std::path::Path {
+        self.nodes[index].data_dir.path()
+    }
+
     /// Native endpoints of live members (client seeds).
     #[must_use]
     pub fn native_endpoints(&self) -> Vec<String> {
@@ -548,7 +560,7 @@ impl Cluster {
             )
         });
         socket
-            .set_read_timeout(Some(Duration::from_secs(10)))
+            .set_read_timeout(Some(ADMIN_TIMEOUT))
             .expect("timeout");
         write!(
             socket,
@@ -589,7 +601,7 @@ impl Cluster {
             )
         });
         socket
-            .set_read_timeout(Some(Duration::from_secs(10)))
+            .set_read_timeout(Some(ADMIN_TIMEOUT))
             .expect("timeout");
         write!(
             socket,

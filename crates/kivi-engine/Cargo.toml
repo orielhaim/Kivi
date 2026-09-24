@@ -16,6 +16,7 @@ kivi-durability.workspace = true
 kivi-checkpoint.workspace = true
 kivi-chunk.workspace = true
 kivi-memory.workspace = true
+kivi-redundancy.workspace = true
 crc32c.workspace = true
 async-channel.workspace = true
 bytes.workspace = true

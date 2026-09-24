@@ -2965,6 +2965,20 @@ impl Conn {
         Ok(RoutedMedium::Staged(staged, seals))
     }
 
+    /// Best-effort redundancy for one staged value on the connection task.
+    /// Submits one lane job and returns without blocking the reactor (a
+    /// rejected submit only costs redundancy): local durability already
+    /// proved these bytes, so a fabric miss only costs redundancy. `None`
+    /// redundancy (ephemeral mode) is a silent no-op.
+    fn protect_staged(&self, bytes: &bytes::Bytes, staged: &crate::chunk_lane::StagedValue) {
+        crate::redundancy::protect_staged_value(
+            self.chunks.redundancy.as_ref(),
+            self.chunks.domain,
+            bytes,
+            staged,
+        );
+    }
+
     /// Splits one routed operation by size on the connection task:
     /// medium `Set`s stage into the fabric synchronously (arena insert,
     /// suspends nothing) and re-enter as small `SetFabric` roots; large
@@ -3011,9 +3025,15 @@ impl Conn {
                             .map(|()| None);
                     }
                 };
+                // `Bytes` clones share the allocation: the copy below only
+                // feeds best-effort redundancy protection after staging.
+                let bytes = value.clone();
                 match self.chunks.lane.stage_value_async(value).await {
                     Ok(staged) => {
                         guard.set_manifest(staged.manifest);
+                        // Best-effort: local durability already proved
+                        // these bytes (see `protect_staged`).
+                        self.protect_staged(&bytes, &staged);
                         Ok(Some((
                             Operation::SetChunked {
                                 key,
@@ -3053,9 +3073,15 @@ impl Conn {
                             .map(|()| None);
                     }
                 };
+                // `Bytes` clones share the allocation: the copy below only
+                // feeds best-effort redundancy protection after staging.
+                let bytes = value.clone();
                 match self.chunks.lane.stage_value_async(value).await {
                     Ok(staged) => {
                         guard.set_manifest(staged.manifest);
+                        // Best-effort: local durability already proved
+                        // these bytes (see `protect_staged`).
+                        self.protect_staged(&bytes, &staged);
                         Ok(Some((
                             Operation::SetConditionalChunked {
                                 key,

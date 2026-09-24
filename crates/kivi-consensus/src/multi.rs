@@ -47,6 +47,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use kivi_redundancy::LocalFragmentStore;
 use kivi_state::Operation;
 use kivi_types::{
     ClusterId, IdempotencyKey, MutationIdentity, NamespaceId, NodeId, ReadContract,
@@ -61,7 +62,9 @@ use crate::node::{
     bootstrap_group, classify_from_store, owner_call_on, process_ticks, propose_caller_side,
     spawn_raft,
 };
-use crate::peer::{PeerRequest, PeerResponse, PeerRpcError};
+use crate::peer::{
+    PeerControlForwardRequest, PeerControlForwardResponse, PeerRequest, PeerResponse, PeerRpcError,
+};
 use crate::router::PeerRouter;
 use crate::shared::{
     GroupRaftStore, SharedDurabilityConfig, SharedRaftDurability, dispatch_by_group,
@@ -70,7 +73,7 @@ use crate::sidecar::SidecarStore;
 use crate::state_machine::ReplicatedStateMachine;
 use crate::tls::NodeCert;
 use crate::transport::{PeerHandler, PeerTransport, TlsMaterial, TransportConfig};
-use crate::types::{ConsensusError, ConsensusGroupId, ConsensusLogIndex};
+use crate::types::{ConsensusError, ConsensusGroupId, ConsensusLogIndex, ControlProposeError};
 use crate::worker::worker_for_tablet;
 
 /// Depth of each worker ingress queue (same bound as the single-group
@@ -139,6 +142,12 @@ pub struct MultiNodeConfig {
     /// (fresh directories with seeds, or any restart recovering durable
     /// control state — restarts never re-initialize).
     pub control: Option<ControlGroupConfig>,
+    /// Redundancy-fragment store root. `Some` opens a node-local
+    /// [`LocalFragmentStore`] there (recovering indexed state) and serves
+    /// project-owned fragment RPCs from every replica; `None` disables
+    /// fragments (RPCs are refused as shutting down) so existing
+    /// deployments and tests keep working unchanged.
+    pub fragment_store_root: Option<PathBuf>,
 }
 
 /// How this node participates in the system control group.
@@ -174,6 +183,9 @@ pub struct ConsensusNode {
     /// [`machines`](Self::machines)).
     authorities: Mutex<HashMap<TabletId, TabletAuthority>>,
     sidecar: SidecarStore,
+    /// Node-local redundancy fragment store (`None` when disabled).
+    /// Shared by every replica (content-addressed, group-independent).
+    fragments: Option<Arc<LocalFragmentStore>>,
     preflight: Arc<crate::preflight::PreflightMetrics>,
     durability: SharedRaftDurability,
     /// Shared H3 mesh handle: dynamic peer admission (`add_peer_dial`)
@@ -244,9 +256,10 @@ struct GroupRegistry {
     fallback: Vec<async_channel::Sender<OwnerRequest>>,
     /// Worker count for the deterministic fallback mapping.
     worker_count: usize,
-    /// Worker serving group-independent bulk sidecars (manifest/chunk
-    /// decode with a zero tablet): owns the smallest tablet, so it always
-    /// hosts at least one replica serving the shared sidecar store.
+    /// Worker serving group-independent bulk traffic (manifest/chunk/
+    /// fragment decode with a zero tablet): owns the smallest tablet, so
+    /// it always hosts at least one replica serving the shared sidecar
+    /// and fragment stores.
     bulk: async_channel::Sender<OwnerRequest>,
 }
 
@@ -264,9 +277,11 @@ impl PeerHandler for GroupRegistry {
         let worker_count = self.worker_count;
         let bulk = self.bulk.clone();
         Box::pin(async move {
-            let tx = if group == ConsensusGroupId::of_tablet(TabletId::from_u64(0)) {
+            let tx = if group == ConsensusGroupId::redundancy_sentinel() {
                 match &request {
-                    PeerRequest::Manifest(_) | PeerRequest::Chunk(_) => Some(bulk),
+                    PeerRequest::Manifest(_) | PeerRequest::Chunk(_) | PeerRequest::Fragment(_) => {
+                        Some(bulk)
+                    }
                     _ => None,
                 }
             } else if let Some(tx) = routes.get(&group).cloned() {
@@ -708,6 +723,20 @@ impl ConsensusNode {
                     reason: error.to_string(),
                 }
             })?;
+        // Node-local redundancy fragment store (project-owned fragment
+        // transport): opened at the caller-provided root, or disabled
+        // when absent (existing deployments keep working unchanged).
+        let fragments: Option<Arc<LocalFragmentStore>> = config
+            .fragment_store_root
+            .as_ref()
+            .map(|root| {
+                LocalFragmentStore::open(root, opened.meta.incarnation.as_u64())
+                    .map(|(store, _recovery)| Arc::new(store))
+                    .map_err(|error| Fault::Fragments {
+                        reason: error.to_string(),
+                    })
+            })
+            .transpose()?;
         // Peer TLS identity plus the static dial maps.
         let peer_tls_cert = NodeCert::load_or_generate(&config.data_dir, opened.meta.node)
             .map_err(|error| Fault::Tls {
@@ -882,6 +911,7 @@ impl ConsensusNode {
                 transport_config: config.transport.clone(),
                 transport: transport.clone(),
                 sidecar: sidecar.clone(),
+                fragments: fragments.clone(),
                 namespace: config.namespace,
                 local: opened.meta.node,
                 cluster: opened.meta.cluster,
@@ -995,6 +1025,7 @@ impl ConsensusNode {
             machines: Mutex::new(machines),
             authorities: Mutex::new(authorities),
             sidecar,
+            fragments,
             preflight,
             durability,
             mesh: transport.clone(),
@@ -1095,6 +1126,49 @@ impl ConsensusNode {
     #[must_use]
     pub fn sidecar(&self) -> &SidecarStore {
         &self.sidecar
+    }
+
+    /// Returns the node-local redundancy fragment store, if enabled
+    /// ([`MultiNodeConfig::fragment_store_root`]). Coordinators borrow it
+    /// for local staging; remote holders are reached through
+    /// [`crate::fragments::FragmentClient`] over the peer mesh.
+    #[must_use]
+    pub fn fragments(&self) -> Option<&LocalFragmentStore> {
+        self.fragments.as_deref()
+    }
+
+    /// Returns the node-local redundancy fragment store as a shared handle,
+    /// if enabled. The coordinator moves this into background lane jobs
+    /// (which require `'static` ownership); request paths keep using
+    /// [`Self::fragments`].
+    #[must_use]
+    pub fn fragments_arc(&self) -> Option<Arc<LocalFragmentStore>> {
+        self.fragments.clone()
+    }
+
+    /// Returns the shared peer mesh handle. The redundancy coordinator
+    /// reuses this exact mesh (same identity, same runtime, same dials)
+    /// for fragment RPCs via [`crate::fragments::FragmentClient`]: no
+    /// second mesh, no second runtime, no second identity is ever created
+    /// for redundancy traffic.
+    #[must_use]
+    pub fn mesh_transport(&self) -> crate::transport::PeerTransport {
+        self.mesh.clone()
+    }
+
+    /// Builds a fragment client over the shared mesh with a per-call
+    /// ceiling. One client per coordinator; the driver thread it spawns is
+    /// reclaimed when the client drops.
+    #[must_use]
+    pub fn fragment_client(
+        &self,
+        timeout: std::time::Duration,
+    ) -> crate::fragments::FragmentClient {
+        crate::fragments::FragmentClient::new(
+            self.mesh.clone(),
+            crate::types::ConsensusGroupId::redundancy_sentinel(),
+            timeout,
+        )
     }
 
     /// Returns current shared-durability metrics (physical batches,
@@ -1696,9 +1770,27 @@ impl ConsensusNode {
         &self,
         mutation: kivi_control::ControlMutation,
     ) -> Result<ConsensusLogIndex, String> {
+        self.propose_control_typed_front(mutation)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Proposes one control mutation locally and preserves its typed
+    /// leader hint or failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControlProposeError`] when the local control replica is
+    /// unavailable, shutting down, or not the leader.
+    pub async fn propose_control_typed_front(
+        &self,
+        mutation: kivi_control::ControlMutation,
+    ) -> Result<ConsensusLogIndex, ControlProposeError> {
         let group = ConsensusGroupId::control();
         let Some(worker) = self.channel_for(group) else {
-            return Err(format!("control group {group} not served by this node"));
+            return Err(ControlProposeError::Unavailable {
+                detail: format!("control group {group} not served by this node"),
+            });
         };
         let (reply, rx) = futures::channel::oneshot::channel();
         worker
@@ -1708,9 +1800,83 @@ impl ConsensusNode {
                 reply,
             })
             .await
-            .map_err(|_| "consensus worker shut down".to_owned())?;
-        rx.await
-            .map_err(|_| "consensus worker shut down".to_owned())?
+            .map_err(|_| ControlProposeError::Unavailable {
+                detail: "consensus worker shut down".to_owned(),
+            })?;
+        rx.await.map_err(|_| ControlProposeError::Unavailable {
+            detail: "consensus worker shut down".to_owned(),
+        })?
+    }
+
+    /// Proposes a control mutation from any node, forwarding once over the
+    /// existing peer mesh when this replica is not the control leader.
+    ///
+    /// The forwarded bytes are the canonical control mutation encoding,
+    /// so the control group's Raft log still decides order and durability.
+    /// At most two peer hops are attempted, with no loop and no membership
+    /// change. A duplicate forwarded mutation is safe for the redundancy
+    /// coordinator because publishing the same generation with the same
+    /// bytes is fenced to a no-op by the control state machine.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable reason when the local proposal and the
+    /// bounded forwarded attempts fail.
+    pub async fn propose_control_anywhere(
+        &self,
+        mutation: kivi_control::ControlMutation,
+        timeout: Duration,
+    ) -> Result<ConsensusLogIndex, String> {
+        let leader = match self.propose_control_typed_front(mutation.clone()).await {
+            Ok(index) => return Ok(index),
+            Err(ControlProposeError::NotLeader {
+                leader: Some(leader),
+            }) => leader,
+            Err(error) => return Err(error.to_string()),
+        };
+        let request = PeerRequest::ControlForward(PeerControlForwardRequest {
+            mutation: mutation.encode_to_vec(),
+        });
+        let first = self
+            .mesh
+            .call(
+                leader,
+                ConsensusGroupId::control(),
+                request.clone(),
+                timeout,
+            )
+            .await;
+        match first {
+            Ok(PeerResponse::ControlForward(PeerControlForwardResponse { index })) => {
+                Ok(ConsensusLogIndex::new(index))
+            }
+            Ok(response) => Err(format!(
+                "control forward to leader {} returned {response:?}",
+                leader.as_u64()
+            )),
+            Err(error) => {
+                let Some(next) = control_forward_leader(&error.to_string()) else {
+                    return Err(format!("control forward failed: {error}"));
+                };
+                if next == leader {
+                    return Err(format!("control forward failed: {error}"));
+                }
+                match self
+                    .mesh
+                    .call(next, ConsensusGroupId::control(), request, timeout)
+                    .await
+                {
+                    Ok(PeerResponse::ControlForward(PeerControlForwardResponse { index })) => {
+                        Ok(ConsensusLogIndex::new(index))
+                    }
+                    Ok(response) => Err(format!(
+                        "control forward to leader {} returned {response:?}",
+                        next.as_u64()
+                    )),
+                    Err(error) => Err(format!("control forward failed: {error}")),
+                }
+            }
+        }
     }
 
     /// Sets the split/merge cutover fence on one local replica
@@ -2372,6 +2538,14 @@ fn bump_tombstone(data_dir: &std::path::Path, tablet: TabletId, generation: u64)
     }
 }
 
+fn control_forward_leader(detail: &str) -> Option<NodeId> {
+    let suffix = detail.split_once("control forward: leader ")?.1;
+    let value = suffix
+        .split(|character: char| !character.is_ascii_digit())
+        .next()?;
+    value.parse().ok().map(NodeId::from_u64)
+}
+
 /// Validates the configured tablet set: unique, nonzero, and every
 /// tablet assigned to the local node in the static topology. Empty is
 /// valid: a joining data node starts empty and gains replicas through
@@ -2512,6 +2686,8 @@ struct WorkerParams {
     transport_config: TransportConfig,
     transport: PeerTransport,
     sidecar: SidecarStore,
+    /// Node-local fragment store (shared by every replica on the node).
+    fragments: Option<Arc<LocalFragmentStore>>,
     namespace: NamespaceId,
     local: NodeId,
     cluster: ClusterId,
@@ -2552,6 +2728,7 @@ struct WorkerBuildCtx {
     local: NodeId,
     incarnation: kivi_types::NodeIncarnation,
     sidecar: SidecarStore,
+    fragments: Option<Arc<LocalFragmentStore>>,
     transport: PeerTransport,
     router: PeerRouter,
     preflight: Arc<crate::preflight::PreflightMetrics>,
@@ -2612,6 +2789,7 @@ async fn worker_main(mut params: WorkerParams) {
         local: params.local,
         incarnation: params.incarnation,
         sidecar: params.sidecar.clone(),
+        fragments: params.fragments.clone(),
         transport: params.transport.clone(),
         router: router.clone(),
         preflight: Arc::clone(&params.preflight),
@@ -2678,6 +2856,9 @@ fn fail_ready(
 ///
 /// Returns [`NodeOpenError`] when the tablet lacks wiring or the spawn or
 /// bootstrap fails.
+// One linear build sequence (gate, spawn, bootstrap, assemble); splitting
+// it would scatter the replica construction across helpers for no gain.
+#[allow(clippy::too_many_lines)]
 async fn build_replica(
     params: &WorkerParams,
     tablet: TabletId,
@@ -2771,6 +2952,7 @@ async fn build_replica(
             machine,
             params.sidecar.clone(),
             gate,
+            params.fragments.clone(),
             params.transport.clone(),
             group,
             params.namespace,
@@ -2872,6 +3054,7 @@ fn assemble_ctx(
     machine: ReplicatedStateMachine,
     sidecar: SidecarStore,
     gate: SidecarGate,
+    fragments: Option<Arc<LocalFragmentStore>>,
     transport: PeerTransport,
     group: ConsensusGroupId,
     namespace: NamespaceId,
@@ -2891,6 +3074,7 @@ fn assemble_ctx(
         machine,
         sidecar,
         gate,
+        fragments,
         transport,
         group,
         namespace,
@@ -2980,6 +3164,7 @@ async fn build_dynamic_replica(
         machine,
         build.sidecar.clone(),
         gate,
+        build.fragments.clone(),
         build.transport.clone(),
         group,
         build.namespace,
@@ -3067,16 +3252,18 @@ async fn worker_loop(
                 .detach();
             }
             other => {
-                // Group-independent bulk sidecars decode with a zero
-                // tablet: any local replica serves them from the shared
-                // sidecar store (the registry only sends these to a worker
-                // that owns at least one group).
+                // Group-independent bulk traffic decodes with a zero
+                // tablet: any local replica serves it from the shared
+                // sidecar/fragment stores (the registry only sends these
+                // to a worker that owns at least one group).
                 let dest = match &other {
                     OwnerRequest::Serve { group, request, .. }
-                        if *group == ConsensusGroupId::of_tablet(TabletId::from_u64(0))
+                        if *group == ConsensusGroupId::redundancy_sentinel()
                             && matches!(
                                 request,
-                                PeerRequest::Manifest(_) | PeerRequest::Chunk(_)
+                                PeerRequest::Manifest(_)
+                                    | PeerRequest::Chunk(_)
+                                    | PeerRequest::Fragment(_)
                             ) =>
                     {
                         replicas.values().next()
@@ -3208,6 +3395,7 @@ mod tests {
                 worker_count: 2,
                 durability: SharedDurabilityConfig::default(),
                 control: None,
+                fragment_store_root: None,
             })
             .await
             .expect("multi opens");
@@ -3303,6 +3491,7 @@ mod tests {
                     peer_addrs: peer_addrs.clone(),
                     seeds: Vec::new(),
                 }),
+                fragment_store_root: None,
             };
             let node = ConsensusNode::open(config())
                 .await
@@ -3396,6 +3585,149 @@ mod tests {
         });
     }
 
+    /// A control mutation proposed on a follower is forwarded to the
+    /// control leader and applied on every control replica.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn control_forward_from_follower_converges_on_all_replicas() {
+        block_on(async {
+            use crate::cluster::{NodeDescriptor, TabletAssignment};
+            let addrs = [probe_udp(), probe_udp(), probe_udp()];
+            let topology = ClusterTopology {
+                cluster: ClusterId::from_u128(0x0C10_57E2),
+                nodes: addrs
+                    .iter()
+                    .enumerate()
+                    .map(|(index, peer)| NodeDescriptor {
+                        node: NodeId::from_u64(index as u64 + 1),
+                        peer: *peer,
+                        native: format!("127.0.0.1:{}", 9000 + index)
+                            .parse()
+                            .expect("native address parses"),
+                    })
+                    .collect(),
+                tablets: vec![TabletAssignment {
+                    tablet: TabletId::from_u64(1),
+                    replicas: vec![
+                        NodeId::from_u64(1),
+                        NodeId::from_u64(2),
+                        NodeId::from_u64(3),
+                    ],
+                }],
+            };
+            let voters = BTreeSet::from([1u64, 2, 3]);
+            let peer_addrs = BTreeMap::from([
+                (1, addrs[0].to_string()),
+                (2, addrs[1].to_string()),
+                (3, addrs[2].to_string()),
+            ]);
+            let mut nodes = Vec::new();
+            let mut dirs = Vec::new();
+            for (index, _peer) in addrs.iter().enumerate() {
+                let dir = tempfile::tempdir().expect("scratch");
+                let node = ConsensusNode::open(MultiNodeConfig {
+                    data_dir: dir.path().to_owned(),
+                    namespace: NS,
+                    tablets: vec![TabletId::from_u64(1)],
+                    local: NodeId::from_u64(index as u64 + 1),
+                    topology: topology.clone(),
+                    segment_target_bytes: 1024 * 1024,
+                    transport: TransportConfig::default(),
+                    peer_certs: HashMap::new(),
+                    insecure_peer_tls: true,
+                    preflight_enabled: true,
+                    lease_params: kivi_types::LeaseParams::default(),
+                    worker_count: 1,
+                    durability: SharedDurabilityConfig::default(),
+                    control: Some(ControlGroupConfig {
+                        voters: voters.clone(),
+                        peer_addrs: peer_addrs.clone(),
+                        seeds: Vec::new(),
+                    }),
+                    fragment_store_root: None,
+                })
+                .await
+                .expect("control replica opens");
+                nodes.push(node);
+
+                dirs.push(dir);
+            }
+
+            let group = ConsensusGroupId::control();
+            let leader_deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let leader_index = loop {
+                let statuses = futures::future::join_all(
+                    nodes
+                        .iter()
+                        .map(|node| node.status_for(group))
+                        .collect::<Vec<_>>(),
+                )
+                .await;
+                let leaders: Vec<usize> = statuses
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, status)| status.role == crate::types::ReplicaRole::Leader)
+                    .map(|(index, _)| index)
+                    .collect();
+                if leaders.len() == 1 && statuses.iter().all(|status| status.leader.is_some()) {
+                    break leaders[0];
+                }
+                assert!(
+                    std::time::Instant::now() < leader_deadline,
+                    "control group did not elect a leader"
+                );
+                compio::time::sleep(Duration::from_millis(100)).await;
+            };
+            let follower_index = (leader_index + 1) % nodes.len();
+            let record = kivi_control::NodeRecord {
+                node: NodeId::from_u64(3),
+                peer: addrs[2],
+                native: "127.0.0.1:9003".parse().expect("address parses"),
+                admin: "127.0.0.1:19003".parse().expect("address parses"),
+                cert_fingerprint: [7u8; 32],
+                failure_domain: String::new(),
+                weight: 1,
+                state: kivi_control::NodeState::Joining,
+            };
+            let mutation = kivi_control::ControlMutation::RegisterNode {
+                record: record.clone(),
+            };
+            let index = nodes[follower_index]
+                .propose_control_anywhere(mutation, Duration::from_secs(10))
+                .await
+                .expect("follower control proposal commits");
+            assert!(index.get() > 0);
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                let states = futures::future::join_all(
+                    nodes
+                        .iter()
+                        .map(ConsensusNode::control_state)
+                        .collect::<Vec<_>>(),
+                )
+                .await;
+                if states.iter().all(|state| {
+                    state.as_ref().is_some_and(|state| {
+                        state
+                            .node(record.node)
+                            .is_some_and(|current| current.state == record.state)
+                    })
+                }) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "control mutation did not converge on all replicas"
+                );
+                compio::time::sleep(Duration::from_millis(100)).await;
+            }
+            for node in nodes {
+                node.shutdown().await;
+            }
+            drop(dirs);
+        });
+    }
+
     /// Unknown tablets fail loudly (never route to a wrong group).
     #[test]
     fn unknown_tablet_is_rejected() {
@@ -3419,6 +3751,7 @@ mod tests {
                 worker_count: 1,
                 durability: SharedDurabilityConfig::default(),
                 control: None,
+                fragment_store_root: None,
             })
             .await
             .expect("multi opens");
@@ -3467,6 +3800,7 @@ mod tests {
                 worker_count: 1,
                 durability: SharedDurabilityConfig::default(),
                 control: None,
+                fragment_store_root: None,
             };
             assert!(ConsensusNode::open(bad).await.is_err(), "tablet 0 refused");
             node.shutdown().await;

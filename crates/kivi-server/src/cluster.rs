@@ -83,10 +83,14 @@ const CLUSTER_CHUNK_SIZE: usize = 1_048_576;
 /// Maximum `StreamData` payload per frame on cluster uploads (bounded
 /// bulk framing; well under the peer and native ceilings).
 const CLUSTER_STREAM_MAX_DATA: u32 = 1_048_576;
-/// Admin per-request ceiling.
-const ADMIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-/// Admin body limit.
-const MAX_ADMIN_BODY_BYTES: usize = 64 * 1024;
+/// Admin per-request ceiling (60 s: redundancy protects/uploads plus Raft
+/// commits exceed the old 5 s budget; ordinary diagnostics stay fast).
+const ADMIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Admin body limit (16 MiB: redundancy `protect` carries base64 images
+/// whose decoded form caps at 8 MiB; base64 inflates 33%, so ~10.7 MiB
+/// encoded fits with headroom; every redundancy handler additionally
+/// enforces its own decoded-size cap before allocating).
+const MAX_ADMIN_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum stream entries encoded in one `StreamEntries` response page
 /// (mirrors the embedded engine's bound; shaping truncates explicitly and
 /// the client resumes by offset, keeping shard order).
@@ -167,6 +171,9 @@ pub struct ClusterShared {
     /// Live reconciler policy (operator-tunable via
     /// `POST /v1/control/policy`; the reconciler clones it every pass).
     pub policy: Arc<std::sync::Mutex<super::control::ReconcilePolicy>>,
+    /// Distributed redundancy coordinator (`None` when its lane failed to
+    /// open; every redundancy endpoint then answers 503).
+    pub redundancy: Option<Arc<kivi_consensus::distcoord::RedundancyCoordinator>>,
 }
 
 impl ClusterShared {
@@ -1089,6 +1096,12 @@ async fn open_node(
                 peer_addrs: control_peer_addrs,
                 seeds: control_seeds,
             }),
+            // Node-local redundancy fragments live under
+            // `<data_dir>/redundancy/fragments` (sibling of `sidecar/`,
+            // `consensus-sm/`, ...). Restart reopens and re-indexes the
+            // store while the catalog recovers through control-log replay:
+            // the two-source recovery documented on the coordinator.
+            fragment_store_root: Some(config.data_dir.join("redundancy").join("fragments")),
         })
         .await
         .context("replicated node failed to open")?,
@@ -1124,6 +1137,22 @@ pub async fn run(config: ClusterServeConfig) -> anyhow::Result<()> {
     let natives: std::collections::HashMap<NodeId, SocketAddr> =
         config.natives.iter().copied().collect();
     let policy = Arc::new(std::sync::Mutex::new(policy_from_env()));
+    // Distributed redundancy plane: the coordinator reuses this node's
+    // existing mesh (identity/runtime/dials), the replicated control group
+    // as layout authority, and the node-local fragment store opened above.
+    // A coordinator that cannot open leaves the plane disabled (503) and
+    // never blocks startup: durability of Raft-referenced sidecars stays
+    // local-first, redundancy only adds protection.
+    let redundancy = match kivi_consensus::distcoord::RedundancyCoordinator::open(
+        Arc::clone(&node),
+        kivi_consensus::distcoord::CoordinatorConfig::conservative(),
+    ) {
+        Ok(coordinator) => Some(Arc::new(coordinator)),
+        Err(error) => {
+            tracing::warn!(%error, "redundancy plane disabled");
+            None
+        }
+    };
     let shared = ClusterShared {
         node: Arc::clone(&node),
         directory: Arc::new(arc_swap::ArcSwap::from_pointee(directory)),
@@ -1131,6 +1160,7 @@ pub async fn run(config: ClusterServeConfig) -> anyhow::Result<()> {
         native: native_addr,
         namespace: config.namespace,
         policy: Arc::clone(&policy),
+        redundancy,
     };
     // Replay completed topology plans over the genesis tiling so a full
     // cluster restart recovers the post-split/merge directory (old parents
@@ -5485,6 +5515,7 @@ async fn control_migrations_create(
 /// Serves the cluster admin plane until aborted.
 async fn serve_admin(listener: tokio::net::TcpListener, shared: ClusterShared) {
     let router = axum::Router::new()
+        .merge(crate::redundancy_admin::router())
         .route("/health", get(health))
         .route("/ready", get(ready))
         .route("/v1/node", get(node_info))

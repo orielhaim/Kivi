@@ -177,6 +177,12 @@ pub(crate) struct CheckpointContext {
     pub fabric_journals: Vec<(kivi_types::WorkerId, std::path::PathBuf)>,
     /// Shared admin state.
     pub admin: Arc<Mutex<CheckpointAdminState>>,
+    /// Redundancy fabric for best-effort protection of published
+    /// immutable artifacts (`None` in ephemeral mode, which never
+    /// checkpoints). Each publish submits one fire-and-forget lane job;
+    /// protection failures only warn, never fail the checkpoint that just
+    /// published.
+    pub redundancy: Option<crate::redundancy::EngineRedundancy>,
 }
 
 /// Per-tablet worker-side bookkeeping (trigger baselines).
@@ -470,39 +476,60 @@ fn checkpoint_tablet_inner(
         Some(current) => load_previous_manifest(context, tablet, current)
             .map(|manifest| (manifest, current.manifest)),
     };
-    // 3. Build (CPU off the DataWorker).
-    let identity = CheckpointIdentity {
-        cluster: context.cluster,
-        node: context.node,
-        incarnation: context.incarnation,
-        namespace: context.namespace,
-        tablet,
+    // 3. Build (CPU off the DataWorker), then publish. The build window
+    // is the known background-heavy stretch, so lane foreground pressure
+    // is held across it (released on every exit, including `?` early
+    // returns): spare-capacity protects park until the checkpoint — and
+    // its own protection submit below — are done.
+    let (installed, publish_stats, band_count, bands_reused, stored_bytes) = {
+        let _pressure = LanePressureGuard::hold(context.redundancy.as_ref());
+        let identity = CheckpointIdentity {
+            cluster: context.cluster,
+            node: context.node,
+            incarnation: context.incarnation,
+            namespace: context.namespace,
+            tablet,
+        };
+        let built = build_tablet(
+            &snapshot,
+            previous.as_ref().map(|(manifest, hash)| (manifest, *hash)),
+            &context.config.policy,
+            &identity,
+        )
+        .map_err(CheckpointFailure::Build)?;
+        // 4. Publish (crash-safe install + retention GC).
+        let previous_current = context.installed.get(&tablet).cloned();
+        let (installed, publish_stats) =
+            publish_tablet(&context.data_dir, &built, previous_current.as_ref())
+                .map_err(CheckpointFailure::Publish)?;
+        // The installed map updates before reclamation: the floor promise
+        // must cover the just-published cut, or its tail would never become
+        // reclaimable until the NEXT checkpoint.
+        context.installed.insert(tablet, installed.clone());
+        // Best-effort redundancy for the just-published immutable artifacts:
+        // one fire-and-forget lane job, never blocking this worker.
+        // Publication order is unchanged (build → verify → publish → retire
+        // still holds end to end): the fabric runs its own verify-before-
+        // publish per asset, and failures here only warn, never fail the
+        // checkpoint that just succeeded.
+        protect_checkpoint_artifacts(context, tablet, &built);
+        (
+            installed,
+            publish_stats,
+            built.bands.len(),
+            built.stats.bands_reused,
+            built.stats.stored_bytes,
+        )
     };
-    let built = build_tablet(
-        &snapshot,
-        previous.as_ref().map(|(manifest, hash)| (manifest, *hash)),
-        &context.config.policy,
-        &identity,
-    )
-    .map_err(CheckpointFailure::Build)?;
-    // 4. Publish (crash-safe install + retention GC).
-    let previous_current = context.installed.get(&tablet).cloned();
-    let (installed, publish_stats) =
-        publish_tablet(&context.data_dir, &built, previous_current.as_ref())
-            .map_err(CheckpointFailure::Publish)?;
-    // The installed map updates before reclamation: the floor promise
-    // must cover the just-published cut, or its tail would never become
-    // reclaimable until the NEXT checkpoint.
-    context.installed.insert(tablet, installed.clone());
     // 5. Reclaim WAL under the new retention promise.
     let reclaim_stats = reclaim_wal(context)?;
     let info = CheckpointInfo {
         cut: installed.cut,
         manifest: Some(installed.manifest),
         created_wall_micros: installed.created_wall_micros,
-        bands: built.bands.len(),
-        bands_reused: built.stats.bands_reused,
-        stored_bytes: built.stats.stored_bytes,
+        bands: band_count,
+        bands_reused,
+        stored_bytes,
         duration: started.elapsed(),
         fell_back: false,
     };
@@ -712,6 +739,91 @@ fn run_chunk_gc(
             }
         }
     }
+}
+
+/// Best-effort redundancy protection for one published checkpoint: each
+/// newly-written band file plus the dedup component and manifest is read
+/// into one owned artifact set and submitted as a single lane job under
+/// whole-file BLAKE3 identities (distinct from the checkpoint content
+/// hashes, per the checkpoint redundancy adapter's discipline). Reused
+/// bands are skipped: they were protected when first written, and fabric
+/// re-protection is idempotent anyway. Unreadable files warn and are left
+/// out of the set; the submit itself never blocks this worker and never
+/// fails the checkpoint that just succeeded. A missing fabric (`None`) is a
+/// silent no-op.
+fn protect_checkpoint_artifacts(
+    context: &CheckpointContext,
+    tablet: TabletId,
+    built: &kivi_checkpoint::BuiltTablet,
+) {
+    use kivi_checkpoint::{ArtifactKind, BuiltBandRef, artifact::artifact_path};
+
+    use crate::redundancy::{CheckpointProtection, ProtectedArtifact};
+    let Some(redundancy) = context.redundancy.as_ref() else {
+        return;
+    };
+    let mut bands = Vec::new();
+    for reference in &built.bands {
+        let BuiltBandRef::New(band) = reference else {
+            continue;
+        };
+        let path = artifact_path(&context.data_dir, tablet, ArtifactKind::Band, band.hash);
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                let hash = kivi_codec::integrity::blake3_256(&bytes);
+                bands.push(ProtectedArtifact {
+                    hash,
+                    bytes: bytes::Bytes::from(bytes),
+                });
+            }
+            Err(_) => {
+                tracing::warn!(tablet = tablet.as_u64(), path = %path.display(), "redundancy band protection skipped: file unreadable");
+            }
+        }
+    }
+    let path = artifact_path(
+        &context.data_dir,
+        tablet,
+        ArtifactKind::DedupComponent,
+        built.dedup.hash,
+    );
+    let dedup = match std::fs::read(&path) {
+        Ok(bytes) => {
+            let hash = kivi_codec::integrity::blake3_256(&bytes);
+            Some(ProtectedArtifact {
+                hash,
+                bytes: bytes::Bytes::from(bytes),
+            })
+        }
+        Err(error) => {
+            tracing::warn!(tablet = tablet.as_u64(), path = %path.display(), ?error, "redundancy dedup protection skipped: file unreadable");
+            None
+        }
+    };
+    let path = artifact_path(
+        &context.data_dir,
+        tablet,
+        ArtifactKind::Manifest,
+        built.manifest.hash,
+    );
+    let manifest = match std::fs::read(&path) {
+        Ok(bytes) => {
+            let hash = kivi_codec::integrity::blake3_256(&bytes);
+            Some(ProtectedArtifact {
+                hash,
+                bytes: bytes::Bytes::from(bytes),
+            })
+        }
+        Err(error) => {
+            tracing::warn!(tablet = tablet.as_u64(), path = %path.display(), ?error, "redundancy manifest protection skipped: file unreadable");
+            None
+        }
+    };
+    redundancy.submit_checkpoint(CheckpointProtection {
+        bands,
+        dedup,
+        manifest,
+    });
 }
 
 /// Captures one tablet's checkpoint view through the control channel.
@@ -929,6 +1041,33 @@ fn retained_wal_bytes(wal_dir: &std::path::Path) -> u64 {
         }
     }
     total
+}
+
+/// Holds the redundancy lane's foreground-pressure flag across the
+/// checkpoint build window; releases on drop (including `?` early returns
+/// and unwinds), so a failed build never parks background lane work forever.
+struct LanePressureGuard<'a> {
+    /// Fabric handle whose lane flag is held (`None` in ephemeral mode,
+    /// which never checkpoints and holds no fabric).
+    redundancy: Option<&'a crate::redundancy::EngineRedundancy>,
+}
+
+impl<'a> LanePressureGuard<'a> {
+    /// Sets lane pressure (when a fabric exists) for the guard lifetime.
+    fn hold(redundancy: Option<&'a crate::redundancy::EngineRedundancy>) -> Self {
+        if let Some(worker) = redundancy {
+            worker.set_lane_pressure(true);
+        }
+        Self { redundancy }
+    }
+}
+
+impl Drop for LanePressureGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(worker) = self.redundancy {
+            worker.set_lane_pressure(false);
+        }
+    }
 }
 
 /// Checkpoint failure modes (worker-internal; surfaced via admin + logs).

@@ -1096,6 +1096,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef25905e51abafe4dcea6c15fec58c57b601cdbd0ee53d22ea1d3016c587d39b"
 
 [[package]]
+name = "fixedbitset"
+version = "0.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
+
+[[package]]
 name = "flate2"
 version = "1.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1709,6 +1715,7 @@ dependencies = [
  "kivi-codec",
  "kivi-core",
  "kivi-durability",
+ "kivi-redundancy",
  "kivi-state",
  "kivi-types",
  "lz4_flex",
@@ -1725,6 +1732,7 @@ dependencies = [
  "bytes",
  "kivi-codec",
  "kivi-durability",
+ "kivi-redundancy",
  "kivi-types",
  "tempfile",
  "thiserror",
@@ -1776,6 +1784,7 @@ dependencies = [
  "kivi-core",
  "kivi-durability",
  "kivi-protocol",
+ "kivi-redundancy",
  "kivi-state",
  "kivi-types",
  "openraft",
@@ -1794,6 +1803,7 @@ name = "kivi-control"
 version = "0.1.0"
 dependencies = [
  "kivi-codec",
+ "kivi-redundancy",
  "kivi-types",
  "thiserror",
 ]
@@ -1843,6 +1853,7 @@ dependencies = [
  "kivi-durability",
  "kivi-memory",
  "kivi-protocol",
+ "kivi-redundancy",
  "kivi-state",
  "kivi-tablet",
  "kivi-types",
@@ -1856,6 +1867,7 @@ name = "kivi-lab"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.23.1",
  "bytes",
  "clap",
  "divan",
@@ -1863,10 +1875,12 @@ dependencies = [
  "jiff",
  "kivi-checkpoint",
  "kivi-client",
+ "kivi-codec",
  "kivi-core",
  "kivi-durability",
  "kivi-engine",
  "kivi-protocol",
+ "kivi-redundancy",
  "kivi-state",
  "kivi-tablet",
  "kivi-types",
@@ -1909,6 +1923,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "kivi-redundancy"
+version = "0.1.0"
+dependencies = [
+ "async-channel",
+ "blake3",
+ "bytes",
+ "crc32c",
+ "divan",
+ "futures",
+ "kivi-codec",
+ "kivi-types",
+ "proptest",
+ "reed-solomon-simd",
+ "rstest",
+ "tempfile",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "kivi-resp"
 version = "0.1.0"
 dependencies = [
@@ -1928,8 +1962,10 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "axum",
+ "base64 0.23.1",
  "bytes",
  "clap",
+ "compio",
  "file-rotate",
  "kivi-checkpoint",
  "kivi-chunk",
@@ -1941,6 +1977,7 @@ dependencies = [
  "kivi-durability",
  "kivi-engine",
  "kivi-protocol",
+ "kivi-redundancy",
  "kivi-resp",
  "kivi-state",
  "kivi-tablet",
@@ -2762,6 +2799,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "readme-rustdocifier"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08ad765b21a08b1a8e5cdce052719188a23772bcbefb3c439f0baaf62c56ceac"
+
+[[package]]
 name = "redis"
 version = "1.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2800,6 +2843,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
 dependencies = [
  "bitflags 2.13.2",
+]
+
+[[package]]
+name = "reed-solomon-simd"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cffef0520d30fbd4151fb20e262947ae47fb0ab276a744a19b6398438105a072"
+dependencies = [
+ "cpufeatures 0.2.17",
+ "fixedbitset",
+ "once_cell",
+ "readme-rustdocifier",
 ]
 
 [[package]]
@@ -3312,18 +3367,18 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "2.0.20"
+version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec86235f5fcc2a73650310756d2ac5b138a5780bbbdfae3eeccec992c435ba4f"
+checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
 dependencies = [
  "thiserror-impl",
 ]
 
 [[package]]
 name = "thiserror-impl"
-version = "2.0.20"
+version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc04cd3e1236dd4a98afca4569f2deb3f120e5422a4023be2cb683f8486292af"
+checksum = "fe5197923287db20a58125f0bc85c062f7f2c892de97b18c356f9efb14b28524"
 dependencies = [
  "proc-macro2",
  "quote",

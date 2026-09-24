@@ -459,9 +459,9 @@ where
         // owner serves them from the sidecar store (fetches) or the
         // durability gate (preflight). Arriving here is a routing bug,
         // refused loudly.
-        PeerRequest::Manifest(_) | PeerRequest::Chunk(_) => Err(refused(
-            "sidecar bulk requests serve from the sidecar store".to_owned(),
-        )),
+        PeerRequest::Manifest(_) | PeerRequest::Chunk(_) | PeerRequest::Fragment(_) => Err(
+            refused("bulk requests serve from the sidecar or fragment store".to_owned()),
+        ),
         PeerRequest::Prepare(_) => Err(refused(
             "sidecar preflight serves from the durability gate".to_owned(),
         )),
@@ -472,6 +472,9 @@ where
         PeerRequest::Lease(_) | PeerRequest::AlrSync(_) | PeerRequest::CoveragePoll(_) => Err(
             refused("read-authority RPCs serve on the owner thread".to_owned()),
         ),
+        PeerRequest::ControlForward(_) => Err(refused(
+            "control forward serves on the owner thread".to_owned(),
+        )),
     }
 }
 

@@ -1,0 +1,40 @@
+[package]
+name = "kivi-redundancy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+kivi-types.workspace = true
+kivi-codec.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+blake3.workspace = true
+crc32c.workspace = true
+# Coding mechanism only (RFC §209): Kivi owns fragment identity, durable
+# metadata, placement, lifecycle, wire/storage format, verification, and
+# repair scheduling. Selected after ecosystem review (see rs.rs docs):
+# reed-solomon-simd is the maintained pure-Rust Leopard-RS port with runtime
+# SIMD and no C toolchain dependency; reed-solomon-erasure is stale (2022)
+# with Haswell-tuned C kernels and 6-25x slower published throughput.
+reed-solomon-simd = "3.1"
+# Bounded job queue + oneshot replies for the background lane (same pattern
+# as kivi-consensus SidecarStore: async_channel::bounded jobs drained by a
+# std worker thread, futures::channel::oneshot replies, block_on joins).
+futures.workspace = true
+async-channel.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+proptest.workspace = true
+divan.workspace = true
+rstest.workspace = true
+
+[[bench]]
+name = "redundancy"
+harness = false
+
+[lints]
+workspace = true

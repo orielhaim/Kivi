@@ -27,6 +27,8 @@
 //!                                       body: manifest + length)
 //! GET  /_kivi/immutable/manifest/{hex}  (body: canonical manifest bytes)
 //! GET  /_kivi/immutable/chunk/{hex}     (body: raw chunk bytes)
+//! POST /_kivi/redundancy/fragment      (bulk lane, group-independent:
+//!                                       body: opaque fragment proto bytes)
 //! ```
 //!
 //! Bodies are compact Kivi-owned binary formats (never JSON). HTTP carries
@@ -56,7 +58,8 @@
 //!
 //! ## Bounds
 //!
-//! No unbounded state: per-request body caps (16 MiB Raft, 8 MiB bulk),
+//! No unbounded state: per-request body caps (16 MiB Raft, 8 MiB bulk,
+//! 8 MiB + 512 B fragment for the proto envelope),
 //! bounded concurrent streams per connection (QUIC transport tuning),
 //! bounded dial backoff, per-RPC timeouts. Timeouts drop the H3 stream,
 //! which resets it — the cancellation primitive for truncated suffixes,
@@ -90,6 +93,8 @@ const MEDIA_PREPARE: &str = "application/vnd.kivi.prepare";
 const MEDIA_MANIFEST: &str = "application/vnd.kivi.manifest";
 /// Media type for chunk bodies (raw logical chunk bytes).
 const MEDIA_CHUNK: &str = "application/vnd.kivi.chunk";
+/// Media type for opaque redundancy-fragment bodies (proto bytes).
+const MEDIA_FRAGMENT: &str = "application/vnd.kivi.fragment";
 /// Media type for read-authority RPC bodies (lease batches, ALR syncs,
 /// coverage polls and their answers).
 const MEDIA_READ: &str = "application/vnd.kivi.read";
@@ -110,6 +115,18 @@ pub const MAX_RAFT_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum sidecar body in bytes (chunk bodies never exceed the 8 MiB
 /// stored-body cap; manifests peak near 2.6 MiB).
 pub const MAX_BULK_BODY_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum redundancy-fragment body in bytes: the bulk cap plus framing
+/// headroom for the fragment proto envelope.
+///
+/// A largest-legal `Put` (8 MiB fragment bytes) encodes to 8 MiB + 129 B
+/// (111 B fixed fields + 18 B header/trailer) and the matching `Bytes`
+/// reply to 8 MiB + 54 B, both past [`MAX_BULK_BODY_BYTES`]. Single-Put
+/// (no offset-chunked upload) is the deliberate choice — fragments are
+/// already the unit of erasure-coded repair, so chunking them again would
+/// add a second reassembly protocol for 129 B — and the 512 B headroom
+/// keeps every legal proto message servable while staying bounded (the
+/// proto caps still reject anything larger before allocation).
+pub const MAX_FRAGMENT_BODY_BYTES: usize = MAX_BULK_BODY_BYTES + 512;
 
 /// Saturating `u64` → QUIC varint for window tuning.
 fn varint_saturating(value: u64) -> VarInt {
@@ -608,6 +625,23 @@ impl PeerTransport {
         request: PeerRequest,
         timeout: Duration,
     ) -> Result<PeerResponse, TransportError> {
+        // Local targets short-circuit through the in-process peer handler.
+        // Self links are never dialed (a node has no link to itself), yet
+        // self-addressed RPCs are legitimate: a fragment layout may place a
+        // copy on the coordinator's own node.
+        if target == self.inner.local.node {
+            let served = {
+                let handler = Arc::clone(&self.inner.handler);
+                async move { handler.handle(target, group, request).await }
+            };
+            return match compio::time::timeout(timeout, served).await {
+                Ok(Ok(response)) => Ok(response),
+                Ok(Err(error)) => Err(TransportError::RemoteRefused {
+                    detail: error.detail,
+                }),
+                Err(_) => Err(TransportError::Timeout),
+            };
+        }
         let known = self
             .inner
             .links
@@ -1158,9 +1192,15 @@ impl MeshDriver {
             // drain tooling expect `Timeout`, never a hang).
             return Err(Fault::Timeout);
         }
-        let max_body = match command.lane {
-            Lane::Control => MAX_RAFT_BODY_BYTES,
-            Lane::Bulk => MAX_BULK_BODY_BYTES,
+        // Fragment replies carry the proto envelope over up to 8 MiB of
+        // fragment bytes, so they need the fragment headroom even though
+        // they ride the bulk lane like the sidecars.
+        let max_body = match &command.request {
+            PeerRequest::Fragment(_) => MAX_FRAGMENT_BODY_BYTES,
+            _ => match command.lane {
+                Lane::Control => MAX_RAFT_BODY_BYTES,
+                Lane::Bulk => MAX_BULK_BODY_BYTES,
+            },
         };
         let (path, body) =
             crate::peer::encode_h3_request(&command.request, command.group.tablet().as_u64());
@@ -1620,11 +1660,14 @@ impl MeshDriver {
         if let Some(link) = inner.link(from) {
             *link.incarnation.lock().await = Some(incarnation);
         }
-        // Bodies are Raft POSTs, the small bulk preflight POST, or empty
-        // bulk GETs; cap everything.
+        // Bodies are Raft POSTs, the small bulk preflight POST, empty
+        // bulk GETs, or opaque fragment POSTs; cap everything. The
+        // fragment path needs the proto-envelope headroom over the bulk
+        // cap (a largest-legal Put is 8 MiB + 129 B on the wire).
         let path = request.uri().path().to_owned();
-        let is_bulk = path.starts_with("/_kivi/immutable/");
-        let cap = if is_bulk {
+        let cap = if path == crate::peer::route::FRAGMENT_PATH {
+            MAX_FRAGMENT_BODY_BYTES
+        } else if path.starts_with("/_kivi/immutable/") {
             MAX_BULK_BODY_BYTES
         } else {
             MAX_RAFT_BODY_BYTES
@@ -1670,9 +1713,10 @@ impl MeshDriver {
         // First validated request of a lane marks inbound connectivity
         // (the dialer opens one QUIC connection per lane).
         let lane = match &decoded.request {
-            PeerRequest::Manifest(_) | PeerRequest::Chunk(_) | PeerRequest::Prepare(_) => {
-                Lane::Bulk
-            }
+            PeerRequest::Manifest(_)
+            | PeerRequest::Chunk(_)
+            | PeerRequest::Prepare(_)
+            | PeerRequest::Fragment(_) => Lane::Bulk,
             _ => Lane::Control,
         };
         self.note_inbound_lane(from, lane, conn);
@@ -1688,13 +1732,15 @@ impl MeshDriver {
         match answer {
             Ok(response) => {
                 let media = match &response {
-                    PeerResponse::Vote(_) | PeerResponse::PreVote(_) | PeerResponse::Append(_) => {
-                        MEDIA_RAFT
-                    }
-                    PeerResponse::Snapshot(_) => MEDIA_RAFT,
+                    PeerResponse::Vote(_)
+                    | PeerResponse::PreVote(_)
+                    | PeerResponse::Append(_)
+                    | PeerResponse::Snapshot(_)
+                    | PeerResponse::ControlForward(_) => MEDIA_RAFT,
                     PeerResponse::Prepared(_) => MEDIA_PREPARE,
                     PeerResponse::Manifest(_) => MEDIA_MANIFEST,
                     PeerResponse::Chunk(_) => MEDIA_CHUNK,
+                    PeerResponse::Fragment(_) => MEDIA_FRAGMENT,
                     PeerResponse::Lease(_)
                     | PeerResponse::AlrSync(_)
                     | PeerResponse::Coverage(_) => MEDIA_READ,

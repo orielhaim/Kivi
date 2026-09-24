@@ -29,6 +29,11 @@ kivi-client.workspace = true
 kivi-engine.workspace = true
 kivi-durability.workspace = true
 kivi-checkpoint.workspace = true
+# Distributed redundancy acceptance + benchmarks: the suite drives the
+# `/v1/redundancy/*` admin plane and computes canonical asset identities
+# (BLAKE3 for generic/checkpoint families) exactly like the coordinator.
+kivi-redundancy.workspace = true
+kivi-codec.workspace = true
 bytes.workspace = true
 anyhow.workspace = true
 clap.workspace = true
@@ -40,6 +45,8 @@ tempfile.workspace = true
 
 [dev-dependencies]
 divan.workspace = true
+# Redundancy suites speak the admin plane's base64 image encoding.
+base64 = "0.23"
 # Ecosystem/reference client: conformance cross-checks and the redis-rs →
 # Kivi compatibility test only. Benchmark targets and the harness speak raw
 # RESP so Kivi-vs-Redis comparisons share one identical transport.

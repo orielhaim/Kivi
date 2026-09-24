@@ -52,12 +52,15 @@ pub mod command;
 pub mod config;
 pub mod consistency;
 pub mod control;
+pub mod distcoord;
+pub mod fragments;
 pub mod gate;
 pub mod multi;
 pub mod mutation;
 pub mod node;
 pub mod peer;
 pub mod preflight;
+pub mod redundancy;
 pub mod router;
 pub mod shared;
 pub mod sidecar;
@@ -85,6 +88,7 @@ pub use control::{
     CATCH_UP_LAG_THRESHOLD, ObservationAuthority, ObservedMembership, ReconcileStep, caught_up,
     next_step, observation_authority, select_authoritative,
 };
+pub use fragments::FragmentClient;
 pub use gate::{SidecarGate, sidecar_io_error};
 pub use multi::{ConsensusNode, ControlGroupConfig, MultiNodeConfig};
 pub use mutation::{
@@ -97,17 +101,22 @@ pub use peer::{
     AuthReject, CAP_CONSENSUS_V2, CAP_SIDECAR_V1, DecodedH3Request, IncarnationTable,
     LEASE_BATCH_CAP, LEASE_BATCH_VERSION, LEASE_ROSTER_CAP, PeerAlrSyncRequest,
     PeerAlrSyncResponse, PeerAppendRequest, PeerAppendResponse, PeerChunkRequest,
-    PeerChunkResponse, PeerCoveragePoll, PeerCoverageReport, PeerEntry, PeerEntryPayload,
-    PeerIdentity, PeerLeaseBatch, PeerLogId, PeerManifestRequest, PeerManifestResponse,
-    PeerPrepareRequest, PeerPreparedResponse, PeerRequest, PeerResponse, PeerRpcError,
-    PeerSnapshotMeta, PeerSnapshotRequest, PeerSnapshotResponse, PeerVote, PeerVoteRequest,
-    PeerVoteResponse, REQUIRED_CAPABILITIES, ValidatedPeer, decode_h3_request, decode_h3_response,
-    encode_h3_request, encode_h3_response, encode_lease_message, h3_media_type, h3_method,
-    h3_request_path, id32_hex, parse_id32_hex, route, validate_peer_headers,
+    PeerChunkResponse, PeerControlForwardRequest, PeerControlForwardResponse, PeerCoveragePoll,
+    PeerCoverageReport, PeerEntry, PeerEntryPayload, PeerIdentity, PeerLeaseBatch, PeerLogId,
+    PeerManifestRequest, PeerManifestResponse, PeerPrepareRequest, PeerPreparedResponse,
+    PeerRequest, PeerResponse, PeerRpcError, PeerSnapshotMeta, PeerSnapshotRequest,
+    PeerSnapshotResponse, PeerVote, PeerVoteRequest, PeerVoteResponse, REQUIRED_CAPABILITIES,
+    ValidatedPeer, decode_h3_request, decode_h3_response, encode_h3_request, encode_h3_response,
+    encode_lease_message, h3_media_type, h3_method, h3_request_path, id32_hex, parse_id32_hex,
+    route, validate_peer_headers,
 };
 pub use preflight::{
     PreflightMetrics, PreflightMetricsSnapshot, PreflightOutcome, followers_needed,
     preflight_to_quorum, quorum_needed,
+};
+pub use redundancy::{
+    protect_chunk_sidecar, protect_sidecar, read_chunk_via_fabric, read_sidecar_via_fabric,
+    sidecar_assets, sidecar_chunk_asset,
 };
 pub use router::{
     GroupNetworkFactory, PeerRouter, RpcCodecError, decode_append_request, decode_snapshot_meta,
@@ -134,9 +143,12 @@ pub use store::{
     CONSENSUS_LANE, ConsensusLogStore, DurableLogReader, DurableRaftStore, StoreOpenError,
 };
 pub use tls::{CertFingerprint, NodeCert, TlsError, TrustRegistry, empty_trust};
-pub use transport::{PeerHandler, PeerStats, PeerTransport, TransportConfig, TransportError};
+pub use transport::{
+    MAX_BULK_BODY_BYTES, MAX_FRAGMENT_BODY_BYTES, MAX_RAFT_BODY_BYTES, PeerHandler, PeerStats,
+    PeerTransport, TransportConfig, TransportError,
+};
 pub use types::{
     CONTROL_TABLET_RAW, ConsensusError, ConsensusGroupId, ConsensusLogIndex, ConsensusTerm,
-    LeaderHint, ReadBarrier, ReplicaId, ReplicaRole,
+    ControlProposeError, LeaderHint, ReadBarrier, ReplicaId, ReplicaRole,
 };
 pub use worker::{tablets_for_worker, worker_for_tablet};

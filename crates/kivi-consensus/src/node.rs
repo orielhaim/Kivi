@@ -109,6 +109,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use kivi_redundancy::LocalFragmentStore;
 use kivi_state::{DurableOutcome, OpError, Operation, OperationResult};
 use kivi_types::{
     ClusterId, CommitPosition, FreshnessReceipt, IdempotencyKey, MutationIdentity, NamespaceId,
@@ -134,8 +135,8 @@ use crate::state_machine::{ProposalGate, ReplicatedStateMachine};
 use crate::store::{ConsensusLogStore, DurableRaftStore};
 use crate::transport::{PeerHandler, PeerStats, PeerTransport, TransportConfig};
 use crate::types::{
-    ConsensusError, ConsensusGroupId, ConsensusLogIndex, ConsensusTerm, LeaderHint, ReadBarrier,
-    ReplicaId, ReplicaRole,
+    ConsensusError, ConsensusGroupId, ConsensusLogIndex, ConsensusTerm, ControlProposeError,
+    LeaderHint, ReadBarrier, ReplicaId, ReplicaRole,
 };
 
 /// How long `AtLeast` waits for local applied coverage before failing.
@@ -257,6 +258,12 @@ pub enum NodeOpenError {
     /// Immutable sidecar store failed to open.
     #[error("sidecar store failed: {reason}")]
     Sidecar {
+        /// Human-readable cause.
+        reason: String,
+    },
+    /// Redundancy fragment store failed to open.
+    #[error("fragment store failed: {reason}")]
+    Fragments {
         /// Human-readable cause.
         reason: String,
     },
@@ -459,8 +466,8 @@ pub(crate) enum OwnerRequest {
         group: ConsensusGroupId,
         /// Typed control mutation.
         mutation: kivi_control::ControlMutation,
-        /// Committed index or human-readable reason.
-        reply: Reply<Result<ConsensusLogIndex, String>>,
+        /// Committed index or typed control-proposal error.
+        reply: Reply<Result<ConsensusLogIndex, ControlProposeError>>,
     },
     /// Quorum-commit one chunked operation with preflight: the owner
     /// pre-distributes sidecars to a write quorum, then prepares the
@@ -775,9 +782,13 @@ impl OwnerRequest {
                     detail: format!("group not served by node {}", local.as_u64()),
                 }));
             }
-            Self::SnapshotPurge { group, reply, .. }
-            | Self::ProposeControl { group, reply, .. } => {
+            Self::SnapshotPurge { group, reply, .. } => {
                 let _ = reply.send(Err(unroutable(group, local)));
+            }
+            Self::ProposeControl { group, reply, .. } => {
+                let _ = reply.send(Err(ControlProposeError::Unavailable {
+                    detail: unroutable(group, local),
+                }));
             }
             Self::AddLearner { group, reply, .. }
             | Self::ChangeMembership { group, reply, .. }
@@ -2329,6 +2340,9 @@ where
             machine,
             sidecar,
             gate,
+            // Single-group nodes serve no fragments: the multi-tablet
+            // node threads its store here instead.
+            fragments: None,
             transport: transport.clone(),
             group,
             namespace,
@@ -2502,6 +2516,11 @@ pub(crate) struct OwnerCtx<S> {
     pub(crate) machine: ReplicatedStateMachine,
     pub(crate) sidecar: SidecarStore,
     pub(crate) gate: SidecarGate,
+    /// Node-local redundancy fragment store (`None` when fragments are
+    /// disabled: fragment RPCs are refused as shutting down). Shared by
+    /// every replica on the node (content-addressed, group-independent);
+    /// `Arc` because the store is `!Clone` but `Send + Sync`.
+    pub(crate) fragments: Option<Arc<LocalFragmentStore>>,
     pub(crate) transport: PeerTransport,
     pub(crate) group: ConsensusGroupId,
     pub(crate) namespace: NamespaceId,
@@ -2596,10 +2615,12 @@ where
                 reply,
             } => {
                 if group != self.group {
-                    let _ = reply.send(Err(format!("group {group} not served here")));
+                    let _ = reply.send(Err(ControlProposeError::Unavailable {
+                        detail: format!("group {group} not served here"),
+                    }));
                     return;
                 }
-                let outcome = self.propose_control(mutation).await;
+                let outcome = self.propose_control_typed(mutation).await;
                 let _ = reply.send(outcome);
             }
             OwnerRequest::ProposeChunked {
@@ -2889,16 +2910,38 @@ where
     /// Quorum-commits one typed control-plane mutation and answers the
     /// committed index (control entries carry no client outcome). Runs
     /// on the owner thread.
-    async fn propose_control(
+    pub(crate) async fn propose_control_typed(
         &self,
         mutation: kivi_control::ControlMutation,
-    ) -> Result<ConsensusLogIndex, String> {
+    ) -> Result<ConsensusLogIndex, ControlProposeError> {
+        use openraft::errors::{ClientWriteError, RaftError};
         let response = self
             .raft
             .client_write(ConsensusCommand::Control(mutation))
             .await
-            .map_err(|error| format!("control write failed: {error}"))?;
+            .map_err(|error| match &error {
+                RaftError::APIError(ClientWriteError::ForwardToLeader(forward)) => {
+                    ControlProposeError::NotLeader {
+                        leader: forward.leader_id.map(NodeId::from_u64),
+                    }
+                }
+                _ => ControlProposeError::Unavailable {
+                    detail: format!("control write failed: {error}"),
+                },
+            })?;
         Ok(ConsensusLogIndex::new(response.log_id.index))
+    }
+
+    /// Quorum-commits one typed control-plane mutation and answers a
+    /// human-readable failure for the legacy proposal front.
+    #[allow(dead_code)]
+    async fn propose_control(
+        &self,
+        mutation: kivi_control::ControlMutation,
+    ) -> Result<ConsensusLogIndex, String> {
+        self.propose_control_typed(mutation)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     /// Quorum-commits one deterministic command and maps the result onto
@@ -3479,8 +3522,10 @@ where
     /// go straight to Raft; snapshot fragments reassemble here and
     /// install whole via `install_full_snapshot` once complete; manifest
     /// and chunk sidecars serve from the local sidecar store on the bulk
-    /// lane (content identity only, never pack offsets); preflight
-    /// prepares immutable roots through the durability gate on the bulk
+    /// lane (content identity only, never pack offsets); redundancy
+    /// fragments serve from the node-local fragment store on the bulk
+    /// lane (opaque proto bytes, incarnation-fenced, group-independent);
+    /// preflight prepares immutable roots through the durability gate on the bulk
     /// lane (same acquisition primitives as the append gate, replying
     /// only once durable — never consensus, never logical state).
     async fn serve_rpc(
@@ -3489,12 +3534,16 @@ where
         group: ConsensusGroupId,
         request: PeerRequest,
     ) -> Result<PeerResponse, PeerRpcError> {
-        // Sidecars are group-independent (content-addressed, domain-scoped)
-        // and decode with a zero tablet: serve before the group check.
+        // Sidecars and redundancy fragments are group-independent
+        // (content-addressed, domain-scoped) and decode with a zero
+        // tablet: serve before the group check.
         match request {
             PeerRequest::Manifest(request) => return self.serve_manifest(request).await,
             PeerRequest::Chunk(request) => return self.serve_chunk(request).await,
             PeerRequest::Prepare(request) => return self.serve_prepare(request).await,
+            PeerRequest::Fragment(bytes) => {
+                return self.serve_redundancy_fragment(&bytes);
+            }
             _ => {}
         }
         if group != self.group {
@@ -3507,7 +3556,41 @@ where
             PeerRequest::Lease(batch) => Ok(self.serve_lease(from, batch)),
             PeerRequest::AlrSync(request) => self.serve_alr_sync(request).await,
             PeerRequest::CoveragePoll(poll) => self.serve_coverage(poll).await,
+            PeerRequest::ControlForward(request) => {
+                self.serve_control_forward(group, request).await
+            }
             other => serve_peer_request(&self.raft, other).await,
+        }
+    }
+
+    async fn serve_control_forward(
+        &self,
+        group: ConsensusGroupId,
+        request: crate::peer::PeerControlForwardRequest,
+    ) -> Result<PeerResponse, PeerRpcError> {
+        if group != ConsensusGroupId::control() {
+            return Err(PeerRpcError {
+                detail: format!("control forward refused for {group}"),
+            });
+        }
+        let mutation =
+            kivi_control::ControlMutation::decode_exact(&request.mutation).map_err(|error| {
+                PeerRpcError {
+                    detail: format!("control forward mutation decode failed: {error}"),
+                }
+            })?;
+        match self.propose_control_typed(mutation).await {
+            Ok(index) => Ok(PeerResponse::ControlForward(
+                crate::peer::PeerControlForwardResponse { index: index.get() },
+            )),
+            Err(ControlProposeError::NotLeader { leader }) => {
+                let detail = leader.map_or_else(
+                    || "control forward: leader unknown".to_owned(),
+                    |leader| format!("control forward: leader {}", leader.as_u64()),
+                );
+                Err(PeerRpcError { detail })
+            }
+            Err(ControlProposeError::Unavailable { detail }) => Err(PeerRpcError { detail }),
         }
     }
 
@@ -3588,6 +3671,21 @@ where
         Ok(PeerResponse::Prepared(crate::peer::PeerPreparedResponse {
             manifest: request.manifest,
         }))
+    }
+
+    /// Serves one redundancy fragment RPC from the node-local fragment
+    /// store: proto-decode, incarnation fence, then dispatch (stage
+    /// verifies hashes before storing; fetch never serves bad bytes).
+    /// Group-independent like the sidecars — any replica serves from the
+    /// shared store. Protocol-level faults refuse the RPC; stale, missing,
+    /// and oversize verdicts return as encoded `Refused` answers; bulk
+    /// bytes are metered by the transport lane counters, never here.
+    fn serve_redundancy_fragment(&self, bytes: &[u8]) -> Result<PeerResponse, PeerRpcError> {
+        crate::fragments::handle_fragment_rpc(
+            self.fragments.as_deref(),
+            self.incarnation.as_u64(),
+            bytes,
+        )
     }
 
     /// Buffers one snapshot fragment; on `done`, validates and installs

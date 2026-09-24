@@ -14,6 +14,7 @@ mod cluster;
 mod compound;
 mod control;
 mod logging;
+mod redundancy_admin;
 #[cfg(feature = "redis-compat")]
 mod resp;
 #[cfg(feature = "redis-compat")]
