@@ -144,7 +144,6 @@ fn lost_response_failover_is_exactly_once() {
 #[test]
 fn full_cluster_restart_preserves_state() {
     let mut cluster = Cluster::spawn().expect("cluster spawns");
-    let _ = cluster.wait_leader();
     let client = cluster.client();
     for (name, value) in [("a", "1"), ("b", "2"), ("c", "3")] {
         client
@@ -175,7 +174,6 @@ fn full_cluster_restart_preserves_state() {
 #[test]
 fn restarted_member_advances_incarnation() {
     let mut cluster = Cluster::spawn().expect("cluster spawns");
-    let _ = cluster.wait_leader();
     let before: Vec<u64> = (0..3).map(|i| cluster.incarnation(i)).collect();
     cluster.restart(1).expect("member restarts");
     let after = cluster.incarnation(1);

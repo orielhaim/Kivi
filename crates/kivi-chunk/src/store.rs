@@ -461,6 +461,13 @@ impl ChunkStore {
     ///
     /// Returns [`ChunkError`] on oversize bodies or append I/O failure.
     pub fn stage_chunk(&mut self, id: ChunkId, bytes: &[u8]) -> Result<StageOutcome, ChunkError> {
+        let computed = kivi_codec::integrity::chunk_id(self.domain, bytes);
+        if computed != id {
+            return Err(ChunkError::CorruptChunk {
+                id,
+                detail: format!("claimed id does not match bytes: {computed}"),
+            });
+        }
         if let Some(location) = self.chunks.get(&id) {
             let durable = self.is_durable_gen(location.generation);
             if durable {
@@ -472,9 +479,6 @@ impl ChunkStore {
                 durable,
             });
         }
-        // Defensive: the address must name these exact bytes, or the
-        // caller hashed wrong — never index a lie.
-        debug_assert_eq!(kivi_codec::integrity::chunk_id(self.domain, bytes), id);
         let record = encode_chunk_record(id, bytes.len() as u64, bytes);
         self.append_record(&record)?;
         self.chunks.insert(
@@ -509,6 +513,13 @@ impl ChunkStore {
         id: ManifestId,
         canonical: &[u8],
     ) -> Result<StageOutcome, ChunkError> {
+        let manifest = verify_manifest(id, canonical)?;
+        if manifest.domain != self.domain {
+            return Err(ChunkError::CorruptManifest {
+                id,
+                detail: "staged manifest names a foreign security domain".to_owned(),
+            });
+        }
         if let Some(location) = self.manifests.get(&id) {
             let durable = self.is_durable_gen(location.generation);
             if durable {
@@ -518,13 +529,6 @@ impl ChunkStore {
             return Ok(StageOutcome {
                 inserted: false,
                 durable,
-            });
-        }
-        let manifest = verify_manifest(id, canonical)?;
-        if manifest.domain != self.domain {
-            return Err(ChunkError::CorruptManifest {
-                id,
-                detail: "staged manifest names a foreign security domain".to_owned(),
             });
         }
         let record = encode_manifest_record(id, canonical);
@@ -846,6 +850,20 @@ mod tests {
         assert!(again.durable);
         assert_eq!(store.stats().dedup_hits, 1);
         assert_eq!(store.stats().dedup_bytes_saved, 4096);
+    }
+
+    #[test]
+    fn dedup_still_verifies_the_claimed_identity() {
+        let scratch = tempfile::tempdir().expect("scratch");
+        let mut store = open_store(scratch.path());
+        let bytes = vec![7u8; 128];
+        let id = chunk_id(DOMAIN, &bytes);
+        store.stage_chunk(id, &bytes).expect("stages");
+        store.sync().expect("syncs");
+        assert!(matches!(
+            store.stage_chunk(id, &[8u8; 128]),
+            Err(ChunkError::CorruptChunk { .. })
+        ));
     }
 
     #[test]

@@ -183,7 +183,6 @@ fn directory_version(cluster: &Cluster, index: usize) -> u64 {
 #[test]
 fn rejoin_lifecycle_survives_ten_restart_cycles() {
     let mut cluster = Cluster::spawn_ordered(4).expect("ordered cluster spawns");
-    let _ = cluster.wait_all_leaders();
     let _ = cluster.set_policy(&serde_json::json!({
         "auto_split": false,
         "auto_merge": false,
@@ -293,5 +292,4 @@ fn rejoin_lifecycle_survives_ten_restart_cycles() {
     assert_eq!(got_sorted, expected_sorted, "final scan matches model");
     assert_eq!(cluster.total_intents(), 0, "no stuck intents");
     eprintln!("rejoin: {CYCLES} restart cycles verified on one client");
-    cluster.kill_all();
 }

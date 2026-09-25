@@ -124,6 +124,27 @@ impl openraft_multi::GroupRouter<KiviTypeConfig, ConsensusGroupId> for SharedReg
         })
     }
 
+    async fn pre_vote(
+        &self,
+        target: u64,
+        group_id: ConsensusGroupId,
+        rpc: openraft::raft::VoteRequest<KiviTypeConfig>,
+        _option: openraft::network::RPCOption,
+    ) -> Result<
+        openraft::raft::VoteResponse<KiviTypeConfig>,
+        openraft::errors::RPCError<KiviTypeConfig>,
+    > {
+        use openraft::errors::{RPCError, Unreachable};
+        let group = group_id.tablet().as_u64();
+        let Some(raft) = self.lookup(group, target) else {
+            return Err(RPCError::Unreachable(unreachable(target, group)));
+        };
+        raft.pre_vote(rpc).await.map_err(|error| {
+            let source = std::io::Error::other(error.to_string());
+            RPCError::Unreachable(Unreachable::new(&source))
+        })
+    }
+
     #[allow(clippy::unused_async_trait_impl)]
     async fn full_snapshot(
         &self,

@@ -20,6 +20,7 @@
 //! race-free in effect, never silent. Restarts reuse static ports (the
 //! mesh heals through the restarted member's outbound dials).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read as _, Write as _};
 use std::net::TcpStream;
 use std::path::PathBuf;
@@ -75,6 +76,14 @@ impl std::fmt::Debug for ClusterNode {
             .field("native", &self.native)
             .field("alive", &self.child.is_some())
             .finish_non_exhaustive()
+    }
+}
+
+impl Drop for ClusterNode {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            terminate_child(&mut child);
+        }
     }
 }
 
@@ -142,6 +151,195 @@ fn free_udp_addr() -> String {
 
 /// One member's ordered tiling view: `(tablet, range_start, range_end)`.
 type Tiling = Vec<(u64, Vec<u8>, Option<Vec<u8>>)>;
+
+#[derive(Debug, Clone)]
+struct TabletStatus {
+    role: String,
+    applied: u64,
+    voters: Option<BTreeSet<u64>>,
+}
+
+type TabletStatuses = BTreeMap<u64, TabletStatus>;
+type LeaderRound = (BTreeSet<u64>, Vec<(u64, usize)>);
+
+fn terminate_child(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn parse_single_tablet(value: &Value) -> Option<(String, u64)> {
+    let object = value.as_object()?;
+    let _group = object.get("group")?.as_u64()?;
+    let role = object.get("role")?.as_str()?;
+    if !matches!(role, "leader" | "follower" | "candidate") {
+        return None;
+    }
+    let applied = object.get("applied")?.as_u64()?;
+    Some((role.to_owned(), applied))
+}
+
+fn parse_tablet_statuses(value: &Value) -> Option<TabletStatuses> {
+    let entries = value.as_array()?;
+    let mut statuses = TabletStatuses::new();
+    for entry in entries {
+        let group = entry.get("group")?.as_u64()?;
+        let role = entry.get("role")?.as_str()?.to_owned();
+        if !matches!(role.as_str(), "leader" | "follower" | "candidate") {
+            return None;
+        }
+        let applied = entry.get("applied")?.as_u64()?;
+        let voters = match entry.get("voters") {
+            Some(Value::Array(values)) => {
+                let mut voters = BTreeSet::new();
+                for value in values {
+                    if !voters.insert(value.as_u64()?) {
+                        return None;
+                    }
+                }
+                Some(voters)
+            }
+            Some(Value::Null) => None,
+            Some(_) | None => return None,
+        };
+        if statuses
+            .insert(
+                group,
+                TabletStatus {
+                    role,
+                    applied,
+                    voters,
+                },
+            )
+            .is_some()
+        {
+            return None;
+        }
+    }
+    Some(statuses)
+}
+
+fn parse_active_tablets(value: &Value) -> Option<BTreeSet<u64>> {
+    let _ = value.get("version")?.as_u64()?;
+    let entries = value.get("tablets")?.as_array()?;
+    let mut all = BTreeSet::new();
+    let mut active = BTreeSet::new();
+    for entry in entries {
+        let tablet = entry.get("tablet")?.as_u64()?;
+        let state = entry.get("state")?.as_str()?;
+        if !matches!(
+            state,
+            "Allocated" | "Inactive" | "Active" | "Fenced" | "Tombstone"
+        ) {
+            return None;
+        }
+        if !all.insert(tablet) {
+            return None;
+        }
+        if state == "Active" {
+            active.insert(tablet);
+        }
+    }
+    Some(active)
+}
+
+fn tablet_voters(
+    views: &[(usize, TabletStatuses)],
+    live_nodes: &[(usize, u64)],
+    tablet: u64,
+) -> Option<BTreeSet<u64>> {
+    let mut voters = None;
+    for (_, statuses) in views {
+        let Some(status) = statuses.get(&tablet) else {
+            continue;
+        };
+        let current = status.voters.as_ref()?;
+        if let Some(previous) = &voters
+            && previous != current
+        {
+            return None;
+        }
+        if voters.is_none() {
+            voters = Some(current.clone());
+        }
+    }
+    let voters = voters?;
+    if voters.is_empty()
+        || !voters
+            .iter()
+            .any(|node| live_nodes.iter().any(|(_, live)| live == node))
+    {
+        return None;
+    }
+    for (index, node) in live_nodes {
+        if voters.contains(node)
+            && views
+                .iter()
+                .find(|(view_index, _)| view_index == index)
+                .and_then(|(_, statuses)| statuses.get(&tablet))
+                .is_none()
+        {
+            return None;
+        }
+    }
+    Some(voters)
+}
+
+fn leaders_from_views(
+    views: &[(usize, TabletStatuses)],
+    live_nodes: &[(usize, u64)],
+    active: &BTreeSet<u64>,
+) -> Option<Vec<(u64, usize)>> {
+    let mut leaders = Vec::with_capacity(active.len());
+    for tablet in active {
+        let voters = tablet_voters(views, live_nodes, *tablet)?;
+        let mut leader = None;
+        for (index, statuses) in views {
+            if statuses
+                .get(tablet)
+                .is_some_and(|status| status.role == "leader")
+                && leader.replace(*index).is_some()
+            {
+                return None;
+            }
+        }
+        let leader = leader?;
+        let leader_node = live_nodes
+            .iter()
+            .find_map(|(index, node)| (*index == leader).then_some(*node))?;
+        if !voters.contains(&leader_node) {
+            return None;
+        }
+        leaders.push((*tablet, leader));
+    }
+    Some(leaders)
+}
+
+fn converged_applied(
+    views: &[(usize, TabletStatuses)],
+    live_nodes: &[(usize, u64)],
+    active: &BTreeSet<u64>,
+) -> Option<BTreeMap<u64, u64>> {
+    let mut converged = BTreeMap::new();
+    for tablet in active {
+        let _ = tablet_voters(views, live_nodes, *tablet)?;
+        let mut watermark: Option<u64> = None;
+        for (_, statuses) in views {
+            let Some(status) = statuses.get(tablet) else {
+                continue;
+            };
+            if let Some(previous) = watermark
+                && previous != status.applied
+            {
+                return None;
+            }
+            if watermark.is_none() {
+                watermark = Some(status.applied);
+            }
+        }
+        converged.insert(*tablet, watermark?);
+    }
+    Some(converged)
+}
 
 impl Cluster {
     /// Spawns a fresh 3-node single-tablet cluster (new data directories)
@@ -752,10 +950,7 @@ impl Cluster {
     /// Panics when the endpoint errors.
     #[must_use]
     pub fn role(&self, index: usize) -> String {
-        self.tablet(index)["role"]
-            .as_str()
-            .unwrap_or("?")
-            .to_owned()
+        parse_single_tablet(&self.tablet(index)).map_or_else(|| "?".to_owned(), |(role, _)| role)
     }
 
     /// Applied log index of one member.
@@ -765,7 +960,61 @@ impl Cluster {
     /// Panics when the endpoint errors or the field is missing.
     #[must_use]
     pub fn applied(&self, index: usize) -> u64 {
-        self.tablet(index)["applied"].as_u64().unwrap_or(u64::MAX)
+        parse_single_tablet(&self.tablet(index))
+            .map(|(_, applied)| applied)
+            .expect("tablet applied")
+    }
+
+    /// Current Raft term for one member.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the member endpoint fails or omits a numeric term.
+    pub fn term(&self, index: usize) -> Result<u64, String> {
+        let (status, json) = self.admin_get(index, "/v1/tablet");
+        if status != 200 {
+            return Err(format!("GET /v1/tablet on node {index}: status {status}"));
+        }
+        json.get("term")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| format!("node {index} response has no term: {json}"))
+    }
+
+    /// Waits while a member keeps the expected term for the full window.
+    ///
+    /// This is an observation window, not a settle delay: a term change
+    /// fails immediately with the member's current term.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the member cannot be queried or its term changes.
+    pub fn wait_term_unchanged(
+        &self,
+        index: usize,
+        expected: u64,
+        window: Duration,
+    ) -> Result<(), String> {
+        let deadline = Instant::now() + window;
+        loop {
+            let current = self.term(index)?;
+            if current != expected {
+                return Err(format!(
+                    "member {index} changed term during isolation window: expected {expected}, got {current}"
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn single_tablet_applied(&self, index: usize) -> Option<u64> {
+        let (status, json) = self.admin_get(index, "/v1/tablet");
+        if status != 200 {
+            return None;
+        }
+        parse_single_tablet(&json).map(|(_, applied)| applied)
     }
 
     /// Incarnation of one member.
@@ -868,15 +1117,21 @@ impl Cluster {
         let deadline = Instant::now() + CONVERGE_TIMEOUT;
         loop {
             let mut ready = true;
+            let mut polled = 0usize;
             for i in 0..self.nodes.len() {
                 if !self.alive(i) {
                     continue;
                 }
-                if self.applied(i) < index {
+                let Some(applied) = self.single_tablet_applied(i) else {
+                    ready = false;
+                    continue;
+                };
+                polled += 1;
+                if applied < index {
                     ready = false;
                 }
             }
-            if ready {
+            if ready && polled > 0 {
                 break;
             }
             assert!(
@@ -895,20 +1150,28 @@ impl Cluster {
     pub fn wait_converged(&self) {
         let deadline = Instant::now() + CONVERGE_TIMEOUT;
         loop {
-            let mut watermark = 0u64;
+            let mut watermark = None;
             let mut converged = true;
+            let mut polled = 0usize;
             for i in 0..self.nodes.len() {
                 if !self.alive(i) {
                     continue;
                 }
-                let applied = self.applied(i);
-                if watermark == 0 {
-                    watermark = applied;
-                } else if applied != watermark {
+                let Some(applied) = self.single_tablet_applied(i) else {
+                    converged = false;
+                    continue;
+                };
+                polled += 1;
+                if let Some(previous) = watermark
+                    && previous != applied
+                {
                     converged = false;
                 }
+                if watermark.is_none() {
+                    watermark = Some(applied);
+                }
             }
-            if converged && watermark > 0 {
+            if converged && polled > 0 {
                 break;
             }
             assert!(Instant::now() < deadline, "cluster never converged");
@@ -1018,10 +1281,10 @@ impl Cluster {
                 args.push("--redis-listen".to_owned());
                 args.push(redis[index].clone());
             }
-            let (child, ready_native, ready_admin, ready_resp) =
+            let (mut child, ready_native, ready_admin, ready_resp) =
                 spawn_member(binary, &args, data_dir.path(), extra_env, ready_timeout)?;
             if want_resp && ready_resp.is_none() {
-                drop(child);
+                terminate_child(&mut child);
                 return Err(SpawnError::RespUnavailable);
             }
             nodes.push(ClusterNode {
@@ -1082,6 +1345,46 @@ impl Cluster {
     pub fn tablets_status_opt(&self, index: usize) -> Option<Value> {
         let (status, json) = self.admin_get(index, "/v1/tablets");
         (status == 200).then_some(json)
+    }
+
+    fn tablet_statuses(&self, index: usize) -> Option<TabletStatuses> {
+        let (status, json) = self.admin_get(index, "/v1/tablets");
+        if status != 200 {
+            return None;
+        }
+        parse_tablet_statuses(&json)
+    }
+
+    fn active_tablets(&self, live_nodes: &[(usize, u64)]) -> Option<BTreeSet<u64>> {
+        let mut expected = None;
+        for (index, _) in live_nodes {
+            let (status, json) = self.admin_get(*index, "/v1/directory");
+            if status != 200 {
+                return None;
+            }
+            let current = parse_active_tablets(&json)?;
+            if current.is_empty() {
+                return None;
+            }
+            if let Some(previous) = &expected
+                && previous != &current
+            {
+                return None;
+            }
+            if expected.is_none() {
+                expected = Some(current);
+            }
+        }
+        expected
+    }
+
+    fn convergence_round(&self, live_nodes: &[(usize, u64)]) -> Option<BTreeMap<u64, u64>> {
+        let active = self.active_tablets(live_nodes)?;
+        let views = live_nodes
+            .iter()
+            .map(|(index, _)| Some((*index, self.tablet_statuses(*index)?)))
+            .collect::<Option<Vec<_>>>()?;
+        converged_applied(&views, live_nodes, &active)
     }
 
     /// Tablet ids served by one member (from `/v1/tablets`).
@@ -1152,56 +1455,40 @@ impl Cluster {
     #[must_use = "the leader map routes the next test step"]
     pub fn wait_all_leaders(&self) -> Vec<(u64, usize)> {
         let deadline = Instant::now() + LEADER_TIMEOUT;
-        // Tablet set first (members agree on the static set). A member
-        // under load may 503 its fan-out; retry for the set like any
-        // other poll round.
-        let tablets = loop {
-            if let Some(status) = self.tablets_status_opt(self.live_index()) {
-                break status
-                    .as_array()
-                    .expect("tablets array")
-                    .iter()
-                    .map(|tablet| tablet["group"].as_u64().expect("tablet group"))
-                    .collect::<Vec<_>>();
-            }
-            assert!(Instant::now() < deadline, "tablet set never readable");
-            std::thread::sleep(Duration::from_millis(200));
-        };
         let mut stable = 0usize;
-        let mut last: Vec<(u64, usize)> = Vec::new();
+        let mut last: Option<LeaderRound> = None;
         loop {
-            let mut current: Vec<(u64, usize)> = Vec::new();
-            let mut ok = true;
-            for tablet in &tablets {
-                // Slow members answer 503 under fan-out load: skip them
-                // this round instead of failing the whole wait.
-                let leaders: Vec<usize> = (0..self.nodes.len())
-                    .filter(|i| {
-                        self.alive(*i)
-                            && self.tablets_status_opt(*i).is_some_and(|status| {
-                                status.as_array().is_some_and(|statuses| {
-                                    statuses.iter().any(|entry| {
-                                        entry["group"].as_u64() == Some(*tablet)
-                                            && entry["role"].as_str() == Some("leader")
-                                    })
-                                })
-                            })
-                    })
-                    .collect();
-                if leaders.len() != 1 {
-                    ok = false;
-                    break;
-                }
-                current.push((*tablet, leaders[0]));
-            }
-            if ok && current == last {
-                stable += 1;
-                if stable >= 3 {
-                    return current;
+            let live_nodes: Vec<(usize, u64)> = (0..self.nodes.len())
+                .filter(|index| self.alive(*index))
+                .map(|index| (index, self.nodes[index].node_id))
+                .collect();
+            let round = if live_nodes.is_empty() {
+                None
+            } else {
+                self.active_tablets(&live_nodes).and_then(|active| {
+                    let views = live_nodes
+                        .iter()
+                        .map(|(index, _)| Some((*index, self.tablet_statuses(*index)?)))
+                        .collect::<Option<Vec<_>>>()?;
+                    leaders_from_views(&views, &live_nodes, &active)
+                        .map(|leaders| (active, leaders))
+                })
+            };
+            if let Some((active, current)) = round {
+                if last.as_ref().is_some_and(|(last_active, last_leaders)| {
+                    last_active == &active && last_leaders == &current
+                }) {
+                    stable += 1;
+                    if stable >= 3 {
+                        return current;
+                    }
+                } else {
+                    stable = 0;
+                    last = Some((active, current));
                 }
             } else {
                 stable = 0;
-                last = current;
+                last = None;
             }
             assert!(
                 Instant::now() < deadline,
@@ -1265,37 +1552,11 @@ impl Cluster {
     pub fn wait_converged_all_timeout(&self, timeout: Duration) {
         let deadline = Instant::now() + timeout;
         loop {
-            let mut per_tablet: std::collections::BTreeMap<u64, u64> =
-                std::collections::BTreeMap::new();
-            let mut converged = true;
-            let mut polled = 0usize;
-            for i in 0..self.nodes.len() {
-                if !self.alive(i) {
-                    continue;
-                }
-                // Slow members answer 503 under fan-out load: skip them
-                // this round (a skipped member simply is not converged
-                // yet as far as this round can tell).
-                let Some(status) = self.tablets_status_opt(i) else {
-                    converged = false;
-                    continue;
-                };
-                polled += 1;
-                for entry in status.as_array().cloned().unwrap_or_default() {
-                    let tablet = entry["group"].as_u64().expect("tablet group");
-                    let applied = entry["applied"].as_u64().expect("tablet applied");
-                    match per_tablet.get(&tablet) {
-                        None => {
-                            per_tablet.insert(tablet, applied);
-                        }
-                        Some(watermark) if *watermark != applied => {
-                            converged = false;
-                        }
-                        Some(_) => {}
-                    }
-                }
-            }
-            if converged && polled > 0 && !per_tablet.is_empty() {
+            let live_nodes: Vec<(usize, u64)> = (0..self.nodes.len())
+                .filter(|index| self.alive(*index))
+                .map(|index| (index, self.nodes[index].node_id))
+                .collect();
+            if self.convergence_round(&live_nodes).is_some() {
                 break;
             }
             assert!(Instant::now() < deadline, "tablets never converged");
@@ -1872,7 +2133,7 @@ impl Cluster {
     ///
     /// Panics past the deadline or when a plan fails.
     pub fn wait_splits_done(&self, timeout: Duration) {
-        self.wait_plans_done("/v1/control/splits", "split", timeout);
+        self.wait_plans_done("/v1/control/splits", "splits", "split", timeout);
     }
 
     /// Waits until no live merge plans remain and none failed.
@@ -1881,40 +2142,41 @@ impl Cluster {
     ///
     /// Panics past the deadline or when a plan fails.
     pub fn wait_merges_done(&self, timeout: Duration) {
-        self.wait_plans_done("/v1/control/merges", "merge", timeout);
+        self.wait_plans_done("/v1/control/merges", "merges", "merge", timeout);
     }
 
-    /// Shared waiter for split/merge plan lists (`key` selects the array:
-    /// `"splits"` or `"merges"`).
-    ///
-    /// # Panics
-    ///
-    /// Panics past the deadline or when a plan fails.
-    fn wait_plans_done(&self, path: &str, what: &str, timeout: Duration) {
-        let key = path.rsplit('/').next().unwrap_or(what);
+    /// Shared waiter for replicated plan lists. Quiescence requires every
+    /// live control observer to report the same terminal plan image.
+    fn wait_plans_done(&self, path: &str, key: &str, what: &str, timeout: Duration) {
         let deadline = Instant::now() + timeout;
         loop {
-            // Quiescence requires EVERY live member at zero: control
-            // commits replicate asynchronously, so one caught-up member
-            // reporting zero must not mask a lagging member still
-            // retiring (that early return lets the next split/merge fire
-            // while the previous plan is still live elsewhere, breaking
-            // the one-live-topology-plan invariant and width counts).
             let mut live = 0usize;
             let mut failed = 0;
-            let mut probed = false;
+            let mut probed = 0usize;
+            let mut converged = true;
+            let mut reference: Option<Value> = None;
             let mut detail = String::new();
             for index in 0..self.nodes.len() {
                 if self.nodes[index].child.is_none() {
                     continue;
                 }
-                let (_, json) = self.admin_get(index, path);
+                let (status, json) = self.admin_get(index, path);
                 let Some(plans) = json.get(key).and_then(Value::as_array) else {
+                    converged = false;
+                    detail = format!("member {index}: {status} {json}");
                     continue;
                 };
-                probed = true;
-                detail = format!("{json}");
-                let node_live = plans
+                probed += 1;
+                let plans_value = Value::Array(plans.clone());
+                if let Some(expected) = &reference {
+                    if *expected != plans_value {
+                        converged = false;
+                    }
+                } else {
+                    reference = Some(plans_value);
+                }
+                detail = format!("member {index}: {json}");
+                live += plans
                     .iter()
                     .filter(|plan| {
                         !matches!(
@@ -1929,15 +2191,14 @@ impl Cluster {
                         matches!(plan.get("phase").and_then(Value::as_str), Some("Failed"))
                     })
                     .count();
-                live = live.max(node_live);
             }
-            assert!(probed, "no live member serves {what} plans");
+            assert!(probed > 0, "no live member serves {what} plans");
             assert_eq!(failed, 0, "{what} plans failed");
-            if live == 0 {
+            if converged && live == 0 {
                 return;
             }
-            eprintln!("wait {what}: {detail}");
             assert!(Instant::now() < deadline, "{what} plans never completed");
+            eprintln!("wait {what}: {detail}");
             std::thread::sleep(Duration::from_millis(500));
         }
     }
@@ -2063,52 +2324,7 @@ impl Cluster {
     ///
     /// Panics past the deadline or when a plan fails.
     pub fn wait_migrations_done(&self, timeout: Duration) {
-        let deadline = Instant::now() + timeout;
-        let mut ticks = 0u32;
-        loop {
-            let mut live = 0usize;
-            let mut failed = 0;
-            let mut probed = false;
-            let mut detail = String::new();
-            for index in 0..self.nodes.len() {
-                if self.nodes[index].child.is_none() {
-                    continue;
-                }
-                let (_, json) = self.admin_get(index, "/v1/control/migrations");
-                let Some(plans) = json.get("migrations").and_then(Value::as_array) else {
-                    continue;
-                };
-                probed = true;
-                detail = format!("{json}");
-                let node_live = plans
-                    .iter()
-                    .filter(|plan| {
-                        !matches!(
-                            plan.get("phase").and_then(Value::as_str),
-                            Some("Completed" | "Failed")
-                        )
-                    })
-                    .count();
-                failed += plans
-                    .iter()
-                    .filter(|plan| {
-                        matches!(plan.get("phase").and_then(Value::as_str), Some("Failed"))
-                    })
-                    .count();
-                live = live.max(node_live);
-            }
-            assert!(probed, "no live member serves migrations");
-            assert_eq!(failed, 0, "migration plans failed");
-            if live == 0 {
-                return;
-            }
-            ticks += 1;
-            if ticks % 20 == 1 {
-                eprintln!("wait migrations: {detail}");
-            }
-            assert!(Instant::now() < deadline, "migrations never completed");
-            std::thread::sleep(Duration::from_millis(500));
-        }
+        self.wait_plans_done("/v1/control/migrations", "migrations", "migration", timeout);
     }
 
     /// Starts draining one node (replicas migrate away, then `Drained`).
@@ -2636,8 +2852,141 @@ fn wait_ready_file(
         }
         if Instant::now() > deadline {
             let _ = child.kill();
+            let _ = child.wait();
             return WaitOutcome::TimedOut;
         }
         std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn tablet_status(role: &str, applied: u64, voters: &[u64]) -> TabletStatus {
+        TabletStatus {
+            role: role.to_owned(),
+            applied,
+            voters: Some(voters.iter().copied().collect()),
+        }
+    }
+
+    #[test]
+    fn tablet_statuses_reject_malformed_rows() {
+        let valid = json!([
+            {"group": 1, "role": "leader", "applied": 7, "voters": [1, 2, 3]}
+        ]);
+        assert!(parse_tablet_statuses(&valid).is_some());
+        for malformed in [
+            json!(null),
+            json!([{"group": 1, "role": "leader", "voters": [1]}]),
+            json!([{"group": 1, "role": "leader", "applied": "7", "voters": [1]}]),
+            json!([{"group": 1, "role": "unknown", "applied": 7, "voters": [1]}]),
+            json!([{"group": 1, "role": "leader", "applied": 7, "voters": [1, 1]}]),
+            json!([
+                {"group": 1, "role": "leader", "applied": 7, "voters": [1]},
+                {"group": 1, "role": "follower", "applied": 7, "voters": [1]}
+            ]),
+        ] {
+            assert!(parse_tablet_statuses(&malformed).is_none());
+        }
+    }
+
+    #[test]
+    fn single_tablet_rejects_missing_or_malformed_fields() {
+        assert_eq!(
+            parse_single_tablet(&json!({"group": 1, "role": "leader", "applied": 7})),
+            Some(("leader".to_owned(), 7))
+        );
+        for malformed in [
+            json!({"role": "leader", "applied": 7}),
+            json!({"group": 1, "applied": 7}),
+            json!({"group": 1, "role": "leader"}),
+            json!({"group": 1, "role": "unknown", "applied": 7}),
+            json!({"group": 1, "role": "leader", "applied": "7"}),
+        ] {
+            assert!(parse_single_tablet(&malformed).is_none());
+        }
+    }
+
+    #[test]
+    fn active_tablets_reject_malformed_directories() {
+        let valid = json!({
+            "version": 3,
+            "tablets": [
+                {"tablet": 1, "state": "Active"},
+                {"tablet": 2, "state": "Tombstone"}
+            ]
+        });
+        assert_eq!(parse_active_tablets(&valid), Some(BTreeSet::from([1])));
+        for malformed in [
+            json!({"tablets": [{"tablet": 1, "state": "Active"}]}),
+            json!({"version": 3, "tablets": [{"tablet": 1}]}),
+            json!({
+                "version": 3,
+                "tablets": [
+                    {"tablet": 1, "state": "Active"},
+                    {"tablet": 1, "state": "Tombstone"}
+                ]
+            }),
+        ] {
+            assert!(parse_active_tablets(&malformed).is_none());
+        }
+    }
+
+    #[test]
+    fn wait_rounds_reject_missing_tablets() {
+        let live_nodes = vec![(0, 1), (1, 2)];
+        let active = BTreeSet::from([1, 2]);
+        let mut first = TabletStatuses::new();
+        first.insert(1, tablet_status("leader", 7, &[1, 2]));
+        let mut second = TabletStatuses::new();
+        second.insert(1, tablet_status("follower", 7, &[1, 2]));
+        let views = vec![(0, first), (1, second)];
+        assert!(leaders_from_views(&views, &live_nodes, &active).is_none());
+        assert!(converged_applied(&views, &live_nodes, &active).is_none());
+    }
+
+    #[test]
+    fn wait_rounds_accept_complete_matching_views() {
+        let live_nodes = vec![(0, 1), (1, 2)];
+        let active = BTreeSet::from([1]);
+        let mut first = TabletStatuses::new();
+        first.insert(1, tablet_status("leader", 7, &[1, 2]));
+        let mut second = TabletStatuses::new();
+        second.insert(1, tablet_status("follower", 7, &[1, 2]));
+        let views = vec![(0, first), (1, second)];
+        assert_eq!(
+            leaders_from_views(&views, &live_nodes, &active),
+            Some(vec![(1, 0)])
+        );
+        assert_eq!(
+            converged_applied(&views, &live_nodes, &active),
+            Some(BTreeMap::from([(1, 7)]))
+        );
+    }
+
+    #[cfg(windows)]
+    fn long_lived_child() -> Child {
+        Command::new("cmd")
+            .args(["/C", "ping -n 60 127.0.0.1 >NUL"])
+            .spawn()
+            .expect("spawn child")
+    }
+
+    #[cfg(not(windows))]
+    fn long_lived_child() -> Child {
+        Command::new("sh")
+            .args(["-c", "sleep 60"])
+            .spawn()
+            .expect("spawn child")
+    }
+
+    #[test]
+    fn partial_formation_child_cleanup_waits_for_exit() {
+        let mut child = long_lived_child();
+        terminate_child(&mut child);
+        assert!(child.try_wait().expect("child status").is_some());
     }
 }

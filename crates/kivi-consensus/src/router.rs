@@ -31,9 +31,8 @@
 //! offset-keyed frames under a fresh transfer id; the receiver
 //! reassembles and calls `install_full_snapshot` once.
 //!
-//! `transfer_leader` and `stream_append` keep their defaults (unreachable
-//! error, sequential unary calls): leader transfer is not used yet, and
-//! pipelined appends can arrive without a wire change later.
+//! `stream_append` keeps the sequential default; leadership transfer has an
+//! explicit peer RPC and preserves `OpenRaft`'s structured refusal response.
 
 use std::io::Cursor;
 use std::sync::Arc;
@@ -42,7 +41,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use openraft::errors::{RPCError, StreamingError, Unreachable};
 use openraft::network::{RPCOption, RaftNetworkFactory};
 use openraft::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, VoteRequest, VoteResponse,
+    AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, TransferLeaderError,
+    TransferLeaderRequest, TransferLeaderResponse, VoteRequest, VoteResponse,
 };
 use openraft::type_config::alias::{EntryOf, LogIdOf, SnapshotMetaOf, SnapshotOf, VoteOf};
 use openraft::vote::RaftLeaderId as _;
@@ -51,8 +51,8 @@ use openraft_multi::{GroupNetworkAdapter, GroupRouter};
 use crate::config::KiviTypeConfig;
 use crate::peer::{
     PeerAppendRequest, PeerAppendResponse, PeerEntry, PeerEntryPayload, PeerLogId, PeerRequest,
-    PeerResponse, PeerSnapshotMeta, PeerSnapshotRequest, PeerVote, PeerVoteRequest,
-    PeerVoteResponse,
+    PeerResponse, PeerSnapshotMeta, PeerSnapshotRequest, PeerTransferLeaderRequest,
+    PeerTransferLeaderResponse, PeerVote, PeerVoteRequest, PeerVoteResponse,
 };
 use crate::transport::{PeerTransport, TransportError};
 use crate::types::ConsensusGroupId;
@@ -274,6 +274,66 @@ pub fn decode_vote_response(response: &PeerVoteResponse) -> VoteResponse<KiviTyp
     )
 }
 
+fn encode_transfer_leader_request(
+    request: &TransferLeaderRequest<KiviTypeConfig>,
+) -> PeerTransferLeaderRequest {
+    PeerTransferLeaderRequest {
+        from_leader: encode_wire_vote(request.from_leader()),
+        to_node: *request.to_node_id(),
+        last_log: encode_opt_log(request.last_log_id()),
+    }
+}
+
+fn decode_transfer_leader_request(
+    request: &PeerTransferLeaderRequest,
+) -> TransferLeaderRequest<KiviTypeConfig> {
+    TransferLeaderRequest::new(
+        decode_wire_vote(&request.from_leader),
+        request.to_node,
+        decode_opt_log(request.last_log.as_ref()),
+    )
+}
+
+fn encode_transfer_leader_response(
+    response: &TransferLeaderResponse<KiviTypeConfig>,
+) -> PeerTransferLeaderResponse {
+    match response {
+        Ok(()) => PeerTransferLeaderResponse::Accepted,
+        Err(TransferLeaderError::VoteChanged { expected, actual }) => {
+            PeerTransferLeaderResponse::VoteChanged {
+                expected: encode_wire_vote(expected),
+                actual: encode_wire_vote(actual),
+            }
+        }
+        Err(TransferLeaderError::LogNotFlushed { expected, actual }) => {
+            PeerTransferLeaderResponse::LogNotFlushed {
+                expected: encode_opt_log(expected.as_ref()),
+                actual: encode_opt_log(actual.as_ref()),
+            }
+        }
+    }
+}
+
+fn decode_transfer_leader_response(
+    response: &PeerTransferLeaderResponse,
+) -> TransferLeaderResponse<KiviTypeConfig> {
+    match response {
+        PeerTransferLeaderResponse::Accepted => Ok(()),
+        PeerTransferLeaderResponse::VoteChanged { expected, actual } => {
+            Err(TransferLeaderError::VoteChanged {
+                expected: decode_wire_vote(expected),
+                actual: decode_wire_vote(actual),
+            })
+        }
+        PeerTransferLeaderResponse::LogNotFlushed { expected, actual } => {
+            Err(TransferLeaderError::LogNotFlushed {
+                expected: decode_opt_log(expected.as_ref()),
+                actual: decode_opt_log(actual.as_ref()),
+            })
+        }
+    }
+}
+
 /// Encodes an outgoing append-entries request for the wire.
 ///
 /// This conversion is total over the request shape (entries encode
@@ -339,9 +399,8 @@ pub fn decode_append_response(
     }
 }
 
-/// Encodes outgoing snapshot metadata for the wire. The 0.10 metadata
-/// carries no transfer identity (that rides the fragment envelope); the
-/// checkpoint reference identifies immutable Kivi state.
+/// Encodes outgoing snapshot metadata for the wire. Transfer identity
+/// rides on the fragment envelope, not in `OpenRaft`'s logical metadata.
 #[must_use]
 pub fn encode_snapshot_meta(meta: &SnapshotMetaOf<KiviTypeConfig>) -> PeerSnapshotMeta {
     let voters: Vec<u64> = meta.last_membership.membership().voter_ids().collect();
@@ -356,22 +415,7 @@ pub fn encode_snapshot_meta(meta: &SnapshotMetaOf<KiviTypeConfig>) -> PeerSnapsh
         voters,
         nodes,
         membership_log: encode_opt_log(meta.last_membership.log_id().as_ref()),
-        checkpoint: checkpoint_of(meta),
     }
-}
-
-/// Derives the checkpoint reference bound into snapshot metadata: the
-/// state machine's snapshot bytes are content-addressed, and the durable
-/// `RaftSnapshotInstalled` record grounds the same reference. The meta
-/// itself carries no separate id in 0.10; the reference travels here so
-/// the receiver can name the installed image before streaming ends.
-fn checkpoint_of(_meta: &SnapshotMetaOf<KiviTypeConfig>) -> Vec<u8> {
-    // The checkpoint reference is content-derived by the state machine
-    // when it seals the image (see `ReplicatedStateMachine`); the
-    // transfer envelope below carries it opaquely once known. Metadata
-    // built for transfer always pairs with its bytes, so an empty
-    // reference here means "derive from the delivered bytes".
-    Vec::new()
 }
 
 /// Decodes incoming snapshot metadata from the wire.
@@ -438,6 +482,15 @@ where
                 .await
                 .map_err(|error| refused(error.to_string()))?;
             Ok(PeerResponse::PreVote(encode_vote_response(&response)))
+        }
+        PeerRequest::TransferLeader(request) => {
+            let response = raft
+                .handle_transfer_leader(decode_transfer_leader_request(&request))
+                .await
+                .map_err(|error| refused(error.to_string()))?;
+            Ok(PeerResponse::TransferLeader(
+                encode_transfer_leader_response(&response),
+            ))
         }
         PeerRequest::Append(request) => {
             let rpc =
@@ -568,6 +621,50 @@ impl GroupRouter<KiviTypeConfig, ConsensusGroupId> for PeerRouter {
             unexpected => Err(protocol_unreachable(
                 target,
                 &format!("peer answered vote with {unexpected:?}"),
+            )),
+        }
+    }
+
+    async fn pre_vote(
+        &self,
+        target: u64,
+        group_id: ConsensusGroupId,
+        rpc: VoteRequest<KiviTypeConfig>,
+        option: RPCOption,
+    ) -> Result<VoteResponse<KiviTypeConfig>, RPCError<KiviTypeConfig>> {
+        let request = PeerRequest::PreVote(encode_vote_request(&rpc));
+        let response = self
+            .call(target, group_id, request, &option)
+            .await
+            .map_err(|error| unreachable(target, &error))?;
+        match response {
+            PeerResponse::PreVote(response) => Ok(decode_vote_response(&response)),
+            unexpected => Err(protocol_unreachable(
+                target,
+                &format!("peer answered pre-vote with {unexpected:?}"),
+            )),
+        }
+    }
+
+    async fn transfer_leader(
+        &self,
+        target: u64,
+        group_id: ConsensusGroupId,
+        rpc: TransferLeaderRequest<KiviTypeConfig>,
+        option: RPCOption,
+    ) -> Result<TransferLeaderResponse<KiviTypeConfig>, RPCError<KiviTypeConfig>> {
+        let request = PeerRequest::TransferLeader(encode_transfer_leader_request(&rpc));
+        let response = self
+            .call(target, group_id, request, &option)
+            .await
+            .map_err(|error| unreachable(target, &error))?;
+        match response {
+            PeerResponse::TransferLeader(response) => {
+                Ok(decode_transfer_leader_response(&response))
+            }
+            unexpected => Err(protocol_unreachable(
+                target,
+                &format!("peer answered transfer-leader with {unexpected:?}"),
             )),
         }
     }
@@ -753,8 +850,7 @@ mod tests {
         let back_vote = decode_vote_request(&wire_vote);
         assert_eq!(back_vote.vote, vote);
         assert!(back_vote.leadership_transfer);
-        // Snapshot metadata binds base, membership, and checkpoint
-        // identity — with no transfer identity anywhere in it.
+        // Snapshot metadata binds the applied base and membership.
         let meta = openraft::storage::SnapshotMeta {
             last_log_id: Some(openraft::LogId::new(LeaderId::new(3, 1), 41)),
             last_membership: openraft::StoredMembership::new(
@@ -773,10 +869,6 @@ mod tests {
             ),
         };
         let wire_meta = encode_snapshot_meta(&meta);
-        assert!(
-            wire_meta.checkpoint.is_empty(),
-            "transfer builds pair bytes"
-        );
         let back_meta = decode_snapshot_meta(&wire_meta).expect("meta decodes");
         assert_eq!(back_meta.last_log_id, meta.last_log_id);
         assert_eq!(

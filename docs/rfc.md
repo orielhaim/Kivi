@@ -1961,20 +1961,15 @@ TiKV is an established example of many independent Raft Regions operating within
 
 Do not implement Raft from scratch initially.
 
-The engine defines its own:
+The engine keeps a Kivi-owned consensus front:
 
 ```rust
 trait ConsensusCore
 ```
 
-Candidate backends include:
+The selected backend is OpenRaft 0.10.0-alpha.35, exact-pinned while the 0.10 API remains unstable. The selected configuration uses `single-threaded` OpenRaft on Kivi's Compio reactors, so the backend respects the single-owner invariant.
 
-```text
-raft-rs
-OpenRaft
-```
-
-A bake-off MUST measure:
+The selected backend's group-density and integration tests MUST measure:
 
 ```text
 100 groups/worker
@@ -5207,9 +5202,9 @@ own mutation semantics
 
 ---
 
-# 210. Core crate candidates
+# 210. Core mechanism crates
 
-Likely:
+Current foundational choices include:
 
 ```text
 bytes
@@ -5222,54 +5217,42 @@ blake3
 
 crc32c
 
-smallvec
-
 bitflags
 
 arc-swap
 
-rustix
+jiff
 
-socket2
+futures
+
+async-channel
+
+crossbeam-channel
+
+core_affinity2
 
 thiserror
 ```
 
----
-
-# 211. Runtime candidates
-
-Data path bake-off:
-
-```text
-Compio
-
-Monoio
-
-minimal custom io-uring reactor
-```
-
-Do not write a custom runtime unless measurements justify it.
+Runtime and server-specific choices are separated in §211–§212.
 
 ---
 
-# 212. Control runtime
+# 211. Runtime selection
 
-Tokio is approved for:
+The current data-plane runtime is Compio 0.19. Each networked `DataWorker` owns one single-threaded Compio runtime. OpenRaft consensus uses the official Compio runtime, and the native client remains blocking with no async runtime of its own.
 
-```text
-control-plane utility services
+Monoio and a custom io-uring reactor remain alternatives, not current workspace dependencies.
 
-admin HTTP
+Do not add another data-plane runtime without measurements that justify the change.
 
-object storage
+---
 
-background orchestration
+# 212. Server and control runtime
 
-Kameo
-```
+The current server runtime is Tokio 1 with Axum and Tower. It hosts admin and control HTTP, plus the server-side `Send` fronts used by cluster mode. It does not schedule tablet state or own OpenRaft groups.
 
-not as mandatory tablet scheduling.
+Single-node `DataWorker` execution remains on Compio. In cluster mode, Tokio drives native serving and the `Send` consensus fronts while each consensus group remains on its owning Compio reactor. Serde and JSON remain confined to admin and configuration boundaries.
 
 ---
 
@@ -5303,27 +5286,25 @@ Raft state machine
 
 ---
 
-# 214. Consensus candidates
+# 214. Consensus selection
+
+The current selection is:
 
 ```text
-raft-rs
-
-OpenRaft
+openraft =0.10.0-alpha.35
+openraft-rt-compio =0.10.0-alpha.35
+openraft-multi =0.10.0-alpha.35
 ```
 
-Prototype both before architectural lock-in.
+The exact pin is intentional while 0.10 remains alpha. OpenRaft uses `single-threaded` and the official Compio runtime; `openraft-multi` provides shared group routing. Production and spike configurations enable pre-vote. No Tokio runtime is used for consensus group execution.
+
+`raft-rs` is not selected or present in the workspace.
 
 ---
 
 # 215. RESP crate
 
-Initial:
-
-```text
-redis-protocol
-```
-
-behind our compatibility module.
+The current compatibility edge is `kivi-resp`, using `redis-protocol` 6.0 behind `kivi-server`'s `redis-compat` feature. It translates protocol syntax into Kivi semantics; it does not define durable formats or core state semantics.
 
 If profiling proves parser CPU significant, replace internally.
 
@@ -5457,57 +5438,40 @@ not just average throughput.
 
 # 222. Workspace architecture
 
-Suggested:
+The workspace is Rust 2024 with an MSRV of 1.98. Its current crates are grouped by responsibility rather than by future fabric names:
 
 ```text
 crates/
+    kivi-types
+    kivi-core
+    kivi-codec
 
-    fabric-types
-    fabric-codec
+    kivi-tablet
+    kivi-state
+    kivi-protocol
+    kivi-client
+    kivi-resp
 
-    fabric-core
+    kivi-engine
+    kivi-memory
+    kivi-server
 
-    fabric-runtime
-    fabric-execution
+    kivi-durability
+    kivi-checkpoint
+    kivi-chunk
 
-    fabric-tablet
-    fabric-state
-    fabric-memory
+    kivi-consensus
+    kivi-control
+    kivi-redundancy
+    kivi-observation
 
-    fabric-consensus
-    fabric-transaction
-
-    fabric-durability
-    fabric-storage
-    fabric-checkpoint
-
-    fabric-redundancy
-    fabric-rlnc
-
-    fabric-network
-    fabric-native-protocol
-    fabric-resp
-
-    fabric-directory
-    fabric-control
-    fabric-placement
-
-    fabric-cache
-    fabric-observation
-
-    fabric-compute
-    fabric-wasm
-
-    fabric-security
-
-    fabric-admin
-
-    fabric-sim
-    fabric-model
-    fabric-testkit
+    kivi-sim
+    kivi-lab
 ```
 
-Optional experimental crates:
+`kivi-server` is the production binary boundary. `kivi-resp` is the optional Redis/RESP edge. `kivi-sim` and `kivi-lab` provide deterministic simulation and test/benchmark support. Experimental mechanisms remain outside the production dependency path until selected.
+
+The current workspace has no separate `experiments/` tree. Future experimental work may use separate crates for:
 
 ```text
 experiments/
@@ -5794,8 +5758,6 @@ strong observability
 # 232. Production Candidates
 
 ```text
-Compio/Monoio completion runtime
-
 Autonomous Commit
 
 Almost-Local Reads
@@ -6068,15 +6030,7 @@ Benchmark configurations must be published.
 
 # 241. Runtime experiments
 
-Required:
-
-```text
-Compio
-
-Monoio
-
-raw io_uring
-```
+The current baseline is Compio 0.19. Monoio and raw io-uring remain comparison experiments; neither is a current workspace dependency.
 
 Measure:
 
@@ -6102,13 +6056,7 @@ large-stream behavior
 
 # 242. Consensus experiments
 
-```text
-raft-rs
-
-OpenRaft
-```
-
-across increasing group counts.
+Use the selected OpenRaft 0.10.0-alpha.35 configuration with the official Compio runtime. Measure increasing group counts with the density dimensions in §61, including idle CPU, memory per group, timers, network and storage integration, and simulation cost.
 
 ---
 
@@ -6519,9 +6467,11 @@ streaming read/write
 Build:
 
 ```text
-ConsensusCore
+Kivi consensus front
 
-Raft bake-off
+OpenRaft 0.10.0-alpha.35 integration
+
+group-density measurements
 
 3-node cluster
 

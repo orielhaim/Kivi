@@ -41,9 +41,9 @@ pub use provider::{
 };
 pub use raft::{
     RAFT_PAYLOAD_BLANK, RAFT_PAYLOAD_MEMBERSHIP, RAFT_PAYLOAD_NORMAL, RECORD_KIND_RAFT_COMMITTED,
-    RECORD_KIND_RAFT_ENTRY, RECORD_KIND_RAFT_PURGE, RECORD_KIND_RAFT_SNAPSHOT_INSTALLED,
-    RECORD_KIND_RAFT_TRUNCATE, RECORD_KIND_RAFT_VOTE, RaftCommitted, RaftEntry, RaftEntryPayload,
-    RaftMembership, RaftPurge, RaftRecord, RaftSnapshotInstalled, RaftTruncate, RaftVote,
+    RECORD_KIND_RAFT_ENTRY, RECORD_KIND_RAFT_PURGE, RECORD_KIND_RAFT_TRUNCATE,
+    RECORD_KIND_RAFT_VOTE, RaftCommitted, RaftEntry, RaftEntryPayload, RaftMembership, RaftPurge,
+    RaftRecord, RaftTruncate, RaftVote,
 };
 pub use wal::{
     DEFAULT_SEGMENT_TARGET_BYTES, LaneFloor, LaneIdentity, LaneRecovery, LocalWalLane,

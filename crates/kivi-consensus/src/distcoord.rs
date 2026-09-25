@@ -76,8 +76,8 @@ use kivi_control::{ControlMutation, ControlState};
 use kivi_redundancy::{
     AssetHealth, AssetId, AssetKind, CatalogPublish, DistConfig, DistributedFabric, FabricMetrics,
     FabricMetricsSnapshot, FragmentStore as _, InformationAsset, LaneConfig, LaneStats,
-    LayoutCatalog, LocalFragmentStore, PublishedLayout, RedundancyError, RedundancyIntent,
-    RedundancyLane, RepairReport, SchemeParams,
+    LayoutCatalog, PublishedLayout, RedundancyError, RedundancyIntent, RedundancyLane,
+    RepairReport, SchemeParams,
 };
 use kivi_types::{ChunkId, NodeId, SecurityDomainId};
 
@@ -1168,12 +1168,4 @@ fn domain_for(kind: AssetKind, domain: u64) -> u64 {
         AssetKind::CheckpointBand | AssetKind::CheckpointManifest | AssetKind::CheckpointDedup => 0,
         _ => domain,
     }
-}
-
-/// Local fragment-store handle for coordinators that need `'static`
-/// ownership (lane jobs). Kept here (not on the node front) so the only
-/// new node-front surface stays the two documented accessors.
-#[allow(dead_code)]
-fn store_arc(node: &ConsensusNode) -> Option<Arc<LocalFragmentStore>> {
-    node.fragments_arc()
 }

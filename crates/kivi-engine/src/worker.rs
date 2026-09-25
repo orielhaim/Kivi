@@ -2028,8 +2028,7 @@ mod tests {
         chunks: WorkerChunks,
         lane: crate::chunk_lane::ChunkLaneHandle,
         guard: crate::chunk_lane::ChunkLaneGuard,
-        #[allow(dead_code)]
-        dir: tempfile::TempDir,
+        _dir: tempfile::TempDir,
     }
 
     impl TestChunks {
@@ -2057,7 +2056,7 @@ mod tests {
                 },
                 lane,
                 guard,
-                dir,
+                _dir: dir,
             }
         }
 

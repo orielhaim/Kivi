@@ -184,7 +184,7 @@ const VALUE_FABRIC: u8 = 9;
 
 /// Converts an applied Raft log index into its [`CommitPosition`]
 /// (task D, Option 1: `CommitPosition = raft_index + 1`; the `+1` preserves
-/// the `UNASSIGNED` sentinel because `OpenRaft` 0.9 numbers entries from 0).
+/// the `UNASSIGNED` sentinel because `OpenRaft` 0.10 numbers entries from 0).
 #[must_use]
 pub const fn commit_of_index(index: u64) -> CommitPosition {
     CommitPosition::from_u64(index.saturating_add(1))
@@ -860,12 +860,15 @@ impl ReplicatedTablet {
                         ),
                     });
                 }
-                self.control
-                    .apply(mutation)
-                    .map_err(|error| Fault::ControlRejected {
-                        index,
-                        detail: error.to_string(),
-                    })?;
+                match self.control.apply(mutation) {
+                    Ok(()) | Err(kivi_control::ControlApplyError::SupersededTopology { .. }) => {}
+                    Err(error) => {
+                        return Err(Fault::ControlRejected {
+                            index,
+                            detail: error.to_string(),
+                        });
+                    }
+                }
                 let _ = log_id;
                 Ok(ReplicatedOutcome::none())
             }
@@ -1711,13 +1714,6 @@ impl ReplicatedTablet {
         }
         self.applied = decoded.applied;
         self.membership = decoded.membership;
-    }
-
-    /// Installs replicated control state directly (control-group open
-    /// path shares this with snapshot install).
-    #[allow(dead_code)]
-    fn install_control(&mut self, control: kivi_control::ControlState) {
-        self.control = control;
     }
 }
 

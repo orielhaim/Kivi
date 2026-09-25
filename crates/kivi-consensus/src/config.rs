@@ -10,14 +10,10 @@
 //!
 //! ## `OpenRaft` selection record
 //!
-//! * Version: `openraft =0.10.0-alpha.34` — verified live on crates.io as the
-//!   newest published `0.10.0-alpha.x` (`.33` superseded; the `0.10` line is
-//!   still alpha, see the upstream README stability warning). Pinned with an
-//!   exact `=` requirement: pre-1.0 alpha APIs shift between releases, so
-//!   caret drift is unacceptable. Known alpha instability: the upgrade guide
-//!   (`upgrade-v09-v10`) is still under construction (only the `snapshot_id`
-//!   section is written); v1 network traits are deprecated stubs pointing at
-//!   the `openraft-legacy` crate, which this crate does not use.
+//! * Version: `openraft =0.10.0-alpha.35` — the latest published `0.10.0-alpha.x`
+//!   release at the time of this audit. Pinned with an exact `=` requirement:
+//!   pre-1.0 alpha APIs shift between releases, so caret drift is unacceptable.
+//!   The release adds the dedicated pre-vote RPC and keeps the pre-1.0 warning.
 //! * Features: `default-features = false` (no Tokio runtime, no clap) plus
 //!   `single-threaded`. The latter empties `OptionalSend`/`OptionalSync`, so
 //!   every `Raft` handle and every consensus future is `!Send`: Raft tasks
@@ -94,6 +90,7 @@ pub fn cluster_config() -> Result<Arc<openraft::Config>, openraft::ConfigError> 
         election_timeout_min: 1500,
         election_timeout_max: 3000,
         max_in_snapshot_log_to_keep: 100,
+        enable_pre_vote: Some(true),
         ..openraft::Config::default()
     }
     .validate()
@@ -114,6 +111,7 @@ pub fn spike_config() -> Result<Arc<openraft::Config>, openraft::ConfigError> {
         heartbeat_interval: 500,
         election_timeout_min: 1000,
         election_timeout_max: 2000,
+        enable_pre_vote: Some(true),
         ..openraft::Config::default()
     }
     .validate()
@@ -139,4 +137,21 @@ pub fn static_membership(
         .map(|(id, addr)| (*id, BasicNode::new(addr.clone())))
         .collect();
     openraft::Membership::new(vec![voters.clone()], indexed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cluster_config, spike_config};
+
+    #[test]
+    fn pre_vote_is_enabled_for_production_and_spike_configs() {
+        assert_eq!(
+            cluster_config().expect("cluster config").enable_pre_vote,
+            Some(true)
+        );
+        assert_eq!(
+            spike_config().expect("spike config").enable_pre_vote,
+            Some(true)
+        );
+    }
 }

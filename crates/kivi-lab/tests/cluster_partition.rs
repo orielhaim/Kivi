@@ -35,6 +35,7 @@ fn minority_partition_fences_old_leader() {
 
     let cluster = Cluster::spawn().expect("cluster spawns");
     let leader = cluster.wait_leader();
+    let isolated_term = cluster.term(leader).expect("initial term");
     cluster
         .client()
         .set(&key("fenced"), bytes::Bytes::from_static(b"base"))
@@ -50,6 +51,9 @@ fn minority_partition_fences_old_leader() {
     // minority, not the majority).
     let majority = cluster.wait_leader_except(leader);
     assert_ne!(majority, leader, "majority elects without the isolate");
+    cluster
+        .wait_term_unchanged(leader, isolated_term, Duration::from_secs(4))
+        .expect("isolated leader term");
 
     // The isolated minority must not acknowledge a new strong mutation:
     // without quorum its commit can never complete. Pin a short-timeout

@@ -21,6 +21,7 @@
 //! ```text
 //! POST /_kivi/raft/{tablet}/vote        (body: vote request codec)
 //! POST /_kivi/raft/{tablet}/prevote
+//! POST /_kivi/raft/{tablet}/transfer-leader
 //! POST /_kivi/raft/{tablet}/append
 //! POST /_kivi/raft/{tablet}/snapshot-frag
 //! POST /_kivi/raft/{tablet}/prepare     (bulk lane: sidecar preflight,
@@ -1734,6 +1735,7 @@ impl MeshDriver {
                 let media = match &response {
                     PeerResponse::Vote(_)
                     | PeerResponse::PreVote(_)
+                    | PeerResponse::TransferLeader(_)
                     | PeerResponse::Append(_)
                     | PeerResponse::Snapshot(_)
                     | PeerResponse::ControlForward(_) => MEDIA_RAFT,
@@ -2288,7 +2290,6 @@ mod tests {
                     voters: vec![1, 2],
                     nodes: vec![],
                     membership_log: None,
-                    checkpoint: vec![],
                 },
                 transfer: 1,
                 offset: 0,

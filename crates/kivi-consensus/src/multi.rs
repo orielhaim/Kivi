@@ -631,16 +631,13 @@ impl ConsensusNode {
             // removal (desired dropped it: tombstone and skip, never
             // serve the stale copy). Empty durable state always
             // recovers (nothing stale to serve).
-            if !first_boot && !durable_includes(&store, &machine, config.local).await {
-                let wanted = control_image
+            if !first_boot {
+                let keep = match control_image
                     .as_ref()
-                    .and_then(|state| state.desired(tablet));
-                let keep = match wanted {
+                    .and_then(|state| state.desired(tablet))
+                {
                     Some(desired) => desired.contains(config.local),
-                    // No desired set (pre-genesis or unknown tablet):
-                    // recover — nothing could have removed it through
-                    // the control plane yet.
-                    None => true,
+                    None => durable_includes(&store, &machine, config.local).await,
                 };
                 if !keep {
                     tracing::warn!(

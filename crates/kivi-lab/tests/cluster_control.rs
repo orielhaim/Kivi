@@ -399,9 +399,20 @@ fn drain_survives_bystander_crash_small() {
     // plans targeting or led elsewhere must keep converging, and the
     // returnee must rejoin without manual cleanup.
     let bystander = cluster.index_of(3).expect("node 3 slot");
+    let incarnation_before = cluster.incarnation(bystander);
     cluster.kill(bystander);
     std::thread::sleep(Duration::from_secs(5));
     cluster.restart(bystander).expect("bystander restarts");
+    let rejoin_deadline = Instant::now() + Duration::from_secs(300);
+    while cluster.incarnation(bystander) <= incarnation_before {
+        assert!(
+            Instant::now() < rejoin_deadline,
+            "bystander incarnation never advanced"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let _ = cluster.wait_all_leaders();
+    cluster.wait_converged_all();
     cluster.wait_node_state(1, "Drained", Duration::from_secs(300));
     cluster.set_control_voters(&[2, 3, 4]);
     let _ = cluster.remove_node(1);

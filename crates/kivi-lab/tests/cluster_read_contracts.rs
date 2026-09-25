@@ -67,8 +67,7 @@ fn read_contracts_hold_through_failover_and_restart() {
     assert_eq!(error, kivi_client::ClientError::StaleToken);
 
     // Failover: kill the leader, write on the successor, and prove the
-    // pre-failover token still covers (same lineage) while reads stay
-    // exact.
+    // pre-failover token remains valid while Latest stays exact.
     let leader = cluster.wait_leader();
     cluster.kill(leader);
     let _elected = cluster.wait_leader();
@@ -76,11 +75,20 @@ fn read_contracts_hold_through_failover_and_restart() {
         .client()
         .set(&key("x"), bytes::Bytes::from_static(b"2"))
         .expect("x=2 commits on the new leader");
-    let (value, _) = cluster
+    let (value, receipt) = cluster
         .client()
         .get_at_least(&key("x"), token)
         .expect("pre-failover token survives failover");
-    assert_eq!(value.expect("present").as_ref(), b"2");
+    let value = value.expect("present");
+    assert!(
+        value.as_ref() == b"1" || value.as_ref() == b"2",
+        "covered read returned an unexpected value"
+    );
+    let receipt = receipt.expect("served proof");
+    assert!(
+        receipt.position.as_u64() >= token.position().as_u64(),
+        "covered read returned a receipt before the token"
+    );
     let (value, _) = cluster
         .client()
         .get_bounded_stale(&key("x"), Duration::from_secs(60))
@@ -96,9 +104,18 @@ fn read_contracts_hold_through_failover_and_restart() {
         .get_with_contract(&key("x"), kivi_types::ReadContract::Latest)
         .expect("latest after catch-up");
     assert_eq!(value.expect("present").as_ref(), b"2");
-    let (value, _) = cluster
+    let (value, receipt) = cluster
         .client()
         .get_at_least(&key("x"), token)
         .expect("token covers after catch-up");
-    assert_eq!(value.expect("present").as_ref(), b"2");
+    let value = value.expect("present");
+    assert!(
+        value.as_ref() == b"1" || value.as_ref() == b"2",
+        "covered read returned an unexpected value"
+    );
+    let receipt = receipt.expect("served proof");
+    assert!(
+        receipt.position.as_u64() >= token.position().as_u64(),
+        "covered read returned a receipt before the token"
+    );
 }

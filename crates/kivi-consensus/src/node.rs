@@ -828,7 +828,7 @@ pub struct ReplicatedNode {
     machine: ReplicatedStateMachine,
     /// Durable log handle for test/diagnostic introspection (production
     /// reads go through the owner; this never touches the lane).
-    #[allow(dead_code)]
+    #[cfg(test)]
     store: DurableRaftStore,
     sidecar: SidecarStore,
     /// Node-wide sidecar preflight metrics (shared with the owner).
@@ -1125,6 +1125,7 @@ impl ReplicatedNode {
         verify_chunked_roots(&machine, &sidecar).await;
         Ok(Self {
             machine: machine.clone(),
+            #[cfg(test)]
             store: store.clone(),
             sidecar: sidecar.clone(),
             preflight,
@@ -2932,18 +2933,6 @@ where
         Ok(ConsensusLogIndex::new(response.log_id.index))
     }
 
-    /// Quorum-commits one typed control-plane mutation and answers a
-    /// human-readable failure for the legacy proposal front.
-    #[allow(dead_code)]
-    async fn propose_control(
-        &self,
-        mutation: kivi_control::ControlMutation,
-    ) -> Result<ConsensusLogIndex, String> {
-        self.propose_control_typed(mutation)
-            .await
-            .map_err(|error| error.to_string())
-    }
-
     /// Quorum-commits one deterministic command and maps the result onto
     /// the Kivi-owned proposal contract. Runs on the owner thread.
     ///
@@ -3540,7 +3529,7 @@ where
         match request {
             PeerRequest::Manifest(request) => return self.serve_manifest(request).await,
             PeerRequest::Chunk(request) => return self.serve_chunk(request).await,
-            PeerRequest::Prepare(request) => return self.serve_prepare(request).await,
+            PeerRequest::Prepare(request) => return self.serve_prepare(from, request).await,
             PeerRequest::Fragment(bytes) => {
                 return self.serve_redundancy_fragment(&bytes);
             }
@@ -3652,6 +3641,7 @@ where
     /// as reusable content-addressed cache.
     async fn serve_prepare(
         &self,
+        from: NodeId,
         request: crate::peer::PeerPrepareRequest,
     ) -> Result<PeerResponse, PeerRpcError> {
         let refused = |detail: String| PeerRpcError { detail };
@@ -3660,7 +3650,7 @@ where
             return Err(refused("zero manifest id".to_owned()));
         }
         self.gate
-            .ensure_root(id, request.logical_len, None)
+            .ensure_root_preflight(id, request.logical_len, Some(from))
             .await
             .map_err(|error| {
                 refused(format!(
@@ -4054,11 +4044,17 @@ fn client_write_error(
 ) -> ProposeError {
     use openraft::errors::{ClientWriteError, RaftError};
     match &error {
-        RaftError::APIError(ClientWriteError::ForwardToLeader(forward)) => {
-            ProposeError::Consensus(ConsensusError::NotLeader {
-                hint: LeaderHint {
-                    leader: forward.leader_id.map(replica_of),
-                },
+        RaftError::APIError(
+            ClientWriteError::ForwardToLeader(forward)
+            | ClientWriteError::LogEntryDiscarded(forward),
+        ) => ProposeError::Consensus(ConsensusError::NotLeader {
+            hint: LeaderHint {
+                leader: forward.leader_id.map(replica_of),
+            },
+        }),
+        RaftError::APIError(ClientWriteError::PreconditionFailed(error)) => {
+            ProposeError::Consensus(ConsensusError::Unavailable {
+                reason: format!("proposal precondition failed: {error}"),
             })
         }
         RaftError::APIError(ClientWriteError::ChangeMembershipError(install)) => {
@@ -4434,7 +4430,9 @@ mod tests {
         Ticks, WallTimestamp, WriteGuardGeneration,
     };
 
-    use super::{NodeConfig, ProposeError, ProposeOutcome, ReadError, ReplicatedNode};
+    use super::{
+        NodeConfig, NodeOpenError, ProposeError, ProposeOutcome, ReadError, ReplicatedNode,
+    };
     use crate::cluster::{ClusterTopology, NodeDescriptor, TabletAssignment};
     use crate::types::{ConsensusError, ReplicaRole};
 
@@ -4535,14 +4533,12 @@ mod tests {
         open_test_node_with_params(dir, id, topology, test_lease_params()).await
     }
 
-    /// Opens one test node with explicit lease timing (failover tests
-    /// need slower leases than the default fast ones).
-    async fn open_test_node_with_params(
+    async fn try_open_test_node_with_params(
         dir: &std::path::Path,
         id: u64,
         topology: &ClusterTopology,
         lease_params: kivi_types::LeaseParams,
-    ) -> ReplicatedNode {
+    ) -> Result<ReplicatedNode, NodeOpenError> {
         ReplicatedNode::open(NodeConfig {
             data_dir: dir.to_owned(),
             namespace: NS,
@@ -4558,13 +4554,29 @@ mod tests {
             lease_params,
         })
         .await
-        .expect("node opens")
     }
 
-    /// Probes one free loopback UDP port for the QUIC endpoint.
-    fn probe_udp() -> std::net::SocketAddr {
-        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("probe binds");
-        socket.local_addr().expect("probe addr")
+    /// Opens one test node with explicit lease timing (failover tests
+    /// need slower leases than the default fast ones).
+    async fn open_test_node_with_params(
+        dir: &std::path::Path,
+        id: u64,
+        topology: &ClusterTopology,
+        lease_params: kivi_types::LeaseParams,
+    ) -> ReplicatedNode {
+        try_open_test_node_with_params(dir, id, topology, lease_params)
+            .await
+            .expect("node opens")
+    }
+
+    fn probe_udp_addrs(count: usize) -> Vec<std::net::SocketAddr> {
+        let sockets: Vec<_> = (0..count)
+            .map(|_| std::net::UdpSocket::bind("127.0.0.1:0").expect("probe binds"))
+            .collect();
+        sockets
+            .iter()
+            .map(|socket| socket.local_addr().expect("probe addr"))
+            .collect()
     }
 
     /// One test cluster: three nodes on loopback with probed ports and
@@ -4578,16 +4590,29 @@ mod tests {
     async fn slow_cluster_with_params(
         lease_params: kivi_types::LeaseParams,
     ) -> (Vec<ReplicatedNode>, Vec<tempfile::TempDir>, ClusterTopology) {
-        let addrs = vec![probe_udp(), probe_udp(), probe_udp()];
-        let topology = test_topology(&addrs);
-        let mut nodes = Vec::new();
-        let mut dirs = Vec::new();
-        for id in [1u64, 2, 3] {
-            let dir = tempfile::tempdir().expect("scratch");
-            nodes.push(open_test_node_with_params(dir.path(), id, &topology, lease_params).await);
-            dirs.push(dir);
+        for _ in 0..8 {
+            let addrs = probe_udp_addrs(3);
+            let topology = test_topology(&addrs);
+            let mut nodes = Vec::new();
+            let mut dirs = Vec::new();
+            let mut opened = true;
+            for id in [1u64, 2, 3] {
+                let dir = tempfile::tempdir().expect("scratch");
+                if let Ok(node) =
+                    try_open_test_node_with_params(dir.path(), id, &topology, lease_params).await
+                {
+                    nodes.push(node);
+                    dirs.push(dir);
+                } else {
+                    opened = false;
+                    break;
+                }
+            }
+            if opened {
+                return (nodes, dirs, topology);
+            }
         }
-        (nodes, dirs, topology)
+        panic!("test cluster formation exhausted UDP port retries")
     }
 
     /// Restarts the node at `index` from its existing directory with the
@@ -4630,6 +4655,34 @@ mod tests {
                 "cluster never elected exactly one stable leader"
             );
             compio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn propose_until_leader(
+        nodes: &[ReplicatedNode],
+        leader: &mut usize,
+        operation: &Operation,
+        identity: Option<MutationIdentity>,
+        idempotency: Option<kivi_types::IdempotencyKey>,
+        now: WallTimestamp,
+    ) -> ProposeOutcome {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            match nodes[*leader]
+                .propose(operation, identity, idempotency, now)
+                .await
+            {
+                Ok(outcome) => return outcome,
+                Err(ProposeError::Consensus(
+                    ConsensusError::NotLeader { .. } | ConsensusError::LeaderUnknown,
+                )) => {}
+                Err(error) => panic!("proposal failed: {error:?}"),
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cluster did not retain a writable leader"
+            );
+            *leader = wait_leader(nodes).await;
         }
     }
 
@@ -4757,19 +4810,19 @@ mod tests {
         u64,
     ) {
         let (nodes, dirs, topology) = slow_cluster_with_params(lease_params).await;
-        let leader = wait_leader(&nodes).await;
-        let outcome = nodes[leader]
-            .propose(
-                &Operation::Set {
-                    key: Key::from("x"),
-                    value: bytes::Bytes::from_static(b"1"),
-                },
-                None,
-                None,
-                NOW,
-            )
-            .await
-            .expect("leader proposes");
+        let mut leader = wait_leader(&nodes).await;
+        let outcome = propose_until_leader(
+            &nodes,
+            &mut leader,
+            &Operation::Set {
+                key: Key::from("x"),
+                value: bytes::Bytes::from_static(b"1"),
+            },
+            None,
+            None,
+            NOW,
+        )
+        .await;
         let index = match outcome {
             ProposeOutcome::Applied { index, .. } => index.get(),
             other => panic!("expected Applied, got {other:?}"),
@@ -5309,20 +5362,30 @@ mod tests {
     #[test]
     fn same_identity_retry_is_duplicate() {
         block_on(async {
-            let (nodes, _dirs, _topology, leader, _index) = elected_cluster().await;
+            let (nodes, _dirs, _topology, mut leader, _index) = elected_cluster().await;
             let add = Operation::CounterAdd {
                 key: Key::from("n"),
                 delta: 1,
             };
-            let first = nodes[leader]
-                .propose(&add, Some(identity(0x5E55, 1)), None, NOW)
-                .await
-                .expect("counter applies");
+            let first = propose_until_leader(
+                &nodes,
+                &mut leader,
+                &add,
+                Some(identity(0x5E55, 1)),
+                None,
+                NOW,
+            )
+            .await;
             assert!(matches!(first, ProposeOutcome::Applied { .. }));
-            let retry = nodes[leader]
-                .propose(&add, Some(identity(0x5E55, 1)), None, NOW)
-                .await
-                .expect("retry answers");
+            let retry = propose_until_leader(
+                &nodes,
+                &mut leader,
+                &add,
+                Some(identity(0x5E55, 1)),
+                None,
+                NOW,
+            )
+            .await;
             assert!(
                 matches!(retry, ProposeOutcome::Duplicate { .. }),
                 "same identity retries without re-executing, got {retry:?}"
@@ -5441,20 +5504,20 @@ mod tests {
     fn restarted_replica_catches_up() {
         block_on(async {
             let (mut nodes, dirs, topology) = cluster().await;
-            let leader = wait_leader(&nodes).await;
+            let mut leader = wait_leader(&nodes).await;
             for (session, value) in [0xA1u128, 0xA2, 0xA3].into_iter().zip([1i64, 2, 3]) {
-                nodes[leader]
-                    .propose(
-                        &Operation::CounterAdd {
-                            key: Key::from("n"),
-                            delta: value,
-                        },
-                        Some(identity(session, 1)),
-                        None,
-                        NOW,
-                    )
-                    .await
-                    .expect("writes apply");
+                propose_until_leader(
+                    &nodes,
+                    &mut leader,
+                    &Operation::CounterAdd {
+                        key: Key::from("n"),
+                        delta: value,
+                    },
+                    Some(identity(session, 1)),
+                    None,
+                    NOW,
+                )
+                .await;
             }
             let status = nodes[leader].status().await;
             wait_applied(&nodes, status.applied.get()).await;
@@ -5514,19 +5577,19 @@ mod tests {
     fn isolated_leader_cannot_acknowledge() {
         block_on(async {
             let (nodes, _dirs, _topology) = cluster().await;
-            let leader = wait_leader(&nodes).await;
-            nodes[leader]
-                .propose(
-                    &Operation::CounterAdd {
-                        key: Key::from("n"),
-                        delta: 1,
-                    },
-                    Some(identity(0xD0, 1)),
-                    None,
-                    NOW,
-                )
-                .await
-                .expect("baseline applies");
+            let mut leader = wait_leader(&nodes).await;
+            propose_until_leader(
+                &nodes,
+                &mut leader,
+                &Operation::CounterAdd {
+                    key: Key::from("n"),
+                    delta: 1,
+                },
+                Some(identity(0xD0, 1)),
+                None,
+                NOW,
+            )
+            .await;
             let base = nodes[leader].status().await.applied.get();
             wait_applied(&nodes, base).await;
             // `suspend_peer` returns only after the evicted tasks exited
@@ -5535,7 +5598,7 @@ mod tests {
             // complete quorum).
             partition_leader(&nodes, leader).await;
             // The majority elects without the isolated node.
-            let majority = wait_leader_except(&nodes, leader).await;
+            let mut majority = wait_leader_except(&nodes, leader).await;
             // The isolated node must not acknowledge a new strong
             // mutation: without quorum its commit can never complete.
             let verdict = compio::time::timeout(
@@ -5560,18 +5623,18 @@ mod tests {
                 }
             }
             // The majority side proceeds.
-            nodes[majority]
-                .propose(
-                    &Operation::CounterAdd {
-                        key: Key::from("n"),
-                        delta: 10,
-                    },
-                    Some(identity(0xD2, 1)),
-                    None,
-                    NOW,
-                )
-                .await
-                .expect("majority writes");
+            propose_until_leader(
+                &nodes,
+                &mut majority,
+                &Operation::CounterAdd {
+                    key: Key::from("n"),
+                    delta: 10,
+                },
+                Some(identity(0xD2, 1)),
+                None,
+                NOW,
+            )
+            .await;
             let read = nodes[majority]
                 .read(
                     &Operation::CounterGet {
@@ -5617,19 +5680,19 @@ mod tests {
     fn conflicting_suffix_truncates_through_durable_record() {
         block_on(async {
             let (nodes, dirs, topology) = cluster().await;
-            let leader = wait_leader(&nodes).await;
-            nodes[leader]
-                .propose(
-                    &Operation::CounterAdd {
-                        key: Key::from("n"),
-                        delta: 1,
-                    },
-                    Some(identity(0xE0, 1)),
-                    None,
-                    NOW,
-                )
-                .await
-                .expect("baseline applies");
+            let mut leader = wait_leader(&nodes).await;
+            propose_until_leader(
+                &nodes,
+                &mut leader,
+                &Operation::CounterAdd {
+                    key: Key::from("n"),
+                    delta: 1,
+                },
+                Some(identity(0xE0, 1)),
+                None,
+                NOW,
+            )
+            .await;
             let base = nodes[leader].status().await.applied.get();
             wait_applied(&nodes, base).await;
             partition_leader(&nodes, leader).await;
@@ -5679,19 +5742,19 @@ mod tests {
                 "suffix entry must append locally, never commit (early: {early:?})"
             );
             // The majority elects and commits a divergent entry.
-            let majority = wait_leader_except(&nodes, leader).await;
-            nodes[majority]
-                .propose(
-                    &Operation::CounterAdd {
-                        key: Key::from("n"),
-                        delta: 10,
-                    },
-                    Some(identity(0xE2, 1)),
-                    None,
-                    NOW,
-                )
-                .await
-                .expect("majority commits divergently");
+            let mut majority = wait_leader_except(&nodes, leader).await;
+            propose_until_leader(
+                &nodes,
+                &mut majority,
+                &Operation::CounterAdd {
+                    key: Key::from("n"),
+                    delta: 10,
+                },
+                Some(identity(0xE2, 1)),
+                None,
+                NOW,
+            )
+            .await;
             // Heal: the authoritative log replaces the stale suffix and
             // every replica converges on the majority history.
             heal_all(&nodes).await;
@@ -5753,7 +5816,7 @@ mod tests {
 
         block_on(async {
             let (mut nodes, dirs, topology) = cluster().await;
-            let leader = wait_leader(&nodes).await;
+            let mut leader = wait_leader(&nodes).await;
             let value = medium_value();
             assert_eq!(value.len(), 2048);
             let key = Key::from("medium");
@@ -5761,10 +5824,7 @@ mod tests {
                 key: key.clone(),
                 value: bytes::Bytes::from(value.clone()),
             };
-            let outcome = nodes[leader]
-                .propose(&op, None, None, NOW)
-                .await
-                .expect("medium Set proposes");
+            let outcome = propose_until_leader(&nodes, &mut leader, &op, None, None, NOW).await;
             let index = match outcome {
                 ProposeOutcome::Applied { index, .. } => index.get(),
                 other => panic!("medium Set must apply, got {other:?}"),
@@ -5809,18 +5869,18 @@ mod tests {
             // Deterministic manifest: the same bytes proposed again (new key)
             // stage to the same manifest instead of fresh sidecars.
             let key_b = Key::from("medium-b");
-            nodes[leader]
-                .propose(
-                    &Operation::Set {
-                        key: key_b.clone(),
-                        value: bytes::Bytes::from(value.clone()),
-                    },
-                    None,
-                    None,
-                    NOW,
-                )
-                .await
-                .expect("second medium proposes");
+            propose_until_leader(
+                &nodes,
+                &mut leader,
+                &Operation::Set {
+                    key: key_b.clone(),
+                    value: bytes::Bytes::from(value.clone()),
+                },
+                None,
+                None,
+                NOW,
+            )
+            .await;
             let second_index = nodes[leader].status().await.applied.get();
             wait_applied(&nodes, second_index).await;
             let served_b = nodes[leader]
@@ -5937,24 +5997,24 @@ mod tests {
     #[test]
     fn snapshot_purge_and_restart() {
         block_on(async {
-            let (nodes, dirs, topology) = cluster().await;
-            let leader = wait_leader(&nodes).await;
+            let (nodes, dirs, _topology) = cluster().await;
+            let mut leader = wait_leader(&nodes).await;
             for (session, value) in [0xB1u128, 0xB2, 0xB3, 0xB4, 0xB5]
                 .into_iter()
                 .zip([1i64, 2, 3, 4, 5])
             {
-                nodes[leader]
-                    .propose(
-                        &Operation::CounterAdd {
-                            key: Key::from("n"),
-                            delta: value,
-                        },
-                        Some(identity(session, 1)),
-                        None,
-                        NOW,
-                    )
-                    .await
-                    .expect("writes apply");
+                propose_until_leader(
+                    &nodes,
+                    &mut leader,
+                    &Operation::CounterAdd {
+                        key: Key::from("n"),
+                        delta: value,
+                    },
+                    Some(identity(session, 1)),
+                    None,
+                    NOW,
+                )
+                .await;
             }
             // Purge trails replication: wait for every replica to apply the
             // writes first.
@@ -5969,18 +6029,18 @@ mod tests {
             // serves: one more write commits past it.
             let status = nodes[leader].status().await;
             assert_eq!(status.purged, Some(base));
-            nodes[leader]
-                .propose(
-                    &Operation::CounterAdd {
-                        key: Key::from("n"),
-                        delta: 100,
-                    },
-                    Some(identity(0xC0, 1)),
-                    None,
-                    NOW,
-                )
-                .await
-                .expect("post-purge write applies");
+            propose_until_leader(
+                &nodes,
+                &mut leader,
+                &Operation::CounterAdd {
+                    key: Key::from("n"),
+                    delta: 100,
+                },
+                Some(identity(0xC0, 1)),
+                None,
+                NOW,
+            )
+            .await;
             // Restart the cluster from its directories: the purge record
             // replays, the snapshot base holds, and new writes succeed.
             // Every node shuts down first (dropping a live node would leak
@@ -5990,27 +6050,28 @@ mod tests {
                 node.shutdown().await;
             }
             drop(nodes);
+            let restart_topology = test_topology(&probe_udp_addrs(3));
             let mut fresh = Vec::new();
-            for (index, _dir) in dirs.iter().enumerate() {
-                fresh.push(restart(&dirs, &topology, index).await);
+            for (index, dir) in dirs.iter().enumerate() {
+                fresh.push(open_test_node(dir.path(), index as u64 + 1, &restart_topology).await);
             }
             assert!(
                 fresh[leader].incarnation().as_u64() > incarnation.as_u64(),
                 "leader incarnation advances"
             );
-            let elected = wait_leader(&fresh).await;
-            fresh[elected]
-                .propose(
-                    &Operation::CounterAdd {
-                        key: Key::from("n"),
-                        delta: 1000,
-                    },
-                    Some(identity(0xC1, 1)),
-                    None,
-                    NOW,
-                )
-                .await
-                .expect("post-restart write applies");
+            let mut elected = wait_leader(&fresh).await;
+            propose_until_leader(
+                &fresh,
+                &mut elected,
+                &Operation::CounterAdd {
+                    key: Key::from("n"),
+                    delta: 1000,
+                },
+                Some(identity(0xC1, 1)),
+                None,
+                NOW,
+            )
+            .await;
             let value = fresh[elected]
                 .read(
                     &Operation::CounterGet {

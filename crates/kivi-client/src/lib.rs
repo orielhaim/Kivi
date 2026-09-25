@@ -33,8 +33,8 @@ use bytes::Bytes;
 use crossbeam_channel::{Sender, bounded, unbounded};
 use kivi_protocol::{
     Capabilities, ClientHello, DEFAULT_MAX_FRAME, Frame, FrameKind, FrameReader,
-    MAX_STREAM_UPLOAD_BYTES, ProtocolError, RequestId, Response, ResponseBody, ServerHello, Status,
-    StreamAbort, StreamBegin, encode_frame,
+    MAX_STREAM_UPLOAD_BYTES, ProtocolError, RequestId, Response, ResponseBody, RouteHint,
+    ServerHello, Status, StreamAbort, StreamBegin, encode_frame,
 };
 use kivi_state::{Key, PartitionHasher};
 use kivi_types::{
@@ -47,7 +47,7 @@ pub use ordered::{
     ClientScanPage, ClientScanValue, IndexHit, IndexTermSet, ScanConsistency, ScanCursor,
     ScanDirection, ScanOptions, ScanProjection, key_successor,
 };
-pub use route::{RouteCache, RouteEntry, TabletLeaderCache};
+pub use route::{RouteCache, RouteEntry};
 
 /// Connection establishment timeout default.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -817,7 +817,7 @@ enum GetOutcome {
     /// Carries the redirect triple when the server named one, so the loop
     /// can tell fresh information from a stale repeat (same patience rules
     /// as `execute_with_seq`; `None` spends budget like before).
-    Reroute(Option<(u64, String, u64)>),
+    Reroute(Option<RouteEntry>),
     /// The server is saturated: back off and re-request.
     Overloaded,
     /// The transport died: drop the connection, redial, re-request.
@@ -855,12 +855,6 @@ struct Shared {
     delivery_retries: u32,
     seeds: Vec<String>,
     routes: route::RouteCache,
-    /// Per-tablet leader hints for replicated clusters. Keyed by
-    /// `TabletId` so future many-tablet deployments route each tablet to
-    /// its own leader; today it holds at most the single replicated
-    /// tablet. Updated on every `StaleRoute` redirect, consulted when no
-    /// range route covers the key.
-    tablet_leaders: route::TabletLeaderCache,
     pool: Mutex<HashMap<String, Arc<Connection>>>,
     id_counter: AtomicU64,
     stream_counter: AtomicU64,
@@ -975,7 +969,6 @@ impl NativeClient {
                 delivery_retries: config.delivery_retries,
                 seeds: config.seeds,
                 routes: route::RouteCache::new(),
-                tablet_leaders: route::TabletLeaderCache::new(),
                 pool: Mutex::new(HashMap::new()),
                 id_counter: AtomicU64::new(1),
                 stream_counter: AtomicU64::new(1),
@@ -1104,14 +1097,6 @@ impl NativeClient {
     #[must_use]
     pub fn cached_routes(&self) -> usize {
         self.shared.routes.len()
-    }
-
-    /// Returns the last-known leader endpoint for `tablet`, if any.
-    /// Per-tablet routing hint for replicated clusters; `None` before the
-    /// first redirect or when the hint went stale.
-    #[must_use]
-    pub fn tablet_leader(&self, tablet: kivi_types::TabletId) -> Option<String> {
-        self.shared.tablet_leaders.lookup(tablet)
     }
 
     /// Allocates the next stream id: the high-bit space request ids never
@@ -1414,15 +1399,8 @@ impl NativeClient {
             // then cached range authority (ordered ranges by key, hash
             // ranges by partition hash — snapshots are single-layout, so
             // exactly one lookup can hit), unless already tried dead this
-            // call, else the next untried seed with no hint. The
-            // per-tablet leader cache (`tablet_leaders`) is updated on
-            // every redirect for cluster introspection and future
-            // many-tablet routing, but it never overrides range routing:
-            // single-node deployments replicate many tablets per process,
-            // so any single cached leader endpoint would misroute other
-            // tablets (replicated clusters use a root range covering every
-            // key, so the range hit already lands on the leader). The
-            // mutation identity above is preserved across all hops.
+            // call, else the next untried seed with no hint. The mutation
+            // identity above is preserved across all hops.
             let (endpoint, hint) = match follow.take() {
                 Some((endpoint, hint)) if !tried.contains(&endpoint) => (endpoint, Some(hint)),
                 _ => match self
@@ -1432,9 +1410,6 @@ impl NativeClient {
                     .or_else(|| self.shared.routes.lookup(hash))
                 {
                     Some(route) if !tried.contains(&route.endpoint) => {
-                        self.shared
-                            .tablet_leaders
-                            .insert(route.tablet, route.endpoint.clone());
                         (route.endpoint.clone(), Some(route.hint()))
                     }
                     _ => {
@@ -1468,7 +1443,6 @@ impl NativeClient {
                 // congestion paths, not graves).
                 self.drop_connection(&endpoint);
                 self.shared.routes.evict_endpoint(&endpoint);
-                self.shared.tablet_leaders.evict_endpoint(&endpoint);
                 tried.push(endpoint);
                 continue;
             };
@@ -1538,7 +1512,6 @@ impl NativeClient {
                     }
                     self.drop_connection(&endpoint);
                     self.shared.routes.evict_endpoint(&endpoint);
-                    self.shared.tablet_leaders.evict_endpoint(&endpoint);
                     tried.push(endpoint);
                     reconnects = 0;
                     backoff(
@@ -1552,21 +1525,6 @@ impl NativeClient {
                     break Err(error);
                 }
             };
-            if std::env::var("KIVI_CLIENT_TRACE").is_ok() {
-                let detail = match &response.body {
-                    kivi_protocol::ResponseBody::Redirect(info) => {
-                        format!("redirect tablet={} to={}", info.tablet, info.endpoint)
-                    }
-                    kivi_protocol::ResponseBody::Diagnostic(text) => {
-                        format!("diagnostic {text:?}")
-                    }
-                    _ => String::from("(body)"),
-                };
-                eprintln!(
-                    "CLIENT hop redirects={redirects} endpoint={endpoint} status={:?} {detail}",
-                    response.status
-                );
-            }
             match response.status {
                 Status::Ok | Status::NotFound => break Ok(response),
                 Status::StaleRoute | Status::NotLocal => {
@@ -1596,18 +1554,12 @@ impl NativeClient {
                             visited_tablets.insert(tablet);
                             max_dir_version = max_dir_version.max(version);
                             stale_repeats = 0;
-                            // Invalidate only the affected range/leader:
-                            // `insert` evicts overlapping ranges for this
-                            // tablet kind, and the leader cache is
-                            // per-tablet. No global cache flush. The next
-                            // hop follows the redirect target directly:
+                            // Update only the affected range. The next hop
+                            // follows the redirect target directly:
                             // re-resolution can miss at exclusive range
                             // boundaries (reverse-scan cursors) and loop
                             // on the seed forever.
-                            self.shared
-                                .tablet_leaders
-                                .insert(info.tablet, info.endpoint.clone());
-                            self.shared.routes.insert(RouteEntry::from_redirect(info));
+                            self.shared.routes.insert(&RouteEntry::from_redirect(info));
                             follow = Some((
                                 info.endpoint.clone(),
                                 kivi_protocol::RouteHint {
@@ -1646,7 +1598,6 @@ impl NativeClient {
                                 // of following another stale hint.
                                 self.drop_connection(&endpoint);
                                 self.shared.routes.evict_endpoint(&endpoint);
-                                self.shared.tablet_leaders.evict_endpoint(&endpoint);
                                 if !tried.contains(&endpoint) {
                                     tried.push(endpoint);
                                 }
@@ -1688,7 +1639,6 @@ impl NativeClient {
                         overloaded_streak = 0;
                         self.drop_connection(&endpoint);
                         self.shared.routes.evict_endpoint(&endpoint);
-                        self.shared.tablet_leaders.evict_endpoint(&endpoint);
                         tried.push(endpoint);
                     } else {
                         backoff(
@@ -2112,27 +2062,11 @@ impl NativeClient {
                 self.shared.errors.fetch_add(1, Ordering::Relaxed);
                 return Err(ClientError::TooManyRedirects);
             }
-            let (endpoint, hint) = match self.shared.routes.lookup(hash) {
-                Some(route) if !tried.contains(&route.endpoint) => {
-                    (route.endpoint.clone(), Some(route.hint()))
-                }
-                _ => {
-                    let mut pick = None;
-                    for _ in 0..self.shared.seeds.len() {
-                        let candidate =
-                            self.shared.seeds[seed_cursor % self.shared.seeds.len()].clone();
-                        seed_cursor += 1;
-                        if !tried.contains(&candidate) {
-                            pick = Some(candidate);
-                            break;
-                        }
-                    }
-                    let Some(endpoint) = pick else {
-                        self.shared.errors.fetch_add(1, Ordering::Relaxed);
-                        return Err(ClientError::Io("all known endpoints failed".to_owned()));
-                    };
-                    (endpoint, None)
-                }
+            let Some((endpoint, hint)) =
+                self.next_stream_endpoint(key, hash, &tried, &mut seed_cursor)
+            else {
+                self.shared.errors.fetch_add(1, Ordering::Relaxed);
+                return Err(ClientError::Io("all known endpoints failed".to_owned()));
             };
             let expect = hint.map(|hint| hint.worker);
             let Ok(conn) = self.connection(&endpoint, expect) else {
@@ -2141,7 +2075,6 @@ impl NativeClient {
                 // without consuming redirect budget).
                 self.drop_connection(&endpoint);
                 self.shared.routes.evict_endpoint(&endpoint);
-                self.shared.tablet_leaders.evict_endpoint(&endpoint);
                 tried.push(endpoint);
                 continue;
             };
@@ -2151,10 +2084,10 @@ impl NativeClient {
             }
             match self.get_stream_attempt(&conn, key, hint) {
                 GetOutcome::Done(value) => return Ok(value),
-                GetOutcome::Reroute(triple) => {
-                    Self::note_stream_reroute_versioned(
+                GetOutcome::Reroute(route) => {
+                    let progress = Self::note_stream_reroute_versioned(
                         self,
-                        triple,
+                        route.as_ref(),
                         &endpoint,
                         &mut visited_redirects,
                         &mut visited_tablets,
@@ -2163,6 +2096,9 @@ impl NativeClient {
                         &mut tried,
                         &mut redirects,
                     );
+                    if progress && let Some(route) = route {
+                        self.shared.routes.insert(&route);
+                    }
                 }
                 GetOutcome::Overloaded => {
                     redirects += 1;
@@ -2180,7 +2116,6 @@ impl NativeClient {
                     self.drop_connection(&endpoint);
                     if reconnects > 2 {
                         self.shared.routes.evict_endpoint(&endpoint);
-                        self.shared.tablet_leaders.evict_endpoint(&endpoint);
                         tried.push(endpoint);
                         reconnects = 0;
                     }
@@ -2197,6 +2132,30 @@ impl NativeClient {
         }
     }
 
+    fn next_stream_endpoint(
+        &self,
+        key: &Key,
+        hash: kivi_types::PartitionHash,
+        tried: &[String],
+        seed_cursor: &mut usize,
+    ) -> Option<(String, Option<RouteHint>)> {
+        if let Some(route) = self
+            .shared
+            .routes
+            .lookup_key(key.as_bytes())
+            .or_else(|| self.shared.routes.lookup(hash))
+            && !tried.contains(&route.endpoint)
+        {
+            return Some((route.endpoint.clone(), Some(route.hint())));
+        }
+        let seed_count = self.shared.seeds.len();
+        (0..seed_count).find_map(|_| {
+            let endpoint = self.shared.seeds[*seed_cursor % seed_count].clone();
+            *seed_cursor += 1;
+            (!tried.contains(&endpoint)).then_some((endpoint, None))
+        })
+    }
+
     /// Records one stream reroute: progress (newer version, or a new
     /// tablet at the current version) spends redirect budget;
     /// non-progress (exact repeats, revisited tablets, older versions —
@@ -2206,7 +2165,7 @@ impl NativeClient {
     #[allow(clippy::too_many_arguments)]
     fn note_stream_reroute_versioned(
         &self,
-        triple: Option<(u64, String, u64)>,
+        route: Option<&RouteEntry>,
         endpoint: &str,
         visited_redirects: &mut Vec<(u64, String, u64)>,
         visited_tablets: &mut std::collections::HashSet<u64>,
@@ -2214,23 +2173,24 @@ impl NativeClient {
         stale_repeats: &mut u32,
         tried: &mut Vec<String>,
         redirects: &mut usize,
-    ) {
-        let Some((tablet, _, version)) = triple.as_ref().map(|(t, e, v)| (*t, e.clone(), *v))
-        else {
+    ) -> bool {
+        let Some(route) = route else {
             *stale_repeats = 0;
             *redirects += 1;
             self.shared.redirects.fetch_add(1, Ordering::Relaxed);
-            return;
+            return false;
         };
-        let exact_repeat = visited_redirects.contains(triple.as_ref().expect("checked"));
+        let tablet = route.tablet.as_u64();
+        let triple = (tablet, route.endpoint.clone(), route.dir_version);
+        let exact_repeat = visited_redirects.contains(&triple);
         let is_progress = !exact_repeat
-            && (version > *max_dir_version
-                || (version == *max_dir_version && !visited_tablets.contains(&tablet))
+            && (route.dir_version > *max_dir_version
+                || (route.dir_version == *max_dir_version && !visited_tablets.contains(&tablet))
                 || *max_dir_version == 0);
         if is_progress {
-            visited_redirects.push(triple.expect("checked"));
+            visited_redirects.push(triple);
             visited_tablets.insert(tablet);
-            *max_dir_version = (*max_dir_version).max(version);
+            *max_dir_version = (*max_dir_version).max(route.dir_version);
             *stale_repeats = 0;
         } else {
             *stale_repeats += 1;
@@ -2243,12 +2203,12 @@ impl NativeClient {
                 *stale_repeats = 0;
                 self.drop_connection(endpoint);
                 self.shared.routes.evict_endpoint(endpoint);
-                self.shared.tablet_leaders.evict_endpoint(endpoint);
                 tried.push(endpoint.to_owned());
             }
             *redirects += 1;
             self.shared.redirects.fetch_add(1, Ordering::Relaxed);
         }
+        is_progress
     }
 
     /// One upload attempt against the routed endpoint: begin, data, commit.
@@ -2272,11 +2232,22 @@ impl NativeClient {
         // through the ordinary redirect machinery, so the begin below
         // lands on the owner the first time (a move between probe and
         // begin still aborts cleanly and surfaces — never miscommits).
-        if self.shared.routes.lookup(hash).is_none() {
+        if self
+            .shared
+            .routes
+            .lookup_key(key.as_bytes())
+            .or_else(|| self.shared.routes.lookup(hash))
+            .is_none()
+        {
             let _ = self.exists(key);
         }
         self.shared.requests.fetch_add(1, Ordering::Relaxed);
-        let (endpoint, hint) = match self.shared.routes.lookup(hash) {
+        let (endpoint, hint) = match self
+            .shared
+            .routes
+            .lookup_key(key.as_bytes())
+            .or_else(|| self.shared.routes.lookup(hash))
+        {
             Some(route) => (route.endpoint.clone(), Some(route.hint())),
             None => (self.shared.seeds[0].clone(), None),
         };
@@ -2495,15 +2466,7 @@ impl NativeClient {
                     Status::NotFound => GetOutcome::Done(None),
                     Status::StaleRoute | Status::NotLocal => {
                         if let ResponseBody::Redirect(info) = &response.body {
-                            self.shared
-                                .tablet_leaders
-                                .insert(info.tablet, info.endpoint.clone());
-                            self.shared.routes.insert(RouteEntry::from_redirect(info));
-                            GetOutcome::Reroute(Some((
-                                info.tablet.as_u64(),
-                                info.endpoint.clone(),
-                                info.dir_version.as_u64(),
-                            )))
+                            GetOutcome::Reroute(Some(RouteEntry::from_redirect(info)))
                         } else {
                             GetOutcome::Reroute(None)
                         }
@@ -2555,8 +2518,11 @@ impl NativeClient {
         let mut out = Vec::new();
         if total > 0
             && let Ok(capacity) = usize::try_from(total)
+            && out.try_reserve_exact(capacity).is_err()
         {
-            out.try_reserve_exact(capacity).ok();
+            Connection::unregister_stream(conn, stream);
+            Connection::abort_stream(conn, stream, "download allocation exceeds client budget");
+            return GetOutcome::Fail(ClientError::ResourceExhausted);
         }
         loop {
             match Connection::await_stream_event(conn, rx) {

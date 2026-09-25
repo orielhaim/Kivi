@@ -466,7 +466,7 @@ impl ConsistencyHub {
                 ctx,
                 self.incarnation,
             ),
-            ReadContract::Any => Self::plan_any(entry, Some(operation)),
+            ReadContract::Any => Self::plan_any(entry, Some(operation), fresh.applied),
         }
     }
 
@@ -536,7 +536,7 @@ impl ConsistencyHub {
             ReadContract::BoundedStale { max_staleness } => {
                 Self::plan_bounded_stale(entry, None, max_staleness, fresh, ctx, self.incarnation)
             }
-            ReadContract::Any => Self::plan_any(entry, None),
+            ReadContract::Any => Self::plan_any(entry, None, fresh.applied),
         }
     }
 
@@ -725,10 +725,16 @@ impl ConsistencyHub {
         }
     }
 
-    /// Plans an `Any` read: cache replay when held, else local applied
-    /// state with no freshness claim.
-    fn plan_any(entry: &mut TabletConsistency, operation: Option<&Operation>) -> PlannedRead {
-        if let Some(cached) = Self::cache_lookup(entry, operation, &AtLeastNeed::Any) {
+    /// Plans an `Any` read: cache replay when held at the current applied
+    /// position, else local applied state with no freshness claim.
+    fn plan_any(
+        entry: &mut TabletConsistency,
+        operation: Option<&Operation>,
+        applied: CommitPosition,
+    ) -> PlannedRead {
+        if let Some(cached) = Self::cache_lookup(entry, operation, &AtLeastNeed::Any)
+            && cached.position == applied
+        {
             entry.metrics.strong_cache_hits += 1;
             PlannedRead {
                 plan: ReadPlan::ServeLocal {

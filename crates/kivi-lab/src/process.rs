@@ -494,6 +494,7 @@ pub(crate) fn wait_ready_or_exit(child: &mut Child, timeout: Duration) -> WaitOu
         }
         if Instant::now() > deadline {
             let _ = child.kill();
+            let _ = child.wait();
             return WaitOutcome::TimedOut;
         }
     }

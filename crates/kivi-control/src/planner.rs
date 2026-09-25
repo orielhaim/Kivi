@@ -10,9 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use kivi_types::{NodeId, TabletId};
 
-use crate::migration::{MigrationPlan, MigrationPlanId};
 use crate::node::NodeState;
-use crate::placement::PlacementVersion;
 use crate::state::ControlState;
 
 /// Planner tuning: replication and concurrency bounds.
@@ -234,7 +232,7 @@ pub fn plan_drain(
 /// (`Unavailable` health) come before merely under-replicated ones, then
 /// tablet-id order (deterministic). Each intent replaces one failed
 /// source with the healthiest eligible target through the SAME
-/// [`MigrationPlan`] path as manual moves (add learner, catch up,
+/// [`crate::migration::MigrationPlan`] path as manual moves (add learner, catch up,
 /// `change_membership`, retire — never delete-first).
 ///
 /// Bounds: global `max_repairs_per_round` plus per-source/per-target caps
@@ -385,36 +383,6 @@ pub fn plan_repair(state: &ControlState, config: &PlannerConfig) -> Vec<Migratio
         }
     }
     intents
-}
-
-/// Materializes intents into persisted [`MigrationPlan`]s at one placement
-/// generation. Pure constructor: no policy inside, so manual moves and
-/// auto-rebalance share this exact pathway.
-#[must_use]
-pub fn intents_to_plans(
-    intents: &[MigrationIntent],
-    first_id: MigrationPlanId,
-    generation: PlacementVersion,
-) -> Vec<MigrationPlan> {
-    let mut out = Vec::with_capacity(intents.len());
-    let mut next = first_id.as_u64();
-    for intent in intents {
-        if intent.from == intent.to {
-            continue;
-        }
-        if let Ok(plan) = MigrationPlan::new(
-            MigrationPlanId::from_u64(next),
-            intent.tablet,
-            generation,
-            intent.from,
-            intent.to,
-            intent.desired_voters.clone(),
-        ) {
-            out.push(plan);
-            next += 1;
-        }
-    }
-    out
 }
 
 /// Eligible placement targets: active nodes in id order.

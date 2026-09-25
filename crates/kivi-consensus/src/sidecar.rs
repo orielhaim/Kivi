@@ -33,20 +33,12 @@
 //! Peers request [`ChunkId`] / [`ManifestId`] and receive bytes. They never
 //! learn whether the holder keeps packs, separate files, or a future tier.
 //!
-//! ## Pin lifecycle
+//! ## Retention
 //!
-//! ```text
-//! staged -> proposal-pinned -> committed/applied referenced
-//!        -> checkpoint referenced -> reclaimable
-//! ```
-//!
-//! A proposal pin protects the root and all sidecars while the proposal is
-//! in flight, leadership changes, or the client response pends. After
-//! commit/apply ownership transfers to live-state references. After
-//! rejection the pin releases (orphans age out via deferred GC, never
-//! immediate deletion).
+//! Sidecars are content-addressed cache entries. Staging, durability checks,
+//! and live-state references are the authoritative ownership contract; no
+//! separate proposal-pin lifecycle exists in the current store.
 
-use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{
     Arc,
@@ -86,188 +78,6 @@ impl ImmutableDependencies {
     #[must_use]
     pub fn is_valid(self) -> bool {
         self.manifest.is_valid()
-    }
-}
-
-/// Lifecycle stage of a pinned immutable root.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PinStage {
-    /// Staged but not yet proposed (volatile until synced).
-    Staged,
-    /// Proposal in flight (protects across leadership change + reply).
-    ProposalPinned,
-    /// Committed/applied live-state reference.
-    Committed,
-    /// Referenced by a retained checkpoint.
-    CheckpointReferenced,
-    /// Eligible for deferred orphan reclamation.
-    Reclaimable,
-}
-
-/// Reference counts protecting immutable roots from reclamation.
-///
-/// Conservative: anything pinned here plus anything reachable from live
-/// roots / retained checkpoints is kept. Distributed global GC is out of
-/// scope; unsafe reclamation is never attempted.
-#[derive(Debug, Default)]
-pub struct SidecarPins {
-    manifests: HashMap<ManifestId, usize>,
-    chunks: HashMap<ChunkId, usize>,
-}
-
-impl SidecarPins {
-    /// Creates empty pins.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Pins one manifest for the proposal lifetime.
-    pub fn pin_manifest(&mut self, id: ManifestId) {
-        *self.manifests.entry(id).or_insert(0) += 1;
-    }
-
-    /// Pins one chunk for the proposal lifetime.
-    pub fn pin_chunk(&mut self, id: ChunkId) {
-        *self.chunks.entry(id).or_insert(0) += 1;
-    }
-
-    /// Pins a full root (manifest + chunks).
-    pub fn pin_root(&mut self, manifest: ManifestId, chunks: &[ChunkId]) {
-        self.pin_manifest(manifest);
-        for chunk in chunks {
-            self.pin_chunk(*chunk);
-        }
-    }
-
-    /// Releases one manifest pin.
-    pub fn unpin_manifest(&mut self, id: &ManifestId) {
-        if let Some(count) = self.manifests.get_mut(id) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                self.manifests.remove(id);
-            }
-        }
-    }
-
-    /// Releases one chunk pin.
-    pub fn unpin_chunk(&mut self, id: &ChunkId) {
-        if let Some(count) = self.chunks.get_mut(id) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                self.chunks.remove(id);
-            }
-        }
-    }
-
-    /// Releases a full root.
-    pub fn unpin_root(&mut self, manifest: &ManifestId, chunks: &[ChunkId]) {
-        self.unpin_manifest(manifest);
-        for chunk in chunks {
-            self.unpin_chunk(chunk);
-        }
-    }
-
-    /// Snapshots pinned sets for GC planning.
-    #[must_use]
-    pub fn snapshot(&self) -> (HashSet<ManifestId>, HashSet<ChunkId>) {
-        (
-            self.manifests.keys().copied().collect(),
-            self.chunks.keys().copied().collect(),
-        )
-    }
-
-    /// Number of pinned manifests (diagnostics).
-    #[must_use]
-    pub fn manifest_count(&self) -> usize {
-        self.manifests.len()
-    }
-
-    /// Number of pinned chunks (diagnostics).
-    #[must_use]
-    pub fn chunk_count(&self) -> usize {
-        self.chunks.len()
-    }
-
-    /// Whether anything is pinned.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.manifests.is_empty() && self.chunks.is_empty()
-    }
-}
-
-/// RAII proposal pin: holds manifest + chunk pins until commit/abandon.
-///
-/// Dropping releases the pins (orphans remain content-addressed and cached
-/// safely; deferred GC ages them out, never immediate deletion).
-#[derive(Debug)]
-pub struct ProposalPin {
-    pins: Arc<futures::lock::Mutex<SidecarPins>>,
-    manifest: Option<ManifestId>,
-    chunks: Vec<ChunkId>,
-    released: bool,
-}
-
-impl ProposalPin {
-    /// Creates a pin handle (pins acquired separately via [`SidecarStore`]).
-    pub(crate) fn new(
-        pins: Arc<futures::lock::Mutex<SidecarPins>>,
-        manifest: ManifestId,
-        chunks: Vec<ChunkId>,
-    ) -> Self {
-        Self {
-            pins,
-            manifest: Some(manifest),
-            chunks,
-            released: false,
-        }
-    }
-
-    /// Consumes the pin after commit (ownership transfers to live state).
-    /// Releases the proposal counts; live roots keep data alive.
-    pub async fn commit(mut self) {
-        self.release().await;
-        std::mem::forget(self);
-    }
-
-    /// Abandons the proposal (rejection, leadership loss).
-    pub async fn abandon(mut self) {
-        self.release().await;
-        std::mem::forget(self);
-    }
-
-    /// Returns the pinned manifest.
-    #[must_use]
-    pub fn manifest(&self) -> Option<ManifestId> {
-        self.manifest
-    }
-
-    /// Returns the pinned chunks.
-    #[must_use]
-    pub fn chunks(&self) -> &[ChunkId] {
-        &self.chunks
-    }
-
-    async fn release(&mut self) {
-        if self.released {
-            return;
-        }
-        self.released = true;
-        if let Some(manifest) = self.manifest.take() {
-            let chunks = std::mem::take(&mut self.chunks);
-            let mut pins = self.pins.lock().await;
-            pins.unpin_root(&manifest, &chunks);
-        }
-    }
-}
-
-impl Drop for ProposalPin {
-    fn drop(&mut self) {
-        // Async release impossible in Drop; the counts leak conservatively
-        // (safe: retention, never unsafe reclamation). The holder should
-        // call commit/abandon explicitly.
-        let _ = self.released;
-        let _ = self.manifest.is_none();
     }
 }
 
@@ -472,7 +282,6 @@ enum SidecarJob {
 #[derive(Debug, Clone)]
 pub struct SidecarStore {
     sender: async_channel::Sender<SidecarJob>,
-    pins: Arc<futures::lock::Mutex<SidecarPins>>,
     metrics: Arc<SidecarMetrics>,
     domain: SecurityDomainId,
 }
@@ -498,7 +307,6 @@ impl SidecarStore {
         })?;
         let (sender, receiver) = async_channel::bounded::<SidecarJob>(Self::QUEUE_DEPTH);
         let metrics = Arc::new(SidecarMetrics::new());
-        let pins = Arc::new(futures::lock::Mutex::new(SidecarPins::new()));
         let worker_root = root;
         let handle = std::thread::Builder::new()
             .name("kivi-sidecar".to_owned())
@@ -511,7 +319,6 @@ impl SidecarStore {
         Ok((
             Self {
                 sender,
-                pins,
                 metrics,
                 domain,
             },
@@ -549,12 +356,6 @@ impl SidecarStore {
     #[must_use]
     pub fn metrics(&self) -> &Arc<SidecarMetrics> {
         &self.metrics
-    }
-
-    /// Returns shared pins.
-    #[must_use]
-    pub fn pins(&self) -> &Arc<futures::lock::Mutex<SidecarPins>> {
-        &self.pins
     }
 
     /// Stages one verified chunk (no sync). Returns `true` when newly
@@ -815,11 +616,6 @@ impl SidecarStore {
         manifest_obj.encode_canonical(&mut canonical);
         self.stage_manifest(computed, canonical.clone()).await?;
         self.sync().await?;
-        // Pin for the proposal lifetime.
-        {
-            let mut pins = self.pins.lock().await;
-            pins.pin_root(computed, &chunks);
-        }
         Ok(StagedRoot {
             manifest: computed,
             canonical,
@@ -877,19 +673,6 @@ impl SidecarStore {
             });
         }
         Ok(out)
-    }
-
-    /// Acquires a proposal pin handle for an already-durable root.
-    pub async fn pin_for_proposal(
-        &self,
-        manifest: ManifestId,
-        chunks: Vec<ChunkId>,
-    ) -> ProposalPin {
-        {
-            let mut pins = self.pins.lock().await;
-            pins.pin_root(manifest, &chunks);
-        }
-        ProposalPin::new(Arc::clone(&self.pins), manifest, chunks)
     }
 
     /// Current chunk-store stats (diagnostics).
@@ -1045,7 +828,7 @@ impl SidecarStore {
     }
 }
 
-/// One staged value proven durable, pinned for proposal.
+/// One staged value proven durable and ready for proposal.
 #[derive(Debug, Clone)]
 pub struct StagedRoot {
     /// Manifest addressing the value.
@@ -1109,22 +892,6 @@ mod tests {
         let deps = ImmutableDependencies::new(ManifestId::from_bytes([7; 32]), 9, domain);
         assert!(deps.is_valid());
         assert!(!ImmutableDependencies::new(ManifestId::ZERO, 0, domain).is_valid());
-    }
-
-    #[test]
-    fn pins_track_and_release_roots() {
-        let mut pins = SidecarPins::new();
-        assert!(pins.is_empty());
-        let manifest = ManifestId::from_bytes([1; 32]);
-        let chunks = vec![ChunkId::from_bytes([2; 32]), ChunkId::from_bytes([3; 32])];
-        pins.pin_root(manifest, &chunks);
-        assert_eq!(pins.manifest_count(), 1);
-        assert_eq!(pins.chunk_count(), 2);
-        let (m, c) = pins.snapshot();
-        assert!(m.contains(&manifest));
-        assert_eq!(c.len(), 2);
-        pins.unpin_root(&manifest, &chunks);
-        assert!(pins.is_empty());
     }
 
     #[test]

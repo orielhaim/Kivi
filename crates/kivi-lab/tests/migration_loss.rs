@@ -154,7 +154,6 @@ fn migration_plans(cluster: &Cluster) -> String {
 #[test]
 fn migration_preserves_acked_writes_across_handoff() {
     let mut cluster = Cluster::spawn_ordered(4).expect("ordered cluster spawns");
-    let _ = cluster.wait_all_leaders();
     let _ = cluster.set_policy(&serde_json::json!({
         "auto_split": false,
         "auto_merge": false,
@@ -316,5 +315,4 @@ fn migration_preserves_acked_writes_across_handoff() {
         "migration-loss probe: {ITERATIONS}/{ITERATIONS} clean, {} keys verified",
         model.len()
     );
-    cluster.kill_all();
 }

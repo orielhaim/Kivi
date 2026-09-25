@@ -30,24 +30,7 @@
 use kivi_types::{NodeId, TabletId};
 
 use crate::placement::PlacementVersion;
-
-/// Identity of one split plan.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SplitPlanId(pub u64);
-
-impl SplitPlanId {
-    /// Wraps a raw plan id.
-    #[must_use]
-    pub const fn from_u64(value: u64) -> Self {
-        Self(value)
-    }
-
-    /// Returns the raw value.
-    #[must_use]
-    pub const fn as_u64(self) -> u64 {
-        self.0
-    }
-}
+use crate::topology::PlanId;
 
 /// Split lifecycle phase (kept small; every step idempotent).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -76,6 +59,22 @@ impl SplitPhase {
     #[must_use]
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Failed)
+    }
+
+    pub(crate) fn can_advance_to(self, next: Self) -> bool {
+        self == next
+            || matches!(
+                (self, next),
+                (Self::Planned, Self::ChildrenAllocated | Self::Failed)
+                    | (Self::ChildrenAllocated, Self::BaseSeeded | Self::Failed)
+                    | (Self::BaseSeeded, Self::Fenced | Self::Failed)
+                    | (
+                        Self::Fenced,
+                        Self::BaseSeeded | Self::CutoverCommitted | Self::Failed
+                    )
+                    | (Self::CutoverCommitted, Self::ParentRetiring | Self::Failed)
+                    | (Self::ParentRetiring, Self::Completed | Self::Failed)
+            )
     }
 
     /// Encodes the phase as a canonical discriminant byte.
@@ -149,7 +148,7 @@ pub enum SplitError {
 pub struct SplitPlan {
     /// Plan identity (shares the control `next_plan_id` sequence with
     /// migrations: ids are unique across plan kinds).
-    pub id: SplitPlanId,
+    pub id: PlanId,
     /// Parent tablet subdividing.
     pub parent: TabletId,
     /// Deterministic split boundary for hash parents (midpoint of parent
@@ -178,7 +177,7 @@ impl SplitPlan {
     /// Returns [`SplitError::BadChildren`] on degenerate identities.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        id: SplitPlanId,
+        id: PlanId,
         parent: TabletId,
         split_hash: u128,
         split_key: Option<Vec<u8>>,
@@ -285,7 +284,7 @@ impl SplitPlan {
         if input.len() < 8 + 8 + 16 + 8 + 8 + 8 + 1 + 4 + 1 {
             return Err(Fault::Truncated);
         }
-        let id = SplitPlanId::from_u64(u64::from_le_bytes(input[..8].try_into().unwrap_or([0; 8])));
+        let id = PlanId::from_u64(u64::from_le_bytes(input[..8].try_into().unwrap_or([0; 8])));
         let parent = TabletId::from_u64(u64::from_le_bytes(
             input[8..16].try_into().unwrap_or([0; 8]),
         ));
@@ -357,7 +356,7 @@ mod tests {
 
     fn sample() -> SplitPlan {
         SplitPlan::new(
-            SplitPlanId::from_u64(1),
+            PlanId::from_u64(1),
             TabletId::from_u64(7),
             1u128 << 127,
             None,
@@ -375,7 +374,7 @@ mod tests {
 
     fn ordered_sample() -> SplitPlan {
         SplitPlan::new(
-            SplitPlanId::from_u64(2),
+            PlanId::from_u64(2),
             TabletId::from_u64(8),
             0,
             Some(b"m".to_vec()),
@@ -405,7 +404,7 @@ mod tests {
     fn degenerate_children_fail() {
         assert!(matches!(
             SplitPlan::new(
-                SplitPlanId::from_u64(1),
+                PlanId::from_u64(1),
                 TabletId::from_u64(7),
                 0,
                 None,

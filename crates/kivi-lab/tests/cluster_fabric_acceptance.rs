@@ -119,7 +119,6 @@ fn scan_all_keys(client: &kivi_client::NativeClient) -> BTreeSet<Vec<u8>> {
 #[test]
 fn fabric_transparent_across_failover_and_restart() {
     let mut cluster = Cluster::spawn_ordered(4).expect("ordered cluster spawns");
-    let _ = cluster.wait_all_leaders();
     let mut model: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
     let mut counters: HashMap<Vec<u8>, i64> = HashMap::new();
 
@@ -183,7 +182,6 @@ fn fabric_transparent_across_failover_and_restart() {
     // Phase 3: full restart, then exact read-back of everything.
     cluster.kill_all();
     cluster.restart_all().expect("cluster restarts");
-    let _ = cluster.wait_all_leaders();
     cluster.wait_converged_all();
     let client = cluster.client();
     for (key, value) in &model {
@@ -208,5 +206,4 @@ fn fabric_transparent_across_failover_and_restart() {
         scanned.len()
     );
     assert_eq!(cluster.total_intents(), 0, "no stuck intents");
-    cluster.kill_all();
 }

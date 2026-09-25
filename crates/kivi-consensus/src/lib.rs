@@ -16,10 +16,9 @@
 //!
 //! ## `OpenRaft` selection record
 //!
-//! * Version: `openraft =0.10.0-alpha.34`, exact-pinned — verified live on
-//!   crates.io as the newest published `0.10.0-alpha.x` (the `0.10` line is
-//!   still alpha; see [`config`] for the full record including known alpha
-//!   instability).
+//! * Version: `openraft =0.10.0-alpha.35`, exact-pinned. The release adds
+//!   dedicated pre-vote transport; Kivi implements it on the shared peer
+//!   mesh and enables it for production and spike configurations.
 //! * Runtime: the official `openraft-rt-compio` `AsyncRuntime`. There is no
 //!   isolated Tokio runtime in this crate: `cargo tree -p kivi-consensus`
 //!   must show no Tokio. `OpenRaft` tasks park on Kivi's Compio reactors.
@@ -105,10 +104,10 @@ pub use peer::{
     PeerCoverageReport, PeerEntry, PeerEntryPayload, PeerIdentity, PeerLeaseBatch, PeerLogId,
     PeerManifestRequest, PeerManifestResponse, PeerPrepareRequest, PeerPreparedResponse,
     PeerRequest, PeerResponse, PeerRpcError, PeerSnapshotMeta, PeerSnapshotRequest,
-    PeerSnapshotResponse, PeerVote, PeerVoteRequest, PeerVoteResponse, REQUIRED_CAPABILITIES,
-    ValidatedPeer, decode_h3_request, decode_h3_response, encode_h3_request, encode_h3_response,
-    encode_lease_message, h3_media_type, h3_method, h3_request_path, id32_hex, parse_id32_hex,
-    route, validate_peer_headers,
+    PeerSnapshotResponse, PeerTransferLeaderRequest, PeerTransferLeaderResponse, PeerVote,
+    PeerVoteRequest, PeerVoteResponse, REQUIRED_CAPABILITIES, ValidatedPeer, decode_h3_request,
+    decode_h3_response, encode_h3_request, encode_h3_response, encode_lease_message, h3_media_type,
+    h3_method, h3_request_path, id32_hex, parse_id32_hex, route, validate_peer_headers,
 };
 pub use preflight::{
     PreflightMetrics, PreflightMetricsSnapshot, PreflightOutcome, followers_needed,
@@ -129,9 +128,8 @@ pub use shared::{
     SharedDurabilityStats, SharedOpenError, SharedRaftDurability, dispatch_by_group,
 };
 pub use sidecar::{
-    ImmutableDependencies, PinStage, ProposalPin, SidecarError, SidecarMetrics,
-    SidecarMetricsSnapshot, SidecarPins, SidecarStore, StagedRoot, build_manifest_for,
-    chunk_id_for, split_value,
+    ImmutableDependencies, SidecarError, SidecarMetrics, SidecarMetricsSnapshot, SidecarStore,
+    StagedRoot, build_manifest_for, chunk_id_for, split_value,
 };
 pub use state_machine::{
     ANONYMOUS_SESSION, AppliedPointer, DecodedSnapshot, ProposalGate, RangeBase,

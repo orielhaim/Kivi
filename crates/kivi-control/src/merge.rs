@@ -19,24 +19,7 @@
 use kivi_types::{NodeId, TabletId};
 
 use crate::placement::PlacementVersion;
-
-/// Identity of one merge plan.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct MergePlanId(pub u64);
-
-impl MergePlanId {
-    /// Wraps a raw plan id.
-    #[must_use]
-    pub const fn from_u64(value: u64) -> Self {
-        Self(value)
-    }
-
-    /// Returns the raw value.
-    #[must_use]
-    pub const fn as_u64(self) -> u64 {
-        self.0
-    }
-}
+use crate::topology::PlanId;
 
 /// Merge lifecycle phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -65,6 +48,22 @@ impl MergePhase {
     #[must_use]
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Failed)
+    }
+
+    pub(crate) fn can_advance_to(self, next: Self) -> bool {
+        self == next
+            || matches!(
+                (self, next),
+                (Self::Planned, Self::TargetAllocated | Self::Failed)
+                    | (Self::TargetAllocated, Self::BaseSeeded | Self::Failed)
+                    | (Self::BaseSeeded, Self::Fenced | Self::Failed)
+                    | (
+                        Self::Fenced,
+                        Self::BaseSeeded | Self::CutoverCommitted | Self::Failed
+                    )
+                    | (Self::CutoverCommitted, Self::ParentsRetiring | Self::Failed)
+                    | (Self::ParentsRetiring, Self::Completed | Self::Failed)
+            )
     }
 
     /// Encodes the phase as a canonical discriminant byte.
@@ -127,7 +126,7 @@ pub enum MergeError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergePlan {
     /// Plan identity (shares the control `next_plan_id` sequence).
-    pub id: MergePlanId,
+    pub id: PlanId,
     /// Left parent (`[A,M)`).
     pub left: TabletId,
     /// Right parent (`[M,Z)`).
@@ -150,7 +149,7 @@ impl MergePlan {
     ///
     /// Returns [`MergeError::BadIdentities`] on degenerate identities.
     pub fn new(
-        id: MergePlanId,
+        id: PlanId,
         left: TabletId,
         right: TabletId,
         merged: TabletId,
@@ -232,7 +231,7 @@ impl MergePlan {
         if input.len() < 8 * 5 + 1 + 4 {
             return Err(Fault::Truncated);
         }
-        let id = MergePlanId::from_u64(u64::from_le_bytes(input[..8].try_into().unwrap_or([0; 8])));
+        let id = PlanId::from_u64(u64::from_le_bytes(input[..8].try_into().unwrap_or([0; 8])));
         let left = TabletId::from_u64(u64::from_le_bytes(
             input[8..16].try_into().unwrap_or([0; 8]),
         ));
@@ -275,7 +274,7 @@ mod tests {
     #[test]
     fn merge_round_trips() {
         let plan = MergePlan::new(
-            MergePlanId::from_u64(2),
+            PlanId::from_u64(2),
             TabletId::from_u64(101),
             TabletId::from_u64(102),
             TabletId::from_u64(201),
@@ -292,7 +291,7 @@ mod tests {
     fn degenerate_identities_fail() {
         assert!(matches!(
             MergePlan::new(
-                MergePlanId::from_u64(1),
+                PlanId::from_u64(1),
                 TabletId::from_u64(1),
                 TabletId::from_u64(1),
                 TabletId::from_u64(2),

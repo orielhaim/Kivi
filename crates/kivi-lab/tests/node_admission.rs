@@ -385,7 +385,6 @@ fn wait_directory_agreed(cluster: &Cluster, timeout: Duration) {
 #[test]
 fn live_fourth_node_admission_without_traffic_loss() {
     let mut cluster = Cluster::spawn_ordered(4).expect("ordered cluster spawns");
-    let _ = cluster.wait_all_leaders();
     let _ = cluster.set_policy(&serde_json::json!({
         "auto_split": false,
         "auto_merge": false,
@@ -536,5 +535,4 @@ fn live_fourth_node_admission_without_traffic_loss() {
         "admission: 4th node joined, tracked churn, hosts tablet {moved}; {} keys verified",
         model.len()
     );
-    cluster.kill_all();
 }

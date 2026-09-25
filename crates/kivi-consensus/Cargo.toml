@@ -23,11 +23,11 @@ crc32c.workspace = true
 # is unacceptable. `default-features = false` drops the Tokio runtime and
 # clap; `single-threaded` removes the `Send` bounds so Raft tasks park on
 # Kivi's Compio reactors (thread-per-core ownership, enforced by types).
-openraft = { version = "=0.10.0-alpha.34", default-features = false, features = ["single-threaded"] }
+openraft = { version = "=0.10.0-alpha.35", default-features = false, features = ["single-threaded"] }
 # Official Compio `AsyncRuntime` for OpenRaft (the `KiviTypeConfig` runtime).
-openraft-rt-compio = "=0.10.0-alpha.34"
+openraft-rt-compio = "=0.10.0-alpha.35"
 # Official Multi-Raft routing adapters (`GroupRouter` and friends).
-openraft-multi = "=0.10.0-alpha.34"
+openraft-multi = "=0.10.0-alpha.35"
 # Compio execution architecture: consensus tasks run on Compio reactors
 # (the owner thread today, `DataWorker` reactors in the future). No Tokio
 # anywhere in this crate: `cargo tree -p kivi-consensus` must show none.

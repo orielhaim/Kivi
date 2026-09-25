@@ -188,6 +188,7 @@ fn auto_repair_after_hard_kill() {
     // Restart the failed node: it must NOT resurrect obsolete memberships
     // (generation/tombstone fencing at open tombstones removed replicas).
     cluster.restart(victim).expect("victim restarts");
+    cluster.wait_converged_all();
     let _ = cluster.wait_all_leaders();
     // No-resurrection as a quiescence predicate (never a fixed sleep):
     // poll the invariant itself — the returnee converges with zero

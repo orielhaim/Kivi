@@ -31,11 +31,6 @@
 //! kind 14 v1 RAFT_COMMITTED: namespace u64, group u64, term u64,
 //!                           leader u64, index u64
 //!     (the `save_committed` pointer; absent means "re-derive at startup")
-//! kind 15 v1 RAFT_SNAPSHOT_INSTALLED:
-//!                          namespace u64, group u64, term u64, leader u64,
-//!                          index u64, u32 id len, snapshot id bytes
-//!     (installed-snapshot metadata grounding the purge base; artifact
-//!     transfer arrives in a later stage)
 //! ```
 //!
 //! Every record identifies its consensus group (backed by [`TabletId`])
@@ -59,8 +54,6 @@ pub const RECORD_KIND_RAFT_TRUNCATE: u16 = 12;
 pub const RECORD_KIND_RAFT_PURGE: u16 = 13;
 /// `RAFT_COMMITTED` record kind (see module docs).
 pub const RECORD_KIND_RAFT_COMMITTED: u16 = 14;
-/// `RAFT_SNAPSHOT_INSTALLED` record kind (see module docs).
-pub const RECORD_KIND_RAFT_SNAPSHOT_INSTALLED: u16 = 15;
 
 /// Entry payload tag: leader blank (commit barrier, no data).
 pub const RAFT_PAYLOAD_BLANK: u8 = 0;
@@ -70,7 +63,7 @@ pub const RAFT_PAYLOAD_NORMAL: u8 = 1;
 pub const RAFT_PAYLOAD_MEMBERSHIP: u8 = 2;
 
 /// Returns whether a record kind tag belongs to the consensus family
-/// (kinds 10–15). The segment scanner dispatches on this before version
+/// (kinds 10–14). The segment scanner dispatches on this before version
 /// checks, so unknown consensus versions fail exactly like unknown tablet
 /// versions: loudly, never skipped.
 #[must_use]
@@ -82,7 +75,6 @@ pub const fn is_raft_kind(kind: u16) -> bool {
             | RECORD_KIND_RAFT_TRUNCATE
             | RECORD_KIND_RAFT_PURGE
             | RECORD_KIND_RAFT_COMMITTED
-            | RECORD_KIND_RAFT_SNAPSHOT_INSTALLED
     )
 }
 
@@ -110,7 +102,7 @@ pub struct RaftEntry {
     pub namespace: NamespaceId,
     /// Consensus group (tablet) this entry belongs to.
     pub group: TabletId,
-    /// Per-group log index (consecutive — no holes). `OpenRaft` 0.9
+    /// Per-group log index (consecutive — no holes). `OpenRaft` 0.10
     /// numbers its first entry 0, so 0 is a legal index here.
     pub index: u64,
     /// Term that produced the entry.
@@ -185,23 +177,6 @@ pub struct RaftCommitted {
     pub index: u64,
 }
 
-/// Durably recorded installed-snapshot metadata (grounds the purge base).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RaftSnapshotInstalled {
-    /// Owning namespace.
-    pub namespace: NamespaceId,
-    /// Consensus group (tablet) snapshotted.
-    pub group: TabletId,
-    /// Snapshot's last entry term.
-    pub term: u64,
-    /// Snapshot's last entry leader.
-    pub leader: NodeId,
-    /// Snapshot's last entry index.
-    pub index: u64,
-    /// Snapshot identity bytes (Kivi checkpoint-cut reference).
-    pub snapshot_id: Vec<u8>,
-}
-
 /// One physical consensus record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RaftRecord {
@@ -215,8 +190,6 @@ pub enum RaftRecord {
     Purge(RaftPurge),
     /// Commit pointer.
     Committed(RaftCommitted),
-    /// Installed snapshot metadata.
-    SnapshotInstalled(RaftSnapshotInstalled),
 }
 
 impl RaftRecord {
@@ -229,7 +202,6 @@ impl RaftRecord {
             Self::Truncate(record) => record.group,
             Self::Purge(record) => record.group,
             Self::Committed(record) => record.group,
-            Self::SnapshotInstalled(record) => record.group,
         }
     }
 
@@ -242,7 +214,6 @@ impl RaftRecord {
             Self::Truncate(record) => record.namespace,
             Self::Purge(record) => record.namespace,
             Self::Committed(record) => record.namespace,
-            Self::SnapshotInstalled(record) => record.namespace,
         }
     }
 
@@ -255,7 +226,6 @@ impl RaftRecord {
             Self::Truncate(_) => RECORD_KIND_RAFT_TRUNCATE,
             Self::Purge(_) => RECORD_KIND_RAFT_PURGE,
             Self::Committed(_) => RECORD_KIND_RAFT_COMMITTED,
-            Self::SnapshotInstalled(_) => RECORD_KIND_RAFT_SNAPSHOT_INSTALLED,
         }
     }
 }
@@ -367,14 +337,6 @@ pub(crate) fn encode_raft_body(
             push_u64(out, pointer.leader.as_u64());
             push_u64(out, pointer.index);
         }
-        RaftRecord::SnapshotInstalled(snapshot) => {
-            push_u64(out, snapshot.namespace.as_u64());
-            push_u64(out, snapshot.group.as_u64());
-            push_u64(out, snapshot.term);
-            push_u64(out, snapshot.leader.as_u64());
-            push_u64(out, snapshot.index);
-            push_blob(out, &snapshot.snapshot_id)?;
-        }
     }
     Ok(())
 }
@@ -398,7 +360,6 @@ pub(crate) fn decode_raft_body(
         RECORD_KIND_RAFT_TRUNCATE => decode_truncate(body),
         RECORD_KIND_RAFT_PURGE => decode_purge(body),
         RECORD_KIND_RAFT_COMMITTED => decode_committed(body),
-        RECORD_KIND_RAFT_SNAPSHOT_INSTALLED => decode_snapshot_installed(body),
         other => Err(RecordFault::Unknown {
             kind: other,
             version: crate::wal::RECORD_VERSION_1,
@@ -460,7 +421,7 @@ fn decode_entry(body: &[u8]) -> Result<RaftRecord, RecordFault> {
         }
         _ => return Err(RecordFault::Corrupt("unknown raft entry payload tag")),
     };
-    // Note: index 0 is legal — `OpenRaft` 0.9 numbers its first entry
+    // Note: index 0 is legal — `OpenRaft` 0.10 numbers its first entry
     // 0 — so no nonzero check here (unlike truncate/purge markers,
     // whose zero values are never minted).
     Ok(RaftRecord::Entry(RaftEntry {
@@ -520,26 +481,6 @@ fn decode_committed(body: &[u8]) -> Result<RaftRecord, RecordFault> {
         term,
         leader: NodeId::from_u64(leader),
         index,
-    }))
-}
-
-fn decode_snapshot_installed(body: &[u8]) -> Result<RaftRecord, RecordFault> {
-    let (namespace, rest) = take_u64(body)?;
-    let (group, rest) = take_u64(rest)?;
-    let (term, rest) = take_u64(rest)?;
-    let (leader, rest) = take_u64(rest)?;
-    let (index, rest) = take_u64(rest)?;
-    let (snapshot_id, rest) = take_blob(rest, 1024 * 1024)?;
-    if !rest.is_empty() {
-        return Err(RecordFault::Corrupt("malformed raft snapshot record"));
-    }
-    Ok(RaftRecord::SnapshotInstalled(RaftSnapshotInstalled {
-        namespace: NamespaceId::from_u64(namespace),
-        group: TabletId::from_u64(group),
-        term,
-        leader: NodeId::from_u64(leader),
-        index,
-        snapshot_id: snapshot_id.to_vec(),
     }))
 }
 
@@ -668,14 +609,6 @@ mod tests {
             term: 7,
             leader: NodeId::from_u64(2),
             index: 42,
-        }));
-        round_trip(&RaftRecord::SnapshotInstalled(RaftSnapshotInstalled {
-            namespace: namespace(),
-            group: group(),
-            term: 7,
-            leader: NodeId::from_u64(2),
-            index: 40,
-            snapshot_id: b"ckpt-9@42".to_vec(),
         }));
     }
 

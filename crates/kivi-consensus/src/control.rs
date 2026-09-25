@@ -249,7 +249,7 @@ pub enum ReconcileStep {
     /// Advance the persisted plan phase (control-plane commit).
     AdvancePlan {
         /// Affected plan.
-        plan: kivi_control::MigrationPlanId,
+        plan: kivi_control::topology::PlanId,
         /// New phase.
         phase: kivi_control::MigrationPhase,
     },
@@ -497,7 +497,8 @@ pub fn next_step(
 mod tests {
     use std::collections::BTreeSet;
 
-    use kivi_control::{MigrationPhase, MigrationPlan, MigrationPlanId, PlacementVersion};
+    use kivi_control::topology::PlanId;
+    use kivi_control::{MigrationPhase, MigrationPlan, PlacementVersion};
     use kivi_types::{NodeId, TabletId};
 
     use super::*;
@@ -505,7 +506,7 @@ mod tests {
 
     fn plan_at(phase: MigrationPhase) -> MigrationPlan {
         let mut plan = MigrationPlan::new(
-            MigrationPlanId::from_u64(1),
+            PlanId::from_u64(1),
             TabletId::from_u64(17),
             PlacementVersion::from_u64(2),
             NodeId::from_u64(1),

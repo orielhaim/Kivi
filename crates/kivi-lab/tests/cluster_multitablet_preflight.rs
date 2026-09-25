@@ -9,9 +9,10 @@
 
 use std::time::{Duration, Instant};
 
+use kivi_client::{ClientConfig, NativeClient};
 use kivi_lab::cluster::Cluster;
 use kivi_state::Key;
-use kivi_types::{RequestSeq, SessionId};
+use kivi_types::{NamespaceId, RequestSeq, SessionId};
 
 fn key(name: &str) -> Key {
     Key::from(name)
@@ -313,16 +314,48 @@ fn preflight_leader_loss_abandons_without_commit() {
         );
         // New leader reuses distributed chunks by manifest id; the same
         // identity converges exactly once.
-        let mut retry: &[u8] = &value;
-        cluster
-            .client_with_session(session)
-            .put_stream_with_seq(
+        let deadline = Instant::now() + Duration::from_secs(150);
+        loop {
+            let retry_client = NativeClient::new(ClientConfig {
+                seeds: cluster.native_endpoints(),
+                namespace: NamespaceId::from_u64(1),
+                session: Some(session),
+                request_timeout: Duration::from_secs(120),
+                ..ClientConfig::default()
+            })
+            .expect("retry client builds");
+            let mut retry: &[u8] = &value;
+            match retry_client.put_stream_with_seq(
                 &key(&name),
                 Some(value.len() as u64),
                 &mut retry,
                 Some(RequestSeq::from_u64(1)),
-            )
-            .expect("retry converges");
+            ) {
+                Ok(()) => break,
+                Err(
+                    kivi_client::ClientError::AmbiguousOutcome
+                    | kivi_client::ClientError::Timeout
+                    | kivi_client::ClientError::Io(_)
+                    | kivi_client::ClientError::Overloaded,
+                ) => {
+                    if cluster
+                        .client()
+                        .get_stream(&key(&name))
+                        .ok()
+                        .flatten()
+                        .is_some_and(|got| got.as_ref() == value.as_slice())
+                    {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "ambiguous stream upload did not converge"
+                    );
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                Err(error) => panic!("retry converges: {error:?}"),
+            }
+        }
         assert_eq!(get_stream(&cluster.client(), &name), value);
     }
     cluster.restart(leader_a).expect("old leader restarts");

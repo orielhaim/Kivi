@@ -66,7 +66,6 @@ fn assert_sorted_unique(keys: &[Vec<u8>]) {
 #[test]
 fn ordered_range_scan_money() {
     let cluster = Cluster::spawn_ordered(4).expect("ordered cluster spawns");
-    let _ = cluster.wait_all_leaders();
     let client = cluster.client();
     // 1200 keys spread over all four tablets.
     let mut expected: Vec<Vec<u8>> = Vec::new();

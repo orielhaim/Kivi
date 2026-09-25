@@ -697,7 +697,10 @@ fn main() -> anyhow::Result<()> {
         adaptive::AdaptiveRuntimeConfig::default(),
     ));
     let (adaptive_shutdown, adaptive_shutdown_rx) = tokio::sync::watch::channel(false);
-    let adaptive_task = Arc::clone(&adaptive).spawn(adaptive_shutdown_rx);
+    let adaptive_task = {
+        let _runtime_guard = runtime.enter();
+        Arc::clone(&adaptive).spawn(adaptive_shutdown_rx)
+    };
     let state = AdminState {
         node,
         cluster,

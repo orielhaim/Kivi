@@ -287,7 +287,14 @@ pub async fn serve_with<E>(
         tokio::select! {
             _ = shutdown.changed() => break,
             accepted = listener.accept() => {
-                let Ok((socket, _)) = accepted else { continue };
+                let (socket, _) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        tracing::debug!(%error, "RESP accept failed");
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        continue;
+                    }
+                };
                 // Request/response traffic is small frames in both
                 // directions: disable Nagle so replies never wait for
                 // delayed ACKs (same reason the native path avoids

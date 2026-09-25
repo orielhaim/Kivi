@@ -227,7 +227,6 @@ fn estimate_bytes(records: &[RaftRecord]) -> usize {
                 }
             }
             RaftRecord::Truncate(_) => 48,
-            RaftRecord::SnapshotInstalled(snapshot) => 64 + snapshot.snapshot_id.len(),
         })
         .sum()
 }
@@ -532,7 +531,6 @@ struct GroupInner {
     entries: BTreeMap<u64, GroupStoredEntry>,
     last_purged: Option<GroupStoredLogId>,
     committed: Option<GroupStoredLogId>,
-    snapshot_base: Option<GroupStoredLogId>,
     truncations: u64,
 }
 
@@ -593,13 +591,6 @@ impl GroupInner {
                     term: pointer.term,
                     leader: pointer.leader.as_u64(),
                     index: pointer.index,
-                });
-            }
-            RaftRecord::SnapshotInstalled(snapshot) => {
-                self.snapshot_base = Some(GroupStoredLogId {
-                    term: snapshot.term,
-                    leader: snapshot.leader.as_u64(),
-                    index: snapshot.index,
                 });
             }
         }
@@ -769,7 +760,6 @@ impl GroupRaftStore {
             entries: BTreeMap::new(),
             last_purged: None,
             committed: None,
-            snapshot_base: None,
             truncations: 0,
         };
         for record in records {
@@ -876,16 +866,6 @@ impl GroupRaftStore {
             .await
             .committed
             .map(|pointer| (pointer.term, pointer.leader, pointer.index))
-    }
-
-    /// Returns the cached snapshot base. Test-only.
-    #[cfg(test)]
-    pub(crate) async fn cached_snapshot_base(&self) -> Option<(u64, u64, u64)> {
-        self.shared_cache
-            .lock()
-            .await
-            .snapshot_base
-            .map(|base| (base.term, base.leader, base.index))
     }
 
     /// Returns observed logical truncations. Test-only.

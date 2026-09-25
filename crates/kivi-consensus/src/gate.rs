@@ -45,6 +45,7 @@ use crate::types::ConsensusGroupId;
 const MAX_CONCURRENT_CHUNK_FETCH: usize = 4;
 /// Maximum inflight gated roots (bounded acquisition table).
 const MAX_INFLIGHT_ROOTS: usize = 64;
+const SOURCE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Durability gate for sidecar-backed Raft entries.
 ///
@@ -88,21 +89,43 @@ impl SidecarGate {
         }
     }
 
-    /// Orders sources leader-first when a hint is available (replication
-    /// peer / leader today; archive / object store later).
-    fn ordered_sources(&self, hint: Option<NodeId>) -> Vec<NodeId> {
-        let mut out = Vec::with_capacity(self.peers.len());
+    fn all_sources(&self, hint: Option<NodeId>) -> Vec<NodeId> {
+        let mut sources = Vec::with_capacity(self.peers.len());
         if let Some(leader) = hint
             && self.peers.contains(&leader)
         {
-            out.push(leader);
+            sources.push(leader);
         }
-        for peer in self.peers.iter() {
-            if Some(*peer) != hint {
-                out.push(*peer);
+        sources.extend(
+            self.peers
+                .iter()
+                .copied()
+                .filter(|peer| Some(*peer) != hint),
+        );
+        sources
+    }
+
+    async fn ordered_sources(&self, hint: Option<NodeId>) -> Vec<NodeId> {
+        if hint.is_some() {
+            return self.all_sources(hint);
+        }
+        let stats = self.transport.stats().await;
+        let mut live = Vec::with_capacity(self.peers.len());
+        let mut offline = Vec::with_capacity(self.peers.len());
+        for peer in self.peers.iter().copied() {
+            if stats
+                .get(&peer)
+                .is_some_and(|stats| stats.connected_bulk || stats.connected_control)
+            {
+                live.push(peer);
+            } else {
+                offline.push(peer);
             }
         }
-        out
+        live.sort_by_key(|peer| peer.as_u64());
+        offline.sort_by_key(|peer| peer.as_u64());
+        live.extend(offline);
+        live
     }
 
     /// Returns the sidecar store.
@@ -198,6 +221,27 @@ impl SidecarGate {
         logical_len: u64,
         hint: Option<NodeId>,
     ) -> Result<(), SidecarError> {
+        self.ensure_root_with_mode(manifest, logical_len, hint, false)
+            .await
+    }
+
+    pub(crate) async fn ensure_root_preflight(
+        &self,
+        manifest: ManifestId,
+        logical_len: u64,
+        hint: Option<NodeId>,
+    ) -> Result<(), SidecarError> {
+        self.ensure_root_with_mode(manifest, logical_len, hint, true)
+            .await
+    }
+
+    async fn ensure_root_with_mode(
+        &self,
+        manifest: ManifestId,
+        logical_len: u64,
+        hint: Option<NodeId>,
+        preflight: bool,
+    ) -> Result<(), SidecarError> {
         if !manifest.is_valid() {
             return Err(SidecarError::Corrupt {
                 detail: "zero manifest id".to_owned(),
@@ -234,8 +278,10 @@ impl SidecarGate {
                 .inflight
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        let sources = self.ordered_sources(hint);
-        let result = self.fetch_root(manifest, logical_len, &sources).await;
+        let sources = self.ordered_sources(hint).await;
+        let result = self
+            .fetch_root(manifest, logical_len, &sources, hint, preflight)
+            .await;
         {
             self.inflight.lock().await.remove(&manifest);
             self.store
@@ -315,6 +361,8 @@ impl SidecarGate {
         manifest: ManifestId,
         logical_len: u64,
         sources: &[NodeId],
+        hint: Option<NodeId>,
+        preflight: bool,
     ) -> Result<(), SidecarError> {
         self.store
             .metrics()
@@ -322,7 +370,9 @@ impl SidecarGate {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // 1. Manifest (single, small): fetch if not durable.
         if !self.store.is_durable_manifest(manifest).await? {
-            let canonical = self.fetch_manifest(manifest, sources).await?;
+            let canonical = self
+                .fetch_manifest(manifest, sources, hint, preflight)
+                .await?;
             // Verify before install: id recompute + structural validation
             // + domain + length agreement (never trust peer-supplied ids).
             let decoded = kivi_chunk::verify_manifest(manifest, &canonical).map_err(|error| {
@@ -359,8 +409,8 @@ impl SidecarGate {
         let missing = self.store.missing_chunks(manifest).await?;
         if missing.is_empty() {
             self.store.sync().await?;
-            // Pin for the applying entry's lifetime is handled by the
-            // caller (proposal pins); here just prove durability.
+            // The gate proves durability; live-state references and the
+            // content-addressed store own retention.
             if !self.store.check_root(manifest, logical_len).await? {
                 return Err(SidecarError::Missing {
                     detail: format!("root {manifest} not durable after no-op fetch"),
@@ -380,7 +430,8 @@ impl SidecarGate {
         for batch in missing.chunks(MAX_CONCURRENT_CHUNK_FETCH) {
             let mut futures_list = Vec::with_capacity(batch.len());
             for chunk in batch {
-                futures_list.push(self.fetch_and_stage_chunk(*chunk, &expected, sources));
+                futures_list
+                    .push(self.fetch_and_stage_chunk(*chunk, &expected, sources, hint, preflight));
             }
             let results = futures::future::join_all(futures_list).await;
             for result in results {
@@ -397,11 +448,34 @@ impl SidecarGate {
         Ok(())
     }
 
+    async fn source_timeout(
+        &self,
+        source: NodeId,
+        hint: Option<NodeId>,
+        preflight: bool,
+    ) -> Duration {
+        if preflight && hint == Some(source) {
+            let stats = self.transport.stats().await;
+            if stats
+                .get(&source)
+                .is_some_and(|stats| stats.connected_bulk || stats.connected_control)
+            {
+                self.bulk_timeout
+            } else {
+                self.bulk_timeout.min(SOURCE_ATTEMPT_TIMEOUT)
+            }
+        } else {
+            self.bulk_timeout
+        }
+    }
+
     async fn fetch_and_stage_chunk(
         &self,
         chunk: ChunkId,
         expected: &HashMap<ChunkId, u64>,
         sources: &[NodeId],
+        hint: Option<NodeId>,
+        preflight: bool,
     ) -> Result<(), SidecarError> {
         // Dedup re-check inside the batch (another entry may have staged).
         if self.store.is_durable_chunk(chunk).await? {
@@ -415,7 +489,7 @@ impl SidecarGate {
             .metrics()
             .chunk_requests
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let bytes = self.fetch_chunk(chunk, sources).await?;
+        let bytes = self.fetch_chunk(chunk, sources, hint, preflight).await?;
         // Verify: id recompute + length vs manifest entry.
         let computed = kivi_codec::integrity::chunk_id(self.domain, &bytes);
         if computed != chunk {
@@ -454,6 +528,8 @@ impl SidecarGate {
         &self,
         manifest: ManifestId,
         sources: &[NodeId],
+        hint: Option<NodeId>,
+        preflight: bool,
     ) -> Result<Vec<u8>, SidecarError> {
         let mut last_error = None;
         for source in sources {
@@ -462,7 +538,12 @@ impl SidecarGate {
             });
             match self
                 .transport
-                .call_bulk(*source, self.group, request, self.bulk_timeout)
+                .call_bulk(
+                    *source,
+                    self.group,
+                    request,
+                    self.source_timeout(*source, hint, preflight).await,
+                )
                 .await
             {
                 Ok(PeerResponse::Manifest(response)) => {
@@ -512,6 +593,8 @@ impl SidecarGate {
         &self,
         chunk: ChunkId,
         sources: &[NodeId],
+        hint: Option<NodeId>,
+        preflight: bool,
     ) -> Result<Vec<u8>, SidecarError> {
         let mut last_error = None;
         for source in sources {
@@ -520,7 +603,12 @@ impl SidecarGate {
             });
             match self
                 .transport
-                .call_bulk(*source, self.group, request, self.bulk_timeout)
+                .call_bulk(
+                    *source,
+                    self.group,
+                    request,
+                    self.source_timeout(*source, hint, preflight).await,
+                )
                 .await
             {
                 Ok(PeerResponse::Chunk(response)) => {

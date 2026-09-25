@@ -612,7 +612,6 @@ mod tests {
             assert_eq!(seed.cached_indexes().await, vec![3, 4, 5]);
             assert_eq!(seed.cached_vote().await, Some((3, 2, true)));
             assert_eq!(seed.cached_committed().await, Some((3, 2, 5)));
-            assert_eq!(seed.cached_snapshot_base().await, None);
 
             // Reopen: the fold rebuilds the identical logical state from the
             // physical bytes (truncate dropped 4/5-divergent, purge dropped
@@ -700,11 +699,6 @@ pub(crate) mod test_support {
         /// Returns the cached commit pointer.
         pub(crate) async fn cached_committed(&self) -> Option<(u64, u64, u64)> {
             self.view.cached_committed().await
-        }
-
-        /// Returns the cached snapshot base.
-        pub(crate) async fn cached_snapshot_base(&self) -> Option<(u64, u64, u64)> {
-            self.view.cached_snapshot_base().await
         }
 
         /// Returns observed logical truncations (live calls plus

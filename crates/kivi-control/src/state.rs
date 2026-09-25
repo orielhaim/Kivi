@@ -10,12 +10,13 @@ use kivi_types::{NodeId, TabletId};
 
 use crate::catalog::{CatalogIndexState, IndexRecord, NamespaceRecord};
 use crate::layouts::{LayoutKey, LayoutRecord};
-use crate::merge::{MergePlan, MergePlanId};
-use crate::migration::{MigrationPlan, MigrationPlanId};
-use crate::mutation::{ControlMutation, MergePlanIdAlias, MigrationPlanIdAlias, SplitPlanIdAlias};
+use crate::merge::MergePlan;
+use crate::migration::MigrationPlan;
+use crate::mutation::ControlMutation;
 use crate::node::{NodeRecord, NodeState};
 use crate::placement::{DesiredReplicaSet, PlacementVersion};
-use crate::split::{SplitPlan, SplitPlanId};
+use crate::split::SplitPlan;
+use crate::topology::PlanId;
 
 /// Monotonic cluster generation: every control-membership or
 /// placement-epoch transition advances it. Stale create/remove/complete
@@ -102,6 +103,14 @@ pub enum ControlApplyError {
         /// Human-readable cause.
         detail: String,
     },
+    /// A concurrent topology proposal superseded this mutation.
+    #[error("topology mutation superseded on tablet {tablet}: {detail}")]
+    SupersededTopology {
+        /// Affected tablet.
+        tablet: u64,
+        /// Human-readable cause.
+        detail: String,
+    },
     /// A desired placement carries a stale version.
     #[error("stale placement generation: offered {offered}, current {current}")]
     StalePlacement {
@@ -164,6 +173,12 @@ pub enum ControlSnapshotError {
     /// Trailing bytes after the framed image.
     #[error("trailing bytes in control snapshot")]
     TrailingBytes,
+    /// Two topology plan kinds reuse one identity in a snapshot.
+    #[error("duplicate topology plan id {plan} in control snapshot")]
+    DuplicatePlan {
+        /// Repeated plan identity.
+        plan: u64,
+    },
     /// An embedded node record failed to decode.
     #[error("undecodable node record: {0}")]
     BadNode(#[from] crate::node::NodeError),
@@ -278,8 +293,8 @@ impl ControlState {
 
     /// Returns the next plan id without assigning it.
     #[must_use]
-    pub const fn next_plan_id(&self) -> MigrationPlanId {
-        MigrationPlanId::from_u64(self.next_plan_id)
+    pub const fn next_plan_id(&self) -> PlanId {
+        PlanId::from_u64(self.next_plan_id)
     }
 
     /// Returns the next tablet id for dynamic allocation without
@@ -338,7 +353,7 @@ impl ControlState {
 
     /// Looks up one migration plan.
     #[must_use]
-    pub fn migration(&self, id: MigrationPlanId) -> Option<&MigrationPlan> {
+    pub fn migration(&self, id: PlanId) -> Option<&MigrationPlan> {
         self.migrations.get(&id.as_u64())
     }
 
@@ -358,7 +373,7 @@ impl ControlState {
 
     /// Looks up one split plan.
     #[must_use]
-    pub fn split(&self, id: SplitPlanId) -> Option<&SplitPlan> {
+    pub fn split(&self, id: PlanId) -> Option<&SplitPlan> {
         self.splits.get(&id.as_u64())
     }
 
@@ -378,7 +393,7 @@ impl ControlState {
 
     /// Looks up one merge plan.
     #[must_use]
-    pub fn merge(&self, id: MergePlanId) -> Option<&MergePlan> {
+    pub fn merge(&self, id: PlanId) -> Option<&MergePlan> {
         self.merges.get(&id.as_u64())
     }
 
@@ -449,6 +464,13 @@ impl ControlState {
             || !self.merges_for(tablet).is_empty()
     }
 
+    fn has_plan(&self, id: PlanId) -> bool {
+        let id = id.as_u64();
+        self.migrations.contains_key(&id)
+            || self.splits.contains_key(&id)
+            || self.merges.contains_key(&id)
+    }
+
     /// Applies one committed control mutation in log order.
     ///
     /// # Errors
@@ -477,6 +499,12 @@ impl ControlState {
                 Ok(())
             }
             ControlMutation::SetDesiredPlacement { desired } => {
+                if self.has_live_topology(desired.tablet) {
+                    return Err(Fault::SupersededTopology {
+                        tablet: desired.tablet.as_u64(),
+                        detail: "desired placement superseded by a live topology plan".to_owned(),
+                    });
+                }
                 let current = self.placement_version.as_u64();
                 let offered = desired.version.as_u64();
                 if let Some(existing) = self.placements.get(&desired.tablet.as_u64()) {
@@ -521,33 +549,86 @@ impl ControlState {
                     if *existing == *plan {
                         return Ok(());
                     }
-                    return Err(Fault::DuplicatePlan {
-                        plan: plan.id.as_u64(),
+                    return Err(Fault::SupersededTopology {
+                        tablet: plan.tablet.as_u64(),
+                        detail: "migration plan identity was already allocated".to_owned(),
                     });
                 }
-                if plan.generation != self.placement_version {
-                    return Err(Fault::StaleGeneration {
-                        plan: plan.id.as_u64(),
-                        carried: plan.generation.as_u64(),
-                        current: self.placement_version.as_u64(),
+                if self.has_plan(plan.id) {
+                    return Err(Fault::SupersededTopology {
+                        tablet: plan.tablet.as_u64(),
+                        detail: "migration plan identity was already allocated".to_owned(),
                     });
                 }
-                let Some(desired) = self.placements.get(&plan.tablet.as_u64()) else {
+                if self.has_live_topology(plan.tablet) {
+                    return Err(Fault::SupersededTopology {
+                        tablet: plan.tablet.as_u64(),
+                        detail: "migration superseded by a live topology plan".to_owned(),
+                    });
+                }
+                let current = self.placement_version;
+                let Some(desired) = self.placements.get(&plan.tablet.as_u64()).cloned() else {
                     return Err(Fault::TopologyConflict {
                         tablet: plan.tablet.as_u64(),
                         detail: "migration names an unplaced tablet".to_owned(),
                     });
                 };
-                if plan.from == plan.to
-                    || desired.contains(plan.from)
-                    || !desired.contains(plan.to)
-                    || plan.desired_voters != desired.replicas
-                {
+                if plan.from == plan.to {
                     return Err(Fault::TopologyConflict {
                         tablet: plan.tablet.as_u64(),
                         detail: "migration endpoints do not match desired placement".to_owned(),
                     });
                 }
+                let advances_placement = if plan.generation == current {
+                    if desired.version != plan.generation
+                        || desired.contains(plan.from)
+                        || !desired.contains(plan.to)
+                        || plan.desired_voters != desired.replicas
+                    {
+                        return Err(Fault::TopologyConflict {
+                            tablet: plan.tablet.as_u64(),
+                            detail: "migration endpoints do not match desired placement".to_owned(),
+                        });
+                    }
+                    false
+                } else if plan.generation
+                    == current.next().map_err(|error| Fault::TopologyConflict {
+                        tablet: plan.tablet.as_u64(),
+                        detail: error.to_string(),
+                    })?
+                {
+                    if !desired.contains(plan.from) || desired.contains(plan.to) {
+                        return Err(Fault::TopologyConflict {
+                            tablet: plan.tablet.as_u64(),
+                            detail: "migration endpoints do not match desired placement".to_owned(),
+                        });
+                    }
+                    let mut expected: Vec<NodeId> = desired
+                        .replicas
+                        .iter()
+                        .copied()
+                        .filter(|node| *node != plan.from)
+                        .collect();
+                    expected.push(plan.to);
+                    let expected = DesiredReplicaSet::new(plan.tablet, expected, plan.generation)
+                        .map_err(|error| Fault::TopologyConflict {
+                        tablet: plan.tablet.as_u64(),
+                        detail: error.to_string(),
+                    })?;
+                    if expected.replicas != plan.desired_voters {
+                        return Err(Fault::TopologyConflict {
+                            tablet: plan.tablet.as_u64(),
+                            detail: "migration endpoints do not match desired placement".to_owned(),
+                        });
+                    }
+                    true
+                } else {
+                    return Err(Fault::StaleGeneration {
+                        plan: plan.id.as_u64(),
+                        carried: plan.generation.as_u64(),
+                        current: self.placement_version.as_u64(),
+                    });
+                };
                 if self
                     .node(plan.to)
                     .is_none_or(|node| node.state != NodeState::Active)
@@ -556,6 +637,24 @@ impl ControlState {
                         tablet: plan.tablet.as_u64(),
                         detail: "migration target is not active".to_owned(),
                     });
+                }
+                if advances_placement {
+                    let desired = DesiredReplicaSet::new(
+                        plan.tablet,
+                        plan.desired_voters.clone(),
+                        plan.generation,
+                    )
+                    .map_err(|error| Fault::TopologyConflict {
+                        tablet: plan.tablet.as_u64(),
+                        detail: error.to_string(),
+                    })?;
+                    self.placements.insert(plan.tablet.as_u64(), desired);
+                    self.placement_version = plan.generation;
+                    self.next_tablet_id = self
+                        .next_tablet_id
+                        .max(plan.tablet.as_u64().saturating_add(1));
+                    self.generation =
+                        ClusterGeneration::from_u64(self.generation.as_u64().saturating_add(1));
                 }
                 self.migrations.insert(plan.id.as_u64(), plan.clone());
                 self.next_plan_id = self.next_plan_id.max(plan.id.as_u64() + 1);
@@ -568,7 +667,7 @@ impl ControlState {
                 phase,
                 generation,
             } => {
-                let id = MigrationPlanId::from_u64(plan.as_u64());
+                let id = *plan;
                 let Some(existing) = self.migrations.get(&id.as_u64()).cloned() else {
                     return Err(Fault::UnknownPlan { plan: id.as_u64() });
                 };
@@ -579,14 +678,23 @@ impl ControlState {
                         current: existing.generation.as_u64(),
                     });
                 }
-                let mut advanced = existing.advance(*phase);
-                let _ = MigrationPlanIdAlias::from_u64(0);
-                advanced.phase = *phase;
-                self.migrations.insert(id.as_u64(), advanced);
+                if !existing.phase.can_advance_to(*phase) {
+                    return Err(Fault::IllegalTransition {
+                        node: id.as_u64(),
+                        detail: format!(
+                            "cannot move migration {} from {:?} to {:?}",
+                            id.as_u64(),
+                            existing.phase,
+                            phase
+                        ),
+                    });
+                }
+                self.migrations
+                    .insert(id.as_u64(), existing.advance(*phase));
                 Ok(())
             }
             ControlMutation::RemoveMigration { plan } => {
-                let id = MigrationPlanId::from_u64(plan.as_u64());
+                let id = *plan;
                 let Some(existing) = self.migrations.get(&id.as_u64()) else {
                     return Err(Fault::UnknownPlan { plan: id.as_u64() });
                 };
@@ -600,6 +708,19 @@ impl ControlState {
                 Ok(())
             }
             ControlMutation::CreateSplit { plan } => {
+                if let Some(existing) = self.splits.get(&plan.id.as_u64()) {
+                    if *existing == *plan {
+                        return Ok(());
+                    }
+                    return Err(Fault::DuplicatePlan {
+                        plan: plan.id.as_u64(),
+                    });
+                }
+                if self.has_plan(plan.id) {
+                    return Err(Fault::DuplicatePlan {
+                        plan: plan.id.as_u64(),
+                    });
+                }
                 // Conflict rule: one tablet, one live plan.
                 for tablet in plan.tablets() {
                     if self.has_live_topology(tablet) {
@@ -608,6 +729,48 @@ impl ControlState {
                             detail: "tablet already has a live topology plan".to_owned(),
                         });
                     }
+                }
+                if plan.phase != crate::split::SplitPhase::Planned {
+                    return Err(Fault::TopologyConflict {
+                        tablet: plan.parent.as_u64(),
+                        detail: "split plan must start in Planned".to_owned(),
+                    });
+                }
+                let expected_generation =
+                    self.placement_version
+                        .next()
+                        .map_err(|error| Fault::TopologyConflict {
+                            tablet: plan.parent.as_u64(),
+                            detail: error.to_string(),
+                        })?;
+                if plan.generation != expected_generation {
+                    return Err(Fault::StaleGeneration {
+                        plan: plan.id.as_u64(),
+                        carried: plan.generation.as_u64(),
+                        current: expected_generation.as_u64(),
+                    });
+                }
+                let Some(parent) = self.placements.get(&plan.parent.as_u64()) else {
+                    return Err(Fault::TopologyConflict {
+                        tablet: plan.parent.as_u64(),
+                        detail: "split parent has no desired placement".to_owned(),
+                    });
+                };
+                if parent.replicas != plan.replicas || plan.replicas.is_empty() {
+                    return Err(Fault::TopologyConflict {
+                        tablet: plan.parent.as_u64(),
+                        detail: "split replicas must inherit a non-empty parent placement"
+                            .to_owned(),
+                    });
+                }
+                if [plan.left, plan.right]
+                    .iter()
+                    .any(|child| self.placements.contains_key(&child.as_u64()))
+                {
+                    return Err(Fault::TopologyConflict {
+                        tablet: plan.parent.as_u64(),
+                        detail: "split child tablet is already placed".to_owned(),
+                    });
                 }
                 self.splits.insert(plan.id.as_u64(), plan.clone());
                 self.placement_version = PlacementVersion::from_u64(
@@ -637,7 +800,7 @@ impl ControlState {
                 phase,
                 generation,
             } => {
-                let id = SplitPlanId::from_u64(plan.as_u64());
+                let id = *plan;
                 let Some(existing) = self.splits.get(&id.as_u64()).cloned() else {
                     return Err(Fault::UnknownSplit { plan: id.as_u64() });
                 };
@@ -648,14 +811,22 @@ impl ControlState {
                         current: existing.generation.as_u64(),
                     });
                 }
-                let mut advanced = existing.advance(*phase);
-                let _ = SplitPlanIdAlias::from_u64(0);
-                advanced.phase = *phase;
-                self.splits.insert(id.as_u64(), advanced);
+                if !existing.phase.can_advance_to(*phase) {
+                    return Err(Fault::IllegalTransition {
+                        node: id.as_u64(),
+                        detail: format!(
+                            "cannot move split {} from {:?} to {:?}",
+                            id.as_u64(),
+                            existing.phase,
+                            phase
+                        ),
+                    });
+                }
+                self.splits.insert(id.as_u64(), existing.advance(*phase));
                 Ok(())
             }
             ControlMutation::RemoveSplit { plan } => {
-                let id = SplitPlanId::from_u64(plan.as_u64());
+                let id = *plan;
                 let Some(existing) = self.splits.get(&id.as_u64()) else {
                     return Err(Fault::UnknownSplit { plan: id.as_u64() });
                 };
@@ -669,6 +840,19 @@ impl ControlState {
                 Ok(())
             }
             ControlMutation::CreateMerge { plan } => {
+                if let Some(existing) = self.merges.get(&plan.id.as_u64()) {
+                    if *existing == *plan {
+                        return Ok(());
+                    }
+                    return Err(Fault::DuplicatePlan {
+                        plan: plan.id.as_u64(),
+                    });
+                }
+                if self.has_plan(plan.id) {
+                    return Err(Fault::DuplicatePlan {
+                        plan: plan.id.as_u64(),
+                    });
+                }
                 for tablet in plan.tablets() {
                     if self.has_live_topology(tablet) {
                         return Err(Fault::TopologyConflict {
@@ -676,6 +860,53 @@ impl ControlState {
                             detail: "tablet already has a live topology plan".to_owned(),
                         });
                     }
+                }
+                if plan.phase != crate::merge::MergePhase::Planned {
+                    return Err(Fault::TopologyConflict {
+                        tablet: plan.left.as_u64(),
+                        detail: "merge plan must start in Planned".to_owned(),
+                    });
+                }
+                let expected_generation =
+                    self.placement_version
+                        .next()
+                        .map_err(|error| Fault::TopologyConflict {
+                            tablet: plan.left.as_u64(),
+                            detail: error.to_string(),
+                        })?;
+                if plan.generation != expected_generation {
+                    return Err(Fault::StaleGeneration {
+                        plan: plan.id.as_u64(),
+                        carried: plan.generation.as_u64(),
+                        current: expected_generation.as_u64(),
+                    });
+                }
+                let Some(left) = self.placements.get(&plan.left.as_u64()) else {
+                    return Err(Fault::TopologyConflict {
+                        tablet: plan.left.as_u64(),
+                        detail: "merge left parent has no desired placement".to_owned(),
+                    });
+                };
+                let Some(right) = self.placements.get(&plan.right.as_u64()) else {
+                    return Err(Fault::TopologyConflict {
+                        tablet: plan.right.as_u64(),
+                        detail: "merge right parent has no desired placement".to_owned(),
+                    });
+                };
+                if left.replicas != right.replicas
+                    || left.replicas != plan.replicas
+                    || plan.replicas.is_empty()
+                {
+                    return Err(Fault::TopologyConflict {
+                        tablet: plan.left.as_u64(),
+                        detail: "merge parents must share a non-empty replica set".to_owned(),
+                    });
+                }
+                if self.placements.contains_key(&plan.merged.as_u64()) {
+                    return Err(Fault::TopologyConflict {
+                        tablet: plan.left.as_u64(),
+                        detail: "merge target tablet is already placed".to_owned(),
+                    });
                 }
                 self.merges.insert(plan.id.as_u64(), plan.clone());
                 self.placement_version = PlacementVersion::from_u64(
@@ -699,7 +930,7 @@ impl ControlState {
                 phase,
                 generation,
             } => {
-                let id = MergePlanId::from_u64(plan.as_u64());
+                let id = *plan;
                 let Some(existing) = self.merges.get(&id.as_u64()).cloned() else {
                     return Err(Fault::UnknownMerge { plan: id.as_u64() });
                 };
@@ -710,14 +941,22 @@ impl ControlState {
                         current: existing.generation.as_u64(),
                     });
                 }
-                let mut advanced = existing.advance(*phase);
-                let _ = MergePlanIdAlias::from_u64(0);
-                advanced.phase = *phase;
-                self.merges.insert(id.as_u64(), advanced);
+                if !existing.phase.can_advance_to(*phase) {
+                    return Err(Fault::IllegalTransition {
+                        node: id.as_u64(),
+                        detail: format!(
+                            "cannot move merge {} from {:?} to {:?}",
+                            id.as_u64(),
+                            existing.phase,
+                            phase
+                        ),
+                    });
+                }
+                self.merges.insert(id.as_u64(), existing.advance(*phase));
                 Ok(())
             }
             ControlMutation::RemoveMerge { plan } => {
-                let id = MergePlanId::from_u64(plan.as_u64());
+                let id = *plan;
                 let Some(existing) = self.merges.get(&id.as_u64()) else {
                     return Err(Fault::UnknownMerge { plan: id.as_u64() });
                 };
@@ -868,13 +1107,8 @@ impl ControlState {
         drained && self.tablets_desiring(node).is_empty()
     }
 
-    /// Encodes a canonical snapshot image (v3: splits, merges, tablet
-    /// allocator, redundancy section; no legacy v1 compatibility — see
-    /// stage notes).
-    ///
-    /// Pre-1.0 break-freely choice: the writer always emits the redundancy
-    /// section (empty when absent); the reader accepts both the new form
-    /// and old images that end after the index map.
+    /// Encodes the canonical snapshot image, including the required
+    /// redundancy section.
     #[must_use]
     pub fn encode_snapshot(&self) -> Vec<u8> {
         let mut out = Vec::new();
@@ -923,9 +1157,6 @@ impl ControlState {
     }
 
     /// Decodes a canonical snapshot image.
-    ///
-    /// Old images that end after the index map (no redundancy section)
-    /// still decode to a state with no published layouts.
     ///
     /// # Errors
     ///
@@ -981,6 +1212,17 @@ impl ControlState {
             let plan = MergePlan::decode_exact(blob)?;
             merges.insert(plan.id.as_u64(), plan);
         }
+        let mut plan_ids = BTreeSet::new();
+        for id in migrations
+            .keys()
+            .chain(splits.keys())
+            .chain(merges.keys())
+            .copied()
+        {
+            if !plan_ids.insert(id) {
+                return Err(Fault::DuplicatePlan { plan: id });
+            }
+        }
         let namespace_blobs = take_map(rest).map_err(|detail| Fault::Truncated { detail })?;
         rest = namespace_blobs.1;
         for blob in namespace_blobs.0 {
@@ -993,33 +1235,29 @@ impl ControlState {
             let record = IndexRecord::decode_exact(blob)?;
             indexes.insert(record.id, record);
         }
-        // Redundancy tail: absent on old images (decode to empty), present
-        // on everything this writer emits.
         let mut redundancy = HashMap::new();
-        if !rest.is_empty() {
-            if rest.len() < 4 {
-                return Err(Fault::Truncated {
-                    detail: "redundancy section",
-                });
-            }
-            let count = u32::from_le_bytes(rest[..4].try_into().unwrap_or([0; 4])) as usize;
-            if count > MAX_REDUNDANCY_SNAPSHOT_ENTRIES {
-                return Err(Fault::Truncated {
-                    detail: "redundancy map too large",
-                });
-            }
-            rest = &rest[4..];
-            for _ in 0..count {
-                let (key_bytes, tail) =
-                    take_blob(rest).map_err(|detail| Fault::Truncated { detail })?;
-                rest = tail;
-                let key = LayoutKey::decode_exact(key_bytes)?;
-                let (record_bytes, tail) =
-                    take_blob(rest).map_err(|detail| Fault::Truncated { detail })?;
-                rest = tail;
-                let record = LayoutRecord::decode_exact(record_bytes)?;
-                redundancy.insert(key, record);
-            }
+        if rest.len() < 4 {
+            return Err(Fault::Truncated {
+                detail: "redundancy section",
+            });
+        }
+        let count = u32::from_le_bytes(rest[..4].try_into().unwrap_or([0; 4])) as usize;
+        if count > MAX_REDUNDANCY_SNAPSHOT_ENTRIES {
+            return Err(Fault::Truncated {
+                detail: "redundancy map too large",
+            });
+        }
+        rest = &rest[4..];
+        for _ in 0..count {
+            let (key_bytes, tail) =
+                take_blob(rest).map_err(|detail| Fault::Truncated { detail })?;
+            rest = tail;
+            let key = LayoutKey::decode_exact(key_bytes)?;
+            let (record_bytes, tail) =
+                take_blob(rest).map_err(|detail| Fault::Truncated { detail })?;
+            rest = tail;
+            let record = LayoutRecord::decode_exact(record_bytes)?;
+            redundancy.insert(key, record);
         }
         if !rest.is_empty() {
             return Err(Fault::TrailingBytes);
@@ -1194,7 +1432,6 @@ mod tests {
 
     #[test]
     fn stale_generation_rejected() {
-        use crate::migration::MigrationPlanId;
         let mut state = ControlState::bootstrap(
             vec![
                 record(1, NodeState::Active),
@@ -1230,7 +1467,7 @@ mod tests {
             })
             .expect("target placement");
         let plan = MigrationPlan::new(
-            MigrationPlanId::from_u64(1),
+            PlanId::from_u64(1),
             TabletId::from_u64(1),
             PlacementVersion::from_u64(5),
             NodeId::from_u64(1),
@@ -1247,7 +1484,7 @@ mod tests {
             .expect("create");
         assert!(matches!(
             state.apply(&ControlMutation::AdvanceMigration {
-                plan: MigrationPlanIdAlias::from_u64(1),
+                plan: PlanId::from_u64(1),
                 phase: MigrationPhase::Ready,
                 generation: PlacementVersion::from_u64(4),
             }),
@@ -1256,8 +1493,87 @@ mod tests {
     }
 
     #[test]
+    fn migration_creation_publishes_placement_atomically() {
+        let mut state = ControlState::bootstrap(
+            vec![
+                record(1, NodeState::Active),
+                record(2, NodeState::Active),
+                record(3, NodeState::Active),
+                record(4, NodeState::Active),
+            ],
+            vec![
+                DesiredReplicaSet::new(
+                    TabletId::from_u64(1),
+                    vec![
+                        NodeId::from_u64(1),
+                        NodeId::from_u64(2),
+                        NodeId::from_u64(3),
+                    ],
+                    PlacementVersion::INITIAL,
+                )
+                .expect("desired"),
+            ],
+        );
+        let plan = MigrationPlan::new(
+            PlanId::from_u64(1),
+            TabletId::from_u64(1),
+            PlacementVersion::from_u64(2),
+            NodeId::from_u64(1),
+            NodeId::from_u64(4),
+            vec![
+                NodeId::from_u64(2),
+                NodeId::from_u64(3),
+                NodeId::from_u64(4),
+            ],
+        )
+        .expect("plan");
+        state
+            .apply(&ControlMutation::CreateMigration { plan: plan.clone() })
+            .expect("create");
+        let desired = state.desired(TabletId::from_u64(1)).expect("desired");
+        assert_eq!(desired.replicas, plan.desired_voters);
+        assert_eq!(desired.version, plan.generation);
+        assert_eq!(state.placement_version(), plan.generation);
+        assert_eq!(state.migration(plan.id), Some(&plan));
+    }
+
+    #[test]
+    fn rejected_migration_leaves_placement_unchanged() {
+        let mut state = ControlState::bootstrap(
+            vec![record(1, NodeState::Active), record(2, NodeState::Active)],
+            vec![
+                DesiredReplicaSet::new(
+                    TabletId::from_u64(1),
+                    vec![NodeId::from_u64(1), NodeId::from_u64(2)],
+                    PlacementVersion::INITIAL,
+                )
+                .expect("desired"),
+            ],
+        );
+        let plan = MigrationPlan::new(
+            PlanId::from_u64(1),
+            TabletId::from_u64(1),
+            PlacementVersion::from_u64(2),
+            NodeId::from_u64(1),
+            NodeId::from_u64(4),
+            vec![NodeId::from_u64(2), NodeId::from_u64(4)],
+        )
+        .expect("plan");
+        assert!(matches!(
+            state.apply(&ControlMutation::CreateMigration { plan }),
+            Err(ControlApplyError::TopologyConflict { .. })
+        ));
+        let desired = state.desired(TabletId::from_u64(1)).expect("desired");
+        assert_eq!(
+            desired.replicas,
+            vec![NodeId::from_u64(1), NodeId::from_u64(2)]
+        );
+        assert_eq!(state.placement_version(), PlacementVersion::INITIAL);
+        assert!(state.migration(PlanId::from_u64(1)).is_none());
+    }
+
+    #[test]
     fn duplicate_migration_is_idempotent_and_conflicts_fail_closed() {
-        use crate::migration::{MigrationPlan, MigrationPlanId};
         let mut state = ControlState::bootstrap(
             vec![
                 record(1, NodeState::Active),
@@ -1293,7 +1609,7 @@ mod tests {
             })
             .expect("target placement");
         let plan = MigrationPlan::new(
-            MigrationPlanId::from_u64(1),
+            PlanId::from_u64(1),
             TabletId::from_u64(1),
             PlacementVersion::from_u64(2),
             NodeId::from_u64(1),
@@ -1311,8 +1627,24 @@ mod tests {
         state
             .apply(&ControlMutation::CreateMigration { plan })
             .expect("idempotent retry");
+        let superseded = DesiredReplicaSet::new(
+            TabletId::from_u64(1),
+            vec![
+                NodeId::from_u64(2),
+                NodeId::from_u64(3),
+                NodeId::from_u64(5),
+            ],
+            PlacementVersion::from_u64(3),
+        )
+        .expect("superseded desired");
+        assert!(matches!(
+            state.apply(&ControlMutation::SetDesiredPlacement {
+                desired: superseded
+            }),
+            Err(ControlApplyError::SupersededTopology { tablet: 1, .. })
+        ));
         let conflict = MigrationPlan::new(
-            MigrationPlanId::from_u64(1),
+            PlanId::from_u64(1),
             TabletId::from_u64(1),
             PlacementVersion::from_u64(2),
             NodeId::from_u64(1),
@@ -1326,9 +1658,61 @@ mod tests {
         .expect("conflict plan");
         assert!(matches!(
             state.apply(&ControlMutation::CreateMigration { plan: conflict }),
-            Err(ControlApplyError::DuplicatePlan { plan: 1 })
+            Err(ControlApplyError::SupersededTopology { tablet: 1, .. })
         ));
         assert_eq!(state.migrations().count(), 1);
+    }
+
+    #[test]
+    fn plan_ids_are_globally_unique_across_kinds() {
+        let mut state = ControlState::bootstrap(
+            vec![record(1, NodeState::Active)],
+            vec![
+                DesiredReplicaSet::new(
+                    TabletId::from_u64(1),
+                    vec![NodeId::from_u64(1)],
+                    PlacementVersion::INITIAL,
+                )
+                .expect("placement"),
+            ],
+        );
+        let id = PlanId::from_u64(1);
+        let split = SplitPlan::new(
+            id,
+            TabletId::from_u64(1),
+            0,
+            None,
+            TabletId::from_u64(2),
+            TabletId::from_u64(3),
+            vec![NodeId::from_u64(1)],
+            PlacementVersion::from_u64(2),
+        )
+        .expect("split");
+        state
+            .apply(&ControlMutation::CreateSplit {
+                plan: split.clone(),
+            })
+            .expect("create split");
+        state
+            .apply(&ControlMutation::CreateSplit { plan: split })
+            .expect("idempotent split retry");
+        assert_eq!(state.next_plan_id(), PlanId::from_u64(2));
+
+        let merge = MergePlan::new(
+            id,
+            TabletId::from_u64(4),
+            TabletId::from_u64(5),
+            TabletId::from_u64(6),
+            vec![NodeId::from_u64(1)],
+            PlacementVersion::INITIAL,
+        )
+        .expect("merge");
+        assert!(matches!(
+            state.apply(&ControlMutation::CreateMerge { plan: merge }),
+            Err(ControlApplyError::DuplicatePlan { plan: 1 })
+        ));
+        assert!(state.split(id).is_some());
+        assert!(state.merge(id).is_none());
     }
 
     #[test]
@@ -1511,15 +1895,15 @@ mod tests {
     }
 
     #[test]
-    fn old_snapshot_without_section_still_decodes() {
+    fn snapshot_without_redundancy_section_is_rejected() {
         let state = ControlState::empty();
-        let mut new_form = state.encode_snapshot();
-        // The writer always appends the section; an old writer ends after
-        // the index map. An empty section is exactly its 4-byte count, so
-        // stripping it simulates a pre-section image byte-for-byte.
-        new_form.truncate(new_form.len() - 4);
-        let back = ControlState::decode_snapshot(&new_form).expect("old form decodes");
-        assert_eq!(back, state);
-        assert_eq!(back.redundancy_layouts().count(), 0);
+        let mut image = state.encode_snapshot();
+        image.truncate(image.len() - 4);
+        assert!(matches!(
+            ControlState::decode_snapshot(&image),
+            Err(ControlSnapshotError::Truncated {
+                detail: "redundancy section"
+            })
+        ));
     }
 }

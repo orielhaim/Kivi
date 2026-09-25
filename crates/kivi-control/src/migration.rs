@@ -9,24 +9,7 @@
 use kivi_types::{NodeId, TabletId};
 
 use crate::placement::PlacementVersion;
-
-/// Identity of one migration plan.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct MigrationPlanId(pub u64);
-
-impl MigrationPlanId {
-    /// Wraps a raw plan id.
-    #[must_use]
-    pub const fn from_u64(value: u64) -> Self {
-        Self(value)
-    }
-
-    /// Returns the raw value.
-    #[must_use]
-    pub const fn as_u64(self) -> u64 {
-        self.0
-    }
-}
+use crate::topology::PlanId;
 
 /// Migration lifecycle phase.
 ///
@@ -60,6 +43,20 @@ impl MigrationPhase {
     #[must_use]
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Failed)
+    }
+
+    pub(crate) fn can_advance_to(self, next: Self) -> bool {
+        self == next
+            || matches!(
+                (self, next),
+                (Self::Planned, Self::TargetStarting | Self::Failed)
+                    | (Self::TargetStarting, Self::LearnerAdded | Self::Failed)
+                    | (Self::LearnerAdded, Self::Ready | Self::Failed)
+                    | (Self::Ready, Self::MembershipChanging | Self::Failed)
+                    | (Self::MembershipChanging, Self::Committed | Self::Failed)
+                    | (Self::Committed, Self::SourceRetiring | Self::Failed)
+                    | (Self::SourceRetiring, Self::Completed | Self::Failed)
+            )
     }
 
     /// Encodes the phase as a canonical discriminant byte.
@@ -132,7 +129,7 @@ pub enum MigrationError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MigrationPlan {
     /// Plan identity (control-plane-assigned, never reused).
-    pub id: MigrationPlanId,
+    pub id: PlanId,
     /// Tablet moving.
     pub tablet: TabletId,
     /// Placement generation at plan creation (fencing).
@@ -155,7 +152,7 @@ impl MigrationPlan {
     ///
     /// Returns [`MigrationError::NoMovement`] when `from == to`.
     pub fn new(
-        id: MigrationPlanId,
+        id: PlanId,
         tablet: TabletId,
         generation: PlacementVersion,
         from: NodeId,
@@ -227,8 +224,7 @@ impl MigrationPlan {
         if input.len() < 8 * 5 + 1 + 4 {
             return Err(Fault::Truncated);
         }
-        let id =
-            MigrationPlanId::from_u64(u64::from_le_bytes(input[..8].try_into().unwrap_or([0; 8])));
+        let id = PlanId::from_u64(u64::from_le_bytes(input[..8].try_into().unwrap_or([0; 8])));
         let tablet = TabletId::from_u64(u64::from_le_bytes(
             input[8..16].try_into().unwrap_or([0; 8]),
         ));
@@ -270,7 +266,7 @@ mod tests {
 
     fn sample() -> MigrationPlan {
         MigrationPlan::new(
-            MigrationPlanId::from_u64(1),
+            PlanId::from_u64(1),
             TabletId::from_u64(17),
             PlacementVersion::from_u64(3),
             NodeId::from_u64(1),
@@ -305,7 +301,7 @@ mod tests {
     fn self_move_fails() {
         assert!(matches!(
             MigrationPlan::new(
-                MigrationPlanId::from_u64(1),
+                PlanId::from_u64(1),
                 TabletId::from_u64(1),
                 PlacementVersion::INITIAL,
                 NodeId::from_u64(2),

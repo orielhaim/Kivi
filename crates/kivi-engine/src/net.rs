@@ -41,7 +41,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use compio::io::{AsyncRead, AsyncWriteExt};
+use compio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use compio::net::{TcpListener, TcpStream};
 use compio::runtime::Runtime;
 
@@ -1449,9 +1449,9 @@ impl Conn {
     async fn run(&mut self) -> ConnExit {
         loop {
             if self.shutdown.get() {
-                // Unanswered outbox entries die with the connection: the
-                // client's retry carries the same identity, so exactly-once
-                // holds across the shutdown.
+                if let Some(stream) = self.stream.as_mut() {
+                    let _ = stream.shutdown().await;
+                }
                 return ConnExit::Clean;
             }
             // Pump first so barrier completions (and fast paths from the
@@ -4405,19 +4405,10 @@ async fn conn_read_loop(
             break ConnExit::Violation("input buffer bound");
         }
         let chunk = Vec::with_capacity(8192);
-        let outcome = compio::time::timeout(ACCEPT_POLL_INTERVAL, stream.read(chunk)).await;
-        let (result, chunk) = match outcome {
-            Err(_) => {
-                if shutdown.get() {
-                    break ConnExit::Clean;
-                }
-                continue;
-            }
-            Ok(outcome) => (outcome.0, outcome.1),
-        };
-        match result {
+        let outcome = stream.read(chunk).await;
+        match outcome.0 {
             Ok(0) => break ConnExit::Clean,
-            Ok(_) => match reader.push(&chunk) {
+            Ok(_) => match reader.push(&outcome.1) {
                 Ok(frames) => {
                     if pending.len() + frames.len() > max_pipelined {
                         break ConnExit::Violation("pipelined backlog bound");

@@ -5,7 +5,7 @@
 //! `OpenRaft` Rust structs are never persisted as canonical control
 //! state.
 
-use kivi_types::{NodeId, TabletId};
+use kivi_types::NodeId;
 
 use crate::layouts::{LAYOUT_KEY_LEN, LayoutKey, LayoutRecord};
 use crate::merge::MergePlan;
@@ -13,6 +13,7 @@ use crate::migration::MigrationPlan;
 use crate::node::NodeRecord;
 use crate::placement::{DesiredReplicaSet, PlacementVersion};
 use crate::split::SplitPlan;
+use crate::topology::PlanId;
 
 /// Framing version of [`ControlMutation`].
 pub const CONTROL_MUTATION_VERSION: u16 = 1;
@@ -38,7 +39,7 @@ pub enum ControlMutation {
         /// Desired set.
         desired: DesiredReplicaSet,
     },
-    /// Persist a new migration plan (phase `Planned`).
+    /// Publish a migration plan and its desired placement atomically (phase `Planned`).
     CreateMigration {
         /// Plan to persist.
         plan: MigrationPlan,
@@ -47,7 +48,7 @@ pub enum ControlMutation {
     /// rejected by [`ControlState`](crate::state::ControlState)).
     AdvanceMigration {
         /// Affected plan.
-        plan: MigrationPlanIdAlias,
+        plan: PlanId,
         /// New phase.
         phase: crate::migration::MigrationPhase,
         /// Fencing generation the writer observed.
@@ -56,7 +57,7 @@ pub enum ControlMutation {
     /// Remove a terminally completed/failed plan.
     RemoveMigration {
         /// Affected plan.
-        plan: MigrationPlanIdAlias,
+        plan: PlanId,
     },
     /// Persist a new split plan (phase `Planned`).
     CreateSplit {
@@ -66,7 +67,7 @@ pub enum ControlMutation {
     /// Advance a split plan's phase (generation-fenced).
     AdvanceSplit {
         /// Affected plan.
-        plan: SplitPlanIdAlias,
+        plan: PlanId,
         /// New phase.
         phase: crate::split::SplitPhase,
         /// Fencing generation the writer observed.
@@ -75,7 +76,7 @@ pub enum ControlMutation {
     /// Remove a terminal split plan.
     RemoveSplit {
         /// Affected plan.
-        plan: SplitPlanIdAlias,
+        plan: PlanId,
     },
     /// Persist a new merge plan (phase `Planned`).
     CreateMerge {
@@ -85,7 +86,7 @@ pub enum ControlMutation {
     /// Advance a merge plan's phase (generation-fenced).
     AdvanceMerge {
         /// Affected plan.
-        plan: MergePlanIdAlias,
+        plan: PlanId,
         /// New phase.
         phase: crate::merge::MergePhase,
         /// Fencing generation the writer observed.
@@ -94,7 +95,7 @@ pub enum ControlMutation {
     /// Remove a terminal merge plan.
     RemoveMerge {
         /// Affected plan.
-        plan: MergePlanIdAlias,
+        plan: PlanId,
     },
     /// Register a namespace (idempotent: re-registering the identical
     /// record is a no-op; a conflicting layout is rejected).
@@ -135,94 +136,6 @@ pub enum ControlMutation {
         /// Map key to remove.
         key: LayoutKey,
     },
-}
-
-/// Identity aliases avoiding circular module imports in this enum's docs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct MigrationPlanIdAlias(pub u64);
-/// Identity of one split plan (alias; see above).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SplitPlanIdAlias(pub u64);
-/// Identity of one merge plan (alias; see above).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct MergePlanIdAlias(pub u64);
-
-impl MigrationPlanIdAlias {
-    /// Wraps a raw plan id.
-    #[must_use]
-    pub const fn from_u64(value: u64) -> Self {
-        Self(value)
-    }
-
-    /// Returns the raw value.
-    #[must_use]
-    pub const fn as_u64(self) -> u64 {
-        self.0
-    }
-}
-
-impl SplitPlanIdAlias {
-    /// Wraps a raw plan id.
-    #[must_use]
-    pub const fn from_u64(value: u64) -> Self {
-        Self(value)
-    }
-
-    /// Returns the raw value.
-    #[must_use]
-    pub const fn as_u64(self) -> u64 {
-        self.0
-    }
-}
-
-impl MergePlanIdAlias {
-    /// Wraps a raw plan id.
-    #[must_use]
-    pub const fn from_u64(value: u64) -> Self {
-        Self(value)
-    }
-
-    /// Returns the raw value.
-    #[must_use]
-    pub const fn as_u64(self) -> u64 {
-        self.0
-    }
-}
-
-impl From<crate::migration::MigrationPlanId> for MigrationPlanIdAlias {
-    fn from(id: crate::migration::MigrationPlanId) -> Self {
-        Self(id.as_u64())
-    }
-}
-
-impl From<MigrationPlanIdAlias> for crate::migration::MigrationPlanId {
-    fn from(id: MigrationPlanIdAlias) -> Self {
-        Self::from_u64(id.0)
-    }
-}
-
-impl From<crate::split::SplitPlanId> for SplitPlanIdAlias {
-    fn from(id: crate::split::SplitPlanId) -> Self {
-        Self(id.as_u64())
-    }
-}
-
-impl From<SplitPlanIdAlias> for crate::split::SplitPlanId {
-    fn from(id: SplitPlanIdAlias) -> Self {
-        Self::from_u64(id.0)
-    }
-}
-
-impl From<crate::merge::MergePlanId> for MergePlanIdAlias {
-    fn from(id: crate::merge::MergePlanId) -> Self {
-        Self(id.as_u64())
-    }
-}
-
-impl From<MergePlanIdAlias> for crate::merge::MergePlanId {
-    fn from(id: MergePlanIdAlias) -> Self {
-        Self::from_u64(id.0)
-    }
 }
 
 /// Why a control mutation was rejected.
@@ -431,9 +344,8 @@ impl ControlMutation {
                 if body.len() != 8 + 1 + 8 {
                     return Err(Fault::Truncated);
                 }
-                let plan = MigrationPlanIdAlias::from_u64(u64::from_le_bytes(
-                    body[..8].try_into().unwrap_or([0; 8]),
-                ));
+                let plan =
+                    PlanId::from_u64(u64::from_le_bytes(body[..8].try_into().unwrap_or([0; 8])));
                 let phase =
                     crate::migration::MigrationPhase::decode_byte(body[8]).map_err(|error| {
                         Fault::BadBody {
@@ -453,9 +365,8 @@ impl ControlMutation {
                 if body.len() != 8 {
                     return Err(Fault::Truncated);
                 }
-                let plan = MigrationPlanIdAlias::from_u64(u64::from_le_bytes(
-                    body[..8].try_into().unwrap_or([0; 8]),
-                ));
+                let plan =
+                    PlanId::from_u64(u64::from_le_bytes(body[..8].try_into().unwrap_or([0; 8])));
                 Ok(Self::RemoveMigration { plan })
             }
             6 => {
@@ -468,9 +379,8 @@ impl ControlMutation {
                 if body.len() != 8 + 1 + 8 {
                     return Err(Fault::Truncated);
                 }
-                let plan = SplitPlanIdAlias::from_u64(u64::from_le_bytes(
-                    body[..8].try_into().unwrap_or([0; 8]),
-                ));
+                let plan =
+                    PlanId::from_u64(u64::from_le_bytes(body[..8].try_into().unwrap_or([0; 8])));
                 let phase = crate::split::SplitPhase::decode_byte(body[8]).map_err(|error| {
                     Fault::BadBody {
                         detail: error.to_string(),
@@ -489,9 +399,8 @@ impl ControlMutation {
                 if body.len() != 8 {
                     return Err(Fault::Truncated);
                 }
-                let plan = SplitPlanIdAlias::from_u64(u64::from_le_bytes(
-                    body[..8].try_into().unwrap_or([0; 8]),
-                ));
+                let plan =
+                    PlanId::from_u64(u64::from_le_bytes(body[..8].try_into().unwrap_or([0; 8])));
                 Ok(Self::RemoveSplit { plan })
             }
             9 => {
@@ -504,9 +413,8 @@ impl ControlMutation {
                 if body.len() != 8 + 1 + 8 {
                     return Err(Fault::Truncated);
                 }
-                let plan = MergePlanIdAlias::from_u64(u64::from_le_bytes(
-                    body[..8].try_into().unwrap_or([0; 8]),
-                ));
+                let plan =
+                    PlanId::from_u64(u64::from_le_bytes(body[..8].try_into().unwrap_or([0; 8])));
                 let phase = crate::merge::MergePhase::decode_byte(body[8]).map_err(|error| {
                     Fault::BadBody {
                         detail: error.to_string(),
@@ -525,9 +433,8 @@ impl ControlMutation {
                 if body.len() != 8 {
                     return Err(Fault::Truncated);
                 }
-                let plan = MergePlanIdAlias::from_u64(u64::from_le_bytes(
-                    body[..8].try_into().unwrap_or([0; 8]),
-                ));
+                let plan =
+                    PlanId::from_u64(u64::from_le_bytes(body[..8].try_into().unwrap_or([0; 8])));
                 Ok(Self::RemoveMerge { plan })
             }
             12 => {
@@ -635,18 +542,14 @@ impl ControlMutation {
     }
 }
 
-/// Type alias so tablet ids stay greppable at control-mutation sites.
-#[allow(dead_code)]
-pub(crate) type TabletRef = TabletId;
-
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
 
-    use kivi_types::NodeId;
+    use kivi_types::{NodeId, TabletId};
 
     use super::*;
-    use crate::migration::{MigrationPhase, MigrationPlanId};
+    use crate::migration::MigrationPhase;
     use crate::node::NodeState;
     use crate::placement::PlacementVersion;
 
@@ -672,12 +575,28 @@ mod tests {
                 state: NodeState::Active,
             },
             ControlMutation::AdvanceMigration {
-                plan: MigrationPlanIdAlias::from_u64(7),
+                plan: PlanId::from_u64(7),
                 phase: MigrationPhase::Ready,
                 generation: PlacementVersion::from_u64(2),
             },
             ControlMutation::RemoveMigration {
-                plan: MigrationPlanIdAlias::from_u64(7),
+                plan: PlanId::from_u64(7),
+            },
+            ControlMutation::AdvanceSplit {
+                plan: PlanId::from_u64(7),
+                phase: crate::split::SplitPhase::ChildrenAllocated,
+                generation: PlacementVersion::from_u64(2),
+            },
+            ControlMutation::RemoveSplit {
+                plan: PlanId::from_u64(7),
+            },
+            ControlMutation::AdvanceMerge {
+                plan: PlanId::from_u64(7),
+                phase: crate::merge::MergePhase::TargetAllocated,
+                generation: PlacementVersion::from_u64(2),
+            },
+            ControlMutation::RemoveMerge {
+                plan: PlanId::from_u64(7),
             },
         ];
         for mutation in cases {
@@ -685,7 +604,7 @@ mod tests {
             assert_eq!(back, mutation);
         }
         let plan = MigrationPlan::new(
-            MigrationPlanId::from_u64(1),
+            PlanId::from_u64(1),
             TabletId::from_u64(3),
             PlacementVersion::INITIAL,
             NodeId::from_u64(1),

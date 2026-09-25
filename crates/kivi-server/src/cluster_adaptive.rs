@@ -1184,7 +1184,7 @@ impl ClusterAdaptiveRuntime {
             return Err("migration recommendation carries a stale placement fence".to_owned());
         }
         let intent = migration_intent(&state, target, recommendation)?;
-        let ids = crate::control::create_plans(&self.node, &state, &[intent]).await?;
+        let ids = crate::control::create_plans(&self.node, &[intent]).await?;
         if ids.is_empty() {
             return Err("control pathway created no migration plan".to_owned());
         }

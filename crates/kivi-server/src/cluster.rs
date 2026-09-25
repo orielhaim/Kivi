@@ -38,8 +38,9 @@
 //! names it per tablet). Redis clients never learn consensus concepts,
 //! and no unsafe fallback ever executes a strong write off-leader.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -61,8 +62,8 @@ use kivi_state::Operation;
 use kivi_state::{DurableOutcome, OpError, OperationResult};
 use kivi_tablet::DirectorySnapshot;
 use kivi_types::{
-    ClusterId, MutationIdentity, NamespaceId, NodeId, ReadContract, TabletEpoch, TabletId,
-    WallTimestamp, WorkerId, WriteGuardGeneration,
+    ClusterId, CommitPosition, CommitToken, MutationIdentity, NamespaceId, NodeId, ReadContract,
+    TabletEpoch, TabletId, WallTimestamp, WorkerId, WriteGuardGeneration,
 };
 use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1425,8 +1426,13 @@ fn genesis_seed(
 /// loop per connection.
 async fn serve_native(listener: tokio::net::TcpListener, shared: ClusterShared, max_frame: usize) {
     loop {
-        let Ok((socket, _)) = listener.accept().await else {
-            continue;
+        let (socket, _) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                tracing::debug!(%error, "native accept failed");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            }
         };
         if socket.set_nodelay(true).is_err() {
             continue;
@@ -1445,6 +1451,7 @@ async fn serve_native_conn(socket: tokio::net::TcpStream, shared: ClusterShared,
     let (mut reader, mut writer) = socket.into_split();
     let mut frames = FrameReader::new(max_frame);
     let mut buf = vec![0u8; 64 * 1024];
+    let mut pending_frames;
     // Handshake first (mirrors the single-node negotiation exactly so
     // the same clients connect unchanged).
     let hello = loop {
@@ -1453,11 +1460,12 @@ async fn serve_native_conn(socket: tokio::net::TcpStream, shared: ClusterShared,
             _ => return,
         };
         match frames.push(&buf[..count]) {
-            Ok(mut parsed) => {
-                if let Some(frame) = parsed.pop() {
-                    break frame;
-                }
+            Ok(mut parsed) if !parsed.is_empty() => {
+                let hello = parsed.remove(0);
+                pending_frames = parsed;
+                break hello;
             }
+            Ok(_) => {}
             Err(_) => return,
         }
     };
@@ -1499,12 +1507,17 @@ async fn serve_native_conn(socket: tokio::net::TcpStream, shared: ClusterShared,
     let mut uploads: std::collections::HashMap<u64, ClusterUpload> =
         std::collections::HashMap::new();
     loop {
-        let count = match reader.read(&mut buf).await {
-            Ok(count) if count > 0 => count,
-            _ => return,
-        };
-        let Ok(parsed) = frames.push(&buf[..count]) else {
-            return;
+        let parsed = if pending_frames.is_empty() {
+            let count = match reader.read(&mut buf).await {
+                Ok(count) if count > 0 => count,
+                _ => return,
+            };
+            let Ok(parsed) = frames.push(&buf[..count]) else {
+                return;
+            };
+            parsed
+        } else {
+            std::mem::take(&mut pending_frames)
         };
         for frame in parsed {
             match frame.kind {
@@ -1607,15 +1620,15 @@ fn is_get_stream(payload: &[u8]) -> bool {
 /// One cluster upload assembling on its connection task.
 ///
 /// Chunks stage incrementally (one pack record per full 1 MiB piece, no
-/// per-chunk sync); the manifest + one barrier complete on commit. Staged
-/// chunks pin implicitly via content addressing until the commit proposes;
-/// a dropped connection leaves harmless orphans for deferred GC.
+/// per-chunk sync); the manifest + one barrier complete on commit. A dropped
+/// connection leaves harmless content-addressed cache entries.
 struct ClusterUpload {
     key: Vec<u8>,
     identity: Option<kivi_types::RequestIdentity>,
     ack_floor: kivi_types::RequestSeq,
     declared: Option<u64>,
     received: u64,
+    max_data: usize,
     buf: Vec<u8>,
     chunks: Vec<(kivi_types::ChunkId, u64)>,
 }
@@ -1666,6 +1679,9 @@ async fn handle_stream_begin(
         writer.write_all(&abort("duplicate stream id")).await?;
         return Ok(());
     }
+    let max_data = u32::try_from(negotiated.saturating_sub(256))
+        .unwrap_or(CLUSTER_STREAM_MAX_DATA)
+        .clamp(1, CLUSTER_STREAM_MAX_DATA);
     uploads.insert(
         stream,
         ClusterUpload {
@@ -1674,13 +1690,11 @@ async fn handle_stream_begin(
             ack_floor: begin.ack_floor,
             declared: begin.total_len,
             received: 0,
+            max_data: max_data as usize,
             buf: Vec::new(),
             chunks: Vec::new(),
         },
     );
-    let max_data = u32::try_from(negotiated.saturating_sub(256))
-        .unwrap_or(CLUSTER_STREAM_MAX_DATA)
-        .clamp(1, CLUSTER_STREAM_MAX_DATA);
     writer
         .write_all(&encode_frame(
             FrameKind::StreamReady,
@@ -1703,7 +1717,7 @@ async fn handle_stream_data(
     let Some(upload) = uploads.get_mut(&stream) else {
         anyhow::bail!("unknown stream");
     };
-    if u32::try_from(payload.len()).unwrap_or(u32::MAX) > CLUSTER_STREAM_MAX_DATA {
+    if payload.len() > upload.max_data {
         anyhow::bail!("stream data exceeds negotiated max");
     }
     upload.received = upload
@@ -1876,13 +1890,6 @@ async fn handle_stream_commit(
             .await?;
         return Ok(());
     }
-    // Pin for the proposal lifetime; ownership transfers to live state on
-    // commit (pins release on reply/dedup-hit paths inside propose).
-    {
-        let chunk_ids: Vec<kivi_types::ChunkId> = upload.chunks.iter().map(|(id, _)| *id).collect();
-        let mut pins = shared.node.sidecar().pins().lock().await;
-        pins.pin_root(manifest, &chunk_ids);
-    }
     let operation = kivi_state::Operation::SetChunked {
         key: kivi_state::Key::new(upload.key.clone()),
         manifest,
@@ -1918,36 +1925,14 @@ async fn handle_stream_commit(
             ProposeOutcome::Applied { outcome, .. }
             | ProposeOutcome::Duplicate { outcome }
             | ProposeOutcome::Read { outcome } => {
-                // Release the proposal pin: live state now references the
-                // root (or the dedup hit answered from retained state).
-                {
-                    let chunk_ids: Vec<kivi_types::ChunkId> =
-                        upload.chunks.iter().map(|(id, _)| *id).collect();
-                    let mut pins = shared.node.sidecar().pins().lock().await;
-                    pins.unpin_root(&manifest, &chunk_ids);
-                }
                 schedule_sidecar_protection(shared, manifest, upload.chunks.clone(), total);
                 shape_result(kivi_protocol::Opcode::Set, tablet, &outcome)
             }
             ProposeOutcome::Rejected { outcome } => {
-                {
-                    let chunk_ids: Vec<kivi_types::ChunkId> =
-                        upload.chunks.iter().map(|(id, _)| *id).collect();
-                    let mut pins = shared.node.sidecar().pins().lock().await;
-                    pins.unpin_root(&manifest, &chunk_ids);
-                }
                 shape_durable(&outcome, kivi_protocol::Opcode::Set, tablet)
             }
         },
-        Err(error) => {
-            {
-                let chunk_ids: Vec<kivi_types::ChunkId> =
-                    upload.chunks.iter().map(|(id, _)| *id).collect();
-                let mut pins = shared.node.sidecar().pins().lock().await;
-                pins.unpin_root(&manifest, &chunk_ids);
-            }
-            shape_propose_error(shared, tablet, &error).await
-        }
+        Err(error) => shape_propose_error(shared, tablet, &error).await,
     };
     writer
         .write_all(&encode_frame(
@@ -2281,7 +2266,7 @@ async fn handle_write(
             // migration answer: the directory names the live successors,
             // so the client converges in one hop with transport intact.
             if let ProposeError::Consensus(ConsensusError::Unavailable { reason }) = &error
-                && reason.contains("not served by this node")
+                && is_unroutable_reason(reason)
                 && shared
                     .directory_snapshot()
                     .get(tablet)
@@ -2361,7 +2346,7 @@ async fn handle_read(
         Err(error) => {
             if let kivi_consensus::ReadError::Consensus(ConsensusError::Unavailable { reason }) =
                 &error
-                && reason.contains("not served by this node")
+                && is_unroutable_reason(reason)
                 && shared
                     .directory_snapshot()
                     .get(tablet)
@@ -2957,6 +2942,10 @@ fn static_founder_redirect(shared: &ClusterShared, tablet: TabletId) -> Option<R
     })
 }
 
+fn is_unroutable_reason(reason: &str) -> bool {
+    reason.contains("not served by")
+}
+
 /// Shapes proposal failures: routing becomes redirects/retriable
 /// statuses (never `OpenRaft` concepts on the wire), validation becomes
 /// stable semantic statuses.
@@ -2975,7 +2964,7 @@ pub(crate) async fn shape_propose_error(
             body: ResponseBody::Diagnostic("leader unknown; retry".to_owned()),
         },
         ProposeError::Consensus(ConsensusError::Unavailable { reason })
-            if reason.contains("not served by this node") =>
+            if is_unroutable_reason(reason) =>
         {
             // Normal during migration: this node holds no replica.
             // Route through desired placement instead of a generic miss.
@@ -3068,7 +3057,7 @@ pub(crate) async fn shape_read_error(
             body: ResponseBody::Diagnostic("leader unknown; retry".to_owned()),
         },
         kivi_consensus::ReadError::Consensus(ConsensusError::Unavailable { reason })
-            if reason.contains("not served by this node") =>
+            if is_unroutable_reason(reason) =>
         {
             desired_redirect(shared, tablet).await.unwrap_or(Response {
                 proof: None,
@@ -5402,7 +5391,7 @@ async fn control_node_drain(
         {
             let policy = super::control::ReconcilePolicy::default();
             let intents = super::control::drain_intents(&state, node, &policy);
-            return match super::control::create_plans(&shared.node, &state, &intents).await {
+            return match super::control::create_plans(&shared.node, &intents).await {
                 Ok(ids) => (
                     StatusCode::OK,
                     Json(
@@ -5494,7 +5483,7 @@ async fn control_rebalance(
     };
     let policy = super::control::ReconcilePolicy::default();
     let intents = super::control::rebalance_intents(&state, &policy);
-    match super::control::create_plans(&shared.node, &state, &intents).await {
+    match super::control::create_plans(&shared.node, &intents).await {
         Ok(ids) => (
             StatusCode::OK,
             Json(
@@ -5598,13 +5587,14 @@ async fn control_migrations_create(
         .filter(|node| *node != from)
         .collect();
     voters.push(to);
+    voters.sort_by_key(|node| node.as_u64());
     let intent = kivi_control::MigrationIntent {
         tablet,
         from,
         to,
         desired_voters: voters,
     };
-    match super::control::create_plans(&shared.node, &state, &[intent]).await {
+    match super::control::create_plans(&shared.node, &[intent]).await {
         Ok(ids) => (
             StatusCode::OK,
             Json(
@@ -5705,12 +5695,26 @@ async fn serve_admin(listener: tokio::net::TcpListener, shared: ClusterShared) {
 /// (there is no Redis Cluster here), and Redis clients never learn
 /// consensus concepts.
 #[cfg(feature = "redis-compat")]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ClusterExecutor {
     node: Arc<ConsensusNode>,
     directory: Arc<arc_swap::ArcSwap<DirectorySnapshot>>,
     namespace: NamespaceId,
     handle: tokio::runtime::Handle,
+    last_writes: Mutex<HashMap<TabletId, CommitToken>>,
+}
+
+#[cfg(feature = "redis-compat")]
+impl Clone for ClusterExecutor {
+    fn clone(&self) -> Self {
+        Self {
+            node: Arc::clone(&self.node),
+            directory: Arc::clone(&self.directory),
+            namespace: self.namespace,
+            handle: self.handle.clone(),
+            last_writes: Mutex::new(HashMap::new()),
+        }
+    }
 }
 
 #[cfg(feature = "redis-compat")]
@@ -5728,6 +5732,7 @@ impl ClusterExecutor {
             directory,
             namespace,
             handle: tokio::runtime::Handle::current(),
+            last_writes: Mutex::new(HashMap::new()),
         }
     }
 
@@ -5747,49 +5752,69 @@ impl ClusterExecutor {
 
     /// Executes one typed operation against its tablet's replica:
     /// reads serve local applied state, mutations propose anonymously.
-    /// RESP reads stay `Any` (the RESP edge promises no freshness
-    /// contract); native reads name theirs explicitly.
+    /// Reads after this connection's writes use `AtLeast`; reads without a
+    /// local write remain unconstrained and use `Any`.
     fn execute_inner(&self, op: &Operation) -> Result<OperationResult, kivi_resp::ExecuteError> {
         use kivi_resp::ExecuteError as E;
-        // `block_on` from a blocking context: `RespConnection` drains on
-        // the blocking pool (`spawn_blocking`), where no async worker
-        // runs, so this never re-enters the runtime.
         let tablet = self.route(op)?;
         if op_is_read(op) {
-            self.handle
-                .block_on(self.node.read(
-                    tablet,
-                    op,
-                    kivi_types::ReadContract::Any,
-                    read_ctx(),
-                    kivi_types::LeaseEligibility::Eligible,
-                ))
-                .map(|served| served.outcome)
-                .map_err(|_| E::Internal)
+            let contract = self
+                .last_writes
+                .lock()
+                .ok()
+                .and_then(|writes| writes.get(&tablet).copied())
+                .map_or(ReadContract::Any, ReadContract::AtLeast);
+            let result = self.handle.block_on(self.node.read(
+                tablet,
+                op,
+                contract,
+                read_ctx(),
+                kivi_types::LeaseEligibility::Eligible,
+            ));
+            if result.is_ok()
+                && let Ok(mut writes) = self.last_writes.lock()
+            {
+                writes.remove(&tablet);
+            }
+            result.map(|served| served.outcome).map_err(|_| E::Internal)
         } else {
             match self
                 .handle
                 .block_on(self.node.propose(tablet, op, None, None, wall_now()))
             {
-                Ok(outcome) => match outcome {
-                    ProposeOutcome::Applied { outcome, .. }
-                    | ProposeOutcome::Duplicate { outcome }
-                    | ProposeOutcome::Read { outcome } => Ok(outcome),
-                    ProposeOutcome::Rejected { outcome } => match outcome {
-                        DurableOutcome::Completed(result) => Ok(result),
-                        DurableOutcome::Rejected(OpError::WrongType { .. }) => Err(E::WrongType),
-                        DurableOutcome::Rejected(_) | DurableOutcome::VersionExhausted => {
-                            Err(E::Rejected)
-                        }
-                    },
+                Ok(ProposeOutcome::Applied { index, outcome }) => {
+                    self.remember_write(tablet, index);
+                    Ok(outcome)
+                }
+                Ok(ProposeOutcome::Duplicate { outcome } | ProposeOutcome::Read { outcome }) => {
+                    Ok(outcome)
+                }
+                Ok(ProposeOutcome::Rejected { outcome }) => match outcome {
+                    DurableOutcome::Completed(result) => Ok(result),
+                    DurableOutcome::Rejected(OpError::WrongType { .. }) => Err(E::WrongType),
+                    DurableOutcome::Rejected(_) | DurableOutcome::VersionExhausted => {
+                        Err(E::Rejected)
+                    }
                 },
                 Err(ProposeError::Op(OpError::WrongType { .. })) => Err(E::WrongType),
                 Err(ProposeError::Op(_)) => Err(E::Rejected),
                 Err(ProposeError::Unsupported { .. }) => Err(E::Internal),
-                // Routing, dedup-window, and future proposal failures
-                // surface as retryable, never silent.
                 Err(_) => Err(E::Overloaded),
             }
+        }
+    }
+
+    fn remember_write(&self, tablet: TabletId, index: kivi_consensus::ConsensusLogIndex) {
+        let Some(authority) = self.node.authority_for(tablet) else {
+            return;
+        };
+        let token = CommitToken::new(
+            tablet,
+            authority.epoch(),
+            CommitPosition::from_u64(index.get().saturating_add(1)),
+        );
+        if let Ok(mut writes) = self.last_writes.lock() {
+            writes.insert(tablet, token);
         }
     }
 }

@@ -19,11 +19,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kivi_consensus::{ConsensusGroupId, ConsensusNode};
+use kivi_control::topology::PlanId;
 use kivi_control::{
     ControlMutation, ControlState, DesiredReplicaSet, MergePhase, MergePlan, MigrationIntent,
-    MigrationPhase, MigrationPlan, MigrationPlanId, NodeRecord, NodeState, PlacementVersion,
-    PlanSchedulerConfig, PlannerConfig, SplitPhase, SplitPlan, intents_to_plans, plan_drain,
-    plan_rebalance,
+    MigrationPhase, MigrationPlan, NodeRecord, NodeState, PlacementVersion, PlanSchedulerConfig,
+    PlannerConfig, SplitPhase, SplitPlan, plan_drain, plan_rebalance,
 };
 use kivi_types::{NodeId, TabletId};
 
@@ -269,6 +269,7 @@ pub async fn reconcile_loop_shared(
         detector.set_config(snapshot.failure.clone());
         tokio::time::sleep(snapshot.poll_interval).await;
         mesh_sync(&node).await;
+        retire_stale_local_replicas(&node).await;
         // Transaction resolution runs on every node (not just the control
         // leader): each node resolves intents on tablets it leads.
         // Bounded per pass; failures simply retry next pass.
@@ -311,6 +312,29 @@ async fn mesh_sync(node: &Arc<ConsensusNode>) {
         ) && node.add_peer_dial(record.node, record.peer)
         {
             tracing::info!(node = record.node.as_u64(), peer = %record.peer, "mesh admitted peer");
+        }
+    }
+}
+
+async fn retire_stale_local_replicas(node: &Arc<ConsensusNode>) {
+    let Some(state) = node.control_state().await else {
+        return;
+    };
+    let local = node.node();
+    let generation = state.placement_version().as_u64();
+    for tablet in node.tablets() {
+        let Some(desired) = state.desired(tablet) else {
+            continue;
+        };
+        if desired.contains(local) {
+            continue;
+        }
+        if let Err(reason) = node.retire_group(tablet, generation).await {
+            tracing::debug!(
+                tablet = tablet.as_u64(),
+                %reason,
+                "stale local replica retirement deferred"
+            );
         }
     }
 }
@@ -954,10 +978,7 @@ async fn drive_repairs(node: &Arc<ConsensusNode>, state: &ControlState, policy: 
     }
     let budget = policy.max_live_plans.saturating_sub(live);
     let intents: Vec<MigrationIntent> = intents.into_iter().take(budget.max(1)).collect();
-    let Some(fresh) = node.control_state().await else {
-        return;
-    };
-    match create_plans(node, &fresh, &intents).await {
+    match create_plans(node, &intents).await {
         Ok(ids) => {
             tracing::info!(plans = ids.len(), "automatic repair round created");
         }
@@ -985,7 +1006,7 @@ async fn advance_split(node: &Arc<ConsensusNode>, plan: &SplitPlan, phase: Split
         .unwrap_or(PlacementVersion::INITIAL);
     if let Err(reason) = node
         .propose_control(ControlMutation::AdvanceSplit {
-            plan: plan.id.into(),
+            plan: plan.id,
             phase,
             generation,
         })
@@ -1017,7 +1038,7 @@ async fn advance_merge(
         .unwrap_or(PlacementVersion::INITIAL);
     if let Err(reason) = node
         .propose_control(ControlMutation::AdvanceMerge {
-            plan: plan.id.into(),
+            plan: plan.id,
             phase,
             generation,
         })
@@ -2201,7 +2222,7 @@ pub async fn create_split_plan_at(
     split_hash: u128,
     left: TabletId,
     right: TabletId,
-) -> Result<kivi_control::SplitPlanId, String> {
+) -> Result<PlanId, String> {
     create_split_plan_full(node, parent, split_hash, None, left, right).await
 }
 
@@ -2215,7 +2236,7 @@ pub async fn create_split_plan_full(
     split_key: Option<Vec<u8>>,
     left: TabletId,
     right: TabletId,
-) -> Result<kivi_control::SplitPlanId, String> {
+) -> Result<PlanId, String> {
     let state = node
         .control_state()
         .await
@@ -2245,7 +2266,7 @@ pub async fn create_split_plan_full(
         .next()
         .map_err(|error| error.to_string())?;
     let plan = SplitPlan::new(
-        kivi_control::SplitPlanId::from_u64(state.next_plan_id().as_u64()),
+        state.next_plan_id(),
         parent,
         split_hash,
         split_key,
@@ -2357,7 +2378,7 @@ pub async fn create_merge_plan(
     node: &Arc<ConsensusNode>,
     left: TabletId,
     right: TabletId,
-) -> Result<kivi_control::MergePlanId, String> {
+) -> Result<PlanId, String> {
     let state = node
         .control_state()
         .await
@@ -2395,7 +2416,7 @@ pub async fn create_merge_plan(
         .next()
         .unwrap_or(TabletId::from_u64(u64::MAX));
     let plan = kivi_control::MergePlan::new(
-        kivi_control::MergePlanId::from_u64(state.next_plan_id().as_u64()),
+        state.next_plan_id(),
         left,
         right,
         merged,
@@ -2437,7 +2458,7 @@ async fn prune_terminal_plans(node: &Arc<ConsensusNode>, state: &ControlState) {
     {
         for id in migrations.into_iter().take(drop) {
             let mutation = ControlMutation::RemoveMigration {
-                plan: MigrationPlanId::from_u64(id).into(),
+                plan: PlanId::from_u64(id),
             };
             if node.propose_control(mutation).await.is_err() {
                 return;
@@ -2455,7 +2476,7 @@ async fn prune_terminal_plans(node: &Arc<ConsensusNode>, state: &ControlState) {
     {
         for id in splits.into_iter().take(drop) {
             let mutation = ControlMutation::RemoveSplit {
-                plan: kivi_control::SplitPlanId::from_u64(id).into(),
+                plan: PlanId::from_u64(id),
             };
             if node.propose_control(mutation).await.is_err() {
                 return;
@@ -2473,7 +2494,7 @@ async fn prune_terminal_plans(node: &Arc<ConsensusNode>, state: &ControlState) {
     {
         for id in merges.into_iter().take(drop) {
             let mutation = ControlMutation::RemoveMerge {
-                plan: kivi_control::MergePlanId::from_u64(id).into(),
+                plan: PlanId::from_u64(id),
             };
             if node.propose_control(mutation).await.is_err() {
                 return;
@@ -2515,11 +2536,7 @@ async fn topup_drains(node: &Arc<ConsensusNode>, state: &ControlState, policy: &
         }
         let budget = policy.max_live_plans - live_now;
         let intents: Vec<MigrationIntent> = intents.into_iter().take(budget.max(1)).collect();
-        // Re-read state for plan creation (generations must be fresh).
-        let Some(fresh) = node.control_state().await else {
-            return;
-        };
-        match create_plans(node, &fresh, &intents).await {
+        match create_plans(node, &intents).await {
             Ok(ids) => {
                 tracing::info!(
                     node = record.node.as_u64(),
@@ -2673,16 +2690,20 @@ async fn drive_plan(node: &Arc<ConsensusNode>, state: &ControlState, plan: &Migr
             let source_gone = state.node(source).is_some_and(|record| {
                 matches!(record.state, NodeState::Unavailable | NodeState::Removed)
             });
-            if source_gone {
+            if plan.phase == MigrationPhase::SourceRetiring
+                && (source_gone || !observed.is_voter(source))
+            {
+                advance(node, plan, MigrationPhase::Completed).await;
+            } else if source_gone {
                 tracing::info!(
                     plan = plan.id.as_u64(),
                     tablet = tablet.as_u64(),
                     source = source.as_u64(),
                     "source repair-worthy dead; completing without retirement RPC"
                 );
-                advance(node, plan, MigrationPhase::Completed).await;
+                advance(node, plan, MigrationPhase::SourceRetiring).await;
             } else if exec_retire(node, state, tablet, source, plan).await {
-                advance(node, plan, MigrationPhase::Completed).await;
+                advance(node, plan, MigrationPhase::SourceRetiring).await;
             }
         }
         kivi_consensus::ReconcileStep::AdvancePlan { plan, phase } => {
@@ -2774,7 +2795,7 @@ async fn advance(node: &Arc<ConsensusNode>, plan: &MigrationPlan, phase: Migrati
 }
 
 /// Advances one plan's persisted phase by id.
-async fn advance_by_id(node: &Arc<ConsensusNode>, id: MigrationPlanId, phase: MigrationPhase) {
+async fn advance_by_id(node: &Arc<ConsensusNode>, id: PlanId, phase: MigrationPhase) {
     // The generation rides from the stored plan; a stale advance is a
     // safe rejection the next pass re-derives.
     let generation = node
@@ -2783,7 +2804,7 @@ async fn advance_by_id(node: &Arc<ConsensusNode>, id: MigrationPlanId, phase: Mi
         .and_then(|state| state.migration(id).map(|plan| plan.generation))
         .unwrap_or(PlacementVersion::INITIAL);
     let mutation = ControlMutation::AdvanceMigration {
-        plan: id.into(),
+        plan: id,
         phase,
         generation,
     };
@@ -3092,36 +3113,104 @@ async fn complete_drains(node: &Arc<ConsensusNode>, state: &ControlState) {
     }
 }
 
-/// Creates migration plans for `intents` at one placement generation:
-/// publishes each tablet's new desired set, then persists its plan. One
-/// shared pathway for auto-rebalance and manual moves (§46: no second
-/// migration pathway).
+fn matching_live_plan<'a>(
+    state: &'a ControlState,
+    intent: &MigrationIntent,
+) -> Option<&'a MigrationPlan> {
+    state
+        .live_plans_for(intent.tablet)
+        .into_iter()
+        .find(|plan| {
+            plan.from == intent.from
+                && plan.to == intent.to
+                && plan.desired_voters == intent.desired_voters
+        })
+}
+
+static CREATE_PLANS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Creates migration plans for `intents`: each plan atomically publishes
+/// its desired placement from a freshly observed control image, so a
+/// failed proposal cannot leave a placement without its plan.
 pub async fn create_plans(
     node: &Arc<ConsensusNode>,
-    state: &ControlState,
     intents: &[MigrationIntent],
-) -> Result<Vec<MigrationPlanId>, String> {
-    let generation = state
-        .placement_version()
-        .next()
-        .map_err(|error| error.to_string())?;
-    // Desired first (the goal), then the plan that reconciles toward it.
+) -> Result<Vec<PlanId>, String> {
+    let _guard = CREATE_PLANS_LOCK.lock().await;
+    let mut ids = Vec::with_capacity(intents.len());
     for intent in intents {
         if intent.from == intent.to {
             continue;
         }
-        let desired =
-            DesiredReplicaSet::new(intent.tablet, intent.desired_voters.clone(), generation)
-                .map_err(|error| error.to_string())?;
-        node.propose_control(ControlMutation::SetDesiredPlacement { desired })
+        let state = node
+            .control_state()
+            .await
+            .ok_or_else(|| "no local control image".to_owned())?;
+        if let Some(existing) = matching_live_plan(&state, intent) {
+            ids.push(existing.id);
+            continue;
+        }
+        if !state.live_plans_for(intent.tablet).is_empty() {
+            return Err(format!(
+                "tablet {} already has a live migration plan",
+                intent.tablet.as_u64()
+            ));
+        }
+        let current = state
+            .desired(intent.tablet)
+            .ok_or_else(|| format!("tablet {} has no desired placement", intent.tablet.as_u64()))?;
+        let mut expected = current
+            .replicas
+            .iter()
+            .copied()
+            .filter(|node| *node != intent.from)
+            .collect::<Vec<_>>();
+        expected.push(intent.to);
+        expected.sort_by_key(|node| node.as_u64());
+        expected.dedup();
+        if !current.contains(intent.from)
+            || current.contains(intent.to)
+            || expected != intent.desired_voters
+        {
+            return Err(format!(
+                "tablet {} migration endpoints changed while creating a plan",
+                intent.tablet.as_u64()
+            ));
+        }
+        let generation = state
+            .placement_version()
+            .next()
+            .map_err(|error| error.to_string())?;
+        let plan = MigrationPlan::new(
+            state.next_plan_id(),
+            intent.tablet,
+            generation,
+            intent.from,
+            intent.to,
+            intent.desired_voters.clone(),
+        )
+        .map_err(|error| error.to_string())?;
+        node.propose_control(ControlMutation::CreateMigration { plan: plan.clone() })
             .await?;
-    }
-    let plans = intents_to_plans(intents, state.next_plan_id(), generation);
-    let mut ids = Vec::with_capacity(plans.len());
-    for plan in plans {
-        ids.push(plan.id);
-        node.propose_control(ControlMutation::CreateMigration { plan })
-            .await?;
+        let state = node
+            .control_state()
+            .await
+            .ok_or_else(|| "no local control image after plan".to_owned())?;
+        if let Some(existing) = matching_live_plan(&state, intent) {
+            ids.push(existing.id);
+        } else if state.migration(plan.id).is_some() {
+            ids.push(plan.id);
+        } else if state.live_plans_for(intent.tablet).is_empty() {
+            return Err(format!(
+                "tablet {} migration plan was superseded before commit",
+                intent.tablet.as_u64()
+            ));
+        } else {
+            return Err(format!(
+                "tablet {} was claimed by another migration plan",
+                intent.tablet.as_u64()
+            ));
+        }
     }
     Ok(ids)
 }

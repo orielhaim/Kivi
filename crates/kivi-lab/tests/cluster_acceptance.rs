@@ -570,6 +570,7 @@ fn chaos_round(
         assert_eq!(live, prior + 2, "counter adds linearly");
         counter_model.insert(key, live);
     }
+    cluster.wait_converged_all();
     split_then_merge(cluster, pick_split_target(cluster, largest_first));
     let victim = round % cluster.member_count();
     let incarnation_before = cluster.incarnation(victim);
@@ -651,7 +652,7 @@ fn verify_phase3(
     let mut counter_missing = 0usize;
     for (key, expected) in counter_model {
         match client.counter_get(&Key::from(key.clone())) {
-            Ok(Some(got)) => assert_eq!(got, *expected, "counter-exact"),
+            Ok(Some(got)) => assert_eq!(got, *expected, "counter-exact {}", hex_key(key)),
             Ok(None) => counter_missing += 1,
             Err(error) => panic!("counter_get {} reads: {error:?}", hex_key(key)),
         }
@@ -685,7 +686,6 @@ fn verify_phase3(
 
 fn run_acceptance(largest_first: bool) {
     let mut cluster = Cluster::spawn_ordered(4).expect("ordered cluster spawns");
-    let _ = cluster.wait_all_leaders();
     // Driver-owned topology: background auto-split/merge would race the
     // manual splits below and churn the directory under single-attempt
     // writes, so it stays off for the whole test.
@@ -731,7 +731,6 @@ fn run_acceptance(largest_first: bool) {
         counter_model.len(),
         ROUNDS
     );
-    cluster.kill_all();
 }
 
 #[test]

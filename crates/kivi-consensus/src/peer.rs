@@ -21,15 +21,11 @@
 //!
 //! ## Snapshot identity discipline
 //!
-//! Snapshot metadata carries the Kivi **checkpoint** identity
-//! ([`PeerSnapshotMeta::checkpoint`]: immutable state at a cut,
-//! content-addressed). The **transfer** identity
-//! ([`PeerSnapshotRequest::transfer`]: one attempt to move that
-//! checkpoint) rides only the fragment envelope, generated fresh per
-//! `full_snapshot` call, so a retransmitted snapshot is never mistaken
-//! for a continuation of an aborted one. These are intentionally separate
-//! concepts (matching `OpenRaft` 0.10's removal of `snapshot_id` from
-//! logical snapshot metadata).
+//! Snapshot metadata carries only the applied base and membership. The
+//! transfer identity ([`PeerSnapshotRequest::transfer`]) rides on the
+//! fragment envelope, generated afresh per `full_snapshot` call, so a
+//! retransmitted snapshot is never mistaken for a continuation of an
+//! aborted transfer.
 //!
 //! ## Incarnation discipline
 //!
@@ -156,6 +152,38 @@ pub struct PeerVoteResponse {
     pub last_log: Option<PeerLogId>,
 }
 
+/// Owned leadership-transfer request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerTransferLeaderRequest {
+    /// Vote of the leader handing over leadership.
+    pub from_leader: PeerVote,
+    /// Node that should become leader.
+    pub to_node: u64,
+    /// Last log the target must have before accepting.
+    pub last_log: Option<PeerLogId>,
+}
+
+/// Owned leadership-transfer response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerTransferLeaderResponse {
+    /// Target accepted the transfer request.
+    Accepted,
+    /// Target observed a different vote.
+    VoteChanged {
+        /// Vote expected by the transferring leader.
+        expected: PeerVote,
+        /// Vote observed by the target.
+        actual: PeerVote,
+    },
+    /// Target has not flushed the leader's required log.
+    LogNotFlushed {
+        /// Log required by the transferring leader.
+        expected: Option<PeerLogId>,
+        /// Log currently durable on the target.
+        actual: Option<PeerLogId>,
+    },
+}
+
 /// Owned log-entry payload: blank barrier, opaque deterministic command
 /// bytes (the canonical [`ReplicatedMutation`](crate::mutation::ReplicatedMutation)
 /// encoding), or membership.
@@ -213,10 +241,8 @@ pub enum PeerAppendResponse {
     HigherVote(PeerVote),
 }
 
-/// Owned snapshot metadata: applied base, membership, checkpoint
-/// identity. The checkpoint reference identifies immutable Kivi state at
-/// a cut (content-addressed); transfer-session identity rides only the
-/// fragment envelope ([`PeerSnapshotRequest::transfer`]), never here.
+/// Owned snapshot metadata: applied base and membership. Transfer-session
+/// identity rides only the fragment envelope ([`PeerSnapshotRequest::transfer`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerSnapshotMeta {
     /// Snapshot's last log id.
@@ -227,8 +253,6 @@ pub struct PeerSnapshotMeta {
     pub nodes: Vec<(u64, String)>,
     /// Log id of the membership entry (grounds the purge base).
     pub membership_log: Option<PeerLogId>,
-    /// Checkpoint identity bytes (Kivi checkpoint-cut reference).
-    pub checkpoint: Vec<u8>,
 }
 
 /// Owned install-snapshot request fragment.
@@ -413,6 +437,8 @@ pub enum PeerRequest {
     Vote(PeerVoteRequest),
     /// Pre-vote probe RPC (hypothetical next term, persists nothing).
     PreVote(PeerVoteRequest),
+    /// Leadership handoff RPC.
+    TransferLeader(PeerTransferLeaderRequest),
     /// Replication/heartbeat RPC.
     Append(PeerAppendRequest),
     /// Snapshot fragment RPC.
@@ -458,6 +484,8 @@ pub enum PeerResponse {
     Vote(PeerVoteResponse),
     /// Pre-vote answer.
     PreVote(PeerVoteResponse),
+    /// Leadership handoff answer.
+    TransferLeader(PeerTransferLeaderResponse),
     /// Replication answer.
     Append(PeerAppendResponse),
     /// Snapshot fragment answer.
@@ -827,6 +855,8 @@ pub mod route {
     pub const VOTE: &str = "vote";
     /// Pre-vote probe route suffix.
     pub const PREVOTE: &str = "prevote";
+    /// Leadership-transfer route suffix.
+    pub const TRANSFER_LEADER: &str = "transfer-leader";
     /// Replication/heartbeat route suffix.
     pub const APPEND: &str = "append";
     /// Snapshot-fragment route suffix.
@@ -858,6 +888,9 @@ pub fn h3_request_path(group_tablet: u64, request: &PeerRequest) -> String {
     match request {
         PeerRequest::Vote(_) => format!("/_kivi/raft/{group_tablet}/{}", route::VOTE),
         PeerRequest::PreVote(_) => format!("/_kivi/raft/{group_tablet}/{}", route::PREVOTE),
+        PeerRequest::TransferLeader(_) => {
+            format!("/_kivi/raft/{group_tablet}/{}", route::TRANSFER_LEADER)
+        }
         PeerRequest::Append(_) => format!("/_kivi/raft/{group_tablet}/{}", route::APPEND),
         PeerRequest::Snapshot(_) => {
             format!("/_kivi/raft/{group_tablet}/{}", route::SNAPSHOT_FRAG)
@@ -894,6 +927,7 @@ pub const fn h3_media_type(request: &PeerRequest) -> &'static str {
     match request {
         PeerRequest::Vote(_)
         | PeerRequest::PreVote(_)
+        | PeerRequest::TransferLeader(_)
         | PeerRequest::Append(_)
         | PeerRequest::Snapshot(_)
         | PeerRequest::ControlForward(_) => "application/vnd.kivi.raft",
@@ -919,6 +953,7 @@ pub fn h3_method(request: &PeerRequest) -> http::Method {
         PeerRequest::Manifest(_) | PeerRequest::Chunk(_) => http::Method::GET,
         PeerRequest::Vote(_)
         | PeerRequest::PreVote(_)
+        | PeerRequest::TransferLeader(_)
         | PeerRequest::Append(_)
         | PeerRequest::Snapshot(_)
         | PeerRequest::Prepare(_)
@@ -948,6 +983,11 @@ pub fn encode_h3_request(request: &PeerRequest, group_tablet: u64) -> (String, V
     match request {
         PeerRequest::Vote(request) | PeerRequest::PreVote(request) => {
             push_vote_request(&mut out, request);
+        }
+        PeerRequest::TransferLeader(request) => {
+            push_vote(&mut out, &request.from_leader);
+            push_u64(&mut out, request.to_node);
+            push_opt_log(&mut out, request.last_log.as_ref());
         }
         PeerRequest::Append(request) => {
             push_vote(&mut out, &request.vote);
@@ -984,7 +1024,6 @@ pub fn encode_h3_request(request: &PeerRequest, group_tablet: u64) -> (String, V
             }
             push_nodes(&mut out, &request.meta.nodes);
             push_opt_log(&mut out, request.meta.membership_log.as_ref());
-            push_blob(&mut out, &request.meta.checkpoint);
             push_u64(&mut out, request.transfer);
             push_u64(&mut out, request.offset);
             push_blob(&mut out, &request.data);
@@ -1050,6 +1089,9 @@ pub fn decode_h3_request(path: &str, body: &[u8]) -> Result<DecodedH3Request, Pe
         let request = match suffix {
             route::VOTE => PeerRequest::Vote(decode_vote_request(&mut reader)?),
             route::PREVOTE => PeerRequest::PreVote(decode_vote_request(&mut reader)?),
+            route::TRANSFER_LEADER => {
+                PeerRequest::TransferLeader(decode_transfer_leader_request(&mut reader)?)
+            }
             route::APPEND => PeerRequest::Append(decode_append_request(&mut reader)?),
             route::SNAPSHOT_FRAG => PeerRequest::Snapshot(decode_snapshot_request(&mut reader)?),
             route::PREPARE => PeerRequest::Prepare(decode_prepare_request(&mut reader)?),
@@ -1114,6 +1156,19 @@ pub fn encode_h3_response(response: &PeerResponse) -> Vec<u8> {
         PeerResponse::Vote(response) | PeerResponse::PreVote(response) => {
             push_vote_response(&mut out, response);
         }
+        PeerResponse::TransferLeader(response) => match response {
+            PeerTransferLeaderResponse::Accepted => out.push(0),
+            PeerTransferLeaderResponse::VoteChanged { expected, actual } => {
+                out.push(1);
+                push_vote(&mut out, expected);
+                push_vote(&mut out, actual);
+            }
+            PeerTransferLeaderResponse::LogNotFlushed { expected, actual } => {
+                out.push(2);
+                push_opt_log(&mut out, expected.as_ref());
+                push_opt_log(&mut out, actual.as_ref());
+            }
+        },
         PeerResponse::Append(response) => match response {
             PeerAppendResponse::Success => out.push(0),
             PeerAppendResponse::PartialSuccess(matched) => {
@@ -1178,6 +1233,9 @@ pub fn decode_h3_response(
     let response = match request {
         PeerRequest::Vote(_) => PeerResponse::Vote(decode_vote_response(&mut reader)?),
         PeerRequest::PreVote(_) => PeerResponse::PreVote(decode_vote_response(&mut reader)?),
+        PeerRequest::TransferLeader(_) => {
+            PeerResponse::TransferLeader(decode_transfer_leader_response(&mut reader)?)
+        }
         PeerRequest::Append(_) => PeerResponse::Append(match reader.u8()? {
             0 => PeerAppendResponse::Success,
             1 => PeerAppendResponse::PartialSuccess(reader.opt_log()?),
@@ -1263,6 +1321,33 @@ fn decode_vote_response(reader: &mut Reader<'_>) -> Result<PeerVoteResponse, Pee
         granted,
         last_log,
     })
+}
+
+fn decode_transfer_leader_request(
+    reader: &mut Reader<'_>,
+) -> Result<PeerTransferLeaderRequest, PeerCodecError> {
+    Ok(PeerTransferLeaderRequest {
+        from_leader: reader.vote()?,
+        to_node: reader.u64()?,
+        last_log: reader.opt_log()?,
+    })
+}
+
+fn decode_transfer_leader_response(
+    reader: &mut Reader<'_>,
+) -> Result<PeerTransferLeaderResponse, PeerCodecError> {
+    match reader.u8()? {
+        0 => Ok(PeerTransferLeaderResponse::Accepted),
+        1 => Ok(PeerTransferLeaderResponse::VoteChanged {
+            expected: reader.vote()?,
+            actual: reader.vote()?,
+        }),
+        2 => Ok(PeerTransferLeaderResponse::LogNotFlushed {
+            expected: reader.opt_log()?,
+            actual: reader.opt_log()?,
+        }),
+        tag => Err(PeerCodecError::BadTag { tag }),
+    }
 }
 
 fn decode_append_request(reader: &mut Reader<'_>) -> Result<PeerAppendRequest, PeerCodecError> {
@@ -1496,7 +1581,6 @@ fn decode_snapshot_request(reader: &mut Reader<'_>) -> Result<PeerSnapshotReques
             voters: reader.voters()?,
             nodes: reader.nodes()?,
             membership_log: reader.opt_log()?,
-            checkpoint: reader.blob()?,
         },
         transfer: reader.u64()?,
         offset: reader.u64()?,
@@ -1690,7 +1774,6 @@ mod tests {
                     voters: vec![1, 2, 3],
                     nodes: vec![(1, "127.0.0.1:9101".to_owned())],
                     membership_log: Some(log),
-                    checkpoint: b"ckpt-9@42".to_vec(),
                 },
                 transfer: 77,
                 offset: 0,
@@ -1718,6 +1801,11 @@ mod tests {
             PeerRequest::CoveragePoll(PeerCoveragePoll { commit: 42 }),
             PeerRequest::ControlForward(PeerControlForwardRequest {
                 mutation: vec![0x55, 0x66, 0x77],
+            }),
+            PeerRequest::TransferLeader(PeerTransferLeaderRequest {
+                from_leader: vote,
+                to_node: 2,
+                last_log: Some(log),
             }),
         ];
         for request in &cases {
@@ -1803,6 +1891,13 @@ mod tests {
             (
                 &cases[11],
                 PeerResponse::ControlForward(PeerControlForwardResponse { index: 43 }),
+            ),
+            (
+                &cases[12],
+                PeerResponse::TransferLeader(PeerTransferLeaderResponse::LogNotFlushed {
+                    expected: Some(log),
+                    actual: None,
+                }),
             ),
         ];
         for (request, response) in cases {
