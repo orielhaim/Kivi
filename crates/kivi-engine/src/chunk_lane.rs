@@ -30,6 +30,7 @@ use std::thread::{self, JoinHandle};
 use async_channel::{Receiver, Sender, bounded};
 use bytes::Bytes;
 use kivi_chunk::{ChunkError, ChunkStats, ChunkStore};
+use kivi_state::{ChunkedRef, FabricRef, LogicalValue, ObjectVersion, StoredObject};
 use kivi_types::{ChunkId, ManifestId, SecurityDomainId};
 
 /// Lane job queue depth. Uploads are rare next to point ops; 64 deep
@@ -1680,6 +1681,54 @@ pub fn split_large_set(op: kivi_state::Operation, threshold: u64) -> LargeSetSpl
     }
 }
 
+/// The logical root coordinates a restaged range write must still name at
+/// admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RangeRootFence {
+    /// Logical object version observed at the root peek.
+    pub object_version: Option<ObjectVersion>,
+    /// Complete physical/logical root identity observed at the peek.
+    pub root: RangeRoot,
+}
+
+/// The root identity carried by a [`RangeRootFence`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeRoot {
+    /// No live object at the peek instant.
+    Absent,
+    /// A non-byte logical value.
+    NonBytes,
+    /// Resident byte value.
+    Inline,
+    /// Chunked byte value.
+    Chunked(ChunkedRef),
+    /// Fabric byte value.
+    Fabric(FabricRef),
+}
+
+impl RangeRootFence {
+    /// Whether a current live object still names exactly the fenced root.
+    #[must_use]
+    pub fn matches(&self, current: Option<&StoredObject>) -> bool {
+        let Some(current) = current else {
+            return matches!(self.root, RangeRoot::Absent) && self.object_version.is_none();
+        };
+        if self.object_version != Some(current.version()) {
+            return false;
+        }
+        match self.root {
+            RangeRoot::Absent => false,
+            RangeRoot::NonBytes => !matches!(
+                current.value(),
+                LogicalValue::Bytes(_) | LogicalValue::Chunked(_) | LogicalValue::Fabric(_)
+            ),
+            RangeRoot::Inline => matches!(current.value(), LogicalValue::Bytes(_)),
+            RangeRoot::Chunked(reference) => current.chunk_ref() == Some(reference),
+            RangeRoot::Fabric(reference) => current.fabric_ref() == Some(reference),
+        }
+    }
+}
+
 /// The tablet-visible base a `SetRange` patches against: live inline
 /// bytes (cloned at peek time), a chunked root's address, a counter
 /// (which rejects at prepare), or nothing (absent or expired reads as
@@ -1692,28 +1741,91 @@ pub enum RangeBase {
     Absent,
     /// Live non-bytes value (counters and semantic objects): patches reject
     /// with `WrongType` at prepare.
-    NonBytes,
+    NonBytes {
+        /// Logical object version observed at the peek.
+        object_version: ObjectVersion,
+    },
     /// Live inline bytes to splice in memory.
-    Inline(Bytes),
+    Inline {
+        /// Resident bytes observed at the peek.
+        bytes: Bytes,
+        /// Logical object version observed at the peek.
+        object_version: ObjectVersion,
+    },
     /// Live chunked root: the lane restages instead of recording a splice.
     Chunked {
         /// Manifest addressing the base value.
         manifest: ManifestId,
         /// Total logical bytes the root claims.
         logical_len: u64,
+        /// Logical object version observed at the peek.
+        object_version: ObjectVersion,
     },
     /// Live fabric root: callers resolve the bytes through the Memory
     /// Fabric first (synchronous residence, promotion, or direct read),
-    /// then re-plan against `Inline`. The planner never sees this
+    /// then re-plan against the resolved bytes. The planner never sees this
     /// variant: reaching `plan_set_range` with it rejects loudly.
     Fabric {
-        /// Fabric-scoped object id assigned at staging.
-        fabric_id: u64,
-        /// Total logical bytes the root claims.
-        logical_len: u64,
-        /// Logical version the bytes were published at.
-        version: u64,
+        /// Complete fabric reference observed at the peek.
+        reference: FabricRef,
+        /// Logical object version observed at the peek.
+        object_version: ObjectVersion,
     },
+    /// Resolved bytes from a live fabric root. The patch must be restaged
+    /// as a complete value so the logical root never changes from fabric
+    /// to an inline splice without replacing the representation.
+    FabricInline {
+        /// Complete fabric reference observed at the peek.
+        reference: FabricRef,
+        /// Logical object version observed at the peek.
+        object_version: ObjectVersion,
+        /// Verified bytes resolved from the fabric.
+        bytes: Bytes,
+    },
+}
+
+impl RangeBase {
+    /// Captures the exact logical root fence for this base.
+    #[must_use]
+    pub fn fence(&self) -> RangeRootFence {
+        match self {
+            Self::Absent => RangeRootFence {
+                object_version: None,
+                root: RangeRoot::Absent,
+            },
+            Self::NonBytes { object_version } => RangeRootFence {
+                object_version: Some(*object_version),
+                root: RangeRoot::NonBytes,
+            },
+            Self::Inline { object_version, .. } => RangeRootFence {
+                object_version: Some(*object_version),
+                root: RangeRoot::Inline,
+            },
+            Self::Chunked {
+                manifest,
+                logical_len,
+                object_version,
+            } => RangeRootFence {
+                object_version: Some(*object_version),
+                root: RangeRoot::Chunked(ChunkedRef {
+                    manifest: *manifest,
+                    logical_len: *logical_len,
+                }),
+            },
+            Self::Fabric {
+                reference,
+                object_version,
+            }
+            | Self::FabricInline {
+                reference,
+                object_version,
+                ..
+            } => RangeRootFence {
+                object_version: Some(*object_version),
+                root: RangeRoot::Fabric(*reference),
+            },
+        }
+    }
 }
 
 /// Outcome of [`plan_set_range`]: where a range patch goes next.
@@ -1731,6 +1843,8 @@ pub enum SetRangePlan {
         key: kivi_state::Key,
         /// Fully spliced bytes (zeros plus patch over the base).
         value: Bytes,
+        /// Root that must still be current at admission.
+        fence: RangeRootFence,
     },
     /// The base is chunked: restage through the lane's prefix-reuse
     /// splice, then admit `SetChunked` in place of the patch.
@@ -1745,6 +1859,8 @@ pub enum SetRangePlan {
         offset: u64,
         /// Bytes written starting at `offset`.
         patch: Bytes,
+        /// Root that must still be current at admission.
+        fence: RangeRootFence,
     },
     /// The patch is not admittable: overflowing arithmetic or a result
     /// past the legacy inline bound (rewrite through a streaming upload
@@ -1768,28 +1884,47 @@ pub fn plan_set_range(
     threshold: u64,
 ) -> SetRangePlan {
     let legacy_max = kivi_chunk::policy::MAX_LEGACY_VALUE_BYTES;
+    let fence = base.fence();
     let Some(patch_end) = offset.checked_add(patch.len() as u64) else {
         return SetRangePlan::Reject {
             detail: "set-range offset plus patch length overflows u64".to_owned(),
         };
     };
     match base {
-        RangeBase::NonBytes => {
+        RangeBase::NonBytes { .. } => {
             SetRangePlan::Inline(kivi_state::Operation::SetRange { key, offset, patch })
         }
         RangeBase::Chunked {
             manifest,
             logical_len,
+            ..
         } => SetRangePlan::Splice {
             key,
             manifest,
             logical_len,
             offset,
             patch,
+            fence,
         },
         RangeBase::Fabric { .. } => SetRangePlan::Reject {
             detail: "fabric base must resolve through the Memory Fabric before planning".to_owned(),
         },
+        RangeBase::FabricInline { bytes, .. } => {
+            let result = (bytes.len() as u64).max(patch_end);
+            if result > legacy_max {
+                return SetRangePlan::Reject {
+                    detail: format!(
+                        "set-range result {result} exceeds the {legacy_max}-byte range bound; rewrite through a streaming upload"
+                    ),
+                };
+            }
+            match kivi_state::splice_inline(&bytes, offset, &patch) {
+                Some(value) => SetRangePlan::RestageSet { key, value, fence },
+                None => SetRangePlan::Reject {
+                    detail: "set-range offset does not fit the address space".to_owned(),
+                },
+            }
+        }
         RangeBase::Absent => {
             if patch_end > legacy_max {
                 return SetRangePlan::Reject {
@@ -1809,12 +1944,13 @@ pub fn plan_set_range(
                 SetRangePlan::RestageSet {
                     key,
                     value: Bytes::from(value),
+                    fence,
                 }
             } else {
                 SetRangePlan::Inline(kivi_state::Operation::SetRange { key, offset, patch })
             }
         }
-        RangeBase::Inline(bytes) => {
+        RangeBase::Inline { bytes, .. } => {
             let result = (bytes.len() as u64).max(patch_end);
             if result > legacy_max {
                 return SetRangePlan::Reject {
@@ -1824,10 +1960,8 @@ pub fn plan_set_range(
                 };
             }
             if result > threshold {
-                // Materialized once, bounded by the legacy cap above, then
-                // stored through the ordinary large-`Set` staging path.
                 match kivi_state::splice_inline(&bytes, offset, &patch) {
-                    Some(value) => SetRangePlan::RestageSet { key, value },
+                    Some(value) => SetRangePlan::RestageSet { key, value, fence },
                     None => SetRangePlan::Reject {
                         detail: "set-range offset does not fit the address space".to_owned(),
                     },

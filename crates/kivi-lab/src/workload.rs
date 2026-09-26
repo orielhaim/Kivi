@@ -10,6 +10,8 @@
 //! value sizes, client/thread count, pipeline depth, op count, and TTL
 //! behavior (expiry attach + TTL read inside the `Compat` mix).
 
+use std::sync::Arc;
+
 /// Shared request mix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Workload {
@@ -22,6 +24,16 @@ pub enum Workload {
     Counter,
     /// Mixed GET/SET/DELETE/COUNTER across the keyspace (native only).
     Mixed,
+    /// Read-only cache-shaped mix using GET, EXISTS, GETRANGE, and TTL.
+    Cache,
+    /// Read-heavy mix with a small mutation tail.
+    ReadHeavy,
+    /// Balanced read/write mix using the shared RESP command profile.
+    Balanced,
+    /// Delete-only workload.
+    Delete,
+    /// Exists-only workload.
+    Exists,
     /// RESP-profile mix: GET/SET/EXPIRE/TTL/SETRANGE across the keyspace
     /// (the exact subset both Native and RESP speak).
     Compat,
@@ -84,6 +96,38 @@ pub fn fill_pattern(len: usize, seed: u64) -> Vec<u8> {
     out
 }
 
+/// Deterministic seed used for every campaign payload.
+pub const PAYLOAD_SEED: u64 = 0xBE4C4;
+
+/// Shared immutable payload used by all workers in one run.
+#[derive(Debug, Clone)]
+pub struct PayloadCache {
+    bytes: Arc<Vec<u8>>,
+}
+
+impl PayloadCache {
+    /// Builds one deterministic payload of `len` bytes.
+    #[must_use]
+    pub fn new(len: usize) -> Self {
+        Self {
+            bytes: Arc::new(fill_pattern(len, PAYLOAD_SEED)),
+        }
+    }
+
+    /// Returns the shared payload bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.bytes.as_slice()
+    }
+
+    /// Returns the payload length.
+    #[must_use]
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
 /// Shared key distribution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeySpace {
@@ -91,6 +135,8 @@ pub enum KeySpace {
     Hot,
     /// `count` distinct keys per thread.
     Uniform(usize),
+    /// `count` distinct keys shared by all threads.
+    UniformGlobal(usize),
 }
 
 /// Parses `hot` or `uniform:<n>` without panicking.
@@ -110,9 +156,26 @@ pub fn parse_key_space(spec: &str) -> Result<KeySpace, String> {
         } else {
             Err(format!("key count must be nonzero in {spec:?}"))
         }
+    } else if let Some(count) = spec.strip_prefix("uniform-global:") {
+        let count: usize = count
+            .parse()
+            .map_err(|_| format!("invalid key count in {spec:?}"))?;
+        if count > 0 {
+            Ok(KeySpace::UniformGlobal(count))
+        } else {
+            Err(format!("key count must be nonzero in {spec:?}"))
+        }
     } else {
-        Err(format!("keys must be `hot` or `uniform:<n>`, got {spec:?}"))
+        Err(format!(
+            "keys must be `hot`, `uniform:<n>`, or `uniform-global:<n>`, got {spec:?}"
+        ))
     }
+}
+
+/// Whether every operation in `workload` is valid on the shared RESP profile.
+#[must_use]
+pub const fn workload_supports_resp(workload: Workload) -> bool {
+    !matches!(workload, Workload::Counter | Workload::Mixed)
 }
 
 /// One target-agnostic workload operation.
@@ -131,6 +194,8 @@ pub enum WorkloadOp {
     CounterAdd(String),
     /// Remove a key.
     Delete(String),
+    /// Test whether a key is present.
+    Exists(String),
     /// Attach a 60-second expiry.
     Expire(String),
     /// Read expiry/TTL.
@@ -156,6 +221,7 @@ pub fn thread_key_names(space: KeySpace, thread: usize, prefix: &str) -> Vec<Str
         KeySpace::Uniform(count) => (0..count)
             .map(|i| format!("{prefix}t{thread}:k{i}"))
             .collect(),
+        KeySpace::UniformGlobal(count) => (0..count).map(|i| format!("{prefix}g:k{i}")).collect(),
     }
 }
 
@@ -165,6 +231,7 @@ pub fn counter_key_name(space: KeySpace, thread: usize, prefix: &str) -> String 
     match space {
         KeySpace::Hot => format!("{prefix}hot:c"),
         KeySpace::Uniform(_) => format!("{prefix}t{thread}:c"),
+        KeySpace::UniformGlobal(_) => format!("{prefix}g:c"),
     }
 }
 
@@ -195,6 +262,36 @@ pub fn workload_op_for(
             2 => WorkloadOp::CounterAdd(counter.to_owned()),
             _ => WorkloadOp::Delete(key),
         },
+        Workload::Cache => match i % 20 {
+            0..=11 => WorkloadOp::Get(key),
+            12..=15 => WorkloadOp::Exists(key),
+            16..=18 => WorkloadOp::GetRange(key),
+            _ => WorkloadOp::Ttl(key),
+        },
+        Workload::ReadHeavy => match i % 20 {
+            0..=13 => WorkloadOp::Get(key),
+            14..=16 => WorkloadOp::Exists(key),
+            17..=18 => WorkloadOp::GetRange(key),
+            _ => WorkloadOp::Set {
+                key,
+                len: value_len,
+            },
+        },
+        Workload::Balanced => match i % 20 {
+            0..=3 => WorkloadOp::Get(key),
+            4..=7 => WorkloadOp::Set {
+                key,
+                len: value_len,
+            },
+            8..=10 => WorkloadOp::Delete(key),
+            11..=13 => WorkloadOp::Exists(key),
+            14..=15 => WorkloadOp::GetRange(key),
+            16 => WorkloadOp::SetRange(key),
+            17 => WorkloadOp::Expire(key),
+            _ => WorkloadOp::Ttl(key),
+        },
+        Workload::Delete => WorkloadOp::Delete(key),
+        Workload::Exists => WorkloadOp::Exists(key),
         Workload::Compat => match i % 5 {
             0 => WorkloadOp::Get(key),
             1 => WorkloadOp::Set {
@@ -223,16 +320,34 @@ pub fn seed_ops_for(
     let mut ops = Vec::new();
     let seed_bytes = matches!(
         workload,
-        Workload::Get | Workload::Set | Workload::Mixed | Workload::Compat | Workload::Range
+        Workload::Get
+            | Workload::Set
+            | Workload::Mixed
+            | Workload::Cache
+            | Workload::ReadHeavy
+            | Workload::Balanced
+            | Workload::Delete
+            | Workload::Exists
+            | Workload::Compat
+            | Workload::Range
     );
     let seed_counters = matches!(workload, Workload::Counter | Workload::Mixed);
     if seed_bytes {
-        if matches!(space, KeySpace::Hot) {
+        if matches!(space, KeySpace::Hot | KeySpace::UniformGlobal(_)) {
             if thread == 0 {
-                ops.push(WorkloadOp::Set {
-                    key: format!("{prefix}hot"),
-                    len: value_len,
-                });
+                if let KeySpace::Hot = space {
+                    ops.push(WorkloadOp::Set {
+                        key: format!("{prefix}hot"),
+                        len: value_len,
+                    });
+                } else {
+                    for key in thread_key_names(space, thread, prefix) {
+                        ops.push(WorkloadOp::Set {
+                            key,
+                            len: value_len,
+                        });
+                    }
+                }
             }
         } else {
             for key in thread_key_names(space, thread, prefix) {
@@ -276,7 +391,12 @@ mod tests {
     fn key_space_parser_accepts_hot_and_uniform() {
         assert_eq!(parse_key_space("hot"), Ok(KeySpace::Hot));
         assert_eq!(parse_key_space("uniform:16"), Ok(KeySpace::Uniform(16)));
+        assert_eq!(
+            parse_key_space("uniform-global:16"),
+            Ok(KeySpace::UniformGlobal(16))
+        );
         assert!(parse_key_space("uniform:0").is_err());
+        assert!(parse_key_space("uniform-global:0").is_err());
         assert!(parse_key_space("uniform:lots").is_err());
         assert!(parse_key_space("cold").is_err());
     }
@@ -320,6 +440,24 @@ mod tests {
             workload_op_for(Workload::Range, 1, 9, &keys, counter),
             WorkloadOp::GetRange("b".to_owned())
         );
+        assert_eq!(
+            workload_op_for(Workload::Exists, 1, 0, &keys, counter),
+            WorkloadOp::Exists("a".to_owned())
+        );
+        assert_eq!(
+            workload_op_for(Workload::Balanced, 1, 0, &keys, counter),
+            WorkloadOp::Get("a".to_owned())
+        );
+        assert_eq!(
+            workload_op_for(Workload::Balanced, 1, 17, &keys, counter),
+            WorkloadOp::Expire("b".to_owned())
+        );
+        assert_eq!(
+            workload_op_for(Workload::Balanced, 1, 19, &keys, counter),
+            WorkloadOp::Ttl("b".to_owned())
+        );
+        assert!(workload_supports_resp(Workload::Cache));
+        assert!(!workload_supports_resp(Workload::Counter));
     }
 
     #[test]
@@ -348,8 +486,13 @@ mod tests {
             thread_key_names(KeySpace::Uniform(2), 1, ""),
             vec!["t1:k0".to_owned(), "t1:k1".to_owned()]
         );
+        assert_eq!(
+            thread_key_names(KeySpace::UniformGlobal(2), 1, ""),
+            vec!["g:k0".to_owned(), "g:k1".to_owned()]
+        );
         assert_eq!(counter_key_name(KeySpace::Hot, 0, ""), "hot:c");
         assert_eq!(counter_key_name(KeySpace::Uniform(9), 2, ""), "t2:c");
+        assert_eq!(counter_key_name(KeySpace::UniformGlobal(9), 2, ""), "g:c");
     }
 
     #[test]

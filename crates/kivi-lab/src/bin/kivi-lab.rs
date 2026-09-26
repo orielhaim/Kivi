@@ -3,6 +3,7 @@
 //! ```text
 //! kivi-lab bench --target native --server 127.0.0.1:9000 ...
 //! kivi-lab bench --target resp --server 127.0.0.1:6379 ...
+//! kivi-lab compare --preset smoke [--kivi-endpoint ...] [--kivi-resp ...]
 //! kivi-lab conformance [--kivi 127.0.0.1:6380 | --spawn] [--redis URL]
 //! ```
 //!
@@ -13,9 +14,12 @@
 //! non-production crate.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::time::Duration;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
+use kivi_lab::campaign::{self, CampaignOptions, CampaignPreset, KiviMode};
 use kivi_lab::conformance;
 use kivi_lab::metrics::{BENCH_SCHEMA, BenchReport};
 use kivi_lab::runner::{self, RunnerConfig};
@@ -33,6 +37,8 @@ struct Cli {
 enum Command {
     /// Run a workload against one target and report throughput/latency.
     Bench(BenchArgs),
+    /// Run the labeled Kivi/Redis campaign matrix.
+    Compare(CompareArgs),
     /// Run the exact-profile vector matrix against Kivi RESP and a
     /// reference Redis, then diff normalized observables.
     Conformance(ConformanceArgs),
@@ -81,6 +87,9 @@ struct BenchArgs {
     /// Measured operations per thread.
     #[arg(long, default_value_t = 5_000, value_parser = parse_nonzero)]
     ops: usize,
+    /// Optional duration-based measured phase; `--ops` remains the default mode.
+    #[arg(long = "duration-ms", alias = "duration", value_parser = parse_duration_ms)]
+    duration: Option<Duration>,
     /// Warmup operations per thread (unmeasured).
     #[arg(long, default_value_t = 500)]
     warmup: usize,
@@ -109,6 +118,74 @@ struct BenchArgs {
     /// Write the JSON report here instead of stdout.
     #[arg(long)]
     out: Option<String>,
+}
+
+/// Campaign matrix options.
+#[derive(Debug, Parser)]
+struct CompareArgs {
+    /// Campaign preset.
+    #[arg(long, value_enum, default_value_t = CampaignPreset::Smoke)]
+    preset: CampaignPreset,
+    /// Reference Redis URL, or `KIVI_LAB_REDIS_URL`/default.
+    #[arg(long, alias = "redis-url")]
+    redis: Option<String>,
+    /// External Kivi native endpoint.
+    #[arg(long = "kivi-endpoint", alias = "kivi", alias = "kivi-url")]
+    kivi_endpoint: Option<String>,
+    /// External Kivi RESP endpoint.
+    #[arg(long = "kivi-resp", alias = "kivi-resp-endpoint")]
+    kivi_resp: Option<String>,
+    /// External Kivi admin endpoint.
+    #[arg(long = "kivi-admin")]
+    kivi_admin: Option<String>,
+    /// Output directory; default is timestamped under target/kivi-lab-campaign.
+    #[arg(long = "output-dir", alias = "out", alias = "output")]
+    output_dir: Option<PathBuf>,
+    /// Override alternating trial count.
+    #[arg(long, value_parser = parse_nonzero)]
+    trials: Option<usize>,
+    /// Duration cap per trial in milliseconds.
+    #[arg(long = "duration-ms", alias = "duration", value_parser = parse_duration_ms)]
+    duration: Option<Duration>,
+    /// Fixed measured operations per thread instead of duration mode.
+    #[arg(long = "ops", alias = "ops-per-trial", value_parser = parse_nonzero)]
+    ops: Option<usize>,
+    /// Override the base and curve concurrency point.
+    #[arg(long, value_parser = parse_nonzero)]
+    threads: Option<usize>,
+    /// Override the base and curve pipeline point.
+    #[arg(long, value_parser = parse_nonzero)]
+    pipeline: Option<usize>,
+    /// Override base value size.
+    #[arg(long = "value-size", value_enum)]
+    value_size: Option<ValueSize>,
+    /// Override the base workload.
+    #[arg(long, value_enum)]
+    workload: Option<Workload>,
+    /// Shared key-space override; omitted uses the preset default.
+    #[arg(long = "keys", value_parser = parse_key_space)]
+    keys: Option<KeySpace>,
+    /// Durability mode for automatically spawned Kivi.
+    #[arg(long, value_enum, default_value_t = KiviMode::Durable)]
+    kivi_mode: KiviMode,
+    /// Workers for automatically spawned Kivi.
+    #[arg(long, default_value_t = 2, value_parser = parse_nonzero)]
+    workers: usize,
+    /// Tablets for automatically spawned Kivi.
+    #[arg(long, default_value_t = 1, value_parser = parse_nonzero)]
+    tablets: usize,
+    /// Native namespace.
+    #[arg(long, default_value_t = 1)]
+    namespace: u64,
+    /// Override warmup operations per thread.
+    #[arg(long, value_parser = parse_nonzero)]
+    warmup: Option<usize>,
+    /// Enable the preset's large-value experiment.
+    #[arg(long = "large-values", action = ArgAction::SetTrue)]
+    large_values: bool,
+    /// Disable the preset's large-value experiment.
+    #[arg(long = "no-large-values", action = ArgAction::SetTrue, conflicts_with = "large_values")]
+    no_large_values: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -146,10 +223,21 @@ fn parse_nonzero(spec: &str) -> Result<usize, String> {
     }
 }
 
+fn parse_duration_ms(spec: &str) -> Result<Duration, String> {
+    let millis: u64 = spec
+        .parse()
+        .map_err(|_| format!("invalid duration {spec:?}"))?;
+    if millis == 0 {
+        return Err("duration must be nonzero".to_owned());
+    }
+    Ok(Duration::from_millis(millis))
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Bench(args) => bench(args),
+        Command::Compare(args) => compare(args),
         Command::Conformance(args) => conformance_cmd(args),
         Command::Cleanup(args) => {
             let url = conformance::redis_url(args.redis.as_deref());
@@ -159,6 +247,56 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+fn compare(args: CompareArgs) -> anyhow::Result<()> {
+    if let Some(workload) = args.workload
+        && !kivi_lab::workload::workload_supports_resp(workload)
+    {
+        anyhow::bail!("campaign workload {workload:?} is not valid for RESP Redis comparison");
+    }
+    let options = CampaignOptions {
+        preset: args.preset,
+        redis_url: args.redis,
+        kivi_endpoint: args.kivi_endpoint,
+        kivi_resp_endpoint: args.kivi_resp,
+        kivi_admin_endpoint: args.kivi_admin,
+        output_dir: args.output_dir,
+        trials: args.trials,
+        duration: args.duration,
+        ops_per_trial: args.ops,
+        thread_counts: args.threads.map(|value| vec![value]),
+        pipeline_depths: args.pipeline.map(|value| vec![value]),
+        value_len: args.value_size.map(ValueSize::len),
+        workload: args.workload,
+        include_large: if args.no_large_values {
+            Some(false)
+        } else if args.large_values {
+            Some(true)
+        } else {
+            None
+        },
+        key_space: args.keys,
+        kivi_mode: args.kivi_mode,
+        workers: args.workers,
+        tablets: args.tablets,
+        namespace: args.namespace,
+        warmup: args.warmup,
+    };
+    let report = campaign::run_campaign(options)?;
+    print!("{}", report.markdown());
+    println!(
+        "\nraw_json={} markdown={}",
+        report.raw_json_path().display(),
+        report.markdown_path().display()
+    );
+    if !report.valid() {
+        anyhow::bail!(
+            "campaign contains failed points; see {}",
+            report.raw_json_path().display()
+        );
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -186,6 +324,7 @@ fn bench(args: BenchArgs) -> anyhow::Result<()> {
     let keys_desc = match args.keys {
         KeySpace::Hot => "hot".to_owned(),
         KeySpace::Uniform(count) => format!("uniform:{count}"),
+        KeySpace::UniformGlobal(count) => format!("uniform-global:{count}"),
     };
     let workload_name = format!("{:?}", args.workload);
     let (report, endpoint, kind) = match args.target {
@@ -204,9 +343,15 @@ fn bench(args: BenchArgs) -> anyhow::Result<()> {
             )
             .context("keyspace seeding failed")?;
             let redirects = seeder.redirects();
-            let stats = runner::run(config, || {
-                KiviNativeTarget::connect_multi(&seeds, args.namespace, args.pending)
-            })?;
+            let stats = if let Some(duration) = args.duration {
+                runner::run_for_duration(config, duration, || {
+                    KiviNativeTarget::connect_multi(&seeds, args.namespace, args.pending)
+                })?
+            } else {
+                runner::run(config, || {
+                    KiviNativeTarget::connect_multi(&seeds, args.namespace, args.pending)
+                })?
+            };
             let mut extra = BTreeMap::new();
             extra.insert("redirects".to_owned(), redirects.to_string());
             (
@@ -235,7 +380,11 @@ fn bench(args: BenchArgs) -> anyhow::Result<()> {
                 &args.prefix,
             )
             .context("keyspace seeding failed")?;
-            let stats = runner::run(config, || Ok(RespTarget::lazy(&server)))?;
+            let stats = if let Some(duration) = args.duration {
+                runner::run_for_duration(config, duration, || Ok(RespTarget::lazy(&server)))?
+            } else {
+                runner::run(config, || Ok(RespTarget::lazy(&server)))?
+            };
             let extra = BTreeMap::new();
             (
                 finish_report(
@@ -279,6 +428,14 @@ fn finish_report(
     args: &BenchArgs,
     extra: BTreeMap<String, String>,
 ) -> BenchReport {
+    let mut extra = extra;
+    if let Some(duration) = args.duration {
+        extra.insert("mode".to_owned(), "duration".to_owned());
+        extra.insert(
+            "requested_duration_ms".to_owned(),
+            duration.as_millis().to_string(),
+        );
+    }
     BenchReport {
         schema: BENCH_SCHEMA,
         target: target.to_owned(),
@@ -292,7 +449,7 @@ fn finish_report(
         ops_per_thread: args.ops,
         completed: stats.completed,
         errors: stats.errors,
-        ops_per_sec: stats.completed as f64 / stats.secs,
+        ops_per_sec: stats.completed as f64 / stats.secs.max(f64::MIN_POSITIVE),
         latency_unit: if args.pipeline == 1 {
             "ns/op"
         } else {
@@ -383,6 +540,8 @@ mod tests {
             "hot",
             "--value-size",
             "kb64",
+            "--duration-ms",
+            "250",
             "--format",
             "json",
         ])
@@ -394,6 +553,7 @@ mod tests {
         assert_eq!(args.ops, 100);
         assert_eq!(args.workload, Workload::Get);
         assert_eq!(args.value_size, ValueSize::Kb64);
+        assert_eq!(args.duration, Some(Duration::from_millis(250)));
         assert_eq!(args.format, Format::Json);
     }
 
@@ -402,6 +562,45 @@ mod tests {
         assert!(Cli::try_parse_from(["kivi-lab", "bench", "--threads", "0"]).is_err());
         assert!(Cli::try_parse_from(["kivi-lab", "bench", "--keys", "cold"]).is_err());
         assert!(Cli::try_parse_from(["kivi-lab", "bench", "--workload", "frobnicate"]).is_err());
+    }
+
+    #[test]
+    fn compare_args_parse_presets_and_overrides() {
+        let cli = Cli::try_parse_from([
+            "kivi-lab",
+            "compare",
+            "--preset",
+            "standard",
+            "--redis",
+            "redis://localhost:6379",
+            "--kivi-endpoint",
+            "127.0.0.1:9000",
+            "--kivi-resp",
+            "127.0.0.1:6380",
+            "--duration-ms",
+            "250",
+            "--threads",
+            "4",
+            "--pipeline",
+            "8",
+            "--workload",
+            "read-heavy",
+        ])
+        .expect("args parse");
+        let Command::Compare(args) = cli.command else {
+            panic!("compare subcommand");
+        };
+        assert_eq!(args.preset, CampaignPreset::Standard);
+        assert_eq!(args.duration, Some(Duration::from_millis(250)));
+        assert_eq!(args.threads, Some(4));
+        assert_eq!(args.pipeline, Some(8));
+        assert_eq!(args.workload, Some(Workload::ReadHeavy));
+    }
+
+    #[test]
+    fn compare_args_reject_bad_bounded_values() {
+        assert!(Cli::try_parse_from(["kivi-lab", "compare", "--trials", "0"]).is_err());
+        assert!(Cli::try_parse_from(["kivi-lab", "compare", "--duration-ms", "0"]).is_err());
     }
 
     #[test]

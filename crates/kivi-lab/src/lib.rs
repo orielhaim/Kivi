@@ -25,12 +25,15 @@
 //! * [`resp_client`] — minimal raw RESP2 client over blocking TCP, shared
 //!   by benchmarks and conformance so comparisons isolate server
 //!   differences, not client libraries.
+//! * [`campaign`] — bounded, correctness-gated Kivi/Redis comparison runs
+//!   with raw JSON and Markdown artifacts.
 //! * [`runner`] — concurrency, pipelining, warmup, timing, and histogram
 //!   methodology, identical for every target.
 //! * [`metrics`] — machine-readable benchmark schema (JSON tooling output).
 //! * [`conformance`] — differential-testing helpers: key-prefix isolation,
 //!   normalization, and reference-Redis configuration inspection.
 
+pub mod campaign;
 pub mod cluster;
 pub mod conformance;
 pub mod metrics;

@@ -64,6 +64,7 @@ pub const DEFAULT_MAX_REDIRECTS: usize = 8;
 /// the endpoint, spends one redirect, and fails over. Bounds every call
 /// while riding out ordinary elections (which land in ~1-5 hops).
 pub const MAX_STALE_REPEATS: u32 = 12;
+const RANGE_REBASE_RETRIES: u32 = 12;
 /// In-flight requests per connection default (fast `Overloaded` past this).
 pub const DEFAULT_MAX_PENDING: usize = 128;
 /// Dial attempts per connection (handshake validation failures fail fast;
@@ -277,6 +278,10 @@ fn status_error(status: Status, body: &ResponseBody) -> ClientError {
         Status::StaleToken => ClientError::StaleToken,
         Status::CoverageUncertain => ClientError::AmbiguousOutcome,
     }
+}
+
+fn is_range_rebase(body: &ResponseBody) -> bool {
+    matches!(body, ResponseBody::Diagnostic(detail) if detail.contains("range base changed"))
 }
 
 /// Encodes a conditional store's condition/policy onto wire bytes plus the
@@ -1356,6 +1361,7 @@ impl NativeClient {
         // then the route evicts and fails over instead of pinning on a
         // black hole.
         let mut overloaded_streak = 0u32;
+        let mut range_rebase_retries = 0u32;
         // Dead-member failover: endpoints that fail this call are
         // remembered (`tried`) and never redialed within the call, so a
         // killed or retired member fails over across untried seeds
@@ -1627,6 +1633,13 @@ impl NativeClient {
                     }
                 }
                 Status::Overloaded => {
+                    if is_range_rebase(&response.body)
+                        && range_rebase_retries < RANGE_REBASE_RETRIES
+                    {
+                        range_rebase_retries += 1;
+                        backoff(self.shared.dial_backoff, range_rebase_retries.min(6));
+                        continue;
+                    }
                     // Election or migration churn: back off (like
                     // redirects) instead of spinning the budget dry in
                     // milliseconds while a leader emerges. Past a short

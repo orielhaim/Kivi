@@ -355,6 +355,46 @@ fn pressure_demotes_and_resume_is_exact() {
     engine.shutdown().expect("clean shutdown");
 }
 
+#[test]
+fn small_set_range_restages_after_offcore_fabric_demotion() {
+    let engine = start_ephemeral(
+        root_snapshot(),
+        Placement::new([(TABLET, worker(0))]),
+        2,
+        pressured_fabric(),
+    );
+    let client = engine.client();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let expected = write_pressure_keys(&client, deadline);
+    if !drive_until_demoted(&engine, &client, &expected, deadline) {
+        let dump = format!("{:#?}", engine.admin_handle().fabric_stats_snapshot());
+        let _ = engine.shutdown();
+        panic!("no worker reported nvme_bytes>0 within 30s; stats: {dump}");
+    }
+    let (key, base) = &expected[0];
+    let patch = Bytes::from_static(b"patch");
+    let mut patched = base.to_vec();
+    patched[..patch.len()].copy_from_slice(&patch);
+    loop {
+        match client.set_range(key, 0, patch.clone()) {
+            Ok(()) => break,
+            Err(error) if is_backpressure(&error) => {
+                assert!(
+                    Instant::now() <= deadline,
+                    "set-range backpressured past deadline: {error:?}"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("set-range failed: {error:?}"),
+        }
+    }
+    assert_eq!(
+        get_retry(&client, key, deadline),
+        Some(Bytes::from(patched))
+    );
+    engine.shutdown().expect("clean shutdown");
+}
+
 fn probe_one_key_per_tablet(engine: &LocalEngine) -> Vec<(TabletId, Key)> {
     let mut probes = Vec::new();
     for index in 0..1000u64 {

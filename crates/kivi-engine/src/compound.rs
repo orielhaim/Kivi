@@ -1127,7 +1127,7 @@ fn map_local_rejection(outcome: &DurableOutcome) -> Response {
         DurableOutcome::Rejected(OpError::StreamFull) => (S::StreamFull, "stream shard full"),
         DurableOutcome::Rejected(OpError::NotFound) => (S::NotFound, "not found"),
         DurableOutcome::Rejected(OpError::StaleRangeBase) => {
-            (S::InvalidRequest, "range base changed; retry")
+            (S::Overloaded, "range base changed; retry")
         }
         DurableOutcome::Completed(_) => (S::Internal, "local commit completed without a record"),
         DurableOutcome::VersionExhausted => (S::VersionExhausted, "version exhausted"),

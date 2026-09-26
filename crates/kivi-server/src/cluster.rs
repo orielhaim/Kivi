@@ -2782,7 +2782,7 @@ pub(crate) fn shape_durable(
         },
         DurableOutcome::Rejected(OpError::StaleRangeBase) => Response {
             proof: None,
-            status: Status::InvalidRequest,
+            status: Status::Overloaded,
             body: ResponseBody::Diagnostic("range base changed; retry".to_owned()),
         },
         DurableOutcome::Rejected(OpError::TxnConflict) => Response {
@@ -3011,7 +3011,7 @@ pub(crate) async fn shape_propose_error(
         },
         ProposeError::Op(OpError::StaleRangeBase) => Response {
             proof: None,
-            status: Status::InvalidRequest,
+            status: Status::Overloaded,
             body: ResponseBody::Diagnostic("range base changed; retry".to_owned()),
         },
         ProposeError::Op(OpError::TxnConflict) => Response {
@@ -3087,7 +3087,7 @@ pub(crate) async fn shape_read_error(
         },
         kivi_consensus::ReadError::Op(OpError::StaleRangeBase) => Response {
             proof: None,
-            status: Status::InvalidRequest,
+            status: Status::Overloaded,
             body: ResponseBody::Diagnostic("range base changed; retry".to_owned()),
         },
         kivi_consensus::ReadError::NotARead => Response {

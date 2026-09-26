@@ -25,8 +25,8 @@ use kivi_state::{ExpiryPolicy, Operation, OperationResult, SetCondition};
 use kivi_types::{ManifestId, MutationIdentity, NamespaceId, TabletId, WallTimestamp, WorkerId};
 
 use crate::chunk_lane::{
-    ChunkLaneHandle, LargeSetSplit, RangeBase, SetRangePlan, StagingPins, plan_set_range,
-    split_large_set,
+    ChunkLaneHandle, LargeSetSplit, RangeBase, RangeRootFence, SetRangePlan, StagingPins,
+    plan_set_range, split_large_set,
 };
 use crate::commit::{BatchPolicy, CommitCoordinator, PendingEntry};
 use crate::fabric::TabletFabric;
@@ -148,7 +148,15 @@ fn admit_drained(
     fabric: &mut TabletFabric,
     requests: &Receiver<TabletRequest>,
 ) {
-    handle_request(first, tablets, metrics, durability.as_mut(), chunks, fabric);
+    handle_request(
+        first,
+        tablets,
+        metrics,
+        durability.as_mut(),
+        chunks,
+        fabric,
+        None,
+    );
     for _ in 0..REQUEST_DRAIN_PER_WAKE {
         match requests.try_recv() {
             Ok(request) => handle_request(
@@ -158,6 +166,7 @@ fn admit_drained(
                 durability.as_mut(),
                 chunks,
                 fabric,
+                None,
             ),
             Err(_) => break,
         }
@@ -985,24 +994,46 @@ pub(crate) fn peek_range_base(
     match live.store().get(key, now) {
         None => RangeBase::Absent,
         Some(object) => match object.value() {
-            kivi_state::LogicalValue::Bytes(bytes) => RangeBase::Inline(bytes.clone()),
+            kivi_state::LogicalValue::Bytes(bytes) => RangeBase::Inline {
+                bytes: bytes.clone(),
+                object_version: object.version(),
+            },
             kivi_state::LogicalValue::StrictCounter(_)
             | kivi_state::LogicalValue::CommutativeCounter(_)
             | kivi_state::LogicalValue::BoundedCounter(_)
             | kivi_state::LogicalValue::Semaphore(_)
             | kivi_state::LogicalValue::Lease(_)
-            | kivi_state::LogicalValue::StreamShard(_) => RangeBase::NonBytes,
+            | kivi_state::LogicalValue::StreamShard(_) => RangeBase::NonBytes {
+                object_version: object.version(),
+            },
             kivi_state::LogicalValue::Chunked(chunked) => RangeBase::Chunked {
                 manifest: chunked.manifest,
                 logical_len: chunked.logical_len,
+                object_version: object.version(),
             },
             kivi_state::LogicalValue::Fabric(fabric) => RangeBase::Fabric {
-                fabric_id: fabric.id,
-                logical_len: fabric.logical_len,
-                version: fabric.version,
+                reference: *fabric,
+                object_version: object.version(),
             },
         },
     }
+}
+
+/// Checks a range root fence against the live committed tablet state.
+pub(crate) fn range_fence_matches(
+    fence: Option<RangeRootFence>,
+    tablets: &HashMap<TabletId, LiveTablet>,
+    tablet: TabletId,
+    key: &kivi_state::Key,
+    now: WallTimestamp,
+) -> bool {
+    fence.is_none_or(|fence| {
+        fence.matches(
+            tablets
+                .get(&tablet)
+                .and_then(|live| live.store().get(key, now)),
+        )
+    })
 }
 
 /// One staging job's input: a full value to chunk, or a chunked base plus
@@ -1622,8 +1653,15 @@ fn resolve_range_base(
     respond: &Sender<WorkerResponse>,
 ) -> Option<RangeBase> {
     match peek_range_base(tablets, tablet, key, now) {
-        RangeBase::Fabric { fabric_id, .. } => match fabric.read_anywhere(fabric_id) {
-            Ok(bytes) => Some(RangeBase::Inline(bytes)),
+        RangeBase::Fabric {
+            reference,
+            object_version,
+        } => match fabric.read_anywhere(reference.id) {
+            Ok(bytes) => Some(RangeBase::FabricInline {
+                reference,
+                object_version,
+                bytes,
+            }),
             Err(error) => {
                 let mut snapshot = metrics.get();
                 snapshot.channel_ops += 1;
@@ -1633,6 +1671,24 @@ fn resolve_range_base(
             }
         },
         other => Some(other),
+    }
+}
+
+struct StagedRequest {
+    op: Operation,
+    pins: Vec<crate::chunk_lane::PinnedUpload>,
+    staged: Vec<crate::fabric::StagedSeal>,
+    range_fence: Option<RangeRootFence>,
+}
+
+impl StagedRequest {
+    fn plain(op: Operation) -> Self {
+        Self {
+            op,
+            pins: Vec::new(),
+            staged: Vec::new(),
+            range_fence: None,
+        }
     }
 }
 
@@ -1653,14 +1709,10 @@ fn stage_range_request(
     fabric: &mut crate::fabric::TabletFabric,
     metrics: &core::cell::Cell<WorkerMetrics>,
     respond: &Sender<WorkerResponse>,
-) -> Option<(
-    Operation,
-    Vec<crate::chunk_lane::PinnedUpload>,
-    Vec<crate::fabric::StagedSeal>,
-)> {
+) -> Option<StagedRequest> {
     let base = resolve_range_base(tablets, tablet, &key, now, fabric, metrics, respond)?;
     match plan_set_range(key, offset, patch, base, chunks.inline_threshold) {
-        SetRangePlan::Inline(op) => Some((op, Vec::new(), Vec::new())),
+        SetRangePlan::Inline(op) => Some(StagedRequest::plain(op)),
         SetRangePlan::Reject { detail } => {
             let mut snapshot = metrics.get();
             snapshot.channel_ops += 1;
@@ -1668,8 +1720,15 @@ fn stage_range_request(
             let _ = respond.try_send(Err(WorkerRequestError::InvalidRequest { detail }));
             None
         }
-        SetRangePlan::RestageSet { key, value } => {
-            stage_restaged_set(tablet, &key, value, chunks, fabric, metrics, respond)
+        SetRangePlan::RestageSet { key, value, fence } => {
+            let (op, pins, staged) =
+                stage_restaged_set(tablet, &key, value, chunks, fabric, metrics, respond)?;
+            Some(StagedRequest {
+                op,
+                pins,
+                staged,
+                range_fence: Some(fence),
+            })
         }
         SetRangePlan::Splice {
             key,
@@ -1677,6 +1736,7 @@ fn stage_range_request(
             logical_len,
             offset,
             patch,
+            fence,
         } => match stage_value_work(
             &key,
             StageWork::Splice {
@@ -1689,7 +1749,12 @@ fn stage_range_request(
             metrics,
             respond,
         ) {
-            Ok((staged, pin)) => Some((staged, pin.into_iter().collect(), Vec::new())),
+            Ok((staged, pin)) => Some(StagedRequest {
+                op: staged,
+                pins: pin.into_iter().collect(),
+                staged: Vec::new(),
+                range_fence: Some(fence),
+            }),
             Err(()) => None,
         },
     }
@@ -1770,7 +1835,7 @@ fn stage_txn_batch(
 /// rejections and lane failures inline: `None` means the request already
 /// answered with state untouched; `Some` carries the admitted operation,
 /// its chunk pins, and its staged fabric seals.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn stage_request_representation(
     op: Operation,
     tablets: &mut HashMap<TabletId, LiveTablet>,
@@ -1780,15 +1845,7 @@ fn stage_request_representation(
     fabric: &mut crate::fabric::TabletFabric,
     metrics: &core::cell::Cell<WorkerMetrics>,
     respond: &Sender<WorkerResponse>,
-) -> Option<(
-    Operation,
-    Vec<crate::chunk_lane::PinnedUpload>,
-    Vec<crate::fabric::StagedSeal>,
-)> {
-    // Medium transactional puts stage into the fabric before prepare so
-    // a later Commit can never meet a durable root with unavailable
-    // payload; chunked references ride the existing chunk path. Staged
-    // seals ride the admission.
+) -> Option<StagedRequest> {
     let staged = match op {
         Operation::TxnPrepare {
             txn,
@@ -1796,40 +1853,43 @@ fn stage_request_representation(
             write,
             digest,
         } => match stage_txn_write(tablet, write, chunks, fabric, metrics, respond) {
-            Ok(Some((write, seal))) => {
-                let mut seals = Vec::new();
-                seals.extend(seal);
-                (
-                    Operation::TxnPrepare {
-                        txn,
-                        coordinator,
-                        write,
-                        digest,
-                    },
-                    Vec::new(),
-                    seals,
-                )
-            }
+            Ok(Some((write, seal))) => StagedRequest {
+                op: Operation::TxnPrepare {
+                    txn,
+                    coordinator,
+                    write,
+                    digest,
+                },
+                pins: Vec::new(),
+                staged: seal.into_iter().collect(),
+                range_fence: None,
+            },
             Ok(None) | Err(()) => return None,
         },
         Operation::TxnCommitLocal { txn, writes } => {
             let (staged_writes, seals) =
                 stage_txn_batch(tablet, writes, chunks, fabric, metrics, respond)?;
-            (
-                Operation::TxnCommitLocal {
+            StagedRequest {
+                op: Operation::TxnCommitLocal {
                     txn,
                     writes: staged_writes,
                 },
-                Vec::new(),
-                seals,
-            )
+                pins: Vec::new(),
+                staged: seals,
+                range_fence: None,
+            }
         }
         Operation::Set { key, value }
             if value.len() > crate::fabric::FABRIC_INLINE_MAX
                 && (value.len() as u64) <= chunks.inline_threshold =>
         {
             match stage_fabric_value(tablet, &key, value, true, fabric, metrics, respond) {
-                Ok((staged, seal)) => (staged, Vec::new(), vec![seal]),
+                Ok((staged, seal)) => StagedRequest {
+                    op: staged,
+                    pins: Vec::new(),
+                    staged: vec![seal],
+                    range_fence: None,
+                },
                 Err(()) => return None,
             }
         }
@@ -1844,21 +1904,40 @@ fn stage_request_representation(
             match stage_fabric_conditional(
                 tablet, &key, value, condition, expiry, fabric, metrics, respond,
             ) {
-                Ok((staged, seal)) => (staged, Vec::new(), vec![seal]),
+                Ok((staged, seal)) => StagedRequest {
+                    op: staged,
+                    pins: Vec::new(),
+                    staged: vec![seal],
+                    range_fence: None,
+                },
                 Err(()) => return None,
             }
         }
-        Operation::SetRange { key, offset, patch } => stage_range_request(
-            tablet, key, offset, patch, tablets, now, chunks, fabric, metrics, respond,
-        )?,
+        Operation::SetRange { key, offset, patch } => {
+            return stage_range_request(
+                tablet, key, offset, patch, tablets, now, chunks, fabric, metrics, respond,
+            );
+        }
         op @ Operation::TxnFinalize { .. } => {
-            seal_finalize_intent(op, tablets, tablet, fabric, metrics, respond)?
+            let (op, pins, staged) =
+                seal_finalize_intent(op, tablets, tablet, fabric, metrics, respond)?;
+            StagedRequest {
+                op,
+                pins,
+                staged,
+                range_fence: None,
+            }
         }
         other => match split_large_set(other, chunks.inline_threshold) {
-            LargeSetSplit::Inline(op) => (op, Vec::new(), Vec::new()),
+            LargeSetSplit::Inline(op) => StagedRequest::plain(op),
             LargeSetSplit::Stage { key, value } => {
                 match stage_value_work(&key, StageWork::Value(value), chunks, metrics, respond) {
-                    Ok((staged, pin)) => (staged, pin.into_iter().collect(), Vec::new()),
+                    Ok((op, pin)) => StagedRequest {
+                        op,
+                        pins: pin.into_iter().collect(),
+                        staged: Vec::new(),
+                        range_fence: None,
+                    },
                     Err(()) => return None,
                 }
             }
@@ -1878,7 +1957,12 @@ fn stage_request_representation(
                 metrics,
                 respond,
             ) {
-                Ok((staged, pin)) => (staged, pin.into_iter().collect(), Vec::new()),
+                Ok((op, pin)) => StagedRequest {
+                    op,
+                    pins: pin.into_iter().collect(),
+                    staged: Vec::new(),
+                    range_fence: None,
+                },
                 Err(()) => return None,
             },
         },
@@ -1893,6 +1977,7 @@ pub(crate) fn handle_request(
     durability: Option<&mut WorkerDurability>,
     chunks: &WorkerChunks,
     fabric: &mut crate::fabric::TabletFabric,
+    range_fence: Option<RangeRootFence>,
 ) {
     let TabletRequest {
         tablet,
@@ -1912,11 +1997,23 @@ pub(crate) fn handle_request(
     // admission, so a later Commit can never meet a durable root with
     // unavailable payload. Staging precedes admission, so a lane failure
     // or a rejected range answers here with state untouched.
-    let Some((op, pins, staged)) =
-        stage_request_representation(op, tablets, tablet, now, chunks, fabric, metrics, &respond)
+    let Some(StagedRequest {
+        op,
+        pins,
+        staged,
+        range_fence: staged_fence,
+    }) = stage_request_representation(op, tablets, tablet, now, chunks, fabric, metrics, &respond)
     else {
         return;
     };
+    let range_fence = range_fence.or(staged_fence);
+    if !range_fence_matches(range_fence, tablets, tablet, op.key(), now) {
+        retire_staged(fabric, staged);
+        let _ = respond.try_send(Err(WorkerRequestError::Tablet(TabletError::Op(
+            kivi_state::OpError::StaleRangeBase,
+        ))));
+        return;
+    }
     // Prove every chunked and fabric reference a transaction carries:
     // staged values pass (just proven above and still alive), as do
     // copies of live committed roots; anything else is a dangling root
@@ -1977,11 +2074,13 @@ pub(crate) fn handle_request(
             }
         },
         Some(durable) => {
-            durable.commit.admit(
-                PendingEntry::new(tablet, op, now, identity, respond)
-                    .with_pins(pins)
-                    .with_fabric_staged(staged),
-            );
+            let mut entry = PendingEntry::new(tablet, op, now, identity, respond)
+                .with_pins(pins)
+                .with_fabric_staged(staged);
+            if let Some(range_fence) = range_fence {
+                entry = entry.with_range_fence(range_fence);
+            }
+            durable.commit.admit(entry);
             durable.commit.poll(tablets, durable.namespace, fabric);
             // Admission itself is the outcome; the reply arrives through
             // the responder once the batch completes.
@@ -2151,9 +2250,11 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn splice_plan_routes_every_base() {
         use crate::chunk_lane::{RangeBase, SetRangePlan, plan_set_range};
         use kivi_chunk::policy::MAX_LEGACY_VALUE_BYTES;
+        use kivi_state::{FabricRef, ObjectVersion};
         let key = || Key::from("k");
         // Absent bases: small results splice inline, large restage.
         assert!(matches!(
@@ -2182,10 +2283,30 @@ mod tests {
                 key(),
                 0,
                 bytes::Bytes::from_static(b"v"),
-                RangeBase::NonBytes,
+                RangeBase::NonBytes {
+                    object_version: ObjectVersion::FIRST,
+                },
                 1024
             ),
             SetRangePlan::Inline(_)
+        ));
+        assert!(matches!(
+            plan_set_range(
+                key(),
+                0,
+                bytes::Bytes::from_static(b"v"),
+                RangeBase::FabricInline {
+                    reference: FabricRef {
+                        id: 7,
+                        logical_len: 6,
+                        version: 3,
+                    },
+                    object_version: ObjectVersion::from_u64(3),
+                    bytes: bytes::Bytes::from_static(b"fabric"),
+                },
+                1024
+            ),
+            SetRangePlan::RestageSet { .. }
         ));
         // Chunked bases splice lane-side with no size bound (streaming).
         assert!(matches!(
@@ -2196,6 +2317,7 @@ mod tests {
                 RangeBase::Chunked {
                     manifest: kivi_types::ManifestId::from_bytes([0x11; 32]),
                     logical_len: MAX_LEGACY_VALUE_BYTES + 1,
+                    object_version: ObjectVersion::FIRST,
                 },
                 1024
             ),
@@ -2230,7 +2352,10 @@ mod tests {
                 key(),
                 MAX_LEGACY_VALUE_BYTES,
                 bytes::Bytes::from_static(b"v"),
-                RangeBase::Inline(bytes::Bytes::from_static(b"v")),
+                RangeBase::Inline {
+                    bytes: bytes::Bytes::from_static(b"v"),
+                    object_version: ObjectVersion::FIRST,
+                },
                 1024
             ),
             SetRangePlan::Reject { .. }

@@ -68,6 +68,7 @@ use kivi_state::{
 };
 use kivi_types::{CommitPosition, MutationIdentity, NamespaceId, RequestSeq, SessionId, TabletId};
 
+use crate::chunk_lane::RangeRootFence;
 use crate::tablet::{IdentityGate, LiveTablet, TabletError};
 use crate::worker::{LaneAccess, WorkerRequestError, WorkerResponse};
 
@@ -238,6 +239,7 @@ pub(crate) struct PendingEntry {
     /// predicted versions; failure paths retire the ids immediately so
     /// uncommitted stages never accumulate.
     fabric_staged: Vec<crate::fabric::StagedSeal>,
+    range_fence: Option<RangeRootFence>,
 }
 
 impl PendingEntry {
@@ -264,6 +266,7 @@ impl PendingEntry {
             admitted_at: Instant::now(),
             pinned: Vec::new(),
             fabric_staged: Vec::new(),
+            range_fence: None,
         }
     }
 
@@ -287,6 +290,11 @@ impl PendingEntry {
     /// fabric at admission; all ride admission→seal together).
     pub(crate) fn with_fabric_staged(mut self, staged: Vec<crate::fabric::StagedSeal>) -> Self {
         self.fabric_staged.extend(staged);
+        self
+    }
+
+    pub(crate) fn with_range_fence(mut self, fence: RangeRootFence) -> Self {
+        self.range_fence = Some(fence);
         self
     }
 }
@@ -389,8 +397,21 @@ struct TabletOverlay {
 }
 
 impl TabletOverlay {
-    /// Prepares `op` against committed-plus-pending state and evolves the
-    /// overlay for a `Write` exactly as the later committed apply will.
+    fn effective_object<'a>(
+        &'a self,
+        committed: &'a ObjectStore,
+        key: &Key,
+        now: kivi_types::WallTimestamp,
+    ) -> Option<&'a StoredObject> {
+        match self.pending.get(key) {
+            Some(Some(object)) => (!object.is_expired(now)).then_some(object),
+            Some(None) => None,
+            None => committed.get(key, now),
+        }
+    }
+
+    /// Prepares `op` against committed-plus-pending state and evolves
+    /// the overlay for a `Write` exactly as the later committed apply will.
     /// Pure except for the overlay itself: committed is only borrowed.
     fn prepare(
         &mut self,
@@ -1801,6 +1822,25 @@ impl CommitCoordinator {
         }
     }
 
+    fn range_fence_matches(
+        &self,
+        tablet: TabletId,
+        key: &Key,
+        now: kivi_types::WallTimestamp,
+        committed: &ObjectStore,
+        fence: RangeRootFence,
+    ) -> bool {
+        let current = self
+            .open
+            .as_ref()
+            .and_then(|open| open.overlays.get(&tablet))
+            .map_or_else(
+                || committed.get(key, now),
+                |overlay| overlay.effective_object(committed, key, now),
+            );
+        fence.matches(current)
+    }
+
     /// Prepares admit-gated mutations into the open batch in deterministic
     /// arrival order, then seals and submits. Runs only with no batch in
     /// flight (single-in-flight invariant): same-tablet mutations hold
@@ -1848,6 +1888,28 @@ impl CommitCoordinator {
                     let _ = entry
                         .respond
                         .try_send(Err(WorkerRequestError::SessionOverloaded));
+                    continue;
+                }
+            }
+            if let Some(fence) = self.queue[cursor].range_fence {
+                let live = tablets.get(&tablet_id).expect("tablet live");
+                if !self.range_fence_matches(
+                    tablet_id,
+                    self.queue[cursor].op.key(),
+                    self.queue[cursor].now,
+                    live.store(),
+                    fence,
+                ) {
+                    let entry = self.queue.remove(cursor).expect("cursor valid");
+                    for staged in &entry.fabric_staged {
+                        fabric.retire_or_defer(staged.fabric_id);
+                    }
+                    let _ =
+                        entry
+                            .respond
+                            .try_send(Err(WorkerRequestError::Tablet(TabletError::Op(
+                                kivi_state::OpError::StaleRangeBase,
+                            ))));
                     continue;
                 }
             }

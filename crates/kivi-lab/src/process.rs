@@ -13,10 +13,12 @@
 //! built without `redis-compat` (rebuild hint included). It never silently
 //! skips: a lab run that explicitly requires RESP must fail clearly.
 
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use kivi_client::{ClientConfig, NativeClient};
@@ -68,23 +70,12 @@ pub enum SpawnError {
 /// Returns [`SpawnError::BinaryMissing`] when nothing is found, with the
 /// exact build command to run.
 pub fn server_binary_path() -> Result<PathBuf, SpawnError> {
-    if let Ok(path) = std::env::var("KIVI_SERVER_BIN") {
-        let path = PathBuf::from(&path);
-        if path.is_file() {
-            return Ok(path);
-        }
-        return Err(SpawnError::BinaryMissing(format!(
-            "KIVI_SERVER_BIN={} is not a file; run `cargo build -p kivi-server` first",
-            path.display()
-        )));
+    if let Some(path) = configured_server_binary()? {
+        return Ok(path);
     }
     let exe =
         std::env::current_exe().map_err(|error| SpawnError::BinaryMissing(error.to_string()))?;
-    let name = if cfg!(windows) {
-        "kivi-server.exe"
-    } else {
-        "kivi-server"
-    };
+    let name = server_binary_name();
     // Bins live beside the current executable (`<target>/<profile>/`);
     // integration tests live one level deeper (`<target>/<profile>/deps/`).
     let mut dir = exe.parent();
@@ -97,9 +88,76 @@ pub fn server_binary_path() -> Result<PathBuf, SpawnError> {
         dir = parent.parent();
     }
     Err(SpawnError::BinaryMissing(format!(
-        "no server binary beside {}; run `cargo build -p kivi-server` (add `--features redis-compat` for RESP runs) or set KIVI_SERVER_BIN",
+        "no server binary beside {}; run `cargo build --release -p kivi-server --features redis-compat` (or a debug build for tests) or set KIVI_SERVER_BIN",
         exe.display()
     )))
+}
+
+/// Locates a release `kivi-server` beside the current Cargo target directory.
+///
+/// `KIVI_SERVER_BIN` still takes precedence, so an operator can select a
+/// different release build without changing the lab binary.
+///
+/// # Errors
+///
+/// Returns [`SpawnError::BinaryMissing`] when no configured or release binary exists.
+pub fn release_server_binary_path() -> Result<PathBuf, SpawnError> {
+    if let Some(path) = configured_server_binary()? {
+        if !is_release_path(&path) {
+            return Err(SpawnError::BinaryMissing(format!(
+                "KIVI_SERVER_BIN must point to a release binary for campaign runs: {}",
+                path.display()
+            )));
+        }
+        return Ok(path);
+    }
+    let exe =
+        std::env::current_exe().map_err(|error| SpawnError::BinaryMissing(error.to_string()))?;
+    let name = server_binary_name();
+    let mut dir = exe.parent();
+    for _ in 0..4 {
+        let Some(parent) = dir else { break };
+        let path = parent.join("release").join(name);
+        if path.is_file() {
+            return Ok(path);
+        }
+        dir = parent.parent();
+    }
+    Err(SpawnError::BinaryMissing(format!(
+        "no release server binary beside {}; run `cargo build --release -p kivi-server --features redis-compat` or set KIVI_SERVER_BIN",
+        exe.display()
+    )))
+}
+
+fn configured_server_binary() -> Result<Option<PathBuf>, SpawnError> {
+    let Ok(path) = std::env::var("KIVI_SERVER_BIN") else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(path);
+    if path.is_file() {
+        return Ok(Some(path));
+    }
+    Err(SpawnError::BinaryMissing(format!(
+        "KIVI_SERVER_BIN={} is not a file; run `cargo build --release -p kivi-server --features redis-compat` first",
+        path.display()
+    )))
+}
+
+fn server_binary_name() -> &'static str {
+    if cfg!(windows) {
+        "kivi-server.exe"
+    } else {
+        "kivi-server"
+    }
+}
+
+fn is_release_path(path: &Path) -> bool {
+    path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case("release")
+    })
 }
 
 /// A running server: native endpoints, admin endpoint, and an optional
@@ -110,6 +168,7 @@ pub struct Server {
     admin: String,
     resp: Option<String>,
     namespace: NamespaceId,
+    stderr_lines: Arc<Mutex<VecDeque<String>>>,
 }
 
 impl std::fmt::Debug for Server {
@@ -140,10 +199,34 @@ impl Server {
         extra: &[&str],
         want_resp: bool,
     ) -> Result<Self, SpawnError> {
-        match probe_server(mode, workers, tablets, extra, want_resp, READY_TIMEOUT)? {
+        let binary = server_binary_path()?;
+        Self::spawn_with_binary(&binary, mode, workers, tablets, extra, want_resp)
+    }
+
+    /// Spawns a specific server binary with ephemeral ports and waits for
+    /// `KIVI_READY`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpawnError`] on missing binary, early exit, or timeout.
+    pub fn spawn_with_binary(
+        binary: &Path,
+        mode: ServerMode,
+        workers: usize,
+        tablets: usize,
+        extra: &[&str],
+        want_resp: bool,
+    ) -> Result<Self, SpawnError> {
+        match probe_server_with_binary(
+            binary,
+            mode,
+            workers,
+            tablets,
+            extra,
+            want_resp,
+            READY_TIMEOUT,
+        )? {
             ProbeOutcome::Ready(server) => {
-                // Belt-and-braces: a successful connect proves the worker
-                // listener serves, not just binds.
                 TcpStream::connect(server.endpoint()).map_err(|error| {
                     SpawnError::Io(format!("worker accepts after ready: {error}"))
                 })?;
@@ -210,38 +293,55 @@ impl Server {
         self.resp.clone().ok_or(SpawnError::RespUnavailable)
     }
 
-    /// Raw HTTP GET against the admin plane (no HTTP client dependency;
-    /// the responses are tiny JSON documents). Returns status + body.
+    /// Process id of the spawned server.
+    #[must_use]
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Lightweight process diagnostics without an additional dependency.
+    #[must_use]
+    pub fn diagnostics(&mut self) -> BTreeMap<String, String> {
+        let mut values = BTreeMap::new();
+        values.insert("pid".to_owned(), self.child.id().to_string());
+        let alive = self.child.try_wait().ok().flatten().is_none();
+        values.insert("alive".to_owned(), alive.to_string());
+        values.insert(
+            "stderr_tail".to_owned(),
+            stderr_snapshot(&self.stderr_lines),
+        );
+        #[cfg(target_os = "linux")]
+        if let Ok(status) = std::fs::read_to_string(format!("/proc/{}/status", self.child.id())) {
+            for line in status.lines().filter(|line| {
+                line.starts_with("VmRSS:")
+                    || line.starts_with("VmSize:")
+                    || line.starts_with("Threads:")
+            }) {
+                if let Some((key, value)) = line.split_once(':') {
+                    values.insert(key.to_ascii_lowercase(), value.trim().to_owned());
+                }
+            }
+        }
+        values
+    }
+
+    /// Raw HTTP GET against the admin plane without panicking.
+    ///
+    /// # Errors
+    ///
+    /// Returns a string when the admin socket cannot be reached or read.
+    pub fn try_admin_get(&self, path: &str) -> Result<(u16, String), String> {
+        try_admin_get_endpoint(&self.admin_endpoint(), path)
+    }
+
+    /// Raw HTTP GET against the admin plane (no HTTP client dependency).
     ///
     /// # Panics
     ///
     /// Panics on connection or I/O failure (test-harness loudness by design).
     #[must_use]
     pub fn admin_get(&self, path: &str) -> (u16, String) {
-        let mut socket = TcpStream::connect(self.admin_endpoint()).expect("admin connect");
-        socket
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .expect("timeout");
-        write!(
-            socket,
-            "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-        )
-        .expect("write");
-        let mut body = String::new();
-        socket
-            .read_to_string(&mut body)
-            .expect("read admin response");
-        let status = body
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .split_whitespace()
-            .nth(1)
-            .unwrap_or("0")
-            .parse::<u16>()
-            .unwrap_or(0);
-        let payload = body.split("\r\n\r\n").nth(1).unwrap_or("").to_owned();
-        (status, payload)
+        self.try_admin_get(path).expect("admin request succeeds")
     }
 
     /// Extracts the first JSON number following `"key":` (admin DTOs are
@@ -300,6 +400,39 @@ impl Drop for Server {
     }
 }
 
+/// Raw HTTP GET against an admin endpoint without panicking.
+///
+/// # Errors
+///
+/// Returns a string when the admin socket cannot be reached or read.
+pub fn try_admin_get_endpoint(endpoint: &str, path: &str) -> Result<(u16, String), String> {
+    let mut socket =
+        TcpStream::connect(endpoint).map_err(|error| format!("admin connect: {error}"))?;
+    socket
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .map_err(|error| format!("admin timeout: {error}"))?;
+    write!(
+        socket,
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )
+    .map_err(|error| format!("admin write: {error}"))?;
+    let mut body = String::new();
+    socket
+        .read_to_string(&mut body)
+        .map_err(|error| format!("admin read: {error}"))?;
+    let status = body
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("0")
+        .parse::<u16>()
+        .unwrap_or(0);
+    let payload = body.split("\r\n\r\n").nth(1).unwrap_or("").to_owned();
+    Ok((status, payload))
+}
+
 /// What a probed server did inside its startup window.
 #[derive(Debug)]
 pub enum ProbeOutcome {
@@ -341,12 +474,24 @@ pub fn probe_server(
     timeout: Duration,
 ) -> Result<ProbeOutcome, SpawnError> {
     let binary = server_binary_path()?;
+    probe_server_with_binary(&binary, mode, workers, tablets, extra, want_resp, timeout)
+}
+
+fn probe_server_with_binary(
+    binary: &Path,
+    mode: ServerMode,
+    workers: usize,
+    tablets: usize,
+    extra: &[&str],
+    want_resp: bool,
+    timeout: Duration,
+) -> Result<ProbeOutcome, SpawnError> {
     // Detect RESP capability from `--help` first: failing fast here beats
     // parsing a ready line that can never contain `redis=`.
-    if want_resp && !binary_supports_resp(&binary)? {
+    if want_resp && !binary_supports_resp(binary)? {
         return Err(SpawnError::RespUnavailable);
     }
-    let mut command = Command::new(&binary);
+    let mut command = Command::new(binary);
     match mode {
         ServerMode::Ephemeral => {
             command.arg("--ephemeral");
@@ -374,6 +519,7 @@ pub fn probe_server(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| SpawnError::Io(error.to_string()))?;
+    let stderr_lines = spawn_stderr_reader(&mut child);
     let outcome = wait_ready_or_exit(&mut child, timeout);
     Ok(match outcome {
         WaitOutcome::Ready(native, admin, resp) => {
@@ -388,6 +534,7 @@ pub fn probe_server(
                 admin,
                 resp,
                 namespace: NamespaceId::from_u64(1),
+                stderr_lines,
             })
         }
         WaitOutcome::Exited(status) => {
@@ -395,11 +542,11 @@ pub fn probe_server(
             ProbeOutcome::Exited {
                 status: status.to_string(),
                 success,
-                stderr: stderr_tail(&mut child),
+                stderr: stderr_snapshot(&stderr_lines),
             }
         }
         WaitOutcome::TimedOut => ProbeOutcome::TimedOut {
-            stderr: stderr_tail(&mut child),
+            stderr: stderr_snapshot(&stderr_lines),
         },
     })
 }
@@ -429,20 +576,41 @@ fn binary_supports_resp(binary: &Path) -> Result<bool, SpawnError> {
     Ok(text.contains("redis-listen"))
 }
 
-/// Last lines of a dead child's stderr for failure diagnostics.
-pub(crate) fn stderr_tail(child: &mut Child) -> String {
-    let mut log = String::new();
-    if let Some(stderr) = child.stderr.as_mut() {
-        let _ = stderr.read_to_string(&mut log);
-    }
-    log.lines()
-        .rev()
-        .take(8)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>()
-        .join("\n")
+fn spawn_stderr_reader(child: &mut Child) -> Arc<Mutex<VecDeque<String>>> {
+    let lines = Arc::new(Mutex::new(VecDeque::new()));
+    let Some(stderr) = child.stderr.take() else {
+        return lines;
+    };
+    let captured = Arc::clone(&lines);
+    std::thread::spawn(move || {
+        use std::io::BufRead as _;
+        let mut reader = std::io::BufReader::new(stderr);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    if let Ok(mut captured) = captured.lock()
+                        && !line.trim().is_empty()
+                    {
+                        if captured.len() == 64 {
+                            captured.pop_front();
+                        }
+                        captured.push_back(line.trim_end().to_owned());
+                    }
+                }
+            }
+        }
+    });
+    lines
+}
+
+fn stderr_snapshot(lines: &Arc<Mutex<VecDeque<String>>>) -> String {
+    lines
+        .lock()
+        .map(|captured| captured.iter().cloned().collect::<Vec<_>>().join("\n"))
+        .unwrap_or_default()
 }
 
 /// Waits for `KIVI_READY` on the child's stdout, watching for early exit

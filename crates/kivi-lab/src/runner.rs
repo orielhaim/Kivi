@@ -13,12 +13,14 @@
 
 use std::sync::{Arc, Barrier};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use hdrhistogram::Histogram;
 
-use crate::targets::BenchTarget;
-use crate::workload::{KeySpace, Workload, counter_key_name, thread_key_names, workload_op_for};
+use crate::targets::{BenchTarget, TargetStats};
+use crate::workload::{
+    KeySpace, PayloadCache, Workload, counter_key_name, thread_key_names, workload_op_for,
+};
 
 /// Runner configuration (shared by all targets).
 #[derive(Debug, Clone)]
@@ -51,8 +53,12 @@ pub struct ThreadStats {
     pub errors: u64,
     /// Completed individual ops.
     pub completed: u64,
+    /// Failed warmup operations.
+    pub warmup_errors: u64,
     /// Bytes written/read, when the target accounts them.
     pub bytes: Option<(u64, u64)>,
+    /// Target-specific counters, when the target exposes them.
+    pub target_stats: Option<TargetStats>,
 }
 
 /// Merged outcome of one run.
@@ -64,13 +70,19 @@ pub struct RunStats {
     pub errors: u64,
     /// Completed individual ops across threads.
     pub completed: u64,
+    /// Completed individual ops for each worker, in worker order.
+    pub completed_per_thread: Vec<u64>,
+    /// Failed warmup operations, which invalidate a trial.
+    pub warmup_errors: u64,
     /// Wall-clock seconds for the measured phase.
     pub secs: f64,
     /// Bytes written/read, when the target accounts them.
     pub bytes: Option<(u64, u64)>,
+    /// Merged target-specific counters, when available.
+    pub target_stats: Option<TargetStats>,
 }
 
-/// Drives one benchmark configuration.
+/// Drives one fixed-count benchmark configuration.
 ///
 /// # Panics
 ///
@@ -82,6 +94,43 @@ pub struct RunStats {
 /// Returns the first target-factory failure.
 pub fn run<T: BenchTarget + 'static>(
     config: RunnerConfig,
+    make_target: impl FnMut() -> anyhow::Result<T> + Send + Sync,
+) -> anyhow::Result<RunStats> {
+    let limit = config.ops_per_thread;
+    run_inner(config, RunLimit::Count(limit), make_target)
+}
+
+/// Drives a benchmark until a wall-clock deadline.
+///
+/// # Panics
+///
+/// Panics when a worker thread fails to spawn/join or a target factory
+/// fails (setup errors are programmer errors here, never runtime noise).
+///
+/// # Errors
+///
+/// Returns an error when `duration` is zero or target construction fails.
+pub fn run_for_duration<T: BenchTarget + 'static>(
+    config: RunnerConfig,
+    duration: Duration,
+    make_target: impl FnMut() -> anyhow::Result<T> + Send + Sync,
+) -> anyhow::Result<RunStats> {
+    if duration.is_zero() {
+        anyhow::bail!("duration must be nonzero");
+    }
+    run_inner(config, RunLimit::Duration(duration), make_target)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RunLimit {
+    Count(usize),
+    Duration(Duration),
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_inner<T: BenchTarget + 'static>(
+    config: RunnerConfig,
+    limit: RunLimit,
     mut make_target: impl FnMut() -> anyhow::Result<T> + Send + Sync,
 ) -> anyhow::Result<RunStats> {
     let RunnerConfig {
@@ -90,76 +139,111 @@ pub fn run<T: BenchTarget + 'static>(
         value_len,
         prefix,
         threads,
-        ops_per_thread,
+        ops_per_thread: _,
         warmup_per_thread,
         pipeline,
     } = config;
+    if threads == 0 || pipeline == 0 {
+        anyhow::bail!("threads and pipeline must be nonzero");
+    }
     let barrier = Arc::new(Barrier::new(threads + 1));
+    let payload = Arc::new(PayloadCache::new(value_len));
     let mut handles = Vec::with_capacity(threads);
-    // Factories are `FnMut`; build all instances up front on this thread.
     let mut targets = Vec::with_capacity(threads);
     for _ in 0..threads {
         targets.push(make_target()?);
     }
     for (thread, mut target) in targets.into_iter().enumerate() {
         let gate = Arc::clone(&barrier);
+        let worker_payload = Arc::clone(&payload);
         let keys = thread_key_names(space, thread, &prefix);
         let counter = counter_key_name(space, thread, &prefix);
         handles.push(thread::spawn(move || {
-            // Warmup: identical op stream, unmeasured, so steady state
-            // (route caches, connections, allocator) is reached first.
+            let mut warmup_errors = 0u64;
             let mut index = 0usize;
             while index < warmup_per_thread {
                 let end = (index + pipeline).min(warmup_per_thread);
                 let chunk: Vec<_> = (index..end)
                     .map(|i| workload_op_for(workload, value_len, i, &keys, &counter))
                     .collect();
-                let _ = target.execute_batch(&chunk);
+                let outcomes = target.execute_batch_with_payload(&chunk, worker_payload.as_bytes());
+                warmup_errors += outcomes.iter().filter(|outcome| outcome.is_err()).count() as u64;
                 index = end;
             }
+            let baseline_stats = target.take_stats();
             let mut histogram = Histogram::<u64>::new(3).expect("histogram builds");
             let mut errors = 0u64;
             let mut completed = 0u64;
-            // Reset transport counters after warmup so I/O metrics cover
-            // the measured phase only.
             let _ = target.take_bytes();
             gate.wait();
+            let run_started = Instant::now();
             let mut index = 0usize;
-            while index < ops_per_thread {
-                let end = (index + pipeline).min(ops_per_thread);
+            loop {
+                let batch_len = match limit {
+                    RunLimit::Count(limit) => {
+                        if index >= limit {
+                            break;
+                        }
+                        (index + pipeline).min(limit) - index
+                    }
+                    RunLimit::Duration(_) => pipeline,
+                };
+                let end = index.saturating_add(batch_len);
                 let chunk: Vec<_> = (index..end)
                     .map(|i| workload_op_for(workload, value_len, i, &keys, &counter))
                     .collect();
                 let start = Instant::now();
-                let outcomes = target.execute_batch(&chunk);
+                let outcomes = target.execute_batch_with_payload(&chunk, worker_payload.as_bytes());
                 let nanos = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
                 let failed = outcomes.iter().filter(|outcome| outcome.is_err()).count() as u64;
                 errors += failed;
                 completed += (outcomes.len() as u64).saturating_sub(failed);
                 histogram.record(nanos).expect("latency fits");
                 index = end;
+                if matches!(limit, RunLimit::Duration(duration) if run_started.elapsed() >= duration) {
+                    break;
+                }
             }
+            let target_stats = target.take_stats().map(|current| TargetStats {
+                requests: current.requests.saturating_sub(
+                    baseline_stats.map_or(0, |baseline| baseline.requests),
+                ),
+                redirects: current.redirects.saturating_sub(
+                    baseline_stats.map_or(0, |baseline| baseline.redirects),
+                ),
+                errors: current.errors.saturating_sub(
+                    baseline_stats.map_or(0, |baseline| baseline.errors),
+                ),
+            });
             ThreadStats {
                 histogram,
                 errors,
                 completed,
+                warmup_errors,
                 bytes: target.take_bytes(),
+                target_stats,
             }
         }));
     }
-    let wall = Instant::now();
     barrier.wait();
+    let wall = Instant::now();
     let mut merged = Histogram::<u64>::new(3).expect("histograms merge");
     let mut errors = 0u64;
     let mut completed = 0u64;
     let mut bytes_out = 0u64;
     let mut bytes_in = 0u64;
+    let mut completed_per_thread = Vec::with_capacity(threads);
+    let mut warmup_errors = 0u64;
     let mut bytes_known = true;
+    let mut target_stats_known = true;
+    let mut target_stats = TargetStats::default();
     for handle in handles {
         let stats = handle.join().expect("thread joins");
         merged.add(&stats.histogram).expect("histograms merge");
         errors += stats.errors;
         completed += stats.completed;
+        warmup_errors += stats.warmup_errors;
+        completed_per_thread.push(stats.completed);
         match stats.bytes {
             Some((out, inn)) => {
                 bytes_out += out;
@@ -167,13 +251,24 @@ pub fn run<T: BenchTarget + 'static>(
             }
             None => bytes_known = false,
         }
+        match stats.target_stats {
+            Some(current) => {
+                target_stats.requests = target_stats.requests.saturating_add(current.requests);
+                target_stats.redirects = target_stats.redirects.saturating_add(current.redirects);
+                target_stats.errors = target_stats.errors.saturating_add(current.errors);
+            }
+            None => target_stats_known = false,
+        }
     }
     Ok(RunStats {
         histogram: merged,
         errors,
         completed,
+        completed_per_thread,
+        warmup_errors,
         secs: wall.elapsed().as_secs_f64(),
         bytes: bytes_known.then_some((bytes_out, bytes_in)),
+        target_stats: target_stats_known.then_some(target_stats),
     })
 }
 
@@ -196,11 +291,12 @@ pub fn seed<T: BenchTarget>(
     prefix: &str,
 ) -> anyhow::Result<()> {
     use crate::workload::seed_ops_for;
+    let payload = PayloadCache::new(value_len);
     for thread in 0..threads {
         for op in seed_ops_for(space, thread, workload, value_len, prefix) {
             let mut attempt = 0u32;
             loop {
-                match target.seed_one(&op) {
+                match target.seed_one_with_payload(&op, payload.as_bytes()) {
                     Ok(()) => break,
                     Err(error) if is_overload(&error) && attempt < 30 => {
                         attempt += 1;

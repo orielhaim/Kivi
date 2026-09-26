@@ -3217,10 +3217,15 @@ impl ObjectStore {
                         .version_of(key)
                         .next()
                         .map_err(|_| ApplyError::VersionExhausted)?;
-                    self.objects.insert(
-                        key.clone(),
-                        StoredObject::new(current.value().clone(), version, *expiry),
-                    );
+                    let value = match current.value() {
+                        LogicalValue::Fabric(reference) => LogicalValue::Fabric(FabricRef {
+                            version: version.as_u64(),
+                            ..*reference
+                        }),
+                        value => value.clone(),
+                    };
+                    self.objects
+                        .insert(key.clone(), StoredObject::new(value, version, *expiry));
                     Ok(ApplyOutcome::Expiry {
                         applied: true,
                         version: Some(version),
@@ -5312,6 +5317,28 @@ mod tests {
             panic!("fabric get must read a fabric value");
         };
         assert_eq!((fabric_id, logical_len, pin), (7, 100, version.as_u64()));
+        let deadline = WallTimestamp::from_micros(9_000_000);
+        let Prepared::Write(expiry_mutation) = store
+            .prepare(
+                &Operation::ExpireAt {
+                    key: key("f"),
+                    expires_at: deadline,
+                },
+                NOW,
+            )
+            .expect("fabric expiry prepares")
+        else {
+            panic!("fabric expiry must prepare a write");
+        };
+        store
+            .apply(&expiry_mutation, NOW)
+            .expect("fabric expiry applies");
+        let object = store.get(&key("f"), NOW).expect("present");
+        assert_eq!(
+            object.fabric_ref().expect("fabric ref").version,
+            object.version().as_u64()
+        );
+        assert_eq!(object.expiry(), Expiry::at(deadline));
         // Length answers from the root without payload reads.
         let Prepared::Read(OperationResult::Length(Some(100))) = store
             .prepare(&Operation::BytesLength { key: key("f") }, NOW)

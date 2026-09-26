@@ -216,8 +216,9 @@ fn pinned_root_version(
     current: Option<&kivi_state::StoredObject>,
     reference: &FabricRef,
 ) -> Option<u64> {
-    let live = current?.fabric_ref()?;
-    if live.id == reference.id && live.version == reference.version {
+    let object = current?;
+    let live = object.fabric_ref()?;
+    if live == *reference && object.version().as_u64() == reference.version {
         Some(live.version)
     } else {
         None
@@ -548,18 +549,20 @@ impl TabletFabric {
             self.stale_completions += 1;
             return Err(FabricError::Unavailable);
         };
-        if live.id != reference.id || live.version != reference.version {
+        if live != *reference
+            || current.map(|object| object.version().as_u64()) != Some(reference.version)
+        {
             self.stale_completions += 1;
             return Err(FabricError::Unavailable);
         }
         if promoted.bytes.len() as u64 != live.logical_len {
             return Err(FabricError::Corrupt);
         }
-        let _ = self.fabric.install_promote_bytes(
+        self.fabric.install_promote_bytes(
             reference.id,
-            reference.version,
+            promoted.version,
             promoted.bytes.clone(),
-        );
+        )?;
         Ok(Bytes::from(promoted.bytes))
     }
 
@@ -639,11 +642,11 @@ impl TabletFabric {
                 }
                 // Install as a synchronous shadow so follow-up reads hit
                 // without another promotion.
-                let _ = self.fabric.install_promote_bytes(
+                self.fabric.install_promote_bytes(
                     wait.fabric_id,
-                    wait.version,
+                    promoted.version,
                     promoted.bytes.clone(),
-                );
+                )?;
                 self.parked_resumes += 1;
                 Ok(Some(Bytes::from(promoted.bytes)))
             }
@@ -1074,6 +1077,100 @@ mod tests {
             kivi_state::ObjectVersion::from_u64(version),
             kivi_types::Expiry::NEVER,
         )
+    }
+
+    #[test]
+    fn finish_promote_uses_physical_version_and_propagates_install_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = FabricPaths {
+            root: dir.path().to_owned(),
+        };
+        let (mut fabric, guard) =
+            TabletFabric::open(WorkerId::from_u64(0), &paths, 1 << 20, 16 << 20)
+                .expect("fabric opens");
+        let tablet = TabletId::from_u64(1);
+        let bytes = Bytes::from(vec![0xABu8; 1024]);
+        let (staging_id, staged_len) = fabric.stage(tablet, bytes.clone(), true).expect("stage");
+        let physical_version = fabric
+            .fabric_mut()
+            .object_version(staging_id)
+            .expect("physical version");
+        let reference = FabricRef {
+            id: staging_id,
+            logical_len: staged_len,
+            version: physical_version + 7,
+        };
+        let current = pinned_object(reference.version, reference);
+        let promotions_before = fabric.stats_snapshot().promotions;
+        let resolved = fabric
+            .finish_promote(
+                &reference,
+                Some(&current),
+                Ok(PromotedBytes {
+                    object: staging_id,
+                    version: physical_version,
+                    bytes: bytes.to_vec(),
+                }),
+            )
+            .expect("finish");
+        assert_eq!(resolved, bytes);
+        assert_eq!(fabric.stats_snapshot().promotions, promotions_before + 1);
+        let error = fabric
+            .finish_promote(
+                &reference,
+                Some(&current),
+                Ok(PromotedBytes {
+                    object: staging_id,
+                    version: physical_version + 1,
+                    bytes: bytes.to_vec(),
+                }),
+            )
+            .expect_err("installation error propagates");
+        assert_eq!(error, FabricError::Unavailable);
+        guard.shutdown();
+    }
+
+    #[test]
+    fn poll_parked_uses_physical_version() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = FabricPaths {
+            root: dir.path().to_owned(),
+        };
+        let (mut fabric, guard) =
+            TabletFabric::open(WorkerId::from_u64(0), &paths, 1 << 12, 16 << 20)
+                .expect("fabric opens");
+        let tablet = TabletId::from_u64(1);
+        let bytes = Bytes::from(vec![0xCDu8; 1024]);
+        let (staging_id, staged_len) = fabric.stage(tablet, bytes.clone(), false).expect("stage");
+        await_offcore(&mut fabric, staging_id);
+        let physical_version = fabric
+            .fabric_mut()
+            .object_version(staging_id)
+            .expect("physical version");
+        let reference = FabricRef {
+            id: staging_id,
+            logical_len: staged_len,
+            version: physical_version + 7,
+        };
+        let current = pinned_object(reference.version, reference);
+        let promotions_before = fabric.stats_snapshot().promotions;
+        let park = fabric
+            .submit_parked_promote(tablet, Key::from("k"), &reference, Some(&current))
+            .expect("parks");
+        let mut resolved = None;
+        for _ in 0..2000 {
+            match fabric.poll_parked(park, Some(&current)) {
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                Ok(Some(bytes)) => {
+                    resolved = Some(bytes);
+                    break;
+                }
+                Err(error) => panic!("park promotion failed: {error:?}"),
+            }
+        }
+        assert_eq!(resolved.expect("park completes"), bytes);
+        assert_eq!(fabric.stats_snapshot().promotions, promotions_before + 1);
+        guard.shutdown();
     }
 
     #[test]

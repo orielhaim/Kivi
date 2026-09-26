@@ -7,6 +7,10 @@
 //! differences must surface, never hide in the harness.
 
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
+use std::fs;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::resp_client::{ClientError, Reply, RespClient};
@@ -54,7 +58,7 @@ pub fn redis_opted_in() -> bool {
 /// Reference Redis configuration relevant to interpreting results.
 /// Persistence posture is *reported*, never assumed: memory-only
 /// acknowledgements must never be presented as durability-equivalent.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct RedisConfig {
     /// `redis_version` from `INFO server`.
     pub version: String,
@@ -68,6 +72,28 @@ pub struct RedisConfig {
     pub maxmemory_policy: String,
     /// Raw `INFO persistence` section for the report.
     pub persistence_section: String,
+    /// Raw `INFO server` section for the report.
+    pub server_section: String,
+    /// `maxmemory` bytes, or the server's textual representation.
+    pub maxmemory: String,
+    /// `io-threads`, when exposed by the server.
+    pub io_threads: String,
+    /// `redis_mode` from `INFO server`.
+    pub mode: String,
+    /// Redis process id from `INFO server`.
+    pub process_id: String,
+    /// Local process thread count when it can be inspected.
+    pub process_threads: String,
+    /// Redis-reported operating system.
+    pub os: String,
+    /// Redis-reported address width.
+    pub arch_bits: String,
+    /// Redis-reported configuration file path.
+    pub config_file: String,
+    /// Redis-reported executable path.
+    pub executable: String,
+    /// Redis-reported TCP port.
+    pub tcp_port: String,
 }
 
 /// Reads reference configuration over a raw client (`INFO` + `CONFIG GET`).
@@ -93,16 +119,30 @@ pub fn redis_config(client: &mut RespClient) -> Result<RedisConfig, ClientError>
     // Persistence posture comes from CONFIG (authoritative across versions;
     // INFO field names drift between releases), never assumed.
     let one_line = |value: String| value.replace(['\r', '\n'], " ").trim().to_owned();
+    let server_info = parse_info(&info);
+    let process_id = server_info.get("process_id").cloned().unwrap_or_default();
+    let process_threads = process_thread_count(&process_id);
     Ok(RedisConfig {
-        version: parse_info(&info)
+        version: server_info
             .get("redis_version")
             .cloned()
             .unwrap_or_default(),
         appendonly: one_line(get("appendonly")),
         appendfsync: one_line(get("appendfsync")),
         save: one_line(get("save")),
+        maxmemory: one_line(get("maxmemory")),
         maxmemory_policy: one_line(get("maxmemory-policy")),
+        io_threads: one_line(get("io-threads")),
+        mode: server_info.get("redis_mode").cloned().unwrap_or_default(),
+        process_id,
+        process_threads,
+        os: server_info.get("os").cloned().unwrap_or_default(),
+        arch_bits: server_info.get("arch_bits").cloned().unwrap_or_default(),
+        config_file: server_info.get("config_file").cloned().unwrap_or_default(),
+        executable: server_info.get("executable").cloned().unwrap_or_default(),
+        tcp_port: server_info.get("tcp_port").cloned().unwrap_or_default(),
         persistence_section: persistence,
+        server_section: info,
     })
 }
 
@@ -116,6 +156,52 @@ pub fn parse_info(info: &str) -> HashMap<String, String> {
                 .map(|(key, value)| (key.trim().to_owned(), value.trim().to_owned()))
         })
         .collect()
+}
+
+fn process_thread_count(process_id: &str) -> String {
+    let Ok(pid) = process_id.parse::<u32>() else {
+        return "unknown".to_owned();
+    };
+    #[cfg(target_os = "linux")]
+    if let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) {
+        if let Some(value) = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Threads:"))
+            .and_then(|value| value.split_whitespace().next())
+        {
+            return value.to_owned();
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let script = format!("(Get-Process -Id {pid}).Threads.Count");
+        if let Ok(output) = Command::new("powershell")
+            .args(["-NoProfile", "-Command", &script])
+            .output()
+            && output.status.success()
+        {
+            let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            if !value.is_empty() {
+                return value;
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if let Ok(output) = Command::new("ps")
+        .args(["-M", "-p", &pid.to_string()])
+        .output()
+        && output.status.success()
+    {
+        let count = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .skip(1)
+            .filter(|line| !line.trim().is_empty())
+            .count();
+        if count > 0 {
+            return count.to_string();
+        }
+    }
+    "unknown".to_owned()
 }
 
 fn command_string(client: &mut RespClient, argv: &[&[u8]]) -> Result<String, ClientError> {

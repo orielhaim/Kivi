@@ -401,3 +401,54 @@ fn reference_conformance_when_configured() {
     }
     eprintln!("reference conformance passed for {} vectors", vectors.len());
 }
+
+#[test]
+fn medium_value_reads_and_ranges_remain_available() {
+    let server = spawn_resp();
+    let resp = server.resp_endpoint().expect("resp endpoint");
+    let key = b"medium-range-regression";
+    let payload = kivi_lab::workload::fill_pattern(1024, 7);
+    let mut immediate = kivi_lab::resp_client::RespClient::connect(&resp).expect("connects");
+    let immediate_key = b"medium-range-immediate";
+    let immediate_set = immediate
+        .round_trip(&[b"SET", immediate_key, payload.as_slice()])
+        .expect("immediate set");
+    assert_eq!(
+        immediate_set,
+        kivi_lab::resp_client::Reply::Simple(b"OK".to_vec())
+    );
+    let immediate_range = immediate
+        .round_trip(&[b"SETRANGE", immediate_key, b"0", b"v"])
+        .expect("immediate range set");
+    assert_eq!(immediate_range, kivi_lab::resp_client::Reply::Integer(1024));
+    drop(immediate);
+    for _ in 0..24 {
+        let mut client = kivi_lab::resp_client::RespClient::connect(&resp).expect("connects");
+        let set = client
+            .round_trip(&[b"SET", key, payload.as_slice()])
+            .expect("set");
+        assert_eq!(set, kivi_lab::resp_client::Reply::Simple(b"OK".to_vec()));
+        for _ in 0..32 {
+            let get = client.round_trip(&[b"GET", key]).expect("get");
+            assert_eq!(
+                get,
+                kivi_lab::resp_client::Reply::Bulk(Some(payload.clone()))
+            );
+        }
+        let range = client
+            .round_trip(&[b"GETRANGE", key, b"0", b"63"])
+            .expect("range");
+        assert_eq!(
+            range,
+            kivi_lab::resp_client::Reply::Bulk(Some(payload[..64].to_vec()))
+        );
+        let range_set = client
+            .round_trip(&[b"SETRANGE", key, b"0", b"v"])
+            .expect("range set");
+        assert_eq!(range_set, kivi_lab::resp_client::Reply::Integer(1024));
+        let expire = client.round_trip(&[b"EXPIRE", key, b"60"]).expect("expire");
+        assert_eq!(expire, kivi_lab::resp_client::Reply::Integer(1));
+        let deleted = client.round_trip(&[b"DEL", key]).expect("delete");
+        assert_eq!(deleted, kivi_lab::resp_client::Reply::Integer(1));
+    }
+}
