@@ -477,6 +477,79 @@ impl MemoryFabric {
         Ok(object)
     }
 
+    /// Inserts an object under an id the caller already fixed, routing by
+    /// size exactly like [`Self::insert`].
+    ///
+    /// Recovery needs this: a durable record names the id its value was
+    /// published under, and re-deriving that id would leave the replayed
+    /// root pointing at nothing. `next_object` advances past the imported id
+    /// so later inserts can never collide with it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryError::Invalid`] when the id is already tracked, and
+    /// otherwise the same failures as [`Self::insert`].
+    pub fn insert_at(
+        &mut self,
+        object: u64,
+        bytes: Bytes,
+        version: u64,
+        intent: MaterializationIntent,
+        class: BehaviorClass,
+        mutability: Mutability,
+    ) -> Result<(), MemoryError> {
+        if self.objects.contains_key(&object) {
+            return Err(MemoryError::Invalid {
+                detail: "imported id collides with a live object".to_owned(),
+            });
+        }
+        if bytes.len() > crate::MEDIUM_MAX {
+            return Err(MemoryError::TooLarge {
+                len: bytes.len() as u64,
+                max: crate::MEDIUM_MAX as u64,
+                context: "fabric insert: use chunk fabric",
+            });
+        }
+        let logical_bytes = bytes.len() as u64;
+        let signals = AccessSignals {
+            mutability,
+            logical_bytes,
+            ..AccessSignals::cold(logical_bytes)
+        };
+        let criticality = criticality_of(&signals, 90.0);
+        let primary = if bytes.len() <= crate::TINY_INLINE_MAX {
+            Residence::Inline(bytes)
+        } else {
+            let handle = self.arenas.alloc(class, bytes)?;
+            Residence::Arena {
+                class,
+                handle,
+                provider: self.dram_provider,
+            }
+        };
+        let mut materialization = ObjectMaterialization::new(object, version, primary);
+        materialization
+            .reconstruction
+            .push(ReconstructionSource::AuthoritativeStore);
+        self.objects.insert(
+            object,
+            ObjectEntry {
+                materialization,
+                intent,
+                class,
+                criticality,
+                signals,
+                ticks_since_move: u64::MAX / 2,
+                pending_promotion: None,
+                transition: None,
+            },
+        );
+        self.telemetry.register(object, mutability, logical_bytes);
+        self.next_object = self.next_object.max(object.saturating_add(1));
+        self.stats.objects = self.objects.len();
+        Ok(())
+    }
+
     fn observe_access(&mut self, object: u64, write: bool, bytes: u64, cpu_ns: u64) {
         if let Some(entry) = self.objects.get(&object) {
             self.telemetry.register(
@@ -812,34 +885,6 @@ impl MemoryFabric {
                 detail: "no valid residence for direct read".to_owned(),
             })?;
         Ok(Bytes::from(bytes))
-    }
-
-    /// Writes an object's current bytes to the backend synchronously,
-    /// returning the record locator for the engine's durability journal.
-    /// The seal-time flush path calls this for every staged id before the
-    /// WAL barrier, establishing durable-before-reference ordering.
-    ///
-    /// # Errors
-    ///
-    /// Propagates backend write failures; the WAL barrier must not seal
-    /// while any staged id lacks a durable record.
-    pub fn flush_object_to_backend(&mut self, object: u64) -> Result<(u64, u64, u32), MemoryError> {
-        let primary = self
-            .objects
-            .get(&object)
-            .map(|entry| entry.materialization.primary.clone())
-            .ok_or(MemoryError::NoRepresentation { object })?;
-        let bytes = Self::resolve(&self.arenas, &primary).map_err(|_| {
-            MemoryError::CorruptRepresentation {
-                object,
-                detail: "flush needs a synchronous residence".to_owned(),
-            }
-        })?;
-        let locator = self.backend.write_record(&bytes)?;
-        self.calibrator
-            .for_provider(self.nvme_provider)
-            .observe_write(bytes.len() as u64, 30_000);
-        Ok(locator)
     }
 
     /// Imports one off-core record as a cold object with a fixed id and

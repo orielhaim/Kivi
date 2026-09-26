@@ -37,9 +37,8 @@ pub use engine::{
     EngineError, LocalClient, LocalEngine, ShutdownReport, TxnStatusReport,
 };
 pub use fabric::{
-    FABRIC_INLINE_MAX, FabricConfig, FabricError, FabricPaths, FabricSealLocator,
-    FabricSealPayload, FabricStatsSnapshot, JournalEntry, JournalFile, StagedSeal, TabletFabric,
-    import_from_entry, journal_append_batch, journal_compact, journal_load, open_material_provider,
+    FABRIC_INLINE_MAX, FabricConfig, FabricError, FabricPaths, FabricStatsSnapshot, StagedSeal,
+    TabletFabric,
 };
 pub use kivi_core::SystemClock;
 pub use kivi_memory::offcore_lane::{

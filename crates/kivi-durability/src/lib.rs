@@ -36,8 +36,8 @@ pub mod wal;
 pub use error::{DurabilityError, RecoveryError};
 pub use node::{NodeMeta, NodeSeed, OpenDir, open_data_dir, open_data_dir_with};
 pub use provider::{
-    CommitProof, DurabilityLevel, DurabilityProvider, LaneStats, PersistIntent, RecoveryRecord,
-    StorageHealth,
+    BarrierCost, CommitProof, DurabilityLevel, DurabilityProvider, LaneStats, PersistIntent,
+    RecoveryRecord, StorageHealth,
 };
 pub use raft::{
     RAFT_PAYLOAD_BLANK, RAFT_PAYLOAD_MEMBERSHIP, RAFT_PAYLOAD_NORMAL, RECORD_KIND_RAFT_COMMITTED,

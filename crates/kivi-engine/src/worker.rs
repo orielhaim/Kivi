@@ -254,10 +254,15 @@ pub struct WorkerDurability {
 /// How a worker reaches its WAL lane. The lane moves into the
 /// coordinator's dedicated durability thread at startup; the `DataWorker`
 /// never touches it again.
+///
+/// The private lane is boxed because it is an order of magnitude larger than
+/// the shared arm, and the enum is moved into a spawned thread exactly once —
+/// so the box costs one allocation at startup and keeps the enum small
+/// everywhere else.
 #[derive(Debug)]
 pub enum LaneAccess {
     /// Private lane: no synchronization, the production default.
-    Exclusive(kivi_durability::LocalWalLane),
+    Exclusive(Box<kivi_durability::LocalWalLane>),
     /// One lane shared by all workers (experiment arm): appends serialize
     /// on the mutex; recovery and ordering are unchanged.
     Shared(Arc<Mutex<kivi_durability::LocalWalLane>>),
@@ -276,12 +281,11 @@ impl WorkerDurability {
         policy: BatchPolicy,
         lane: LaneAccess,
         initial_stats: WorkerLaneStats,
-        seal_store: Option<crate::commit::FabricSealStore>,
     ) -> Result<Self, DurabilityError> {
         Ok(Self {
             namespace,
             worker,
-            commit: CommitCoordinator::spawn(policy, lane, initial_stats, seal_store)?,
+            commit: CommitCoordinator::spawn(policy, lane, initial_stats)?,
         })
     }
 

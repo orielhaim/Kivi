@@ -83,6 +83,65 @@ pub struct LaneStats {
     pub fsyncs: u64,
 }
 
+/// Where one durability barrier's wall time actually goes, split into the
+/// three phases a batch passes through on the lane thread: turning records
+/// into a body, handing bytes to the OS, and forcing them to stable storage.
+///
+/// The split exists because the three have completely different remedies.
+/// `encode` scales with bytes and shrinks by not encoding twice; `write` is
+/// syscall-bound and shrinks by fewer, larger writes; `fsync` is a fixed
+/// platform cost that shrinks *only* by amortizing more mutations behind
+/// each one. An operator who can read all three can tell which of those is
+/// worth doing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BarrierCost {
+    /// Batches measured (the denominator for every mean below).
+    pub batches: u64,
+    /// Cumulative record-encode time.
+    pub encode_ns: u64,
+    /// Cumulative file-write time (the `write` syscalls, pre-flush).
+    pub write_ns: u64,
+    /// Cumulative flush-to-stable-storage time.
+    pub fsync_ns: u64,
+    /// Worst single flush.
+    pub fsync_max_ns: u64,
+    /// Cumulative records per batch (for the per-mutation view).
+    pub records: u64,
+    /// Cumulative time in segment rotation (create, header flush, directory
+    /// sync). A rotation pays a *second* platform flush, so it lands here
+    /// rather than inside `fsync_ns`.
+    pub rotate_ns: u64,
+    /// Rotations performed.
+    pub rotations: u64,
+    /// Cumulative framing time (batch header CRC, body CRC, footer): the
+    /// work between having encoded records and handing bytes to the OS.
+    pub frame_ns: u64,
+}
+
+impl BarrierCost {
+    /// Nanoseconds of a duration, saturating rather than wrapping so a
+    /// duration beyond ~584 years cannot make a running total go backwards.
+    fn ns(duration: core::time::Duration) -> u64 {
+        u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    /// Folds one measured batch into the running totals.
+    pub fn record(
+        &mut self,
+        records: usize,
+        encode: core::time::Duration,
+        write: core::time::Duration,
+        fsync: core::time::Duration,
+    ) {
+        self.batches += 1;
+        self.records += records as u64;
+        self.encode_ns += Self::ns(encode);
+        self.write_ns += Self::ns(write);
+        self.fsync_ns += Self::ns(fsync);
+        self.fsync_max_ns = self.fsync_max_ns.max(Self::ns(fsync));
+    }
+}
+
 /// The durability boundary. Implementations are `Send` (they move into
 /// worker threads); the single-owner discipline stays with the caller.
 pub trait DurabilityProvider: Send {

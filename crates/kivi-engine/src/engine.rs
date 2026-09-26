@@ -870,12 +870,6 @@ impl LocalEngine {
                 ((0..config.worker_count).map(|_| None).collect(), None, None)
             }
             DurabilityMode::Durable(cfg) => {
-                // Fabric journal recovery runs BEFORE the WAL tail
-                // re-links roots to fabric ids: every journaled record is
-                // validated against its device file and imported cold
-                // (off-core residence, hydrate lazily) into its owning
-                // worker's fabric. Corrupt records fail startup loudly.
-                Self::recover_fabrics(&routing, &fabric_paths, &mut fabrics)?;
                 let DurableBootstrap {
                     lanes,
                     maintenance,
@@ -885,6 +879,7 @@ impl LocalEngine {
                 } = Self::recover_durable(
                     cfg,
                     &mut by_worker,
+                    &mut fabrics,
                     &routing,
                     config.namespace,
                     config.worker_count,
@@ -1037,11 +1032,6 @@ impl LocalEngine {
                 installed: spawn.installed,
                 pins: spawn.pins,
                 chunk_lanes: spawn.chunk_lanes,
-                fabric_journals: fabric_paths
-                    .iter()
-                    .enumerate()
-                    .map(|(index, paths)| (WorkerId::from_u64(index as u64), paths.journal()))
-                    .collect(),
                 admin: Arc::clone(&checkpoint_admin),
                 redundancy: spawn.redundancy.clone(),
             };
@@ -1071,120 +1061,6 @@ impl LocalEngine {
         })
     }
 
-    /// Recovers fabric journals before the WAL tail re-links roots:
-    /// validates every journaled record against its device file and
-    /// imports cold objects (off-core residences, hydrate lazily) into
-    /// their owning worker's fabric. Journal entries for tablets the
-    /// startup directory no longer covers are skipped with a warning
-    /// (their WAL history fails startup first if still referenced).
-    /// Corrupt records fail startup loudly - a committed root without
-    /// its bytes must never serve absence. One id seals twice across a
-    /// prepared transaction (staging record at prepare, authoritative
-    /// record at finalize-commit): the journal is append-ordered, so the
-    /// last entry per id wins and earlier ones never import.
-    fn recover_fabrics(
-        routing: &RoutingSnapshot,
-        paths: &[crate::fabric::FabricPaths],
-        fabrics: &mut [crate::fabric::TabletFabric],
-    ) -> Result<(), EngineError> {
-        use crate::fabric::{JournalFile, journal_load, open_material_provider};
-        let map_io = |error: std::io::Error| {
-            if error.kind() == std::io::ErrorKind::InvalidData {
-                EngineError::Fabric(crate::fabric::FabricError::Corrupt)
-            } else {
-                EngineError::Fabric(crate::fabric::FabricError::Unavailable)
-            }
-        };
-        for (index, paths) in paths.iter().enumerate() {
-            let entries = journal_load(&paths.journal()).map_err(map_io)?;
-            if entries.is_empty() {
-                continue;
-            }
-            let provider = open_material_provider(&paths.material_dir())
-                .map_err(|_| EngineError::Fabric(crate::fabric::FabricError::Unavailable))?;
-            let mut imported = 0usize;
-            let mut skipped = 0usize;
-            // Last entry per id wins (prepare stages under version 0,
-            // finalize-commit re-seals under the authoritative version).
-            let mut latest: std::collections::HashMap<u64, &crate::fabric::JournalEntry> =
-                std::collections::HashMap::new();
-            for entry in &entries {
-                latest.insert(entry.fabric_id, entry);
-            }
-            let mut ordered: Vec<&crate::fabric::JournalEntry> = latest.into_values().collect();
-            ordered.sort_by_key(|entry| (entry.tablet.as_u64(), entry.fabric_id));
-            for entry in ordered {
-                // Owner at startup serves this tablet; imports land there.
-                // (Journal-owner and current owner agree absent a move
-                // whose migration re-staged and re-sealed already.)
-                let owner = routing.placement().worker_of(entry.tablet);
-                let Some(owner) = owner else {
-                    tracing::warn!(
-                        tablet = entry.tablet.as_u64(),
-                        fabric_id = entry.fabric_id,
-                        "fabric journal names a forgotten tablet; skipping"
-                    );
-                    skipped += 1;
-                    continue;
-                };
-                let owner_index = usize::try_from(owner.as_u64()).unwrap_or(usize::MAX);
-                if owner_index != index {
-                    continue;
-                }
-                if !matches!(entry.file, JournalFile::Material) {
-                    continue;
-                }
-                // Validate bytes before trusting the locator.
-                let bytes = provider
-                    .read_at(entry.offset, entry.len)
-                    .map_err(|_| EngineError::Fabric(crate::fabric::FabricError::Corrupt))?;
-                if bytes.len() as u64 != entry.len || crc32c::crc32c(&bytes) != entry.checksum {
-                    return Err(EngineError::Fabric(crate::fabric::FabricError::Corrupt));
-                }
-                // Copy the validated bytes onto the demotion device
-                // through the worker's lane and import that locator: the
-                // live fabric only reads the demotion device (lane
-                // promotions, backend reads), so importing
-                // material-device offsets would strand the id behind an
-                // unreadable residence and fail startup below. The
-                // journal keeps naming the material record (the durable
-                // source); the demotion copy is a device-coherent shadow.
-                let record = fabrics[index]
-                    .lane()
-                    .demote_blocking(entry.fabric_id, entry.version, bytes)
-                    .map_err(crate::fabric::FabricError::from)
-                    .map_err(EngineError::Fabric)?;
-                fabrics[index]
-                    .fabric_mut()
-                    .import_offcore(kivi_memory::OffcoreImport {
-                        id: entry.fabric_id,
-                        version: entry.version,
-                        offset: record.offset,
-                        len: record.len,
-                        checksum: record.checksum,
-                        intent: kivi_memory::MaterializationIntent::cold(),
-                        class: kivi_memory::BehaviorClass::ColdCandidate,
-                    })
-                    .map_err(|_| EngineError::Fabric(crate::fabric::FabricError::Corrupt))?;
-                // Mirror the durable locator for GC and observability.
-                fabrics[index].note_sealed(entry.clone());
-                imported += 1;
-            }
-            tracing::info!(
-                worker = index,
-                imported,
-                skipped,
-                "fabric journal recovered"
-            );
-        }
-        Ok(())
-    }
-
-    /// Opens every WAL lane, restores installed checkpoints, repairs torn
-    /// tails from the durable floor, and replays only the WAL tail after
-    /// each tablet's checkpoint cut. Returns lane ownership, both recovery
-    /// summaries, installed currents, and lane maintenance access.
-    ///
     /// Fails (refusing to serve) on corrupt history, structural gaps,
     /// records for tablets the startup directory does not cover, fencing
     /// mismatches, commit-chain breaks, replay divergence, or unloadable
@@ -1192,6 +1068,7 @@ impl LocalEngine {
     fn recover_durable(
         cfg: &DurableConfig,
         by_worker: &mut [Vec<LiveTablet>],
+        fabrics: &mut [crate::fabric::TabletFabric],
         routing: &RoutingSnapshot,
         namespace: NamespaceId,
         worker_count: usize,
@@ -1231,6 +1108,7 @@ impl LocalEngine {
         // be silent data loss.
         let (records_replayed, tablets_recovered, obsolete_skipped) = Self::replay_records(
             by_worker,
+            fabrics,
             routing,
             namespace,
             per_tablet,
@@ -1278,7 +1156,7 @@ impl LocalEngine {
             } else {
                 let lane = lanes.remove(&lane_index).expect("lane open");
                 let stats = lane.lane_stats();
-                (crate::worker::LaneAccess::Exclusive(lane), stats)
+                (crate::worker::LaneAccess::Exclusive(Box::new(lane)), stats)
             };
             // Fresh, replayed, and restored tablets alike start dirty
             // tracking from a clean slate: restore and replay ran before
@@ -1287,15 +1165,7 @@ impl LocalEngine {
             for live in &mut by_worker[index] {
                 live.enable_band_tracking(namespace);
             }
-            let seal_store = Some(
-                crate::commit::FabricSealStore::open(&crate::fabric::FabricPaths::worker(
-                    &cfg.data_dir,
-                    index,
-                ))
-                .map_err(EngineError::Durability)?,
-            );
-            let durable =
-                WorkerDurability::spawn(namespace, worker, cfg.batch, access, initial, seal_store)?;
+            let durable = WorkerDurability::spawn(namespace, worker, cfg.batch, access, initial)?;
             maintenance.push((worker, durable.maintenance()));
             out.push(durable);
         }
@@ -1518,8 +1388,10 @@ impl LocalEngine {
     /// checkpoint-covered records (commit at or below the tablet's cut —
     /// counted as obsolete, never replayed), and replays the tail in
     /// commit order.
+    #[allow(clippy::too_many_lines)]
     fn replay_records(
         by_worker: &mut [Vec<LiveTablet>],
+        fabrics: &mut [crate::fabric::TabletFabric],
         routing: &RoutingSnapshot,
         namespace: NamespaceId,
         per_tablet: std::collections::HashMap<TabletId, Vec<(u64, kivi_durability::WalRecord)>>,
@@ -1540,6 +1412,14 @@ impl LocalEngine {
         let mut records_replayed = 0u64;
         let mut tablets_recovered = 0u64;
         let mut obsolete_skipped = 0u64;
+        // Tablet to owning worker index, resolved once: material records need
+        // the worker's fabric, and looking that up per record would borrow
+        // the tablet set while a tablet from it is already mutably borrowed.
+        let owner: std::collections::HashMap<TabletId, usize> = by_worker
+            .iter()
+            .enumerate()
+            .flat_map(|(index, lives)| lives.iter().map(move |live| (live.id(), index)))
+            .collect();
         for (tablet_id, mut entries) in per_tablet {
             let descriptor =
                 routing
@@ -1564,7 +1444,14 @@ impl LocalEngine {
                     tablet: tablet_id.as_u64(),
                 })?;
             for (_, record) in &entries {
-                if record.namespace() != namespace {
+                // Material records carry no namespace, epoch, or guard of
+                // their own: they are published by the mutation beside them
+                // in the same batch, and that mutation carries the fencing
+                // context these checks exist to validate. Skipping them here
+                // is not a hole — the mutation with the identical commit
+                // position is checked immediately below.
+                let is_material = matches!(record, WalRecord::Material(_));
+                if !is_material && record.namespace() != namespace {
                     return Err(RecoveryError::NamespaceMismatch {
                         tablet: tablet_id.as_u64(),
                         expected: namespace.as_u64(),
@@ -1572,7 +1459,10 @@ impl LocalEngine {
                     }
                     .into());
                 }
-                if record.epoch() != descriptor.epoch() || record.guard() != descriptor.guard() {
+                if !is_material
+                    && (record.epoch() != descriptor.epoch()
+                        || record.guard() != descriptor.guard())
+                {
                     return Err(RecoveryError::FencingMismatch {
                         tablet: tablet_id.as_u64(),
                     }
@@ -1585,7 +1475,16 @@ impl LocalEngine {
                 // effects (and their dedup outcomes), so replaying them
                 // would duplicate logical application. Reappearing
                 // deleted segments are harmless for exactly this reason.
-                if record.commit().as_u64() <= cut {
+                //
+                // Material records are the exception, and provably so: a
+                // band restores a fabric *root* by id but never its bytes,
+                // so skipping the value here would leave a live root with
+                // nothing behind it. Reclamation never lets a segment
+                // holding a live value's bytes fall below the floor, so the
+                // record carrying them is still present. Importing twice is
+                // harmless — the id is already resident.
+                let is_material = matches!(record, WalRecord::Material(_));
+                if record.commit().as_u64() <= cut && !is_material {
                     obsolete_skipped += 1;
                     continue;
                 }
@@ -1611,6 +1510,45 @@ impl LocalEngine {
                             entry.identity.as_ref(),
                             entry.opcode,
                         )?;
+                    }
+                    WalRecord::Material(entry) => {
+                        // Re-home the value under the id the log published
+                        // it as. Material records are written ahead of the
+                        // mutation that installs their reference and share
+                        // its commit position, so the stable sort above has
+                        // already placed them first.
+                        let index = owner.get(&entry.tablet).copied().ok_or(
+                            RecoveryError::UnknownTablet {
+                                tablet: entry.tablet.as_u64(),
+                            },
+                        )?;
+                        if let Err(error) = fabrics[index].import_recovered(
+                            entry.tablet,
+                            entry.fabric_id,
+                            entry.version,
+                            &entry.bytes,
+                        ) {
+                            // A durable record that cannot be re-homed is
+                            // unusable history: fail startup loudly rather
+                            // than serve a root whose bytes are missing.
+                            // The error travels verbatim so the operator
+                            // sees *why* (arena full, oversized, collision)
+                            // instead of only that it happened.
+                            return Err(EngineError::Durability(
+                                kivi_durability::DurabilityError::Io {
+                                    op: "re-home durable fabric value",
+                                    message: format!(
+                                        "tablet {} fabric id {} len {}: {error:?}",
+                                        entry.tablet.as_u64(),
+                                        entry.fabric_id,
+                                        entry.bytes.len()
+                                    ),
+                                    code: None,
+                                },
+                            ));
+                        }
+                        records_replayed += 1;
+                        continue;
                     }
                 }
                 records_replayed += 1;

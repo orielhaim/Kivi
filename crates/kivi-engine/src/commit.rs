@@ -215,6 +215,60 @@ pub struct CommitMetricsSnapshot {
     pub queue_depth_max: usize,
     /// Whether a batch is currently on the durability lane.
     pub in_flight: bool,
+    /// Where end-to-end mutation latency goes, split into the phases a
+    /// mutation passes through on this worker. Read
+    /// [`CommitStages`] before interpreting: every field is a mean over
+    /// committed mutations, and `barrier` is the only phase the disk
+    /// controls.
+    pub stages: CommitStages,
+    /// Lane-side split of barrier wall time (encode / write / flush).
+    pub barrier: kivi_durability::BarrierCost,
+}
+
+/// End-to-end mutation latency decomposed into the phases that add up to
+/// the client's observed durable-write latency.
+///
+/// The split exists to make one question answerable without reading code:
+/// *is this pipeline slow because it is waiting for the disk, or because it
+/// is waiting to notice?* `barrier` is the disk plus the channel hops
+/// around it; `lane` is the part on the durability thread; `notify` is the
+/// gap between the lane posting a proof and the worker acting on it, which
+/// polling granularity controls; `handoff` is the submit-channel transit
+/// that remains. `pre_barrier` is everything before the write — queueing,
+/// routing, preparation — and `post_barrier` is apply plus reply.
+///
+/// Means are per mutation, not per batch, so they divide by `mutations`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CommitStages {
+    /// Mutations the decomposition is averaged over.
+    pub mutations: u64,
+    /// Total: admission to the moment the reply is handed to the connection.
+    pub total_ns: u64,
+    /// Admission to preparation (admission queue residency).
+    pub pre_barrier_ns: u64,
+    /// Submit to proof drained, including the two channel hops.
+    pub barrier_ns: u64,
+    /// Of `barrier_ns`: time on the durability lane thread.
+    pub lane_ns: u64,
+    /// Of `barrier_ns`: proof posted to proof observed.
+    pub notify_ns: u64,
+    /// Of `barrier_ns`: submit-channel transit in and proof-channel transit out.
+    pub handoff_ns: u64,
+    /// Of `lane_ns`: the provider append call itself. The remainder of
+    /// `lane_ns` is the lane thread's own bookkeeping around that call.
+    pub append_ns: u64,
+    /// Of `lane_ns`: from the lane thread taking the job off the submit
+    /// channel to entering the provider append. Non-zero here means the
+    /// lane thread is being descheduled or blocked, not that the disk is
+    /// slow.
+    pub lane_pre_ns: u64,
+    /// Of `lane_ns`: from the provider append returning to the outcome
+    /// being constructed and ready to post.
+    pub lane_post_ns: u64,
+    /// Of `barrier_ns`: seal-time formatting (framing, CRC, record build).
+    pub seal_ns: u64,
+    /// Proof drained to every reply in the batch handed over.
+    pub post_barrier_ns: u64,
 }
 
 /// One admitted request awaiting batch preparation.
@@ -379,6 +433,10 @@ struct ApplyData {
     /// staged data as either pinned or journaled, never neither. One entry
     /// per staged value (transactional batches stage several).
     pinned: Vec<crate::chunk_lane::PinnedUpload>,
+    /// When the request was admitted. Carried to the reply so the
+    /// end-to-end stage decomposition measures the whole request lifetime,
+    /// not just the part the coordinator can see.
+    admitted_at: Instant,
 }
 
 /// Batch-local overlay for one tablet: pending state for touched keys only
@@ -535,23 +593,29 @@ impl TabletOverlay {
     }
 }
 
-/// Builds seal payloads for every staged fabric id the prepared mutation
-/// references, stamping predicted authoritative versions from the
+/// Builds the WAL material records for every staged fabric id the prepared
+/// mutation references, stamping predicted authoritative versions from the
 /// expected outcome. Predict/apply agreement makes these versions exact;
 /// unreferenced staged ids are the caller's to retire (unmet conditions,
 /// terminal outcomes).
+///
+/// The bytes ride in the same physical batch as the mutation that installs
+/// the reference, so one flush makes both durable and the
+/// durable-before-reference rule needs no second file, no second flush, and
+/// no cross-file ordering argument to get wrong.
 ///
 /// 2PC intents seal twice: `TxnPrepare` persists the staged bytes under
 /// the staging version (`0`, never a root) so a crash cannot strand a
 /// prepared intent without payload, and pins the id until the intent
 /// resolves; `TxnFinalize` re-seals the same bytes under the predicted
 /// authoritative version, superseding the staging record.
-fn fabric_payloads_for(
+fn material_records_for(
     tablet: TabletId,
+    commit: CommitPosition,
     mutation: &Mutation,
     expected: &kivi_state::OperationResult,
     staged: &[crate::fabric::StagedSeal],
-) -> Vec<crate::fabric::FabricSealPayload> {
+) -> Vec<WalRecord> {
     use kivi_state::{Mutation as M, OperationResult as R};
     let sealed: Vec<(u64, u64)> = match (mutation, expected) {
         (M::ReplaceFabricRoot { fabric_id, .. }, R::Stored { version }) => {
@@ -596,20 +660,18 @@ fn fabric_payloads_for(
     sealed
         .into_iter()
         .filter_map(|(fabric_id, version)| {
-            staged
-                .iter()
-                .find(|seal| seal.fabric_id == fabric_id)
-                .map(|seal| crate::fabric::FabricSealPayload {
-                    fabric_id,
-                    tablet,
-                    key: mutation.key().clone(),
-                    version,
-                    bytes: seal.bytes.clone(),
-                })
+            let seal = staged.iter().find(|seal| seal.fabric_id == fabric_id)?;
+            Some(WalRecord::Material(kivi_durability::wal::MaterialRecord {
+                tablet,
+                fabric_id,
+                commit,
+                version,
+                checksum: kivi_codec::integrity::crc32c_checksum(&seal.bytes),
+                bytes: seal.bytes.clone(),
+            }))
         })
         .collect()
 }
-
 /// Estimated wire length of one WAL record body contribution, mirroring
 /// `encode_record_body` (8-byte frame + fixed prefix + identity + blobs).
 /// Used for the `max_bytes` close rule; the lane's authoritative
@@ -624,6 +686,11 @@ fn record_wire_len(record: &WalRecord) -> u64 {
             4 + entry.mutation.encoded_len() as u64 + 4 + entry.expected.encoded_len() as u64,
         ),
         WalRecord::Outcome(entry) => (entry.identity, 4 + entry.outcome.encoded_len() as u64),
+        WalRecord::Material(entry) => (
+            None,
+            // frame + tablet + commit + fabric id + version + checksum + blob
+            (8 + 8 * 4 + 4 + 4 + entry.bytes.len()) as u64,
+        ),
     };
     let identity_len: u64 = if identity.is_some() {
         1 + 16 + 8 + 8
@@ -644,14 +711,13 @@ struct OpenBatch {
     /// Pre-batch commit positions per touched tablet (rollback on failure).
     commit_base: HashMap<TabletId, CommitPosition>,
     oldest_admitted: Instant,
-    /// Staged fabric payloads sealed with this batch (durable-before-
-    /// reference): the lane persists every payload plus its journal entry
-    /// before the WAL barrier.
-    fabric_payloads: Vec<crate::fabric::FabricSealPayload>,
     /// When formation started (bounds the formation window: under
     /// continuous arrivals a batch must still seal instead of growing
     /// while the queue never drains).
     formed_at: Instant,
+    /// Admission-to-preparation time summed over this batch's entries:
+    /// the pre-barrier half of the end-to-end decomposition.
+    pre_barrier_ns: u64,
 }
 
 /// Batch on the durability lane: sealed records plus everything needed to
@@ -664,21 +730,22 @@ struct InflightBatch {
     commit_base: HashMap<TabletId, CommitPosition>,
     submitted_at: Instant,
     oldest_admitted: Instant,
-    /// Staged fabric ids sealed with this batch: retired when the batch
-    /// fails (nothing references them), live when it commits (roots name
-    /// them and seal locators reconstruct them).
+    /// Fabric ids this batch's material records publish: retired when the
+    /// batch fails (no root will ever name them), live when it commits.
     fabric_staged: Vec<u64>,
+    /// Pre-barrier nanoseconds inherited from the open batch.
+    pre_barrier_ns: u64,
+    /// Coordinator-side seal cost (record framing handoff + submit): the
+    /// part of barrier latency that happens before the lane sees the job.
+    seal_ns: u64,
 }
 
-/// One sealed unit of work for the lane thread.
+/// One sealed unit of work for the lane thread: the whole physical batch,
+/// mutations and the bulk values they install alike.
 #[derive(Debug)]
 pub(crate) struct SealJob {
     batch_seq: u64,
     records: Vec<WalRecord>,
-    /// Staged fabric payloads: the lane persists every payload and its
-    /// journal entry BEFORE the WAL barrier, establishing
-    /// durable-before-reference ordering for fabric roots in `records`.
-    fabric_payloads: Vec<crate::fabric::FabricSealPayload>,
 }
 
 /// Lane-thread commands: seals plus infrequent checkpoint-time
@@ -736,184 +803,64 @@ pub(crate) struct SealOutcome {
     batch_seq: u64,
     result: Result<CommitProof, DurabilityError>,
     lane_stats: WorkerLaneStats,
-    /// Durable locators for the sealed fabric payloads (empty when the
-    /// batch staged nothing): the worker mirrors these into memory as
-    /// the reconstruction sources for the new roots.
-    fabric_locators: Vec<crate::fabric::FabricSealLocator>,
-}
-
-/// Fabric seal store: the durability lane's single-writer handle over
-/// the worker's `materializations.dat` plus the fabric journal. Lives on
-/// the lane thread; the worker thread never touches these files.
-#[derive(Debug)]
-pub struct FabricSealStore {
-    provider: kivi_memory::NvmeProvider,
-    journal_path: std::path::PathBuf,
-}
-
-impl FabricSealStore {
-    /// Opens (creating) the material provider and journal parent.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DurabilityError`] when directories or files cannot be
-    /// opened, or the record format is newer than this build.
-    pub(crate) fn open(paths: &crate::fabric::FabricPaths) -> Result<Self, DurabilityError> {
-        std::fs::create_dir_all(paths.material_dir()).map_err(|error| DurabilityError::Io {
-            op: "create fabric material dir",
-            message: error.to_string(),
-            code: None,
-        })?;
-        let provider = kivi_memory::NvmeProvider::open(
-            &paths.material_dir(),
-            kivi_memory::NvmeOptions::default(),
-        )
-        .map_err(|error| DurabilityError::Io {
-            op: "open fabric material provider",
-            message: error.to_string(),
-            code: None,
-        })?;
-        Ok(Self {
-            provider,
-            journal_path: paths.journal(),
-        })
-    }
-
-    /// Persists every payload plus its journal entry under one barrier,
-    /// returning locators in input order. The caller seals the WAL only
-    /// after this returns success (durable-before-reference).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DurabilityError`] on any filesystem failure; partial
-    /// prefixes stay in the files and are validated or truncated by
-    /// recovery (torn tails) and journal load (CRC per record).
-    pub(crate) fn seal_payloads(
-        &mut self,
-        payloads: &[crate::fabric::FabricSealPayload],
-    ) -> Result<Vec<crate::fabric::FabricSealLocator>, DurabilityError> {
-        let map_io = |op: &'static str| {
-            move |error: std::io::Error| DurabilityError::Io {
-                op,
-                message: error.to_string(),
-                code: None,
-            }
-        };
-        let mut locators = Vec::with_capacity(payloads.len());
-        let mut entries = Vec::with_capacity(payloads.len());
-        for payload in payloads {
-            let (offset, len, checksum) =
-                self.provider
-                    .append(&payload.bytes)
-                    .map_err(|error| DurabilityError::Io {
-                        op: "append fabric material record",
-                        message: error.to_string(),
-                        code: None,
-                    })?;
-            entries.push(crate::fabric::JournalEntry {
-                fabric_id: payload.fabric_id,
-                tablet: payload.tablet,
-                key: payload.key.as_bytes().to_vec(),
-                version: payload.version,
-                file: crate::fabric::JournalFile::Material,
-                offset,
-                len,
-                checksum,
-            });
-            locators.push(crate::fabric::FabricSealLocator {
-                fabric_id: payload.fabric_id,
-                tablet: payload.tablet,
-                key: payload.key.clone(),
-                version: payload.version,
-                offset,
-                len,
-                checksum,
-            });
-        }
-        if !entries.is_empty() {
-            crate::fabric::journal_append_batch(&self.journal_path, &entries)
-                .map_err(map_io("append fabric journal"))?;
-        }
-        Ok(locators)
-    }
+    /// Wall time the lane thread spent on this seal: from taking the job
+    /// off the submit channel to posting the outcome. Stamped on the lane
+    /// so the coordinator can separate real barrier cost from the channel
+    /// hops on either side of it.
+    lane_span: Duration,
+    /// Time spent inside the provider append call, so the coordinator can
+    /// separate the barrier itself from the lane's bookkeeping around it.
+    append: Duration,
+    /// Time from taking the job off the submit channel to entering the
+    /// provider append.
+    lane_pre: Duration,
+    /// Time from the provider append returning to the outcome being ready
+    /// to post.
+    lane_post: Duration,
+    /// When the outcome was posted. Subtracting this from the coordinator's
+    /// drain time gives the completion *notification* delay, which is the
+    /// part of barrier latency that polling granularity — not the disk —
+    /// controls.
+    posted_at: Instant,
 }
 
 /// Runs one closure under the WAL lane, exclusive or shared.
 type LaneRunner<'a> = &'a mut dyn FnMut(&mut dyn FnMut(&mut kivi_durability::LocalWalLane));
 
-/// Reports one failed seal: builds the outcome under the lane (for
-/// lane stats) and sends it. Kept beside
-/// [`seal_one_batch`] so the seal arm stays reviewable.
-fn fail_seal(
-    job: &SealJob,
-    error: &DurabilityError,
-    with_lane: LaneRunner<'_>,
-    complete: &Sender<SealOutcome>,
-) {
-    let mut outcome: Option<SealOutcome> = None;
-    with_lane(&mut |inner| {
-        outcome = Some(SealOutcome {
-            batch_seq: job.batch_seq,
-            result: Err(error.clone()),
-            lane_stats: inner.lane_stats(),
-            fabric_locators: Vec::new(),
-        });
-    });
-    let _ = complete.send(outcome.expect("seal always reports"));
-}
-
-/// Seals one batch: fabric payloads first (durable-before-reference),
-/// then the WAL barrier. A fabric failure retires nothing here — the
-/// coordinator retires staged ids when it collects the failed proof —
-/// but unreferenced records never accumulate because every staged id
-/// rides exactly one seal.
+/// Seals one batch: every record it holds — mutations, outcomes, and the
+/// bulk values those mutations install by reference — into one physical WAL
+/// batch, then one barrier.
+///
+/// One batch, one file, one flush. There is deliberately no second store
+/// for bulk values: durable-before-reference used to cost an extra platform
+/// flush per value plus another for the locator journal, which dominated
+/// write latency by an order of magnitude. Putting the bytes in the same
+/// ordered log makes the ordering a property of the log instead of a
+/// three-file agreement.
 fn seal_one_batch(
     job: &SealJob,
     with_lane: LaneRunner<'_>,
-    seal_store: &mut Option<FabricSealStore>,
     complete: &Sender<SealOutcome>,
+    started: Instant,
 ) {
-    // Fabric payloads first (durable-before-reference): a seal failure
-    // below then also retires the staged ids on the worker, so
-    // unreferenced records never accumulate behind a failed batch.
-    let fabric_sealed = match seal_store.as_mut() {
-        Some(store) if !job.fabric_payloads.is_empty() => {
-            Some(store.seal_payloads(&job.fabric_payloads))
-        }
-        _ => None,
-    };
-    if !job.fabric_payloads.is_empty() && seal_store.is_none() {
-        fail_seal(
-            job,
-            &DurabilityError::Io {
-                op: "seal fabric payloads",
-                message: "no fabric seal store on this lane".to_owned(),
-                code: None,
-            },
-            with_lane,
-            complete,
-        );
-        return;
-    }
-    let fabric_locators = match fabric_sealed {
-        Some(Err(error)) => {
-            fail_seal(job, &error, with_lane, complete);
-            return;
-        }
-        Some(Ok(locators)) => locators,
-        None => Vec::new(),
-    };
     let mut outcome: Option<SealOutcome> = None;
     with_lane(&mut |inner| {
+        let append_started = Instant::now();
+        let lane_pre = append_started.duration_since(started);
         let result = inner.append_batch(&PersistIntent {
             records: &job.records,
             level: DurabilityLevel::Sync,
         });
+        let append = append_started.elapsed();
         outcome = Some(SealOutcome {
+            append,
+            lane_pre,
+            lane_post: append,
             batch_seq: job.batch_seq,
             result,
             lane_stats: inner.lane_stats(),
-            fabric_locators: fabric_locators.clone(),
+            lane_span: started.elapsed(),
+            posted_at: Instant::now(),
         });
     });
     // The coordinator always waits for every seal it submits
@@ -922,7 +869,6 @@ fn seal_one_batch(
     // moot.
     let _ = complete.send(outcome.expect("seal always reports"));
 }
-
 /// Dedicated durability-lane thread: owns the WAL lane, appends sealed
 /// batches, syncs, and reports. The `DataWorker` never touches the
 /// filesystem; the lane thread never touches tablet state. Maintenance
@@ -933,7 +879,6 @@ fn lane_thread_main(
     lane: LaneAccess,
     submit: Receiver<LaneCommand>,
     complete: &Sender<SealOutcome>,
-    mut seal_store: Option<FabricSealStore>,
 ) {
     let mut lane = lane;
     let mut with_lane = |job: &mut dyn FnMut(&mut kivi_durability::LocalWalLane)| {
@@ -954,7 +899,8 @@ fn lane_thread_main(
     for command in submit {
         match command {
             LaneCommand::Seal(job) => {
-                seal_one_batch(&job, &mut with_lane, &mut seal_store, complete);
+                let started = Instant::now();
+                seal_one_batch(&job, &mut with_lane, complete, started);
             }
             LaneCommand::SealActive { reply } => {
                 let mut result = Ok(());
@@ -1034,13 +980,12 @@ impl LaneHandle {
     pub(crate) fn spawn(
         lane: LaneAccess,
         complete: &Sender<SealOutcome>,
-        seal_store: Option<FabricSealStore>,
     ) -> Result<Self, DurabilityError> {
         let (submit, receive) = bounded::<LaneCommand>(LANE_SUBMIT_DEPTH);
         let complete_thread = complete.clone();
         let thread = thread::Builder::new()
             .name("kivi-durability-lane".to_owned())
-            .spawn(move || lane_thread_main(lane, receive, &complete_thread, seal_store))
+            .spawn(move || lane_thread_main(lane, receive, &complete_thread))
             .map_err(|error| DurabilityError::Io {
                 op: "spawn durability lane thread",
                 message: error.to_string(),
@@ -1129,6 +1074,7 @@ pub struct CommitCoordinator {
     barrier_latency_total: Duration,
     barrier_latency_max: Duration,
     queue_depth_max: usize,
+    stages: CommitStages,
 }
 
 impl core::fmt::Debug for CommitCoordinator {
@@ -1168,7 +1114,6 @@ impl CommitCoordinator {
         policy: BatchPolicy,
         lane: LaneAccess,
         initial_stats: WorkerLaneStats,
-        seal_store: Option<FabricSealStore>,
     ) -> Result<Self, DurabilityError> {
         policy
             .validate()
@@ -1180,7 +1125,7 @@ impl CommitCoordinator {
             open: None,
             inflight: None,
             next_batch_seq: 1,
-            lane: LaneHandle::spawn(lane, &complete_tx, seal_store)?,
+            lane: LaneHandle::spawn(lane, &complete_tx)?,
             complete,
             unapplied_identities: HashSet::new(),
             unapplied_sessions: HashMap::new(),
@@ -1201,6 +1146,7 @@ impl CommitCoordinator {
             barrier_latency_total: Duration::ZERO,
             barrier_latency_max: Duration::ZERO,
             queue_depth_max: 0,
+            stages: CommitStages::default(),
         })
     }
 
@@ -1242,6 +1188,7 @@ impl CommitCoordinator {
             barrier_latency_total: Duration::ZERO,
             barrier_latency_max: Duration::ZERO,
             queue_depth_max: 0,
+            stages: CommitStages::default(),
         };
         (coordinator, submit_rx, complete_tx)
     }
@@ -1316,17 +1263,33 @@ impl CommitCoordinator {
         keys
     }
 
-    /// Fabric ids in the open or in-flight batch (sealed or sealing):
-    /// checkpoint journal GC must retain their records until the batch
-    /// applies, even though no live root names them yet.
+    /// Fabric ids staged into the open or in-flight batch (sealed or
+    /// sealing) that no live root names yet. Their bytes ride the WAL batch
+    /// under the same commit position as the root that will name them, so
+    /// segment reclamation already covers them; this set exists only so
+    /// checkpoint bookkeeping can see them.
     #[must_use]
     pub(crate) fn pending_fabric_ids(&self) -> Vec<u64> {
         let mut ids = Vec::new();
+        let mut collect = |records: &[WalRecord]| {
+            ids.extend(records.iter().filter_map(|record| match record {
+                WalRecord::Material(material) => Some(material.fabric_id),
+                _ => None,
+            }));
+        };
         if let Some(open) = &self.open {
-            ids.extend(open.fabric_payloads.iter().map(|payload| payload.fabric_id));
+            collect(&open.records);
         }
         if let Some(inflight) = &self.inflight {
-            ids.extend(inflight.fabric_staged.iter().copied());
+            for apply in &inflight.applies {
+                if let PreparedKind::Mutation {
+                    mutation: Mutation::ReplaceFabricRoot { fabric_id, .. },
+                    ..
+                } = &apply.kind
+                {
+                    ids.push(*fabric_id);
+                }
+            }
         }
         ids
     }
@@ -1521,6 +1484,8 @@ impl CommitCoordinator {
             queue_depth: self.queue.len(),
             queue_depth_max: self.queue_depth_max,
             in_flight: self.inflight.is_some(),
+            stages: self.stages,
+            barrier: self.lane_stats.barrier,
         }
     }
 
@@ -1553,9 +1518,30 @@ impl CommitCoordinator {
             outcome.batch_seq, inflight.batch_seq
         );
         self.lane_stats = outcome.lane_stats;
+        let drained_at = Instant::now();
         let barrier_latency = inflight.submitted_at.elapsed();
         self.barrier_latency_total += barrier_latency;
         self.barrier_latency_max = self.barrier_latency_max.max(barrier_latency);
+        // Barrier latency is the sum of four disjoint parts. Isolating the
+        // lane's own span and the notification gap leaves the channel
+        // transits, which is what tells a slow disk apart from a slow
+        // wakeup: the disk shows up in `lane`, polling granularity in
+        // `notify`, and neither in `handoff`.
+        let notify = drained_at.saturating_duration_since(outcome.posted_at);
+        let handoff = barrier_latency
+            .saturating_sub(outcome.lane_span)
+            .saturating_sub(notify);
+        let members = inflight.applies.len() as u64;
+        self.stages.mutations += members;
+        self.stages.pre_barrier_ns += inflight.pre_barrier_ns;
+        self.stages.barrier_ns += ns(barrier_latency) * members;
+        self.stages.lane_ns += ns(outcome.lane_span) * members;
+        self.stages.notify_ns += ns(notify) * members;
+        self.stages.handoff_ns += ns(handoff) * members;
+        self.stages.seal_ns += inflight.seal_ns.saturating_mul(members);
+        self.stages.append_ns += ns(outcome.append).saturating_mul(members);
+        self.stages.lane_pre_ns += ns(outcome.lane_pre).saturating_mul(members);
+        self.stages.lane_post_ns += ns(outcome.lane_post).saturating_mul(members);
         match outcome.result {
             Ok(proof) => {
                 self.physical_batches += 1;
@@ -1564,23 +1550,13 @@ impl CommitCoordinator {
                 let size = inflight.applies.len();
                 self.logical_mutations += size as u64;
                 self.record_batch_size(size, inflight.oldest_admitted.elapsed());
-                for locator in outcome.fabric_locators {
-                    fabric.note_sealed(crate::fabric::JournalEntry {
-                        fabric_id: locator.fabric_id,
-                        tablet: locator.tablet,
-                        key: locator.key.as_bytes().to_vec(),
-                        version: locator.version,
-                        file: crate::fabric::JournalFile::Material,
-                        offset: locator.offset,
-                        len: locator.len,
-                        checksum: locator.checksum,
-                    });
-                }
+                let apply_started = Instant::now();
                 for apply in inflight.applies {
                     self.forget_identity(apply.identity.as_ref());
                     let live = tablets.get_mut(&apply.tablet).expect("tablet live");
-                    apply_item(live, apply, fabric);
+                    apply_item(live, apply, fabric, &mut self.stages.total_ns);
                 }
+                self.stages.post_barrier_ns += ns(apply_started.elapsed()).saturating_mul(members);
             }
             Err(error) => {
                 self.failed_batches += 1;
@@ -1603,8 +1579,8 @@ impl CommitCoordinator {
                         fabric.unpin_and_sweep(*fabric_id);
                     }
                 }
-                for id in inflight.fabric_staged {
-                    fabric.retire_or_defer(id);
+                for id in &inflight.fabric_staged {
+                    fabric.retire_or_defer(*id);
                 }
                 for apply in &inflight.applies {
                     self.forget_identity(apply.identity.as_ref());
@@ -1947,9 +1923,14 @@ impl CommitCoordinator {
     }
 
     /// Whether the open batch should seal now: full, past its deadline,
-    /// drained past linger, or drained with only held entries left (held
-    /// entries can never join this batch, so waiting out the linger would
-    /// only delay it).
+    /// drained past linger, or blocked.
+    ///
+    /// "Blocked" means every queued entry is *held* — its tablet is already
+    /// on the lane, or its identity is admitted-but-unapplied — so no arrival
+    /// can ever join this batch and waiting only adds latency. A merely
+    /// non-empty queue is the opposite: it means something *can* still join,
+    /// and at pipeline depth that is the whole difference between a batch of
+    /// one and a batch of many.
     fn seal_is_due(&self) -> bool {
         match &self.open {
             None => false,
@@ -1957,9 +1938,18 @@ impl CommitCoordinator {
             Some(open) => {
                 self.batch_is_full()
                     || open.oldest_admitted.elapsed() >= self.policy.linger
-                    || !self.queue.is_empty()
+                    || self.queue_blocked()
             }
         }
+    }
+
+    /// Whether every queued entry is one that can never join the open batch.
+    fn queue_blocked(&self) -> bool {
+        !self.queue.is_empty()
+            && self
+                .queue
+                .iter()
+                .all(|entry| self.is_held(entry.tablet, entry.identity.as_ref()))
     }
 
     /// Whether a mutation must hold its queue position: its tablet has a
@@ -2009,8 +1999,8 @@ impl CommitCoordinator {
                 overlays: HashMap::new(),
                 commit_base: HashMap::new(),
                 oldest_admitted: entry.admitted_at,
-                fabric_payloads: Vec::new(),
                 formed_at: Instant::now(),
+                pre_barrier_ns: 0,
             });
             open.oldest_admitted = open.oldest_admitted.min(entry.admitted_at);
             let overlay = open.overlays.entry(tablet_id).or_default();
@@ -2021,6 +2011,7 @@ impl CommitCoordinator {
                 _ => overlay.prepare(committed, &entry.op, entry.now),
             }
         };
+        let prepared_started = Instant::now();
         let prepared = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -2051,10 +2042,10 @@ impl CommitCoordinator {
             }
         };
         let is_persist_expiry = matches!(entry.op, Operation::PersistExpiry { .. });
-        // Fabric seal payloads are derived inside the Write arm (where the
+        // Bulk-value records are derived inside the Write arm (where the
         // mutation and expected outcome are both bound); terminal outcomes
         // reference nothing, so their staged ids retire just below.
-        let mut fabric_payloads = Vec::new();
+        let mut material_records: Vec<WalRecord> = Vec::new();
         // Prepared intents pin their staged ids until the intent resolves
         // (finalize-commit re-seals under the authoritative version,
         // finalize-abort releases): a later Commit always finds bytes.
@@ -2070,10 +2061,20 @@ impl CommitCoordinator {
                 panic!("mutating opcode prepared a read after commit assignment");
             }
             StorePrepared::Write { mutation, expected } => {
-                fabric_payloads =
-                    fabric_payloads_for(tablet_id, &mutation, &expected, &entry.fabric_staged);
+                material_records = material_records_for(
+                    tablet_id,
+                    commit,
+                    &mutation,
+                    &expected,
+                    &entry.fabric_staged,
+                );
                 if matches!(mutation, Mutation::TxnPrepare { .. }) {
-                    prepare_pins.extend(fabric_payloads.iter().map(|payload| payload.fabric_id));
+                    prepare_pins.extend(material_records.iter().filter_map(
+                        |record| match record {
+                            WalRecord::Material(material) => Some(material.fabric_id),
+                            _ => None,
+                        },
+                    ));
                 }
                 let record = WalRecord::Mutation(MutationRecord {
                     namespace,
@@ -2125,23 +2126,32 @@ impl CommitCoordinator {
                 .entry(marker.client.session())
                 .or_insert(0) += 1;
         }
-        // Fabric seal payloads: every staged id the mutation references
-        // rides the seal with its predicted version; staged ids the
+        // Bulk values: every staged id the mutation references rides this
+        // batch's record list with its predicted version; staged ids the
         // mutation dropped (unmet conditions, terminal outcomes) retire
         // immediately — nothing will ever reference them.
         let open = self.open.as_mut().expect("open batch");
-        let referenced: std::collections::HashSet<u64> = fabric_payloads
+        let referenced: std::collections::HashSet<u64> = material_records
             .iter()
-            .map(|payload| payload.fabric_id)
+            .filter_map(|record| match record {
+                WalRecord::Material(material) => Some(material.fabric_id),
+                _ => None,
+            })
             .collect();
         for staged in &entry.fabric_staged {
             if !referenced.contains(&staged.fabric_id) {
                 fabric.retire_or_defer(staged.fabric_id);
             }
         }
-        open.fabric_payloads.extend(fabric_payloads);
         for pinned in prepare_pins {
             fabric.pin(pinned);
+        }
+        // Material records land in the batch ahead of the mutation that
+        // installs their reference, so a reader walking the record list in
+        // order always meets the bytes before the root that names them.
+        for material in material_records {
+            open.bytes += record_wire_len(&material);
+            open.records.push(material);
         }
         open.bytes += record_wire_len(&record);
         open.records.push(record);
@@ -2153,14 +2163,18 @@ impl CommitCoordinator {
             now: entry.now,
             respond: entry.respond,
             pinned: entry.pinned,
+            admitted_at: entry.admitted_at,
         });
+        let pre_barrier = ns(prepared_started.duration_since(entry.admitted_at));
+        self.open.as_mut().expect("open batch").pre_barrier_ns += pre_barrier;
         PrepareOutcome::Prepared
     }
 
     /// Seals the open batch (if it holds anything) and submits it to the
     /// lane. An empty open batch is simply dropped.
     fn seal_open(&mut self) {
-        let Some(mut open) = self.open.take() else {
+        let seal_started = Instant::now();
+        let Some(open) = self.open.take() else {
             return;
         };
         if open.applies.is_empty() {
@@ -2176,10 +2190,13 @@ impl CommitCoordinator {
         // With at most one batch in flight and a 16-deep submit channel,
         // this never blocks unless the lane thread died — which fails
         // closed below instead of queuing into the void.
-        let fabric_payloads = std::mem::take(&mut open.fabric_payloads);
-        let fabric_staged: Vec<u64> = fabric_payloads
+        let seal_ids: Vec<u64> = open
+            .records
             .iter()
-            .map(|payload| payload.fabric_id)
+            .filter_map(|record| match record {
+                WalRecord::Material(material) => Some(material.fabric_id),
+                _ => None,
+            })
             .collect();
         if self
             .lane
@@ -2187,12 +2204,12 @@ impl CommitCoordinator {
             .send(LaneCommand::Seal(SealJob {
                 batch_seq,
                 records: open.records,
-                fabric_payloads,
             }))
             .is_err()
         {
             panic!("durability lane thread died with a sealed batch pending");
         }
+        let seal_ns = ns(seal_started.elapsed());
         self.inflight = Some(InflightBatch {
             batch_seq,
             tablets,
@@ -2200,7 +2217,9 @@ impl CommitCoordinator {
             commit_base: open.commit_base,
             submitted_at: Instant::now(),
             oldest_admitted: open.oldest_admitted,
-            fabric_staged,
+            fabric_staged: seal_ids,
+            pre_barrier_ns: open.pre_barrier_ns,
+            seal_ns,
         });
     }
 
@@ -2220,6 +2239,12 @@ impl CommitCoordinator {
         self.oldest_wait_total += oldest_wait;
         self.oldest_wait_max = self.oldest_wait_max.max(oldest_wait);
     }
+}
+
+/// Nanoseconds of a duration, saturating rather than wrapping so a bad
+/// clock reading can never underflow an accumulated total into nonsense.
+fn ns(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// Outcome of preparing one entry into the open batch.
@@ -2272,7 +2297,16 @@ fn map_fabric_error(error: crate::fabric::FabricError) -> WorkerRequestError {
 /// Panics when the post-durability apply fails: durable truth exists at
 /// this point, so a normal request error would be dishonest (spec H).
 /// Verification mismatch already panics inside `commit_persisted`.
-fn apply_item(live: &mut LiveTablet, apply: ApplyData, fabric: &mut crate::fabric::TabletFabric) {
+fn apply_item(
+    live: &mut LiveTablet,
+    apply: ApplyData,
+    fabric: &mut crate::fabric::TabletFabric,
+    total_ns: &mut u64,
+) {
+    // Admission to handed-over reply: the whole request lifetime the
+    // coordinator can see. Accumulated here because this is the last point
+    // the request still exists.
+    *total_ns = total_ns.saturating_add(ns(apply.admitted_at.elapsed()));
     // Held through the reply: the journal records this commit during the
     // apply below, so pins release only after journaling is done.
     let _pinned = apply.pinned;
@@ -2389,7 +2423,7 @@ mod tests {
         )
         .expect("lane opens");
         let stats = lane.lane_stats();
-        (LaneAccess::Exclusive(lane), stats)
+        (LaneAccess::Exclusive(Box::new(lane)), stats)
     }
 
     fn drive(
@@ -2431,8 +2465,8 @@ mod tests {
         let (mut fabric, _fabric_guard, _fabric_dir) = test_fabric();
         let scratch = tempfile::tempdir().expect("scratch");
         let (lane, stats) = test_lane(scratch.path());
-        let mut coord = CommitCoordinator::spawn(BatchPolicy::default_policy(), lane, stats, None)
-            .expect("spawn");
+        let mut coord =
+            CommitCoordinator::spawn(BatchPolicy::default_policy(), lane, stats).expect("spawn");
         let mut tablets = HashMap::new();
         tablets.insert(TabletId::from_u64(1), live_tablet());
         let mut receivers = Vec::new();
@@ -2480,6 +2514,7 @@ mod tests {
             segments: 0,
             health: StorageHealth::Healthy,
             stats: kivi_durability::LaneStats::default(),
+            barrier: kivi_durability::BarrierCost::default(),
         };
         // Deterministic sealing: the step-by-step tests below assert exact
         // pipeline sequencing per poll, so the drain linger is zero here.
@@ -2547,7 +2582,11 @@ mod tests {
                     fsyncs: 1,
                 }),
                 lane_stats: stats,
-                fabric_locators: Vec::new(),
+                lane_span: Duration::ZERO,
+                append: Duration::ZERO,
+                lane_pre: Duration::ZERO,
+                lane_post: Duration::ZERO,
+                posted_at: Instant::now(),
             })
             .expect("coordinator waits");
         records
@@ -2566,7 +2605,11 @@ mod tests {
                     code: None,
                 }),
                 lane_stats: stats,
-                fabric_locators: Vec::new(),
+                lane_span: Duration::ZERO,
+                append: Duration::ZERO,
+                lane_pre: Duration::ZERO,
+                lane_post: Duration::ZERO,
+                posted_at: Instant::now(),
             })
             .expect("coordinator waits");
     }
@@ -2578,6 +2621,7 @@ mod tests {
             segments: 1,
             health: StorageHealth::Healthy,
             stats: kivi_durability::LaneStats::default(),
+            barrier: kivi_durability::BarrierCost::default(),
         }
     }
 

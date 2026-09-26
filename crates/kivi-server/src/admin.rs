@@ -207,6 +207,54 @@ struct CommitDto {
     queue_depth: Option<usize>,
     queue_depth_max: Option<usize>,
     in_flight: Option<bool>,
+    /// End-to-end mutation latency, decomposed per mutation into the phases
+    /// that add up to a client's observed durable-write latency. See
+    /// [`kivi_engine::CommitStages`]: `barrier_us` is the only phase the
+    /// disk controls, and `notify_us` is the only one polling granularity
+    /// controls.
+    stages: Option<StageDto>,
+    /// Barrier wall time split on the durability lane: record encoding, the
+    /// file write, and the flush to stable storage.
+    barrier: Option<BarrierDto>,
+}
+
+/// Per-mutation means of the end-to-end commit latency decomposition, in
+/// microseconds, plus the `mutations` they are averaged over.
+#[derive(Debug, Clone, Serialize)]
+struct StageDto {
+    mutations: u64,
+    total_us: u64,
+    pre_barrier_us: u64,
+    barrier_us: u64,
+    lane_us: u64,
+    notify_us: u64,
+    handoff_us: u64,
+    seal_us: u64,
+    append_us: u64,
+    lane_pre_us: u64,
+    lane_post_us: u64,
+    post_barrier_us: u64,
+}
+
+/// Barrier wall time as the lane thread measured it, split into the three
+/// phases that have different remedies.
+#[derive(Debug, Clone, Serialize)]
+struct BarrierDto {
+    batches: u64,
+    records: u64,
+    records_per_batch_avg: f64,
+    encode_us: u64,
+    write_us: u64,
+    fsync_us: u64,
+    fsync_max_us: u64,
+    rotate_us: u64,
+    frame_us: u64,
+    rotations: u64,
+}
+
+/// Per-mutation mean of an accumulating nanosecond total, in microseconds.
+fn per_mutation_us(total_ns: u64, mutations: u64) -> u64 {
+    total_ns / mutations.max(1) / 1_000
 }
 
 /// Checkpoints: installed current/previous per tablet plus WAL retention.
@@ -477,6 +525,58 @@ async fn durability(State(state): State<AdminState>) -> Result<Json<DurabilityDt
                 queue_depth: Some(metrics.queue_depth),
                 queue_depth_max: Some(metrics.queue_depth_max),
                 in_flight: Some(metrics.in_flight),
+                stages: Some(StageDto {
+                    mutations: metrics.stages.mutations,
+                    total_us: per_mutation_us(metrics.stages.total_ns, metrics.stages.mutations),
+                    pre_barrier_us: per_mutation_us(
+                        metrics.stages.pre_barrier_ns,
+                        metrics.stages.mutations,
+                    ),
+                    barrier_us: per_mutation_us(
+                        metrics.stages.barrier_ns,
+                        metrics.stages.mutations,
+                    ),
+                    lane_us: per_mutation_us(metrics.stages.lane_ns, metrics.stages.mutations),
+                    notify_us: per_mutation_us(metrics.stages.notify_ns, metrics.stages.mutations),
+                    handoff_us: per_mutation_us(
+                        metrics.stages.handoff_ns,
+                        metrics.stages.mutations,
+                    ),
+                    seal_us: per_mutation_us(metrics.stages.seal_ns, metrics.stages.mutations),
+                    append_us: per_mutation_us(metrics.stages.append_ns, metrics.stages.mutations),
+                    lane_pre_us: per_mutation_us(
+                        metrics.stages.lane_pre_ns,
+                        metrics.stages.mutations,
+                    ),
+                    lane_post_us: per_mutation_us(
+                        metrics.stages.lane_post_ns,
+                        metrics.stages.mutations,
+                    ),
+                    post_barrier_us: per_mutation_us(
+                        metrics.stages.post_barrier_ns,
+                        metrics.stages.mutations,
+                    ),
+                }),
+                barrier: {
+                    let batches = metrics.barrier.batches;
+                    #[allow(clippy::cast_precision_loss)]
+                    Some(BarrierDto {
+                        batches,
+                        records: metrics.barrier.records,
+                        records_per_batch_avg: if batches == 0 {
+                            0.0
+                        } else {
+                            metrics.barrier.records as f64 / batches as f64
+                        },
+                        encode_us: metrics.barrier.encode_ns / batches.max(1) / 1_000,
+                        write_us: metrics.barrier.write_ns / batches.max(1) / 1_000,
+                        fsync_us: metrics.barrier.fsync_ns / batches.max(1) / 1_000,
+                        fsync_max_us: metrics.barrier.fsync_max_ns / 1_000,
+                        rotate_us: metrics.barrier.rotate_ns / batches.max(1) / 1_000,
+                        frame_us: metrics.barrier.frame_ns / batches.max(1) / 1_000,
+                        rotations: metrics.barrier.rotations,
+                    })
+                },
             }),
             None => commit_out.push(CommitDto {
                 worker: id,
@@ -497,6 +597,8 @@ async fn durability(State(state): State<AdminState>) -> Result<Json<DurabilityDt
                 queue_depth: None,
                 queue_depth_max: None,
                 in_flight: None,
+                stages: None,
+                barrier: None,
             }),
         }
     }
@@ -664,7 +766,6 @@ struct FabricWorkerDto {
     stale_completions: u64,
     parked_resumes: u64,
     admission_rejects: u64,
-    locators: usize,
     offcore_queued: usize,
     offcore_inflight: usize,
     moves_queued: usize,
@@ -729,7 +830,6 @@ async fn fabric(State(state): State<AdminState>) -> Result<Json<FabricDto>, Stat
             stale_completions: snap.stale_completions,
             parked_resumes: snap.parked_resumes,
             admission_rejects: snap.admission_rejects,
-            locators: snap.locators,
             offcore_queued: report.offcore_depth.0,
             offcore_inflight: report.offcore_depth.1,
             moves_queued: report.move_depth,

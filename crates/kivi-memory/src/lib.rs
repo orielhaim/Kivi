@@ -46,7 +46,6 @@ pub mod error;
 pub mod fabric;
 pub mod handle;
 pub mod intent;
-pub mod journal;
 pub mod movement;
 pub mod numa;
 pub mod nvme;
@@ -76,10 +75,6 @@ pub use handle::{BehaviorClass, ObjectHandle};
 pub use intent::{
     CoherenceRequirement, LocalityRequirement, MaterializationIntent, SharingScope, TenantTag,
     VolatilityAllowed,
-};
-pub use journal::{
-    JournalEntry, JournalFile, import_from_entry, journal_append_batch, journal_compact,
-    journal_load, open_material_provider,
 };
 pub use movement::{BoundedMoveQueue, MovementBudget, MovementScheduler};
 pub use numa::{NumaTopology, OsNuma};

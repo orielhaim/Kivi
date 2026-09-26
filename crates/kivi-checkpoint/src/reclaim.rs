@@ -52,12 +52,21 @@ pub struct LaneReclaim {
 /// Returns per-lane plans sorted by lane. A lane with no summaries keeps a
 /// floor pointing at its active segment.
 #[must_use]
+/// `live_fabric` names the bulk values still live somewhere in the
+/// cluster, or is `None` when that set could not be established. A segment
+/// holding a live value's bytes is never reclaimed, however far the commit
+/// floors have advanced: a value's bytes live in the WAL for as long as the
+/// value is live, and only supersession frees them. `None` pins *every*
+/// fabric-bearing segment, because an incomplete answer is not evidence that
+/// a value is dead.
+#[allow(clippy::too_many_arguments)]
 pub fn plan_reclaim<S: std::hash::BuildHasher>(
     summaries: &std::collections::HashMap<u16, Vec<SealedSegmentSummary>, S>,
     active: &std::collections::HashMap<u16, u64, S>,
     active_first_batch: &std::collections::HashMap<u16, u64, S>,
     next_batch: &std::collections::HashMap<u16, u64, S>,
     floors: &std::collections::HashMap<TabletId, u64, S>,
+    live_fabric: Option<&std::collections::HashSet<u64, S>>,
 ) -> Vec<LaneReclaim> {
     let mut lanes: Vec<u16> = summaries.keys().copied().collect();
     for lane in active.keys() {
@@ -89,7 +98,8 @@ pub fn plan_reclaim<S: std::hash::BuildHasher>(
                             Some((summary.segment, summary_first_batch(summary, watermark)));
                         break;
                     }
-                    if segment_covered(summary, floors) {
+                    if segment_covered(summary, floors) && !holds_live_fabric(summary, live_fabric)
+                    {
                         obsolete.push(summary.segment);
                     } else {
                         first_retained =
@@ -139,6 +149,23 @@ fn segment_covered<S: std::hash::BuildHasher>(
         .all(|(tablet, max)| floors.get(tablet).is_some_and(|floor| *max <= *floor))
 }
 
+/// Whether the segment still holds the bytes of a live bulk value.
+/// Supersession is the only thing that frees them, so the commit floors
+/// alone must never drop a segment a live root still depends on. An unknown
+/// live set pins every fabric-bearing segment.
+fn holds_live_fabric<S: std::hash::BuildHasher>(
+    summary: &SealedSegmentSummary,
+    live: Option<&std::collections::HashSet<u64, S>>,
+) -> bool {
+    if summary.fabric_ids.is_empty() {
+        return false;
+    }
+    match live {
+        None => true,
+        Some(live) => summary.fabric_ids.iter().any(|id| live.contains(id)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,6 +181,7 @@ mod tests {
                     (TabletId::from_u64(tablet), CommitPosition::from_u64(commit))
                 })
                 .collect(),
+            fabric_ids: Vec::new(),
         }
     }
 
@@ -181,7 +209,7 @@ mod tests {
         )]);
         let (active, first_batch, next) = lane_maps(4, 7, 8);
         let floors = HashMap::from([(TabletId::from_u64(1), 20)]);
-        let plans = plan_reclaim(&summaries, &active, &first_batch, &next, &floors);
+        let plans = plan_reclaim(&summaries, &active, &first_batch, &next, &floors, None);
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].obsolete, vec![1, 2]);
         assert_eq!(plans[0].floor.first_segment, 3);
@@ -203,7 +231,7 @@ mod tests {
         )]);
         let (active, first_batch, next) = lane_maps(4, 7, 8);
         let floors = HashMap::from([(TabletId::from_u64(1), 20)]);
-        let plans = plan_reclaim(&summaries, &active, &first_batch, &next, &floors);
+        let plans = plan_reclaim(&summaries, &active, &first_batch, &next, &floors, None);
         assert_eq!(plans[0].obsolete, vec![1]);
         assert_eq!(plans[0].floor.first_segment, 2);
         assert_eq!(plans[0].floor.first_batch, 2);
@@ -215,12 +243,12 @@ mod tests {
         let (active, first_batch, next) = lane_maps(2, 3, 4);
         // Tablet 2's floor is below the segment max: the whole segment stays.
         let floors = HashMap::from([(TabletId::from_u64(1), 50), (TabletId::from_u64(2), 90)]);
-        let plans = plan_reclaim(&summaries, &active, &first_batch, &next, &floors);
+        let plans = plan_reclaim(&summaries, &active, &first_batch, &next, &floors, None);
         assert!(plans[0].obsolete.is_empty());
         assert_eq!(plans[0].floor.first_segment, 1);
         // Tablet 2 catches up: now reclaimable.
         let floors = HashMap::from([(TabletId::from_u64(1), 50), (TabletId::from_u64(2), 99)]);
-        let plans = plan_reclaim(&summaries, &active, &first_batch, &next, &floors);
+        let plans = plan_reclaim(&summaries, &active, &first_batch, &next, &floors, None);
         assert_eq!(plans[0].obsolete, vec![1]);
         assert_eq!(plans[0].floor.first_segment, 2);
         assert_eq!(plans[0].floor.first_batch, 3);
@@ -234,10 +262,18 @@ mod tests {
                 segment: 1,
                 first_batch_seq: None,
                 records: Vec::new(),
+                fabric_ids: Vec::new(),
             }],
         )]);
         let (active, first_batch, next) = lane_maps(2, 3, 4);
-        let plans = plan_reclaim(&summaries, &active, &first_batch, &next, &HashMap::new());
+        let plans = plan_reclaim(
+            &summaries,
+            &active,
+            &first_batch,
+            &next,
+            &HashMap::new(),
+            None,
+        );
         assert_eq!(plans[0].obsolete, vec![1]);
     }
 
@@ -247,7 +283,14 @@ mod tests {
         // segment. Floors only exist for checkpointed tablets.
         let summaries = HashMap::from([(0, vec![summary(1, 1, vec![(9, 3)])])]);
         let (active, first_batch, next) = lane_maps(2, 3, 4);
-        let plans = plan_reclaim(&summaries, &active, &first_batch, &next, &HashMap::new());
+        let plans = plan_reclaim(
+            &summaries,
+            &active,
+            &first_batch,
+            &next,
+            &HashMap::new(),
+            None,
+        );
         assert!(plans[0].obsolete.is_empty());
     }
 }

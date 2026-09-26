@@ -157,6 +157,20 @@ impl BenchTarget for KiviNativeTarget {
     }
 
     fn execute_batch_with_payload(&mut self, ops: &[WorkloadOp], payload: &[u8]) -> Vec<OpOutcome> {
+        // Deliberately sequential. The native client exposes one
+        // request-at-a-time API whose frames therefore reach the server in
+        // submission order, and submission order is load-bearing: a 2PC
+        // prepare must be admitted before its finalize, and any operation
+        // pair that observes another can diverge if the wire order changes.
+        //
+        // So `--pipeline` cannot express concurrency for this frontend. It
+        // is a real gap in the native client, not in the server: the server
+        // admits and answers many in-flight requests per connection
+        // concurrently, and a batched in-order send would use that. Until
+        // the client has one, the honest reading of native pipeline numbers
+        // is "unchanged", and cross-frontend pipeline comparisons must say
+        // so rather than compare RESP's real pipelining against a serial
+        // loop.
         ops.iter()
             .map(|op| execute_native(&self.client, op, payload))
             .collect()

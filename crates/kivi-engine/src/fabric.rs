@@ -36,46 +36,18 @@ use kivi_types::{TabletId, WorkerId};
 
 use kivi_memory::offcore_lane::{OffcoreLaneGuard, OffcoreLaneHandle, OffcoreReply, PromotedBytes};
 
-/// Re-exported journal truth (owned by `kivi-memory`, shared with the
-/// durability lane and recovery): one codec, one set of semantics.
-pub use kivi_memory::{
-    JournalEntry, JournalFile, import_from_entry, journal_append_batch, journal_compact,
-    journal_load, open_material_provider,
-};
-
-/// Compacts one fabric journal to the records still needed: entries
-/// whose id is in `keep`, latest record per id (a prepared intent seals
-/// under version `0`, its finalize-commit re-seals under the
-/// authoritative version - only the latter protects reconstruction).
-/// Atomic rewrite; returns the kept record count. Best-effort like WAL
-/// reclamation: callers warn on failure, never fail a checkpoint over
-/// GC.
+/// Values at or below this stay inline in the WAL record (no arena slot,
+/// no off-core locator, no second durable representation).
 ///
-/// # Errors
-///
-/// Returns [`std::io::Error`] on filesystem failure (load, rewrite, or
-/// directory sync).
-pub fn compact_journal(
-    path: &Path,
-    keep: &HashSet<u64, impl std::hash::BuildHasher>,
-) -> std::io::Result<usize> {
-    let entries = journal_load(path)?;
-    let mut seen = HashSet::new();
-    let mut live = Vec::new();
-    for entry in entries.iter().rev() {
-        if keep.contains(&entry.fabric_id) && seen.insert(entry.fabric_id) {
-            live.push(entry.clone());
-        }
-    }
-    live.reverse();
-    let kept = live.len();
-    journal_compact(path, &live).map_err(std::io::Error::other)?;
-    Ok(kept)
-}
-
-/// Values at or below this stay inline `PutBytes` (tiny fast path).
-/// Must equal [`kivi_memory::TINY_INLINE_MAX`]; asserted in tests.
-pub const FABRIC_INLINE_MAX: usize = 256;
+/// The floor is a *value* judgement, not a technical limit. A small value
+/// costs the WAL only the bytes themselves; routing it through the fabric
+/// instead buys a second copy on the write path and an indirection on the
+/// read path, in exchange for nothing. The fabric earns its keep on real
+/// bulk, where keeping bytes out of the durable log and out of the object
+/// store is worth an arena slot and an off-core locator. One kibibyte is
+/// where that trade stops being favourable: below it the copy and the
+/// indirection dominate, above it the avoided bytes do.
+pub const FABRIC_INLINE_MAX: usize = 1024;
 
 /// Memory Fabric configuration: capacity policy per worker. One value
 /// shared by every worker; per-worker fabrics open beneath it.
@@ -284,8 +256,6 @@ impl FabricPaths {
 pub struct TabletFabric {
     fabric: MemoryFabric,
     lane: OffcoreLaneHandle,
-    /// Durable locators mirrored from seal replies + journal load.
-    locators: HashMap<u64, JournalEntry>,
     /// Parked promotion waits keyed by park sequence.
     parked: HashMap<u64, ParkedOp>,
     next_park: u64,
@@ -357,7 +327,6 @@ impl TabletFabric {
             Self {
                 fabric,
                 lane,
-                locators: HashMap::new(),
                 parked: HashMap::new(),
                 next_park: 1,
                 maint_waits: VecDeque::new(),
@@ -423,10 +392,70 @@ impl TabletFabric {
         Ok((id, len))
     }
 
-    /// Records a seal locator (durability lane reply): the durable
-    /// reconstruction source for `id` from here on.
-    pub fn note_sealed(&mut self, entry: JournalEntry) {
-        self.locators.insert(entry.fabric_id, entry);
+    /// Re-homes a value recovered from the WAL under the id its durable
+    /// record published it as.
+    ///
+    /// A replayed root names a fixed fabric id, so recovery cannot let
+    /// [`Self::stage`] mint a fresh one: the bytes have to land on the id the
+    /// log says they were published under or the root resolves to nothing.
+    ///
+    /// Residence mirrors the pressure the write path would have faced. The
+    /// value goes into the arena when there is room, and to the off-core
+    /// device when there is not — recovery must not be the moment a bounded
+    /// fabric discovers it cannot hold a working set it already accepted, so
+    /// the arena is a preference and the device is the fallback. Either way
+    /// the first read promotes back on demand.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FabricError`] when neither the arena nor the off-core
+    /// device can take the bytes. An id that is already resident is success:
+    /// a value sealed twice under one id (transaction prepare then
+    /// finalize) is normal, not corruption.
+    pub fn import_recovered(
+        &mut self,
+        tablet: TabletId,
+        fabric_id: u64,
+        version: u64,
+        bytes: &Bytes,
+    ) -> Result<(), FabricError> {
+        let mut intent = kivi_memory::MaterializationIntent::cold();
+        intent.tablet = Some(tablet);
+        if let Some(node) = self.numa_node {
+            intent.locality = kivi_memory::LocalityRequirement::PreferredNuma { node };
+        }
+        match self.fabric.insert_at(
+            fabric_id,
+            bytes.clone(),
+            version,
+            intent.clone(),
+            BehaviorClass::HotMutable,
+            Mutability::Mutable,
+        ) {
+            // A second seal of one id (transaction prepare then finalize) is
+            // expected, not corruption: the first import is already resident.
+            Ok(()) | Err(kivi_memory::MemoryError::Invalid { .. }) => return Ok(()),
+            Err(kivi_memory::MemoryError::Overloaded { .. }) => {}
+            Err(error) => return Err(FabricError::from(error)),
+        }
+        // Arena is full. The bytes are already in hand, so park them on the
+        // off-core device and register the locator: same durable truth, a
+        // residence the bounded arena does not have to hold.
+        let demoted = self
+            .lane
+            .demote_blocking(fabric_id, version, bytes.to_vec())
+            .map_err(FabricError::from)?;
+        self.fabric
+            .import_offcore(kivi_memory::OffcoreImport {
+                id: fabric_id,
+                version,
+                offset: demoted.offset,
+                len: demoted.len,
+                checksum: demoted.checksum,
+                intent,
+                class: BehaviorClass::ColdCandidate,
+            })
+            .map_err(FabricError::from)
     }
 
     /// Resolves a fabric reference synchronously when a valid arena
@@ -687,8 +716,6 @@ impl TabletFabric {
         }
         if self.fabric.retire_object(id).is_err() {
             self.retire_pending.insert(id);
-        } else {
-            self.locators.remove(&id);
         }
     }
 
@@ -697,7 +724,6 @@ impl TabletFabric {
         self.fabric.unpin(id);
         if !self.fabric.is_pinned(id) && self.retire_pending.remove(&id) {
             if self.fabric.retire_object(id).is_ok() {
-                self.locators.remove(&id);
             } else {
                 self.retire_pending.insert(id);
             }
@@ -771,7 +797,6 @@ impl TabletFabric {
             if !self.fabric.is_pinned(id) {
                 self.retire_pending.remove(&id);
                 if self.fabric.retire_object(id).is_ok() {
-                    self.locators.remove(&id);
                 } else {
                     self.retire_pending.insert(id);
                 }
@@ -937,7 +962,6 @@ impl TabletFabric {
             stale_completions: self.stale_completions,
             parked_resumes: self.parked_resumes,
             admission_rejects: self.admission_rejects,
-            locators: self.locators.len(),
         }
     }
 
@@ -1012,17 +1036,20 @@ pub struct FabricStatsSnapshot {
     pub parked_resumes: u64,
     /// Staging admission rejections (backpressure events).
     pub admission_rejects: u64,
-    /// Durable locators mirrored in memory.
-    pub locators: usize,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The inline floor is a policy choice, not a mirror of the arena's
+    /// tiny-value path: it decides whether a value is worth an arena slot and
+    /// an off-core locator. Pinning it to the arena's internal tiny constant
+    /// would make that policy a side effect of a storage detail.
     #[test]
-    fn inline_threshold_matches_fabric_tiny_path() {
-        assert_eq!(FABRIC_INLINE_MAX, kivi_memory::TINY_INLINE_MAX);
+    fn inline_floor_is_the_policy_value_not_the_arena_tiny_path() {
+        const { assert!(FABRIC_INLINE_MAX > kivi_memory::TINY_INLINE_MAX) };
+        assert_eq!(FABRIC_INLINE_MAX, 1024);
     }
 
     #[test]

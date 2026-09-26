@@ -84,7 +84,9 @@
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
+use bytes::Bytes;
 use kivi_codec::integrity::crc32c_checksum;
 use kivi_codec::{CodecError, Decode, Encode};
 use kivi_state::{DurableOutcome, Mutation, OperationResult};
@@ -98,7 +100,8 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use crate::error::{DurabilityError, RecoveryError};
 use crate::fs::{create_dir_all_sync, sync_file};
 use crate::provider::{
-    CommitProof, DurabilityLevel, DurabilityProvider, LaneStats, PersistIntent, StorageHealth,
+    BarrierCost, CommitProof, DurabilityLevel, DurabilityProvider, LaneStats, PersistIntent,
+    StorageHealth,
 };
 
 /// Magic word: ASCII `"KVWL"` read as a little-endian `u32`.
@@ -129,6 +132,8 @@ pub const DEFAULT_SEGMENT_TARGET_BYTES: u64 = 256 * 1024 * 1024;
 pub const RECORD_KIND_MUTATION: u16 = 1;
 /// Terminal-outcome record kind (see [`WalRecord::Outcome`]).
 pub const RECORD_KIND_OUTCOME: u16 = 2;
+/// Bulk-value record kind (see [`WalRecord::Material`]).
+pub const RECORD_KIND_MATERIAL: u16 = 3;
 /// Record format version for every kind minted in this stage.
 pub const RECORD_VERSION_1: u16 = 1;
 
@@ -246,6 +251,41 @@ pub struct OutcomeRecord {
     pub outcome: DurableOutcome,
 }
 
+/// One value that a [`WalRecord::Mutation`] in the *same physical batch*
+/// installs by reference instead of by value.
+///
+/// Bulk values live here rather than in a side file so that one flush
+/// makes a value and the record naming it durable together. That is the
+/// whole point: with the bytes in a second file, a correct
+/// durable-before-reference ordering needs a *second* platform flush per
+/// batch, and a flush costs orders of magnitude more than the bytes do. A
+/// single ordered log makes the ordering structural — a replayed batch
+/// always has its material — instead of something three files have to
+/// agree on.
+///
+/// `commit` is the position of the mutation that installs the reference, so
+/// segment reclamation keeps these bytes exactly as long as it keeps the
+/// root that names them. Once a checkpoint absorbs the root, the band owns
+/// the value and the segment is free to go.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaterialRecord {
+    /// Owning tablet (the same tablet as the installing mutation).
+    pub tablet: TabletId,
+    /// Fabric object id the installing mutation's reference names.
+    pub fabric_id: u64,
+    /// Commit position of the installing mutation. Shared deliberately:
+    /// reclamation coverage for the bytes is then identical to coverage for
+    /// the root, with no second floor to keep in step.
+    pub commit: kivi_types::CommitPosition,
+    /// Version this seal publishes the value under (`0` for a prepared
+    /// transaction intent, which finalizes under the authoritative version).
+    pub version: u64,
+    /// CRC32C of `bytes`, re-verified on recovery.
+    pub checksum: u32,
+    /// The value itself.
+    pub bytes: Bytes,
+}
+
 /// One logical WAL record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WalRecord {
@@ -253,6 +293,8 @@ pub enum WalRecord {
     Mutation(MutationRecord),
     /// Terminal outcome with no mutation.
     Outcome(OutcomeRecord),
+    /// Bulk value referenced by a mutation in the same batch.
+    Material(MaterialRecord),
 }
 
 /// One physical WAL entry: tablet-committed data or consensus metadata.
@@ -281,6 +323,7 @@ impl WalRecord {
         match self {
             Self::Mutation(record) => record.tablet,
             Self::Outcome(record) => record.tablet,
+            Self::Material(record) => record.tablet,
         }
     }
 
@@ -290,15 +333,19 @@ impl WalRecord {
         match self {
             Self::Mutation(record) => record.commit,
             Self::Outcome(record) => record.commit,
+            Self::Material(record) => record.commit,
         }
     }
 
-    /// The commit timestamp replay re-applies under.
+    /// The commit timestamp replay re-applies under. Material records carry
+    /// no timestamp of their own: they are installed by the mutation that
+    /// shares their commit position, and that mutation's `now` governs.
     #[must_use]
     pub fn now(&self) -> kivi_types::WallTimestamp {
         match self {
             Self::Mutation(record) => record.now,
             Self::Outcome(record) => record.now,
+            Self::Material(_) => kivi_types::WallTimestamp::from_micros(0),
         }
     }
 
@@ -308,6 +355,9 @@ impl WalRecord {
         match self {
             Self::Mutation(record) => record.namespace,
             Self::Outcome(record) => record.namespace,
+            // Material rides with a tablet-committed mutation and is grouped
+            // by tablet at recovery, so it records no namespace of its own.
+            Self::Material(_) => NamespaceId::from_u64(0),
         }
     }
 
@@ -317,6 +367,7 @@ impl WalRecord {
         match self {
             Self::Mutation(record) => record.epoch,
             Self::Outcome(record) => record.epoch,
+            Self::Material(_) => TabletEpoch::from_u64(0),
         }
     }
 
@@ -326,15 +377,18 @@ impl WalRecord {
         match self {
             Self::Mutation(record) => record.guard,
             Self::Outcome(record) => record.guard,
+            Self::Material(_) => WriteGuardGeneration::from_u64(0),
         }
     }
 
-    /// The retry identity, if the request carried one.
+    /// The retry identity, if the request carried one. Material bytes
+    /// belong to the mutation beside them, so they never carry one.
     #[must_use]
     pub fn identity(&self) -> Option<MutationIdentity> {
         match self {
             Self::Mutation(record) => record.identity,
             Self::Outcome(record) => record.identity,
+            Self::Material(_) => None,
         }
     }
 }
@@ -462,6 +516,14 @@ fn encode_record_body(record: &WalRecord, out: &mut Vec<u8>) -> Result<(), Durab
             entry.outcome.encode(&mut outcome);
             push_wal_blob(out, &outcome)?;
         }
+        WalRecord::Material(entry) => {
+            out.extend_from_slice(&entry.tablet.as_u64().to_le_bytes());
+            out.extend_from_slice(&entry.commit.as_u64().to_le_bytes());
+            out.extend_from_slice(&entry.fabric_id.to_le_bytes());
+            out.extend_from_slice(&entry.version.to_le_bytes());
+            out.extend_from_slice(&entry.checksum.to_le_bytes());
+            push_wal_blob(out, &entry.bytes)?;
+        }
     }
     Ok(())
 }
@@ -508,6 +570,7 @@ fn encode_batch_body(records: &[WalRecord]) -> Result<Vec<u8>, DurabilityError> 
         let kind = match record {
             WalRecord::Mutation(_) => RECORD_KIND_MUTATION,
             WalRecord::Outcome(_) => RECORD_KIND_OUTCOME,
+            WalRecord::Material(_) => RECORD_KIND_MATERIAL,
         };
         frame_record(&mut body, kind, |out| encode_record_body(record, out))?;
     }
@@ -644,6 +707,7 @@ fn decode_blob_prefix(input: &[u8]) -> Result<(&[u8], usize), RecordFault> {
     Ok((&input[4..4 + len], 4 + len))
 }
 
+#[allow(clippy::too_many_lines)]
 fn decode_record_body(kind: u16, version: u16, body: &[u8]) -> Result<WalEntry, RecordFault> {
     // Consensus kinds decode through the Raft formats (shared framing,
     // same fault contract, positions attached by the scanner).
@@ -724,11 +788,66 @@ fn decode_record_body(kind: u16, version: u16, body: &[u8]) -> Result<WalEntry, 
                 },
             ))))
         }
+        RECORD_KIND_MATERIAL => {
+            let (tablet, mut at) = decode_fixed_u64(body, "truncated material tablet")?;
+            let (commit, used) = decode_fixed_u64(&body[at..], "truncated material commit")?;
+            at += used;
+            let (fabric_id, used) = decode_fixed_u64(&body[at..], "truncated material id")?;
+            at += used;
+            let (version, used) = decode_fixed_u64(&body[at..], "truncated material version")?;
+            at += used;
+            if body.len() < at + 4 {
+                return Err(RecordFault::Corrupt("truncated material checksum"));
+            }
+            let checksum = u32::from_le_bytes(
+                body[at..at + 4]
+                    .try_into()
+                    .map_err(|_| RecordFault::Corrupt("truncated material checksum"))?,
+            );
+            at += 4;
+            let (value, used) = decode_blob_prefix(&body[at..])?;
+            at += used;
+            if at != body.len() {
+                return Err(RecordFault::Corrupt("trailing bytes in material record"));
+            }
+            // The footer already protects the batch; this re-check makes a
+            // value that survived framing but not its own checksum fail here,
+            // where the fabric id is still known and the damage attributable.
+            if crc32c_checksum(value) != checksum {
+                return Err(RecordFault::Corrupt("material checksum mismatch"));
+            }
+            Ok(WalEntry::Tablet(Box::new(WalRecord::Material(
+                MaterialRecord {
+                    tablet: TabletId::from_u64(tablet),
+                    commit: kivi_types::CommitPosition::from_u64(commit),
+                    fabric_id,
+                    version,
+                    checksum,
+                    bytes: Bytes::copy_from_slice(value),
+                },
+            ))))
+        }
         other => Err(RecordFault::Unknown {
             kind: other,
             version,
         }),
     }
+}
+
+/// Reads one little-endian `u64` field, reporting a torn or corrupt prefix
+/// rather than panicking on a short slice.
+fn decode_fixed_u64(input: &[u8], what: &'static str) -> Result<(u64, usize), RecordFault> {
+    let bytes: [u8; 8] = input
+        .get(0..8)
+        .and_then(|slice| slice.try_into().ok())
+        .ok_or(RecordFault::Corrupt(what))?;
+    Ok((u64::from_le_bytes(bytes), 8))
+}
+
+/// Nanoseconds of a duration, saturating rather than wrapping: a bad or
+/// absurd reading must never make a cumulative cost counter go backwards.
+fn elapsed_ns(since: Instant) -> u64 {
+    u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// Formats a lane directory name (`lane-0007`).
@@ -785,6 +904,14 @@ pub struct SealedSegmentSummary {
     pub first_batch_seq: Option<u64>,
     /// Every record's tablet and commit position, in file order.
     pub records: Vec<(TabletId, kivi_types::CommitPosition)>,
+    /// Fabric ids whose bulk values this segment still holds.
+    ///
+    /// A value's bytes live in the WAL for as long as the value is live, so
+    /// this is what keeps a segment out of the reclaim plan: the commit
+    /// floor can legitimately pass a root whose value nobody has
+    /// superseded, and dropping the segment then would strand that root.
+    /// Segments stop being pinned the moment their ids are superseded.
+    pub fabric_ids: Vec<u64>,
 }
 
 /// Formats a segment file name (`00000000000000000007.wal`).
@@ -811,6 +938,8 @@ pub struct WorkerLaneStats {
     pub health: StorageHealth,
     /// Cumulative counters.
     pub stats: LaneStats,
+    /// Where barrier wall time goes on this lane.
+    pub barrier: BarrierCost,
 }
 
 /// One worker's WAL lane: an open segment file plus rotation and recovery.
@@ -838,6 +967,7 @@ pub struct LocalWalLane {
     segments: u64,
     next_batch_seq: u64,
     stats: LaneStats,
+    barrier: BarrierCost,
     health: StorageHealth,
 }
 
@@ -877,6 +1007,7 @@ impl LocalWalLane {
             segments: 0,
             next_batch_seq: 1,
             stats: LaneStats::default(),
+            barrier: BarrierCost::default(),
             health: StorageHealth::Healthy,
         };
         lane_state.discover()?;
@@ -911,6 +1042,7 @@ impl LocalWalLane {
             segments: self.segments,
             health: self.health,
             stats: self.stats,
+            barrier: self.barrier,
         }
     }
 
@@ -1131,6 +1263,7 @@ impl LocalWalLane {
                 segment,
                 first_batch_seq: None,
                 records: Vec::new(),
+                fabric_ids: Vec::new(),
             });
         }
         if bytes.len() < SEGMENT_HEADER_LEN + BATCH_HEADER_LEN {
@@ -1155,6 +1288,16 @@ impl LocalWalLane {
                     // through purge markers (stage H), and physical
                     // reclamation stays conservative until then.
                     WalEntry::Tablet(record) => Some((record.tablet(), record.commit())),
+                    WalEntry::Consensus(_) => None,
+                })
+                .collect(),
+            fabric_ids: records
+                .iter()
+                .filter_map(|entry| match &entry.entry {
+                    WalEntry::Tablet(record) => match &**record {
+                        WalRecord::Material(material) => Some(material.fabric_id),
+                        _ => None,
+                    },
                     WalEntry::Consensus(_) => None,
                 })
                 .collect(),
@@ -1203,8 +1346,10 @@ impl LocalWalLane {
                 code: None,
             });
         }
+        let encode_started = Instant::now();
         let body = encode_batch_body(records)?;
-        self.seal_encoded_body(&body, records.len())
+        let encode = encode_started.elapsed();
+        self.seal_encoded_body(&body, records.len(), encode)
     }
 
     /// Appends one consensus batch (a group's Raft records) with exactly
@@ -1226,8 +1371,10 @@ impl LocalWalLane {
                 code: None,
             });
         }
+        let encode_started = Instant::now();
         let body = encode_raft_batch(records)?;
-        self.seal_encoded_body(&body, records.len())
+        let encode = encode_started.elapsed();
+        self.seal_encoded_body(&body, records.len(), encode)
     }
 
     /// Seals a pre-encoded batch body: rotation, header/footer, write,
@@ -1236,13 +1383,18 @@ impl LocalWalLane {
         &mut self,
         body: &[u8],
         count: usize,
+        encode: std::time::Duration,
     ) -> Result<CommitProof, DurabilityError> {
         let batch_len = (BATCH_HEADER_LEN + body.len() + BATCH_FOOTER_LEN) as u64;
         if self.file.is_none()
             || (self.segment_bytes > 0 && self.segment_bytes + batch_len > self.target_bytes)
         {
+            let rotate_started = Instant::now();
             self.rotate()?;
+            self.barrier.rotate_ns += elapsed_ns(rotate_started);
+            self.barrier.rotations += 1;
         }
+        let frame_started = Instant::now();
         let batch_seq = self.next_batch_seq;
         let body_len = u32::try_from(body.len()).map_err(|_| DurabilityError::InvalidConfig {
             reason: "WAL batch body exceeds u32 length",
@@ -1277,16 +1429,31 @@ impl LocalWalLane {
         footer_bytes.copy_from_slice(footer.as_bytes());
         let footer_crc = crc32c_checksum(&footer_bytes[..BATCH_FOOTER_LEN - 4]);
         footer_bytes[BATCH_FOOTER_LEN - 4..].copy_from_slice(&footer_crc.to_le_bytes());
+        self.barrier.frame_ns += elapsed_ns(frame_started);
         let file = self.file.as_mut().expect("lane file open after rotate");
         let path = self.dir.join(segment_file_name(self.segment_seq));
-        let write_outcome = (|| -> io::Result<()> {
-            file.write_all(&header_bytes)?;
-            file.write_all(body)?;
-            file.write_all(&footer_bytes)?;
+        // One contiguous frame, one checked write.
+        //
+        // The frame is assembled rather than written as three pieces
+        // because a scatter write has to be looped by hand to be correct
+        // (`write_all` is the only primitive that guarantees a full
+        // write), and because a single append makes the flush's writeback
+        // cover one contiguous range instead of three. The copy is one
+        // pass over a body the encoder just produced — nanoseconds next to
+        // the barrier it precedes.
+        let mut frame = Vec::with_capacity(BATCH_HEADER_LEN + body.len() + BATCH_FOOTER_LEN);
+        frame.extend_from_slice(&header_bytes);
+        frame.extend_from_slice(body);
+        frame.extend_from_slice(&footer_bytes);
+        let (write_cost, fsync_cost) = (|| {
+            let write_started = Instant::now();
+            file.write_all(&frame)?;
+            let write = write_started.elapsed();
+            let fsync_started = Instant::now();
             crate::fs::sync_file(file)?;
-            Ok(())
-        })();
-        if let Err(error) = write_outcome {
+            Ok::<_, io::Error>((write, fsync_started.elapsed()))
+        })()
+        .map_err(|error| {
             // Health follows the failure kind: full disks go read-only
             // (explicit, recoverable), anything else fails the lane
             // terminally. Either way the typed error below carries the
@@ -1298,8 +1465,9 @@ impl LocalWalLane {
                 self.health = StorageHealth::Failed;
                 tracing::error!(lane = self.lane, path = %path.display(), %error, "WAL lane failed");
             }
-            return Err(DurabilityError::io("append WAL batch", &path, &error));
-        }
+            DurabilityError::io("append WAL batch", &path, &error)
+        })?;
+        self.barrier.record(count, encode, write_cost, fsync_cost);
         self.segment_bytes += batch_len;
         self.next_batch_seq += 1;
         self.stats.batches += 1;

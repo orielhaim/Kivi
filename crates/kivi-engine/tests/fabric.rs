@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use kivi_engine::{
     BatchPolicy, CheckpointConfig, DurabilityMode, DurableConfig, EngineConfig, EngineError,
-    FabricConfig, FabricPaths, LocalClient, LocalEngine, Placement,
+    FabricConfig, LocalClient, LocalEngine, Placement,
 };
 use kivi_state::{Key, ObjectVersion, TxnExpect, TxnWrite, TxnWriteKind};
 use kivi_tablet::{DirectorySnapshot, HashPrefix, PartitionRange};
@@ -489,15 +489,50 @@ fn cross_tablet_batch_with_medium_values() {
     engine.shutdown().expect("clean shutdown");
 }
 
-fn flip_worker_zero_material(data_dir: &Path) {
-    let path = FabricPaths::worker(data_dir, 0)
-        .material_dir()
-        .join("materializations.dat");
-    let mut raw = std::fs::read(&path).expect("worker-0 material file present");
-    assert!(raw.len() > 64, "material file holds sealed records");
-    let flip_at = raw.len() - 8;
+/// Corrupts a sealed WAL batch body on a worker's lane.
+///
+/// A fabric value's bytes are durable *inside* the WAL batch that publishes
+/// them, so that batch is where damage has to be injected to prove recovery
+/// refuses to serve a root whose value is unreadable. The flip lands past
+/// the batch header so it hits body bytes, and the batch/footers CRCs are
+/// what must catch it.
+fn corrupt_worker_zero_wal(data_dir: &Path) {
+    let wal_dir = data_dir.join(kivi_durability::node::WAL_DIR_NAME);
+    let mut segments: Vec<_> = std::fs::read_dir(&wal_dir)
+        .expect("wal dir present")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .flat_map(|lane_dir| {
+            std::fs::read_dir(lane_dir)
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .collect::<Vec<_>>()
+        })
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("wal"))
+        })
+        .collect();
+    segments.sort();
+    // The largest segment is the one carrying sealed batches; a rotation
+    // can leave a newer header-only segment behind, which has nothing to
+    // corrupt.
+    let path = segments
+        .into_iter()
+        .max_by_key(|path| std::fs::metadata(path).map_or(0, |meta| meta.len()))
+        .expect("a WAL segment exists after durable writes");
+    let mut raw = std::fs::read(&path).expect("WAL segment readable");
+    assert!(
+        raw.len() > 80,
+        "WAL segment holds a framed batch beyond its header"
+    );
+    // Second half of the body: past any header, inside sealed bytes.
+    let flip_at = raw.len() / 2;
     raw[flip_at] ^= 0xFF;
-    std::fs::write(&path, raw).expect("clobber material record");
+    std::fs::write(&path, raw).expect("clobber WAL batch bytes");
 }
 
 #[test]
@@ -530,12 +565,12 @@ fn durable_supersede_checkpoint_restart() {
         Some(second),
         "v2 survives reopen"
     );
-    flip_worker_zero_material(scratch.path());
+    corrupt_worker_zero_wal(scratch.path());
     engine.shutdown().expect("clean shutdown");
     match LocalEngine::start(durable(scratch.path(), FabricConfig::default())) {
         Ok(running) => {
             let _ = running.shutdown();
-            panic!("restart on corrupt fabric material must fail, never serve absence");
+            panic!("restart on a corrupt durable value must fail, never serve absence");
         }
         Err(error) => {
             let detail = format!("{error:?}");
