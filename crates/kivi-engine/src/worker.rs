@@ -6,12 +6,10 @@
 //! never deadlock behind a full request queue. The worker loop polls control
 //! first on every iteration, then blocks in `select!` on both channels.
 //!
-//! This is deliberately not the final I/O reactor (no Tokio/Compio/Monoio,
-//! no `io_uring`, no sockets): it establishes the ownership and execution
-//! model — one mutable owner per tablet, synchronous execution, bounded
-//! admission — that every future reactor must preserve. Tablet count and
-//! request depth stay modest; there is one thread per worker, never per
-//! tablet or per request.
+//! One thread per worker, never per tablet or per request. The ownership
+//! model this establishes — one mutable owner per tablet, synchronous
+//! execution, bounded admission — is what the reactor frontend in
+//! [`crate::net`] also relies on.
 
 use core::fmt;
 use std::collections::HashMap;
@@ -550,11 +548,7 @@ impl WorkerHandle {
                     usize::try_from(id.as_u64()).unwrap_or(0),
                 );
                 if let Err(error) = placement.bind(slot) {
-                    tracing::error!(
-                        ?error,
-                        worker = id.as_u64(),
-                        "data worker could not be placed"
-                    );
+                    tracing::warn!(?error, worker = id.as_u64(), "data worker unbound");
                 }
                 run(
                     id, tablets, request_rx, control_rx, durability, chunks, fabric,
@@ -916,6 +910,20 @@ fn fabric_stats_report(
 }
 
 /// Handles one control message. Returns `false` when the worker must exit.
+/// Every prepared transaction intent across this worker's tablets, paired
+/// with the tablet that holds it.
+fn list_intents(tablets: &HashMap<TabletId, LiveTablet>) -> Vec<(TabletId, kivi_state::TxnIntent)> {
+    tablets
+        .values()
+        .flat_map(|live| {
+            live.store()
+                .snapshot_intents()
+                .into_iter()
+                .map(|intent| (live.id(), intent))
+        })
+        .collect()
+}
+
 pub(crate) fn handle_control(
     message: WorkerControl,
     tablets: &mut HashMap<TabletId, LiveTablet>,
@@ -993,15 +1001,7 @@ pub(crate) fn handle_control(
             true
         }
         WorkerControl::ListIntents { respond } => {
-            let intents = tablets
-                .values()
-                .flat_map(|live| {
-                    live.pending_intents()
-                        .into_iter()
-                        .map(|intent| (live.id(), intent))
-                })
-                .collect();
-            let _ = respond.try_send(intents);
+            let _ = respond.try_send(list_intents(tablets));
             true
         }
         WorkerControl::FabricLiveRoots { respond } => {

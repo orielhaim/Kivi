@@ -51,16 +51,6 @@
 //! values replicate as tiny `ReplaceChunkedRoot` mutations plus immutable
 //! bulk sidecars (see [`crate::sidecar`] and [`crate::gate`]).
 //!
-//! ## Supported operations
-//!
-//! The small/state-local semantic set replicates: inline `SET`, `DELETE`,
-//! `EXISTS`/reads, conditional `SET` (materialized at prepare),
-//! `COUNTER_ADD`, expiry mutations, `PERSIST`, and `SETRANGE` against
-//! inline bases. Large values replicate as [`Operation::SetChunked`] and
-//! friends once staged durably locally; `SETRANGE` against a chunked base
-//! restages here (untouched chunks reuse via content addressing) and
-//! followers fetch only missing sidecars before acknowledging.
-//!
 //! ## Leader-only writes
 //!
 //! Only the leader accepts strong mutations. Followers answer
@@ -68,7 +58,7 @@
 //! [`ConsensusError::LeaderUnknown`]); `OpenRaft` error types never cross
 //! the native protocol.
 //!
-//! ## Linearizable reads and follower reads (Phase 7 consistency layer)
+//! ## Linearizable reads and follower reads
 //!
 //! Reads execute under explicit contracts through the caller-side read
 //! front and the node-wide [`ConsistencyHub`]:
@@ -948,7 +938,7 @@ fn open_recovered_parts(config: &NodeConfig) -> Result<RecoveredParts, NodeOpenE
     }
     // Data-directory identity: adopt the static topology identity on
     // first formation, advance the incarnation on every restart.
-    let opened = kivi_durability::open_data_dir_with(
+    let opened = kivi_durability::open_data_dir(
         &config.data_dir,
         Some(kivi_durability::NodeSeed {
             cluster: config.topology.cluster,
@@ -1023,7 +1013,7 @@ fn open_recovered_parts(config: &NodeConfig) -> Result<RecoveredParts, NodeOpenE
     let tls = crate::transport::TlsMaterial {
         cert: peer_tls_cert,
         peer_certs: config.peer_certs.clone(),
-        trust: Some(crate::tls::empty_trust()),
+        trust: Some(Arc::default()),
         insecure_skip_verify: config.insecure_peer_tls,
     };
     Ok(RecoveredParts {
@@ -1699,7 +1689,6 @@ impl<'a> ReadFront<'a> {
                         path,
                     );
                     self.hub.note_served(self.tablet, contract, false);
-                    tracing::debug!("{}", served.describe());
                     return Ok(served);
                     // A planned cache hit without a cached outcome falls
                     // through to a live local read rather than failing.
@@ -1726,7 +1715,6 @@ impl<'a> ReadFront<'a> {
                     served.receipt.position,
                 );
                 self.hub.note_served(self.tablet, contract, false);
-                tracing::debug!("{}", served.describe());
                 Ok(served)
             }
             ReadPlan::BarrierThenServe { escalated } => {
@@ -1766,7 +1754,6 @@ impl<'a> ReadFront<'a> {
             served.receipt.position,
         );
         self.hub.note_served(self.tablet, contract, false);
-        tracing::debug!("{}", served.describe());
         Ok(served)
     }
 
@@ -1792,7 +1779,6 @@ impl<'a> ReadFront<'a> {
             served.receipt.position,
         );
         self.hub.note_served(self.tablet, contract, false);
-        tracing::debug!("{}", served.describe());
         Ok(served)
     }
 
@@ -1920,7 +1906,6 @@ impl<'a> ReadFront<'a> {
             served.receipt.position,
         );
         self.hub.note_served(self.tablet, contract, true);
-        tracing::debug!("{}", served.describe());
         Ok(served)
     }
 
@@ -1958,7 +1943,6 @@ impl<'a> ReadFront<'a> {
             served.receipt.position,
         );
         self.hub.note_served(self.tablet, contract, false);
-        tracing::debug!("{}", served.describe());
         Ok(served)
     }
 
@@ -2227,9 +2211,9 @@ where
         requests,
         ready,
     } = params;
-    // Mesh: one UDP endpoint bound to the topology's peer address; QUIC
-    // handshake plus H3 streams replace the old TCP listener/accept pump.
-    // A bind conflict fails loudly so the harness retries formation.
+    // Mesh: one UDP endpoint bound to the topology's peer address, carrying
+    // QUIC handshakes and H3 streams. A bind conflict fails loudly so the
+    // harness retries formation.
     let bulk_timeout = transport_config.bulk_timeout;
     // Lease-tick channel: cloned before the mesh takes the original.
     let tick_tx = serve_tx.clone();
@@ -2281,9 +2265,8 @@ where
             return;
         }
     };
-    // The single-group node keeps legacy static semantics: a fresh
-    // directory always founds (it serves exactly one fixed group, so
-    // there is no join path here to confuse with formation).
+    // A fresh directory always founds: this node serves exactly one fixed
+    // group, so there is no join path to confuse with formation.
     if let Err(error) = bootstrap_group(
         &BootstrapInputs {
             topology: &topology,

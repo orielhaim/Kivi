@@ -1,4 +1,4 @@
-//! Typed, bounded observation collection for Kivi's Phase 12 control loops.
+//! Typed, bounded observation collection for Kivi's control loops.
 //!
 //! The fabric accepts a closed set of domain signals, combines them by
 //! strongly typed scope, and emits deterministic snapshots. It retains only

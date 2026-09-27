@@ -1,4 +1,4 @@
-//! Phase 7 read contracts end to end over a real 3-process cluster:
+//! Read contracts end to end over a real 3-process cluster:
 //! every contract serves its documented semantics through failover and
 //! restart, proofs chain `AtLeast` reads, and foreign tokens fail as
 //! `StaleToken` instead of serving weak data.

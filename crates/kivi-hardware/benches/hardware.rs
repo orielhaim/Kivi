@@ -462,7 +462,13 @@ fn memory_policy_inherit(b: Bencher) {
 fn report() {
     let capabilities = Capabilities::detect();
     eprintln!("machine: {}", capabilities.topology.summary());
-    eprintln!("capabilities: {}", capabilities.report());
+    for mechanism in capabilities.mechanisms() {
+        eprintln!(
+            "  {}: {:?}",
+            mechanism.name,
+            mechanism.support.unavailable()
+        );
+    }
     eprintln!("huge pages: {:?}", capabilities.huge_pages);
     // The kernel's own accounting for a region Kivi advised, so a reader can
     // see whether the huge-page benchmarks measured a promoted mapping or two

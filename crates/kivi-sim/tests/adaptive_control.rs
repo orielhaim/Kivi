@@ -1,4 +1,4 @@
-//! Deterministic Phase 12 controller scenarios.
+//! Deterministic controller scenarios.
 #![allow(clippy::field_reassign_with_default)]
 
 use core::time::Duration;

@@ -26,8 +26,8 @@
 //! budgets, never by unbounded queues.
 //!
 //! Reactor boundary: Compio types appear only in this module (plus the
-//! affinity helper beside it). Swapping reactors later reimplements this
-//! file against the same tablet/routing/protocol vocabulary.
+//! affinity helper beside it). Nothing below the bridge refers to the reactor
+//! by name.
 
 use core::cell::{Cell, RefCell};
 use core::future::Future;
@@ -326,17 +326,7 @@ pub(crate) fn run_net(
         // gives it. Failing here would turn a cosmetic optimisation into a
         // correctness-bearing dependency, which is exactly what RFC §25
         // forbids.
-        tracing::warn!(
-            worker = id.as_u64(),
-            ?error,
-            "data worker could not be placed; running unbound",
-        );
-    } else {
-        tracing::debug!(
-            worker = id.as_u64(),
-            cpu = ?launch.placement.current_cpu(),
-            "data worker placed",
-        );
+        tracing::warn!(worker = id.as_u64(), ?error, "data worker unbound");
     }
     let tablet_map: HashMap<TabletId, LiveTablet> = tablets
         .into_iter()
@@ -459,7 +449,7 @@ async fn serve(
                 spawn_conn(stream, peer, Rc::clone(&shared));
             }
             Err(error) => {
-                tracing::warn!(worker = %shared.id.as_u64(), %error, "accept failed");
+                tracing::debug!(worker = %shared.id.as_u64(), %error, "accept failed");
                 compio::time::sleep(Duration::from_millis(10)).await;
             }
         }
@@ -2210,10 +2200,8 @@ impl Conn {
                 // Redirects are rare (once per range per client until cached),
                 // so a debug event here is signal, not hot-path noise.
                 tracing::debug!(
-                    worker = self.worker.as_u64(),
                     tablet = info.tablet.as_u64(),
                     owner = info.worker.as_u64(),
-                    dir_version = info.dir_version.as_u64(),
                     status = %status,
                     "route redirect"
                 );
@@ -3157,7 +3145,7 @@ impl Conn {
         reference: kivi_state::FabricRef,
     ) -> Result<Bytes, crate::fabric::FabricError> {
         use crate::fabric::FabricError;
-        // Phase 1: synchronous check + submit (borrows end here).
+        // Step 1: synchronous check + submit (borrows end here).
         let reply = {
             let current = self
                 .tablets
@@ -3177,12 +3165,12 @@ impl Conn {
                 Err(error) => return Err(error),
             }
         };
-        // Phase 2: suspend only this task (no borrows held).
+        // Step 2: suspend only this task (no borrows held).
         let outcome = reply
             .recv_async()
             .await
             .map_err(|_| FabricError::Overloaded)?;
-        // Phase 3: re-read the root, fence, and install (synchronous).
+        // Step 3: re-read the root, fence, and install (synchronous).
         let current = self
             .tablets
             .borrow()
@@ -4665,12 +4653,8 @@ async fn serve_conn(stream: TcpStream, peer: SocketAddr, shared: Rc<WorkerNet>) 
 
 /// Logs one connection outcome at its level.
 fn log_conn_exit(peer: SocketAddr, exit: ConnExit) {
-    match exit {
-        ConnExit::Clean => tracing::debug!(%peer, "connection closed"),
-        ConnExit::Violation(reason) => {
-            tracing::warn!(%peer, reason, "protocol violation; connection closed");
-        }
-        ConnExit::Io => tracing::debug!(%peer, "connection I/O ended"),
+    if let ConnExit::Violation(reason) = exit {
+        tracing::warn!(%peer, reason, "protocol violation; connection closed");
     }
 }
 

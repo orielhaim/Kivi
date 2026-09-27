@@ -53,27 +53,3 @@ pub use translate::{Action, ExecuteError, Executor, Immediate, RedisOp, Reply};
 /// Compatibility profile version string (pinned; future Redis releases do
 /// not change Kivi behavior automatically).
 pub const PROFILE_VERSION: &str = "Kivi RESP Compatibility Profile v1";
-
-/// One row of the machine-testable support table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CompatEntry {
-    /// Uppercase command name.
-    pub command: &'static str,
-    /// Compatibility class.
-    pub status: CompatClass,
-    /// One-line note.
-    pub notes: &'static str,
-}
-
-/// Returns the full support table, in registry order.
-#[must_use]
-pub fn compatibility_table() -> Vec<CompatEntry> {
-    REGISTRY
-        .iter()
-        .map(|spec| CompatEntry {
-            command: spec.name,
-            status: spec.compat,
-            notes: spec.notes,
-        })
-        .collect()
-}

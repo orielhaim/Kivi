@@ -719,7 +719,10 @@ fn submit_best_effort(
     run: impl FnOnce() -> Result<LaneValue, RedundancyError> + Send + 'static,
 ) {
     let Ok(lane) = worker.lane.lock() else {
-        tracing::warn!("redundancy {name} submit skipped: lane lock poisoned; local copy stands");
+        tracing::debug!(
+            name,
+            "redundancy submit skipped: lane lock poisoned; local copy stands"
+        );
         return;
     };
     match lane.submit(name, bytes, LanePriority::Background, None, run) {

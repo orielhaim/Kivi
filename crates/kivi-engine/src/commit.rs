@@ -834,11 +834,8 @@ type LaneRunner<'a> = &'a mut dyn FnMut(&mut dyn FnMut(&mut kivi_durability::Loc
 /// batch, then one barrier.
 ///
 /// One batch, one file, one flush. There is deliberately no second store
-/// for bulk values: durable-before-reference used to cost an extra platform
-/// flush per value plus another for the locator journal, which dominated
-/// write latency by an order of magnitude. Putting the bytes in the same
-/// ordered log makes the ordering a property of the log instead of a
-/// three-file agreement.
+/// for bulk values: putting the bytes in the same ordered log makes ordering a
+/// property of the log instead of a three-file agreement.
 fn seal_one_batch(
     job: &SealJob,
     with_lane: LaneRunner<'_>,
@@ -999,9 +996,7 @@ impl LaneHandle {
                 // is the one thing a barrier lane exists to avoid.
                 let slot = WorkerSlot::new(PlacementRole::DurabilityLane, ordinal);
                 if let Err(error) = placement.bind(slot) {
-                    tracing::error!(?error, "durability lane could not be placed");
-                } else {
-                    tracing::debug!(cpu = ?placement.current_cpu(), "durability lane placed");
+                    tracing::warn!(?error, "durability lane unbound");
                 }
                 lane_thread_main(lane, receive, &complete_thread);
             })

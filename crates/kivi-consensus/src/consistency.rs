@@ -1,4 +1,4 @@
-//! Phase 7 consistency execution layer: one hub per node binding authority,
+//! Consistency execution layer: one hub per node binding authority,
 //! freshness evidence, the strong cache, the roster-lease engines, and the
 //! read-authority providers.
 //!
@@ -10,13 +10,6 @@
 //! fence syncs, and waits still hop to the owner thread, which alone may
 //! touch the Raft handle). Clocks always arrive inside [`ReadContext`];
 //! nothing here reads one.
-//!
-//! ```text
-//! authority ──► freshness ──► cached read ──► validation ──► serve OR fallback
-//!
-//! missing / stale / ambiguous / invalidated / old-generation evidence
-//!   ⇒ fall back toward the conservative baseline, never manufacture freshness.
-//! ```
 //!
 //! Strong-read fallback chain (same `Latest` semantics at every layer):
 //!
@@ -136,16 +129,6 @@ impl ServedRead {
             receipt,
             path,
         }
-    }
-
-    /// One-line operator/debug description: why this read was served here,
-    /// under what generation, at what position.
-    #[must_use]
-    pub fn describe(&self) -> String {
-        format!(
-            "served via {} at {} position {}",
-            self.path, self.receipt.authority, self.receipt.position
-        )
     }
 }
 
@@ -2536,7 +2519,7 @@ mod tests {
     /// Deterministic fault scenario across one tablet's whole evidence
     /// lifecycle: cold start, proof install, duplication, reorder,
     /// partition aging, restart amnesia, topology movement, lease bounds,
-    /// and guard movement. Every step asserts the Phase 7 invariants:
+    /// and guard movement. Every step asserts the layer invariants:
     ///
     /// ```text
     /// BoundedStale never succeeds without a satisfying receipt;

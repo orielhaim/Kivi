@@ -16,7 +16,7 @@
 //! A refusal to bind is an error the caller must handle, and the channel-only
 //! worker path and the networked worker path both propagate it. That is
 //! deliberate: a worker that believes it is pinned and is not produces
-//! benchmark numbers that cannot be trusted, and Phase 13's whole method is
+//! benchmark numbers that cannot be trusted, and the whole method is
 //! measurement.
 
 use std::sync::Arc;

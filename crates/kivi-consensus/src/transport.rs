@@ -821,7 +821,7 @@ impl PeerTransport {
         match compio::time::timeout(Duration::from_secs(5), rx).await {
             Ok(_) => {}
             Err(_) => {
-                tracing::warn!("peer mesh teardown timed out; continuing shutdown");
+                tracing::debug!("peer mesh teardown timed out; continuing shutdown");
             }
         }
     }

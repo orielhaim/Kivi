@@ -1,4 +1,4 @@
-//! Kivi-owned replicated command (stage G, framing v2 since stage M).
+//! Kivi-owned replicated command (framing v2).
 //!
 //! The consensus application data is [`ReplicatedMutation`]: a deterministic
 //! [`MutationEnvelope`] (tablet authority,

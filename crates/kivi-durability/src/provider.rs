@@ -13,7 +13,7 @@ use crate::wal::WalRecord;
 #[non_exhaustive]
 pub enum DurabilityLevel {
     /// The batch is file-synced before acknowledgement: a later crash
-    /// still replays it. The only level this stage implements.
+    /// still replays it. The only level implemented here.
     Sync,
 }
 

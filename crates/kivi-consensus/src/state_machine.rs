@@ -1,21 +1,11 @@
-//! Kivi-backed `OpenRaft` state machine (stage M).
+//! Kivi-backed `OpenRaft` state machine.
 //!
-//! Committed entries flow through the existing deterministic state path —
-//! no second database implementation exists:
+//! Committed entries flow through the existing deterministic state path: a
+//! `ReplicatedMutation` decodes to a `MutationEnvelope`, then to the shared
+//! `Mutation` IR, then through `ObjectStore::apply` — no second database
+//! implementation exists.
 //!
-//! ```text
-//! OpenRaft committed entry
-//!         ↓
-//! ReplicatedMutation (canonical Kivi bytes)
-//!         ↓
-//! MutationEnvelope → Mutation IR (existing types)
-//!         ↓
-//! ObjectStore::apply + outcome_for (existing deterministic apply)
-//!         ↓
-//! ReplicatedOutcome (installed + replicated dedup)
-//! ```
-//!
-//! ## `CommitPosition` decision (task D: Option 1)
+//! ## `CommitPosition`
 //!
 //! For replicated strong tablets there is exactly one order counter: the
 //! Raft log index. [`CommitPosition`] is the
@@ -32,7 +22,7 @@
 //! commit chain retires for the replicated tablet and the Raft log is the
 //! authoritative mutation history (no double-logging).
 //!
-//! ## Applied tracking (task B)
+//! ## Applied tracking
 //!
 //! The machine distinguishes `last_log` (log store), `committed` (log
 //! store pointer), and `applied` (here). Runtime `applied` lives in memory
@@ -48,7 +38,7 @@
 //! history; the Raft log already is that history, so snapshots stay the
 //! sole object durability.
 //!
-//! ## Replicated dedup (task C)
+//! ## Replicated dedup
 //!
 //! [`SessionId`] / [`RequestSeq`]
 //! floors and retained [`DurableOutcome`]s are
@@ -66,7 +56,7 @@
 //! re-evaluates deterministically. They consume no log slot anywhere, so no
 //! replica diverges.
 //!
-//! ## Deterministic verification (task E)
+//! ## Deterministic verification
 //!
 //! Every applied command recomputes its outcome and compares it against the
 //! proposal's `expected`. A mismatch is state-machine divergence or
@@ -82,17 +72,14 @@
 //! The snapshot is the Kivi checkpoint state in canonical bytes: objects,
 //! sessions, applied pointer, and membership — the same logical concepts
 //! `LiveTablet` checkpoints, encoded here
-//! because this crate must not depend on the engine. Small single-tablet
-//! state is sufficient for this stage; chunk-aware differential transfer
-//! belongs to the next stage (chunked roots snapshot as manifest
-//! references; bulk bytes stay in chunk packs).
+//! because this crate must not depend on the engine. Chunked roots snapshot
+//! as manifest references; bulk bytes stay in chunk packs.
 //!
 //! Snapshot metadata binds the applied [`LogId`](openraft::LogId) and the
-//! membership `OpenRaft` requires — and nothing else. There is no
-//! snapshot transfer id in logical metadata (0.10 removed it upstream;
-//! Kivi's checkpoint identity is the sealed image name plus its bytes,
-//! while transfer-session identity rides only the network fragment
-//! envelope). Install validates everything, swaps state only after the
+//! membership `OpenRaft` requires - and nothing else. Kivi's checkpoint
+//! identity is the sealed image name plus its bytes, while transfer-session
+//! identity rides only the network fragment envelope. Install validates
+//! everything, swaps state only after the
 //! snapshot file *and* the applied file are durable, and never marks
 //! installation complete before that.
 //!
@@ -183,7 +170,7 @@ const VALUE_STREAM_SHARD: u8 = 8;
 const VALUE_FABRIC: u8 = 9;
 
 /// Converts an applied Raft log index into its [`CommitPosition`]
-/// (task D, Option 1: `CommitPosition = raft_index + 1`; the `+1` preserves
+/// (`CommitPosition = raft_index + 1`; the `+1` preserves
 /// the `UNASSIGNED` sentinel because `OpenRaft` 0.10 numbers entries from 0).
 #[must_use]
 pub const fn commit_of_index(index: u64) -> CommitPosition {
@@ -343,7 +330,7 @@ pub enum ProposalGate {
 }
 
 /// Why state-machine application failed. Every variant is divergence,
-/// corruption, or I/O — never an ordinary client error (task E).
+/// corruption, or I/O — never an ordinary client error.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum StateMachineFault {
@@ -557,6 +544,11 @@ impl ReplicatedTablet {
         &self.store
     }
 
+    /// Returns the underlying object store for mutation by the owner thread.
+    pub const fn store_mut(&mut self) -> &mut ObjectStore {
+        &mut self.store
+    }
+
     /// Enables or disables the ordered key index (ordered namespaces
     /// enable it; hash namespaces leave it off). Enabling rebuilds the
     /// index deterministically from current objects, so late enablement is
@@ -614,12 +606,6 @@ impl ReplicatedTablet {
     #[must_use]
     pub fn pending_intent_count(&self) -> usize {
         self.store.pending_intent_count()
-    }
-
-    /// Logical telemetry at `now` for split/merge policy.
-    #[must_use]
-    pub fn tablet_stats(&self, now: WallTimestamp) -> kivi_state::StoreStats {
-        self.store.stats(now)
     }
 
     /// Removes and returns every prepared intent (topology cutover
@@ -769,7 +755,7 @@ impl ReplicatedTablet {
     }
 
     /// Serves a local read against applied state. The caller must have
-    /// established a linearizable barrier first (task Q); this never talks
+    /// established a linearizable barrier first; this never talks
     /// to a quorum itself.
     ///
     /// # Errors
@@ -1310,7 +1296,7 @@ fn encode_membership(out: &mut Vec<u8>, membership: &StoredMembershipOf<KiviType
 }
 
 /// Extracts the single-group voter set and node map from stored
-/// membership (this stage replicates one tablet with one voter group;
+/// membership (this replicates one tablet with one voter group;
 /// multi-group membership arrives with dynamic membership, out of scope).
 fn membership_nodes(
     membership: &StoredMembershipOf<KiviTypeConfig>,
@@ -1453,7 +1439,7 @@ impl ReplicatedTablet {
         push_u64(&mut out, applied.leader);
         push_u64(&mut out, applied.index);
         // Membership log id rides along so the snapshot grounds
-        // `applied_state` exactly (task T metadata requirement). The
+        // `applied_state` exactly (metadata requirement). The
         // encode side stays total (`unwrap_or(0)`): images from any source
         // must re-encode without panicking; only the live protocol path
         // (`of_log_id`) is strict.
@@ -1970,7 +1956,7 @@ pub enum StateMachineOpenError {
     },
 }
 
-/// Read-only state-machine diagnostics for the admin plane (task AE).
+/// Read-only state-machine diagnostics for the admin plane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateMachineStatus {
     /// Tablet replicated.
@@ -2085,9 +2071,8 @@ impl ReplicatedStateMachine {
             }
             let applied = decoded.applied;
             tablet_core.install_decoded(decoded);
-            // The sealed file name is the checkpoint identity (no
-            // transfer id in logical metadata); the bytes carry the
-            // rest. `name` is unused beyond locating the image.
+            // The sealed file name is the checkpoint identity; the bytes
+            // carry the rest. `name` only locates the image.
             let _ = name;
             let meta = SnapshotMeta {
                 last_log_id: applied.map(AppliedPointer::openraft),
@@ -2136,7 +2121,7 @@ impl ReplicatedStateMachine {
 
     /// Logical telemetry of this replica for split/merge policy.
     pub async fn tablet_stats(&self, now: WallTimestamp) -> kivi_state::StoreStats {
-        self.shared.lock().await.tablet.tablet_stats(now)
+        self.shared.lock().await.tablet.store().stats(now)
     }
 
     /// Approximate median split key of this replica (self-healing: the
@@ -2153,13 +2138,18 @@ impl ReplicatedStateMachine {
 
     /// Number of prepared transaction intents on this replica.
     pub async fn pending_intent_count(&self) -> usize {
-        self.shared.lock().await.tablet.pending_intent_count()
+        self.shared
+            .lock()
+            .await
+            .tablet
+            .store()
+            .pending_intent_count()
     }
 
     /// Prepared transaction intents on this replica, in key order
     /// (resolver consults this; never discards here).
     pub async fn snapshot_intents(&self) -> Vec<kivi_state::TxnIntent> {
-        self.shared.lock().await.tablet.pending_intents()
+        self.shared.lock().await.tablet.store().snapshot_intents()
     }
 
     /// Removes and returns every prepared intent (cutover migration).
@@ -2169,7 +2159,12 @@ impl ReplicatedStateMachine {
 
     /// Installs one migrated intent verbatim (cutover path only).
     pub async fn restore_intent(&self, intent: kivi_state::TxnIntent) {
-        self.shared.lock().await.tablet.restore_intent(intent);
+        self.shared
+            .lock()
+            .await
+            .tablet
+            .store_mut()
+            .restore_intent(intent);
     }
 
     /// Whether this replica maintains the ordered index.
@@ -2348,7 +2343,7 @@ impl ReplicatedStateMachine {
         inner.tablet.read_local(op, now)
     }
 
-    /// Arms fault injection for snapshot/install persistence (task S
+    /// Arms fault injection for snapshot/install persistence (a
     /// storage-health path): the next snapshot build or install fails its
     /// durability barrier, latches unhealthy, and blocks purge. Test and
     /// chaos hooks only; never armed in normal serving.
@@ -2398,7 +2393,7 @@ impl ReplicatedStateMachine {
 
     /// Returns the installed snapshot base index (`None` before the first
     /// snapshot). The node layer may purge the log only through this
-    /// index (task V).
+    /// index.
     pub async fn snapshotted_index(&self) -> Option<u64> {
         self.shared
             .lock()
@@ -2485,10 +2480,7 @@ fn execute_seal(plan: &SealPlan) -> Result<(), StateMachineFault> {
     Ok(())
 }
 
-/// Runs a seal plan off the reactor: file `fsync`s never stall async
-/// progress (the old Tokio island used `block_in_place` for the same
-/// reason; on single-threaded Compio the work moves to a blocking
-/// thread instead).
+/// Runs a seal plan off the reactor: file `fsync`s never stall async progress.
 async fn seal_off_reactor(plan: SealPlan) -> Result<(), StateMachineFault> {
     compio::runtime::spawn_blocking(move || execute_seal(&plan))
         .await
@@ -2626,8 +2618,7 @@ impl RaftStateMachine<KiviTypeConfig> for ReplicatedStateMachine {
         // image on the leader. A poisoned machine still seals (the node
         // layer blocks purge and reads while unhealthy, and the seal
         // records the latched state for forensics, never for serving).
-        // Kivi always seals synchronously (`force` is moot): deferring
-        // would only delay replication that already waits.
+
         let (bytes, applied, membership) = {
             let inner = self.shared.lock().await;
             (

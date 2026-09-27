@@ -253,7 +253,7 @@ impl SoftwareTelemetry {
         self.drain()
     }
 
-    /// Converts one object to the typed Phase 12 criticality signal.
+    /// Converts one object to the typed criticality signal.
     #[must_use]
     pub fn observation_signal(&self, object: u64) -> Option<ExecutionCriticalitySignal> {
         self.entries
@@ -262,7 +262,7 @@ impl SoftwareTelemetry {
             .map(Self::observation_signal_for)
     }
 
-    /// Drains typed Phase 12 criticality signals in ascending object order.
+    /// Drains typed criticality signals in ascending object order.
     pub fn drain_observation_signals(&mut self) -> Vec<(u64, ExecutionCriticalitySignal)> {
         self.drain()
             .into_iter()
@@ -320,7 +320,7 @@ impl SoftwareTelemetry {
         }
     }
 
-    /// Converts generic access signals into the typed Phase 12 signal.
+    /// Converts generic access signals into the typed criticality signal.
     #[must_use]
     pub fn observation_signal_from_access(signals: AccessSignals) -> ExecutionCriticalitySignal {
         let total = signals.frequency();
@@ -344,13 +344,6 @@ impl TelemetrySource for SoftwareTelemetry {
             .filter(|entry| entry.counters.reads != 0 || entry.counters.writes != 0)
             .map(Self::signals_for)
     }
-}
-
-/// Extension point for hardware telemetry (DAMON age bits, PMU counters,
-/// CXL/NEMO rules).
-pub trait HardwareTelemetry {
-    /// Converts a hardware observation into generic access signals.
-    fn translate(&self, object: u64) -> Option<AccessSignals>;
 }
 
 #[cfg(test)]

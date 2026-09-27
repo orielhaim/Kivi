@@ -216,14 +216,8 @@ impl CheckpointWorkerHandle {
                 // checkpoint thread that believes it is placed and is not
                 // produces throughput numbers that mean nothing.
                 let slot = WorkerSlot::new(PlacementRole::CheckpointWorker, 0);
-                match placement.bind(slot) {
-                    Ok(_) => tracing::debug!(
-                        cpu = ?placement.current_cpu(),
-                        "checkpoint worker placed",
-                    ),
-                    Err(error) => {
-                        tracing::error!(?error, "checkpoint worker could not be placed");
-                    }
+                if let Err(error) = placement.bind(slot) {
+                    tracing::warn!(?error, "checkpoint worker unbound");
                 }
                 run_checkpoint(context, &receive);
             })
@@ -457,12 +451,6 @@ fn checkpoint_tablet(
                     admin.last_error = None;
                 })
                 .ok();
-            tracing::info!(
-                tablet = tablet.as_u64(),
-                cut,
-                elapsed_ms = started.elapsed().as_millis(),
-                "checkpoint complete"
-            );
         }
         Err(error) => {
             context
@@ -682,13 +670,13 @@ fn live_fabric_ids(context: &CheckpointContext) -> Option<std::collections::Hash
             .try_send(crate::worker::WorkerControl::FabricLiveRoots { respond })
             .is_err()
         {
-            tracing::warn!(worker = %worker, "live bulk-value report not queued; retaining");
+            tracing::debug!(worker = %worker, "live bulk-value report not queued; retaining");
             return None;
         }
         if let Ok(worker_live) = receive.recv_timeout(Duration::from_secs(5)) {
             live.extend(worker_live);
         } else {
-            tracing::warn!(worker = %worker, "live bulk-value report timed out; retaining");
+            tracing::debug!(worker = %worker, "live bulk-value report timed out; retaining");
             return None;
         }
     }
@@ -724,16 +712,7 @@ fn run_chunk_gc(
             continue;
         }
         match lane.delete_packs_blocking(report.dead_sealed_packs.clone()) {
-            Ok(deleted) => {
-                tracing::info!(
-                    worker = %worker,
-                    packs = deleted.len(),
-                    live_chunks = report.live_chunks,
-                    live_manifests = report.live_manifests,
-                    marked_bytes = report.marked_bytes,
-                    "chunk GC reclaimed packs"
-                );
-            }
+            Ok(_) => {}
             Err(error) => {
                 tracing::warn!(worker = %worker, ?error, "chunk pack deletion failed; packs kept");
             }

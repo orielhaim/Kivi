@@ -21,24 +21,13 @@
 //! `Raft` internals. Thread count scales with workers plus fixed services
 //! (mesh, shared writer, sidecar blocking) — never with tablet count.
 //!
-//! ## Shared machinery
-//!
-//! Group behavior (proposals, barriers, peer RPCs, snapshots, preflight)
-//! is NOT reimplemented here: every replica is an owner context over a
-//! lightweight [`GroupRaftStore`], sharing one implementation with the
-//! single-group node. This module owns only multi-group concerns: worker
-//! assignment, the group registry, the shared mesh thread, worker
-//! threads, lifecycle, and fan-out diagnostics.
-//!
 //! ## Dynamic placement
 //!
-//! The static topology seeds first-boot formation (initial members and
-//! their tablet assignments, usually all-nodes-host-all-tablets);
-//! afterwards the replicated control plane owns desired placement and
-//! each tablet's Raft membership owns actual voters, with independent
-//! Raft leadership per tablet. Replicas come and go at runtime through
-//! learner replication plus joint-consensus membership changes; APIs
-//! never assume equal replica sets.
+//! The static topology seeds first-boot formation; afterwards the replicated
+//! control plane owns desired placement and each tablet's Raft membership owns
+//! actual voters, with independent Raft leadership per tablet. Replicas come
+//! and go at runtime through learner replication plus joint-consensus
+//! membership changes; APIs never assume equal replica sets.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -417,7 +406,7 @@ impl ConsensusNode {
             .collect();
         // Data-directory identity: adopt the static topology identity on
         // first formation, advance the incarnation on every restart.
-        let opened = kivi_durability::open_data_dir_with(
+        let opened = kivi_durability::open_data_dir(
             &config.data_dir,
             Some(kivi_durability::NodeSeed {
                 cluster: config.topology.cluster,
@@ -447,18 +436,11 @@ impl ConsensusNode {
         let durable_tablets = existing_sm_tablets(&config.data_dir);
         let configured: BTreeSet<TabletId> = tablets.iter().copied().collect();
         let control_tablet = ConsensusGroupId::control().tablet();
-        let mut extra: Vec<u64> = durable_tablets
+        let sm_extra: Vec<TabletId> = durable_tablets
             .difference(&configured)
             .filter(|tablet| **tablet != control_tablet && !tombstoned.contains(*tablet))
-            .map(|tablet| tablet.as_u64())
+            .copied()
             .collect();
-        extra.sort_unstable();
-        if !extra.is_empty() {
-            tracing::info!(
-                tablets = ?extra,
-                "rejoin recovers dynamic topology tablets outside the static set"
-            );
-        }
         // Shared physical durability: one WAL lane recovered once; records
         // dispatch by group so N groups rebuild in a single recovery pass.
         let lane_identity = kivi_durability::LaneIdentity {
@@ -502,14 +484,24 @@ impl ConsensusNode {
             .into_iter()
             .collect();
         let mut live_tablets = live_tablets;
+        let mut recovered_dynamic: Vec<u64> = sm_extra
+            .iter()
+            .map(|tablet| tablet.as_u64())
+            .collect::<Vec<_>>();
         for tablet in &wal_extra {
             if !live_tablets.contains(tablet) {
-                tracing::info!(
-                    tablet = tablet.as_u64(),
-                    "rejoin recovers dynamic topology tablet outside the static set"
-                );
                 live_tablets.push(*tablet);
+                if !recovered_dynamic.contains(&tablet.as_u64()) {
+                    recovered_dynamic.push(tablet.as_u64());
+                }
             }
+        }
+        if !recovered_dynamic.is_empty() {
+            recovered_dynamic.sort_unstable();
+            tracing::info!(
+                tablets = ?recovered_dynamic,
+                "rejoin recovers dynamic topology tablets outside the static set"
+            );
         }
         live_tablets.sort_by_key(|tablet| tablet.as_u64());
         let mut groups: Vec<ConsensusGroupId> = live_tablets
@@ -742,7 +734,7 @@ impl ConsensusNode {
         let tls = TlsMaterial {
             cert: peer_tls_cert,
             peer_certs: config.peer_certs.clone(),
-            trust: Some(crate::tls::empty_trust()),
+            trust: Some(Arc::default()),
             insecure_skip_verify: config.insecure_peer_tls,
         };
         let peers: HashMap<NodeId, std::net::SocketAddr> = config
@@ -2283,10 +2275,6 @@ impl ConsensusNode {
     /// Panics when an owner-handle lock is poisoned (a lifecycle bug,
     /// never a runtime condition).
     pub async fn shutdown(&self) {
-        tracing::info!(
-            node = self.local.as_u64(),
-            "consensus node shutdown started"
-        );
         for worker in &self.workers {
             let _ = worker.send(OwnerRequest::Shutdown).await;
         }
@@ -2658,15 +2646,13 @@ async fn mesh_main(params: MeshParams) {
         }
     };
     if ready.send(Ok((transport.clone(), peer_addr))).is_err() {
-        tracing::warn!("mesh opener gone; shutting down mesh");
+        tracing::debug!("mesh opener gone; shutting down mesh");
         transport.shutdown().await;
         return;
     }
     tracing::info!(peer = %peer_addr, "peer mesh open");
     let _ = shutdown.await;
-    tracing::info!("mesh shutdown signaled; stopping transport");
     transport.shutdown().await;
-    tracing::info!("peer mesh stopped");
 }
 
 /// Parameters crossing into one worker thread at spawn. Everything is

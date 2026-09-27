@@ -8,12 +8,12 @@
 //! only mutator, and execution is plain synchronous Rust once a request
 //! arrives.
 //!
-//! Execution mirrors the future replicated path exactly: [`prepare`](LiveTablet::prepare)
+//! Execution mirrors the replicated path: [`prepare`](LiveTablet::prepare)
 //! validates, [`apply_mutation`](LiveTablet::apply_mutation) commits, and
 //! [`execute`](LiveTablet::execute) runs both atomically for the single-node
 //! engine. Expiry reclamation also flows through explicit [`Delete`](kivi_state::Mutation::Delete)
-//! mutations via [`sweep_expired`](LiveTablet::sweep_expired), so a future
-//! consensus layer can propose the same mutations without changing tablet logic.
+//! mutations via [`sweep_expired`](LiveTablet::sweep_expired), so consensus
+//! proposes the same mutations without changing tablet logic.
 
 use core::fmt;
 use std::collections::{BTreeMap, HashMap};
@@ -460,10 +460,9 @@ impl LiveTablet {
         &self.store
     }
 
-    /// Enables or disables the ordered key index on this tablet's store
-    /// (ordered namespaces enable it; hash namespaces leave it off).
-    pub fn set_ordered_indexing(&mut self, enabled: bool) {
-        self.store.set_ordered_indexing(enabled);
+    /// Returns the underlying object store for mutation by the owning worker.
+    pub fn store_mut(&mut self) -> &mut ObjectStore {
+        &mut self.store
     }
 
     /// Executes one bounded local scan page against this tablet.
@@ -485,32 +484,6 @@ impl LiveTablet {
         self.metrics.reads += 1;
         self.metrics.ops_total += 1;
         Ok(page)
-    }
-
-    /// Prepared transaction intents currently reserving keys on this
-    /// tablet, in key order (resolver and split/merge fencing consult this:
-    /// tablets with unresolved intents do not cut over).
-    #[must_use]
-    pub fn pending_intents(&self) -> Vec<kivi_state::TxnIntent> {
-        self.store.snapshot_intents()
-    }
-
-    /// Number of prepared intents on this tablet.
-    #[must_use]
-    pub fn pending_intent_count(&self) -> usize {
-        self.store.pending_intent_count()
-    }
-
-    /// Installs a recovered intent verbatim (checkpoint restore never
-    /// discards unresolved intents).
-    pub fn restore_intent(&mut self, intent: kivi_state::TxnIntent) {
-        self.store.restore_intent(intent);
-    }
-
-    /// Logical telemetry at `now` for split/merge policy.
-    #[must_use]
-    pub fn tablet_stats(&self, now: WallTimestamp) -> kivi_state::StoreStats {
-        self.store.stats(now)
     }
 
     /// Returns a copy of the local metrics.

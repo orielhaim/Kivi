@@ -43,27 +43,20 @@ pub struct ConnConfig {
 impl Default for ConnConfig {
     fn default() -> Self {
         Self {
-            // 64 MiB input (matches the legacy value ceiling; requests are
-            // small, pipelines share this, never per-command).
+            // Requests are small and a pipeline shares this buffer, so the
+            // ceiling is per connection rather than per command.
             max_input_bytes: 64 * 1024 * 1024,
-            // Bulk strings cap at the legacy value ceiling: larger payloads
-            // belong on the native streaming interface.
+            // Larger payloads belong on the native streaming interface.
             max_bulk_bytes: 64 * 1024 * 1024,
-            // Commands are small; 256 elements is already generous.
             max_array_elements: 256,
             // Argument count is not configurable: the parser's inline
             // capacity (`frame::MAX_ARGS`) is the bound, because that array
             // is what keeps a parse allocation-free.
             //
-            // There is deliberately no separate pipeline-depth cap. The
-            // previous `max_pipelined` answered `BUSY pipeline depth
-            // exceeded` past 128 requests and *dropped* them, which Redis
-            // never does — Redis processes whatever depth a client sends.
-            // Fairness comes from the per-turn budget, not from refusing
-            // work a client is entitled to.
+            // No separate pipeline-depth cap: Redis processes whatever depth
+            // a client sends, and fairness comes from the per-turn budget
+            // rather than from refusing work a client is entitled to.
             max_commands_per_turn: 64,
-            // RESP values cap at the legacy ceiling with the same message
-            // as the native bound.
             max_value_bytes: 64 * 1024 * 1024,
         }
     }
@@ -285,14 +278,9 @@ impl<E: Executor> RespConnection<E> {
         let budget = self.config.max_commands_per_turn;
 
         // One turn collects every command, then executes the engine-bound ones
-        // together, then encodes every reply in request order.
-        //
-        // The alternative — execute as you decode — makes pipelining actively
-        // harmful: a pipeline of N commands became N sequential engine
-        // round-trips, so a deeper pipeline cost proportionally more latency
-        // for the same work. Measured against Redis, which answers a whole
-        // pipeline in one event-loop pass, that was the single largest gap on
-        // this edge.
+        // together, then encodes every reply in request order. Executing as
+        // you decode instead makes a pipeline of N commands cost N sequential
+        // engine round-trips.
         let mut slots: Vec<Slot> = Vec::with_capacity(budget);
         let mut engine_ops: Vec<kivi_state::Operation> = Vec::new();
         while outcome.replies < budget as u64 {
@@ -333,9 +321,8 @@ impl<E: Executor> RespConnection<E> {
             }
         }
 
-        // One compaction per turn rather than one per command: the previous
-        // code memoved the entire remaining tail for every command it decoded,
-        // which is quadratic in pipeline depth.
+        // One compaction per turn, not one per command: the latter is
+        // quadratic in pipeline depth.
         if self.cursor > 0 {
             let keep = buffer.len() - self.cursor;
             buffer.copy_within(self.cursor.., 0);
@@ -369,7 +356,7 @@ impl<E: Executor> RespConnection<E> {
                 Slot::Ready(reply) => write_reply(out, self.state.version, reply),
                 Slot::Execute { redis } => {
                     let Some(result) = results.get(next) else {
-                        write_error(out, self.state.version, "ERR internal error");
+                        write_error(out, "ERR internal error");
                         continue;
                     };
                     next += 1;
@@ -382,7 +369,7 @@ impl<E: Executor> RespConnection<E> {
                 Slot::SetRange { writes } => {
                     let consumed = 1 + usize::from(*writes);
                     let Some(results) = results.get(next..next + consumed) else {
-                        write_error(out, self.state.version, "ERR internal error");
+                        write_error(out, "ERR internal error");
                         continue;
                     };
                     next += consumed;
@@ -393,10 +380,9 @@ impl<E: Executor> RespConnection<E> {
                     match results.last() {
                         Some(Ok(kivi_state::OperationResult::Length(value))) => write_integer(
                             out,
-                            self.state.version,
                             value.map_or(0, |len| i64::try_from(len).unwrap_or(i64::MAX)),
                         ),
-                        _ => write_error(out, self.state.version, "ERR internal error"),
+                        _ => write_error(out, "ERR internal error"),
                     }
                 }
             }
@@ -415,7 +401,6 @@ impl<E: Executor> RespConnection<E> {
     /// Answers a frame the parser refused, keeping or closing the
     /// connection exactly as the refusal class says.
     fn write_refusal(&mut self, refused: &Parsed<'_>, out: &mut Vec<u8>) {
-        let version = self.state.version;
         self.metrics.protocol_errors += 1;
         let message: &str = match refused {
             Parsed::TooManyArgs => "ERR too many arguments",
@@ -428,7 +413,7 @@ impl<E: Executor> RespConnection<E> {
             }
             Parsed::Incomplete | Parsed::Command(_) => return,
         };
-        write_error(out, version, message);
+        write_error(out, message);
     }
 
     /// Whether any bytes remain that no command has been decoded from yet.
@@ -452,18 +437,14 @@ impl<E: Executor> RespConnection<E> {
         let name = command.name();
         let args = command.args();
 
-        // One case-insensitive fold, then one match. The previous path
-        // compared five bootstrap literals, then scanned a 30-entry registry
-        // for a `&str` (which meant UTF-8-validating the name), then matched
-        // the name a third time inside `translate`.
+        // One case-insensitive fold, then one match.
         let Some(folded) = fold_command_name(name) else {
             self.metrics.protocol_errors += 1;
             slots.push(Slot::Ready(Reply::Error(malformed_request())));
             return;
         };
-        // The registry is keyed by upper-case names, so the *folded* name is
-        // what has to be looked up. Passing the raw name here made every
-        // lower-case command "unknown" — which is what `redis-cli` sends.
+        // The registry is keyed by upper-case names, so the folded name is
+        // what has to be looked up.
         let folded_name = &folded[..name.len()];
         match folded_name {
             b"HELLO" => {
@@ -591,8 +572,6 @@ impl<E: Executor> RespConnection<E> {
 
     /// Dispatches `HELLO [protover [AUTH user pass] [SETNAME name]]`.
     fn dispatch_hello(&mut self, args: &[&[u8]], out: &mut Vec<u8>) {
-        let version = self.state.version;
-        // No args: report the current context without switching.
         if args.is_empty() {
             self.encode_hello(out);
             return;
@@ -602,15 +581,11 @@ impl<E: Executor> RespConnection<E> {
             b"3" => RespVersion::V3,
             _ => {
                 self.metrics.protocol_errors += 1;
-                write_error(
-                    out,
-                    version,
-                    "NOPROTO sorry, this protocol version is not supported",
-                );
+                write_error(out, "NOPROTO sorry, this protocol version is not supported");
                 return;
             }
         };
-        // Optional AUTH / SETNAME tail.
+
         let mut index = 1;
         while index < args.len() {
             let token = args[index];
@@ -620,7 +595,6 @@ impl<E: Executor> RespConnection<E> {
                 self.metrics.unsupported += 1;
                 write_error(
                     out,
-                    version,
                     "ERR AUTH not implemented in Kivi RESP profile v1; no authentication is enforced",
                 );
                 return;
@@ -635,7 +609,7 @@ impl<E: Executor> RespConnection<E> {
                 continue;
             }
             self.metrics.protocol_errors += 1;
-            write_error(out, version, "ERR syntax error in HELLO options");
+            write_error(out, "ERR syntax error in HELLO options");
             return;
         }
         self.state.version = target;
@@ -717,37 +691,31 @@ impl<E: Executor> RespConnection<E> {
 
     /// Dispatches `CLIENT ...` bootstrap subcommands.
     fn dispatch_client(&mut self, args: &[&[u8]], out: &mut Vec<u8>) {
-        let version = self.state.version;
         let Some((first, rest)) = args.split_first() else {
             self.metrics.protocol_errors += 1;
-            write_error(
-                out,
-                version,
-                "ERR wrong number of arguments for 'client' command",
-            );
+            write_error(out, "ERR wrong number of arguments for 'client' command");
             return;
         };
         if token_is(first, b"SETINFO") && rest.len() == 2 {
-            write_simple(out, version, "OK");
+            write_simple(out, "OK");
         } else if token_is(first, b"SETNAME") && rest.len() == 1 {
             let name = rest[0];
             if name.len() > 1024 {
                 self.metrics.protocol_errors += 1;
-                write_error(out, version, "ERR client name too long");
+                write_error(out, "ERR client name too long");
                 return;
             }
             self.state.name = Some(String::from_utf8_lossy(name).into_owned());
-            write_simple(out, version, "OK");
+            write_simple(out, "OK");
         } else if token_is(first, b"GETNAME") && rest.is_empty() {
             match &self.state.name {
-                Some(name) => write_bulk(out, version, name.as_bytes()),
-                None => write_nil(out, version),
+                Some(name) => write_bulk(out, name.as_bytes()),
+                None => write_nil(out, self.state.version),
             }
         } else {
             self.metrics.protocol_errors += 1;
             write_error(
                 out,
-                version,
                 "ERR unsupported CLIENT subcommand in Kivi RESP profile v1",
             );
         }
@@ -756,36 +724,29 @@ impl<E: Executor> RespConnection<E> {
     /// Dispatches `SELECT index`: `0` maps to the configured namespace,
     /// anything else is rejected (never faked as extra databases).
     fn dispatch_select(&mut self, args: &[&[u8]], out: &mut Vec<u8>) {
-        let version = self.state.version;
         let [index] = args else {
             self.metrics.protocol_errors += 1;
-            write_error(
-                out,
-                version,
-                "ERR wrong number of arguments for 'select' command",
-            );
+            write_error(out, "ERR wrong number of arguments for 'select' command");
             return;
         };
         match parse_unsigned(index) {
-            Ok(0) => write_simple(out, version, "OK"),
+            Ok(0) => write_simple(out, "OK"),
             Ok(_) => {
                 self.metrics.protocol_errors += 1;
                 write_error(
                     out,
-                    version,
                     "ERR database numbers other than 0 are unsupported in Kivi RESP profile v1",
                 );
             }
             Err(_) => {
                 self.metrics.protocol_errors += 1;
-                write_error(out, version, "ERR value is not an integer or out of range");
+                write_error(out, "ERR value is not an integer or out of range");
             }
         }
     }
 
     /// Dispatches `COMMAND [COUNT|INFO|DOCS|LIST]` from the registry.
     fn dispatch_command(&mut self, args: &[&[u8]], out: &mut Vec<u8>) {
-        let version = self.state.version;
         if args.is_empty() {
             out.extend_from_slice(&self.encode_command_list());
             return;
@@ -793,11 +754,7 @@ impl<E: Executor> RespConnection<E> {
         let sub = args[0];
         let rest = &args[1..];
         if token_is(sub, b"COUNT") && rest.is_empty() {
-            write_integer(
-                out,
-                version,
-                i64::try_from(REGISTRY.len()).unwrap_or(i64::MAX),
-            );
+            write_integer(out, i64::try_from(REGISTRY.len()).unwrap_or(i64::MAX));
         } else if token_is(sub, b"LIST") {
             out.extend_from_slice(&self.encode_command_names());
         } else if token_is(sub, b"INFO") {
@@ -806,7 +763,7 @@ impl<E: Executor> RespConnection<E> {
             out.extend_from_slice(&self.encode_command_docs());
         } else {
             self.metrics.protocol_errors += 1;
-            write_error(out, version, "ERR unsupported COMMAND subcommand");
+            write_error(out, "ERR unsupported COMMAND subcommand");
         }
     }
 
@@ -1066,16 +1023,16 @@ fn shape<E: Executor>(
 /// copied the whole batch into a third.
 pub fn write_reply(out: &mut Vec<u8>, version: RespVersion, reply: &Reply) {
     match reply {
-        Reply::Simple(text) => write_simple(out, version, text),
-        Reply::Bulk(bytes) => write_bulk(out, version, bytes),
+        Reply::Simple(text) => write_simple(out, text),
+        Reply::Bulk(bytes) => write_bulk(out, bytes),
         Reply::Nil => write_nil(out, version),
-        Reply::Int(value) => write_integer(out, version, *value),
-        Reply::Error(message) => write_error(out, version, message),
+        Reply::Int(value) => write_integer(out, *value),
+        Reply::Error(message) => write_error(out, message),
     }
 }
 
 /// Appends a simple string.
-pub fn write_simple(out: &mut Vec<u8>, _version: RespVersion, text: &str) {
+fn write_simple(out: &mut Vec<u8>, text: &str) {
     // RESP2 and RESP3 spell a simple string the same way.
     out.push(b'+');
     out.extend_from_slice(text.as_bytes());
@@ -1083,7 +1040,7 @@ pub fn write_simple(out: &mut Vec<u8>, _version: RespVersion, text: &str) {
 }
 
 /// Appends a bulk string (binary-safe).
-pub fn write_bulk(out: &mut Vec<u8>, _version: RespVersion, bytes: &[u8]) {
+fn write_bulk(out: &mut Vec<u8>, bytes: &[u8]) {
     // RESP2's bulk string and RESP3's blob string have the same wire form;
     // only RESP2's *null* is spelled differently (see `write_nil`).
     out.push(b'$');
@@ -1094,7 +1051,7 @@ pub fn write_bulk(out: &mut Vec<u8>, _version: RespVersion, bytes: &[u8]) {
 }
 
 /// Appends nil (null bulk string in RESP2, `_` in RESP3).
-pub fn write_nil(out: &mut Vec<u8>, version: RespVersion) {
+fn write_nil(out: &mut Vec<u8>, version: RespVersion) {
     match version {
         RespVersion::V2 => out.extend_from_slice(b"$-1\r\n"),
         RespVersion::V3 => out.extend_from_slice(b"_\r\n"),
@@ -1102,7 +1059,7 @@ pub fn write_nil(out: &mut Vec<u8>, version: RespVersion) {
 }
 
 /// Appends an integer.
-pub fn write_integer(out: &mut Vec<u8>, _version: RespVersion, value: i64) {
+fn write_integer(out: &mut Vec<u8>, value: i64) {
     // RESP2's integer and RESP3's number have the same wire form.
     out.push(b':');
     write_i64(out, value);
@@ -1110,7 +1067,7 @@ pub fn write_integer(out: &mut Vec<u8>, _version: RespVersion, value: i64) {
 }
 
 /// Appends an error (without the leading `-`; framing adds it).
-pub fn write_error(out: &mut Vec<u8>, _version: RespVersion, message: &str) {
+fn write_error(out: &mut Vec<u8>, message: &str) {
     // RESP2's error and RESP3's simple error have the same wire form.
     out.push(b'-');
     out.extend_from_slice(message.as_bytes());

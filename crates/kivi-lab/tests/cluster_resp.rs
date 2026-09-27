@@ -1,4 +1,4 @@
-//! RESP edge on the replicated cluster (task P).
+//! RESP edge on the replicated cluster.
 //!
 //! Spawns a 3-node cluster with RESP edges and drives Redis commands
 //! through them: writes/reads round-trip on the leader, followers answer

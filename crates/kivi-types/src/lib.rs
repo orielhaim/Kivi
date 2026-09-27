@@ -39,9 +39,9 @@ pub use consistency::{
 pub use hash::{ChunkId, ManifestId, PartitionHash};
 pub use identity::{IdempotencyKey, MutationIdentity, RequestIdentity};
 pub use ids::{
-    ClusterId, CommitPosition, CpuId, GenerationExhausted, NamespaceId, NodeId, NodeIncarnation,
-    NumaId, RequestSeq, SecurityDomainId, SequenceExhausted, SessionId, TabletEpoch, TabletId,
-    WorkerId, WriteGuardGeneration,
+    ClusterId, CommitPosition, GenerationExhausted, NamespaceId, NodeId, NodeIncarnation,
+    RequestSeq, SecurityDomainId, SequenceExhausted, SessionId, TabletEpoch, TabletId, WorkerId,
+    WriteGuardGeneration,
 };
 pub use names::{MAX_NAMESPACE_NAME_LEN, NamespaceName, NamespaceNameError};
 pub use position::CommitToken;

@@ -68,7 +68,7 @@ fn start_ephemeral(chunks: ChunkFabricConfig) -> LocalEngine {
 }
 
 fn start_durable(dir: &std::path::Path) -> LocalEngine {
-    let opened = kivi_durability::open_data_dir(dir).expect("data dir opens");
+    let opened = kivi_durability::open_data_dir(dir, None).expect("data dir opens");
     LocalEngine::start(EngineConfig {
         namespace: NS,
         hardware: kivi_engine::HardwareConfig::default(),

@@ -6,12 +6,9 @@
 //! application threads: hash the key, load the routing snapshot (no mutex),
 //! and hand the typed operation to the owning worker over a bounded queue.
 //!
-//! This channel-based path is the *local* API, not the future native network
-//! fast path: later, client connections will live directly on data workers
-//! and call tablet execution without this cross-thread hop. Shared tablet
-//! logic keeps both paths identical; only the transport differs, and this
-//! file documents the boundary so the wrong path is never "optimized" into
-//! the fast one.
+//! Network frontends skip the hop: their connection tasks live on the owning
+//! worker's reactor (see [`crate::net`]). Shared tablet logic keeps both paths
+//! identical; only the transport differs.
 
 use core::fmt;
 use std::sync::Arc;
@@ -711,7 +708,7 @@ impl LocalEngine {
     /// per active directory tablet on its placed worker, spawns worker
     /// threads, and publishes the initial routing snapshot.
     ///
-    /// Fresh tablets start at initial fencing generations (this stage has no
+    /// Fresh tablets start at initial fencing generations (there is no
     /// persisted fencing state to recover; future phases will carry fencing
     /// generations in directory metadata instead of defaulting them here).
     ///
@@ -762,7 +759,7 @@ impl LocalEngine {
             // Ordered tablets maintain the key index from birth (empty
             // and therefore trivially exact); hash tablets skip it.
             if matches!(tablet.range(), kivi_tablet::PartitionRange::Ordered(_)) {
-                live.set_ordered_indexing(true);
+                live.store_mut().set_ordered_indexing(true);
             }
             let index = usize::try_from(worker.as_u64())
                 .map_err(|_| EngineError::UnknownWorker { worker })?;
@@ -1290,7 +1287,7 @@ impl LocalEngine {
             if installed.manifest.epoch != descriptor.epoch()
                 || installed.manifest.guard != descriptor.guard()
             {
-                tracing::warn!(
+                tracing::debug!(
                     tablet = tablet.as_u64(),
                     "installed checkpoint names a stale authority; skipping to WAL replay"
                 );
@@ -1356,7 +1353,7 @@ impl LocalEngine {
             // from restored objects (exact: every stored key is indexed).
             // Hash tablets keep the fast path (no ordered structure).
             if matches!(descriptor.range(), kivi_tablet::PartitionRange::Ordered(_)) {
-                live.set_ordered_indexing(true);
+                live.store_mut().set_ordered_indexing(true);
             }
             cuts.insert(tablet, installed.manifest.cut);
             currents.insert(tablet, installed.current.clone());
@@ -2093,8 +2090,8 @@ impl LocalEngine {
     /// (channel vs. direct). Used to prove the native fast path bypasses
     /// the cross-thread queue, and for operator introspection.
     ///
-    /// Workers that already exited report their last... — no: exited workers
-    /// are simply absent from the result. Query before shutdown for full data.
+    /// Workers that already exited are absent from the result; query before
+    /// shutdown for full data.
     #[must_use]
     pub fn worker_metrics(&self) -> Vec<(WorkerId, crate::worker::WorkerMetrics)> {
         self.admin_handle().worker_metrics_snapshot()
@@ -2415,11 +2412,8 @@ impl LocalClient {
 
     /// Executes one already-typed operation against its owning tablet.
     ///
-    /// The public form of the private per-verb path. Frontends that receive
-    /// whole operations rather than method calls — the RESP edge — need
-    /// exactly this, and previously had to re-implement a match over every
-    /// `Operation` variant to get it, which silently went stale whenever a
-    /// variant was added.
+    /// The public form of the private per-verb path, for frontends that
+    /// receive whole operations rather than method calls (the RESP edge).
     ///
     /// # Errors
     ///

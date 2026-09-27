@@ -219,7 +219,7 @@ async fn spawn_lone_voter(config: &Arc<openraft::Config>, node_id: u64) -> Densi
         Arc::clone(config),
         StubNetworkFactory,
         MemLogStore::new(),
-        MemStateMachine::new(),
+        MemStateMachine::default(),
     )
     .await
     .expect("raft spawns");
@@ -260,7 +260,7 @@ async fn spawn_voter_group(
             Arc::clone(config),
             kivi_consensus::router::GroupNetworkFactory::new(registry.clone(), group_id),
             MemLogStore::new(),
-            MemStateMachine::new(),
+            MemStateMachine::default(),
         )
         .await
         .expect("raft spawns");

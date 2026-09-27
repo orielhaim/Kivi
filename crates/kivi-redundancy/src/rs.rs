@@ -23,7 +23,7 @@
 //! shard sizes with 64-byte-multiple cross-version compatibility — which is
 //! exactly what [`crate::RsParams`] (`V1`, 64-byte-aligned shards) encodes.
 //! Local `benches/redundancy.rs` re-measures encode/decode on this machine
-//! for representative Kivi asset sizes; see the Phase 10 report for numbers.
+//! for representative Kivi asset sizes.
 //!
 //! Kivi owns everything around the kernels: [`RsParams`] validation, shard
 //! padding/truncation, fragment identity/hashes, durable metadata, placement,

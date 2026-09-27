@@ -141,7 +141,7 @@ fn start_single_ephemeral(fabric: FabricConfig) -> LocalEngine {
 /// Durable config with automatic checkpoints stilled: tests trigger
 /// manually, so cuts stay deterministic.
 fn durable(dir: &Path, fabric: FabricConfig) -> EngineConfig {
-    let opened = kivi_durability::open_data_dir(dir).expect("data dir opens");
+    let opened = kivi_durability::open_data_dir(dir, None).expect("data dir opens");
     EngineConfig {
         namespace: NS,
         hardware: kivi_engine::HardwareConfig::default(),
@@ -588,7 +588,7 @@ fn durable_supersede_checkpoint_restart() {
 
 /// Durable config over the split directory (two tablets, two workers).
 fn durable_split(dir: &Path, fabric: FabricConfig) -> EngineConfig {
-    let opened = kivi_durability::open_data_dir(dir).expect("data dir opens");
+    let opened = kivi_durability::open_data_dir(dir, None).expect("data dir opens");
     EngineConfig {
         namespace: NS,
         hardware: kivi_engine::HardwareConfig::default(),

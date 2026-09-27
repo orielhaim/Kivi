@@ -511,7 +511,7 @@ fn split_then_merge(cluster: &Cluster, parent: u64) {
     cluster.wait_tiling_agreed(4, Instant::now() + Duration::from_secs(300));
 }
 
-fn load_phase1(
+fn load_baseline(
     cluster: &Cluster,
     client: &kivi_client::NativeClient,
     bytes_model: &mut HashMap<Vec<u8>, Vec<u8>>,
@@ -606,7 +606,7 @@ fn chaos_round(
 /// a model key absent from the scan is lost state, while a key present in
 /// the scan but missed by its point `get` is a stale-route read. The
 /// report separates the two instead of lumping both as "missing".
-fn verify_phase3(
+fn verify_final(
     cluster: &Cluster,
     client: &kivi_client::NativeClient,
     bytes_model: &HashMap<Vec<u8>, Vec<u8>>,
@@ -704,7 +704,7 @@ fn run_acceptance(largest_first: bool) {
     // instead of pinning dead ranges. The model (not fresh caches)
     // carries continuity across phases.
     let client = cluster.client();
-    load_phase1(&cluster, &client, &mut bytes_model, &mut counter_model);
+    load_baseline(&cluster, &client, &mut bytes_model, &mut counter_model);
     cluster.wait_converged_all();
 
     for round in 0..ROUNDS {
@@ -724,7 +724,7 @@ fn run_acceptance(largest_first: bool) {
     let _ = cluster.snapshot_tablet(live, tablet);
     cluster.wait_converged_all();
 
-    verify_phase3(&cluster, &client, &bytes_model, &counter_model);
+    verify_final(&cluster, &client, &bytes_model, &counter_model);
     eprintln!(
         "acceptance: {} byte keys + {} counters verified, {} rounds of chaos",
         bytes_model.len(),

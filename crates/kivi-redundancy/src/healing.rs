@@ -1,4 +1,4 @@
-//! Phase 11 self-healing controller model.
+//! Self-healing controller model.
 //!
 //! These values are pure inputs and outputs for a distributed controller. They
 //! do not read clocks, choose nodes, perform I/O, or retry work. Every ranking,

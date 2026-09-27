@@ -75,7 +75,7 @@ struct BenchArgs {
     /// stays `--server`). A multi-seed native target is how existing
     /// workload definitions run against the replicated cluster: leader
     /// discovery, `NotLeader` retries, and stable mutation identities
-    /// are handled inside the target (task AG).
+    /// are handled inside the target.
     #[arg(long, value_delimiter = ',')]
     seeds: Vec<String>,
     /// Target namespace id (native only; RESP always uses DB 0).

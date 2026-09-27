@@ -7,8 +7,8 @@
 use core::time::Duration;
 
 use kivi_types::{
-    ChunkId, ClusterId, CommitPosition, CommitToken, CpuId, Expiry, IdempotencyKey, NamespaceId,
-    NamespaceName, NodeId, NodeIncarnation, NumaId, PartitionHash, ReadContract, RequestIdentity,
+    ChunkId, ClusterId, CommitPosition, CommitToken, Expiry, IdempotencyKey, NamespaceId,
+    NamespaceName, NodeId, NodeIncarnation, PartitionHash, ReadContract, RequestIdentity,
     RequestSeq, SecurityDomainId, SessionId, TabletAuthority, TabletEpoch, TabletId, Ticks,
     WallTimestamp, WorkerId, WriteGuardGeneration,
 };
@@ -79,8 +79,6 @@ impl_int_encoding!(IdempotencyKey, u128, 16);
 impl_int_encoding!(PartitionHash, u128, 16);
 
 // `u32`-backed identifiers are 4 bytes little-endian on the wire.
-impl_int_encoding!(NumaId, u32, 4);
-impl_int_encoding!(CpuId, u32, 4);
 
 impl Encode for ChunkId {
     fn encoded_len(&self) -> usize {
@@ -306,7 +304,7 @@ mod tests {
     fn fixed_width_ids_have_stable_sizes() {
         assert_eq!(TabletId::from_u64(918).encode_to_vec().len(), 8);
         assert_eq!(SessionId::from_u128(1).encode_to_vec().len(), 16);
-        assert_eq!(NumaId::from_u32(0).encode_to_vec().len(), 4);
+
         assert_eq!(ChunkId::ZERO.encode_to_vec().len(), 32);
         assert_eq!(
             PartitionHash::from_u128(u128::MAX).encode_to_vec(),

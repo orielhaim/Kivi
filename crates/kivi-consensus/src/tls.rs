@@ -41,12 +41,6 @@ use kivi_types::NodeId;
 /// connection — no restart, no flag edits.
 pub type TrustRegistry = Arc<RwLock<HashMap<NodeId, Vec<u8>>>>;
 
-/// Creates an empty dynamic trust registry.
-#[must_use]
-pub fn empty_trust() -> TrustRegistry {
-    Arc::new(RwLock::new(HashMap::new()))
-}
-
 /// Fingerprint of a peer certificate: `BLAKE3(cert DER)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CertFingerprint(pub [u8; 32]);

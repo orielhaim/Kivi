@@ -116,7 +116,7 @@ pub fn plan_rebalance(state: &ControlState, config: &PlannerConfig) -> Vec<Migra
         // Desired size honors both policy and eligibility: degrade
         // gracefully instead of refusing the whole cluster when the
         // requested spread is impossible. Size changes themselves (grow
-        // or shrink below/above the factor) are out of stage scope —
+        // or shrink below/above the factor) are out of scope —
         // replication factor is fixed and genesis always forms full
         // sets — so only balanced-size swaps move here.
         let want = config.replication_factor.min(eligible.len());

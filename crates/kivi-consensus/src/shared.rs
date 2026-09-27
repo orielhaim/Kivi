@@ -1,6 +1,6 @@
 //! Shared physical consensus durability: one WAL writer batching many groups.
 //!
-//! The single-tablet stage gave every [`DurableRaftStore`](crate::store::DurableRaftStore)
+//! [`DurableRaftStore`](crate::store::DurableRaftStore)
 //! its own lane-writer thread (`kivi-consensus-lane`): one OS thread per Raft
 //! group. Multi-Raft replaces that with one node-wide physical writer
 //! serving every local group:
@@ -1021,7 +1021,7 @@ impl RaftLogStorage<KiviTypeConfig> for GroupRaftStore {
                     .map_err(|error| crate::gate::sidecar_io_error(&error))?;
             }
         }
-        // Stage records and cache together under one lock (readable on
+        // Records and cache together under one lock (readable on
         // return) and submit the barrier in FIFO order while still
         // holding it. The lock releases before the ack wait.
         let (staged, rx, bytes) = {

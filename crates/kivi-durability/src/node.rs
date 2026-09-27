@@ -193,32 +193,23 @@ pub struct NodeSeed {
 }
 
 /// Opens (creating if needed) a Kivi data directory: lock, identity,
-/// incarnation advance, WAL root — in that order, before any listener.
+/// incarnation advance, WAL root - in that order, before any listener.
+/// `seed` is adopted on first startup when present. An existing directory
+/// ignores the seed entirely: its identity is authoritative, and callers
+/// verify that separately and fail loudly on conflict.
 ///
 /// # Errors
 ///
 /// Returns [`DurabilityError::Locked`] when another process holds the
 /// directory, [`DurabilityError::IncarnationExhausted`] when the
-/// incarnation cannot advance, or filesystem/validation failures.
+/// incarnation cannot advance, [`DurabilityError::InvalidConfig`] when the
+/// seed names the reserved zero node id, or filesystem/validation failures.
 /// Nothing is published until every step succeeds.
-pub fn open_data_dir(path: &Path) -> Result<OpenDir, DurabilityError> {
-    open_data_dir_with(path, None)
-}
-
-/// Opens a data directory like [`open_data_dir`], adopting `seed` on
-/// first startup when present. Existing directories ignore the seed
-/// entirely (their identity is authoritative; callers verify it matches
-/// separately and fail loudly on conflict).
-///
-/// # Errors
-///
-/// Returns the same failures as [`open_data_dir`], plus
-/// [`DurabilityError::InvalidConfig`] when the seed names the reserved
-/// zero node id.
-pub fn open_data_dir_with(path: &Path, seed: Option<NodeSeed>) -> Result<OpenDir, DurabilityError> {
-    let dir_sync = create_dir_all_sync(path)
+pub fn open_data_dir(path: &Path, seed: Option<NodeSeed>) -> Result<OpenDir, DurabilityError> {
+    // The data directory is created once; `node.meta` publication syncs it.
+    // The mkdir outcome is not the durability carrier.
+    let _ = create_dir_all_sync(path)
         .map_err(|error| DurabilityError::io("create data directory", path, &error))?;
-    tracing::debug!(dir = %path.display(), ?dir_sync, "data directory ready");
     // The lock guards every mutation below against concurrent processes.
     // `File::try_lock` (std, stable since 1.89): non-blocking and
     // unambiguous — a held lock is an immediate clear error, no waiting.
@@ -288,14 +279,7 @@ pub fn open_data_dir_with(path: &Path, seed: Option<NodeSeed>) -> Result<OpenDir
     let wal_sync = create_dir_all_sync(&wal_dir)
         .map_err(|error| DurabilityError::io("create WAL root", &wal_dir, &error))?;
     tracing::debug!(dir = %wal_dir.display(), ?wal_sync, "WAL root ready");
-    tracing::info!(
-        cluster = meta.cluster.as_u128(),
-        node = meta.node.as_u64(),
-        incarnation = meta.incarnation.as_u64(),
-        fresh,
-        dir = %path.display(),
-        "data directory open",
-    );
+
     Ok(OpenDir {
         dir: path.to_owned(),
         meta,
@@ -339,13 +323,13 @@ mod tests {
     #[test]
     fn first_startup_mints_identity_and_restart_advances() {
         let scratch = tempfile::tempdir().expect("scratch");
-        let first = open_data_dir(scratch.path()).expect("first open");
+        let first = open_data_dir(scratch.path(), None).expect("first open");
         assert!(first.fresh);
         assert_eq!(first.meta.incarnation, NodeIncarnation::INITIAL);
         assert!(first.meta.node.as_u64() != 0);
         let (cluster, node) = (first.meta.cluster, first.meta.node);
         drop(first);
-        let second = open_data_dir(scratch.path()).expect("second open");
+        let second = open_data_dir(scratch.path(), None).expect("second open");
         assert!(!second.fresh);
         assert_eq!(second.meta.cluster, cluster);
         assert_eq!(second.meta.node, node);
@@ -354,7 +338,7 @@ mod tests {
             NodeIncarnation::from_u64(NodeIncarnation::INITIAL.as_u64() + 1)
         );
         drop(second);
-        let third = open_data_dir(scratch.path()).expect("third open");
+        let third = open_data_dir(scratch.path(), None).expect("third open");
         assert!(third.meta.incarnation.supersedes(NodeIncarnation::from_u64(
             NodeIncarnation::INITIAL.as_u64() + 1
         )));
@@ -367,8 +351,8 @@ mod tests {
         // inside one test process proves exactly what a second process
         // would hit: the lock is held, not merely referenced.
         let scratch = tempfile::tempdir().expect("scratch");
-        let _first = open_data_dir(scratch.path()).expect("first open");
-        let err = open_data_dir(scratch.path()).expect_err("second open fails");
+        let _first = open_data_dir(scratch.path(), None).expect("first open");
+        let err = open_data_dir(scratch.path(), None).expect_err("second open fails");
         assert!(
             matches!(err, DurabilityError::Locked { .. }),
             "clear lock error, got {err:?}"
@@ -378,13 +362,13 @@ mod tests {
     #[test]
     fn corrupt_meta_fails_startup() {
         let scratch = tempfile::tempdir().expect("scratch");
-        let opened = open_data_dir(scratch.path()).expect("first open");
+        let opened = open_data_dir(scratch.path(), None).expect("first open");
         drop(opened);
         let meta_path = scratch.path().join(NODE_META_FILE_NAME);
         let mut bytes = fs::read(&meta_path).expect("read");
         bytes[30] ^= 0x01;
         fs::write(&meta_path, &bytes).expect("corrupt");
-        let err = open_data_dir(scratch.path()).expect_err("corrupt meta fails");
+        let err = open_data_dir(scratch.path(), None).expect_err("corrupt meta fails");
         assert!(
             matches!(err, DurabilityError::InvalidConfig { .. }),
             "clear config error, got {err:?}"

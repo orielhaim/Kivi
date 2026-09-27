@@ -5,7 +5,7 @@
 //! `kivi_hardware` produces hardware samples and `kivi-observation` consumes
 //! typed signals. Between them was nothing: a `PmuSample` stopped at
 //! `kivi-hardware::telemetry`, so no controller could distinguish a software
-//! estimate from a hardware measurement, and no signal ever told the Phase 12
+//! estimate from a hardware measurement, and no signal ever told the control
 //! loop that a worker had been migrated off the core it was placed on.
 //!
 //! This module is the seam. It does one thing: turn a hardware sample into a

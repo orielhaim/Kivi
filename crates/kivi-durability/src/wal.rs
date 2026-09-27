@@ -992,9 +992,11 @@ impl LocalWalLane {
             });
         }
         let dir = wal_dir.join(lane_dir_name(lane));
-        let dir_sync = create_dir_all_sync(&dir)
+        // The lane directory is created once and never renamed; segment
+        // creation syncs it itself. The mkdir outcome does not carry
+        // durability, so the `DirSync` arm is not acted on here.
+        let _ = create_dir_all_sync(&dir)
             .map_err(|error| DurabilityError::io("create WAL lane directory", &dir, &error))?;
-        tracing::debug!(lane, dir = %dir.display(), ?dir_sync, "WAL lane directory ready");
         let mut lane_state = Self {
             dir,
             lane,
@@ -1285,7 +1287,7 @@ impl LocalWalLane {
                     // Tablet commits drive reclamation coverage. Consensus
                     // entries carry no commit position and contribute no
                     // coverage here; their retention is tracked separately
-                    // through purge markers (stage H), and physical
+                    // through purge markers, and physical
                     // reclamation stays conservative until then.
                     WalEntry::Tablet(record) => Some((record.tablet(), record.commit())),
                     WalEntry::Consensus(_) => None,
@@ -1530,7 +1532,7 @@ impl LocalWalLane {
         // fixed now, whatever appends first.
         self.active_first_batch = self.next_batch_seq;
         self.segments += 1;
-        tracing::debug!(lane = self.lane, segment = seq, "WAL segment rotated");
+
         Ok(())
     }
 

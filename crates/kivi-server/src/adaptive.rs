@@ -1,4 +1,4 @@
-//! Phase 12 production controller runtime for the single-node engine.
+//! Production controller runtime for the single-node engine.
 //!
 //! The runtime owns bounded observation windows, the deterministic baseline,
 //! optional learned shadowing, and the narrow actuator that applies memory
@@ -23,7 +23,7 @@ use kivi_observation::{
     ObservationMetadata, ObservationPeriod, ObservationSample, ObservationScope,
     ObservationSequence, ObservationSource, ObservationStamp, ObservationWindowId, QueueingSignal,
     RedundancySignal, RepairDebt, RequestSignal, ScrubDebt, StorageBytes, TopologyImbalanceSignal,
-    UnitInterval,
+    TypedSignal, UnitInterval,
 };
 use kivi_types::{ClusterId, NamespaceId, TabletId, Ticks, WorkerId};
 
@@ -470,14 +470,24 @@ impl AdaptiveRuntime {
                 .unwrap_or_default();
             let pressure = fabric_stats_pressure(&fabrics, *worker);
             let barrier = duration_ns(commit.barrier_latency_avg);
-            self.push_sample(state, samples, scope, metadata, period, TypedRequest(delta));
-            self.push_sample(
+            Self::push_sample(
                 state,
                 samples,
                 scope,
                 metadata,
                 period,
-                TypedQueueing(QueueingSignal {
+                TypedSignal::Request(RequestSignal {
+                    reads: delta,
+                    writes: 0,
+                }),
+            );
+            Self::push_sample(
+                state,
+                samples,
+                scope,
+                metadata,
+                period,
+                TypedSignal::Queueing(QueueingSignal {
                     depth: commit.queue_depth as u64,
                     wait_p50_ns: duration_ns(commit.oldest_wait_avg),
                     wait_p99_ns: duration_ns(commit.oldest_wait_max),
@@ -485,36 +495,36 @@ impl AdaptiveRuntime {
                     admission_rejections: 0,
                 }),
             );
-            self.push_sample(
+            Self::push_sample(
                 state,
                 samples,
                 scope,
                 metadata,
                 period,
-                TypedCompute(ComputeSignal {
+                TypedSignal::Compute(ComputeSignal {
                     cpu_time_ns: barrier.saturating_mul(delta),
                     service_time_ns: barrier.saturating_mul(delta),
                 }),
             );
             let resident = fabric_resident_bytes(fabric);
-            self.push_sample(
+            Self::push_sample(
                 state,
                 samples,
                 scope,
                 metadata,
                 period,
-                TypedMemory(MemorySignal {
+                TypedSignal::Memory(MemorySignal {
                     resident_bytes: resident,
                     logical_bytes: resident,
                 }),
             );
-            self.push_sample(
+            Self::push_sample(
                 state,
                 samples,
                 scope,
                 metadata,
                 period,
-                TypedMemoryPressure(MemoryPressureSignal {
+                TypedSignal::MemoryPressure(MemoryPressureSignal {
                     pressure: UnitInterval::new(pressure).unwrap_or(UnitInterval::ZERO),
                     reclaim_attempts: 0,
                     reclaim_failures: 0,
@@ -526,13 +536,13 @@ impl AdaptiveRuntime {
                     .get(&worker.as_u64())
                     .map_or(0, |old| old.migration_bytes),
             );
-            self.push_sample(
+            Self::push_sample(
                 state,
                 samples,
                 scope,
                 metadata,
                 period,
-                TypedIo(IoSignal {
+                TypedSignal::Io(IoSignal {
                     network: NetworkBytes::default(),
                     storage: StorageBytes {
                         read: 0,
@@ -546,22 +556,22 @@ impl AdaptiveRuntime {
                 .find(|(id, _)| id == worker)
                 .map_or(&[][..], |(_, signals)| signals.as_slice());
             let criticality = aggregate_criticality(signals);
-            self.push_sample(
+            Self::push_sample(
                 state,
                 samples,
                 scope,
                 metadata,
                 period,
-                TypedCriticality(criticality),
+                TypedSignal::ExecutionCriticality(criticality),
             );
             for (object, access) in signals.iter().take(hot_key_limit) {
-                self.push_sample(
+                Self::push_sample(
                     state,
                     samples,
                     scope,
                     metadata,
                     period,
-                    TypedHotKey(hot_key_signal(*object, access)),
+                    TypedSignal::HotKey(hot_key_signal(*object, access)),
                 );
             }
             // The hardware reading carries its own provenance, so it is the one
@@ -570,13 +580,13 @@ impl AdaptiveRuntime {
             // is a fact about the machine, and a consumer must be able to tell
             // "measured nothing" from "was not asked".
             if let Some((_, reading)) = inputs.hardware.iter().find(|(id, _)| id == worker) {
-                self.push_sample(
+                Self::push_sample(
                     state,
                     samples,
                     scope,
                     reading.metadata(state.ticks),
                     period,
-                    TypedHardware(reading.to_hardware_signal()),
+                    TypedSignal::Hardware(reading.to_hardware_signal()),
                 );
             }
             total_ops = total_ops.saturating_add(delta);
@@ -602,48 +612,48 @@ impl AdaptiveRuntime {
                     .saturating_add(footprint.compressed_bytes)
                     .saturating_add(footprint.nvme_bytes);
                 let scope = ObservationScope::Tablet(*tablet);
-                self.push_sample(
+                Self::push_sample(
                     state,
                     samples,
                     scope,
                     metadata,
                     period,
-                    TypedMemory(MemorySignal {
+                    TypedSignal::Memory(MemorySignal {
                         resident_bytes: resident,
                         logical_bytes: resident,
                     }),
                 );
-                self.push_sample(
+                Self::push_sample(
                     state,
                     samples,
                     scope,
                     metadata,
                     period,
-                    TypedMemoryPressure(MemoryPressureSignal {
+                    TypedSignal::MemoryPressure(MemoryPressureSignal {
                         pressure: UnitInterval::new(report.arena_pressure)
                             .unwrap_or(UnitInterval::ZERO),
                         reclaim_attempts: 0,
                         reclaim_failures: 0,
                     }),
                 );
-                self.push_sample(
+                Self::push_sample(
                     state,
                     samples,
                     scope,
                     metadata,
                     period,
-                    TypedCompute(ComputeSignal {
+                    TypedSignal::Compute(ComputeSignal {
                         cpu_time_ns: 0,
                         service_time_ns: 0,
                     }),
                 );
-                self.push_sample(
+                Self::push_sample(
                     state,
                     samples,
                     scope,
                     metadata,
                     period,
-                    TypedCriticality(ExecutionCriticalitySignal {
+                    TypedSignal::ExecutionCriticality(ExecutionCriticalitySignal {
                         accesses: 0,
                         serial_accesses: 0,
                         critical_path_accesses: 0,
@@ -680,44 +690,47 @@ impl AdaptiveRuntime {
             },
         );
         let cluster = ObservationScope::Cluster(self.cluster);
-        self.push_sample(
+        Self::push_sample(
             state,
             samples,
             cluster,
             metadata,
             period,
-            TypedRequest(total_ops),
+            TypedSignal::Request(RequestSignal {
+                reads: total_ops,
+                writes: 0,
+            }),
         );
-        self.push_sample(
+        Self::push_sample(
             state,
             samples,
             cluster,
             metadata,
             period,
-            TypedMemory(MemorySignal {
+            TypedSignal::Memory(MemorySignal {
                 resident_bytes: total_resident,
                 logical_bytes: total_logical,
             }),
         );
-        self.push_sample(
+        Self::push_sample(
             state,
             samples,
             cluster,
             metadata,
             period,
-            TypedMemoryPressure(MemoryPressureSignal {
+            TypedSignal::MemoryPressure(MemoryPressureSignal {
                 pressure: UnitInterval::new(max_pressure).unwrap_or(UnitInterval::ZERO),
                 reclaim_attempts: 0,
                 reclaim_failures: 0,
             }),
         );
-        self.push_sample(
+        Self::push_sample(
             state,
             samples,
             cluster,
             metadata,
             period,
-            TypedMaintenance(MaintenanceDebtSignal {
+            TypedSignal::MaintenanceDebt(MaintenanceDebtSignal {
                 checkpoint: CheckpointDebt {
                     bytes: inputs.checkpoint.wal_retained_bytes,
                     oldest_age: Duration::ZERO,
@@ -727,13 +740,13 @@ impl AdaptiveRuntime {
             }),
         );
         if let Some(metrics) = redundancy_metrics {
-            self.push_sample(
+            Self::push_sample(
                 state,
                 samples,
                 cluster,
                 metadata,
                 period,
-                TypedRedundancy(RedundancySignal {
+                TypedSignal::Redundancy(RedundancySignal {
                     logical_bytes: metrics.logical_bytes,
                     physical_bytes: metrics.physical_bytes,
                     fragments: inputs
@@ -742,38 +755,38 @@ impl AdaptiveRuntime {
                         .map_or(0, |snapshot| snapshot.census_fragments),
                 }),
             );
-            self.push_sample(
+            Self::push_sample(
                 state,
                 samples,
                 cluster,
                 metadata,
                 period,
-                TypedDegraded(DegradedAssetsSignal {
+                TypedSignal::DegradedAssets(DegradedAssetsSignal {
                     assets: metrics.degraded,
                     oldest_age: Duration::from_millis(metrics.degraded_time_ms),
                 }),
             );
         }
-        self.push_sample(
+        Self::push_sample(
             state,
             samples,
             cluster,
             metadata,
             period,
-            TypedTopology(TopologyImbalanceSignal {
+            TypedSignal::TopologyImbalance(TopologyImbalanceSignal {
                 busiest_worker_load: total_ops,
                 mean_worker_load: total_ops / u64::try_from(workers.len().max(1)).unwrap_or(1),
                 busiest_tablet_load: total_resident,
                 mean_tablet_load: total_logical / u64::try_from(fabrics.len().max(1)).unwrap_or(1),
             }),
         );
-        self.push_sample(
+        Self::push_sample(
             state,
             samples,
             cluster,
             metadata,
             period,
-            TypedConsensus(ConsensusLagSignal {
+            TypedSignal::ConsensusLag(ConsensusLagSignal {
                 commit_lag_ns: max_latency,
                 replica_lag_ns: 0,
             }),
@@ -781,19 +794,14 @@ impl AdaptiveRuntime {
         let _ = max_queue;
     }
 
-    #[allow(clippy::unused_self)]
-    fn push_sample<S>(
-        &self,
+    fn push_sample(
         state: &mut RuntimeState,
         samples: &mut Vec<ObservationSample>,
         scope: ObservationScope,
         metadata: ObservationMetadata,
         period: ObservationPeriod,
-        signal: S,
-    ) where
-        S: Into<RuntimeSignal>,
-    {
-        let signal = signal.into().into_observation();
+        signal: TypedSignal,
+    ) {
         let stamp = ObservationStamp {
             window: state.window,
             sequence: state.sequence,
@@ -918,135 +926,6 @@ impl Actuator for MemoryActuator {
                 ActionCost::zero(),
             ),
         ))
-    }
-}
-
-enum RuntimeSignal {
-    Request(u64),
-    Queueing(QueueingSignal),
-    Compute(ComputeSignal),
-    Memory(MemorySignal),
-    MemoryPressure(MemoryPressureSignal),
-    Io(IoSignal),
-    Criticality(ExecutionCriticalitySignal),
-    HotKey(HotKeySignal),
-    Maintenance(MaintenanceDebtSignal),
-    Redundancy(RedundancySignal),
-    Degraded(DegradedAssetsSignal),
-    Topology(TopologyImbalanceSignal),
-    Consensus(ConsensusLagSignal),
-    Hardware(kivi_observation::HardwareSignal),
-}
-
-impl RuntimeSignal {
-    fn into_observation(self) -> kivi_observation::TypedSignal {
-        match self {
-            Self::Request(reads) => {
-                kivi_observation::TypedSignal::Request(RequestSignal { reads, writes: 0 })
-            }
-            Self::Queueing(signal) => kivi_observation::TypedSignal::Queueing(signal),
-            Self::Compute(signal) => kivi_observation::TypedSignal::Compute(signal),
-            Self::Memory(signal) => kivi_observation::TypedSignal::Memory(signal),
-            Self::MemoryPressure(signal) => kivi_observation::TypedSignal::MemoryPressure(signal),
-            Self::Io(signal) => kivi_observation::TypedSignal::Io(signal),
-            Self::Criticality(signal) => {
-                kivi_observation::TypedSignal::ExecutionCriticality(signal)
-            }
-            Self::HotKey(signal) => kivi_observation::TypedSignal::HotKey(signal),
-            Self::Maintenance(signal) => kivi_observation::TypedSignal::MaintenanceDebt(signal),
-            Self::Redundancy(signal) => kivi_observation::TypedSignal::Redundancy(signal),
-            Self::Degraded(signal) => kivi_observation::TypedSignal::DegradedAssets(signal),
-            Self::Topology(signal) => kivi_observation::TypedSignal::TopologyImbalance(signal),
-            Self::Consensus(signal) => kivi_observation::TypedSignal::ConsensusLag(signal),
-            Self::Hardware(signal) => kivi_observation::TypedSignal::Hardware(signal),
-        }
-    }
-}
-
-struct TypedRequest(u64);
-struct TypedQueueing(QueueingSignal);
-struct TypedCompute(ComputeSignal);
-struct TypedMemory(MemorySignal);
-struct TypedMemoryPressure(MemoryPressureSignal);
-struct TypedIo(IoSignal);
-struct TypedCriticality(ExecutionCriticalitySignal);
-struct TypedHotKey(HotKeySignal);
-struct TypedMaintenance(MaintenanceDebtSignal);
-struct TypedRedundancy(RedundancySignal);
-struct TypedDegraded(DegradedAssetsSignal);
-struct TypedTopology(TopologyImbalanceSignal);
-struct TypedConsensus(ConsensusLagSignal);
-struct TypedHardware(kivi_observation::HardwareSignal);
-
-impl From<TypedHardware> for RuntimeSignal {
-    fn from(value: TypedHardware) -> Self {
-        Self::Hardware(value.0)
-    }
-}
-
-impl From<TypedRequest> for RuntimeSignal {
-    fn from(value: TypedRequest) -> Self {
-        Self::Request(value.0)
-    }
-}
-impl From<TypedQueueing> for RuntimeSignal {
-    fn from(value: TypedQueueing) -> Self {
-        Self::Queueing(value.0)
-    }
-}
-impl From<TypedCompute> for RuntimeSignal {
-    fn from(value: TypedCompute) -> Self {
-        Self::Compute(value.0)
-    }
-}
-impl From<TypedMemory> for RuntimeSignal {
-    fn from(value: TypedMemory) -> Self {
-        Self::Memory(value.0)
-    }
-}
-impl From<TypedMemoryPressure> for RuntimeSignal {
-    fn from(value: TypedMemoryPressure) -> Self {
-        Self::MemoryPressure(value.0)
-    }
-}
-impl From<TypedIo> for RuntimeSignal {
-    fn from(value: TypedIo) -> Self {
-        Self::Io(value.0)
-    }
-}
-impl From<TypedCriticality> for RuntimeSignal {
-    fn from(value: TypedCriticality) -> Self {
-        Self::Criticality(value.0)
-    }
-}
-impl From<TypedHotKey> for RuntimeSignal {
-    fn from(value: TypedHotKey) -> Self {
-        Self::HotKey(value.0)
-    }
-}
-impl From<TypedMaintenance> for RuntimeSignal {
-    fn from(value: TypedMaintenance) -> Self {
-        Self::Maintenance(value.0)
-    }
-}
-impl From<TypedRedundancy> for RuntimeSignal {
-    fn from(value: TypedRedundancy) -> Self {
-        Self::Redundancy(value.0)
-    }
-}
-impl From<TypedDegraded> for RuntimeSignal {
-    fn from(value: TypedDegraded) -> Self {
-        Self::Degraded(value.0)
-    }
-}
-impl From<TypedTopology> for RuntimeSignal {
-    fn from(value: TypedTopology) -> Self {
-        Self::Topology(value.0)
-    }
-}
-impl From<TypedConsensus> for RuntimeSignal {
-    fn from(value: TypedConsensus) -> Self {
-        Self::Consensus(value.0)
     }
 }
 

@@ -32,7 +32,7 @@
 //!
 //! ## Reclamation scope (§38, §39)
 //!
-//! This stage deletes only fully-dead sealed packs. Mixed live/dead packs
+//! Only fully-dead sealed packs are deleted. Mixed live/dead packs
 //! are kept; mark-copy compaction of cold packs is a later optimization
 //! once pack-lifetime measurements justify it.
 

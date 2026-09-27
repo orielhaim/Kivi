@@ -1,6 +1,6 @@
-//! Repair engine: the mechanism for repair (Phase 11 policy stays out).
+//! Repair engine: the mechanism for repair (self-healing policy stays out).
 //!
-//! Phase 10 repair reacts to explicit known deficits — node unavailable,
+//! Repair reacts to explicit known deficits — node unavailable,
 //! fragment missing, corruption detected, drain requires replacement, layout
 //! transition — and calculates whether each asset is healthy, degraded but
 //! recoverable, critically degraded, or unrecoverable. Work is
@@ -10,7 +10,7 @@
 //! traffic retains priority (repair yields when the caller reports pressure).
 //!
 //! Scrubbing hooks ([`scrub_report`]) classify every fragment for the future
-//! Phase 11 self-healing policy without building that policy here:
+//! self-healing policy without building that policy here:
 //! missing, unreadable, checksum mismatch, stale generation, reconstructable
 //! corruption, unrecoverable corruption. Corruption is never treated as a
 //! valid fragment merely because bytes were read.
@@ -245,8 +245,6 @@ pub struct RepairEngine {
     queue: VecDeque<RepairTask>,
     /// Budgets enforced per tick.
     budgets: RepairBudgetsState,
-    /// Currently executing decodes (concurrency bound).
-    inflight_decodes: usize,
 }
 
 /// Mutable budget counters (reset per tick where noted).
@@ -283,7 +281,6 @@ impl RepairEngine {
                 limits: budgets,
                 bytes_this_tick: 0,
             },
-            inflight_decodes: 0,
         }
     }
 
@@ -362,12 +359,6 @@ impl RepairEngine {
         self.queue.len()
     }
 
-    /// Whether the queue is empty.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.queue.is_empty()
-    }
-
     /// Drains up to the per-tick budget, returning the tasks to execute now.
     ///
     /// The caller executes them (reconstruct → verify → publish replacement
@@ -391,10 +382,9 @@ impl RepairEngine {
         out
     }
 
-    /// Reports a completed repair (frees decode accounting).
+    /// Reports a completed repair's byte cost against this tick's budget.
     pub fn mark_done(&mut self, _task: &RepairTask, bytes: u64) {
         self.budgets.bytes_this_tick = self.budgets.bytes_this_tick.saturating_add(bytes);
-        self.inflight_decodes = self.inflight_decodes.saturating_sub(1);
     }
 
     /// Re-queues a failed repair (keeps its reason; caller bounds retries).
@@ -411,32 +401,10 @@ impl RepairEngine {
         self.queue.push_back(task);
         Ok(())
     }
-
-    /// Whether another decode may start under the concurrency bound.
-    #[must_use]
-    pub const fn can_decode(&self) -> bool {
-        self.inflight_decodes < self.budgets.limits.max_concurrent_decodes
-    }
-
-    /// Acquires a decode slot, if available.
-    #[must_use]
-    pub fn try_acquire_decode(&mut self) -> bool {
-        if self.can_decode() {
-            self.inflight_decodes += 1;
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Releases a decode slot.
-    pub fn release_decode(&mut self) {
-        self.inflight_decodes = self.inflight_decodes.saturating_sub(1);
-    }
 }
 
 /// Scrub report for one asset: per-fragment verdicts for operators and the
-/// future Phase 11 policy. Pure classification — this function never repairs.
+/// self-healing policy. Pure classification — this function never repairs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScrubReport {
     /// Asset scrubbed.

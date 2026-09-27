@@ -12,7 +12,6 @@ use jiff::SignedDuration;
 use kivi_state::{ExpiryPolicy, Operation, OperationResult, SetCondition};
 use kivi_types::WallTimestamp;
 
-use crate::command::CompatClass;
 use crate::error::{KiviErrorKind, RespError};
 
 /// Which Redis command produced an engine operation: drives exact reply
@@ -848,37 +847,6 @@ pub fn slice_getrange(value: &[u8], start: i64, end: i64) -> Bytes {
         return Bytes::new();
     }
     Bytes::copy_from_slice(&value[from_usize..=to_usize])
-}
-
-/// Classifies one compatibility entry for the published support table.
-#[must_use]
-pub const fn compat_of(name: &str) -> Option<CompatClass> {
-    let mut index = 0;
-    while index < crate::command::REGISTRY.len() {
-        let spec = &crate::command::REGISTRY[index];
-        // `const` string comparison is byte-wise by construction here.
-        if str_eq(spec.name, name) {
-            return Some(spec.compat);
-        }
-        index += 1;
-    }
-    None
-}
-
-const fn str_eq(left: &str, right: &str) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    let left = left.as_bytes();
-    let right = right.as_bytes();
-    let mut index = 0;
-    while index < left.len() {
-        if left[index] != right[index] {
-            return false;
-        }
-        index += 1;
-    }
-    true
 }
 
 #[cfg(test)]

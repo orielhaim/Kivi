@@ -307,8 +307,10 @@ async fn successor_endpoint(shared: &ClusterShared, tablet: TabletId) -> Option<
     })
 }
 
-/// Layout routing for ordinary keys.
-fn route_normal_key(
+/// Layout routing for ordinary keys: byte lookup first, then the hash-layout
+/// fallback. Every routing site in the server resolves through here so the
+/// two-step rule exists once.
+pub(crate) fn route_normal_key(
     snapshot: &kivi_tablet::DirectorySnapshot,
     namespace: NamespaceId,
     key: &[u8],
@@ -1392,7 +1394,7 @@ fn spawn_redundancy_healer(
             .await;
             match result {
                 Ok(Ok(_)) => {}
-                Ok(Err(error)) => tracing::warn!(%error, "redundancy maintenance tick deferred"),
+                Ok(Err(error)) => tracing::debug!(%error, "redundancy maintenance tick deferred"),
                 Err(error) => tracing::warn!(%error, "redundancy maintenance task failed"),
             }
         }
@@ -1795,7 +1797,9 @@ fn schedule_sidecar_protection(
     let domain = kivi_types::SecurityDomainId::from_u64(shared.namespace.as_u64());
     tokio::spawn(async move {
         let owned = Arc::clone(&coordinator);
-        let result = tokio::task::spawn_blocking(move || {
+        // Each arm below already names the artifact it could not protect;
+        // a runtime that would not start is the only failure without one.
+        if tokio::task::spawn_blocking(move || {
             let runtime = compio::runtime::Runtime::new().map_err(|error| error.to_string())?;
             runtime.block_on(async move {
                 for (chunk, len) in chunks {
@@ -1811,9 +1815,10 @@ fn schedule_sidecar_protection(
                 Ok::<(), String>(())
             })
         })
-        .await;
-        if let Ok(Err(error)) = result {
-            tracing::warn!(%error, "sidecar protection worker stopped");
+        .await
+        .is_err()
+        {
+            tracing::warn!("sidecar protection worker panicked");
         }
     });
 }
@@ -5708,7 +5713,7 @@ async fn serve_admin(listener: tokio::net::TcpListener, shared: ClusterShared) {
     }
 }
 
-/// RESP executor over the replicated node (task P edge adapter).
+/// RESP executor over the replicated node.
 /// Anonymous identity throughout (Redis carries no sessions); leader
 /// routing failures surface as retryable `Overloaded` (`BUSY`, safe to
 /// retry with backoff). The `ExecuteError` surface carries no dynamic

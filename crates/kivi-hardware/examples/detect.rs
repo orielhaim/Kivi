@@ -11,13 +11,22 @@ fn main() {
     let capabilities = kivi_hardware::snapshot();
 
     println!("== snapshot ==");
-    println!("{}", capabilities.report());
+    for mechanism in capabilities.mechanisms() {
+        println!(
+            "  {}: {}",
+            mechanism.name,
+            mechanism
+                .support
+                .unavailable()
+                .map_or_else(|| "available".to_owned(), ToString::to_string)
+        );
+    }
 
     println!();
     println!("== topology ==");
-    let topology = capabilities.topology_logical();
+    let topology = &capabilities.topology;
     println!("{}", topology.summary());
-    for core in &capabilities.topology_logical().physical_cores {
+    for core in &topology.physical_cores {
         println!(
             "  core {:?} node={} cpus={:?} class={:?} llc_shared={}",
             core.key, core.numa_node.0, core.logical_cpus, core.class, core.llc_shared
@@ -80,7 +89,7 @@ fn main() {
         kivi_hardware::PlacementStrategy::PhysicalCore,
         kivi_hardware::PlacementStrategy::NumaAware,
     ] {
-        let plan = kivi_hardware::plan(capabilities.topology_logical(), strategy, &slots);
+        let plan = kivi_hardware::plan(&capabilities.topology, strategy, &slots);
         println!("  {}", plan.diagnostics.summary());
         for placement in &plan.placements {
             println!("    {placement}");

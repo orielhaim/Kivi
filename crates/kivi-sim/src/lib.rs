@@ -2,10 +2,9 @@
 //!
 //! This crate implements the interfaces from `kivi-core` (`Clock`,
 //! [`RandomSource`](kivi_core::RandomSource),
-//! [`FaultPolicy`](kivi_core::FaultPolicy), [`StateMachine`](kivi_core::StateMachine))
-//! with virtual components: a frozen-algorithm RNG ([`SimRng`]), a totally
-//! ordered event [`Scheduler`], built-in fault policies, and a replayable
-//! [`Trace`].
+//! [`FaultPolicy`](kivi_core::FaultPolicy)) with virtual components: a
+//! frozen-algorithm RNG ([`SimRng`]), a totally ordered event [`Scheduler`],
+//! built-in fault policies, and a replayable [`Trace`].
 //!
 //! Determinism contract: identical initial state, seed, scheduled events,
 //! and fault policy produce identical event order, virtual timestamps,

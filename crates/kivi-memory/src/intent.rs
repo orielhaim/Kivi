@@ -110,7 +110,7 @@ pub struct MaterializationIntent {
     /// Sustained bandwidth the workload needs, bytes per second.
     pub bandwidth_requirement_bps: u64,
     /// Whether compute near the data is desired (future DPA/CXL hook).
-    /// Informational in Phase 9; no provider is required to honor it.
+    /// Informational; no provider is required to honor it.
     pub compute_near_data: bool,
     /// Whether the bytes must be encrypted at rest on this provider.
     pub encryption_required: bool,

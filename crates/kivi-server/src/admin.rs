@@ -53,7 +53,7 @@ pub struct AdminState {
     pub incarnation: NodeIncarnation,
     /// Read-only engine query handle (`Send + Sync`, Tokio-safe).
     pub engine: AdminHandle,
-    /// Phase 12 adaptive controller runtime, when enabled for this process.
+    /// Adaptive controller runtime, when enabled for this process.
     pub adaptive: Option<std::sync::Arc<super::adaptive::AdaptiveRuntime>>,
     /// RESP frontend view (`None` when compiled without the feature or
     /// running native-only).
@@ -781,12 +781,20 @@ struct FabricWorkerDto {
 /// report of absences, not an error.
 #[derive(Serialize)]
 struct HardwareDto {
-    /// One line per capability dimension, exactly as the startup log prints it.
-    report: String,
-    /// Physical topology, one line.
-    topology: String,
     /// Processor identity, cache geometry and locality summary.
     topology_summary: String,
+    /// Every optional mechanism, and the reason it is absent when it is.
+    mechanisms: Vec<HardwareMechanismDto>,
+    /// Huge-page backing.
+    huge_pages: String,
+    /// Direct I/O mode and the alignment it requires.
+    direct_io: String,
+    /// Performance counters this process may read.
+    pmu: String,
+    /// DAMON aggregation parameters.
+    damon: String,
+    /// Advanced `io_uring` features the running kernel offers.
+    io_uring: String,
     /// Instruction sets the running binary can use.
     isa: Vec<String>,
     /// Memory nodes, with technology class and capacity.
@@ -805,6 +813,13 @@ struct HardwareDto {
     workers: Vec<HardwareWorkerDto>,
     /// Every researched track and why it was or was not adopted.
     tracks: Vec<HardwareTrackDto>,
+}
+
+#[derive(Serialize)]
+struct HardwareMechanismDto {
+    mechanism: String,
+    /// The absence reason, or `None` when a probe opened the mechanism.
+    unavailable: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -873,8 +888,19 @@ async fn hardware() -> Json<HardwareDto> {
         })
         .collect();
     Json(HardwareDto {
-        report: capabilities.report(),
-        topology: capabilities.report(),
+        mechanisms: capabilities
+            .mechanisms()
+            .into_iter()
+            .map(|mechanism| HardwareMechanismDto {
+                mechanism: mechanism.name.to_owned(),
+                unavailable: mechanism.support.unavailable().map(ToString::to_string),
+            })
+            .collect(),
+        huge_pages: capabilities.huge_pages.to_string(),
+        direct_io: capabilities.direct_io.to_string(),
+        pmu: capabilities.pmu.to_string(),
+        damon: capabilities.damon.to_string(),
+        io_uring: capabilities.io_ring.to_string(),
         topology_summary: topology.summary(),
         isa: capabilities
             .isa
@@ -1136,7 +1162,7 @@ pub async fn serve(
         .with_graceful_shutdown(shutdown)
         .await
         .context("admin server failed")?;
-    tracing::info!("admin plane stopped");
+
     Ok(())
 }
 

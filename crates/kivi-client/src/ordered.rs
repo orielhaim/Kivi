@@ -2272,7 +2272,7 @@ impl NativeClient {
     ) -> Result<Vec<ClientScanEntry>, ClientError> {
         use kivi_state::{prefix_successor, term_prefix};
         let bound = limit.min(INDEX_RESOLVE_LIMIT);
-        let prefix = term_prefix(index, term, false);
+        let prefix = term_prefix(index, term);
         let Some(end) = prefix_successor(&prefix) else {
             return Ok(Vec::new());
         };
@@ -2341,8 +2341,8 @@ impl NativeClient {
     ) -> Result<Vec<Vec<u8>>, ClientError> {
         use kivi_state::term_prefix;
         let bound = limit.min(INDEX_RESOLVE_LIMIT);
-        let start = term_prefix(index, start_term, false);
-        let end = term_prefix(index, end_term, false);
+        let start = term_prefix(index, start_term);
+        let end = term_prefix(index, end_term);
         let entries = self.index_window_entries(namespace, &start, &end, bound)?;
         let mut hits: Vec<IndexHit> = Vec::new();
         for entry in entries {

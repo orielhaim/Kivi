@@ -11,7 +11,7 @@ use kivi_types::{NodeId, TabletId};
 
 /// Identity of one replicated tablet group.
 ///
-/// This stage replicates exactly one tablet, so the group is 1:1 with its
+/// The group is 1:1 with its
 /// tablet; the newtype keeps that coincidence from becoming structural.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ConsensusGroupId(TabletId);

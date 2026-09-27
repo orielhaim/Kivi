@@ -59,7 +59,6 @@ pub mod mutation;
 pub mod node;
 pub mod peer;
 pub mod preflight;
-pub mod redundancy;
 pub mod router;
 pub mod shared;
 pub mod sidecar;
@@ -113,10 +112,6 @@ pub use preflight::{
     PreflightMetrics, PreflightMetricsSnapshot, PreflightOutcome, followers_needed,
     preflight_to_quorum, quorum_needed,
 };
-pub use redundancy::{
-    protect_chunk_sidecar, protect_sidecar, read_chunk_via_fabric, read_sidecar_via_fabric,
-    sidecar_assets, sidecar_chunk_asset,
-};
 pub use router::{
     GroupNetworkFactory, PeerRouter, RpcCodecError, decode_append_request, decode_snapshot_meta,
     decode_vote_request, decode_wire_entry, decode_wire_log, decode_wire_vote,
@@ -140,7 +135,7 @@ pub use state_machine::{
 pub use store::{
     CONSENSUS_LANE, ConsensusLogStore, DurableLogReader, DurableRaftStore, StoreOpenError,
 };
-pub use tls::{CertFingerprint, NodeCert, TlsError, TrustRegistry, empty_trust};
+pub use tls::{CertFingerprint, NodeCert, TlsError, TrustRegistry};
 pub use transport::{
     MAX_BULK_BODY_BYTES, MAX_FRAGMENT_BODY_BYTES, MAX_RAFT_BODY_BYTES, PeerHandler, PeerStats,
     PeerTransport, TransportConfig, TransportError,

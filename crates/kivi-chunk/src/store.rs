@@ -369,15 +369,7 @@ impl ChunkStore {
             duplicate_records: summary.duplicates_skipped,
             truncated_bytes: summary.truncated_bytes,
         };
-        tracing::info!(
-            lane,
-            packs = stats.packs,
-            chunks = stats.chunks,
-            manifests = stats.manifests,
-            truncated_bytes = summary.truncated_bytes,
-            duplicates = summary.duplicates_skipped,
-            "chunk lane recovered"
-        );
+
         Ok((
             Self {
                 dir,
@@ -784,7 +776,6 @@ impl ChunkStore {
         self.active_len = PACK_HEADER_LEN as u64;
         self.stats.packs += 1;
         self.stats.active_bytes = self.active_len;
-        tracing::debug!(lane = self.lane, pack = seq, "chunk pack rotated");
         Ok(())
     }
 }

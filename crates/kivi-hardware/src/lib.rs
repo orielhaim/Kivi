@@ -34,24 +34,11 @@
 //!
 //! ## Unsafe
 //!
-//! Almost none. Hand-written `unsafe` exists only where a platform has no safe
-//! interface: processor binding, thread topology, huge-page advice, direct I/O
-//! and device-control codes. Each site carries a safety comment naming its
-//! invariant, and the workspace's `unsafe_code = "deny"` is not weakened:
-//! every allowance is a scoped, grep-able `#[allow]` on one item.
-//!
-//! ## Crates considered and rejected
-//!
-//! * `hwlocality` — the maintained hwloc binding, and the richest topology
-//!   model available in Rust. Rejected: pre-1.0, needs `pkg-config` or
-//!   `cmake`/`automake` at build time, and its Windows story needs a C
-//!   toolchain upstream itself does not get right. Reading two documented OS
-//!   interfaces directly is cheaper and has no failure mode a topology
-//!   library would have handled better.
-//! * `core_affinity2` — replaced. It binds a thread to one core, which is not
-//!   the operation Kivi needs, and it pulls `libafl_core` in to do it.
-//! * `nix` / `rustix` for topology — neither exposes topology; they expose the
-//!   syscalls, which is the only part used here.
+//! Hand-written `unsafe` exists only where a platform has no safe interface:
+//! processor binding, thread topology, huge-page advice, direct I/O and
+//! device-control codes. Each site carries a safety comment naming its
+//! invariant, and the workspace's `unsafe_code = "deny"` is not weakened: every
+//! allowance is a scoped, grep-able `#[allow]` on one item.
 
 #![doc = include_str!("../README.md")]
 
@@ -71,9 +58,8 @@ pub mod telemetry;
 pub mod transport;
 
 pub use capability::{
-    Capabilities, CapabilityStage, DamonSupport, DirectIoSupport, HugePageSupport, IoUringSupport,
-    IsaSupport, Mechanism, MechanismStatus, MemoryRegion, PmuCounter, PmuSupport, Support,
-    Unavailable, snapshot,
+    Capabilities, DamonParams, DirectIoSupport, HugePageSupport, IoUringSupport, IsaFeature,
+    IsaSupport, Mechanism, MemoryRegion, PmuCounter, PmuSupport, Support, Unavailable, snapshot,
 };
 pub use cpuset::{BindError, Binding, CpuSet, bind_current_thread, current_cpu, parse_cpu_list};
 pub use numa::{Arena, HUGE_PAGE_BYTES, NodePolicy, PagePlacement, PlacementOutcome, page_size};

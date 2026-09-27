@@ -30,7 +30,7 @@
 //!   converges identically.
 //! * `append` — "**should return immediately after saving in memory**" and
 //!   "**when the callback is called, the entries must be persisted**".
-//!   Entries stage into the cache (readable on return, as required) while
+//!   Entries land in the cache (readable on return, as required) while
 //!   the shared writer persists; the [`openraft::storage::IOFlushed`]
 //!   callback fires only after the barrier acks. A barrier failure removes
 //!   the staged suffix so the cache never advertises undurable history.
@@ -459,7 +459,7 @@ mod tests {
                 config,
                 StubNetworkFactory,
                 store.clone(),
-                MemStateMachine::new(),
+                MemStateMachine::default(),
             )
             .await
             .expect("raft spawns");
@@ -500,7 +500,7 @@ mod tests {
                 config,
                 StubNetworkFactory,
                 store.clone(),
-                MemStateMachine::new(),
+                MemStateMachine::default(),
             )
             .await
             .expect("raft respawns");

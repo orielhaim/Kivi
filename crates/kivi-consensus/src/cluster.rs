@@ -224,7 +224,7 @@ impl ClusterTopology {
     }
 }
 
-/// Fresh vs. existing group, decided from durable state (task G).
+/// Fresh vs. existing group, decided from durable state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bootstrap {
     /// No vote, no log entries, no snapshot base: first formation may

@@ -42,3 +42,11 @@ pub mod resp_client;
 pub mod runner;
 pub mod targets;
 pub mod workload;
+/// Far-future expiry stamp for benchmark and campaign expirations: one
+/// production wall read plus sixty seconds, clamped to the max stamp.
+#[must_use]
+pub fn far_future_expiry() -> kivi_types::WallTimestamp {
+    kivi_core::wall_now_or_max(&kivi_core::SystemClock)
+        .checked_add(jiff::SignedDuration::from_secs(60))
+        .unwrap_or(kivi_types::WallTimestamp::MAX)
+}

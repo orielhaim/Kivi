@@ -334,18 +334,11 @@ impl TabletFabric {
     ) -> Result<(Self, OffcoreLaneGuard), FabricError> {
         std::fs::create_dir_all(&paths.root).map_err(|_| FabricError::Unavailable)?;
 
-        // Locality is read from the *planned* core of the thread that owns this
-        // fabric, not guessed from the worker index. The previous
-        // `worker % nodes` arithmetic happened to be right on a one-node
-        // machine and wrong on every multi-node one, because the owner thread
-        // and the worker's index have no relationship to which node the
-        // scheduler put the thread on.
-        //
-        // It also has to arrive *before* construction: the fabric registers one
-        // provider per memory node so the planner can see the whole machine and
-        // score remote residency, which is only possible if the node set is
-        // known when providers are registered. Setting it afterwards updated a
-        // field nobody read and left the local provider on node 0.
+        // Locality comes from the *planned* core of the owning thread, not from
+        // the worker index: the index says nothing about which node the
+        // scheduler placed the thread on. It must arrive *before* construction,
+        // because the fabric registers one provider per memory node so the
+        // planner can score remote residency.
         let ordinal = usize::try_from(worker.as_u64()).unwrap_or(0);
         let owner_slot = WorkerSlot::new(PlacementRole::DataWorker, ordinal);
         let topology = &kivi_hardware::snapshot().topology;
@@ -353,13 +346,7 @@ impl TabletFabric {
             .plan()
             .placement(owner_slot)
             .and_then(|p| p.numa_node);
-        if let Some(node) = numa_node {
-            tracing::debug!(
-                worker = worker.as_u64(),
-                node = node.0,
-                "fabric locality follows the planned core",
-            );
-        }
+
         let mut fabric = MemoryFabric::new(MemoryFabricConfig {
             arena_capacity_bytes: arena_bytes,
             nvme_capacity_bytes: demotion_bytes,
@@ -389,17 +376,8 @@ impl TabletFabric {
             kivi_memory::NvmeOptions::default(),
             Some(Box::new(move || {
                 let slot = WorkerSlot::new(PlacementRole::OffcoreLane, ordinal);
-                match bind.bind(slot) {
-                    Ok(_) => tracing::debug!(
-                        worker = worker.as_u64(),
-                        cpu = ?bind.current_cpu(),
-                        "offcore lane placed",
-                    ),
-                    Err(error) => tracing::error!(
-                        ?error,
-                        worker = worker.as_u64(),
-                        "offcore lane could not be placed",
-                    ),
+                if let Err(error) = bind.bind(slot) {
+                    tracing::warn!(?error, worker = worker.as_u64(), "offcore lane unbound");
                 }
             })),
         )
@@ -447,12 +425,8 @@ impl TabletFabric {
         // Consensus determinism never depends on this (prepare stays pure).
         //
         // Saturation is a *tiering* signal, not a refusal: the arena is a
-        // cache of hot medium values and the off-core device is where the
-        // rest of the working set lives. Refusing here made a bounded hot
-        // tier into a bounded database — every value between
-        // `FABRIC_INLINE_MAX` and the chunk threshold failed once the arena
-        // filled, which is the same working set `import_recovered` already
-        // handles by demoting.
+        // cache of hot medium values and the off-core device holds the rest of
+        // the working set.
         match self.fabric.stage_plan(len) {
             Ok(()) => {}
             Err(kivi_memory::MemoryError::Overloaded { .. }) => self.admission_rejects += 1,

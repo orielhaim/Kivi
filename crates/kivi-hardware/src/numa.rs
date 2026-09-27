@@ -479,7 +479,7 @@ pub fn page_size() -> usize {
 /// machine locality is not a fact anyone can observe.
 #[must_use]
 pub fn report() -> String {
-    let topology = crate::snapshot().topology_logical();
+    let topology = &crate::snapshot().topology;
     let mut parts = vec![format!("nodes={}", topology.numa_node_count())];
     for node in &topology.memory_nodes {
         parts.push(format!(
@@ -817,7 +817,7 @@ mod sys {
 #[must_use]
 pub fn nodes() -> Vec<NumaNodeId> {
     crate::snapshot()
-        .topology_logical()
+        .topology
         .memory_nodes
         .iter()
         .map(|node| node.id)

@@ -1295,7 +1295,7 @@ mod tests {
             );
             let mut live =
                 LiveTablet::from_descriptor(descriptor, authority).expect("tablet builds");
-            live.set_ordered_indexing(true);
+            live.store_mut().set_ordered_indexing(true);
             tablets.borrow_mut().insert(descriptor.id(), live);
         }
         // Seed data on both tablets through the tablets directly.

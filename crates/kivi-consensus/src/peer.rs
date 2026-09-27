@@ -1599,7 +1599,7 @@ fn push_vote_response(out: &mut Vec<u8>, response: &PeerVoteResponse) {
     push_opt_log(out, response.last_log.as_ref());
 }
 
-/// Highest incarnation observed per node (task K). Connections and
+/// Highest incarnation observed per node. Connections and
 /// messages from an older generation than recorded never regain
 /// validity; a newer generation supersedes and is recorded.
 #[derive(Debug, Default)]

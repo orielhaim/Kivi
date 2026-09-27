@@ -181,19 +181,16 @@ pub fn encode_unique_key(index: IndexId, term: &[u8]) -> Vec<u8> {
 }
 
 /// Term prefix shared by every entry for `(index, term)`: equality scans
-/// use `[prefix, prefix_successor)`; term ranges compose prefixes.
+/// use `[prefix, prefix_successor)`; term ranges compose prefixes. A unique
+/// index has the same prefix shape, since its entry key adds no primary.
 #[must_use]
-pub fn term_prefix(index: IndexId, term: &[u8], unique: bool) -> Vec<u8> {
-    if unique {
-        encode_unique_key(index, term)
-    } else {
-        let mut out = Vec::with_capacity(24 + term.len());
-        out.extend_from_slice(INDEX_FORMAT_TAG);
-        out.extend_from_slice(&index.as_u64().to_be_bytes());
-        out.push(0x00);
-        push_escaped(&mut out, term);
-        out
-    }
+pub fn term_prefix(index: IndexId, term: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(24 + term.len());
+    out.extend_from_slice(INDEX_FORMAT_TAG);
+    out.extend_from_slice(&index.as_u64().to_be_bytes());
+    out.push(0x00);
+    push_escaped(&mut out, term);
+    out
 }
 
 /// Exclusive end of a prefix range: the lexicographic successor of
@@ -504,7 +501,7 @@ mod tests {
         assert!(a < b);
         assert!(b < other);
         // Equality prefix covers exactly the term's entries.
-        let prefix = term_prefix(IndexId::from_u64(1), b"t", false);
+        let prefix = term_prefix(IndexId::from_u64(1), b"t");
         assert!(a.starts_with(&prefix));
         assert!(b.starts_with(&prefix));
         assert!(!other.starts_with(&prefix));
@@ -513,7 +510,7 @@ mod tests {
         assert!(b < end);
         assert!(other >= end);
         // Earlier terms sort earlier.
-        let earlier = term_prefix(IndexId::from_u64(1), b"s", false);
+        let earlier = term_prefix(IndexId::from_u64(1), b"s");
         assert!(earlier < prefix);
     }
 

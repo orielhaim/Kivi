@@ -210,9 +210,9 @@ impl ProviderCaps {
         if durability_required && !self.durable {
             return false;
         }
-        // Encryption is a deployment property, not a Phase 9 provider
-        // property: no Phase 9 provider offers it, so an intent requiring
-        // it excludes all Phase 9 providers (fail closed into the
+        // Encryption is a deployment property, not a provider
+        // property: no provider here offers it, so an intent requiring
+        // it excludes all providers (fail closed into the
         // correctness path, per RFC §2).
         if encryption_required {
             return false;

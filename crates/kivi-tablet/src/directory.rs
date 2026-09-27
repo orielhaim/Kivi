@@ -4,10 +4,8 @@
 //! tablet for a single namespace. Snapshots are values, never mutated in
 //! place: each transition (`allocate`, `stage`, `activate`, `seal`,
 //! `retire`) validates its preconditions and returns a new snapshot with a
-//! bumped [`DirectoryVersion`]. A future RCU/`ArcSwap` publication layer can
-//! therefore publish snapshots atomically without changing any semantics
-//! defined here; it only needs to call [`DirectorySnapshot::validate`] before
-//! publishing.
+//! bumped [`DirectoryVersion`]. Publication is atomic through one `Arc`, so
+//! readers never observe a half-applied replacement.
 //!
 //! Replacement ordering is enforced by construction, mirroring RFC §190:
 //! a successor can activate only once the current owner no longer covers its

@@ -285,9 +285,7 @@ pub async fn reconcile_loop_shared(
         // keeps serving directories converged, while the admin cutover
         // push stays the same-pass fast path.
         super::cluster::replay_committed_topology(&node, &directory).await;
-        if let Err(reason) = reconcile_once(&node, &snapshot, &mut detector, &directory).await {
-            tracing::debug!(%reason, "reconciler pass skipped");
-        }
+        let _ = reconcile_once(&node, &snapshot, &mut detector, &directory).await;
     }
 }
 
@@ -329,13 +327,7 @@ async fn retire_stale_local_replicas(node: &Arc<ConsensusNode>) {
         if desired.contains(local) {
             continue;
         }
-        if let Err(reason) = node.retire_group(tablet, generation).await {
-            tracing::debug!(
-                tablet = tablet.as_u64(),
-                %reason,
-                "stale local replica retirement deferred"
-            );
-        }
+        let _ = node.retire_group(tablet, generation).await;
     }
 }
 
@@ -454,8 +446,6 @@ async fn reconcile_once(
         // already published), and past any reconciler retry.
         let pruned = node.control_state().await.unwrap_or(done);
         prune_terminal_plans(node, &pruned).await;
-    } else {
-        tracing::debug!("control quorum unreachable; deferring automated topology actions");
     }
     Ok(())
 }
@@ -530,7 +520,7 @@ fn route_record_tablet(
     if let Some(tablet) = snapshot.lookup_by_key(record_key.as_bytes()) {
         return Some(tablet);
     }
-    // Hash-layout fallback (mirrors `cluster::route_normal_key`).
+    // Hash-layout fallback, shared with every other routing site.
     let hash = kivi_state::PartitionHasher::V1.hash(namespace, record_key.as_bytes())?;
     snapshot.lookup_by_hash(hash)
 }
@@ -944,15 +934,12 @@ async fn drive_liveness(
                 alive,
                 "node liveness transition"
             );
-            if let Err(reason) = node
+            let _ = node
                 .propose_control(ControlMutation::SetNodeState {
                     node: record.node,
                     state: next,
                 })
-                .await
-            {
-                tracing::debug!(node = record.node.as_u64(), %reason, "liveness transition deferred");
-            }
+                .await;
         }
     }
 }
@@ -978,41 +965,35 @@ async fn drive_repairs(node: &Arc<ConsensusNode>, state: &ControlState, policy: 
     }
     let budget = policy.max_live_plans.saturating_sub(live);
     let intents: Vec<MigrationIntent> = intents.into_iter().take(budget.max(1)).collect();
-    match create_plans(node, &intents).await {
-        Ok(ids) => {
-            tracing::info!(plans = ids.len(), "automatic repair round created");
-        }
-        Err(reason) => {
-            tracing::debug!(%reason, "automatic repair deferred");
-        }
+    if let Ok(ids) = create_plans(node, &intents).await {
+        tracing::info!(plans = ids.len(), "automatic repair round created");
     }
 }
 
 /// Advances one split plan's persisted phase (generation-fenced).
 async fn advance_split(node: &Arc<ConsensusNode>, plan: &SplitPlan, phase: SplitPhase) {
-    tracing::info!(
-        node_id = node.node().as_u64(),
-        plan_id = plan.id.as_u64(),
-        parent = plan.parent.as_u64(),
-        left = plan.left.as_u64(),
-        right = plan.right.as_u64(),
-        ?phase,
-        "split plan advanced"
-    );
     let generation = node
         .control_state()
         .await
         .and_then(|state| state.split(plan.id).map(|plan| plan.generation))
         .unwrap_or(PlacementVersion::INITIAL);
-    if let Err(reason) = node
+    if node
         .propose_control(ControlMutation::AdvanceSplit {
             plan: plan.id,
             phase,
             generation,
         })
         .await
+        .is_ok()
     {
-        tracing::debug!(plan = plan.id.as_u64(), %reason, "split advance deferred");
+        tracing::info!(
+            plan_id = plan.id.as_u64(),
+            parent = plan.parent.as_u64(),
+            left = plan.left.as_u64(),
+            right = plan.right.as_u64(),
+            ?phase,
+            "split plan advanced"
+        );
     }
 }
 
@@ -1022,29 +1003,28 @@ async fn advance_merge(
     plan: &kivi_control::MergePlan,
     phase: MergePhase,
 ) {
-    tracing::info!(
-        node_id = node.node().as_u64(),
-        plan_id = plan.id.as_u64(),
-        left = plan.left.as_u64(),
-        right = plan.right.as_u64(),
-        merged = plan.merged.as_u64(),
-        ?phase,
-        "merge plan advanced"
-    );
     let generation = node
         .control_state()
         .await
         .and_then(|state| state.merge(plan.id).map(|plan| plan.generation))
         .unwrap_or(PlacementVersion::INITIAL);
-    if let Err(reason) = node
+    if node
         .propose_control(ControlMutation::AdvanceMerge {
             plan: plan.id,
             phase,
             generation,
         })
         .await
+        .is_ok()
     {
-        tracing::debug!(plan = plan.id.as_u64(), %reason, "merge advance deferred");
+        tracing::info!(
+            plan_id = plan.id.as_u64(),
+            left = plan.left.as_u64(),
+            right = plan.right.as_u64(),
+            merged = plan.merged.as_u64(),
+            ?phase,
+            "merge plan advanced"
+        );
     }
 }
 
@@ -1091,20 +1071,10 @@ async fn drive_split(
         return;
     }
     if !state.live_plans_for(plan.parent).is_empty() {
-        tracing::debug!(
-            plan = plan.id.as_u64(),
-            parent = plan.parent.as_u64(),
-            "split deferred: parent has a live migration (repair wins)"
-        );
         return;
     }
     // A degraded parent never splits: safety before optimization.
     if parent_degraded(state, plan.parent) {
-        tracing::debug!(
-            plan = plan.id.as_u64(),
-            parent = plan.parent.as_u64(),
-            "split deferred: parent under-replicated"
-        );
         return;
     }
     match plan.phase {
@@ -1127,11 +1097,6 @@ async fn drive_split(
             // live intents would strand them: the fence blocks the very
             // finalizes that could resolve them.
             if !blocked_parents(node, &[plan.parent]).await.is_empty() {
-                tracing::debug!(
-                    plan = plan.id.as_u64(),
-                    parent = plan.parent.as_u64(),
-                    "split deferred: parent holds unresolved intents"
-                );
                 return;
             }
             let fenced_at = std::time::Instant::now();
@@ -1158,11 +1123,6 @@ async fn drive_split(
             // the next pass re-drains and re-fences) rather than stranding
             // transactional state in a retired lineage.
             if !blocked_parents(node, &[plan.parent]).await.is_empty() {
-                tracing::info!(
-                    plan = plan.id.as_u64(),
-                    parent = plan.parent.as_u64(),
-                    "split seal deferred: intents raced the fence; unfencing"
-                );
                 let _ = fence_tablets(node, state, &[plan.parent], false).await;
                 advance_split(node, plan, SplitPhase::BaseSeeded).await;
                 return;
@@ -1176,11 +1136,6 @@ async fn drive_split(
             // unresolved intents (a stranded intent could never resolve
             // once its group is gone).
             if !blocked_parents(node, &[plan.parent]).await.is_empty() {
-                tracing::debug!(
-                    plan = plan.id.as_u64(),
-                    parent = plan.parent.as_u64(),
-                    "split retire deferred: parent holds unresolved intents"
-                );
                 return;
             }
             if retire_tablets(node, state, &[plan.parent], plan.generation.as_u64()).await {
@@ -1194,26 +1149,13 @@ async fn drive_split(
     }
 }
 
-/// Defers a merge step while any parent holds unresolved intents,
-/// logging each blocked parent: `true` means all clear (drain, seal, and
-/// retire share the gate — intents never migrate, so the step retries on
-/// a later pass). Seal races log at info (`notable`); routine drains at
-/// debug.
-async fn merge_parents_clear(
-    node: &Arc<ConsensusNode>,
-    plan: &kivi_control::MergePlan,
-    cause: &str,
-    notable: bool,
-) -> bool {
-    let blocked = blocked_parents(node, &[plan.left, plan.right]).await;
-    for parent in &blocked {
-        if notable {
-            tracing::info!(plan = plan.id.as_u64(), parent = parent.as_u64(), "{cause}");
-        } else {
-            tracing::debug!(plan = plan.id.as_u64(), parent = parent.as_u64(), "{cause}");
-        }
-    }
-    blocked.is_empty()
+/// Defers a merge step while any parent holds unresolved intents: `true`
+/// means all clear. Drain, seal, and retire share the gate — intents never
+/// migrate, so the step retries on a later pass.
+async fn merge_parents_clear(node: &Arc<ConsensusNode>, plan: &kivi_control::MergePlan) -> bool {
+    blocked_parents(node, &[plan.left, plan.right])
+        .await
+        .is_empty()
 }
 
 /// Installs the merge final tail under fence: seed, snapshot, advance —
@@ -1250,19 +1192,10 @@ async fn drive_merge(
         return;
     }
     if !state.live_plans_for(plan.left).is_empty() || !state.live_plans_for(plan.right).is_empty() {
-        tracing::debug!(
-            plan = plan.id.as_u64(),
-            "merge deferred: parent has a live migration (repair wins)"
-        );
         return;
     }
     for parent in [plan.left, plan.right] {
         if parent_degraded(state, parent) {
-            tracing::debug!(
-                plan = plan.id.as_u64(),
-                parent = parent.as_u64(),
-                "merge deferred: parent under-replicated"
-            );
             return;
         }
     }
@@ -1283,14 +1216,7 @@ async fn drive_merge(
             // Drain before fence (see the split seal gate): unresolved
             // intents never migrate, and finalizes flow only while
             // unfenced.
-            if !merge_parents_clear(
-                node,
-                plan,
-                "merge deferred: parent holds unresolved intents",
-                false,
-            )
-            .await
-            {
+            if !merge_parents_clear(node, plan).await {
                 return;
             }
             merge_install_tail(node, state, plan).await;
@@ -1299,14 +1225,7 @@ async fn drive_merge(
             // Seal gate (see the split seal gate): re-verify zero intents
             // under fence; on a race, unfence and regress rather than
             // strand transactional state in a retired lineage.
-            if !merge_parents_clear(
-                node,
-                plan,
-                "merge seal deferred: intents raced the fence; unfencing",
-                true,
-            )
-            .await
-            {
+            if !merge_parents_clear(node, plan).await {
                 let _ = fence_tablets(node, state, &[plan.left, plan.right], false).await;
                 advance_merge(node, plan, MergePhase::BaseSeeded).await;
                 return;
@@ -1318,14 +1237,7 @@ async fn drive_merge(
         MergePhase::CutoverCommitted => {
             // Retirement reclaims the parent lineages: never retire under
             // unresolved intents.
-            if !merge_parents_clear(
-                node,
-                plan,
-                "merge retire deferred: parent holds unresolved intents",
-                false,
-            )
-            .await
-            {
+            if !merge_parents_clear(node, plan).await {
                 return;
             }
             if retire_tablets(
@@ -1894,10 +1806,7 @@ fn publish_cutover_local(
             directory.store(Arc::new(next));
             true
         }
-        Err(reason) => {
-            tracing::debug!(%reason, "cutover deferred");
-            false
-        }
+        Err(_) => false,
     }
 }
 
@@ -2536,16 +2445,13 @@ async fn topup_drains(node: &Arc<ConsensusNode>, state: &ControlState, policy: &
         }
         let budget = policy.max_live_plans - live_now;
         let intents: Vec<MigrationIntent> = intents.into_iter().take(budget.max(1)).collect();
-        match create_plans(node, &intents).await {
-            Ok(ids) => {
+        if let Ok(ids) = create_plans(node, &intents).await {
+            {
                 tracing::info!(
                     node = record.node.as_u64(),
                     plans = ids.len(),
                     "drain top-up round created"
                 );
-            }
-            Err(reason) => {
-                tracing::debug!(node = record.node.as_u64(), %reason, "drain top-up deferred");
             }
         }
         return;
@@ -2574,12 +2480,9 @@ async fn ensure_control_learners(
             continue;
         }
         let addr = record.peer.to_string();
-        if let Err(reason) = node
+        let _ = node
             .add_learner(control_tablet(), record.node, addr, false)
-            .await
-        {
-            tracing::debug!(node = record.node.as_u64(), %reason, "control learner add deferred");
-        }
+            .await;
     }
 }
 
@@ -2602,10 +2505,6 @@ async fn control_voters_of(node: &Arc<ConsensusNode>) -> BTreeSet<u64> {
 /// simply retries next pass.
 async fn drive_plan(node: &Arc<ConsensusNode>, state: &ControlState, plan: &MigrationPlan) {
     let Some(observed) = observe_tablet(node, state, plan.tablet).await else {
-        tracing::debug!(
-            tablet = plan.tablet.as_u64(),
-            "no observation; retry next pass"
-        );
         return;
     };
     // Replication lag is only authoritative on the tablet leader
@@ -2634,13 +2533,6 @@ async fn drive_plan(node: &Arc<ConsensusNode>, state: &ControlState, plan: &Migr
             }
             if kivi_consensus::caught_up(&observed, target) {
                 advance(node, plan, MigrationPhase::Ready).await;
-            } else {
-                tracing::debug!(
-                    tablet = tablet.as_u64(),
-                    target = target.as_u64(),
-                    lag = observed.lag_of(target),
-                    "learner catching up"
-                );
             }
         }
         kivi_consensus::ReconcileStep::ChangeMembership { tablet, desired } => {
@@ -2667,11 +2559,6 @@ async fn drive_plan(node: &Arc<ConsensusNode>, state: &ControlState, plan: &Migr
             // propose-after-commit holds) and converges directly to
             // the uniform config. Never wait passively. Repetitive
             // per-pass state (not a transition): `debug`, not `info`.
-            tracing::debug!(
-                plan = plan.id.as_u64(),
-                tablet = tablet.as_u64(),
-                "joint pending; re-proposing uniform membership"
-            );
             let _ = exec_members(node, state, &observed, tablet, &plan.desired_voters).await;
         }
         kivi_consensus::ReconcileStep::TransferLeadership { tablet, to } => {
@@ -2731,10 +2618,6 @@ async fn exec_ensure(
         return node
             .ensure_group(tablet, voters, plan.generation.as_u64())
             .await
-            .map_err(|reason| {
-                tracing::debug!(tablet = tablet.as_u64(), %reason, "ensure deferred");
-                reason
-            })
             .is_ok();
     }
     match step_target(node, state, target) {
@@ -2762,10 +2645,6 @@ async fn exec_retire(
         return node
             .retire_group(tablet, plan.generation.as_u64())
             .await
-            .map_err(|reason| {
-                tracing::debug!(tablet = tablet.as_u64(), %reason, "retire deferred");
-                reason
-            })
             .is_ok();
     }
     match step_target(node, state, source) {
@@ -2782,20 +2661,21 @@ async fn exec_retire(
 
 /// Advances one plan's persisted phase (generation-fenced).
 async fn advance(node: &Arc<ConsensusNode>, plan: &MigrationPlan, phase: MigrationPhase) {
-    tracing::info!(
-        node_id = node.node().as_u64(),
-        plan_id = plan.id.as_u64(),
-        tablet_id = plan.tablet.as_u64(),
-        from = plan.from.as_u64(),
-        to = plan.to.as_u64(),
-        ?phase,
-        "migration plan advanced"
-    );
-    advance_by_id(node, plan.id, phase).await;
+    if advance_by_id(node, plan.id, phase).await {
+        tracing::info!(
+            plan_id = plan.id.as_u64(),
+            tablet_id = plan.tablet.as_u64(),
+            from = plan.from.as_u64(),
+            to = plan.to.as_u64(),
+            ?phase,
+            "migration plan advanced"
+        );
+    }
 }
 
-/// Advances one plan's persisted phase by id.
-async fn advance_by_id(node: &Arc<ConsensusNode>, id: PlanId, phase: MigrationPhase) {
+/// Advances one plan's persisted phase by id. `true` when the proposal
+/// committed; a stale advance is a safe rejection the next pass re-derives.
+async fn advance_by_id(node: &Arc<ConsensusNode>, id: PlanId, phase: MigrationPhase) -> bool {
     // The generation rides from the stored plan; a stale advance is a
     // safe rejection the next pass re-derives.
     let generation = node
@@ -2808,9 +2688,7 @@ async fn advance_by_id(node: &Arc<ConsensusNode>, id: PlanId, phase: MigrationPh
         phase,
         generation,
     };
-    if let Err(reason) = node.propose_control(mutation).await {
-        tracing::debug!(plan = id.as_u64(), %reason, "plan advance deferred");
-    }
+    node.propose_control(mutation).await.is_ok()
 }
 
 /// Observes one tablet's actual membership through
@@ -2958,11 +2836,6 @@ async fn exec_learner(
             if attempt == 0 {
                 continue;
             }
-            tracing::debug!(
-                tablet = tablet.as_u64(),
-                target = target.as_u64(),
-                "migration step waits: tablet has no leader"
-            );
             return false;
         };
         let ok = if leader == node.node() {
@@ -3073,9 +2946,7 @@ async fn exec_transfer(
         return;
     };
     if leader == node.node() {
-        if let Err(reason) = node.transfer_leader(tablet, to).await {
-            tracing::debug!(tablet = tablet.as_u64(), %reason, "transfer deferred");
-        }
+        let _ = node.transfer_leader(tablet, to).await;
         return;
     }
     if let Some(StepTarget::Remote(admin)) = step_target(node, state, leader) {
@@ -3101,15 +2972,12 @@ async fn complete_drains(node: &Arc<ConsensusNode>, state: &ControlState) {
         if touched {
             continue;
         }
-        if let Err(reason) = node
+        let _ = node
             .propose_control(ControlMutation::SetNodeState {
                 node: record.node,
                 state: NodeState::Drained,
             })
-            .await
-        {
-            tracing::debug!(node = record.node.as_u64(), %reason, "drain completion deferred");
-        }
+            .await;
     }
 }
 

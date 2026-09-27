@@ -1,4 +1,4 @@
-//! Cluster-side Phase 12 adaptive control runtime.
+//! Cluster-side adaptive control runtime.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -72,25 +72,18 @@ impl ClusterAdaptiveConfig {
     #[must_use]
     pub fn from_env() -> Self {
         let mut config = Self::default();
-        let interval = std::env::var("KIVI_CLUSTER_ADAPTIVE_INTERVAL_MS")
+        if let Some(interval) = std::env::var("KIVI_CLUSTER_ADAPTIVE_INTERVAL_MS")
             .ok()
-            .or_else(|| std::env::var("KIVI_ADAPTIVE_INTERVAL_MS").ok())
             .and_then(|value| value.parse::<u64>().ok())
             .filter(|value| *value >= 50)
-            .map(Duration::from_millis);
-        if let Some(interval) = interval {
+            .map(Duration::from_millis)
+        {
             config.interval = interval;
         }
-        let shadow = std::env::var("KIVI_CLUSTER_ADAPTIVE_SHADOW")
-            .ok()
-            .or_else(|| std::env::var("KIVI_ADAPTIVE_SHADOW").ok());
-        let active = std::env::var("KIVI_CLUSTER_ADAPTIVE_ACTIVE")
-            .ok()
-            .or_else(|| std::env::var("KIVI_ADAPTIVE_ACTIVE").ok());
-        if shadow.is_some_and(|value| value == "1") {
+        if std::env::var("KIVI_CLUSTER_ADAPTIVE_SHADOW").is_ok_and(|value| value == "1") {
             config.shadow = true;
         }
-        if active.is_some_and(|value| value == "1") {
+        if std::env::var("KIVI_CLUSTER_ADAPTIVE_ACTIVE").is_ok_and(|value| value == "1") {
             config.shadow = false;
         }
         config

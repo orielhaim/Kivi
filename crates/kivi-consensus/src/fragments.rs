@@ -1237,7 +1237,7 @@ mod tests {
                 id.verify_bytes(&bytes).is_err(),
                 "coordinator verification rejects flipped bytes"
             );
-            // And the store refuses the same lie at stage time.
+            // And the store refuses the same lie at write time.
             let dir = tempfile::tempdir().expect("scratch");
             let (store, _) =
                 kivi_redundancy::LocalFragmentStore::open(&dir.path().join("s"), INCARNATION)

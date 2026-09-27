@@ -1,18 +1,8 @@
 //! The Redis/RESP compatibility edge, served from a worker's own reactor.
 //!
-//! # Why this is not a separate frontend
-//!
-//! RESP used to be served by a thread per connection, each one reaching storage
-//! through the engine's request queue. That shape costs two thread wakeups per
-//! request — one to hand the request to the owning worker, one to wake the
-//! connection thread with the answer — and where a context switch costs tens of
-//! microseconds, that is the entire cost of a `GET`.
-//!
-//! Measured on this host: a small `GET` is 26 ns of store work and 176 ns of
-//! RESP frontend work, inside a 110 µs round trip. The native frontend already
-//! solved this — its connection tasks run on the same reactor as the worker
-//! that owns the tablets, sharing state through `Rc<RefCell<_>>`, so there is
-//! no queue and no wakeup. This module gives RESP the same shape.
+//! Connection tasks run on the same reactor as the worker that owns the
+//! tablets, sharing state through `Rc<RefCell<_>>`, so there is no engine queue
+//! and no thread wakeup on the request path.
 //!
 //! ```text
 //! socket → RESP parse → route → handle_request (same thread) → RESP reply → socket
@@ -33,8 +23,8 @@
 //!
 //! Everything else — the overwhelming majority of traffic, and every point-read
 //! profile — executes inline. What does not goes to the owning worker through
-//! the engine queue, exactly as before: correctness never depends on which
-//! worker holds the connection.
+//! the engine queue: correctness never depends on which worker holds the
+//! connection.
 //!
 //! # Which worker accepts
 //!
@@ -46,6 +36,7 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use compio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use compio::net::{TcpListener, TcpStream};
@@ -203,6 +194,7 @@ pub(crate) async fn serve_resp(shared: Rc<WorkerNet>, config: RespNetConfig) {
             }
             Err(error) => {
                 tracing::debug!(%error, "RESP accept failed");
+                compio::time::sleep(Duration::from_millis(10)).await;
             }
         }
     }

@@ -160,7 +160,6 @@ impl RaftLogStorage<KiviTypeConfig> for MemLogStore {
 struct MemStateMachineCore {
     last_applied: Option<LogIdOf<KiviTypeConfig>>,
     membership: StoredMembershipOf<KiviTypeConfig>,
-    applied_commands: u64,
 }
 
 /// In-memory [`RaftStateMachine`] for experiments. Installs the proposer's
@@ -168,29 +167,6 @@ struct MemStateMachineCore {
 #[derive(Debug, Clone, Default)]
 pub struct MemStateMachine {
     core: Arc<Mutex<MemStateMachineCore>>,
-}
-
-impl MemStateMachine {
-    /// Creates an empty state machine.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Counts applied command entries (experiment introspection only).
-    ///
-    /// # Panics
-    ///
-    /// Panics when the in-memory lock is poisoned (a previous holder
-    /// panicked mid-apply — an experiment-harness bug, never a runtime
-    /// condition).
-    #[must_use]
-    pub fn applied_commands(&self) -> u64 {
-        self.core
-            .lock()
-            .expect("mem sm lock holds")
-            .applied_commands
-    }
 }
 
 /// Snapshot builder capturing the applied watermark at build time.
@@ -253,18 +229,15 @@ impl RaftStateMachine<KiviTypeConfig> for MemStateMachine {
                     }
                     crate::mutation::ReplicatedOutcome::none()
                 }
-                EntryPayload::Normal(command) => {
-                    core.applied_commands += 1;
-                    match command {
-                        crate::command::ConsensusCommand::Tablet(mutation) => {
-                            crate::mutation::ReplicatedOutcome::new(mutation.expected().clone())
-                        }
-                        crate::command::ConsensusCommand::Control(_)
-                        | crate::command::ConsensusCommand::ReadSync(_) => {
-                            crate::mutation::ReplicatedOutcome::none()
-                        }
+                EntryPayload::Normal(command) => match command {
+                    crate::command::ConsensusCommand::Tablet(mutation) => {
+                        crate::mutation::ReplicatedOutcome::new(mutation.expected().clone())
                     }
-                }
+                    crate::command::ConsensusCommand::Control(_)
+                    | crate::command::ConsensusCommand::ReadSync(_) => {
+                        crate::mutation::ReplicatedOutcome::none()
+                    }
+                },
             };
             drop(core);
             if let Some(responder) = responder {

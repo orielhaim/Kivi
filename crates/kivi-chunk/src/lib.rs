@@ -23,7 +23,7 @@
 //! ## Ordering rule (the invariant everything else serves)
 //!
 //! ```text
-//! stage chunks + manifest
+//! write chunks + manifest
 //!        ↓
 //! sync the pack tail (one barrier for the whole batch)
 //!        ↓
@@ -61,8 +61,7 @@ pub use manifest::{ChunkEntry, ChunkManifest, build_manifest, splice_entries, ve
 pub use pack::{RecordId, ScannedRecord, pack_file_name};
 pub use policy::{Chunking, DEFAULT_CHUNK_SIZE, DEFAULT_INLINE_THRESHOLD, MAX_CHUNKS_PER_MANIFEST};
 pub use redundancy::{
-    chunk_asset, manifest_asset, protect_manifest_staged, protect_staged, read_manifest_via_fabric,
-    read_via_fabric,
+    protect_manifest_staged, protect_staged, read_manifest_via_fabric, read_via_fabric,
 };
 pub use store::{
     ChunkRecovery, ChunkStats, ChunkStore, DurableChunk, DurableManifest, StageOutcome,

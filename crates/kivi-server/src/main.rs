@@ -437,7 +437,7 @@ fn open_durability(
         (false, Some(dir)) => {
             // Lock, identity, incarnation advance, WAL root — all before
             // any listener binds (see `open_data_dir`).
-            let opened = kivi_durability::open_data_dir(dir)
+            let opened = kivi_durability::open_data_dir(dir, None)
                 .with_context(|| format!("open data directory {}", dir.display()))?;
             let (node, cluster, incarnation) = (
                 opened.meta.node,
@@ -560,10 +560,6 @@ fn main() -> anyhow::Result<()> {
     if args.queue == 0 {
         anyhow::bail!("queue depth must be nonzero");
     }
-    // Placement is resolved against the real machine here so the operator sees
-    // exactly what will happen, including shortfalls, before any worker starts.
-    let placement = ThreadPlacement::resolve(args.placement, args.workers);
-    tracing::info!(placement = %placement.summary(), "worker placement resolved");
     // The lock guard lives for the whole process: dropping it would
     // release the data directory to a second process mid-run.
     let (node, cluster, incarnation, durability, _data_dir_guard) = open_durability(&args)?;
@@ -668,9 +664,7 @@ fn main() -> anyhow::Result<()> {
         partitioning = %PartitionHasher::V1.algorithm(),
         "serving native endpoints"
     );
-    for (index, addr) in engine.worker_addrs().iter().enumerate() {
-        tracing::info!(worker = index, endpoint = %addr, "worker listening");
-    }
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("kivi-admin")
@@ -716,7 +710,7 @@ fn main() -> anyhow::Result<()> {
         .block_on(tokio::net::TcpListener::bind(args.admin))
         .with_context(|| format!("admin bind failed on {}", args.admin))?;
     let admin_addr = listener.local_addr().context("admin listener address")?;
-    tracing::info!(endpoint = %admin_addr, "admin plane listening");
+
     // Machine-readable startup report for process supervisors and the
     // integration-test harness: the actual bound endpoints (authoritative
     // when `--port 0` / `--admin 127.0.0.1:0` select ephemeral ports).

@@ -103,59 +103,12 @@ impl fmt::Display for NodeId {
     }
 }
 
-/// Identity of a NUMA domain within a node (RFC §6, §15).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct NumaId(u32);
-
-impl NumaId {
-    /// Wraps a raw OS-reported NUMA node index.
-    #[must_use]
-    pub const fn from_u32(value: u32) -> Self {
-        Self(value)
-    }
-
-    /// Returns the raw value.
-    #[must_use]
-    pub const fn as_u32(self) -> u32 {
-        self.0
-    }
-}
-
-impl fmt::Display for NumaId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// Identity of a single CPU within a node (RFC §15).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct CpuId(u32);
-
-impl CpuId {
-    /// Wraps a raw OS-reported CPU index.
-    #[must_use]
-    pub const fn from_u32(value: u32) -> Self {
-        Self(value)
-    }
-
-    /// Returns the raw value.
-    #[must_use]
-    pub const fn as_u32(self) -> u32 {
-        self.0
-    }
-}
-
-impl fmt::Display for CpuId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
 /// Identity of a worker pinned to one CPU (RFC §15).
 ///
 /// A worker owns a set of tablet replicas; tablet state stays with its owner
-/// worker (RFC §16, §20). Distinct from [`CpuId`]: CPUs are hardware, workers
-/// are execution owners that can be re-pinned.
+/// worker (RFC §16, §20). Distinct from the hardware's own processor identity
+/// (`kivi_hardware::topology::CpuId`): CPUs are hardware, workers are
+/// execution owners that can be re-pinned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WorkerId(u64);
 
@@ -635,8 +588,6 @@ impl_raw_conversions!(RequestSeq, u64, as_u64, from_u64);
 impl_raw_conversions!(SecurityDomainId, u64, as_u64, from_u64);
 impl_raw_conversions!(ClusterId, u128, as_u128, from_u128);
 impl_raw_conversions!(SessionId, u128, as_u128, from_u128);
-impl_raw_conversions!(NumaId, u32, as_u32, from_u32);
-impl_raw_conversions!(CpuId, u32, as_u32, from_u32);
 
 #[cfg(test)]
 mod tests {
@@ -645,8 +596,7 @@ mod tests {
     #[test]
     fn integer_ids_round_trip_through_raw_values() {
         assert_eq!(NodeId::from_u64(7).as_u64(), 7);
-        assert_eq!(NumaId::from_u32(1).as_u32(), 1);
-        assert_eq!(CpuId::from_u32(11).as_u32(), 11);
+
         assert_eq!(WorkerId::from_u64(11).as_u64(), 11);
         assert_eq!(NamespaceId::from_u64(3).as_u64(), 3);
         assert_eq!(TabletId::from_u64(918).as_u64(), 918);

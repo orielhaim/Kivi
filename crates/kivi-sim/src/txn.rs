@@ -1,4 +1,4 @@
-//! Deterministic 2PC transaction simulation (Phase 8).
+//! Deterministic 2PC transaction simulation.
 //!
 //! A message-level model of Kivi's cross-tablet OCC + 2PC discipline,
 //! executed over [`SimCluster`](crate::SimCluster) with virtual time,
@@ -539,7 +539,7 @@ pub struct AppliedWrite {
 #[derive(Debug, Default)]
 pub struct TxnSim {
     /// Which node hosts which key (scenario routing; fixed within a run —
-    /// Phase 8 never remaps prepared writes into another lineage).
+    /// Prepared writes are never remapped into another lineage).
     pub key_home: BTreeMap<TxnKey, NodeId>,
     /// Durable participant intents: `(host, key) -> intent`.
     pub intents: BTreeMap<(NodeId, TxnKey), TxnIntent>,

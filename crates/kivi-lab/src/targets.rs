@@ -92,15 +92,6 @@ pub trait BenchTarget: Send {
     }
 }
 
-/// Far-future expiry stamp for benchmark expirations: one shared
-/// production read plus sixty seconds of Jiff arithmetic.
-fn bench_expiry() -> kivi_types::WallTimestamp {
-    use kivi_core::{SystemClock, wall_now_or_max};
-    wall_now_or_max(&SystemClock)
-        .checked_add(jiff::SignedDuration::from_secs(60))
-        .unwrap_or(kivi_types::WallTimestamp::MAX)
-}
-
 /// Kivi native adapter: [`WorkloadOp`] to [`Key`] plus typed
 /// [`NativeClient`].
 ///
@@ -121,7 +112,7 @@ impl KiviNativeTarget {
         Self::connect_multi(std::slice::from_ref(&server.to_owned()), namespace, pending)
     }
 
-    /// Connects with several seed endpoints (task AG: the replicated
+    /// Connects with several seed endpoints (the replicated
     /// cluster target). The workload definitions stay untouched: this
     /// target handles leader discovery (`StaleRoute` redirects),
     /// bounded retries, and stable mutation identities internally, so
@@ -176,22 +167,8 @@ impl BenchTarget for KiviNativeTarget {
             .collect()
     }
 
-    fn seed_one(&mut self, op: &WorkloadOp) -> OpOutcome {
-        // Counters seed at 0 (create without counting); the workload adds 1.
-        if let WorkloadOp::CounterAdd(key) = op {
-            return self
-                .client
-                .counter_add(&Key::from(key.as_str()), 0)
-                .map(|_| ())
-                .map_err(|error| error.to_string());
-        }
-        self.execute_batch(std::slice::from_ref(op))
-            .into_iter()
-            .next()
-            .unwrap_or(Err("empty batch".to_owned()))
-    }
-
     fn seed_one_with_payload(&mut self, op: &WorkloadOp, payload: &[u8]) -> OpOutcome {
+        // Counters seed at 0 (create without counting); the workload adds 1.
         if let WorkloadOp::CounterAdd(key) = op {
             return self
                 .client
@@ -216,7 +193,7 @@ impl BenchTarget for KiviNativeTarget {
 }
 
 /// Inline threshold mirroring the server's representation split: values
-/// above this stage through chunk lanes either way, so the native target
+/// above this through chunk lanes either way, so the native target
 /// streams them (one giant frame would trip the connection input bound
 /// instead of measuring the store).
 const NATIVE_STREAM_ABOVE: usize = 256 * 1024;
@@ -261,7 +238,7 @@ fn execute_native(client: &NativeClient, op: &WorkloadOp, payload: &[u8]) -> OpO
             .map(|_| ())
             .map_err(|error| error.to_string()),
         WorkloadOp::Expire(key) => client
-            .expire_at(&Key::from(key.as_str()), bench_expiry())
+            .expire_at(&Key::from(key.as_str()), crate::far_future_expiry())
             .map(|_| ())
             .map_err(|error| error.to_string()),
         WorkloadOp::Ttl(key) => client
@@ -384,11 +361,7 @@ impl BenchTarget for RespTarget {
 
 /// Encodes one workload op as a RESP command (argv as owned byte strings).
 #[must_use]
-pub fn encode_workload_command(op: &WorkloadOp, payload: &[u8]) -> Vec<Vec<u8>> {
-    encode_op(op, payload)
-}
-
-fn encode_op(op: &WorkloadOp, payload: &[u8]) -> Vec<Vec<u8>> {
+pub fn encode_op(op: &WorkloadOp, payload: &[u8]) -> Vec<Vec<u8>> {
     let owned = |parts: &[&[u8]]| parts.iter().map(|part| part.to_vec()).collect::<Vec<_>>();
     match op {
         WorkloadOp::Get(key) => owned(&[b"GET", key.as_bytes()]),

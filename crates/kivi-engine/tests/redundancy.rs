@@ -56,7 +56,7 @@ fn pattern_bytes(len: usize, seed: u64) -> bytes::Bytes {
 }
 
 fn durable_config(dir: &std::path::Path) -> DurabilityMode {
-    let opened = kivi_durability::open_data_dir(dir).expect("data dir opens");
+    let opened = kivi_durability::open_data_dir(dir, None).expect("data dir opens");
     DurabilityMode::Durable(DurableConfig {
         data_dir: dir.to_owned(),
         segment_target_bytes: 1024 * 1024,

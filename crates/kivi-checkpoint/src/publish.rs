@@ -94,9 +94,10 @@ pub fn publish_tablet(
     let comp_dir = checkpoints_dir(data_dir).join(crate::artifact::COMP_DIR_NAME);
     let manifests_dir = tablet_dir(data_dir, tablet).join(crate::artifact::MANIFESTS_DIR_NAME);
     for dir in [&bands_dir, &comp_dir, &manifests_dir] {
-        let created = create_dir_all_sync(dir)
+        // Each band, component and manifest is written atomically and its
+        // parent synced afterwards; the mkdir outcome is not the carrier.
+        let _ = create_dir_all_sync(dir)
             .map_err(|error| CheckpointError::io("create checkpoint directory", dir, &error))?;
-        tracing::debug!(dir = %dir.display(), ?created, "checkpoint directory ready");
     }
     let mut stats = PublishStats::default();
     // Bands: write missing, verify new writes by read-back, stat-check
@@ -230,9 +231,8 @@ pub fn write_wal_floor(
     use crate::catalog::encode_wal_floor;
     let path = wal_floor_path(data_dir);
     if let Some(parent) = path.parent() {
-        let created = create_dir_all_sync(parent)
+        let _ = create_dir_all_sync(parent)
             .map_err(|error| CheckpointError::io("create checkpoint directory", parent, &error))?;
-        tracing::debug!(dir = %parent.display(), ?created, "checkpoint directory ready");
     }
     write_atomic_sync(&path, &encode_wal_floor(floors.to_vec())?)
         .map_err(|error| CheckpointError::io("publish WAL floor", &path, &error))?;

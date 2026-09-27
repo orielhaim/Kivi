@@ -1,4 +1,4 @@
-//! Phase 12 adaptive control decisions over typed observations.
+//! Adaptive control decisions over typed observations.
 
 use core::time::Duration;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};

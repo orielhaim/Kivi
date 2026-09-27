@@ -12,9 +12,8 @@ use anyhow::Context as _;
 use bytes::Bytes;
 use clap::ValueEnum;
 use kivi_client::{ClientConfig, NativeClient};
-use kivi_core::{SystemClock, wall_now_or_max};
 use kivi_state::Key;
-use kivi_types::{NamespaceId, WallTimestamp};
+use kivi_types::NamespaceId;
 use serde::Serialize;
 use tempfile::TempDir;
 
@@ -22,9 +21,7 @@ use crate::conformance::{self, RedisConfig};
 use crate::process::{Server, ServerMode, release_server_binary_path, try_admin_get_endpoint};
 use crate::resp_client::{Reply, RespClient};
 use crate::runner::{self, RunStats, RunnerConfig};
-use crate::targets::{
-    KiviNativeTarget, RespTarget, TargetStats, check_workload_reply, encode_workload_command,
-};
+use crate::targets::{KiviNativeTarget, RespTarget, TargetStats, check_workload_reply, encode_op};
 use crate::workload::{
     KeySpace, PayloadCache, RANGE_WINDOW, Workload, WorkloadOp, counter_key_name, thread_key_names,
     workload_op_for, workload_supports_resp,
@@ -2711,7 +2708,7 @@ fn validate_resp_model_op(
     op: &WorkloadOp,
     payload: &[u8],
 ) -> Result<String, String> {
-    let command = encode_workload_command(op, payload);
+    let command = encode_op(op, payload);
     let argv: Vec<&[u8]> = command.iter().map(Vec::as_slice).collect();
     let reply = client
         .round_trip(&argv)
@@ -2801,7 +2798,7 @@ fn validate_native_model_op(
             format!("length:{length:?}")
         }
         WorkloadOp::Expire(key) => client
-            .expire_at(&Key::from(key.as_str()), campaign_expiry())
+            .expire_at(&Key::from(key.as_str()), crate::far_future_expiry())
             .map_err(|error| error.to_string())
             .map(|value| format!("exists:{value}"))?,
         WorkloadOp::Ttl(key) => {
@@ -3133,7 +3130,7 @@ fn validate_native_body(client: &NativeClient, key: &Key, payload: &[u8]) -> Res
     }
     checks += 1;
     if !client
-        .expire_at(key, campaign_expiry())
+        .expire_at(key, crate::far_future_expiry())
         .map_err(|error| error.to_string())?
     {
         return Err("native validation EXPIRE returned false".to_owned());
@@ -3301,12 +3298,6 @@ fn native_client(endpoint: &str, namespace: u64) -> anyhow::Result<NativeClient>
         ..ClientConfig::default()
     })
     .context("native Kivi client setup failed")
-}
-
-fn campaign_expiry() -> WallTimestamp {
-    wall_now_or_max(&SystemClock)
-        .checked_add(jiff::SignedDuration::from_secs(60))
-        .unwrap_or(WallTimestamp::MAX)
 }
 
 fn profile_name(workload: Workload) -> &'static str {

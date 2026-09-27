@@ -28,7 +28,7 @@ pub mod io_uring;
 pub mod pmu;
 pub mod signals;
 
-use crate::capability::{DamonSupport, IoUringSupport, PmuSupport, Support};
+use crate::capability::{DamonParams, IoUringSupport, PmuSupport, Support};
 
 /// What the performance monitoring unit offers, and whether this process may
 /// read it.
@@ -48,7 +48,7 @@ pub fn pmu_support() -> Support<PmuSupport> {
 /// DAMON is a kernel subsystem, so its absence is a kernel or boot
 /// configuration fact. Most container and hardened kernels omit it.
 #[must_use]
-pub fn damon_support() -> Support<DamonSupport> {
+pub fn damon_support() -> Support<DamonParams> {
     damon::detect()
 }
 

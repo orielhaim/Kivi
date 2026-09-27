@@ -7,7 +7,7 @@
 //! and stored lengths plus this codec so decoders know how to recover the
 //! logical bytes the id names.
 //!
-//! This stage wires `NONE` only. `LZ4` keeps its reserved assignment so a
+//! `NONE` is the only codec wired here. `LZ4` keeps its reserved assignment so a
 //! future experiment cannot silently collide, but builds and loads reject
 //! it explicitly until measured.
 
@@ -17,7 +17,7 @@ pub struct ChunkCodecId(u8);
 
 impl ChunkCodecId {
     /// Stored bytes are the logical bytes verbatim. The only codec this
-    /// stage mints or reads.
+    /// mints or reads.
     pub const NONE: Self = Self(0);
     /// Reserved assignment for a future LZ4 experiment. Rejected by
     /// [`is_supported`](Self::is_supported) until then.

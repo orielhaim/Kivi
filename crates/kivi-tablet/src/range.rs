@@ -120,7 +120,7 @@ impl HashPrefix {
     /// `split_hash` is the first hash of the right half (also
     /// `right.bits()`), the deterministic boundary persisted in
     /// control-plane split-plan flows. The architecture permits arbitrary
-    /// future split points; this stage supports midpoint only.
+    /// future split points; only the midpoint is supported.
     ///
     /// # Errors
     ///

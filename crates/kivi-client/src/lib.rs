@@ -4224,7 +4224,7 @@ mod tests {
         }
     }
 
-    /// Leader redirect preserves the mutation identity (task O): a
+    /// Leader redirect preserves the mutation identity: a
     /// follower answers `StaleRoute` with the leader's endpoint, and the
     /// retry at the leader carries the identical session, sequence, and
     /// ack floor — bounded by the redirect budget, never an infinite

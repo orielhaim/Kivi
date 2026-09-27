@@ -1,4 +1,4 @@
-//! Kivi Memory Fabric (Phase 9): logical state independent from physical
+//! Kivi Memory Fabric: logical state independent from physical
 //! materialization.
 //!
 //! One logical object (small authoritative root plus version) may
@@ -49,7 +49,6 @@ pub mod handle;
 pub mod hardware;
 pub mod intent;
 pub mod movement;
-pub mod numa;
 pub mod nvme;
 pub mod offcore;
 pub mod offcore_lane;
@@ -84,7 +83,6 @@ pub use intent::{
     VolatilityAllowed,
 };
 pub use movement::{BoundedMoveQueue, MovementBudget, MovementScheduler};
-pub use numa::{MemoryNode, MemoryTier, NumaNodeId, Topology, TopologySource};
 pub use nvme::{
     Admission, AdmissionController, NvmeOptions, NvmeProvider, demote_async, promote_async,
 };

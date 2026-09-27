@@ -2,7 +2,7 @@
 //!
 //! The simulation layer drives these hooks with a seeded RNG (never wall
 //! time, never global randomness): each [`FaultKind`] names one failure the
-//! Phase 10 suite must cover — missing or corrupted fragments, failures
+//! suite must cover — missing or corrupted fragments, failures
 //! within and beyond tolerance, failures during encoding/reconstruction,
 //! before publish, after publish before retirement, stale completions, drain
 //! during repair, restart during transition, duplicate repair work, and

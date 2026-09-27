@@ -8,27 +8,8 @@
 //! [`kivi_redundancy::integration`] so [`kivi_types::ChunkId`] and
 //! [`kivi_types::ManifestId`] stay the single vocabulary.
 
-use kivi_redundancy::{
-    InformationAsset, RedundancyError, RedundancyFabric, RedundancyIntent, RedundancyLayout,
-};
+use kivi_redundancy::{RedundancyError, RedundancyFabric, RedundancyIntent, RedundancyLayout};
 use kivi_types::{ChunkId, ManifestId, SecurityDomainId};
-
-/// Converts a chunk identity into a fabric asset.
-///
-/// Delegates to [`kivi_redundancy::integration::chunk_asset`]; no identity
-/// logic is duplicated here.
-#[must_use]
-pub fn chunk_asset(id: ChunkId, domain: SecurityDomainId, len: u64) -> InformationAsset {
-    kivi_redundancy::integration::chunk_asset(id, domain, len)
-}
-
-/// Converts a chunk-manifest identity into a fabric asset.
-///
-/// Delegates to [`kivi_redundancy::integration::manifest_asset`].
-#[must_use]
-pub fn manifest_asset(id: ManifestId, domain: SecurityDomainId, len: u64) -> InformationAsset {
-    kivi_redundancy::integration::manifest_asset(id, domain, len)
-}
 
 /// Protects staged chunk bytes in the fabric under the minimum durable
 /// intent (survive one independent failure).
@@ -46,7 +27,7 @@ pub fn protect_staged(
     id: ChunkId,
     bytes: &[u8],
 ) -> Result<RedundancyLayout, RedundancyError> {
-    let asset = chunk_asset(id, domain, bytes.len() as u64);
+    let asset = kivi_redundancy::integration::chunk_asset(id, domain, bytes.len() as u64);
     fabric.protect(asset, bytes, &RedundancyIntent::survive_one())
 }
 
@@ -64,7 +45,7 @@ pub fn protect_manifest_staged(
     id: ManifestId,
     canonical: &[u8],
 ) -> Result<RedundancyLayout, RedundancyError> {
-    let asset = manifest_asset(id, domain, canonical.len() as u64);
+    let asset = kivi_redundancy::integration::manifest_asset(id, domain, canonical.len() as u64);
     fabric.protect(asset, canonical, &RedundancyIntent::survive_one())
 }
 
@@ -80,7 +61,7 @@ pub fn read_via_fabric(
     id: ChunkId,
     len: u64,
 ) -> Result<Vec<u8>, RedundancyError> {
-    let asset = chunk_asset(id, domain, len);
+    let asset = kivi_redundancy::integration::chunk_asset(id, domain, len);
     fabric.read(asset)
 }
 
@@ -96,7 +77,7 @@ pub fn read_manifest_via_fabric(
     id: ManifestId,
     len: u64,
 ) -> Result<Vec<u8>, RedundancyError> {
-    let asset = manifest_asset(id, domain, len);
+    let asset = kivi_redundancy::integration::manifest_asset(id, domain, len);
     fabric.read(asset)
 }
 

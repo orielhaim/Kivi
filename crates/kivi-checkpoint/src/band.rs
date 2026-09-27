@@ -60,7 +60,7 @@ pub const BAND_MINOR: u16 = 0;
 pub const BAND_HEADER_LEN: usize = 60;
 /// Encoded band footer length in bytes.
 pub const BAND_FOOTER_LEN: usize = 40;
-/// Inline representation tag (the only one this stage mints).
+/// Inline representation tag (the only one minted here).
 pub const REPR_INLINE: u8 = 0;
 /// Chunked-root representation tag: the record carries a manifest id plus
 /// logical length, never bulk bytes. Fixed forever within band version 1.

@@ -394,7 +394,7 @@ impl RedundancyFabric {
     }
 
     /// Scrub hook for one asset: per-fragment verdicts for operators and the
-    /// future Phase 11 policy. Never repairs; never treats corruption as
+    /// self-healing policy. Never repairs; never treats corruption as
     /// valid merely because bytes were read.
     #[must_use]
     pub fn scrub(&self, asset: &crate::AssetId) -> Option<crate::ScrubReport> {

@@ -5486,7 +5486,7 @@ mod tests {
 
     /// Index-term scan window `[prefix, successor)` for one `(index, term)`.
     fn term_spec(index: crate::IndexId, term: &[u8], max_items: usize) -> ScanSpec {
-        let prefix = crate::term_prefix(index, term, false);
+        let prefix = crate::term_prefix(index, term);
         let end = crate::prefix_successor(&prefix).expect("prefix successor");
         ScanSpec::new(
             Some(prefix),
@@ -5507,8 +5507,8 @@ mod tests {
         max_items: usize,
     ) -> ScanSpec {
         ScanSpec::new(
-            Some(crate::term_prefix(index, start_term, false)),
-            Some(crate::term_prefix(index, end_term, false)),
+            Some(crate::term_prefix(index, start_term)),
+            Some(crate::term_prefix(index, end_term)),
             ScanDirection::Forward,
             max_items,
             1 << 20,

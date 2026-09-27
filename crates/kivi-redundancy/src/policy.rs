@@ -1,4 +1,4 @@
-//! Deterministic Phase 12 self-healing policy and redundancy preference adapter.
+//! Deterministic self-healing policy and redundancy preference adapter.
 
 use core::time::Duration;
 

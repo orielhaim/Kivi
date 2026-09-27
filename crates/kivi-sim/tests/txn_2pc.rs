@@ -1,4 +1,4 @@
-//! Deterministic 2PC failure scenarios (Phase 8): message loss and
+//! Deterministic 2PC failure scenarios: message loss and
 //! duplication, one-way partitions, coordinator and participant crashes,
 //! full-cluster restart, and conflicting drivers — all on virtual time
 //! with per-event invariant checks (no real sleeps, no wall clocks).

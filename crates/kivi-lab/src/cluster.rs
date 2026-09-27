@@ -1,4 +1,4 @@
-//! Reusable 3-node replicated cluster harness (task W).
+//! Reusable 3-node replicated cluster harness.
 //!
 //! Spawns three real `kivi-server --cluster-mode` processes with
 //! independent data directories, discovers their endpoints from
@@ -10,15 +10,12 @@
 //!
 //! ## Port allocation
 //!
-//! Static topologies name every port before any process starts, which
-//! conflicts with race-free ephemeral discovery. The harness probes nine
-//! loopback ports (UDP for the QUIC peer mesh, TCP for native/admin × 3)
-//! by bind-then-release and spawns immediately; if any member fails to
-//! bind (a parallel run stole a probed port), the whole attempt is
-//! discarded and retried with fresh probes (bounded attempts). A bind
-//! conflict therefore retries loudly instead of serving a half cluster —
-//! race-free in effect, never silent. Restarts reuse static ports (the
-//! mesh heals through the restarted member's outbound dials).
+//! Static topologies name every port before any process starts, so the harness
+//! probes nine loopback ports (UDP for the QUIC peer mesh, TCP for
+//! native/admin × 3) by bind-then-release. If any member fails to bind, the
+//! whole attempt is discarded and re-probed, so a port race retries loudly
+//! instead of serving a half cluster. Restarts reuse the probed ports; the mesh
+//! heals through the restarted member's outbound dials.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read as _, Write as _};
@@ -1532,24 +1529,24 @@ impl Cluster {
             .expect("a live leader for the tablet")
     }
 
-    /// Waits until every live member converges per tablet: for each
-    /// tablet, all live members report the same applied index.
+    /// Waits until every live member converges per tablet: for each tablet,
+    /// all live members report the same applied index.
     ///
     /// # Panics
     ///
     /// Panics on timeout.
     pub fn wait_converged_all(&self) {
-        self.wait_converged_all_timeout(CONVERGE_TIMEOUT);
+        self.wait_converged_all_within(CONVERGE_TIMEOUT);
     }
 
-    /// Waits like [`wait_converged_all`](Self::wait_converged_all) with
-    /// an explicit deadline (rolling restarts over many tablets need
-    /// longer than the default window).
+    /// Waits like [`wait_converged_all`](Self::wait_converged_all) with an
+    /// explicit deadline. Rolling restarts over many tablets need longer than
+    /// [`CONVERGE_TIMEOUT`].
     ///
     /// # Panics
     ///
     /// Panics past the deadline.
-    pub fn wait_converged_all_timeout(&self, timeout: Duration) {
+    pub fn wait_converged_all_within(&self, timeout: Duration) {
         let deadline = Instant::now() + timeout;
         loop {
             let live_nodes: Vec<(usize, u64)> = (0..self.nodes.len())
@@ -1834,7 +1831,7 @@ impl Cluster {
     /// Waits until every live member reports the same exact ordered tiling
     /// at `width` — first range starts empty, last is unbounded, adjacent
     /// boundaries match — stable across consecutive polls. `deadline` is
-    /// absolute (callers with a multi-stage budget pass theirs through).
+    /// absolute (callers with their own budget pass theirs through).
     ///
     /// # Panics
     ///

@@ -129,7 +129,7 @@ impl ScanSpec {
         let Some((index, term)) = term_prefix_parts(start) else {
             return false;
         };
-        if start != term_prefix(index, &term, false) {
+        if start != term_prefix(index, &term) {
             return false;
         }
         if start.len() < INDEX_FORMAT_TAG.len() {
@@ -154,7 +154,7 @@ impl ScanSpec {
         // (no primary suffix), so the window covers one term. A full
         // entry key never qualifies here.
         let (index, term) = crate::index::term_prefix_parts(start)?;
-        if start != term_prefix(index, &term, false) {
+        if start != term_prefix(index, &term) {
             return None;
         }
         let end = self.end.as_deref()?;
@@ -192,10 +192,10 @@ impl ScanSpec {
         if index != end_index {
             return false;
         }
-        if start != term_prefix(index, &start_term, false) {
+        if start != term_prefix(index, &start_term) {
             return false;
         }
-        if end != term_prefix(index, &end_term, false) {
+        if end != term_prefix(index, &end_term) {
             return false;
         }
         start_term.as_slice() < end_term.as_slice()
@@ -217,10 +217,10 @@ impl ScanSpec {
         if index != end_index {
             return None;
         }
-        if start != term_prefix(index, &start_term, false) {
+        if start != term_prefix(index, &start_term) {
             return None;
         }
-        if end != term_prefix(index, &end_term, false) {
+        if end != term_prefix(index, &end_term) {
             return None;
         }
         if start_term.as_slice() >= end_term.as_slice() {
@@ -400,7 +400,7 @@ mod tests {
     #[test]
     fn term_windows_cover_exactly_one_term() {
         use crate::index::{IndexId, term_prefix};
-        let prefix = term_prefix(IndexId::from_u64(9), b"red", false);
+        let prefix = term_prefix(IndexId::from_u64(9), b"red");
         let end = crate::index::prefix_successor(&prefix).expect("successor");
         let spec = ScanSpec::new(
             Some(prefix.clone()),

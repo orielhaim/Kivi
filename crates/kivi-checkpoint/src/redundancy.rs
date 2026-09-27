@@ -87,64 +87,6 @@ pub fn protect_dedup(
     fabric.protect(asset, bytes, &RedundancyIntent::survive_one())
 }
 
-/// Reads arbitrary checkpoint bytes back through the fabric.
-///
-/// The caller builds `asset` with [`band_asset`], [`manifest_asset`], or
-/// [`dedup_asset`] using the whole-file BLAKE3 and length.
-///
-/// # Errors
-///
-/// Returns [`RedundancyError`] when no layout exists, reconstruction fails,
-/// or the bytes do not verify.
-pub fn read_via_fabric(
-    fabric: &mut RedundancyFabric,
-    asset: InformationAsset,
-) -> Result<Vec<u8>, RedundancyError> {
-    fabric.read(asset)
-}
-
-/// Reads band file bytes back through the fabric.
-///
-/// # Errors
-///
-/// Returns [`RedundancyError`] when no layout exists, reconstruction fails,
-/// or the bytes do not verify.
-pub fn read_band_via_fabric(
-    fabric: &mut RedundancyFabric,
-    hash: [u8; 32],
-    len: u64,
-) -> Result<Vec<u8>, RedundancyError> {
-    fabric.read(band_asset(hash, len))
-}
-
-/// Reads manifest file bytes back through the fabric.
-///
-/// # Errors
-///
-/// Returns [`RedundancyError`] when no layout exists, reconstruction fails,
-/// or the bytes do not verify.
-pub fn read_manifest_via_fabric(
-    fabric: &mut RedundancyFabric,
-    hash: [u8; 32],
-    len: u64,
-) -> Result<Vec<u8>, RedundancyError> {
-    fabric.read(manifest_asset(hash, len))
-}
-
-/// Reads dedup-component file bytes back through the fabric.
-///
-/// # Errors
-///
-/// Returns [`RedundancyError`] when no layout exists, reconstruction fails,
-/// or the bytes do not verify.
-pub fn read_dedup_via_fabric(
-    fabric: &mut RedundancyFabric,
-    hash: [u8; 32],
-    len: u64,
-) -> Result<Vec<u8>, RedundancyError> {
-    fabric.read(dedup_asset(hash, len))
-}
-
 #[cfg(test)]
 mod tests {
     use kivi_redundancy::{FabricConfig, NodeDescriptor};
@@ -204,7 +146,9 @@ mod tests {
         std::fs::remove_file(&band_path).expect("deletes band");
         assert!(!band_path.exists());
 
-        let back = read_band_via_fabric(&mut fabric, file_hash, file_len).expect("recovers band");
+        let back = fabric
+            .read(band_asset(file_hash, file_len))
+            .expect("recovers band");
         assert_eq!(back, built.bytes);
         // Recovered bytes still load under the checkpoint content identity.
         let loaded = load_band(

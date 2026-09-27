@@ -45,7 +45,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::capability::{DamonSupport, Support, Unavailable};
+use crate::capability::{DamonParams, Support, Unavailable};
 
 /// Where the kernel exposes the DAMON control interface.
 const DAMON_ROOT: &str = "/sys/kernel/mm/damon";
@@ -405,7 +405,7 @@ impl<'a> StatsHeader<'a> {
 /// Whether the kernel's DAMON control interface exists and this process may
 /// control it.
 #[must_use]
-pub fn detect() -> Support<DamonSupport> {
+pub fn detect() -> Support<DamonParams> {
     let admin = Path::new(DAMON_ROOT).join("admin");
     if !admin.is_dir() {
         return Support::Unavailable(Unavailable::NotPresent);
@@ -443,7 +443,7 @@ pub fn detect() -> Support<DamonSupport> {
         .and_then(|raw| raw.trim().parse::<u64>().ok())
         .unwrap_or(0);
     let aggressive = Path::new(DAMON_ROOT).join("aggr_interval").exists();
-    Support::Available(DamonSupport::Monitoring {
+    Support::Available(DamonParams {
         free_us,
         aggressive,
     })

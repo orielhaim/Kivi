@@ -582,7 +582,7 @@ fn route_batch_key(
     route_normal_key(directory, namespace, key)
 }
 
-/// Layout routing for ordinary keys.
+/// Layout routing for ordinary keys, falling back to the hash layout.
 fn route_normal_key(
     directory: &DirectorySnapshot,
     namespace: NamespaceId,

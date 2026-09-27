@@ -59,7 +59,7 @@ pub const MANIFEST_HEADER_LEN: usize = 88;
 pub const BAND_DESCRIPTOR_LEN: usize = 56;
 /// Encoded dedup reference length in bytes.
 pub const DEDUP_REF_LEN: usize = 48;
-/// Feature floor this stage mints (capability floor for readers).
+/// Feature floor minted here (capability floor for readers).
 pub const FEATURE_FLOOR_V1: u64 = 1;
 
 /// One band reference inside a manifest.

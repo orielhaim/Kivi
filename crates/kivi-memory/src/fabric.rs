@@ -1469,44 +1469,11 @@ impl MemoryFabric {
         &self.control_policy
     }
 
-    /// Returns the active bounded memory control policy.
-    #[must_use]
-    pub const fn get_control_policy(&self) -> &MemoryControlPolicy {
-        self.control_policy()
-    }
-
-    /// Returns the active bounded memory control policy.
-    #[must_use]
-    pub const fn get_policy(&self) -> &MemoryControlPolicy {
-        self.control_policy()
-    }
-
     /// Applies a memory control policy without exceeding configured movement ceilings.
     pub fn set_control_policy(&mut self, policy: MemoryControlPolicy) {
         let policy = policy.bounded_by(&self.config.budget);
         self.scheduler.set_budget(policy.movement_budget);
         self.control_policy = policy;
-    }
-
-    /// Applies a memory control policy.
-    pub fn set_policy(&mut self, policy: MemoryControlPolicy) {
-        self.set_control_policy(policy);
-    }
-
-    /// Applies a memory control policy.
-    pub fn set_memory_control_policy(&mut self, policy: MemoryControlPolicy) {
-        self.set_control_policy(policy);
-    }
-
-    /// Applies a memory control policy.
-    pub fn set_memory_policy(&mut self, policy: MemoryControlPolicy) {
-        self.set_control_policy(policy);
-    }
-
-    /// Returns the active bounded memory control policy.
-    #[must_use]
-    pub const fn memory_control_policy(&self) -> &MemoryControlPolicy {
-        self.control_policy()
     }
 
     /// Returns the stored execution criticality for an object.
@@ -1560,7 +1527,7 @@ impl MemoryFabric {
         signals
     }
 
-    /// Drains typed Phase 12 criticality signals for controller observation.
+    /// Drains typed criticality signals for controller observation.
     pub fn drain_observation_signals(&mut self) -> Vec<(u64, ExecutionCriticalitySignal)> {
         let signals = self.telemetry.drain_observation_signals();
         for (object, _) in &signals {
