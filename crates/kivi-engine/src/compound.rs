@@ -834,7 +834,7 @@ fn stage_batch_medium(
                         ),
                     });
                 }
-                match fabric.borrow_mut().stage(coordinator, value.clone(), true) {
+                match fabric.borrow_mut().stage(coordinator, &value, true) {
                     Ok((fabric_id, logical_len)) => {
                         seals.push(crate::fabric::StagedSeal {
                             fabric_id,

@@ -381,6 +381,12 @@ impl From<WorkerRequestError> for EngineError {
     }
 }
 
+/// Handle the RESP edge's accept loops wait on before serving, so no connection
+/// is ever answered before there is an engine client to forward through.
+///
+/// Published exactly once, after the workers a client might route to exist.
+pub type RespForward = Arc<std::sync::OnceLock<LocalClient>>;
+
 /// State shared by the engine handle and every cloned client: routing
 /// publication plus one request sender per worker. The routing `Arc` is the
 /// same object handed to networked workers, so publication swaps are visible
@@ -416,6 +422,10 @@ pub struct LocalEngine {
     /// Chunk lane handles (stats, shutdown signaling) plus join guards
     /// (shutdown after workers join: no worker submits once it exits).
     chunk_lanes: Vec<crate::chunk_lane::ChunkLaneHandle>,
+    /// Endpoint the RESP edge actually bound (`None` when not configured).
+    /// The configured address can name port `0`, so this is the one clients can
+    /// be told to dial.
+    resp_bound: Option<std::net::SocketAddr>,
     chunk_guards: Vec<crate::chunk_lane::ChunkLaneGuard>,
     /// Offcore lane join guards (shutdown after workers join, like chunk
     /// lanes: no worker submits once it exits).
@@ -1004,7 +1014,7 @@ impl LocalEngine {
             }
         }
         let routing = Arc::new(ArcSwap::from_pointee(routing));
-        let (workers, senders, bound) = match &config.network {
+        let ((workers, senders, bound), resp_forward, resp_bound) = match &config.network {
             None => {
                 let (workers, senders) = Self::spawn_channel_workers(
                     config.request_capacity,
@@ -1015,21 +1025,22 @@ impl LocalEngine {
                     fabrics,
                     &thread_placement,
                 );
-                (workers, senders, Vec::new())
+                (
+                    (workers, senders, Vec::new()),
+                    Arc::new(std::sync::OnceLock::new()),
+                    None,
+                )
             }
-            Some(network) => {
-                let (workers, senders, bound) = Self::spawn_network_workers(
-                    network,
-                    config.request_capacity,
-                    config.worker_count,
-                    by_worker,
-                    &routing,
-                    lanes,
-                    chunk_access,
-                    fabrics,
-                )?;
-                (workers, senders, bound)
-            }
+            Some(network) => Self::spawn_network_workers(
+                network,
+                config.request_capacity,
+                config.worker_count,
+                by_worker,
+                &routing,
+                lanes,
+                chunk_access,
+                fabrics,
+            )?,
         };
         // The checkpoint worker starts last (it needs worker control
         // senders) and stops first (before workers flush). `disabled`
@@ -1081,16 +1092,23 @@ impl LocalEngine {
             };
             crate::checkpoint::CheckpointWorkerHandle::spawn(context, spawn.thread_placement)
         });
+        let shared = Arc::new(EngineShared {
+            namespace: config.namespace,
+            routing,
+            senders,
+            chunk_lanes: chunk_lanes.clone(),
+            recovery_runs: std::sync::atomic::AtomicU64::new(0),
+            resolved_commits: std::sync::atomic::AtomicU64::new(0),
+            resolved_aborts: std::sync::atomic::AtomicU64::new(0),
+        });
+        // Every worker the client can route to now exists, so the RESP edge's
+        // accept loops may start. Published last, and exactly once: a
+        // connection that arrived earlier is still waiting in the backlog.
+        let _ = resp_forward.set(LocalClient {
+            shared: Arc::clone(&shared),
+        });
         Ok(Self {
-            shared: Arc::new(EngineShared {
-                namespace: config.namespace,
-                routing,
-                senders,
-                chunk_lanes: chunk_lanes.clone(),
-                recovery_runs: std::sync::atomic::AtomicU64::new(0),
-                resolved_commits: std::sync::atomic::AtomicU64::new(0),
-                resolved_aborts: std::sync::atomic::AtomicU64::new(0),
-            }),
+            shared,
             workers,
             bound,
             durability,
@@ -1100,9 +1118,16 @@ impl LocalEngine {
             chunk_lanes,
             chunk_guards,
             fabric_guards,
+            resp_bound,
             _ephemeral_chunks: ephemeral_chunks,
             _ephemeral_fabric: ephemeral_fabric,
         })
+    }
+
+    /// Endpoint the RESP compatibility edge bound, if configured.
+    #[must_use]
+    pub fn resp_endpoint(&self) -> Option<std::net::SocketAddr> {
+        self.resp_bound
     }
 
     /// Fails (refusing to serve) on corrupt history, structural gaps,
@@ -1648,7 +1673,22 @@ impl LocalEngine {
 
     /// Spawns networked workers, collecting bound addresses into the shared
     /// endpoint registry once every worker reports ready.
-    #[allow(clippy::too_many_arguments)]
+    /// Spawns one networked worker per placement slot.
+    ///
+    /// Returns the handles, the per-worker request senders, each worker's bound
+    /// native address, the slot the RESP accept loops wait on for an engine
+    /// client to forward through (published by the caller once the engine
+    /// exists, the only moment a client can route to a live worker), and the
+    /// RESP endpoint when that edge is configured.
+    ///
+    /// Nine parameters is the shape the surrounding call sites dictate; they
+    /// are grouped by the `WorkerSpawn` bundle rather than left as a list that
+    /// a reader has to decode positionally.
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::type_complexity,
+        clippy::too_many_lines
+    )]
     fn spawn_network_workers(
         network: &crate::net::EngineNetwork,
         request_capacity: usize,
@@ -1658,7 +1698,7 @@ impl LocalEngine {
         lanes: Vec<Option<WorkerDurability>>,
         chunks: Vec<crate::worker::WorkerChunks>,
         fabrics: Vec<crate::fabric::TabletFabric>,
-    ) -> Result<NetworkSpawn, EngineError> {
+    ) -> Result<(NetworkSpawn, RespForward, Option<std::net::SocketAddr>), EngineError> {
         let endpoints = Arc::new(ArcSwap::new(Arc::new(crate::net::EndpointMap::new())));
         // Lanes present means durable mode (start() builds all-or-none);
         // the advertised capabilities follow the mode, never flags.
@@ -1673,6 +1713,23 @@ impl LocalEngine {
         let mut senders = Vec::with_capacity(worker_count);
         let mut bound: Vec<(WorkerId, String)> = Vec::with_capacity(worker_count);
         let mut addrs: Vec<std::net::SocketAddr> = Vec::with_capacity(worker_count);
+        // The RESP edge binds on the worker that owns the most tablets, so a
+        // single-tablet engine — the common shape — forwards nothing. Decided
+        // once, here, from the same distribution the placement already
+        // produced; a tie goes to the lower index for determinism.
+        let resp_owner = by_worker
+            .iter()
+            .enumerate()
+            .max_by_key(|(index, tablets)| (tablets.len(), std::cmp::Reverse(*index)))
+            .map(|(index, _)| index);
+        let resp_forward: RespForward = Arc::new(std::sync::OnceLock::new());
+        // Receivers for the accepting worker's bind report, collected below so
+        // a failed bind fails startup instead of leaving a frontend that
+        // silently accepts nothing.
+        let mut resp_reporting: Vec<(
+            usize,
+            std::sync::mpsc::Receiver<Result<crate::resp_net::RespBinding, String>>,
+        )> = Vec::new();
         for ((((index, tablets), durability), chunks), fabric) in by_worker
             .into_iter()
             .enumerate()
@@ -1726,6 +1783,24 @@ impl LocalEngine {
                 endpoints: Arc::clone(&endpoints),
                 routing: Arc::clone(routing),
             };
+            let resp = network.resp.as_ref().map(|edge| {
+                let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+                // Only the accepting worker binds, so only it has a binding to
+                // wait for. The others get the config with no listener and
+                // never report, which is why the receiver is registered here
+                // rather than for every worker.
+                if resp_owner == Some(index) {
+                    resp_reporting.push((index, ready_rx));
+                }
+                crate::resp_net::RespNetConfig {
+                    listen: (resp_owner == Some(index)).then_some(edge.listen),
+                    namespace: edge.namespace,
+                    conn: edge.conn,
+                    stats: Arc::clone(&edge.stats),
+                    forward: Arc::clone(&resp_forward),
+                    ready: ready_tx,
+                }
+            });
             let (handle, addr) = WorkerHandle::spawn_net(
                 id,
                 tablets,
@@ -1736,6 +1811,7 @@ impl LocalEngine {
                 crate::net::NetLaunch {
                     routing: Arc::clone(routing),
                     net,
+                    resp,
                     placement: network.placement.clone(),
                     worker_index: index,
                 },
@@ -1747,7 +1823,25 @@ impl LocalEngine {
             workers.push(handle);
         }
         endpoints.store(Arc::new(bound.into_iter().collect()));
-        Ok((workers, senders, addrs))
+        // The accepting worker has bound by now: it reports before it serves,
+        // and `spawn_net` only returns once that worker is up.
+        let mut resp_bound = None;
+        for (index, receiver) in resp_reporting {
+            match receiver.recv_timeout(crate::net::STARTUP_TIMEOUT) {
+                Ok(Ok(binding)) => resp_bound = Some(binding.endpoint),
+                Ok(Err(reason)) => {
+                    return Err(EngineError::NetStart(crate::net::NetStartError::Bind(
+                        reason,
+                    )));
+                }
+                Err(_) => {
+                    return Err(EngineError::NetStart(crate::net::NetStartError::Startup(
+                        format!("RESP listener on worker {index} never reported readiness"),
+                    )));
+                }
+            }
+        }
+        Ok(((workers, senders, addrs), resp_forward, resp_bound))
     }
 
     /// Returns the bound native endpoint per worker index (empty for
@@ -2259,30 +2353,6 @@ enum AbortOutcome {
 }
 
 impl LocalClient {
-    /// Executes one typed operation against its owning tablet. Chunked
-    /// reads resolve here on the caller thread (blocking lane call — this
-    /// is application-thread context, never the reactor), so every typed
-    /// method below keeps its plain-bytes contract whatever the physical
-    /// representation is.
-    fn execute(&self, key: &Key, op: Operation) -> Result<OperationResult, EngineError> {
-        // `GetRange` over a chunked root resolves through the lane and
-        // then slices: the store names the reference, this layer applies
-        // the caller's window (a future lane range-read will fetch only
-        // the required chunks instead of the full payload).
-        let range = match &op {
-            Operation::GetRange { offset, len, .. } => Some((*offset, *len)),
-            _ => None,
-        };
-        let routing = self.shared.routing.load();
-        let tablet = crate::compound::route_point_key(
-            routing.directory(),
-            self.shared.namespace,
-            key.as_bytes(),
-        )
-        .ok_or(EngineError::NoRoute)?;
-        self.execute_on(tablet, op, range)
-    }
-
     /// Executes one typed operation against an explicitly addressed tablet
     /// (transaction drivers address participants directly after planning).
     fn execute_on(
@@ -2341,6 +2411,181 @@ impl LocalClient {
             }
             other => Ok(other),
         }
+    }
+
+    /// Executes one already-typed operation against its owning tablet.
+    ///
+    /// The public form of the private per-verb path. Frontends that receive
+    /// whole operations rather than method calls — the RESP edge — need
+    /// exactly this, and previously had to re-implement a match over every
+    /// `Operation` variant to get it, which silently went stale whenever a
+    /// variant was added.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError`] when the key is unroutable, the owning worker
+    /// refuses the request, or the tablet rejects the operation.
+    pub fn execute_op(&self, op: Operation) -> Result<OperationResult, EngineError> {
+        // The range window is read before the operation is moved: the
+        // execution path needs the bytes, the client path needs the window.
+        let range = match &op {
+            Operation::GetRange { offset, len, .. } => Some((*offset, *len)),
+            _ => None,
+        };
+        let key = op.key().clone();
+        self.execute_range(&key, op, range)
+    }
+
+    /// Executes one typed operation against its owning tablet. Chunked reads
+    /// resolve here on the caller thread (blocking lane call — this is
+    /// application-thread context, never the reactor), so every typed
+    /// method below keeps its plain-bytes contract whatever the physical
+    /// representation is.
+    fn execute(&self, key: &Key, op: Operation) -> Result<OperationResult, EngineError> {
+        self.execute_range(key, op, None)
+    }
+
+    /// [`Self::execute`] with the caller's slice window carried through, so a
+    /// range read over a chunked root resolves the payload and then applies
+    /// the window in one place.
+    fn execute_range(
+        &self,
+        key: &Key,
+        op: Operation,
+        range: Option<(u64, u64)>,
+    ) -> Result<OperationResult, EngineError> {
+        // A `GetRange` over a chunked root resolves through the lane and then
+        // slices: the store names the reference, this layer applies the
+        // caller's window (a future lane range-read will fetch only the
+        // required chunks instead of the full payload).
+        let routing = self.shared.routing.load();
+        let tablet = crate::compound::route_point_key(
+            routing.directory(),
+            self.shared.namespace,
+            key.as_bytes(),
+        )
+        .ok_or(EngineError::NoRoute)?;
+        self.execute_on(tablet, op, range)
+    }
+
+    /// Executes many operations, issuing **every** request before waiting for
+    /// any answer. Results come back in request order.
+    ///
+    /// The serial path costs one thread rendezvous per operation, so a client
+    /// that pipelines N commands into one buffer still pays N round-trips.
+    /// Issuing them all first lets the owning worker drain its queue in a
+    /// single turn, which is what pipelining is supposed to buy. Measured
+    /// against Redis — which already answers a whole pipeline in one event
+    /// loop pass — the serial path was the largest single gap on this edge.
+    ///
+    /// Per-operation routing and send failures are recorded against that
+    /// operation and do not abort the batch: one unroutable key must not
+    /// discard the work already accepted for its neighbours, and must not
+    /// shift anybody else's answer out of position.
+    #[must_use]
+    pub fn execute_many(&self, ops: Vec<Operation>) -> Vec<Result<OperationResult, EngineError>> {
+        /// One operation's place in the batch.
+        enum Slot<'lane> {
+            /// Queued, with the rendezvous to collect it.
+            Queued {
+                receive: crossbeam_channel::Receiver<crate::worker::WorkerResponse>,
+                lane: &'lane crate::chunk_lane::ChunkLaneHandle,
+                range: Option<(u64, u64)>,
+            },
+            /// Already decided; the answer does not need collecting.
+            Settled(Result<OperationResult, EngineError>),
+        }
+
+        // One routing snapshot for the whole batch: the directory cannot
+        // change under a caller that has not been told it may change.
+        let routing = self.shared.routing.load();
+        let now = kivi_core::wall_now_or_max(&SystemClock);
+        let mut slots: Vec<Slot<'_>> = Vec::with_capacity(ops.len());
+
+        for op in ops {
+            // A range read over a chunked root is sliced on this side, so the
+            // window has to travel with the request (same as `execute`).
+            let range = match &op {
+                Operation::GetRange { offset, len, .. } => Some((*offset, *len)),
+                _ => None,
+            };
+            let Some(tablet) = crate::compound::route_point_key(
+                routing.directory(),
+                self.shared.namespace,
+                op.key().as_bytes(),
+            ) else {
+                slots.push(Slot::Settled(Err(EngineError::NoRoute)));
+                continue;
+            };
+            let Some(worker) = routing.placement().worker_of(tablet) else {
+                slots.push(Slot::Settled(Err(EngineError::UnknownTablet { tablet })));
+                continue;
+            };
+            let Ok(index) = usize::try_from(worker.as_u64()) else {
+                slots.push(Slot::Settled(Err(EngineError::UnknownWorker { worker })));
+                continue;
+            };
+            let (Some(sender), Some(lane)) = (
+                self.shared.senders.get(index),
+                self.shared.chunk_lanes.get(index),
+            ) else {
+                slots.push(Slot::Settled(Err(EngineError::UnknownWorker { worker })));
+                continue;
+            };
+            let (respond, receive) = bounded(RESPONSE_CAPACITY);
+            let request = TabletRequest {
+                tablet,
+                op,
+                now,
+                // Embedded callers share fate with the process: no retry
+                // identity, so no dedup — durable mode still WALs the write.
+                identity: None,
+                respond,
+            };
+            match sender.try_send(request) {
+                Ok(()) => slots.push(Slot::Queued {
+                    receive,
+                    lane,
+                    range,
+                }),
+                Err(error) => slots.push(Slot::Settled(Err(map_send_error(&error, worker)))),
+            }
+        }
+
+        // Collect pass: every request is already queued, so waiting for the
+        // first answer overlaps with the worker executing the rest.
+        slots
+            .into_iter()
+            .map(|slot| match slot {
+                Slot::Settled(result) => result,
+                Slot::Queued {
+                    receive,
+                    lane,
+                    range,
+                } => receive
+                    .recv()
+                    .map_err(|_| EngineError::WorkerDown {
+                        worker: kivi_types::WorkerId::from_u64(0),
+                    })
+                    .and_then(|response| response.map_err(EngineError::from))
+                    .and_then(|outcome| {
+                        let OperationResult::ChunkedValue {
+                            manifest,
+                            logical_len,
+                        } = outcome
+                        else {
+                            return Ok(outcome);
+                        };
+                        let bytes = lane.read_value_blocking(manifest, logical_len)?;
+                        Ok(match range {
+                            None => OperationResult::Value(Some(bytes)),
+                            Some((offset, len)) => OperationResult::Value(Some(
+                                kivi_state::slice_range(&bytes, offset, len),
+                            )),
+                        })
+                    }),
+            })
+            .collect()
     }
 
     /// Fetches bytes (`None` when absent, expired, or never written).

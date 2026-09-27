@@ -53,6 +53,16 @@ use kivi_memory::offcore_lane::{OffcoreLaneGuard, OffcoreLaneHandle, OffcoreRepl
 /// indirection dominate, above it the avoided bytes do.
 pub const FABRIC_INLINE_MAX: usize = 1024;
 
+/// Version stamped on a fabric object that has no committed version yet.
+///
+/// A freshly staged value is not published under any version until its
+/// mutation seals, so its locator cannot carry one. Reads are located by
+/// offset and length and the authoritative version lives on the state root,
+/// so this is metadata rather than a fence. It matches the version
+/// [`MemoryFabric::insert`] gives an arena-resident object, which keeps one
+/// rule for "not yet published" across both tiers.
+const STAGED_FABRIC_VERSION: u64 = 1;
+
 /// Memory Fabric configuration: capacity policy per worker. One value
 /// shared by every worker; per-worker fabrics open beneath it.
 #[derive(Debug, Clone)]
@@ -422,43 +432,86 @@ impl TabletFabric {
     ///
     /// # Errors
     ///
-    /// Returns [`FabricError::Overloaded`] when the arena is saturated and
-    /// [`FabricError::Unavailable`] when the value cannot be staged (for
-    /// example, above the medium limit).
+    /// Returns [`FabricError::Unavailable`] when the value is above the
+    /// medium limit, or [`FabricError::Overloaded`] when neither the arena
+    /// nor the off-core device can take the bytes.
     pub fn stage(
         &mut self,
         tablet: TabletId,
-        bytes: Bytes,
+        bytes: &Bytes,
         hot: bool,
     ) -> Result<(u64, u64), FabricError> {
-        // Explicit admission plan before any staging work: proves arena
-        // headroom now, so a commit that reaches the seal can never meet
-        // an unrepresentable payload. Consensus determinism never
-        // depends on this (prepare stays pure); saturation answers
-        // overload here instead of failing the batch at the seal.
-        if let Err(error) = self.fabric.stage_plan(bytes.len() as u64) {
-            self.admission_rejects += 1;
-            return Err(FabricError::from(error));
+        let len = bytes.len() as u64;
+        // Explicit admission plan before any staging work, so a commit that
+        // reaches the seal can never meet an unrepresentable payload.
+        // Consensus determinism never depends on this (prepare stays pure).
+        //
+        // Saturation is a *tiering* signal, not a refusal: the arena is a
+        // cache of hot medium values and the off-core device is where the
+        // rest of the working set lives. Refusing here made a bounded hot
+        // tier into a bounded database — every value between
+        // `FABRIC_INLINE_MAX` and the chunk threshold failed once the arena
+        // filled, which is the same working set `import_recovered` already
+        // handles by demoting.
+        match self.fabric.stage_plan(len) {
+            Ok(()) => {}
+            Err(kivi_memory::MemoryError::Overloaded { .. }) => self.admission_rejects += 1,
+            Err(error) => return Err(FabricError::from(error)),
         }
-        let intent = if hot {
+        let mut intent = if hot {
             kivi_memory::MaterializationIntent::hot()
         } else {
             kivi_memory::MaterializationIntent::cold()
         };
-        let mut intent = intent;
         intent.tablet = Some(tablet);
         if let Some(node) = self.numa_node {
             intent.locality = kivi_memory::LocalityRequirement::PreferredNuma { node };
         }
-        let len = bytes.len() as u64;
-        let id = self
-            .fabric
-            .insert(
-                bytes,
+        match self.fabric.insert(
+            bytes.clone(),
+            intent.clone(),
+            BehaviorClass::HotMutable,
+            Mutability::Mutable,
+        ) {
+            Ok(id) => Ok((id, len)),
+            // The arena bound moved between the plan and the insert (or the
+            // plan was optimistic). Same answer: take the cold tier.
+            Err(kivi_memory::MemoryError::Overloaded { .. }) => {
+                self.admission_rejects += 1;
+                self.stage_offcore(bytes, len, intent)
+            }
+            Err(error) => Err(FabricError::from(error)),
+        }
+    }
+
+    /// Stages a value on the off-core tier because the hot arena cannot take
+    /// it.
+    ///
+    /// The write is a relaxed append — no fsync — because a demotion record
+    /// is an optimization copy that nothing references durably. The bytes
+    /// still ride the WAL as a `MaterialRecord` when the mutation seals, so
+    /// the cold tier changes where a value lives, never whether it survives.
+    fn stage_offcore(
+        &mut self,
+        bytes: &Bytes,
+        len: u64,
+        intent: kivi_memory::MaterializationIntent,
+    ) -> Result<(u64, u64), FabricError> {
+        let id = self.fabric.reserve_object();
+        let record = self
+            .lane
+            .demote_blocking(id, STAGED_FABRIC_VERSION, bytes.to_vec())
+            .map_err(FabricError::from)?;
+        self.fabric
+            .import_offcore(kivi_memory::OffcoreImport {
+                id,
+                version: STAGED_FABRIC_VERSION,
+                offset: record.offset,
+                len: record.len,
+                checksum: record.checksum,
                 intent,
-                BehaviorClass::HotMutable,
-                Mutability::Mutable,
-            )
+                class: BehaviorClass::ColdCandidate,
+            })
             .map_err(FabricError::from)?;
         Ok((id, len))
     }
@@ -1134,7 +1187,7 @@ mod tests {
             TabletFabric::open_unbound(worker, &paths, 1 << 20, 16 << 20).expect("fabric opens");
         let tablet = TabletId::from_u64(1);
         let bytes = Bytes::from(vec![0xABu8; 1024]);
-        let (staging_id, staged_len) = fabric.stage(tablet, bytes.clone(), true).expect("stage");
+        let (staging_id, staged_len) = fabric.stage(tablet, &bytes, true).expect("stage");
         let reference = FabricRef {
             id: staging_id,
             logical_len: staged_len,
@@ -1188,7 +1241,7 @@ mod tests {
                 .expect("fabric opens");
         let tablet = TabletId::from_u64(1);
         let bytes = Bytes::from(vec![0xABu8; 1024]);
-        let (staging_id, staged_len) = fabric.stage(tablet, bytes.clone(), true).expect("stage");
+        let (staging_id, staged_len) = fabric.stage(tablet, &bytes, true).expect("stage");
         let physical_version = fabric
             .fabric_mut()
             .object_version(staging_id)
@@ -1239,7 +1292,7 @@ mod tests {
                 .expect("fabric opens");
         let tablet = TabletId::from_u64(1);
         let bytes = Bytes::from(vec![0xCDu8; 1024]);
-        let (staging_id, staged_len) = fabric.stage(tablet, bytes.clone(), false).expect("stage");
+        let (staging_id, staged_len) = fabric.stage(tablet, &bytes, false).expect("stage");
         await_offcore(&mut fabric, staging_id);
         let physical_version = fabric
             .fabric_mut()
@@ -1283,7 +1336,7 @@ mod tests {
             TabletFabric::open_unbound(worker, &paths, 1 << 12, 16 << 20).expect("fabric opens");
         let tablet = TabletId::from_u64(1);
         let bytes = Bytes::from(vec![0xCDu8; 1024]);
-        let (staging_id, staged_len) = fabric.stage(tablet, bytes.clone(), false).expect("stage");
+        let (staging_id, staged_len) = fabric.stage(tablet, &bytes, false).expect("stage");
         await_offcore(&mut fabric, staging_id);
         let reference = FabricRef {
             id: staging_id,

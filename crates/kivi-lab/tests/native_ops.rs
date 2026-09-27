@@ -55,6 +55,9 @@ fn start_ephemeral() -> LocalEngine {
             incarnation: NodeIncarnation::INITIAL,
             conn: ConnLimits::default(),
             turn: TurnBudget::default(),
+            // The RESP edge is served by the engine's own workers;
+            // these harnesses exercise the native protocol only.
+            resp: None,
         }),
         durability: DurabilityMode::Ephemeral,
     })

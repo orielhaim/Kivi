@@ -226,6 +226,193 @@ fn exchange(stream: &mut TcpStream, parts: &[&[u8]]) -> Vec<u8> {
     buf[..count].to_vec()
 }
 
+/// A pipeline deeper than the server's per-turn budget spans several turns,
+/// and the client must still see exactly one reply per command, in order.
+///
+/// This is a stream-integrity test, not a throughput one: the failure it
+/// guards against is re-sending a turn's replies when the next turn is
+/// flushed, which desynchronises a pipelined client rather than merely
+/// slowing it down.
+#[test]
+fn a_pipeline_deeper_than_one_turn_stays_in_sync() {
+    /// Deep enough to need several server turns: the turn budget is what
+    /// stops one client monopolising the frontend.
+    const DEPTH: usize = 200;
+
+    let server = spawn_resp();
+    let resp = server.resp_endpoint().expect("resp endpoint");
+    let mut stream = TcpStream::connect(resp.as_str()).expect("connects");
+    stream.set_read_timeout(Some(IO_TIMEOUT)).expect("timeout");
+    stream.set_write_timeout(Some(IO_TIMEOUT)).expect("timeout");
+
+    let mut batch = Vec::new();
+    for index in 0..DEPTH {
+        let key = format!("deep:{index}");
+        batch.extend_from_slice(&exchange_bytes(&[b"SET", key.as_bytes(), b"v"]));
+    }
+    for index in 0..DEPTH {
+        let key = format!("deep:{index}");
+        batch.extend_from_slice(&exchange_bytes(&[b"STRLEN", key.as_bytes()]));
+    }
+    stream.write_all(&batch).expect("writes");
+    stream.flush().expect("flush");
+
+    // Read exactly 2 * DEPTH frames and check each one: the SETs answer +OK,
+    // then every STRLEN must answer :1. A duplicated or shifted frame breaks
+    // the pattern immediately.
+    for index in 0..DEPTH {
+        let frame = read_frame(&mut stream);
+        assert_eq!(frame, b"+OK\r\n", "SET {index} of {DEPTH}");
+    }
+    for index in 0..DEPTH {
+        let frame = read_frame(&mut stream);
+        assert_eq!(frame, b":1\r\n", "STRLEN {index} of {DEPTH}");
+    }
+}
+
+/// A single pipeline mixing commands the engine answers inline with commands
+/// it forwards to another worker, and every reply must land in its own
+/// command's position.
+///
+/// The engine serves a RESP connection on the worker that owns the tablet: a
+/// request it owns executes on that thread, and one it does not goes through
+/// the worker queue. A turn can contain both, and the two paths finish in
+/// different orders — the inline one returns before the turn moves on, the
+/// forwarded one blocks on another thread. This test is the oracle for that
+/// interleaving: if replies were ever paired by completion rather than by
+/// position, a value would be attributed to the wrong key, and a length to the
+/// wrong key, and the assertions below would fail.
+///
+/// Large values are the forwarded case by construction: a value above the
+/// engine's inline threshold stages through the chunk lane, which is a
+/// different thread, so it can never be answered inline.
+#[test]
+fn a_pipeline_mixing_inline_and_forwarded_commands_keeps_reply_order() {
+    /// Above the default inline threshold, so these stage and therefore forward.
+    const LARGE: usize = 512 * 1024;
+    const SMALL: usize = 16;
+
+    let server = spawn_resp();
+    let resp = server.resp_endpoint().expect("resp endpoint");
+    let mut stream = TcpStream::connect(resp.as_str()).expect("connects");
+    stream.set_read_timeout(Some(IO_TIMEOUT)).expect("timeout");
+    stream.set_write_timeout(Some(IO_TIMEOUT)).expect("timeout");
+
+    let large = vec![b'L'; LARGE];
+    let small = vec![b's'; SMALL];
+
+    // One turn, alternating shapes, so a mis-pairing has to survive an
+    // adjacent-swap to go unnoticed. It does not.
+    let mut batch = Vec::new();
+    // One expected reply per command: its RESP type byte, the fill byte a bulk
+    // reply must carry, and the integer a bulk length or an integer reply must
+    // carry. `(b'+', .., _)` means "+OK", whose payload is implied.
+    let mut expected: Vec<(u8, u8, u64)> = Vec::new();
+
+    batch.extend_from_slice(&exchange_bytes(&[b"SET", b"mix:large", &large]));
+    expected.push((b'+', b'L', 0));
+    batch.extend_from_slice(&exchange_bytes(&[b"SET", b"mix:small", &small]));
+    expected.push((b'+', b'L', 0));
+    batch.extend_from_slice(&exchange_bytes(&[b"STRLEN", b"mix:large"]));
+    expected.push((b':', b'L', LARGE as u64));
+    batch.extend_from_slice(&exchange_bytes(&[b"STRLEN", b"mix:small"]));
+    expected.push((b':', b'L', SMALL as u64));
+    batch.extend_from_slice(&exchange_bytes(&[b"EXISTS", b"mix:large"]));
+    expected.push((b':', b'L', 1));
+    batch.extend_from_slice(&exchange_bytes(&[b"EXISTS", b"mix:small"]));
+    expected.push((b':', b'L', 1));
+    // The `end` of a RESP range is inclusive, so `0 3` is four bytes. Asserted
+    // here rather than assumed: a range one byte too long desynchronises a
+    // client just as thoroughly as a mis-ordered reply.
+    batch.extend_from_slice(&exchange_bytes(&[b"GETRANGE", b"mix:small", b"0", b"3"]));
+    expected.push((b'$', b's', 4));
+    batch.extend_from_slice(&exchange_bytes(&[b"STRLEN", b"mix:absent"]));
+    expected.push((b':', b'L', 0));
+    batch.extend_from_slice(&exchange_bytes(&[b"GETRANGE", b"mix:small", b"0", b"3"]));
+    expected.push((b'$', b's', 4));
+
+    stream.write_all(&batch).expect("writes");
+    stream.flush().expect("flush");
+
+    for (index, (kind, fill, value)) in expected.iter().enumerate() {
+        let frame = read_frame(&mut stream);
+        assert_eq!(
+            frame.first(),
+            Some(kind),
+            "reply {index} has the wrong type; a reply was paired with the wrong command"
+        );
+        match kind {
+            b':' => {
+                let text = String::from_utf8_lossy(&frame[1..frame.len() - 2]).to_string();
+                assert_eq!(
+                    text.parse::<u64>().ok(),
+                    Some(*value),
+                    "reply {index} carries the wrong value"
+                );
+            }
+            b'$' => {
+                // The large value's `L`s and the small one's `s`s, in replies
+                // of identical shape, so only their bytes can tell a
+                // mis-pairing from a reordering.
+                let length = usize::try_from(*value).expect("test length fits usize");
+                let mut want = format!("${value}\r\n").into_bytes();
+                want.extend(std::iter::repeat_n(*fill, length));
+                want.extend_from_slice(b"\r\n");
+                assert_eq!(frame, want, "reply {index} carries the wrong bytes");
+            }
+            _ => assert_eq!(frame, b"+OK\r\n", "reply {index} is not +OK"),
+        }
+    }
+
+    // The stream is still in sync afterwards: one more command, one more
+    // reply, of the right value. A shifted stream would answer this with
+    // whatever was still queued.
+    stream
+        .write_all(&exchange_bytes(&[b"GETRANGE", b"mix:small", b"0", b"1"]))
+        .expect("writes trailing");
+    stream.flush().expect("flush");
+    assert_eq!(
+        read_frame(&mut stream),
+        b"$2\r\nss\r\n",
+        "stream desynchronised"
+    );
+}
+
+/// One command's bytes, without sending them.
+fn exchange_bytes(parts: &[&[u8]]) -> Vec<u8> {
+    let mut out = format!("*{}\r\n", parts.len()).into_bytes();
+    for part in parts {
+        out.extend_from_slice(format!("${}\r\n", part.len()).as_bytes());
+        out.extend_from_slice(part);
+        out.extend_from_slice(b"\r\n");
+    }
+    out
+}
+
+/// One reply frame, read whole. A single `read` can return half a frame, and
+/// then every later "reply" is really the previous frame's tail.
+fn read_frame(stream: &mut TcpStream) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let count = stream.read(&mut byte).expect("reads");
+        assert!(count > 0, "connection closed mid-frame");
+        out.push(byte[0]);
+        if out.ends_with(b"\r\n") {
+            if out[0] == b'$' {
+                let len: usize = std::str::from_utf8(&out[1..out.len() - 2])
+                    .expect("numeric header")
+                    .parse()
+                    .expect("numeric header");
+                let mut payload = vec![0u8; len + 2];
+                stream.read_exact(&mut payload).expect("bulk payload");
+                out.extend_from_slice(&payload);
+            }
+            return out;
+        }
+    }
+}
+
 /// Raw-socket checks for exact machine-visible error prefixes and shapes.
 #[test]
 fn raw_error_shapes_and_bootstrap() {

@@ -204,6 +204,7 @@ fn net_engine() -> LocalEngine {
             incarnation: NodeIncarnation::INITIAL,
             conn: kivi_engine::ConnLimits::default(),
             turn: kivi_engine::TurnBudget::default(),
+            resp: None,
         }),
         durability: DurabilityMode::Ephemeral,
     })

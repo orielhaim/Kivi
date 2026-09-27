@@ -1214,7 +1214,7 @@ pub async fn run(config: ClusterServeConfig) -> anyhow::Result<()> {
     // Optional RESP edge (edge adapter; never `MOVED`/`ASK`).
     #[cfg(feature = "redis-compat")]
     let (resp_admin, resp_shutdown) =
-        start_resp_edge(&node, &shared, config.redis_bind, config.namespace).await?;
+        start_resp_edge(&node, &shared, config.redis_bind, config.namespace)?;
     #[cfg(feature = "redis-compat")]
     let redis_part = resp_admin
         .as_ref()
@@ -1240,7 +1240,12 @@ pub async fn run(config: ClusterServeConfig) -> anyhow::Result<()> {
         tracing::warn!(%error, "shutdown signal watch failed; exiting");
     }
     #[cfg(feature = "redis-compat")]
-    drop(resp_shutdown);
+    if let Some(shutdown) = resp_shutdown {
+        // Explicit, not by dropping: the generic server's shutdown handle is
+        // a flag, and a dropped handle would leave the accept loop running for
+        // the rest of the process's life.
+        shutdown.trigger();
+    }
     #[cfg(feature = "redis-compat")]
     drop(resp_admin);
     native.abort();
@@ -1263,38 +1268,51 @@ pub async fn run(config: ClusterServeConfig) -> anyhow::Result<()> {
 
 /// Starts the optional RESP edge against the replicated node. Absent
 /// bind means native-only even when compiled in.
+///
+/// A replicated node answers through consensus, not through the tablet its key
+/// hashes to, so it cannot borrow a worker's reactor the way the single-node
+/// engine does. It uses the generic blocking server instead, which owns only
+/// the socket: parsing, dispatch, and reply shaping are the same code either
+/// way.
 #[cfg(feature = "redis-compat")]
-async fn start_resp_edge(
+fn start_resp_edge(
     node: &Arc<ConsensusNode>,
     shared: &ClusterShared,
     bind: Option<SocketAddr>,
     namespace: NamespaceId,
-) -> anyhow::Result<(
-    Option<super::resp::RespAdmin>,
-    Option<tokio::sync::watch::Sender<bool>>,
-)> {
+) -> anyhow::Result<(Option<super::resp::RespAdmin>, Option<kivi_resp::Shutdown>)> {
     let Some(addr) = bind else {
         return Ok((None, None));
     };
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
+    let listener = std::net::TcpListener::bind(addr)
         .with_context(|| format!("redis bind failed on {addr}"))?;
     let endpoint = listener.local_addr().context("redis listener address")?;
-    let stats = Arc::new(super::resp::RespStats::default());
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    tokio::spawn(super::resp::serve_with(
-        listener,
-        ClusterExecutor::new(Arc::clone(node), Arc::clone(&shared.directory), namespace),
+    let stats = Arc::new(kivi_resp::RespStats::default());
+    let node = Arc::clone(node);
+    let directory = Arc::clone(&shared.directory);
+    let serve = kivi_resp::BlockingServe::new(
+        move |_id| {
+            Box::new(ClusterExecutor::new(
+                Arc::clone(&node),
+                Arc::clone(&directory),
+                namespace,
+            ))
+        },
+        kivi_resp::ConnConfig::default(),
         Arc::clone(&stats),
-        shutdown_rx,
-    ));
+    );
+    let shutdown = serve.shutdown_handle();
+    std::thread::Builder::new()
+        .name("kivi-resp-accept".to_owned())
+        .spawn(move || serve.serve(&listener))
+        .context("RESP accept thread spawn failed")?;
     Ok((
         Some(super::resp::RespAdmin {
             endpoint,
             namespace: namespace.as_u64(),
             stats,
         }),
-        Some(shutdown_tx),
+        Some(shutdown),
     ))
 }
 

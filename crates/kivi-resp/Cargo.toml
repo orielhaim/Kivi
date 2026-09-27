@@ -15,6 +15,20 @@ redis-protocol = { version = "6.0.0", default-features = false, features = ["std
 
 [dev-dependencies]
 proptest.workspace = true
+divan.workspace = true
+# Allocation counting for the frontend bench. The workspace denies
+# hand-written `unsafe`, and a `GlobalAlloc` counter cannot be written
+# without it, so the measurement comes from a crate that carries its own.
+dhat = "0.3"
+
+[features]
+# `cargo bench -p kivi-resp --bench frontend --features alloc-profile -- <shape>`
+# prints allocations and bytes per request for one request shape.
+alloc-profile = []
+
+[[bench]]
+name = "frontend"
+harness = false
 
 [lints]
 workspace = true

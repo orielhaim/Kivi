@@ -594,6 +594,35 @@ fn main() -> anyhow::Result<()> {
         .iter()
         .filter(|tablet| tablet.state().is_writable())
         .count();
+    // The RESP edge is configured here, before the engine starts, because the
+    // engine's own workers serve it: a connection is answered by the thread
+    // that owns the tablet, with no queue and no second wakeup. Binding it
+    // from the admin runtime instead would put a thread hop back on every
+    // request, which is the entire cost this edge used to pay.
+    #[cfg(feature = "redis-compat")]
+    let resp_stats = std::sync::Arc::new(kivi_resp::RespStats::default());
+    #[cfg(feature = "redis-compat")]
+    let resp_edge = match args.redis_listen {
+        None => None,
+        Some(addr) => {
+            if args.redis_namespace != NS.as_u64() {
+                anyhow::bail!(
+                    "single-namespace stage serves namespace 1; --redis-namespace {} has no route",
+                    args.redis_namespace
+                );
+            }
+            Some(kivi_engine::EngineResp {
+                listen: addr,
+                namespace: NS,
+                conn: kivi_resp::ConnConfig::default(),
+                stats: std::sync::Arc::clone(&resp_stats),
+            })
+        }
+    };
+    // Without the compatibility feature the edge cannot be configured, and the
+    // engine is told so explicitly rather than being left to guess.
+    #[cfg(not(feature = "redis-compat"))]
+    let resp_edge: Option<kivi_engine::EngineResp> = None;
     let engine = LocalEngine::start(EngineConfig {
         namespace: NS,
         directory,
@@ -627,6 +656,7 @@ fn main() -> anyhow::Result<()> {
             incarnation,
             conn: ConnLimits::default(),
             turn: TurnBudget::default(),
+            resp: resp_edge,
         }),
         durability,
     })
@@ -646,47 +676,22 @@ fn main() -> anyhow::Result<()> {
         .thread_name("kivi-admin")
         .build()
         .context("admin runtime failed to start")?;
-    // Optional RESP frontend: bound before the ready line prints so the
-    // reported endpoint is authoritative (including `:0` ephemeral ports).
+    // The RESP edge is already bound and serving: the engine reported the
+    // endpoint it actually took, which is authoritative even for `:0`.
     // Absent `--redis-listen` means native-only even when compiled in.
-    // The shutdown sender outlives `admin::serve`; dropping it afterwards
-    // trips the frontend's watch so RESP tasks exit before the engine.
     #[cfg(feature = "redis-compat")]
-    let (resp_admin, resp_shutdown): (
-        Option<resp::RespAdmin>,
-        Option<tokio::sync::watch::Sender<bool>>,
-    ) = match args.redis_listen {
-        None => (None, None),
-        Some(addr) => {
-            if args.redis_namespace != NS.as_u64() {
-                anyhow::bail!(
-                    "single-namespace stage serves namespace 1; --redis-namespace {} has no route",
-                    args.redis_namespace
-                );
-            }
-            let stats = std::sync::Arc::new(resp::RespStats::default());
-            let listener = runtime
-                .block_on(tokio::net::TcpListener::bind(addr))
-                .with_context(|| format!("redis bind failed on {addr}"))?;
-            let endpoint = listener.local_addr().context("redis listener address")?;
-            tracing::info!(endpoint = %endpoint, namespace = args.redis_namespace, "resp frontend listening");
-            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-            runtime.spawn(resp::serve(
-                listener,
-                engine.client(),
-                Arc::clone(&stats),
-                shutdown_rx,
-            ));
-            (
-                Some(resp::RespAdmin {
-                    endpoint,
-                    namespace: args.redis_namespace,
-                    stats,
-                }),
-                Some(shutdown_tx),
-            )
+    let resp_admin = engine.resp_endpoint().map(|endpoint| {
+        tracing::info!(
+            endpoint = %endpoint,
+            namespace = args.redis_namespace,
+            "resp frontend listening"
+        );
+        resp::RespAdmin {
+            endpoint,
+            namespace: args.redis_namespace,
+            stats: std::sync::Arc::clone(&resp_stats),
         }
-    };
+    });
     let adaptive = Arc::new(adaptive::AdaptiveRuntime::new(
         engine.admin_handle(),
         cluster,
@@ -754,8 +759,9 @@ fn main() -> anyhow::Result<()> {
     }))?;
     let _ = adaptive_shutdown.send(true);
     let _ = runtime.block_on(adaptive_task);
-    #[cfg(feature = "redis-compat")]
-    drop(resp_shutdown);
+    // The engine's own shutdown drains the RESP accept loops and their live
+    // connections with the workers that own them, so there is nothing to signal
+    // here and nothing that could outlive the runtime.
     let report = engine.shutdown().context("engine shutdown failed")?;
     tracing::info!(
         workers_joined = report.workers_joined,

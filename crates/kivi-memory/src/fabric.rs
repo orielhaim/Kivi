@@ -946,6 +946,18 @@ impl MemoryFabric {
         Ok(Bytes::from(bytes))
     }
 
+    /// Reserves a fresh object id without materializing anything.
+    ///
+    /// Staging to a tier other than the arena needs an id before the bytes
+    /// exist: the off-core record is keyed by it. Reserving here keeps id
+    /// minting in one place instead of letting a caller invent one and
+    /// collide with [`Self::insert`]'s counter.
+    pub fn reserve_object(&mut self) -> u64 {
+        let object = self.next_object;
+        self.next_object += 1;
+        object
+    }
+
     /// Imports one off-core record as a cold object with a fixed id and
     /// version (recovery path). The id must be unused; `next_object`
     /// advances past it so later inserts never collide.

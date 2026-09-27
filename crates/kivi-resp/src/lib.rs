@@ -32,14 +32,22 @@
 //! The single source of truth is [`command::REGISTRY`]; dispatch,
 //! `COMMAND` output, and tests all read from it.
 
+pub mod blocking;
 pub mod command;
 pub mod connection;
 pub mod error;
+pub mod frame;
+pub mod stats;
 pub mod translate;
 
+pub use blocking::{BlockingServe, Shutdown};
 pub use command::{CommandKind, CommandSpec, CompatClass, REGISTRY, arity_ok, lookup};
-pub use connection::{ConnConfig, ConnMetrics, ConnState, RespConnection, RespVersion};
+pub use connection::{
+    ConnConfig, ConnMetrics, ConnState, DrainOutcome, RespConnection, RespVersion, write_reply,
+};
 pub use error::{KiviErrorKind, RespError};
+pub use frame::{Command, Limits, MAX_ARGS, Parsed, parse_command};
+pub use stats::{RespSnapshot, RespStats};
 pub use translate::{Action, ExecuteError, Executor, Immediate, RedisOp, Reply};
 
 /// Compatibility profile version string (pinned; future Redis releases do

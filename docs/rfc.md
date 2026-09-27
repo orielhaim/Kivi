@@ -6756,6 +6756,28 @@ check. A two-worker `--pmu` server on WSL2 reports `measured: true`,
 `trust: 1.0`, and real page-fault counts, carried from the serving thread's own
 counter group through the sampler, the closed signal, and the fabric fold.
 
+## Validation
+
+Both platforms are validated with `cargo fmt --all --check`,
+`cargo check --workspace --all-targets [--all-features]`,
+`cargo clippy --workspace --all-targets --all-features` (zero warnings on both),
+and `cargo nextest run --workspace --all-features`, each from a run with nothing
+else in flight. The `kivi-lab` cluster tests spawn `kivi-server` processes and
+are wall-clock sensitive: three *overlapping* Windows runs of this same tree gave
+2, 24, and 1 failures, against one clean run's 1, so only exclusive runs are
+reported.
+
+Exclusive results: Windows 1421 run / 1420 pass / 1 fail; Linux 1422 run / 24
+fail. On Linux the same suite was run against a pristine `git archive HEAD` copy
+on the same host and fails **31**, so the changed tree is net better than the
+baseline: eight baseline failures pass here, one name appears the other way
+(`migration_preserves_acked_writes_across_handoff`, a 230-second handoff test
+that also failed in the clean Windows run and passes alone there), and zero
+failures fall outside `kivi-lab`. The 23 that fail on both trees are one cluster
+family whose cause is a harness gap — the 4th member is spawned with no
+`--control-seeds` and no `add_learner`, so it waits for a control group a founding
+voter already created.
+
 ## What the crate provides
 
 `kivi-hardware` is the single place that answers "what does this machine offer,

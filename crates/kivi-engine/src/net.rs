@@ -61,6 +61,7 @@ use kivi_hardware::{PlacementRole, WorkerSlot};
 use crate::chunk_lane::{RangeRoot, RangeRootFence};
 use crate::commit::PendingEntry;
 use crate::placement::ThreadPlacement;
+use crate::resp_net::serve_resp;
 use crate::routing::RoutingSnapshot;
 use crate::tablet::LiveTablet;
 use crate::worker::{
@@ -181,6 +182,10 @@ pub struct EngineNetwork {
     pub conn: ConnLimits,
     /// Per-turn fairness budgets.
     pub turn: TurnBudget,
+    /// Optional Redis/RESP compatibility edge, served from a worker's own
+    /// reactor beside its native listener. `None` serves the native protocol
+    /// only.
+    pub resp: Option<crate::resp_net::EngineResp>,
 }
 
 /// Per-worker resolved network configuration.
@@ -251,30 +256,30 @@ impl Future for YieldNow {
 }
 
 /// Shared per-worker serving state (single-threaded; `Rc` never crosses threads).
-struct WorkerNet {
-    id: WorkerId,
-    tablets: Rc<RefCell<HashMap<TabletId, LiveTablet>>>,
-    metrics: Rc<Cell<WorkerMetrics>>,
-    routing: Arc<ArcSwap<RoutingSnapshot>>,
-    endpoints: Arc<ArcSwap<EndpointMap>>,
-    shutdown: Rc<Cell<bool>>,
-    active: Rc<Cell<usize>>,
+pub(crate) struct WorkerNet {
+    pub(crate) id: WorkerId,
+    pub(crate) tablets: Rc<RefCell<HashMap<TabletId, LiveTablet>>>,
+    pub(crate) metrics: Rc<Cell<WorkerMetrics>>,
+    pub(crate) routing: Arc<ArcSwap<RoutingSnapshot>>,
+    pub(crate) endpoints: Arc<ArcSwap<EndpointMap>>,
+    pub(crate) shutdown: Rc<Cell<bool>>,
+    pub(crate) active: Rc<Cell<usize>>,
     net: NetConfig,
     /// Durable state (`None` in ephemeral mode). Shared across this
     /// worker's connection tasks and bridge: single-threaded `Rc`, and
     /// every use is synchronous (no `.await` while borrowed), so tasks
     /// cannot interleave a persist-apply sequence.
-    durability: Option<Rc<RefCell<WorkerDurability>>>,
+    pub(crate) durability: Option<Rc<RefCell<WorkerDurability>>>,
     /// Chunk lane access plus the representation policy. Shared across
     /// connection tasks and bridge like durability above. Staging and
     /// resolution suspend the awaiting task only — never the reactor.
-    chunks: crate::worker::WorkerChunks,
+    pub(crate) chunks: crate::worker::WorkerChunks,
     /// Memory Fabric integration. Shared across connection tasks and
     /// bridge like durability above. Staging is synchronous (arena
     /// insert, never blocking); promotion suspends the awaiting task
     /// (connection tasks) or parks on the frontier (bridge) — the
     /// reactor thread itself never blocks on storage.
-    fabric: Rc<RefCell<crate::fabric::TabletFabric>>,
+    pub(crate) fabric: Rc<RefCell<crate::fabric::TabletFabric>>,
 }
 
 /// Launch bundle for one networked worker: everything `spawn_net` needs
@@ -286,6 +291,8 @@ pub struct NetLaunch {
     pub routing: Arc<ArcSwap<RoutingSnapshot>>,
     /// Resolved per-worker network configuration.
     pub net: NetConfig,
+    /// RESP edge launch, `None` on every worker but the accepting one.
+    pub resp: Option<crate::resp_net::RespNetConfig>,
     /// Where this node's owner threads run, resolved once from the machine.
     pub placement: ThreadPlacement,
     /// This worker's index, which names its placement slot.
@@ -355,7 +362,17 @@ pub(crate) fn run_net(
             return;
         }
     };
-    runtime.block_on(serve(shared, requests, control, bridge_wake, ready));
+    // The RESP edge, when configured, runs on this same reactor beside the
+    // native accept loop. Spawned from inside the runtime rather than around
+    // `block_on`, because a task can only be spawned from inside a runtime.
+    runtime.block_on(serve(
+        shared,
+        requests,
+        control,
+        bridge_wake,
+        ready,
+        launch.resp,
+    ));
 }
 
 /// Top-level serving future: bind, report, accept until shutdown, drain.
@@ -365,6 +382,7 @@ async fn serve(
     control: crossbeam_channel::Receiver<WorkerControl>,
     bridge_wake: async_channel::Receiver<()>,
     ready: std::sync::mpsc::Sender<Result<SocketAddr, NetStartError>>,
+    resp: Option<crate::resp_net::RespNetConfig>,
 ) {
     let listener = match TcpListener::bind(shared.net.listen).await {
         Ok(listener) => listener,
@@ -382,6 +400,16 @@ async fn serve(
     };
     tracing::info!(worker = %shared.id.as_u64(), addr = %bound, "worker listening");
     let _ = ready.send(Ok(bound));
+    // The RESP edge binds independently and reports on its own channel, so a
+    // caller can tell which listener failed. The engine collects it after this
+    // worker reports, which is why startup cannot race it.
+    if let Some(resp) = resp {
+        let shared_resp = Rc::clone(&shared);
+        compio::runtime::spawn(async move {
+            serve_resp(shared_resp, resp).await;
+        })
+        .detach();
+    }
     // The embedded channel bridge runs beside the accept loop so LocalClient
     // keeps working on networked workers through the same tablets. Joined
     // explicitly at shutdown (never detached): deterministic teardown with
@@ -1059,7 +1087,7 @@ fn bridge_stage_fabric(
         } => (key.clone(), value.clone(), Some((*condition, *expiry))),
         _ => unreachable!("bridge stages medium sets only"),
     };
-    let staged = fabric.borrow_mut().stage(tablet, value.clone(), true);
+    let staged = fabric.borrow_mut().stage(tablet, &value, true);
     let mut snapshot = metrics.get();
     snapshot.channel_ops += 1;
     metrics.set(snapshot);
@@ -1459,12 +1487,12 @@ fn spawn_conn(stream: TcpStream, peer: SocketAddr, shared: Rc<WorkerNet>) {
 }
 
 /// Guards the active-connection count against every exit path.
-struct ActiveGuard {
+pub(crate) struct ActiveGuard {
     active: Rc<Cell<usize>>,
 }
 
 impl ActiveGuard {
-    fn hold(active: &Rc<Cell<usize>>) -> Self {
+    pub(crate) fn hold(active: &Rc<Cell<usize>>) -> Self {
         active.set(active.get() + 1);
         Self {
             active: Rc::clone(active),
@@ -2955,7 +2983,7 @@ impl Conn {
         if value.len() > crate::fabric::FABRIC_INLINE_MAX
             && (value.len() as u64) <= self.chunks.inline_threshold
         {
-            let staged = self.fabric.borrow_mut().stage(tablet, value.clone(), true);
+            let staged = self.fabric.borrow_mut().stage(tablet, &value, true);
             let Ok((fabric_id, logical_len)) = staged else {
                 self.respond_diagnostic(
                     request_id,
@@ -3195,7 +3223,7 @@ impl Conn {
         {
             return Ok(RoutedMedium::Pass);
         }
-        let staged = self.fabric.borrow_mut().stage(tablet, value.clone(), true);
+        let staged = self.fabric.borrow_mut().stage(tablet, value, true);
         let Ok((fabric_id, logical_len)) = staged else {
             self.respond_diagnostic(
                 request_id,
@@ -3565,11 +3593,8 @@ impl Conn {
                 if value.len() > crate::fabric::FABRIC_INLINE_MAX
                     && (value.len() as u64) <= self.chunks.inline_threshold =>
             {
-                let (fabric_id, logical_len) = self
-                    .fabric
-                    .borrow_mut()
-                    .stage(tablet, value.clone(), true)
-                    .ok()?;
+                let (fabric_id, logical_len) =
+                    self.fabric.borrow_mut().stage(tablet, &value, true).ok()?;
                 Some((
                     kivi_state::TxnWrite {
                         key: write.key.clone(),

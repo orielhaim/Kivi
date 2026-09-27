@@ -20,6 +20,7 @@ pub mod fabric;
 pub mod net;
 pub mod placement;
 pub mod redundancy;
+pub mod resp_net;
 pub mod routing;
 pub mod tablet;
 pub mod worker;
@@ -51,6 +52,7 @@ pub use redundancy::{
     CheckpointProtection, EngineRedundancy, ProtectedArtifact, RedundancyAdminSnapshot,
     protect_staged_value,
 };
+pub use resp_net::{EngineResp, RespBinding, RespNetConfig};
 pub use routing::{Placement, RoutingSnapshot};
 pub use tablet::{
     DedupEntry, DurablePrepared, LiveTablet, SessionDedup, TabletError, TabletMetrics,

@@ -1311,7 +1311,7 @@ fn stage_txn_write(
             if value.len() > crate::fabric::FABRIC_INLINE_MAX
                 && (value.len() as u64) <= chunks.inline_threshold =>
         {
-            let (fabric_id, logical_len) = match fabric.stage(tablet, value.clone(), true) {
+            let (fabric_id, logical_len) = match fabric.stage(tablet, &value, true) {
                 Ok(staged) => staged,
                 Err(error) => return failed(metrics, respond, map_fabric_error(error)),
             };
@@ -1545,7 +1545,7 @@ fn stage_fabric_value(
         let _ = respond.try_send(Err(error));
         Err(())
     }
-    let (fabric_id, logical_len) = match fabric.stage(tablet, value.clone(), hot) {
+    let (fabric_id, logical_len) = match fabric.stage(tablet, &value, hot) {
         Ok(staged) => staged,
         Err(crate::fabric::FabricError::Overloaded) => {
             return failed(metrics, respond, WorkerRequestError::SessionOverloaded);
@@ -1599,7 +1599,7 @@ fn stage_fabric_conditional(
         let _ = respond.try_send(Err(error));
         Err(())
     }
-    let (fabric_id, logical_len) = match fabric.stage(tablet, value.clone(), true) {
+    let (fabric_id, logical_len) = match fabric.stage(tablet, &value, true) {
         Ok(staged) => staged,
         Err(crate::fabric::FabricError::Overloaded) => {
             return failed(metrics, respond, WorkerRequestError::SessionOverloaded);
@@ -2027,6 +2027,13 @@ fn stage_request_representation(
     Some(staged)
 }
 
+/// Executes one request against a tablet this worker owns, answering inline in
+/// ephemeral mode and admitting to the commit coordinator in durable mode.
+///
+/// The two modes answer at different times on purpose: an ephemeral tablet can
+/// answer before returning, a durable one cannot, and every caller knows which
+/// it is talking to.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn handle_request(
     request: TabletRequest,
     tablets: &mut HashMap<TabletId, LiveTablet>,
@@ -2096,34 +2103,88 @@ pub(crate) fn handle_request(
                 let _ = respond.try_send(Err(WorkerRequestError::UnknownTablet { tablet }));
             }
             Some(live) => {
-                let key = op.key().clone();
-                // Pre-image for post-write retirement: when this write
-                // supersedes a fabric root, the old materialization
-                // retires (or defers while pinned) after success.
-                let previous = live
-                    .store()
-                    .get(&key, now)
-                    .and_then(kivi_state::StoredObject::fabric_ref);
-                match live.execute(&op, now) {
-                    Err(error) => {
-                        retire_staged(fabric, staged);
-                        let _ = respond.try_send(Err(WorkerRequestError::Tablet(error)));
-                    }
-                    Ok(result) => {
-                        if let Some(post) = tablets
-                            .get(&tablet)
-                            .and_then(|live| live.store().get(&key, now))
-                        {
-                            fabric.retire_superseded(previous, post);
+                // A read cannot supersede a materialization, so it needs no
+                // pre-image, no post-image, and no owned key: it costs one map
+                // probe instead of three plus a heap allocation. The
+                // pre/post pair exists only so a write can retire the
+                // materialization it replaced, and that work is meaningless for
+                // an operation that changes nothing.
+                //
+                // Anything not named here is treated as a write, so a new
+                // operation variant keeps the safe (slower) behaviour until
+                // someone proves it is a read.
+                let is_read = matches!(
+                    op,
+                    Operation::Get { .. }
+                        | Operation::GetRange { .. }
+                        | Operation::Exists { .. }
+                        | Operation::BytesLength { .. }
+                        | Operation::CounterGet { .. }
+                        | Operation::GetExpiry { .. }
+                );
+                if is_read {
+                    // No owned key: both the store and the resolve step below
+                    // borrow the operation's own key, so a read allocates
+                    // nothing on the way through.
+                    match live.execute(&op, now) {
+                        Err(error) => {
+                            let _ = respond.try_send(Err(WorkerRequestError::Tablet(error)));
                         }
-                        match resolve_channel_outcome(
-                            tablet, &key, now, &op, result, tablets, fabric,
-                        ) {
-                            Ok(resolved) => {
-                                let _ = respond.try_send(Ok(resolved));
+                        Ok(result) => {
+                            // A read still resolves: a value that lives in the
+                            // Memory Fabric comes back as a reference, and
+                            // turning that into bytes — and applying a range
+                            // read's window to them — is this step's job.
+                            // Skipping it answers a fabric-backed `GETRANGE`
+                            // with a manifest instead of its bytes.
+                            match resolve_channel_outcome(
+                                tablet,
+                                op.key(),
+                                now,
+                                &op,
+                                result,
+                                tablets,
+                                fabric,
+                            ) {
+                                Ok(resolved) => {
+                                    let _ = respond.try_send(Ok(resolved));
+                                }
+                                Err(error) => {
+                                    let _ = respond.try_send(Err(error));
+                                }
                             }
-                            Err(error) => {
-                                let _ = respond.try_send(Err(error));
+                        }
+                    }
+                } else {
+                    let key = op.key().clone();
+                    // Pre-image for post-write retirement: when this write
+                    // supersedes a fabric root, the old materialization
+                    // retires (or defers while pinned) after success.
+                    let previous = live
+                        .store()
+                        .get(&key, now)
+                        .and_then(kivi_state::StoredObject::fabric_ref);
+                    match live.execute(&op, now) {
+                        Err(error) => {
+                            retire_staged(fabric, staged);
+                            let _ = respond.try_send(Err(WorkerRequestError::Tablet(error)));
+                        }
+                        Ok(result) => {
+                            if let Some(post) = tablets
+                                .get(&tablet)
+                                .and_then(|live| live.store().get(&key, now))
+                            {
+                                fabric.retire_superseded(previous, post);
+                            }
+                            match resolve_channel_outcome(
+                                tablet, &key, now, &op, result, tablets, fabric,
+                            ) {
+                                Ok(resolved) => {
+                                    let _ = respond.try_send(Ok(resolved));
+                                }
+                                Err(error) => {
+                                    let _ = respond.try_send(Err(error));
+                                }
                             }
                         }
                     }

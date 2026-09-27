@@ -75,7 +75,7 @@ pub enum Immediate {
     /// Simple string (`+OK`, `+PONG`).
     Simple(&'static str),
     /// Echo bytes as a bulk string.
-    Echo(Vec<u8>),
+    Echo(Bytes),
     /// Nil (null bulk string / null).
     Nil,
     /// Integer reply.
@@ -111,9 +111,15 @@ impl ExecuteError {
     }
 }
 
-/// Engine access for one RESP connection. Implemented by the server with its
-/// `LocalClient`; this crate only speaks `Operation`/`OperationResult`.
-pub trait Executor: Send + Sync {
+/// Engine access for one RESP connection.
+///
+/// Deliberately **not** `Send + Sync`. A connection may be served on the same
+/// thread that owns the data it addresses, and then the cheapest correct
+/// executor is a handle to that owner's state — no lock, no channel, no second
+/// wakeup. Demanding `Send + Sync` here would forbid exactly the executor
+/// worth having and force a rendezvous per request to satisfy a bound no
+/// caller needs.
+pub trait Executor {
     /// Executes one typed operation (reads resolve chunked values to bytes
     /// before returning, so `Value` is always inline here).
     ///
@@ -124,9 +130,65 @@ pub trait Executor: Send + Sync {
     /// unexpected failure occurs.
     fn execute(&self, op: &Operation) -> Result<OperationResult, ExecuteError>;
 
+    /// Executes a batch of operations, issuing them **together** rather than
+    /// one at a time.
+    ///
+    /// The default loops, which is correct but serial: a pipelined client
+    /// would still pay one engine rendezvous per command, so deepening a
+    /// pipeline would cost more rather than less. An executor that can hold
+    /// several operations in flight should override this, and its answers
+    /// must line up with `ops` positionally — RESP replies are positional.
+    fn execute_batch(&self, ops: &[Operation]) -> Vec<Result<OperationResult, ExecuteError>> {
+        ops.iter().map(|op| self.execute(op)).collect()
+    }
+
     /// Current wall time (relative expiry computation only; never
     /// persisted as a decision — the materialized stamp is).
     fn now(&self) -> WallTimestamp;
+
+    /// Executes a batch, allowed to suspend.
+    ///
+    /// Only an executor whose answer depends on another thread needs this: a
+    /// durability proof, or a payload that lives in a chunk lane. Such an
+    /// answer cannot be collected by a blocking call from a reactor, because
+    /// the call would park the thread that has to produce it — so it is awaited
+    /// instead.
+    ///
+    /// A boxed future rather than `async fn` so this trait stays object-safe
+    /// and so this crate stays free of any async runtime: a caller with no
+    /// runtime simply never polls it.
+    fn execute_batch_async<'a>(&'a self, ops: &'a [Operation]) -> BatchFuture<'a> {
+        Box::pin(core::future::ready(self.execute_batch(ops)))
+    }
+}
+
+/// One turn's answers, in request order.
+pub type BatchResults = Vec<Result<OperationResult, ExecuteError>>;
+
+/// A turn's answers, produced later.
+///
+/// Boxed rather than an `async fn` so [`Executor`] stays object-safe and this
+/// crate stays free of any async runtime: a caller with no runtime simply never
+/// polls one.
+pub type BatchFuture<'a> =
+    core::pin::Pin<Box<dyn core::future::Future<Output = BatchResults> + 'a>>;
+
+impl<T: Executor + ?Sized> Executor for Box<T> {
+    fn execute(&self, op: &Operation) -> Result<OperationResult, ExecuteError> {
+        (**self).execute(op)
+    }
+
+    fn execute_batch(&self, ops: &[Operation]) -> Vec<Result<OperationResult, ExecuteError>> {
+        (**self).execute_batch(ops)
+    }
+
+    fn now(&self) -> WallTimestamp {
+        (**self).now()
+    }
+
+    fn execute_batch_async<'a>(&'a self, ops: &'a [Operation]) -> BatchFuture<'a> {
+        (**self).execute_batch_async(ops)
+    }
 }
 
 /// Parses an ASCII decimal integer argument (optional leading `+`/`-`,
@@ -177,52 +239,43 @@ pub fn parse_unsigned(arg: &[u8]) -> Result<u64, RespError> {
         })
 }
 
-/// Uppercases an ASCII command token (`None` on non-ASCII).
+/// Case-insensitive equality against an upper-case literal, for the option
+/// tokens a `SET` or `HELLO` carries. Allocation-free, so the option loops do
+/// not build a `Vec` per token.
 #[must_use]
-pub fn uppercase_token(token: &[u8]) -> Option<Vec<u8>> {
-    if !token.is_ascii() {
-        return None;
-    }
-    Some(token.to_ascii_uppercase())
+pub fn token_is(token: &[u8], upper: &[u8]) -> bool {
+    token.len() == upper.len()
+        && token
+            .iter()
+            .zip(upper)
+            .all(|(actual, expected)| actual.to_ascii_uppercase() == *expected)
 }
 
-/// Splits a decoded command frame into its name and arguments. The frame
-/// must be a non-empty array whose elements are all bulk/simple strings
-/// (binary-safe payloads preserved verbatim).
-///
-/// # Errors
-///
-/// Returns [`RespError::InvalidArguments`] on an empty command or a
-/// non-ASCII command name.
-pub fn split_command(elements: &[Vec<u8>]) -> Result<(Vec<u8>, Vec<Vec<u8>>), RespError> {
-    let (first, rest) = elements.split_first().ok_or(RespError::InvalidArguments {
-        reason: "empty command".to_owned(),
-    })?;
-    let name = uppercase_token(first).ok_or(RespError::InvalidArguments {
-        reason: "bad command name".to_owned(),
-    })?;
-    Ok((name, rest.to_vec()))
-}
-
-/// Translates one command (name plus raw byte args) into an [`Action`].
+/// Translates one command (name plus borrowed byte args) into an [`Action`].
 /// `now` anchors relative expiries (`EX`/`PX`) to absolute stamps.
 ///
 /// # Errors
 ///
-/// Returns [`RespError::InvalidArguments`] on bad arity or values and
-/// [`RespError::Unsupported`] for commands or options outside this profile.
+/// Returns [`RespError::InvalidArguments`] on bad arity or values,
+/// [`RespError::Unsupported`] for commands or options outside this profile,
+/// and [`RespError::Malformed`] for a name that is not a short ASCII token.
 #[allow(clippy::too_many_lines)]
-pub fn translate(name: &[u8], args: &[Vec<u8>], now: WallTimestamp) -> Result<Action, RespError> {
-    match name {
-        b"PING" => match args.len() {
-            0 => Ok(Action::Reply(Immediate::Simple("PONG"))),
-            1 => Ok(Action::Reply(Immediate::Echo(args[0].clone()))),
+pub fn translate(name: &[u8], args: &[&[u8]], now: WallTimestamp) -> Result<Action, RespError> {
+    let folded = crate::frame::fold_command_name(name).ok_or(RespError::Malformed)?;
+    match &folded[..name.len()] {
+        b"PING" => match args {
+            [] => Ok(Action::Reply(Immediate::Simple("PONG"))),
+            [message] => Ok(Action::Reply(Immediate::Echo(Bytes::copy_from_slice(
+                message,
+            )))),
             _ => Err(RespError::InvalidArguments {
                 reason: "wrong number of arguments for 'ping'".to_owned(),
             }),
         },
-        b"ECHO" => match args.len() {
-            1 => Ok(Action::Reply(Immediate::Echo(args[0].clone()))),
+        b"ECHO" => match args {
+            [message] => Ok(Action::Reply(Immediate::Echo(Bytes::copy_from_slice(
+                message,
+            )))),
             _ => Err(RespError::InvalidArguments {
                 reason: "wrong number of arguments for 'echo'".to_owned(),
             }),
@@ -238,7 +291,7 @@ pub fn translate(name: &[u8], args: &[Vec<u8>], now: WallTimestamp) -> Result<Ac
         b"GET" => match args {
             [key] => Ok(Action::Execute {
                 op: Operation::Get {
-                    key: kivi_state::Key::from(key.clone()),
+                    key: kivi_state::Key::from(*key),
                 },
                 redis: RedisOp::Get,
             }),
@@ -250,7 +303,7 @@ pub fn translate(name: &[u8], args: &[Vec<u8>], now: WallTimestamp) -> Result<Ac
         b"DEL" => match args {
             [key] => Ok(Action::Execute {
                 op: Operation::Delete {
-                    key: kivi_state::Key::from(key.clone()),
+                    key: kivi_state::Key::from(*key),
                 },
                 redis: RedisOp::Del,
             }),
@@ -261,7 +314,7 @@ pub fn translate(name: &[u8], args: &[Vec<u8>], now: WallTimestamp) -> Result<Ac
         b"EXISTS" => match args {
             [key] => Ok(Action::Execute {
                 op: Operation::Exists {
-                    key: kivi_state::Key::from(key.clone()),
+                    key: kivi_state::Key::from(*key),
                 },
                 redis: RedisOp::Exists,
             }),
@@ -276,7 +329,7 @@ pub fn translate(name: &[u8], args: &[Vec<u8>], now: WallTimestamp) -> Result<Ac
         b"TTL" => match args {
             [key] => Ok(Action::Execute {
                 op: Operation::GetExpiry {
-                    key: kivi_state::Key::from(key.clone()),
+                    key: kivi_state::Key::from(*key),
                 },
                 redis: RedisOp::Ttl,
             }),
@@ -287,7 +340,7 @@ pub fn translate(name: &[u8], args: &[Vec<u8>], now: WallTimestamp) -> Result<Ac
         b"PTTL" => match args {
             [key] => Ok(Action::Execute {
                 op: Operation::GetExpiry {
-                    key: kivi_state::Key::from(key.clone()),
+                    key: kivi_state::Key::from(*key),
                 },
                 redis: RedisOp::PTtl,
             }),
@@ -298,7 +351,7 @@ pub fn translate(name: &[u8], args: &[Vec<u8>], now: WallTimestamp) -> Result<Ac
         b"EXPIRETIME" => match args {
             [key] => Ok(Action::Execute {
                 op: Operation::GetExpiry {
-                    key: kivi_state::Key::from(key.clone()),
+                    key: kivi_state::Key::from(*key),
                 },
                 redis: RedisOp::ExpireTime,
             }),
@@ -309,7 +362,7 @@ pub fn translate(name: &[u8], args: &[Vec<u8>], now: WallTimestamp) -> Result<Ac
         b"PEXPIRETIME" => match args {
             [key] => Ok(Action::Execute {
                 op: Operation::GetExpiry {
-                    key: kivi_state::Key::from(key.clone()),
+                    key: kivi_state::Key::from(*key),
                 },
                 redis: RedisOp::PExpireTime,
             }),
@@ -320,7 +373,7 @@ pub fn translate(name: &[u8], args: &[Vec<u8>], now: WallTimestamp) -> Result<Ac
         b"PERSIST" => match args {
             [key] => Ok(Action::Execute {
                 op: Operation::PersistExpiry {
-                    key: kivi_state::Key::from(key.clone()),
+                    key: kivi_state::Key::from(*key),
                 },
                 redis: RedisOp::Persist,
             }),
@@ -336,9 +389,9 @@ pub fn translate(name: &[u8], args: &[Vec<u8>], now: WallTimestamp) -> Result<Ac
                 })?;
                 Ok(Action::Execute {
                     op: Operation::SetRange {
-                        key: kivi_state::Key::from(key.clone()),
+                        key: kivi_state::Key::from(*key),
                         offset,
-                        patch: Bytes::from(value.clone()),
+                        patch: Bytes::copy_from_slice(value),
                     },
                     redis: RedisOp::SetRange,
                 })
@@ -350,7 +403,7 @@ pub fn translate(name: &[u8], args: &[Vec<u8>], now: WallTimestamp) -> Result<Ac
         b"STRLEN" => match args {
             [key] => Ok(Action::Execute {
                 op: Operation::BytesLength {
-                    key: kivi_state::Key::from(key.clone()),
+                    key: kivi_state::Key::from(*key),
                 },
                 redis: RedisOp::StrLen,
             }),
@@ -359,7 +412,7 @@ pub fn translate(name: &[u8], args: &[Vec<u8>], now: WallTimestamp) -> Result<Ac
             }),
         },
         _ => Err(RespError::Unsupported {
-            command: String::from_utf8_lossy(name).into_owned(),
+            command: String::from_utf8_lossy(&folded[..name.len()]).into_owned(),
         }),
     }
 }
@@ -369,7 +422,7 @@ pub fn translate(name: &[u8], args: &[Vec<u8>], now: WallTimestamp) -> Result<Ac
 /// Relative expiries materialize `now + delta` with Jiff arithmetic; an
 /// unrepresentable sum is an invalid expiry (loud error), never a silent
 /// clamp to maximum time.
-fn translate_set(args: &[Vec<u8>], now: WallTimestamp) -> Result<Action, RespError> {
+fn translate_set(args: &[&[u8]], now: WallTimestamp) -> Result<Action, RespError> {
     let [key, value, options @ ..] = args else {
         return Err(RespError::InvalidArguments {
             reason: "wrong number of arguments for 'set'".to_owned(),
@@ -381,57 +434,59 @@ fn translate_set(args: &[Vec<u8>], now: WallTimestamp) -> Result<Action, RespErr
     let mut expiry_set = false;
     let mut index = 0;
     while index < options.len() {
-        let token = uppercase_token(&options[index]).ok_or(RespError::InvalidArguments {
-            reason: "bad SET option".to_owned(),
-        })?;
-        match token.as_slice() {
-            b"NX" => {
-                if condition_set {
-                    return err_set_syntax();
-                }
-                condition = SetCondition::IfAbsent;
-                condition_set = true;
-                index += 1;
+        let token = options[index];
+        if token_is(token, b"NX") {
+            if condition_set {
+                return err_set_syntax();
             }
-            b"XX" => {
-                if condition_set {
-                    return err_set_syntax();
-                }
-                condition = SetCondition::IfPresent;
-                condition_set = true;
-                index += 1;
+            condition = SetCondition::IfAbsent;
+            condition_set = true;
+            index += 1;
+        } else if token_is(token, b"XX") {
+            if condition_set {
+                return err_set_syntax();
             }
-            b"GET" | b"IFEQ" | b"IFNE" | b"IFDEQ" | b"IFDNE" => {
-                return Err(RespError::Unsupported {
-                    command: "SET".to_owned(),
-                });
+            condition = SetCondition::IfPresent;
+            condition_set = true;
+            index += 1;
+        } else if token_is(token, b"GET")
+            || token_is(token, b"IFEQ")
+            || token_is(token, b"IFNE")
+            || token_is(token, b"IFDEQ")
+            || token_is(token, b"IFDNE")
+        {
+            return Err(RespError::Unsupported {
+                command: "SET".to_owned(),
+            });
+        } else if token_is(token, b"KEEPTTL") {
+            if expiry_set {
+                return err_set_syntax();
             }
-            b"KEEPTTL" => {
-                if expiry_set {
-                    return err_set_syntax();
-                }
-                expiry = ExpiryPolicy::Keep;
-                expiry_set = true;
-                index += 1;
+            expiry = ExpiryPolicy::Keep;
+            expiry_set = true;
+            index += 1;
+        } else if token_is(token, b"EX")
+            || token_is(token, b"PX")
+            || token_is(token, b"EXAT")
+            || token_is(token, b"PXAT")
+        {
+            if expiry_set {
+                return err_set_syntax();
             }
-            b"EX" | b"PX" | b"EXAT" | b"PXAT" => {
-                if expiry_set {
-                    return err_set_syntax();
-                }
-                let arg = options.get(index + 1).ok_or(RespError::InvalidArguments {
-                    reason: "wrong number of arguments for 'set'".to_owned(),
-                })?;
-                expiry = ExpiryPolicy::ExpireAt(set_expiry_stamp(&token, arg, now)?);
-                expiry_set = true;
-                index += 2;
-            }
-            _ => return err_set_syntax(),
+            let arg = options.get(index + 1).ok_or(RespError::InvalidArguments {
+                reason: "wrong number of arguments for 'set'".to_owned(),
+            })?;
+            expiry = ExpiryPolicy::ExpireAt(set_expiry_stamp(token, arg, now)?);
+            expiry_set = true;
+            index += 2;
+        } else {
+            return err_set_syntax();
         }
     }
     Ok(Action::Execute {
         op: Operation::SetConditional {
-            key: kivi_state::Key::from(key.clone()),
-            value: Bytes::from(value.clone()),
+            key: kivi_state::Key::from(*key),
+            value: Bytes::copy_from_slice(value),
             condition,
             expiry,
         },
@@ -490,7 +545,7 @@ fn invalid_expire() -> RespError {
 /// yet own, so those forms error clearly instead of racing a
 /// read-then-write loop.
 fn translate_expire(
-    args: &[Vec<u8>],
+    args: &[&[u8]],
     now: WallTimestamp,
     unit_micros: i64,
     name: &'static str,
@@ -512,7 +567,7 @@ fn translate_expire(
             })?;
             Ok(Action::Execute {
                 op: Operation::ExpireAt {
-                    key: kivi_state::Key::from(key.clone()),
+                    key: kivi_state::Key::from(*key),
                     expires_at: stamp,
                 },
                 redis,
@@ -530,7 +585,7 @@ fn translate_expire(
 /// Translates absolute expiries (`EXPIREAT`/`PEXPIREAT`); same option policy
 /// as [`translate_expire`].
 fn translate_expire_at(
-    args: &[Vec<u8>],
+    args: &[&[u8]],
     unit_micros: i64,
     name: &'static str,
 ) -> Result<Action, RespError> {
@@ -547,7 +602,7 @@ fn translate_expire_at(
                 })?;
             Ok(Action::Execute {
                 op: Operation::ExpireAt {
-                    key: kivi_state::Key::from(key.clone()),
+                    key: kivi_state::Key::from(*key),
                     expires_at: WallTimestamp::from_micros(micros),
                 },
                 redis: RedisOp::Expire,
@@ -567,7 +622,7 @@ fn translate_expire_at(
 /// lane-friendly); windows with a negative bound compile to a single `Get`
 /// whose snapshot the connection slices locally (still one atomic read,
 /// never a length-then-slice race).
-fn translate_getrange(args: &[Vec<u8>]) -> Result<Action, RespError> {
+fn translate_getrange(args: &[&[u8]]) -> Result<Action, RespError> {
     match args {
         [key, start, end] => {
             let start = parse_integer(start).map_err(|_| RespError::InvalidArguments {
@@ -576,7 +631,7 @@ fn translate_getrange(args: &[Vec<u8>]) -> Result<Action, RespError> {
             let end = parse_integer(end).map_err(|_| RespError::InvalidArguments {
                 reason: "value is not an integer or out of range".to_owned(),
             })?;
-            let key = kivi_state::Key::from(key.clone());
+            let key = kivi_state::Key::from(*key);
             if start >= 0 && end >= 0 {
                 if end < start {
                     // Empty window: still a read (for WRONGTYPE parity),
@@ -613,12 +668,16 @@ fn translate_getrange(args: &[Vec<u8>]) -> Result<Action, RespError> {
 }
 
 /// Version-agnostic reply: the connection encodes it as RESP2 or RESP3.
+///
+/// `Bulk` carries the engine's own handle rather than a copy of it. A `GET`
+/// result is already a `Bytes` the tablet store owns, so copying it here
+/// would duplicate every value the database returns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reply {
     /// Simple string (`+OK`, `+PONG`).
     Simple(&'static str),
     /// Bulk string (binary-safe).
-    Bulk(Vec<u8>),
+    Bulk(Bytes),
     /// Nil (null bulk string in RESP2, null in RESP3).
     Nil,
     /// Integer reply.
@@ -633,11 +692,11 @@ pub enum Reply {
 pub fn map_result(result: &OperationResult, redis: RedisOp, now: WallTimestamp) -> Reply {
     match (result, redis) {
         (OperationResult::Value(Some(value)), RedisOp::Get | RedisOp::GetRange) => {
-            Reply::Bulk(value.to_vec())
+            Reply::Bulk(value.clone())
         }
         (OperationResult::Value(None), RedisOp::Get) => Reply::Nil,
         (OperationResult::Value(None), RedisOp::GetRange | RedisOp::GetRangeSlice { .. }) => {
-            Reply::Bulk(Vec::new())
+            Reply::Bulk(Bytes::new())
         }
         (OperationResult::Value(Some(value)), RedisOp::GetRangeSlice { start, end }) => {
             Reply::Bulk(slice_getrange(value, start, end))
@@ -768,7 +827,7 @@ fn expire_millis(expiry: Option<kivi_types::Expiry>) -> i64 {
 /// Slices a full value snapshot to a Redis `GETRANGE` window (inclusive,
 /// negatives from the end, clamped; empty when the window misses).
 #[must_use]
-pub fn slice_getrange(value: &[u8], start: i64, end: i64) -> Vec<u8> {
+pub fn slice_getrange(value: &[u8], start: i64, end: i64) -> Bytes {
     let total = i64::try_from(value.len()).unwrap_or(i64::MAX);
     let norm = |index: i64| {
         if index < 0 {
@@ -780,15 +839,15 @@ pub fn slice_getrange(value: &[u8], start: i64, end: i64) -> Vec<u8> {
     let from = norm(start);
     let to = norm(end);
     if from > to || from >= total {
-        return Vec::new();
+        return Bytes::new();
     }
     let to = to.min(total - 1);
     let from_usize = usize::try_from(from).unwrap_or(0);
     let to_usize = usize::try_from(to).unwrap_or(0);
     if from_usize > to_usize || to_usize >= value.len() {
-        return Vec::new();
+        return Bytes::new();
     }
-    value[from_usize..=to_usize].to_vec()
+    Bytes::copy_from_slice(&value[from_usize..=to_usize])
 }
 
 /// Classifies one compatibility entry for the published support table.
@@ -826,10 +885,6 @@ const fn str_eq(left: &str, right: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn bytes(items: &[&[u8]]) -> Vec<Vec<u8>> {
-        items.iter().map(|item| item.to_vec()).collect()
-    }
-
     #[test]
     fn integers_reject_floats_empty_and_overflow() {
         assert_eq!(parse_integer(b"41"), Ok(41));
@@ -851,7 +906,7 @@ mod tests {
         let now = WallTimestamp::from_micros(1_000_000_000);
         // Bare SET clears expiry.
         let Action::Execute { op, redis } =
-            translate(b"SET", &bytes(&[b"k", b"v"]), now).expect("bare set")
+            translate(b"SET", &[b"k", b"v"], now).expect("bare set")
         else {
             panic!("bare SET must execute");
         };
@@ -865,8 +920,7 @@ mod tests {
         assert_eq!(condition, SetCondition::Always);
         assert_eq!(expiry, ExpiryPolicy::Clear);
         // NX / XX.
-        let Action::Execute { op, .. } =
-            translate(b"SET", &bytes(&[b"k", b"v", b"NX"]), now).expect("nx")
+        let Action::Execute { op, .. } = translate(b"SET", &[b"k", b"v", b"NX"], now).expect("nx")
         else {
             panic!("NX must execute");
         };
@@ -878,7 +932,7 @@ mod tests {
             }
         ));
         let Action::Execute { op, .. } =
-            translate(b"SET", &bytes(&[b"k", b"v", b"xx"]), now).expect("xx lowercase")
+            translate(b"SET", &[b"k", b"v", b"xx"], now).expect("xx lowercase")
         else {
             panic!("XX must execute");
         };
@@ -890,22 +944,22 @@ mod tests {
             }
         ));
         // Conflicts and bad values error, never approximate.
-        assert!(translate(b"SET", &bytes(&[b"k", b"v", b"NX", b"XX"]), now).is_err());
-        assert!(translate(b"SET", &bytes(&[b"k", b"v", b"EX", b"1", b"PX", b"1"]), now).is_err());
-        assert!(translate(b"SET", &bytes(&[b"k", b"v", b"EX", b"0"]), now).is_err());
-        assert!(translate(b"SET", &bytes(&[b"k", b"v", b"EX", b"nope"]), now).is_err());
+        assert!(translate(b"SET", &[b"k", b"v", b"NX", b"XX"], now).is_err());
+        assert!(translate(b"SET", &[b"k", b"v", b"EX", b"1", b"PX", b"1"], now).is_err());
+        assert!(translate(b"SET", &[b"k", b"v", b"EX", b"0"], now).is_err());
+        assert!(translate(b"SET", &[b"k", b"v", b"EX", b"nope"], now).is_err());
         // GET and the value-compare family stay unsupported, never faked.
         assert!(matches!(
-            translate(b"SET", &bytes(&[b"k", b"v", b"GET"]), now),
+            translate(b"SET", &[b"k", b"v", b"GET"], now),
             Err(RespError::Unsupported { .. })
         ));
         assert!(matches!(
-            translate(b"SET", &bytes(&[b"k", b"v", b"IFEQ", b"x"]), now),
+            translate(b"SET", &[b"k", b"v", b"IFEQ", b"x"], now),
             Err(RespError::Unsupported { .. })
         ));
         // EX anchors relative to now; EXAT is absolute; KEEPTTL keeps.
         let Action::Execute { op, .. } =
-            translate(b"SET", &bytes(&[b"k", b"v", b"EX", b"10"]), now).expect("ex")
+            translate(b"SET", &[b"k", b"v", b"EX", b"10"], now).expect("ex")
         else {
             panic!("EX must execute");
         };
@@ -917,7 +971,7 @@ mod tests {
             ExpiryPolicy::ExpireAt(WallTimestamp::from_micros(now.as_micros() + 10_000_000))
         );
         let Action::Execute { op, .. } =
-            translate(b"SET", &bytes(&[b"k", b"v", b"PXAT", b"5000"]), now).expect("pxat")
+            translate(b"SET", &[b"k", b"v", b"PXAT", b"5000"], now).expect("pxat")
         else {
             panic!("PXAT must execute");
         };
@@ -932,7 +986,7 @@ mod tests {
             ExpiryPolicy::ExpireAt(WallTimestamp::from_micros(5_000_000))
         );
         let Action::Execute { op, .. } =
-            translate(b"SET", &bytes(&[b"k", b"v", b"KEEPTTL"]), now).expect("keepttl")
+            translate(b"SET", &[b"k", b"v", b"KEEPTTL"], now).expect("keepttl")
         else {
             panic!("KEEPTTL must execute");
         };
@@ -948,12 +1002,9 @@ mod tests {
     #[test]
     fn getrange_windows_compile_to_one_atomic_read() {
         // Non-negative windows use the native range op directly.
-        let Action::Execute { op, redis } = translate(
-            b"GETRANGE",
-            &bytes(&[b"k", b"0", b"3"]),
-            WallTimestamp::EPOCH,
-        )
-        .expect("getrange") else {
+        let Action::Execute { op, redis } =
+            translate(b"GETRANGE", &[b"k", b"0", b"3"], WallTimestamp::EPOCH).expect("getrange")
+        else {
             panic!("GETRANGE must execute");
         };
         assert_eq!(redis, RedisOp::GetRange);
@@ -966,12 +1017,10 @@ mod tests {
             }
         ));
         // Negative bounds read the full snapshot once and slice locally.
-        let Action::Execute { op, redis } = translate(
-            b"GETRANGE",
-            &bytes(&[b"k", b"-3", b"-1"]),
-            WallTimestamp::EPOCH,
-        )
-        .expect("negative getrange") else {
+        let Action::Execute { op, redis } =
+            translate(b"GETRANGE", &[b"k", b"-3", b"-1"], WallTimestamp::EPOCH)
+                .expect("negative getrange")
+        else {
             panic!("negative GETRANGE must execute");
         };
         assert!(matches!(
@@ -980,13 +1029,16 @@ mod tests {
         ));
         assert!(matches!(op, Operation::Get { .. }));
         // Docs examples slice exactly.
-        assert_eq!(slice_getrange(b"This is a string", 0, 3), b"This");
-        assert_eq!(slice_getrange(b"This is a string", -3, -1), b"ing");
+        assert_eq!(slice_getrange(b"This is a string", 0, 3).as_ref(), b"This");
+        assert_eq!(slice_getrange(b"This is a string", -3, -1).as_ref(), b"ing");
         assert_eq!(
-            slice_getrange(b"This is a string", 0, -1),
+            slice_getrange(b"This is a string", 0, -1).as_ref(),
             b"This is a string"
         );
-        assert_eq!(slice_getrange(b"This is a string", 10, 100), b"string");
+        assert_eq!(
+            slice_getrange(b"This is a string", 10, 100).as_ref(),
+            b"string"
+        );
         assert!(slice_getrange(b"abc", 5, 9).is_empty());
         assert!(slice_getrange(b"abc", 2, 1).is_empty());
     }
@@ -1009,7 +1061,7 @@ mod tests {
                 RedisOp::GetRange,
                 WallTimestamp::EPOCH
             ),
-            Reply::Bulk(Vec::new())
+            Reply::Bulk(Bytes::new())
         );
         assert_eq!(
             map_result(
@@ -1102,8 +1154,7 @@ mod tests {
     fn relative_expiry_materializes_once_and_rejects_overflow() {
         let now = WallTimestamp::from_micros(1_000_000_000);
         // EXPIRE anchors `now + delta` exactly once at the edge.
-        let Action::Execute { op, .. } =
-            translate(b"EXPIRE", &bytes(&[b"k", b"10"]), now).expect("expire")
+        let Action::Execute { op, .. } = translate(b"EXPIRE", &[b"k", b"10"], now).expect("expire")
         else {
             panic!("EXPIRE must execute");
         };
@@ -1119,16 +1170,20 @@ mod tests {
         assert!(
             translate(
                 b"SET",
-                &[b"k".to_vec(), b"v".to_vec(), b"EX".to_vec(), huge.clone()],
+                &[
+                    b"k".as_slice(),
+                    b"v".as_slice(),
+                    b"EX".as_slice(),
+                    huge.as_slice()
+                ],
                 now
             )
             .is_err()
         );
-        assert!(translate(b"EXPIRE", &[b"k".to_vec(), huge], now).is_err());
+        assert!(translate(b"EXPIRE", &[b"k".as_slice(), huge.as_slice()], now).is_err());
         // Absolute expiries accept the full signed range.
         let Action::Execute { op, .. } =
-            translate(b"PEXPIREAT", &bytes(&[b"k", b"5000"]), WallTimestamp::EPOCH)
-                .expect("pexpireat")
+            translate(b"PEXPIREAT", &[b"k", b"5000"], WallTimestamp::EPOCH).expect("pexpireat")
         else {
             panic!("PEXPIREAT must execute");
         };
@@ -1159,10 +1214,12 @@ mod tests {
     fn binary_keys_and_values_survive_verbatim() {
         let key = vec![0x00, 0xFF, 0x10, 0x00];
         let value = vec![0x00, 0x00, 0xFF, 0xFE, 0x61];
-        let Action::Execute { op, .. } =
-            translate(b"SET", &[key.clone(), value.clone()], WallTimestamp::EPOCH)
-                .expect("binary set")
-        else {
+        let Action::Execute { op, .. } = translate(
+            b"SET",
+            &[key.as_slice(), value.as_slice()],
+            WallTimestamp::EPOCH,
+        )
+        .expect("binary set") else {
             panic!("binary SET must execute");
         };
         let Operation::SetConditional {

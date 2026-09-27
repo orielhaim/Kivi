@@ -8,9 +8,10 @@
 
 use crate::command::{REGISTRY, arity_ok, lookup};
 use crate::error::RespError;
+use crate::frame::{Command, Limits, Parsed, fold_command_name, parse_command};
 use crate::translate::{
-    Action, Executor, Immediate, RedisOp, Reply, map_execute_error, map_parse_error, map_result,
-    parse_unsigned, split_command, translate, uppercase_token,
+    Action, ExecuteError, Executor, Immediate, RedisOp, Reply, map_execute_error, map_parse_error,
+    map_result, parse_unsigned, token_is, translate,
 };
 
 /// RESP version spoken on one connection.
@@ -33,10 +34,6 @@ pub struct ConnConfig {
     pub max_bulk_bytes: usize,
     /// Maximum array elements in one command frame.
     pub max_array_elements: usize,
-    /// Maximum command argument count (including the name).
-    pub max_args: usize,
-    /// Maximum queued pipelined requests answered per connection.
-    pub max_pipelined: usize,
     /// Maximum commands executed per drain turn (fairness).
     pub max_commands_per_turn: usize,
     /// Maximum single value bytes accepted from clients (`SET`).
@@ -54,14 +51,17 @@ impl Default for ConnConfig {
             max_bulk_bytes: 64 * 1024 * 1024,
             // Commands are small; 256 elements is already generous.
             max_array_elements: 256,
-            // No supported command takes more than a handful of args.
-            max_args: 32,
-            // Pipelines deeper than this are rejected, never queued
-            // unboundedly.
-            max_pipelined: 128,
-            // One client sending a huge pipeline cannot monopolize the
-            // frontend: this many commands per turn, then yield.
-            max_commands_per_turn: 32,
+            // Argument count is not configurable: the parser's inline
+            // capacity (`frame::MAX_ARGS`) is the bound, because that array
+            // is what keeps a parse allocation-free.
+            //
+            // There is deliberately no separate pipeline-depth cap. The
+            // previous `max_pipelined` answered `BUSY pipeline depth
+            // exceeded` past 128 requests and *dropped* them, which Redis
+            // never does — Redis processes whatever depth a client sends.
+            // Fairness comes from the per-turn budget, not from refusing
+            // work a client is entitled to.
+            max_commands_per_turn: 64,
             // RESP values cap at the legacy ceiling with the same message
             // as the native bound.
             max_value_bytes: 64 * 1024 * 1024,
@@ -113,18 +113,36 @@ pub struct ConnMetrics {
     pub unsupported: u64,
 }
 
-/// One decoded request: raw args plus its connection-order index.
-#[derive(Debug)]
-struct Pending {
-    /// Command name (uppercased ASCII).
-    name: Vec<u8>,
-    /// Raw byte args (binary-safe, verbatim).
-    args: Vec<Vec<u8>>,
+/// What one drain turn produced.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DrainOutcome {
+    /// Replies appended to the caller's output buffer.
+    pub replies: u64,
+    /// The connection must close once the output is flushed.
+    pub close: bool,
+}
+
+/// One turn's decoded commands, carried from decoding to encoding.
+///
+/// The engine operations are held separately from the reply slots because they
+/// are the only part that can suspend: encoding has to wait for every answer
+/// before it writes the first reply, or replies would reach the client out of
+/// order.
+struct DecodedTurn {
+    slots: Vec<Slot>,
+    engine_ops: Vec<kivi_state::Operation>,
+    outcome: DrainOutcome,
 }
 
 /// A RESP connection: buffer, version state, metrics, and bounded
 /// decode/dispatch. I/O lives in the server; this type never touches a
 /// socket, so unit tests drive it with byte strings.
+///
+/// Input is consumed with a cursor rather than by draining from the front,
+/// and replies are appended into a caller-owned buffer rather than returned
+/// as a `Vec` of `Vec`s. Both exist because the previous shape memmoved the
+/// whole tail per command (quadratic in pipeline depth) and allocated and
+/// copied every reply twice.
 pub struct RespConnection<E> {
     /// Engine access (shared handle, cheap to clone if needed).
     executor: E,
@@ -132,10 +150,38 @@ pub struct RespConnection<E> {
     config: ConnConfig,
     /// Mutable version/name state.
     pub state: ConnState,
-    /// Undecoded input tail.
+    /// Undecoded input tail; `cursor` is how much of it has been consumed.
     buffer: Vec<u8>,
+    /// Parse offset into `buffer`.
+    cursor: usize,
+    /// Set by `QUIT` so the turn loop can stop without threading a flag
+    /// through every dispatch arm.
+    quit_requested: bool,
     /// Per-connection metrics.
     pub metrics: ConnMetrics,
+}
+
+/// One command's answer, in request order.
+///
+/// An engine-bound command records *where* in the turn's result list it
+/// belongs rather than waiting: the whole turn is issued together, so no
+/// reply can be known until every command has been decoded.
+#[derive(Debug)]
+enum Slot {
+    /// Bytes already encoded (bootstrap and introspection replies).
+    Raw(Vec<u8>),
+    /// A reply the turn can encode without the engine.
+    Ready(Reply),
+    /// One engine operation, answered as `redis`.
+    Execute {
+        /// How to shape the engine's answer.
+        redis: RedisOp,
+    },
+    /// `SETRANGE`: write, then measure. Two operations, one reply.
+    SetRange {
+        /// Whether the write itself is issued (an empty patch is a pure read).
+        writes: bool,
+    },
 }
 
 impl<E> core::fmt::Debug for RespConnection<E> {
@@ -156,7 +202,11 @@ impl<E: Executor> RespConnection<E> {
             executor,
             config,
             state: ConnState::new(id),
-            buffer: Vec::new(),
+            // Sized for a typical pipelined batch so the steady state does
+            // not reallocate on the first turn.
+            buffer: Vec::with_capacity(16 * 1024),
+            cursor: 0,
+            quit_requested: false,
             metrics: ConnMetrics::default(),
         }
     }
@@ -176,227 +226,327 @@ impl<E: Executor> RespConnection<E> {
         Ok(())
     }
 
-    /// Drains up to the per-turn command budget, executing each request in
-    /// order and returning their encoded replies in the same order. `quit`
-    /// is included as a `bool` (the server closes after flushing when set).
-    /// Incomplete trailing bytes stay buffered for the next read.
-    pub fn drain(&mut self) -> (Vec<Vec<u8>>, bool) {
-        let mut replies = Vec::new();
-        let mut quit = false;
-        for _ in 0..self.config.max_commands_per_turn {
-            let Some((pending, consumed)) = self.decode_one() else {
+    /// Executes every complete command currently buffered, up to the
+    /// per-turn budget, appending encoded replies to `out` in request order.
+    ///
+    /// `out` is caller-owned so the server keeps one reusable buffer per
+    /// connection and writes it once per turn. The previous shape returned a
+    /// `Vec<Vec<u8>>` the caller then copied into a second buffer: an
+    /// allocation and a full copy of every reply, for nothing.
+    ///
+    /// The input buffer is moved out for the duration of the turn because the
+    /// parser hands out slices into it, and a slice cannot outlive a borrow
+    /// of `self` that dispatch also needs mutably. Moving a `Vec` is three
+    /// words, so this costs nothing.
+    pub fn drain(&mut self, out: &mut Vec<u8>) -> DrainOutcome {
+        let turn = self.decode_turn(out);
+        let replies_before = out.len();
+        let results = if turn.engine_ops.is_empty() {
+            Vec::new()
+        } else {
+            self.executor.execute_batch(&turn.engine_ops)
+        };
+        self.encode_turn(out, &turn, &results, replies_before)
+    }
+
+    /// One turn that may wait on something other than this thread.
+    ///
+    /// Identical to [`Self::drain`] except that the executor is given the
+    /// chance to suspend, which it needs for exactly one reason: a request
+    /// whose answer depends on another thread — a durability proof, or a
+    /// payload in the chunk lane — cannot be collected by a blocking call from
+    /// a reactor, because that call would park the very thread that has to
+    /// produce the answer. An executor with nothing to wait for takes the
+    /// default and pays nothing.
+    pub async fn drain_async(&mut self, out: &mut Vec<u8>) -> DrainOutcome {
+        let turn = self.decode_turn(out);
+        let replies_before = out.len();
+        let results = if turn.engine_ops.is_empty() {
+            Vec::new()
+        } else {
+            self.executor.execute_batch_async(&turn.engine_ops).await
+        };
+        self.encode_turn(out, &turn, &results, replies_before)
+    }
+
+    /// Decodes one turn: every command the per-turn budget allows, classified
+    /// into the slots that encode it and the operations the engine must answer.
+    ///
+    /// Shared by both turn shapes, because the order of replies is settled here
+    /// and a second copy of this loop is a second chance to read the same bytes
+    /// differently.
+    fn decode_turn(&mut self, out: &mut Vec<u8>) -> DecodedTurn {
+        let mut buffer = core::mem::take(&mut self.buffer);
+        let mut outcome = DrainOutcome::default();
+        let limits = Limits {
+            max_bulk_bytes: self.config.max_bulk_bytes,
+            max_array_elements: self.config.max_array_elements,
+        };
+        let budget = self.config.max_commands_per_turn;
+
+        // One turn collects every command, then executes the engine-bound ones
+        // together, then encodes every reply in request order.
+        //
+        // The alternative — execute as you decode — makes pipelining actively
+        // harmful: a pipeline of N commands became N sequential engine
+        // round-trips, so a deeper pipeline cost proportionally more latency
+        // for the same work. Measured against Redis, which answers a whole
+        // pipeline in one event-loop pass, that was the single largest gap on
+        // this edge.
+        let mut slots: Vec<Slot> = Vec::with_capacity(budget);
+        let mut engine_ops: Vec<kivi_state::Operation> = Vec::new();
+        while outcome.replies < budget as u64 {
+            let Some(tail) = buffer.get(self.cursor..) else {
                 break;
             };
-            self.buffer.drain(..consumed);
-            if replies.len() >= self.config.max_pipelined {
-                replies.push(encode_error(
-                    self.state.version,
-                    "BUSY pipeline depth exceeded",
-                ));
-                self.metrics.protocol_errors += 1;
-                continue;
+            if tail.is_empty() {
+                break;
             }
-            let (bytes, close) = self.dispatch(pending);
+            let (parsed, used) = parse_command(tail, &limits);
+            match parsed {
+                Parsed::Incomplete => break,
+                Parsed::Command(command) => {
+                    self.cursor += used;
+                    self.classify(&command, &mut slots, &mut engine_ops);
+                }
+                refused => {
+                    // A refused frame must still leave the buffer or the
+                    // connection spins on it forever. A parser that consumed
+                    // nothing cannot be trusted to advance, so drop everything
+                    // it inspected.
+                    self.cursor += used.max(tail.len());
+                    self.write_refusal(&refused, out);
+                    self.metrics.requests += 1;
+                    outcome.replies += 1;
+                    self.note_close(&mut outcome);
+                    if outcome.close {
+                        break;
+                    }
+                    continue;
+                }
+            }
             self.metrics.requests += 1;
-            self.metrics.bytes_out += bytes.len() as u64;
-            replies.push(bytes);
-            if close {
-                quit = true;
+            outcome.replies += 1;
+            self.note_close(&mut outcome);
+            if outcome.close {
                 break;
             }
         }
-        (replies, quit)
-    }
 
-    /// Whether buffered bytes hold no complete frame (idle, not an error).
-    #[must_use]
-    pub fn needs_more(&self) -> bool {
-        self.buffer.is_empty()
-    }
-
-    /// Decodes one command frame from the buffered tail (bounds-checked).
-    /// Malformed input fails the connection closed (never resynced by
-    /// guessing): the sentinel below carries the whole tail length so the
-    /// dispatcher can answer once and signal close.
-    fn decode_one(&mut self) -> Option<(Pending, usize)> {
-        let (frame, consumed) = match redis_protocol::resp2::decode::decode(self.buffer.as_slice())
-        {
-            Ok(Some(pair)) => pair,
-            Ok(None) => return None,
-            Err(_) => {
-                let consumed = self.buffer.len();
-                return Some((
-                    Pending {
-                        name: b"__MALFORMED__".to_vec(),
-                        args: Vec::new(),
-                    },
-                    consumed,
-                ));
-            }
-        };
-        // Inline commands (`PING` over telnet) are outside this
-        // profile: answer a clear error rather than guessing.
-        let redis_protocol::resp2::types::OwnedFrame::Array(elements) = frame else {
-            return Some((
-                Pending {
-                    name: Vec::new(),
-                    args: Vec::new(),
-                },
-                consumed,
-            ));
-        };
-        if elements.len() > self.config.max_array_elements || elements.len() > self.config.max_args
-        {
-            return Some((
-                Pending {
-                    name: b"__TOO_MANY__".to_vec(),
-                    args: Vec::new(),
-                },
-                consumed,
-            ));
+        // One compaction per turn rather than one per command: the previous
+        // code memoved the entire remaining tail for every command it decoded,
+        // which is quadratic in pipeline depth.
+        if self.cursor > 0 {
+            let keep = buffer.len() - self.cursor;
+            buffer.copy_within(self.cursor.., 0);
+            buffer.truncate(keep);
+            self.cursor = 0;
         }
-        let mut raw: Vec<Vec<u8>> = Vec::with_capacity(elements.len());
-        for element in elements {
-            match element {
-                redis_protocol::resp2::types::OwnedFrame::BulkString(bytes)
-                | redis_protocol::resp2::types::OwnedFrame::SimpleString(bytes) => {
-                    if bytes.len() > self.config.max_bulk_bytes {
-                        return Some((
-                            Pending {
-                                name: b"__TOO_LARGE__".to_vec(),
-                                args: Vec::new(),
-                            },
-                            consumed,
-                        ));
+        self.buffer = buffer;
+        DecodedTurn {
+            slots,
+            engine_ops,
+            outcome,
+        }
+    }
+
+    /// Encodes a decoded turn's replies in request order.
+    ///
+    /// `results` lines up with the turn's engine operations positionally, which
+    /// is why nothing here may reorder: a RESP client has no other way to tell
+    /// which answer belongs to which command.
+    fn encode_turn(
+        &mut self,
+        out: &mut Vec<u8>,
+        turn: &DecodedTurn,
+        results: &[Result<kivi_state::OperationResult, ExecuteError>],
+        replies_before: usize,
+    ) -> DrainOutcome {
+        let mut next = 0usize;
+        for slot in &turn.slots {
+            match slot {
+                Slot::Raw(bytes) => out.extend_from_slice(bytes),
+                Slot::Ready(reply) => write_reply(out, self.state.version, reply),
+                Slot::Execute { redis } => {
+                    let Some(result) = results.get(next) else {
+                        write_error(out, self.state.version, "ERR internal error");
+                        continue;
+                    };
+                    next += 1;
+                    write_reply(
+                        out,
+                        self.state.version,
+                        &shape(result, *redis, &self.executor),
+                    );
+                }
+                Slot::SetRange { writes } => {
+                    let consumed = 1 + usize::from(*writes);
+                    let Some(results) = results.get(next..next + consumed) else {
+                        write_error(out, self.state.version, "ERR internal error");
+                        continue;
+                    };
+                    next += consumed;
+                    if let Some(Err(error)) = results.first() {
+                        write_reply(out, self.state.version, &map_execute_error(*error));
+                        continue;
                     }
-                    raw.push(bytes);
-                }
-                // Integers/errors/nils are not valid command arguments.
-                _ => {
-                    return Some((
-                        Pending {
-                            name: Vec::new(),
-                            args: Vec::new(),
-                        },
-                        consumed,
-                    ));
+                    match results.last() {
+                        Some(Ok(kivi_state::OperationResult::Length(value))) => write_integer(
+                            out,
+                            self.state.version,
+                            value.map_or(0, |len| i64::try_from(len).unwrap_or(i64::MAX)),
+                        ),
+                        _ => write_error(out, self.state.version, "ERR internal error"),
+                    }
                 }
             }
         }
-        let Ok((name, args)) = split_command(raw.as_slice()) else {
-            return Some((
-                Pending {
-                    name: Vec::new(),
-                    args: Vec::new(),
-                },
-                consumed,
-            ));
+        self.metrics.bytes_out += (out.len() - replies_before) as u64;
+        turn.outcome
+    }
+
+    /// Records a close request the turn loop observed.
+    fn note_close(&mut self, outcome: &mut DrainOutcome) {
+        if core::mem::take(&mut self.quit_requested) {
+            outcome.close = true;
+        }
+    }
+
+    /// Answers a frame the parser refused, keeping or closing the
+    /// connection exactly as the refusal class says.
+    fn write_refusal(&mut self, refused: &Parsed<'_>, out: &mut Vec<u8>) {
+        let version = self.state.version;
+        self.metrics.protocol_errors += 1;
+        let message: &str = match refused {
+            Parsed::TooManyArgs => "ERR too many arguments",
+            Parsed::TooLarge => "ERR bulk string exceeds bound",
+            // An empty array, a non-string element, and a well-formed
+            // non-command frame are all "this is not a command" to a Redis
+            // client, and all leave the connection usable.
+            Parsed::Malformed | Parsed::Empty | Parsed::BadArgument | Parsed::NotACommand => {
+                "ERR malformed request: expected an array of bulk strings"
+            }
+            Parsed::Incomplete | Parsed::Command(_) => return,
         };
-        Some((Pending { name, args }, consumed))
+        write_error(out, version, message);
+    }
+
+    /// Whether any bytes remain that no command has been decoded from yet.
+    ///
+    /// Deliberately distinct from "the buffer is empty": a frame split across
+    /// two reads leaves bytes behind that no command can come from yet, and
+    /// the server must not read that as "nothing to do".
+    #[must_use]
+    pub fn has_unconsumed(&self) -> bool {
+        self.cursor < self.buffer.len()
     }
 
     /// Dispatches one decoded request to an encoded reply (plus close flag).
     #[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
-    fn dispatch(&mut self, pending: Pending) -> (Vec<u8>, bool) {
-        let version = self.state.version;
-        // Decode sentinels from `decode_one`.
-        if pending.name == b"__MALFORMED__" {
+    fn classify(
+        &mut self,
+        command: &Command<'_>,
+        slots: &mut Vec<Slot>,
+        engine_ops: &mut Vec<kivi_state::Operation>,
+    ) {
+        let name = command.name();
+        let args = command.args();
+
+        // One case-insensitive fold, then one match. The previous path
+        // compared five bootstrap literals, then scanned a 30-entry registry
+        // for a `&str` (which meant UTF-8-validating the name), then matched
+        // the name a third time inside `translate`.
+        let Some(folded) = fold_command_name(name) else {
             self.metrics.protocol_errors += 1;
-            return (
-                encode_error(
-                    version,
-                    "ERR malformed request: expected an array of bulk strings",
-                ),
-                true,
-            );
-        }
-        if pending.name == b"__TOO_MANY__" {
-            self.metrics.protocol_errors += 1;
-            return (encode_error(version, "ERR too many arguments"), false);
-        }
-        if pending.name == b"__TOO_LARGE__" {
-            self.metrics.protocol_errors += 1;
-            return (
-                encode_error(version, "ERR bulk string exceeds bound"),
-                false,
-            );
-        }
-        if pending.name.is_empty() {
-            self.metrics.protocol_errors += 1;
-            return (
-                encode_error(
-                    version,
-                    "ERR malformed request: expected an array of bulk strings",
-                ),
-                false,
-            );
-        }
-        // Connection/bootstrap commands bypass the engine.
-        match pending.name.as_slice() {
-            b"HELLO" => return self.dispatch_hello(&pending.args),
-            b"CLIENT" => return self.dispatch_client(&pending.args),
-            b"SELECT" => return self.dispatch_select(&pending.args),
-            b"COMMAND" => return self.dispatch_command(&pending.args),
+            slots.push(Slot::Ready(Reply::Error(malformed_request())));
+            return;
+        };
+        // The registry is keyed by upper-case names, so the *folded* name is
+        // what has to be looked up. Passing the raw name here made every
+        // lower-case command "unknown" — which is what `redis-cli` sends.
+        let folded_name = &folded[..name.len()];
+        match folded_name {
+            b"HELLO" => {
+                let mut out = Vec::new();
+                self.dispatch_hello(args, &mut out);
+                slots.push(Slot::Raw(out));
+                return;
+            }
+            b"CLIENT" => {
+                let mut out = Vec::new();
+                self.dispatch_client(args, &mut out);
+                slots.push(Slot::Raw(out));
+                return;
+            }
+            b"SELECT" => {
+                let mut out = Vec::new();
+                self.dispatch_select(args, &mut out);
+                slots.push(Slot::Raw(out));
+                return;
+            }
+            b"COMMAND" => {
+                let mut out = Vec::new();
+                self.dispatch_command(args, &mut out);
+                slots.push(Slot::Raw(out));
+                return;
+            }
             b"AUTH" => {
                 self.metrics.unsupported += 1;
-                return (
-                    encode_error(
-                        version,
-                        "ERR AUTH not implemented in Kivi RESP profile v1; no authentication is enforced",
-                    ),
-                    false,
-                );
+                slots.push(Slot::Ready(Reply::Error(
+                    "ERR AUTH not implemented in Kivi RESP profile v1; no authentication is enforced"
+                        .to_owned(),
+                )));
+                return;
             }
             _ => {}
         }
-        let spec = lookup(core::str::from_utf8(&pending.name).unwrap_or(""));
-        let Some(spec) = spec else {
+
+        let Some(spec) = lookup(std::str::from_utf8(folded_name).unwrap_or("")) else {
             self.metrics.protocol_errors += 1;
-            let name = String::from_utf8_lossy(&pending.name).into_owned();
-            return (
-                encode_error(version, &format!("ERR unknown command '{name}'")),
-                false,
-            );
+            let printable = String::from_utf8_lossy(name);
+            slots.push(Slot::Ready(Reply::Error(format!(
+                "ERR unknown command '{printable}'"
+            ))));
+            return;
         };
-        if !arity_ok(spec, pending.args.len() + 1) {
+        if !arity_ok(spec, args.len() + 1) {
             self.metrics.protocol_errors += 1;
-            let want = format!(
+            slots.push(Slot::Ready(Reply::Error(format!(
                 "ERR wrong number of arguments for '{}' command",
                 spec.name.to_lowercase()
-            );
-            return (encode_error(version, &want), false);
+            ))));
+            return;
         }
         if spec.compat == crate::command::CompatClass::Unsupported {
             self.metrics.unsupported += 1;
-            let reply = map_parse_error(&RespError::Unsupported {
+            slots.push(Slot::Ready(map_parse_error(&RespError::Unsupported {
                 command: spec.name.to_owned(),
-            });
-            return (encode_reply(version, &reply), false);
+            })));
+            return;
         }
         // Multi-key forms are rejected, never faked with a loop.
-        if matches!(spec.name, "DEL" | "EXISTS") && pending.args.len() != 1 {
+        if matches!(spec.name, "DEL" | "EXISTS") && args.len() != 1 {
             self.metrics.protocol_errors += 1;
-            return (
-                encode_error(
-                    version,
-                    "ERR multi-key form unsupported in Kivi RESP profile v1; send single-key requests",
-                ),
-                false,
-            );
+            slots.push(Slot::Ready(Reply::Error(
+                "ERR multi-key form unsupported in Kivi RESP profile v1; send single-key requests"
+                    .to_owned(),
+            )));
+            return;
         }
-        let action = match translate(&pending.name, &pending.args, self.executor.now()) {
+        let action = match translate(name, args, self.executor.now()) {
             Ok(action) => action,
             Err(error) => {
                 match &error {
                     RespError::Unsupported { .. } => self.metrics.unsupported += 1,
                     _ => self.metrics.protocol_errors += 1,
                 }
-                let reply = map_parse_error(&error);
-                return (encode_reply(version, &reply), false);
+                slots.push(Slot::Ready(map_parse_error(&error)));
+                return;
             }
         };
-        // Value-size bound: RESP bulk strings larger than the legacy
-        // ceiling belong on native streaming, never buffered here.
+        // Value-size bound: RESP bulk strings larger than the configured
+        // ceiling are refused here rather than after the engine has copied
+        // them.
         if let Action::Execute { op, .. } = &action {
             let size = match op {
                 kivi_state::Operation::SetConditional { value, .. }
@@ -406,151 +556,95 @@ impl<E: Executor> RespConnection<E> {
             };
             if size.is_some_and(|len| len > self.config.max_value_bytes) {
                 self.metrics.protocol_errors += 1;
-                return (
-                    encode_error(
-                        version,
-                        "ERR value exceeds RESP bound; use native streaming",
-                    ),
-                    false,
-                );
+                slots.push(Slot::Ready(Reply::Error(
+                    "ERR value exceeds RESP bound; use native streaming".to_owned(),
+                )));
+                return;
             }
         }
         match action {
-            Action::Reply(immediate) => {
-                let (bytes, close) = self.dispatch_immediate(immediate);
-                (bytes, close)
-            }
-            Action::Execute { op, redis } => self.dispatch_execute(op, redis),
-        }
-    }
-
-    /// Dispatches an immediate (engine-free) reply.
-    fn dispatch_immediate(&mut self, immediate: Immediate) -> (Vec<u8>, bool) {
-        let version = self.state.version;
-        match immediate {
-            Immediate::Simple(text) => (encode_simple(version, text), false),
-            Immediate::Echo(bytes) => (encode_bulk(version, &bytes), false),
-            Immediate::Nil => (encode_nil(version), false),
-            Immediate::Integer(value) => (encode_integer(version, value), false),
-            Immediate::Quit => (encode_simple(version, "OK"), true),
-        }
-    }
-
-    /// Executes one typed operation and maps its outcome (including the
-    /// `SETRANGE` read-after-write length).
-    #[allow(clippy::needless_pass_by_value)]
-    fn dispatch_execute(&mut self, op: kivi_state::Operation, redis: RedisOp) -> (Vec<u8>, bool) {
-        let version = self.state.version;
-        // `SETRANGE` answers its post-write length: write, then measure.
-        // Single-client observable behavior is exact; under concurrent
-        // writers the length may reflect a newer write (documented).
-        //
-        // An empty patch is a pure length read, never a write: Redis treats
-        // it as a complete no-op (missing keys answer 0 and are NOT
-        // created, TTLs are untouched). Skipping the mutation is
-        // atomicity-neutral — there is nothing to race — and it keeps the
-        // native splice semantics (explicit offsets are real operations
-        // there) out of the compatibility profile.
-        if redis == RedisOp::SetRange {
-            let key = op.key().clone();
-            let empty = matches!(
-                &op,
-                kivi_state::Operation::SetRange { patch, .. } if patch.is_empty()
-            );
-            if !empty {
-                match self.executor.execute(&op) {
-                    Ok(_) => {}
-                    Err(error) => return (encode_reply(version, &map_execute_error(error)), false),
+            Action::Reply(immediate) => slots.push(Slot::Ready(immediate_reply(immediate))),
+            Action::Execute { op, redis } => {
+                if redis == RedisOp::SetRange {
+                    // An empty patch is a pure length read: Redis treats it as
+                    // a complete no-op (missing keys answer 0 and are NOT
+                    // created, TTLs are untouched), so no mutation is issued
+                    // and there is nothing to race.
+                    let writes = !matches!(
+                        &op,
+                        kivi_state::Operation::SetRange { patch, .. } if patch.is_empty()
+                    );
+                    if writes {
+                        engine_ops.push(op.clone());
+                    }
+                    engine_ops.push(kivi_state::Operation::BytesLength {
+                        key: op.key().clone(),
+                    });
+                    slots.push(Slot::SetRange { writes });
+                } else {
+                    engine_ops.push(op);
+                    slots.push(Slot::Execute { redis });
                 }
-            }
-            match self
-                .executor
-                .execute(&kivi_state::Operation::BytesLength { key })
-            {
-                Ok(kivi_state::OperationResult::Length(value)) => (
-                    encode_integer(
-                        version,
-                        value.map_or(0, |len| i64::try_from(len).unwrap_or(i64::MAX)),
-                    ),
-                    false,
-                ),
-                Ok(_) => (encode_error(version, "ERR internal error"), false),
-                Err(error) => (encode_reply(version, &map_execute_error(error)), false),
-            }
-        } else {
-            match self.executor.execute(&op) {
-                Ok(result) => {
-                    let reply = map_result(&result, redis, self.executor.now());
-                    (encode_reply(version, &reply), false)
-                }
-                Err(error) => (encode_reply(version, &map_execute_error(error)), false),
             }
         }
     }
 
     /// Dispatches `HELLO [protover [AUTH user pass] [SETNAME name]]`.
-    fn dispatch_hello(&mut self, args: &[Vec<u8>]) -> (Vec<u8>, bool) {
+    fn dispatch_hello(&mut self, args: &[&[u8]], out: &mut Vec<u8>) {
         let version = self.state.version;
         // No args: report the current context without switching.
         if args.is_empty() {
-            return (self.encode_hello(), false);
+            self.encode_hello(out);
+            return;
         }
-        let proto = uppercase_token(&args[0]).unwrap_or_default();
-        let target = match proto.as_slice() {
+        let target = match args[0] {
             b"2" => RespVersion::V2,
             b"3" => RespVersion::V3,
             _ => {
                 self.metrics.protocol_errors += 1;
-                return (
-                    encode_error(
-                        version,
-                        "NOPROTO sorry, this protocol version is not supported",
-                    ),
-                    false,
+                write_error(
+                    out,
+                    version,
+                    "NOPROTO sorry, this protocol version is not supported",
                 );
+                return;
             }
         };
         // Optional AUTH / SETNAME tail.
         let mut index = 1;
         while index < args.len() {
-            let token = uppercase_token(&args[index]).unwrap_or_default();
-            match token.as_slice() {
-                b"AUTH" => {
-                    // Security is a separate feature: never succeed
-                    // silently, never switch versions on the way out.
-                    self.metrics.unsupported += 1;
-                    return (
-                        encode_error(
-                            version,
-                            "ERR AUTH not implemented in Kivi RESP profile v1; no authentication is enforced",
-                        ),
-                        false,
-                    );
-                }
-                b"SETNAME" => {
-                    index += 1;
-                    let name = args.get(index).map_or(String::new(), |bytes| {
-                        String::from_utf8_lossy(bytes).into_owned()
-                    });
-                    self.state.name = Some(name);
-                    index += 1;
-                }
-                _ => {
-                    self.metrics.protocol_errors += 1;
-                    return (
-                        encode_error(version, "ERR syntax error in HELLO options"),
-                        false,
-                    );
-                }
+            let token = args[index];
+            if token_is(token, b"AUTH") {
+                // Security is a separate feature: never succeed silently,
+                // never switch versions on the way out.
+                self.metrics.unsupported += 1;
+                write_error(
+                    out,
+                    version,
+                    "ERR AUTH not implemented in Kivi RESP profile v1; no authentication is enforced",
+                );
+                return;
             }
+            if token_is(token, b"SETNAME") {
+                index += 1;
+                let name = args.get(index).map_or_else(String::new, |bytes| {
+                    String::from_utf8_lossy(bytes).into_owned()
+                });
+                self.state.name = Some(name);
+                index += 1;
+                continue;
+            }
+            self.metrics.protocol_errors += 1;
+            write_error(out, version, "ERR syntax error in HELLO options");
+            return;
         }
         self.state.version = target;
-        (self.encode_hello(), false)
+        self.encode_hello(out);
     }
 
     /// Encodes the `HELLO` reply in the (possibly just switched) version:
     /// a flat array in RESP2, a map in RESP3.
-    fn encode_hello(&self) -> Vec<u8> {
+    fn encode_hello(&self, out: &mut Vec<u8>) {
         const VERSION: &str = env!("CARGO_PKG_VERSION");
         let id = self.state.id;
         match self.state.version {
@@ -575,7 +669,7 @@ impl<E: Executor> RespConnection<E> {
                     F::BulkString(b"modules".to_vec()),
                     F::Array(Vec::new()),
                 ]);
-                encode_frame_v2(&frame)
+                out.extend_from_slice(&encode_frame_v2(&frame));
             }
             RespVersion::V3 => {
                 use redis_protocol::resp3::types::OwnedFrame as F;
@@ -613,113 +707,106 @@ impl<E: Executor> RespConnection<E> {
                         attributes: None,
                     },
                 );
-                encode_frame_v3(&F::Map {
+                out.extend_from_slice(&encode_frame_v3(&F::Map {
                     data: map,
                     attributes: None,
-                })
+                }));
             }
         }
     }
 
     /// Dispatches `CLIENT ...` bootstrap subcommands.
-    fn dispatch_client(&mut self, args: &[Vec<u8>]) -> (Vec<u8>, bool) {
+    fn dispatch_client(&mut self, args: &[&[u8]], out: &mut Vec<u8>) {
         let version = self.state.version;
         let Some((first, rest)) = args.split_first() else {
             self.metrics.protocol_errors += 1;
-            return (
-                encode_error(
-                    version,
-                    "ERR wrong number of arguments for 'client' command",
-                ),
-                false,
+            write_error(
+                out,
+                version,
+                "ERR wrong number of arguments for 'client' command",
             );
+            return;
         };
-        let sub = first.to_ascii_uppercase();
-        match (sub.as_slice(), rest) {
-            (b"SETINFO", [_, _]) => (encode_simple(version, "OK"), false),
-            (b"SETNAME", [name]) => {
-                if name.len() > 1024 {
-                    self.metrics.protocol_errors += 1;
-                    return (encode_error(version, "ERR client name too long"), false);
-                }
-                self.state.name = Some(String::from_utf8_lossy(name).into_owned());
-                (encode_simple(version, "OK"), false)
-            }
-            (b"GETNAME", []) => match &self.state.name {
-                Some(name) => (encode_bulk(version, name.as_bytes()), false),
-                None => (encode_nil(version), false),
-            },
-            _ => {
+        if token_is(first, b"SETINFO") && rest.len() == 2 {
+            write_simple(out, version, "OK");
+        } else if token_is(first, b"SETNAME") && rest.len() == 1 {
+            let name = rest[0];
+            if name.len() > 1024 {
                 self.metrics.protocol_errors += 1;
-                (
-                    encode_error(
-                        version,
-                        "ERR unsupported CLIENT subcommand in Kivi RESP profile v1",
-                    ),
-                    false,
-                )
+                write_error(out, version, "ERR client name too long");
+                return;
             }
+            self.state.name = Some(String::from_utf8_lossy(name).into_owned());
+            write_simple(out, version, "OK");
+        } else if token_is(first, b"GETNAME") && rest.is_empty() {
+            match &self.state.name {
+                Some(name) => write_bulk(out, version, name.as_bytes()),
+                None => write_nil(out, version),
+            }
+        } else {
+            self.metrics.protocol_errors += 1;
+            write_error(
+                out,
+                version,
+                "ERR unsupported CLIENT subcommand in Kivi RESP profile v1",
+            );
         }
     }
 
     /// Dispatches `SELECT index`: `0` maps to the configured namespace,
     /// anything else is rejected (never faked as extra databases).
-    fn dispatch_select(&mut self, args: &[Vec<u8>]) -> (Vec<u8>, bool) {
+    fn dispatch_select(&mut self, args: &[&[u8]], out: &mut Vec<u8>) {
         let version = self.state.version;
         let [index] = args else {
             self.metrics.protocol_errors += 1;
-            return (
-                encode_error(
-                    version,
-                    "ERR wrong number of arguments for 'select' command",
-                ),
-                false,
+            write_error(
+                out,
+                version,
+                "ERR wrong number of arguments for 'select' command",
             );
+            return;
         };
         match parse_unsigned(index) {
-            Ok(0) => (encode_simple(version, "OK"), false),
+            Ok(0) => write_simple(out, version, "OK"),
             Ok(_) => {
                 self.metrics.protocol_errors += 1;
-                (
-                    encode_error(
-                        version,
-                        "ERR database numbers other than 0 are unsupported in Kivi RESP profile v1",
-                    ),
-                    false,
-                )
+                write_error(
+                    out,
+                    version,
+                    "ERR database numbers other than 0 are unsupported in Kivi RESP profile v1",
+                );
             }
             Err(_) => {
                 self.metrics.protocol_errors += 1;
-                (
-                    encode_error(version, "ERR value is not an integer or out of range"),
-                    false,
-                )
+                write_error(out, version, "ERR value is not an integer or out of range");
             }
         }
     }
 
     /// Dispatches `COMMAND [COUNT|INFO|DOCS|LIST]` from the registry.
-    fn dispatch_command(&mut self, args: &[Vec<u8>]) -> (Vec<u8>, bool) {
+    fn dispatch_command(&mut self, args: &[&[u8]], out: &mut Vec<u8>) {
         let version = self.state.version;
         if args.is_empty() {
-            return (self.encode_command_list(), false);
+            out.extend_from_slice(&self.encode_command_list());
+            return;
         }
-        let sub = args[0].to_ascii_uppercase();
-        match (sub.as_slice(), &args[1..]) {
-            (b"COUNT", []) => (
-                encode_integer(version, i64::try_from(REGISTRY.len()).unwrap_or(i64::MAX)),
-                false,
-            ),
-            (b"LIST", _) => (self.encode_command_names(), false),
-            (b"INFO", names) => (self.encode_command_info(names), false),
-            (b"DOCS", _) => (self.encode_command_docs(), false),
-            _ => {
-                self.metrics.protocol_errors += 1;
-                (
-                    encode_error(version, "ERR unsupported COMMAND subcommand"),
-                    false,
-                )
-            }
+        let sub = args[0];
+        let rest = &args[1..];
+        if token_is(sub, b"COUNT") && rest.is_empty() {
+            write_integer(
+                out,
+                version,
+                i64::try_from(REGISTRY.len()).unwrap_or(i64::MAX),
+            );
+        } else if token_is(sub, b"LIST") {
+            out.extend_from_slice(&self.encode_command_names());
+        } else if token_is(sub, b"INFO") {
+            out.extend_from_slice(&self.encode_command_info(rest));
+        } else if token_is(sub, b"DOCS") {
+            out.extend_from_slice(&self.encode_command_docs());
+        } else {
+            self.metrics.protocol_errors += 1;
+            write_error(out, version, "ERR unsupported COMMAND subcommand");
         }
     }
 
@@ -791,11 +878,11 @@ impl<E: Executor> RespConnection<E> {
     }
 
     /// Encodes `COMMAND INFO [names...]` (all commands when empty).
-    fn encode_command_info(&self, names: &[Vec<u8>]) -> Vec<u8> {
+    fn encode_command_info(&self, names: &[&[u8]]) -> Vec<u8> {
         let wanted: Vec<&[u8]> = if names.is_empty() {
             REGISTRY.iter().map(|spec| spec.name.as_bytes()).collect()
         } else {
-            names.iter().map(Vec::as_slice).collect()
+            names.to_vec()
         };
         match self.state.version {
             RespVersion::V2 => {
@@ -942,78 +1029,131 @@ fn blob3(bytes: &[u8]) -> redis_protocol::resp3::types::OwnedFrame {
     }
 }
 
-/// Encodes a version-agnostic reply.
-fn encode_reply(version: RespVersion, reply: &Reply) -> Vec<u8> {
+/// The one error string every "this is not a command" refusal uses.
+fn malformed_request() -> String {
+    "ERR malformed request: expected an array of bulk strings".to_owned()
+}
+
+/// The version-agnostic reply an immediate action produces.
+fn immediate_reply(immediate: Immediate) -> Reply {
+    match immediate {
+        Immediate::Simple(text) => Reply::Simple(text),
+        Immediate::Echo(bytes) => Reply::Bulk(bytes),
+        Immediate::Nil => Reply::Nil,
+        Immediate::Integer(value) => Reply::Int(value),
+        Immediate::Quit => Reply::Simple("OK"),
+    }
+}
+
+/// Maps one engine answer onto its Redis reply.
+fn shape<E: Executor>(
+    result: &Result<kivi_state::OperationResult, ExecuteError>,
+    redis: RedisOp,
+    executor: &E,
+) -> Reply {
+    match result {
+        Ok(value) => map_result(value, redis, executor.now()),
+        Err(error) => map_execute_error(*error),
+    }
+}
+
+/// Appends a version-agnostic reply to `out`.
+///
+/// Every writer here appends into a buffer the connection reuses, so a reply
+/// costs no allocation of its own and a pipelined batch costs one write. The
+/// previous encoders built an owned frame — copying the payload — then
+/// allocated an exactly-sized buffer and encoded into it, and the server
+/// copied the whole batch into a third.
+pub fn write_reply(out: &mut Vec<u8>, version: RespVersion, reply: &Reply) {
     match reply {
-        Reply::Simple(text) => encode_simple(version, text),
-        Reply::Bulk(bytes) => encode_bulk(version, bytes),
-        Reply::Nil => encode_nil(version),
-        Reply::Int(value) => encode_integer(version, *value),
-        Reply::Error(message) => encode_error(version, message),
+        Reply::Simple(text) => write_simple(out, version, text),
+        Reply::Bulk(bytes) => write_bulk(out, version, bytes),
+        Reply::Nil => write_nil(out, version),
+        Reply::Int(value) => write_integer(out, version, *value),
+        Reply::Error(message) => write_error(out, version, message),
     }
 }
 
-/// Encodes a simple string.
-fn encode_simple(version: RespVersion, text: &str) -> Vec<u8> {
+/// Appends a simple string.
+pub fn write_simple(out: &mut Vec<u8>, _version: RespVersion, text: &str) {
+    // RESP2 and RESP3 spell a simple string the same way.
+    out.push(b'+');
+    out.extend_from_slice(text.as_bytes());
+    out.extend_from_slice(b"\r\n");
+}
+
+/// Appends a bulk string (binary-safe).
+pub fn write_bulk(out: &mut Vec<u8>, _version: RespVersion, bytes: &[u8]) {
+    // RESP2's bulk string and RESP3's blob string have the same wire form;
+    // only RESP2's *null* is spelled differently (see `write_nil`).
+    out.push(b'$');
+    write_usize(out, bytes.len());
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(bytes);
+    out.extend_from_slice(b"\r\n");
+}
+
+/// Appends nil (null bulk string in RESP2, `_` in RESP3).
+pub fn write_nil(out: &mut Vec<u8>, version: RespVersion) {
     match version {
-        RespVersion::V2 => encode_frame_v2(
-            &redis_protocol::resp2::types::OwnedFrame::SimpleString(text.as_bytes().to_vec()),
-        ),
-        RespVersion::V3 => {
-            encode_frame_v3(&redis_protocol::resp3::types::OwnedFrame::SimpleString {
-                data: text.as_bytes().to_vec(),
-                attributes: None,
-            })
+        RespVersion::V2 => out.extend_from_slice(b"$-1\r\n"),
+        RespVersion::V3 => out.extend_from_slice(b"_\r\n"),
+    }
+}
+
+/// Appends an integer.
+pub fn write_integer(out: &mut Vec<u8>, _version: RespVersion, value: i64) {
+    // RESP2's integer and RESP3's number have the same wire form.
+    out.push(b':');
+    write_i64(out, value);
+    out.extend_from_slice(b"\r\n");
+}
+
+/// Appends an error (without the leading `-`; framing adds it).
+pub fn write_error(out: &mut Vec<u8>, _version: RespVersion, message: &str) {
+    // RESP2's error and RESP3's simple error have the same wire form.
+    out.push(b'-');
+    out.extend_from_slice(message.as_bytes());
+    out.extend_from_slice(b"\r\n");
+}
+
+/// Appends a decimal length. Hand-rolled because `format!` allocates and
+/// every bulk reply needs one.
+fn write_usize(out: &mut Vec<u8>, value: usize) {
+    let mut digits = [0u8; 20];
+    let mut index = digits.len();
+    let mut remaining = value;
+    loop {
+        index -= 1;
+        digits[index] = b'0' + u8::try_from(remaining % 10).unwrap_or(0);
+        remaining /= 10;
+        if remaining == 0 {
+            break;
         }
     }
+    out.extend_from_slice(&digits[index..]);
 }
 
-/// Encodes a bulk string (binary-safe).
-fn encode_bulk(version: RespVersion, bytes: &[u8]) -> Vec<u8> {
-    match version {
-        RespVersion::V2 => encode_frame_v2(&redis_protocol::resp2::types::OwnedFrame::BulkString(
-            bytes.to_vec(),
-        )),
-        RespVersion::V3 => encode_frame_v3(&redis_protocol::resp3::types::OwnedFrame::BlobString {
-            data: bytes.to_vec(),
-            attributes: None,
-        }),
-    }
-}
-
-/// Encodes nil (null bulk string in RESP2, null in RESP3).
-fn encode_nil(version: RespVersion) -> Vec<u8> {
-    match version {
-        RespVersion::V2 => encode_frame_v2(&redis_protocol::resp2::types::OwnedFrame::Null),
-        RespVersion::V3 => encode_frame_v3(&redis_protocol::resp3::types::OwnedFrame::Null),
-    }
-}
-
-/// Encodes an integer.
-fn encode_integer(version: RespVersion, value: i64) -> Vec<u8> {
-    match version {
-        RespVersion::V2 => {
-            encode_frame_v2(&redis_protocol::resp2::types::OwnedFrame::Integer(value))
+/// Appends a signed decimal, including `i64::MIN` (whose magnitude does not
+/// fit in an `i64`).
+fn write_i64(out: &mut Vec<u8>, value: i64) {
+    if value < 0 {
+        out.push(b'-');
+        let magnitude = value.unsigned_abs();
+        let mut digits = [0u8; 20];
+        let mut index = digits.len();
+        let mut remaining = magnitude;
+        loop {
+            index -= 1;
+            digits[index] = b'0' + u8::try_from(remaining % 10).unwrap_or(0);
+            remaining /= 10;
+            if remaining == 0 {
+                break;
+            }
         }
-        RespVersion::V3 => encode_frame_v3(&redis_protocol::resp3::types::OwnedFrame::Number {
-            data: value,
-            attributes: None,
-        }),
-    }
-}
-
-/// Encodes an error (without the leading `-`; added by framing).
-fn encode_error(version: RespVersion, message: &str) -> Vec<u8> {
-    match version {
-        RespVersion::V2 => encode_frame_v2(&redis_protocol::resp2::types::OwnedFrame::Error(
-            message.to_owned(),
-        )),
-        RespVersion::V3 => {
-            encode_frame_v3(&redis_protocol::resp3::types::OwnedFrame::SimpleError {
-                data: message.to_owned(),
-                attributes: None,
-            })
-        }
+        out.extend_from_slice(&digits[index..]);
+    } else {
+        write_usize(out, usize::try_from(value).unwrap_or(0));
     }
 }
 
@@ -1047,6 +1187,67 @@ mod tests {
     struct FakeExec {
         store: Mutex<ObjectStore>,
         now: kivi_types::WallTimestamp,
+    }
+
+    /// Records the batches it is asked to execute, and answers with a
+    /// deterministic per-key string so reply ordering is visible on the wire.
+    #[derive(Debug, Default)]
+    struct BatchSpy {
+        batches: Mutex<Vec<Vec<Operation>>>,
+        now: kivi_types::WallTimestamp,
+    }
+
+    impl BatchSpy {
+        fn new() -> Self {
+            Self {
+                batches: Mutex::new(Vec::new()),
+                now: kivi_types::WallTimestamp::from_micros(1_000_000_000),
+            }
+        }
+
+        fn batches(&self) -> Vec<Vec<Operation>> {
+            self.batches.lock().expect("spy lock").clone()
+        }
+
+        fn answer(op: &Operation) -> OperationResult {
+            let key = String::from_utf8_lossy(op.key().as_bytes()).into_owned();
+            match op {
+                // `SET` compiles to `SetConditional`, and the engine answers
+                // a conditional write with `ConditionalSet`.
+                Operation::SetConditional { .. } => OperationResult::ConditionalSet {
+                    applied: true,
+                    version: Some(kivi_state::ObjectVersion::from_u64(1)),
+                },
+                Operation::Get { .. } | Operation::GetRange { .. } => {
+                    OperationResult::Value(Some(bytes::Bytes::from(format!("{key}:1"))))
+                }
+                Operation::Exists { .. } => OperationResult::Exists(true),
+                Operation::Delete { .. } => OperationResult::Deleted { existed: true },
+                Operation::BytesLength { .. } => OperationResult::Length(Some(1)),
+                _ => OperationResult::Exists(false),
+            }
+        }
+    }
+
+    impl Executor for BatchSpy {
+        fn execute(
+            &self,
+            op: &Operation,
+        ) -> Result<OperationResult, crate::translate::ExecuteError> {
+            Ok(Self::answer(op))
+        }
+
+        fn execute_batch(
+            &self,
+            ops: &[Operation],
+        ) -> Vec<Result<OperationResult, crate::translate::ExecuteError>> {
+            self.batches.lock().expect("spy lock").push(ops.to_vec());
+            ops.iter().map(|op| Ok(Self::answer(op))).collect()
+        }
+
+        fn now(&self) -> kivi_types::WallTimestamp {
+            self.now
+        }
     }
 
     impl FakeExec {
@@ -1108,11 +1309,253 @@ mod tests {
         )
     }
 
+    /// Splits a RESP2 reply stream into per-reply frames.
+    ///
+    /// Tests assert on framing rather than on a container shape, so this
+    /// walks the bytes the way a client would.
+    pub(crate) fn split_frames(bytes: &[u8]) -> Vec<Vec<u8>> {
+        let mut frames = Vec::new();
+        let mut at = 0usize;
+        while at < bytes.len() {
+            let len = split_one(&bytes[at..]).expect("well-formed frame");
+            assert!(len > 0, "frame made no progress in {bytes:?}");
+            assert!(at + len <= bytes.len(), "truncated frame in {bytes:?}");
+            frames.push(bytes[at..at + len].to_vec());
+            at += len;
+        }
+        frames
+    }
+
+    /// Length of the single frame at the front of `bytes`.
+    pub(crate) fn split_one(bytes: &[u8]) -> Option<usize> {
+        let kind = *bytes.first()?;
+        let line_end = bytes.windows(2).position(|pair| pair == b"\r\n")? + 2;
+        match kind {
+            b'$' | b'=' | b'(' => {
+                let count: i64 = std::str::from_utf8(&bytes[1..line_end - 2])
+                    .ok()?
+                    .parse()
+                    .ok()?;
+                Some(if count < 0 {
+                    line_end
+                } else {
+                    line_end + usize::try_from(count).ok()? + 2
+                })
+            }
+            b'*' | b'%' | b'~' | b'>' => {
+                let count: i64 = std::str::from_utf8(&bytes[1..line_end - 2])
+                    .ok()?
+                    .parse()
+                    .ok()?;
+                if count < 0 {
+                    return Some(line_end);
+                }
+                let mut at = line_end;
+                for _ in 0..count {
+                    at += split_one(&bytes[at..])?;
+                }
+                Some(at)
+            }
+            _ => Some(line_end),
+        }
+    }
+
+    /// Drains one push and returns the replies as separate frames.
+    fn drain_frames(connection: &mut RespConnection<FakeExec>) -> (Vec<Vec<u8>>, bool) {
+        let mut out = Vec::new();
+        let outcome = connection.drain(&mut out);
+        (split_frames(&out), outcome.close)
+    }
+
     fn round_trip(connection: &mut RespConnection<FakeExec>, bytes: &[u8]) -> Vec<Vec<u8>> {
         connection.push(bytes).expect("push fits");
-        let (replies, quit) = connection.drain();
+        let (replies, quit) = drain_frames(connection);
         assert!(!quit, "no quit in these flows");
         replies
+    }
+
+    /// Every command name is case-insensitive, as in Redis.
+    ///
+    /// This is not a detail: `redis-cli` sends `set`, `get` and `ttl` in lower
+    /// case, while most libraries send upper case. A dispatcher that folds
+    /// the name for one lookup and not another answers real clients
+    /// `ERR unknown command` while passing every upper-case test.
+    #[test]
+    fn command_names_are_case_insensitive() {
+        for (lower, upper) in [
+            (&b"get"[..], &b"GET"[..]),
+            (&b"set"[..], &b"SET"[..]),
+            (&b"del"[..], &b"DEL"[..]),
+            (&b"exists"[..], &b"EXISTS"[..]),
+            (&b"strlen"[..], &b"STRLEN"[..]),
+            (&b"ttl"[..], &b"TTL"[..]),
+            (&b"expire"[..], &b"EXPIRE"[..]),
+            (&b"getrange"[..], &b"GETRANGE"[..]),
+            (&b"setrange"[..], &b"SETRANGE"[..]),
+            (&b"persist"[..], &b"PERSIST"[..]),
+            (&b"ping"[..], &b"PING"[..]),
+            (&b"hello"[..], &b"HELLO"[..]),
+            (&b"client"[..], &b"CLIENT"[..]),
+            (&b"select"[..], &b"SELECT"[..]),
+            (&b"quit"[..], &b"QUIT"[..]),
+        ] {
+            let mut lower_conn = conn();
+            let mut upper_conn = conn();
+            let lower_replies = round_trip(&mut lower_conn, &cmd(&[lower, b"k"]));
+            let upper_replies = round_trip(&mut upper_conn, &cmd(&[upper, b"k"]));
+            assert_eq!(
+                lower_replies,
+                upper_replies,
+                "{} and {} must dispatch identically",
+                String::from_utf8_lossy(lower),
+                String::from_utf8_lossy(upper)
+            );
+            assert!(
+                !lower_replies.is_empty() && !lower_replies[0].starts_with(b"-ERR unknown"),
+                "{} was reported unknown: {lower_replies:?}",
+                String::from_utf8_lossy(lower)
+            );
+        }
+    }
+
+    /// The registry is keyed by upper case, so the fold has to reach the
+    /// lookup, not only the bootstrap match.
+    #[test]
+    fn a_known_command_in_lower_case_is_never_reported_unknown() {
+        let mut connection = conn();
+        // `TTL` on a missing key is `-2`, never an unknown-command error.
+        let replies = round_trip(&mut connection, &cmd(&[b"ttl", b"nope"]));
+        assert_eq!(replies[0], b":-2\r\n");
+        let replies = round_trip(&mut connection, &cmd(&[b"pErSiSt", b"nope"]));
+        assert_eq!(replies[0], b":0\r\n");
+        let replies = round_trip(&mut connection, &cmd(&[b"sTrLeN", b"nope"]));
+        assert_eq!(replies[0], b":0\r\n");
+        // An actually unknown command is still unknown, and names it.
+        let replies = round_trip(&mut connection, &cmd(&[b"frobnicate"]));
+        assert!(
+            replies[0].starts_with(b"-ERR unknown command"),
+            "{replies:?}"
+        );
+    }
+
+    /// A pipeline is issued as one batch, not as N round-trips.
+    ///
+    /// This is the property that makes pipelining worth anything. Executing
+    /// as it decodes turns a pipeline of N commands into N sequential engine
+    /// round-trips, so a deeper pipeline costs proportionally more latency for
+    /// the same work — the opposite of the intent, and measured against
+    /// Redis, the largest single gap on this edge.
+    #[test]
+    fn a_pipeline_is_issued_as_one_batch_in_request_order() {
+        let executor = BatchSpy::new();
+        let mut connection = RespConnection::new(executor, ConnConfig::default(), 1);
+        let mut batch = cmd(&[b"SET", b"a", b"1"]);
+        batch.extend_from_slice(&cmd(&[b"GET", b"a"]));
+        batch.extend_from_slice(&cmd(&[b"SET", b"b", b"22"]));
+        batch.extend_from_slice(&cmd(&[b"GET", b"b"]));
+        batch.extend_from_slice(&cmd(&[b"DEL", b"a"]));
+        connection.push(&batch).expect("batch fits");
+        let mut out = Vec::new();
+        let outcome = connection.drain(&mut out);
+        assert_eq!(outcome.replies, 5);
+
+        let executor = connection.executor;
+        assert_eq!(
+            executor.batches(),
+            vec![vec![
+                // `SET` compiles to `SetConditional` so the write stays atomic
+                // at the owning tablet; that is the operation, not a wrapper.
+                kivi_state::Operation::SetConditional {
+                    key: kivi_state::Key::from("a"),
+                    value: bytes::Bytes::from_static(b"1"),
+                    condition: kivi_state::SetCondition::Always,
+                    expiry: kivi_state::ExpiryPolicy::Clear,
+                },
+                kivi_state::Operation::Get {
+                    key: kivi_state::Key::from("a"),
+                },
+                kivi_state::Operation::SetConditional {
+                    key: kivi_state::Key::from("b"),
+                    value: bytes::Bytes::from_static(b"22"),
+                    condition: kivi_state::SetCondition::Always,
+                    expiry: kivi_state::ExpiryPolicy::Clear,
+                },
+                kivi_state::Operation::Get {
+                    key: kivi_state::Key::from("b"),
+                },
+                kivi_state::Operation::Delete {
+                    key: kivi_state::Key::from("a"),
+                },
+            ]],
+            "the whole pipeline must arrive in one batch, in order"
+        );
+        // The spy answers `key:1` for reads, so the wire proves the answers
+        // came back positionally rather than in completion order.
+        let frames = split_frames(&out);
+        assert_eq!(frames[0], b"+OK\r\n");
+        assert_eq!(frames[1], b"$3\r\na:1\r\n");
+        assert_eq!(frames[2], b"+OK\r\n");
+        assert_eq!(frames[3], b"$3\r\nb:1\r\n");
+        assert_eq!(frames[4], b":1\r\n");
+    }
+
+    /// A pipelined refusal does not shift anybody else's answer.
+    #[test]
+    fn a_refusal_inside_a_pipeline_keeps_every_answer_in_place() {
+        let executor = BatchSpy::new();
+        let mut connection = RespConnection::new(executor, ConnConfig::default(), 1);
+        let mut batch = cmd(&[b"FROBNICATE"]);
+        batch.extend_from_slice(&cmd(&[b"GET", b"a"]));
+        batch.extend_from_slice(&cmd(&[b"GET"]));
+        batch.extend_from_slice(&cmd(&[b"GET", b"b"]));
+        connection.push(&batch).expect("batch fits");
+        let mut out = Vec::new();
+        let outcome = connection.drain(&mut out);
+        assert_eq!(outcome.replies, 4);
+        let frames = split_frames(&out);
+        assert!(frames[0].starts_with(b"-ERR unknown command"));
+        assert_eq!(frames[1], b"$3\r\na:1\r\n");
+        assert!(frames[2].starts_with(b"-ERR wrong number of arguments"));
+        assert_eq!(frames[3], b"$3\r\nb:1\r\n");
+        // Only the two well-formed GETs reached the engine.
+        assert_eq!(connection.executor.batches().len(), 1);
+        assert_eq!(connection.executor.batches()[0].len(), 2);
+    }
+
+    /// A pipeline deeper than one turn's budget still answers once, in order.
+    ///
+    /// The turn budget is what stops one client monopolising the frontend, so
+    /// a deep pipeline necessarily spans several turns. Each turn allocates
+    /// its own slots and issues its own engine batch: a slot or an operation
+    /// left over from the previous turn would show up here as a shifted or
+    /// duplicated reply.
+    #[test]
+    fn a_pipeline_deeper_than_one_turn_answers_exactly_once_in_order() {
+        let executor = BatchSpy::new();
+        let mut connection = RespConnection::new(executor, ConnConfig::default(), 1);
+        let depth = ConnConfig::default().max_commands_per_turn * 3;
+        let mut batch = Vec::new();
+        for index in 0..depth {
+            batch.extend_from_slice(&cmd(&[b"GET", format!("k{index}").as_bytes()]));
+        }
+        connection.push(&batch).expect("batch fits");
+        let mut out = Vec::new();
+        let mut total = 0u64;
+        while connection.has_unconsumed() {
+            let outcome = connection.drain(&mut out);
+            total += outcome.replies;
+            assert!(outcome.replies > 0, "a turn must make progress");
+        }
+        assert_eq!(total, depth as u64, "exactly one reply per command");
+        // One engine batch per turn, and every command answered exactly once.
+        let batches = connection.executor.batches();
+        assert_eq!(batches.len(), 3, "one batch per turn, not per command");
+        assert_eq!(
+            batches.iter().map(Vec::len).sum::<usize>(),
+            depth,
+            "every command must be issued exactly once"
+        );
+        assert!(!connection.has_unconsumed());
     }
 
     #[test]
@@ -1319,7 +1762,7 @@ mod tests {
         batch.extend_from_slice(&cmd(&[b"GET", b"a"]));
         batch.extend_from_slice(&cmd(&[b"GET", b"b"]));
         connection.push(&batch).expect("batch fits");
-        let (replies, _) = connection.drain();
+        let (replies, _) = drain_frames(&mut connection);
         assert_eq!(replies.len(), 4);
         assert_eq!(replies[0], b"+OK\r\n");
         assert_eq!(replies[1], b"+OK\r\n");
@@ -1331,10 +1774,10 @@ mod tests {
         connection
             .push(&full[..full.len() - 2])
             .expect("partial fits");
-        let (replies, _) = connection.drain();
+        let (replies, _) = drain_frames(&mut connection);
         assert!(replies.is_empty());
         connection.push(&full[full.len() - 2..]).expect("rest fits");
-        let (replies, _) = connection.drain();
+        let (replies, _) = drain_frames(&mut connection);
         assert_eq!(replies, vec![b"+PONG\r\n".to_vec()]);
     }
 
@@ -1343,7 +1786,7 @@ mod tests {
         let mut connection = conn();
         // Not an array: clear error, connection stays usable afterwards.
         connection.push(b"+PING\r\n").expect("fits");
-        let (replies, quit) = connection.drain();
+        let (replies, quit) = drain_frames(&mut connection);
         assert_eq!(replies.len(), 1);
         assert!(replies[0].starts_with(b"-ERR"));
         assert!(!quit);
@@ -1358,10 +1801,10 @@ mod tests {
             1,
         );
         small.push(&cmd(&[b"GET", b"a", b"b"])).expect("fits");
-        let (replies, _) = small.drain();
+        let (replies, _) = drain_frames(&mut small);
         assert!(replies[0].starts_with(b"-ERR"));
         small.push(&cmd(&[b"GET", b"12345"])).expect("fits");
-        let (replies, _) = small.drain();
+        let (replies, _) = drain_frames(&mut small);
         assert!(replies[0].starts_with(b"-ERR"));
         // Random bytes never panic (close is acceptable, panic is not).
         let mut fuzz = conn();
@@ -1372,7 +1815,8 @@ mod tests {
             b"*3\r\n$1\r\na".as_slice(),
         ] {
             fuzz.push(chunk).expect("fits");
-            let _ = fuzz.drain();
+            let mut out = Vec::new();
+            let _ = fuzz.drain(&mut out);
         }
     }
 
@@ -1395,6 +1839,7 @@ mod tests {
 
 #[cfg(test)]
 mod fuzz {
+    use super::tests::split_frames;
     use super::*;
     use proptest::prelude::*;
 
@@ -1605,15 +2050,22 @@ mod fuzz {
             // Tiny chunks force every partial-frame path.
             for chunk in bytes.chunks(7) {
                 let _ = connection.push(chunk);
-                let (replies, quit) = connection.drain();
-                // Replies are always well-formed RESP in the connection version.
-                for reply in &replies {
-                    prop_assert!(!reply.is_empty());
-                }
-                if quit {
+                let mut out = Vec::new();
+                let outcome = connection.drain(&mut out);
+                // Every reply is well-formed RESP: splitting must not panic
+                // and must consume the output exactly.
+                let frames = split_frames(&out);
+                prop_assert_eq!(frames.len() as u64, outcome.replies);
+                if outcome.close {
                     break;
                 }
             }
+            // Whatever the input was, the connection either consumed it or
+            // refused and closed. It must never be left claiming progress it
+            // did not make.
+            let mut out = Vec::new();
+            let outcome = connection.drain(&mut out);
+            prop_assert!(out.is_empty() || outcome.close || connection.has_unconsumed());
         }
     }
 }

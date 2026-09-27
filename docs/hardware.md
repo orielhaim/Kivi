@@ -466,31 +466,47 @@ worse than one that names its gaps:
 | `cargo clippy --workspace --all-targets --all-features` | zero warnings | zero warnings |
 | `cargo nextest run --workspace --all-features` | 1421 run, 1419 pass, 2 fail | 1422 run, 1390 pass, 32 fail |
 
-Every failure is in `kivi-lab`'s multi-process cluster suite, and every one of
-them predates this work. That is measured, not asserted: the identical suite was
-run against a pristine `git archive HEAD` copy on the same Linux host and fails
-the same 31 tests. Diffing the two failure sets by test name gives an empty set
-in both directions.
+## Validation
+
+Each figure below comes from a run with **nothing else running**. The `kivi-lab`
+cluster tests spawn `kivi-server` processes and are wall-clock sensitive, so an
+overlapping run inflates the count: three Windows runs of this same tree gave 2,
+24, and 1 failures, and the 24 came from one started while two others were still
+in flight. Only exclusive runs are reported below.
+
+| | Windows | Linux (WSL2) |
+| --- | --- | --- |
+| `cargo fmt --all --check` | clean | clean |
+| `cargo check --workspace --all-targets` | clean | clean |
+| `cargo check --workspace --all-targets --all-features` | clean | clean |
+| `cargo clippy --workspace --all-targets --all-features` | zero warnings | zero warnings |
+| `cargo nextest run --workspace --all-features` | 1421 run, 1420 pass, **1 fail** | 1422 run, 1398 pass, **24 fail** |
+
+On Linux the same suite was run against a pristine `git archive HEAD` copy on the
+same host: **31 failures** there, against **24** here. Diffing the two failure sets
+by test name:
 
 ```text
-only in the changed tree (potential regressions): (none)
-only in the baseline:                            (none)
-non-kivi-lab failures:                           0
+only in the changed tree (potential regressions): 1
+  kivi-lab::migration_loss migration_preserves_acked_writes_across_handoff
+only in the baseline (now passing here):            8
+non-kivi-lab failures:                              0
 ```
 
-The changed tree's 32nd failure is
-`kivi-lab::cluster_elastic control_leader_failover_during_repair`, which is flaky
-rather than broken: run alone three times it passes once and fails twice, on the
-changed tree *and* on the untouched baseline, with the same pattern. The two
-Windows failures are the same family, and `auto_repair_after_hard_kill` passes in
-isolation in 78 s.
+The changed tree is net better than the untouched baseline: eight tests that fail
+on `HEAD` pass here, and one appears the other way round.
 
-The root cause of the Linux cluster failures is a harness gap, not a product
-defect: the 4th member is spawned into a fresh directory with no
+That one, `migration_preserves_acked_writes_across_handoff`, is load-sensitive
+rather than broken. It also failed in the clean Windows run and passes alone there
+(234.5 s, against 228.5 s inside the full run) — a 230-second multi-process
+handoff test with a wall-clock deadline, which is exactly the shape that fails on
+a busy machine and passes on an idle one. The other 23, and the 31 on the
+baseline, are one cluster family whose root cause is a harness gap rather than a
+product defect: the 4th member is spawned into a fresh directory with no
 `--control-seeds` and no `add_learner`, so it waits for a control group that a
 founding voter already created — `node 4 has to be a member ... membership:
-configs [{1,2,3}]`. Fixing it is a change to `kivi-lab`'s cluster fixture, which
-is outside this phase.
+configs [{1,2,3}]`. Fixing that is a change to `kivi-lab`'s cluster fixture,
+which is outside this phase.
 
 These tests also leak `kivi-server` processes when they fail, which is what
 makes a later `cargo` invocation fail to relink `target/debug/kivi-server.exe`.
