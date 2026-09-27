@@ -76,6 +76,7 @@ fn durable_config(dir: &std::path::Path) -> DurabilityMode {
 fn start(dir: &std::path::Path) -> LocalEngine {
     LocalEngine::start(EngineConfig {
         namespace: NS,
+        hardware: kivi_engine::HardwareConfig::default(),
         directory: directory(),
         placement: placement(),
         worker_count: 2,
@@ -135,6 +136,7 @@ fn await_current(dir: &std::path::Path, cut: u64) -> kivi_checkpoint::CurrentRec
 fn ephemeral_holds_no_redundancy_fabric() {
     let engine = LocalEngine::start(EngineConfig {
         namespace: NS,
+        hardware: kivi_engine::HardwareConfig::default(),
         directory: directory(),
         placement: placement(),
         worker_count: 2,

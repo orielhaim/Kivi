@@ -56,9 +56,11 @@ use kivi_types::{
     ReplicaFreshness, TabletId, WorkerId,
 };
 
-use crate::affinity::{AffinityError, AffinityMode, pin_current_thread};
+use kivi_hardware::{PlacementRole, WorkerSlot};
+
 use crate::chunk_lane::{RangeRoot, RangeRootFence};
 use crate::commit::PendingEntry;
+use crate::placement::ThreadPlacement;
 use crate::routing::RoutingSnapshot;
 use crate::tablet::LiveTablet;
 use crate::worker::{
@@ -166,8 +168,8 @@ pub struct EngineNetwork {
     pub bind_ip: IpAddr,
     /// Engine-wide maximum frame (clamped to the 64 MiB protocol ceiling).
     pub max_frame: usize,
-    /// CPU pinning for worker threads.
-    pub affinity: AffinityMode,
+    /// Where this node's owner threads run, resolved once from the machine.
+    pub placement: ThreadPlacement,
     /// This node's identity.
     pub node_id: NodeId,
     /// This cluster's identity.
@@ -211,14 +213,12 @@ pub struct NetConfig {
     pub routing: Arc<ArcSwap<RoutingSnapshot>>,
 }
 
-/// Networked worker startup failure: affinity, runtime, or bind problems
+/// Networked worker startup failure: placement, runtime, or bind problems
 /// report here before serving begins — never as a silent dead worker.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum NetStartError {
-    /// CPU pinning failed.
-    #[error("worker affinity failed: {0}")]
-    Affinity(#[source] AffinityError),
+    /// The thread could not be placed.
     /// Runtime creation failed.
     #[error("runtime creation failed: {0}")]
     Runtime(String),
@@ -286,12 +286,10 @@ pub struct NetLaunch {
     pub routing: Arc<ArcSwap<RoutingSnapshot>>,
     /// Resolved per-worker network configuration.
     pub net: NetConfig,
-    /// CPU pinning for the worker thread.
-    pub affinity: AffinityMode,
-    /// This worker's index for affinity distribution.
+    /// Where this node's owner threads run, resolved once from the machine.
+    pub placement: ThreadPlacement,
+    /// This worker's index, which names its placement slot.
     pub worker_index: usize,
-    /// Total worker count for affinity distribution.
-    pub worker_count: usize,
 }
 
 /// Thread body for a networked `DataWorker`: affinity, runtime, listener,
@@ -312,11 +310,26 @@ pub(crate) fn run_net(
     bridge_wake: async_channel::Receiver<()>,
     ready: std::sync::mpsc::Sender<Result<SocketAddr, NetStartError>>,
 ) {
-    if let Err(error) =
-        pin_current_thread(&launch.affinity, launch.worker_index, launch.worker_count)
-    {
-        let _ = ready.send(Err(NetStartError::Affinity(error)));
-        return;
+    if let Err(error) = launch.placement.bind(WorkerSlot::new(
+        PlacementRole::DataWorker,
+        launch.worker_index,
+    )) {
+        // Placement is an optimisation, so a refusal must cost throughput, not
+        // availability: the worker runs unbound on whatever the scheduler
+        // gives it. Failing here would turn a cosmetic optimisation into a
+        // correctness-bearing dependency, which is exactly what RFC §25
+        // forbids.
+        tracing::warn!(
+            worker = id.as_u64(),
+            ?error,
+            "data worker could not be placed; running unbound",
+        );
+    } else {
+        tracing::debug!(
+            worker = id.as_u64(),
+            cpu = ?launch.placement.current_cpu(),
+            "data worker placed",
+        );
     }
     let tablet_map: HashMap<TabletId, LiveTablet> = tablets
         .into_iter()
@@ -381,6 +394,11 @@ async fn serve(
         let chunks = shared.chunks.clone();
         let fabric = Rc::clone(&shared.fabric);
         compio::runtime::spawn(async move {
+            // Opened inside the future, so on the runtime thread that also
+            // serves the requests this sampler describes. A counter group is
+            // `!Send` precisely because a counter belongs to one thread, and
+            // the bridge shares the worker's thread by construction.
+            let hardware = Rc::new(RefCell::new(kivi_memory::hardware::HardwareSampler::new()));
             bridge_loop(BridgeContext {
                 requests,
                 control,
@@ -390,6 +408,7 @@ async fn serve(
                 durability,
                 chunks,
                 fabric,
+                hardware,
                 shutdown,
             })
             .await;
@@ -470,6 +489,7 @@ struct BridgeContext {
     durability: Option<Rc<RefCell<WorkerDurability>>>,
     chunks: crate::worker::WorkerChunks,
     fabric: Rc<RefCell<crate::fabric::TabletFabric>>,
+    hardware: Rc<RefCell<kivi_memory::hardware::HardwareSampler>>,
     shutdown: Rc<Cell<bool>>,
 }
 
@@ -487,6 +507,7 @@ fn bridge_control(
     metrics: &Rc<Cell<WorkerMetrics>>,
     durability: Option<&Rc<RefCell<WorkerDurability>>>,
     fabric: &Rc<RefCell<crate::fabric::TabletFabric>>,
+    hardware: &Rc<RefCell<kivi_memory::hardware::HardwareSampler>>,
 ) -> bool {
     let durable = durability.map(|cell| cell.borrow());
     let durable_ref = durable.as_deref();
@@ -496,7 +517,52 @@ fn bridge_control(
         metrics,
         durable_ref,
         &mut fabric.borrow_mut(),
+        &mut hardware.borrow_mut(),
     )
+}
+
+/// What one control drain did.
+enum ControlDrain {
+    /// Every pending control message was handled. `channel_alive` is false when
+    /// the engine has dropped the channel, which the loop treats as an exit
+    /// condition once the request channel is dead too.
+    Continue { channel_alive: bool },
+    /// A message said the worker must exit.
+    Stop,
+}
+
+/// Drains every pending control message into the shared worker state.
+///
+/// Split out of [`bridge_loop`] so both drains read alike and neither has to
+/// hold the loop's whole state in view. Every borrow ends with the call.
+fn drain_bridge_control(
+    control: &crossbeam_channel::Receiver<WorkerControl>,
+    tablets: &Rc<RefCell<HashMap<TabletId, LiveTablet>>>,
+    metrics: &Rc<Cell<WorkerMetrics>>,
+    durability: Option<&Rc<RefCell<WorkerDurability>>>,
+    fabric: &Rc<RefCell<crate::fabric::TabletFabric>>,
+    hardware: &Rc<RefCell<kivi_memory::hardware::HardwareSampler>>,
+) -> ControlDrain {
+    use crossbeam_channel::TryRecvError;
+    loop {
+        match control.try_recv() {
+            Ok(message) => {
+                if !bridge_control(message, tablets, metrics, durability, fabric, hardware) {
+                    return ControlDrain::Stop;
+                }
+            }
+            Err(TryRecvError::Empty) => {
+                return ControlDrain::Continue {
+                    channel_alive: true,
+                };
+            }
+            Err(TryRecvError::Disconnected) => {
+                return ControlDrain::Continue {
+                    channel_alive: false,
+                };
+            }
+        }
+    }
 }
 
 /// Wakeups are event-driven: every ingress send pings `bridge_wake`, so an
@@ -516,6 +582,7 @@ async fn bridge_loop(context: BridgeContext) {
         durability,
         chunks,
         fabric,
+        hardware,
         shutdown,
     } = context;
     let mut requests_dead = false;
@@ -529,20 +596,24 @@ async fn bridge_loop(context: BridgeContext) {
     // before serving so the reactor never blocks on storage.
     let mut fabric_parks: VecDeque<FabricReadPark> = VecDeque::new();
     loop {
-        loop {
-            match control.try_recv() {
-                Ok(message) => {
-                    if !bridge_control(message, &tablets, &metrics, durability.as_ref(), &fabric) {
-                        shutdown.set(true);
-                        return;
-                    }
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    control_dead = true;
-                    break;
-                }
+        match drain_bridge_control(
+            &control,
+            &tablets,
+            &metrics,
+            durability.as_ref(),
+            &fabric,
+            &hardware,
+        ) {
+            ControlDrain::Stop => {
+                shutdown.set(true);
+                return;
             }
+            ControlDrain::Continue {
+                channel_alive: false,
+            } => control_dead = true,
+            ControlDrain::Continue {
+                channel_alive: true,
+            } => {}
         }
         // Full drain (the channel capacity bounds the work): intake is
         // admit-only with no I/O, and a yield every slice keeps connection

@@ -6652,9 +6652,167 @@ Strict deterministic constraints surround all actions.
 
 ---
 
-# 266. Phase 13 — hardware acceleration
+# 266. Phase 13 - hardware acceleration
 
-Independent experimental tracks:
+## Outcome
+
+Phase 13 establishes what the machine offers, adopts only what a measurement
+justifies, and records what it could not test. No mechanism it introduced may
+affect a durability, ordering, or consensus guarantee. Every one is an
+optimisation with a software path behind it.
+
+Linux is a first-class validation target. Every Linux path was compiled and run
+on WSL2 (`6.18.33.2-microsoft-standard-WSL2`), not merely guarded by a `cfg`
+attribute. The evidence, the per-mechanism measurements, and the classification
+of every evaluated track are in [docs/hardware.md](hardware.md).
+
+The findings that change decisions:
+
+* **CRC32C is already hardware accelerated.** 23.3 GB/s at 1 MiB, 96x over a
+  bitwise scalar oracle: the `crc32c` crate is dispatching the SSE4.2
+  instruction. Replacing it for a crate that advertises SIMD would be trading a
+  working hardware path for a different advertisement of the same instruction.
+  RFC section 26's open question is closed: retain.
+* **Affinity buys nothing on a single thread here.** Physical-core placement
+  (67.04 us) and no placement (67.14 us) are indistinguishable. The case for
+  pinning is inter-thread contention, and this machine has no SMT siblings, so
+  that case was not producible. Placement is therefore diagnostics-first: the
+  plan is free (below the measurement floor, dominated by topology discovery),
+  so the strategy is chosen on measured benefit and the default is "none" on a
+  machine that shows no benefit.
+* **The one large win was not an accelerator.** The NVMe demotion store read one
+  record by copying the whole store, so a promotion was O(store). Positioned
+  reads make it O(record): flat at ~21 us per promotion from a 0.5 MB store to
+  an 8.6 MB store, where the old path grows 53 us to 2664 us. 128x at the top
+  end, and no store size at which the old path wins.
+* **A third SIMD kernel was deleted.** `xor_fold` measured 95 us against 89 us
+  for the plain form, because the compiler already vectorises it. A kernel with
+  no measured win is not a kernel.
+* **Huge pages are a 1.3x loss on this host, and the measurement proves the
+  promotion happened.** `/proc/self/smaps` reports 6 of 8 MiB as
+  `AnonHugePages` after `madvise(MADV_HUGEPAGE)`, and the advised region is still
+  1.27x slower to fault and 1.28x slower to walk. 8 MiB is too small for the TLB
+  to be the bottleneck, so the slower huge-page fault is pure cost. The policy
+  therefore stays `Inherit` by default and `Advice` is opt-in per arena.
+* **Direct I/O is real on Linux.** `O_DIRECT` engages on the ext4 volume
+  (`unbuffered = true`, 512-byte alignment from `statx(STATX_DIOALIGN)`), and
+  every windowed read returns the right bytes. It is applied to the bulk scan
+  path only; a single-record promotion stays buffered, because an unaligned
+  unbuffered read of 20 bytes is a refusal, not a fallback.
+* **A hardware counter group has to be commensurable to mean anything.** The PMU
+  opens a *group* so its members share a scaling factor, and falls back to
+  independently opened counters when the kernel refuses — which WSL2's does, with
+  `EACCES` on `PERF_IOC_ADD_EVENT` for software events. Two bugs lived in that
+  fallback and both are fixed: it discarded the task clock it had just opened and
+  reported `CycleSource::None`, so a machine with working counters read exactly
+  like a machine with none; and it marked the set non-commensurable permanently,
+  withholding every ratio on a machine that never multiplexed anything.
+  Commutability is now decided per sample from the kernel's own
+  `time_running == time_enabled`, and `PmuCounter::TaskClock` is a distinct
+  variant so a consumer can tell a task-clock denominator from hardware cycles.
+* **`hwlocality` rejected, `core_affinity2` removed.** The first is pre-1.0,
+  needs a C toolchain, and has a weak Windows story; the second pulls `libafl`
+  for a placement boundary that is now ~300 tested lines in `kivi-hardware`.
+
+## Hardware telemetry reaches the controller
+
+This was the phase's other gap, and closing it is a behaviour change rather than
+an addition. A `PmuSample` used to stop at `kivi-hardware::telemetry`, so no
+controller could distinguish a software estimate from a measurement, and no
+signal ever told the Phase 12 loop that a worker had been migrated off the core
+it was placed on.
+
+The counter group now lives on the serving thread, because a counter opened on
+thread A counts thread A's instructions. It is read through a
+`WorkerControl::HardwareSample` rendezvous on that thread rather than by a
+collector thread, which would either signal the owner on the hot path or measure
+the wrong thing. The sample becomes a closed `HardwareSignal` carrying its own
+provenance, folds into a `HardwareSummary` by extremes, and reaches
+`BaselineController` as ordinary features.
+
+The fold is by extremes rather than by mean, and that is the design: a
+controller asking "did this worker ever stall badly" needs the worst window, a
+controller deciding whether a worker is CPU bound needs the best IPC, and one
+multiplexed window in three must lower the whole scope's trust rather than be
+averaged away. Page faults, context switches, and migrations are additive,
+because a page fault is a page fault whether or not a stall counter was readable.
+
+Two new baseline branches act on it, and both *reduce* work:
+
+| Branch | Condition | Action |
+| --- | --- | --- |
+| `SustainedMemoryBoundWorker` | measured, trusted, stall > 0.35 and LLC miss > 0.2, sustained | `AdjustScrubBudget` down |
+| `SustainedWorkerMigration` | measured, trusted, any migration, sustained | `AdjustScrubBudget` down |
+
+Both are gated on `BaselineConfig::hardware_min_trust_ppm` (default 900 000), so
+a multiplexed reading can never reach a decision on its own. A machine with no
+counters produces exactly the decision the software-only path produced before
+this existed, which is asserted by comparing the two proposals rather than by
+asserting the intent.
+
+`GET /v1/control/adaptive` now reports the per-worker `HardwareSummary` for the
+latest window, because "the chain is wired" is not a claim anyone can otherwise
+check. A two-worker `--pmu` server on WSL2 reports `measured: true`,
+`trust: 1.0`, and real page-fault counts, carried from the serving thread's own
+counter group through the sampler, the closed signal, and the fabric fold.
+
+## What the crate provides
+
+`kivi-hardware` is the single place that answers "what does this machine offer,
+and what did we decide about it":
+
+* A topology model and a real backend per platform
+  (`GetLogicalProcessorInformationEx`, Linux sysfs), with the project owning the
+  types so no consumer can hold a topology from anywhere else.
+* `Capabilities` with a typed `Support<T>` per dimension, plus a five-stage
+  registry (`HardwarePresent`, `OsSupported`, `Permitted`, `BackendBuilt`,
+  `BackendInitialised`) so "the struct exists" and "the probe succeeded" are
+  different values.
+* Placement strategies with explicit shortfalls, and a refusal that costs
+  throughput rather than availability.
+* One DRAM and one compressed provider per memory node, so the planner sees the
+  machine instead of assuming one node.
+* A NUMA `Arena` that binds with `mbind` before first touch and then *verifies*
+  the binding by parsing `/proc/self/numa_maps`, rather than trusting the
+  syscall's return value.
+* `DirectFile` with alignment resolved from the volume, `HugePagePolicy` with a
+  `/proc/self/smaps` census that reports what the kernel did rather than what
+  `madvise` returned, a CXL/DAX mapping with a bounded extent allocator, device
+  locality, and the PMU, DAMON, io_uring, and signal-translation models.
+* `GET /v1/hardware`, which reports all of the above including every absence, and
+  is a diagnostic rather than a gate.
+
+`kivi-memory` gained the CXL provider that was missing: it maps every tiered
+region, registers **uncalibrated and `healthy: false`** until the calibrator has
+measured something, never claims persistence (a CXL Type-3 device is volatile
+unless a backend proved otherwise), and labels its anonymous emulation with a
+distinct kind tag so no capability snapshot or benchmark can present it as a
+CXL device.
+
+## What is not done
+
+Stated in the phase report rather than deferred silently:
+
+* No hardware PMU, CXL, pmem, RDMA, or DSA exists on either validation host, so
+  the PMU is proven against software events and a hardware-event comparison has
+  not been run.
+* DAMON is absent from both kernels, so its sysfs adapter is exercised by parser
+  tests against the documented `damon_stats` layout and reports `NotPresent` on a
+  live machine. It has never read a real monitor. Two parser bugs were found and
+  fixed against that layout: the column header is not `#`-prefixed, so the
+  original header match could never fire, and the start address is the
+  second-to-last column, so reading field 0 attributed an access count to an
+  address.
+* The host has one NUMA node, so `mbind` always resolves to node 0 and
+  `numa-aware` placement reports `single-node`. Nothing here validates the
+  two-node case.
+* Huge pages were measured and did not help; `Advice` stays off by default.
+* Registered buffers and Compio advanced I/O are not integrated.
+
+## Not evaluated here
+
+The independent experimental tracks are untouched, and none blocks product
+viability:
 
 ```text
 CXL
@@ -6671,6 +6829,11 @@ P4
 
 kernel state
 ```
+
+`cxl` regions and `rdma` devices are enumerated and reported when present,
+because the *decision* to use them needs the inventory to exist first — and, for
+CXL, because the `kivi-memory` provider above consumes that inventory. The
+tracks themselves are untouched.
 
 None blocks product viability.
 

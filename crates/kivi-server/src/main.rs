@@ -27,9 +27,13 @@ use std::path::PathBuf;
 use admin::AdminState;
 use anyhow::Context;
 use clap::Parser;
+use kivi_hardware::PlacementStrategy;
+use kivi_hardware::io::DirectIoPolicy;
+use kivi_hardware::pages::HugePagePolicy;
+
 use kivi_engine::{
-    AffinityMode, ConnLimits, DurabilityMode, DurableConfig, EngineConfig, EngineNetwork,
-    LocalEngine, Placement, TurnBudget,
+    ConnLimits, DurabilityMode, DurableConfig, EngineConfig, EngineNetwork, HardwareConfig,
+    LocalEngine, Placement, ThreadPlacement, TurnBudget,
 };
 use kivi_state::PartitionHasher;
 use kivi_tablet::DirectorySnapshot;
@@ -67,9 +71,22 @@ struct Args {
     /// `--tablets` and cluster `--cluster-tablets` alike.
     #[arg(long, default_value = "hash", value_parser = parse_layout)]
     layout: String,
-    /// CPU pinning: auto, none, or explicit cores like "0,2-4,7".
-    #[arg(long, default_value = "auto", value_parser = parse_affinity)]
-    pin: AffinityMode,
+    /// Where owner threads run: `none`, `simple`, `physical-core`,
+    /// `numa-aware`. Only change this from the default after reading the
+    /// placement report; it is a measured setting, not a preference.
+    #[arg(long, default_value = "physical-core", value_parser = parse_placement)]
+    placement: PlacementStrategy,
+    /// Huge-page advice for large long-lived arenas: `inherit`, `advice`,
+    /// `never`.
+    #[arg(long, default_value = "inherit", value_parser = parse_huge_pages)]
+    huge_pages: HugePagePolicy,
+    /// Off-core materialization I/O: `adaptive`, `always`, `never`.
+    #[arg(long, default_value = "adaptive", value_parser = parse_direct_io)]
+    direct_io: DirectIoPolicy,
+    /// Open per-thread hardware performance counters (Linux only; silently
+    /// inert where the platform or the privileges forbid it).
+    #[arg(long, default_value_t = false)]
+    pmu: bool,
     /// Per-worker bounded request queue depth.
     #[arg(long, default_value_t = 1024)]
     queue: usize,
@@ -275,43 +292,21 @@ fn parse_node_endpoint(spec: &str) -> Result<(u64, SocketAddr), String> {
     Ok((node, addr))
 }
 
-/// Parses CPU pinning without panicking: `auto`, `none`, or explicit cores
-/// like `0,2-4,7`. A Clap value parser, so bad input is a usage error
-/// (exit code 2), never a panic.
-fn parse_affinity(spec: &str) -> Result<AffinityMode, String> {
-    match spec {
-        "none" => Ok(AffinityMode::Disabled),
-        "auto" => Ok(AffinityMode::Auto),
-        other => {
-            let mut cores = Vec::new();
-            for part in other.split(',') {
-                if let Some((from, to)) = part.split_once('-') {
-                    let from: usize = from
-                        .trim()
-                        .parse()
-                        .map_err(|_| format!("invalid core range {part:?}"))?;
-                    let to: usize = to
-                        .trim()
-                        .parse()
-                        .map_err(|_| format!("invalid core range {part:?}"))?;
-                    if from > to {
-                        return Err(format!("inverted core range {part:?}"));
-                    }
-                    cores.extend(from..=to);
-                } else {
-                    cores.push(
-                        part.trim()
-                            .parse()
-                            .map_err(|_| format!("invalid core index {part:?}"))?,
-                    );
-                }
-            }
-            if cores.is_empty() {
-                return Err("no cores listed".to_owned());
-            }
-            Ok(AffinityMode::Explicit(cores))
-        }
-    }
+/// Parses the placement strategy without panicking. A Clap value parser, so a
+/// bad strategy is a usage error (exit code 2), never a startup panic on a
+/// machine nobody has run Kivi on yet.
+fn parse_placement(spec: &str) -> Result<PlacementStrategy, String> {
+    PlacementStrategy::parse(spec)
+}
+
+/// Parses the huge-page policy without panicking.
+fn parse_huge_pages(spec: &str) -> Result<HugePagePolicy, String> {
+    HugePagePolicy::parse(spec)
+}
+
+/// Parses the direct-I/O policy without panicking.
+fn parse_direct_io(spec: &str) -> Result<DirectIoPolicy, String> {
+    DirectIoPolicy::parse(spec)
 }
 
 /// Parses the cluster tablet count: any nonzero count (static buddy
@@ -565,15 +560,10 @@ fn main() -> anyhow::Result<()> {
     if args.queue == 0 {
         anyhow::bail!("queue depth must be nonzero");
     }
-    if let AffinityMode::Explicit(cores) = &args.pin
-        && cores.len() < args.workers
-    {
-        tracing::warn!(
-            cores = cores.len(),
-            workers = args.workers,
-            "fewer cores listed than workers; wrapping round-robin"
-        );
-    }
+    // Placement is resolved against the real machine here so the operator sees
+    // exactly what will happen, including shortfalls, before any worker starts.
+    let placement = ThreadPlacement::resolve(args.placement, args.workers);
+    tracing::info!(placement = %placement.summary(), "worker placement resolved");
     // The lock guard lives for the whole process: dropping it would
     // release the data directory to a second process mid-run.
     let (node, cluster, incarnation, durability, _data_dir_guard) = open_durability(&args)?;
@@ -615,6 +605,13 @@ fn main() -> anyhow::Result<()> {
             pack_target_bytes: args.chunk_pack_target,
             cache_bytes: args.chunk_cache_bytes,
         },
+        hardware: HardwareConfig {
+            strategy: args.placement,
+            huge_pages: args.huge_pages,
+            direct_io: args.direct_io,
+            pmu: args.pmu,
+        }
+        .resolve(),
         fabric: kivi_engine::FabricConfig {
             arena_bytes_per_worker: args.fabric_arena_bytes,
             demotion_bytes_per_worker: args.fabric_demotion_bytes,
@@ -624,7 +621,7 @@ fn main() -> anyhow::Result<()> {
             ports: Vec::new(),
             bind_ip: args.bind,
             max_frame: args.max_frame,
-            affinity: args.pin.clone(),
+            placement: ThreadPlacement::resolve(args.placement, args.workers),
             node_id: node,
             cluster_id: cluster,
             incarnation,
@@ -773,16 +770,30 @@ mod tests {
     use clap::Parser;
 
     #[test]
-    fn affinity_parser_accepts_all_forms() {
-        assert_eq!(parse_affinity("none"), Ok(AffinityMode::Disabled));
-        assert_eq!(parse_affinity("auto"), Ok(AffinityMode::Auto));
+    fn hardware_parsers_accept_every_spelling() {
+        for spec in ["none", "unbound", "off"] {
+            assert_eq!(parse_placement(spec), Ok(PlacementStrategy::Unbound));
+        }
         assert_eq!(
-            parse_affinity("0,2-4,7"),
-            Ok(AffinityMode::Explicit(vec![0, 2, 3, 4, 7]))
+            parse_placement("simple"),
+            Ok(PlacementStrategy::LogicalIndex)
         );
-        assert!(parse_affinity("x").is_err());
-        assert!(parse_affinity("4-2").is_err());
-        assert!(parse_affinity("").is_err());
+        assert_eq!(
+            parse_placement("physical-core"),
+            Ok(PlacementStrategy::PhysicalCore)
+        );
+        assert_eq!(parse_placement("NUMA"), Ok(PlacementStrategy::NumaAware));
+        assert!(parse_placement("x").is_err());
+
+        for spec in ["inherit", "default", "off"] {
+            assert_eq!(parse_huge_pages(spec), Ok(HugePagePolicy::Inherit));
+        }
+        assert_eq!(parse_huge_pages("madvise"), Ok(HugePagePolicy::Advice));
+        assert!(parse_huge_pages("always").is_err());
+
+        assert_eq!(parse_direct_io("auto"), Ok(DirectIoPolicy::Adaptive));
+        assert_eq!(parse_direct_io("on"), Ok(DirectIoPolicy::Always));
+        assert!(parse_direct_io("turbo").is_err());
     }
 
     #[test]
@@ -809,21 +820,21 @@ mod tests {
             "4",
             "--tablets",
             "4",
-            "--pin",
-            "0,1",
+            "--placement",
+            "numa-aware",
             "--admin",
             "127.0.0.1:0",
         ])
         .expect("args parse");
         assert_eq!(args.workers, 4);
         assert_eq!(args.tablets, 4);
-        assert_eq!(args.pin, AffinityMode::Explicit(vec![0, 1]));
+        assert_eq!(args.placement, PlacementStrategy::NumaAware);
         assert_eq!(args.admin.port(), 0);
     }
 
     #[test]
     fn server_args_reject_bad_input_without_panicking() {
-        assert!(Args::try_parse_from(["kivi-server", "--pin", "banana"]).is_err());
+        assert!(Args::try_parse_from(["kivi-server", "--placement", "banana"]).is_err());
         assert!(Args::try_parse_from(["kivi-server", "--tablets", "0"]).is_err());
         assert!(Args::try_parse_from(["kivi-server", "--layout", "b-tree"]).is_err());
     }

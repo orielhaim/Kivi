@@ -11,7 +11,6 @@
 //! execution without this cross-thread hop. The two paths share tablet logic
 //! but are not optimized as one.
 
-pub mod affinity;
 pub mod checkpoint;
 pub mod chunk_lane;
 pub mod commit;
@@ -19,12 +18,12 @@ pub mod compound;
 pub mod engine;
 pub mod fabric;
 pub mod net;
+pub mod placement;
 pub mod redundancy;
 pub mod routing;
 pub mod tablet;
 pub mod worker;
 
-pub use affinity::{AffinityError, AffinityMode, available_cores, pin_current_thread};
 pub use checkpoint::{CheckpointAdminState, CheckpointCommand, CheckpointConfig, CheckpointInfo};
 pub use chunk_lane::{
     CHUNK_JOB_DEPTH, ChunkJob, ChunkLaneGuard, ChunkLaneHandle, ChunkLaneStats, ChunkReply,
@@ -47,6 +46,7 @@ pub use kivi_memory::offcore_lane::{
 };
 pub use kivi_memory::{Footprint, MemoryControlPolicy, MemoryControlPolicyError};
 pub use net::{ConnLimits, EngineNetwork, NetConfig, NetStartError, TurnBudget};
+pub use placement::{DEFAULT_ROLES, HardwareConfig, PlacementError, ThreadPlacement};
 pub use redundancy::{
     CheckpointProtection, EngineRedundancy, ProtectedArtifact, RedundancyAdminSnapshot,
     protect_staged_value,

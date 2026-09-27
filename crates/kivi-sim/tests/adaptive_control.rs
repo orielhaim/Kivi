@@ -74,6 +74,7 @@ fn snapshot(window: u64, sequence: u64, pressure: f64, criticality: u64) -> Obse
             observation_count: 1,
             access_count: 1,
         }),
+        hardware: kivi_observation::HardwareSummary::absent(),
     };
     ObservationSnapshot {
         as_of: observed,
@@ -256,6 +257,7 @@ fn scenario_snapshot(window: u64, sequence: u64, scenario: Scenario) -> Observat
             observation_count: 1,
             access_count: 1,
         }),
+        hardware: kivi_observation::HardwareSummary::absent(),
     };
     ObservationSnapshot {
         as_of: observed,

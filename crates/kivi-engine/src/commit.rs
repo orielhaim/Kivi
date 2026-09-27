@@ -63,12 +63,14 @@ use kivi_durability::{
     StorageHealth, WalRecord, WorkerLaneStats,
     wal::{MutationRecord, OutcomeRecord},
 };
+use kivi_hardware::{PlacementRole, WorkerSlot};
 use kivi_state::{
     Key, Mutation, ObjectStore, Operation, OperationResult, StorePrepared, StoredObject,
 };
 use kivi_types::{CommitPosition, MutationIdentity, NamespaceId, RequestSeq, SessionId, TabletId};
 
 use crate::chunk_lane::RangeRootFence;
+use crate::placement::ThreadPlacement;
 use crate::tablet::{IdentityGate, LiveTablet, TabletError};
 use crate::worker::{LaneAccess, WorkerRequestError, WorkerResponse};
 
@@ -980,12 +982,29 @@ impl LaneHandle {
     pub(crate) fn spawn(
         lane: LaneAccess,
         complete: &Sender<SealOutcome>,
+        placement: ThreadPlacement,
+        ordinal: usize,
     ) -> Result<Self, DurabilityError> {
         let (submit, receive) = bounded::<LaneCommand>(LANE_SUBMIT_DEPTH);
         let complete_thread = complete.clone();
         let thread = thread::Builder::new()
             .name("kivi-durability-lane".to_owned())
-            .spawn(move || lane_thread_main(lane, receive, &complete_thread))
+            .spawn(move || {
+                // The barrier lane is the most latency critical thread in the
+                // process: every durable write in every data worker waits on
+                // it. Binding it first means a refusal is discovered before
+                // any worker can queue a seal.
+                // One core per lane. Two lanes on one core would put two
+                // independent fsync barriers in the same hardware queue, which
+                // is the one thing a barrier lane exists to avoid.
+                let slot = WorkerSlot::new(PlacementRole::DurabilityLane, ordinal);
+                if let Err(error) = placement.bind(slot) {
+                    tracing::error!(?error, "durability lane could not be placed");
+                } else {
+                    tracing::debug!(cpu = ?placement.current_cpu(), "durability lane placed");
+                }
+                lane_thread_main(lane, receive, &complete_thread);
+            })
             .map_err(|error| DurabilityError::Io {
                 op: "spawn durability lane thread",
                 message: error.to_string(),
@@ -1114,6 +1133,8 @@ impl CommitCoordinator {
         policy: BatchPolicy,
         lane: LaneAccess,
         initial_stats: WorkerLaneStats,
+        placement: ThreadPlacement,
+        ordinal: usize,
     ) -> Result<Self, DurabilityError> {
         policy
             .validate()
@@ -1125,7 +1146,7 @@ impl CommitCoordinator {
             open: None,
             inflight: None,
             next_batch_seq: 1,
-            lane: LaneHandle::spawn(lane, &complete_tx)?,
+            lane: LaneHandle::spawn(lane, &complete_tx, placement, ordinal)?,
             complete,
             unapplied_identities: HashSet::new(),
             unapplied_sessions: HashMap::new(),
@@ -2450,7 +2471,7 @@ mod tests {
         let paths = crate::fabric::FabricPaths {
             root: dir.path().to_owned(),
         };
-        let (fabric, guard) = crate::fabric::TabletFabric::open(
+        let (fabric, guard) = crate::fabric::TabletFabric::open_unbound(
             kivi_types::WorkerId::from_u64(0),
             &paths,
             1 << 20,
@@ -2465,8 +2486,14 @@ mod tests {
         let (mut fabric, _fabric_guard, _fabric_dir) = test_fabric();
         let scratch = tempfile::tempdir().expect("scratch");
         let (lane, stats) = test_lane(scratch.path());
-        let mut coord =
-            CommitCoordinator::spawn(BatchPolicy::default_policy(), lane, stats).expect("spawn");
+        let mut coord = CommitCoordinator::spawn(
+            BatchPolicy::default_policy(),
+            lane,
+            stats,
+            ThreadPlacement::unbound(),
+            0,
+        )
+        .expect("spawn");
         let mut tablets = HashMap::new();
         tablets.insert(TabletId::from_u64(1), live_tablet());
         let mut receivers = Vec::new();

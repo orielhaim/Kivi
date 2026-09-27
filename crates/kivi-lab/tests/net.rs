@@ -64,7 +64,7 @@ fn network() -> EngineNetwork {
         ports: Vec::new(),
         bind_ip: [127, 0, 0, 1].into(),
         max_frame: kivi_protocol::DEFAULT_MAX_FRAME,
-        affinity: kivi_engine::AffinityMode::Disabled,
+        placement: kivi_engine::ThreadPlacement::unbound(),
         node_id: NodeId::from_u64(1),
         cluster_id: ClusterId::from_u128(1),
         incarnation: NodeIncarnation::INITIAL,
@@ -78,6 +78,7 @@ fn network() -> EngineNetwork {
 fn restart_on_ports(ports: &[u16], placement: Placement) -> LocalEngine {
     LocalEngine::start(EngineConfig {
         namespace: NS,
+        hardware: kivi_engine::HardwareConfig::default(),
         directory: split_snapshot(),
         placement,
         worker_count: 2,
@@ -96,6 +97,7 @@ fn restart_on_ports(ports: &[u16], placement: Placement) -> LocalEngine {
 fn start_split() -> LocalEngine {
     LocalEngine::start(EngineConfig {
         namespace: NS,
+        hardware: kivi_engine::HardwareConfig::default(),
         directory: split_snapshot(),
         placement: Placement::new([
             (TabletId::from_u64(2), WorkerId::from_u64(0)),

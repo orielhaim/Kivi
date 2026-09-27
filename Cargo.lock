@@ -791,19 +791,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
-name = "core_affinity2"
-version = "0.16.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62f8881ee4f0a11950850c835af4024d8bb95bce539b987e7dd592bc6ccd4c89"
-dependencies = [
- "libafl_core",
- "libc",
- "rustversion",
- "serde",
- "windows",
-]
-
-[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -957,6 +944,15 @@ dependencies = [
  "rustc_version",
  "syn 2.0.119",
  "unicode-xid",
+]
+
+[[package]]
+name = "diffy"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b545b8c50194bdd008283985ab0b31dba153cfd5b3066a92770634fbc0d7d291"
+dependencies = [
+ "nu-ansi-term",
 ]
 
 [[package]]
@@ -1843,7 +1839,6 @@ dependencies = [
  "async-channel",
  "bytes",
  "compio",
- "core_affinity2",
  "crc32c",
  "crossbeam-channel",
  "divan",
@@ -1852,6 +1847,7 @@ dependencies = [
  "kivi-codec",
  "kivi-core",
  "kivi-durability",
+ "kivi-hardware",
  "kivi-memory",
  "kivi-protocol",
  "kivi-redundancy",
@@ -1861,6 +1857,23 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tracing",
+]
+
+[[package]]
+name = "kivi-hardware"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "crc32c",
+ "divan",
+ "libc",
+ "multiversion",
+ "perf-event-open",
+ "serde",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1903,6 +1916,7 @@ dependencies = [
  "compio",
  "crc32c",
  "divan",
+ "kivi-hardware",
  "kivi-observation",
  "kivi-types",
  "lz4_flex",
@@ -1988,6 +2002,7 @@ dependencies = [
  "kivi-core",
  "kivi-durability",
  "kivi-engine",
+ "kivi-hardware",
  "kivi-memory",
  "kivi-observation",
  "kivi-protocol",
@@ -2057,17 +2072,6 @@ name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
-
-[[package]]
-name = "libafl_core"
-version = "0.16.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "500f095e2ded36a365006c5c0b1af91df9fa1db8eb1d8bf09e0519110051bf18"
-dependencies = [
- "nonzero_macros",
- "rustversion",
- "windows-result",
-]
 
 [[package]]
 name = "libc"
@@ -2206,6 +2210,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "21909324aa58f5c284d91cac514c6d081210901dc372d7c8ea6a9d7e0406097a"
 
 [[package]]
+name = "multiversion"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b4ca4bea16ffc3f443cf7d866912118196bfef4c6a1556ca00f9f9b00bb43f7c"
+dependencies = [
+ "multiversion-macros",
+]
+
+[[package]]
+name = "multiversion-macros"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d416831a7317ef4b08bee00b69cbbb9c8763da7959a7026244d6266869f9c83"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "rustversion",
+ "syn 3.0.6",
+]
+
+[[package]]
 name = "nom"
 version = "7.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2223,12 +2248,6 @@ checksum = "df9761775871bdef83bee530e60050f7e54b1105350d6884eb0fb4f46c2f9405"
 dependencies = [
  "memchr",
 ]
-
-[[package]]
-name = "nonzero_macros"
-version = "0.16.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f58b86669675275aa80411d548739c787956f3a80594667bd96fc9d03d5ebfb"
 
 [[package]]
 name = "ntapi"
@@ -2526,6 +2545,19 @@ name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
+
+[[package]]
+name = "perf-event-open"
+version = "0.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c54a678ed27b2db04a50a0528bee972afcfec6187bd76c6b7ea0d275b2584680"
+dependencies = [
+ "anyhow",
+ "arrayvec",
+ "diffy",
+ "futures",
+ "libc",
+]
 
 [[package]]
 name = "phf"

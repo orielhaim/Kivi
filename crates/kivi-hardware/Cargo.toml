@@ -1,0 +1,59 @@
+[package]
+name = "kivi-hardware"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "AGPL-3.0-or-later"
+description = "Physical machine discovery, capability snapshot, and worker placement for Kivi"
+
+[dependencies]
+thiserror.workspace = true
+serde = { workspace = true }
+tracing.workspace = true
+# Runtime CPU-feature dispatch for Kivi-owned SIMD kernels. Stable, proc-macro
+# only, and the kernel body stays safe.
+multiversion.workspace = true
+
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_Kernel",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies.perf-event-open]
+package = "perf-event-open"
+version = "0.6"
+optional = true
+
+[features]
+default = []
+# Linux `perf_event_open` counters. Off by default: the counters are a
+# diagnostic accelerator, never load-bearing, and `perf_event_paranoid`
+# commonly forbids them in production.
+pmu = ["dep:perf-event-open"]
+
+[dev-dependencies]
+divan.workspace = true
+# Measured, not adopted: these are the crates Kivi already ship, benchmarked
+# here so the claim that they already run on hardware instructions can be
+# checked rather than believed.
+crc32c.workspace = true
+blake3.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "hardware"
+harness = false

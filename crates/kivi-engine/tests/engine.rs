@@ -63,6 +63,7 @@ fn worker(n: u64) -> WorkerId {
 fn start_root(workers: usize) -> LocalEngine {
     LocalEngine::start(EngineConfig {
         namespace: NS,
+        hardware: kivi_engine::HardwareConfig::default(),
         directory: root_snapshot(),
         placement: Placement::new([(TabletId::from_u64(1), worker(0))]),
         worker_count: workers,
@@ -83,6 +84,7 @@ fn invalid_configurations_fail_before_serving() {
     assert!(matches!(
         LocalEngine::start(EngineConfig {
             namespace: NS,
+            hardware: kivi_engine::HardwareConfig::default(),
             directory: root.clone(),
             placement: placement.clone(),
             worker_count: 0,
@@ -98,6 +100,7 @@ fn invalid_configurations_fail_before_serving() {
     assert!(matches!(
         LocalEngine::start(EngineConfig {
             namespace: NS,
+            hardware: kivi_engine::HardwareConfig::default(),
             directory: root.clone(),
             placement: placement.clone(),
             worker_count: 1,
@@ -113,6 +116,7 @@ fn invalid_configurations_fail_before_serving() {
     assert!(matches!(
         LocalEngine::start(EngineConfig {
             namespace: NS,
+            hardware: kivi_engine::HardwareConfig::default(),
             directory: root.clone(),
             placement: Placement::new([]),
             worker_count: 1,
@@ -128,6 +132,7 @@ fn invalid_configurations_fail_before_serving() {
     assert!(matches!(
         LocalEngine::start(EngineConfig {
             namespace: NS,
+            hardware: kivi_engine::HardwareConfig::default(),
             directory: root,
             placement: Placement::new([(TabletId::from_u64(1), worker(9))]),
             worker_count: 1,
@@ -184,6 +189,7 @@ fn typed_crud_round_trip_with_ttl() {
 fn multi_tablet_routing_reaches_both_owners() {
     let engine = LocalEngine::start(EngineConfig {
         namespace: NS,
+        hardware: kivi_engine::HardwareConfig::default(),
         directory: split_snapshot(),
         placement: Placement::new([
             (TabletId::from_u64(2), worker(0)),

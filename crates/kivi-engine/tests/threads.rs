@@ -108,6 +108,7 @@ fn run_tolerant<T>(
 fn concurrent_counter_is_exact() {
     let engine = LocalEngine::start(EngineConfig {
         namespace: NS,
+        hardware: kivi_engine::HardwareConfig::default(),
         directory: root_snapshot(),
         placement: Placement::new([(TabletId::from_u64(1), worker(0))]),
         worker_count: 1,
@@ -145,6 +146,7 @@ fn concurrent_counter_is_exact() {
 fn multi_tablet_parallelism_makes_independent_progress() {
     let engine = LocalEngine::start(EngineConfig {
         namespace: NS,
+        hardware: kivi_engine::HardwareConfig::default(),
         directory: split_snapshot(),
         placement: Placement::new([
             (TabletId::from_u64(2), worker(0)),
@@ -235,6 +237,7 @@ fn mixed_workload_matches_sequential_reference() {
     const OPS: usize = 400;
     let engine = LocalEngine::start(EngineConfig {
         namespace: NS,
+        hardware: kivi_engine::HardwareConfig::default(),
         directory: split_snapshot(),
         placement: Placement::new([
             (TabletId::from_u64(2), worker(0)),
@@ -396,4 +399,93 @@ fn apply_concurrent(client: &LocalClient, key: &Key, tag: u8, bytes: &[u8], numb
         7 => run_tolerant(client, |c| c.persist_expiry(key)),
         _ => run_tolerant(client, |c| c.get_expiry(key)),
     }
+}
+
+#[test]
+fn hardware_sampling_answers_for_every_worker_that_served_work() {
+    // The whole hardware-telemetry chain depends on this: the counter group
+    // lives on the serving thread, so the engine can only report a reading by
+    // asking that thread. A missing worker here means a controller silently
+    // receives no hardware evidence for a worker that was doing work, and a
+    // missing *measurement* is indistinguishable from a missing worker — which
+    // is exactly the distinction this asserts.
+    let engine = LocalEngine::start(EngineConfig {
+        namespace: NS,
+        hardware: kivi_engine::HardwareConfig::default(),
+        directory: split_snapshot(),
+        placement: Placement::new([
+            (TabletId::from_u64(2), worker(0)),
+            (TabletId::from_u64(3), worker(1)),
+        ]),
+        worker_count: 2,
+        request_capacity: 64,
+        chunks: kivi_engine::ChunkFabricConfig::default(),
+        fabric: kivi_engine::FabricConfig::default(),
+        network: None,
+        durability: DurabilityMode::Ephemeral,
+    })
+    .expect("engine starts");
+    let client = engine.client();
+    for i in 0..64 {
+        let key = Key::from(format!("hw:{i}"));
+        run(&client, |c| c.counter_add(&key, 1));
+    }
+    let admin = engine.admin_handle();
+    let first = admin.hardware_samples_snapshot();
+    assert_eq!(
+        first.len(),
+        2,
+        "one reading per worker, however the machine answers"
+    );
+    for (id, sample) in &first {
+        // The first sample of any window is a baseline and claims nothing: the
+        // delta against a counter's own opening value measures process startup,
+        // not the window a controller reasons about.
+        assert!(
+            !sample.reading.measured,
+            "worker {id:?} first sample is a baseline"
+        );
+        assert!(
+            (sample.cost_multiplier - 1.0).abs() <= f64::EPSILON,
+            "an unmeasured reading costs nothing"
+        );
+    }
+    // A second window over work that really happened. Whether the machine
+    // granted a commensurable counter group is a machine fact, so the test
+    // asserts the shape of the answer rather than its magnitude: a measured
+    // reading carries a confidence in range, and an unmeasured one is exactly
+    // the software-only reading.
+    for i in 0..64 {
+        let key = Key::from(format!("hw:{i}"));
+        run(&client, |c| c.counter_add(&key, 1));
+    }
+    let second = admin.hardware_samples_snapshot();
+    assert_eq!(second.len(), 2);
+    for (id, sample) in &second {
+        if sample.reading.measured {
+            assert!(
+                sample.reading.confidence > 0.0 && sample.reading.confidence <= 1.0,
+                "worker {id:?} confidence {} is in range",
+                sample.reading.confidence
+            );
+        } else {
+            assert_eq!(
+                *sample,
+                kivi_memory::hardware::HardwareSample::software_only()
+            );
+        }
+        // Whichever answer the machine gave, the reading is bounded and
+        // dimensionless — a controller acts on these numbers.
+        assert!(
+            sample.ipc <= 8.0,
+            "worker {id:?} ipc {} is bounded",
+            sample.ipc
+        );
+        assert!(
+            (0.0..=1.0).contains(&sample.stall_fraction),
+            "worker {id:?} stall {} is a fraction",
+            sample.stall_fraction
+        );
+    }
+    engine.shutdown().expect("clean shutdown");
 }

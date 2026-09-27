@@ -83,7 +83,7 @@ Stop-KiviServer 9210
 $ephemeralPid = 0
 try {
     # --- Reference: b16 inline (all-DRAM, no fabric involvement). ---
-    $ephemeralPid = Start-KiviServer @("--ephemeral", "--port", "9200", "--workers", "2", "--pin", "none", "--admin", "127.0.0.1:19090") (Join-Path $outDir "server-fabric-ref.log") 9200
+    $ephemeralPid = Start-KiviServer @("--ephemeral", "--port", "9200", "--workers", "2", "--placement", "none", "--admin", "127.0.0.1:19090") (Join-Path $outDir "server-fabric-ref.log") 9200
     Invoke-Bench "fabric-ref-set-b16-8t" "--target native --server 127.0.0.1:9200 --threads 8 --ops 5000 --warmup 500 --workload set --keys uniform:256 --prefix base:fab:ref8: --value-size b16"
     Invoke-Bench "fabric-ref-get-b16-8t" "--target native --server 127.0.0.1:9200 --threads 8 --ops 5000 --warmup 500 --workload get --keys uniform:256 --prefix base:fab:ref8: --value-size b16"
     # --- Fabric, roomy arena: medium values, no pressure. ---
@@ -99,7 +99,7 @@ try {
     # mostly keeps up, so sets succeed with visible movement underneath
     # (2x overload sheds by design; see the report). Single-thread
     # seeding is the gentlest burst.
-    $pressuredPid = Start-KiviServer @("--ephemeral", "--port", "9210", "--workers", "2", "--pin", "none", "--admin", "127.0.0.1:19091", "--fabric-arena-bytes", "1048576") (Join-Path $outDir "server-fabric-pressure.log") 9210
+    $pressuredPid = Start-KiviServer @("--ephemeral", "--port", "9210", "--workers", "2", "--placement", "none", "--admin", "127.0.0.1:19091", "--fabric-arena-bytes", "1048576") (Join-Path $outDir "server-fabric-pressure.log") 9210
     Invoke-Bench "fabric-pressure-set-kb1-1t" "--target native --server 127.0.0.1:9210 --threads 1 --ops 1500 --warmup 0 --workload set --keys uniform:1536 --prefix base:fab:pres1: --value-size kb1"
     Invoke-Bench "fabric-pressure-get-kb1-1t" "--target native --server 127.0.0.1:9210 --threads 1 --ops 1500 --warmup 0 --workload get --keys uniform:1536 --prefix base:fab:pres1: --value-size kb1"
 } finally {
@@ -111,7 +111,7 @@ try {
     # --- Durable (file NVMe demotion device): roomy and constrained. ---
     $dataDir = Join-Path $outDir "data-fabric"
     Remove-Item -LiteralPath $dataDir -Recurse -Force -ErrorAction SilentlyContinue
-    $durablePid = Start-KiviServer @("--data-dir", $dataDir, "--port", "9200", "--workers", "2", "--pin", "none", "--admin", "127.0.0.1:19090", "--no-checkpoint") (Join-Path $outDir "server-fabric-durable.log") 9200
+    $durablePid = Start-KiviServer @("--data-dir", $dataDir, "--port", "9200", "--workers", "2", "--placement", "none", "--admin", "127.0.0.1:19090", "--no-checkpoint") (Join-Path $outDir "server-fabric-durable.log") 9200
     Invoke-Bench "fabric-durable-set-kb1-8t" "--target native --server 127.0.0.1:9200 --threads 8 --ops 5000 --warmup 500 --workload set --keys uniform:256 --prefix base:fab:dur8: --value-size kb1"
     Invoke-Bench "fabric-durable-get-kb1-8t" "--target native --server 127.0.0.1:9200 --threads 8 --ops 5000 --warmup 500 --workload get --keys uniform:256 --prefix base:fab:dur8: --value-size kb1"
 } finally {

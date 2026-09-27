@@ -337,6 +337,11 @@ impl OffcoreLaneGuard {
 
 /// Spawns one offcore lane thread over `dir/demotion.dat`.
 ///
+/// `on_thread_start` runs inside the new thread before it serves anything, so
+/// the embedding engine can bind it to the core it planned. The hook is a
+/// parameter rather than an engine type because the Memory Fabric must not know
+/// who embeds it.
+///
 /// # Errors
 ///
 /// Returns [`MemoryError::Io`] when the directory or data file cannot be
@@ -345,12 +350,21 @@ pub fn spawn_offcore_lane(
     worker: kivi_types::WorkerId,
     dir: &Path,
     options: NvmeOptions,
+    on_thread_start: Option<Box<dyn FnOnce() + Send + 'static>>,
 ) -> Result<(OffcoreLaneHandle, OffcoreLaneGuard), MemoryError> {
     let (tx, rx) = bounded::<OffcoreJob>(OFFCORE_JOB_DEPTH);
     let provider = NvmeProvider::open(&dir.join("demotion"), options)?;
     let thread = thread::Builder::new()
         .name(format!("kivi-offcore-{}", worker.as_u64()))
-        .spawn(move || serve(provider, &rx))
+        .spawn(move || {
+            // The embedding engine binds this thread to the core it planned for
+            // the lane. The hook is a parameter rather than a kivi-engine type
+            // because the Memory Fabric must not know who embeds it.
+            if let Some(bind) = on_thread_start {
+                bind();
+            }
+            serve(provider, &rx);
+        })
         .map_err(|error| MemoryError::Io {
             op: "spawn offcore lane",
             path: dir.to_owned(),
@@ -443,8 +457,8 @@ mod tests {
     fn demote_promote_roundtrip_on_lane() {
         let dir = tempfile::tempdir().expect("tempdir");
         let worker = kivi_types::WorkerId::from_u64(0);
-        let (lane, guard) =
-            spawn_offcore_lane(worker, dir.path(), NvmeOptions::default()).expect("lane spawns");
+        let (lane, guard) = spawn_offcore_lane(worker, dir.path(), NvmeOptions::default(), None)
+            .expect("lane spawns");
         let record = lane
             .demote_blocking(7, 1, b"cold bytes".to_vec())
             .expect("demote");
@@ -462,8 +476,8 @@ mod tests {
     fn promote_missing_record_fails_closed() {
         let dir = tempfile::tempdir().expect("tempdir");
         let worker = kivi_types::WorkerId::from_u64(0);
-        let (lane, guard) =
-            spawn_offcore_lane(worker, dir.path(), NvmeOptions::default()).expect("lane spawns");
+        let (lane, guard) = spawn_offcore_lane(worker, dir.path(), NvmeOptions::default(), None)
+            .expect("lane spawns");
         let error = lane
             .promote_blocking(9, 1, 0, 10)
             .expect_err("missing record fails");

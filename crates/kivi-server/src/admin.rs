@@ -773,6 +773,169 @@ struct FabricWorkerDto {
     tablets: Vec<FabricTabletDto>,
 }
 
+/// The machine's capabilities, its resolved placement, and every accelerator
+/// this process found or could not find.
+///
+/// Nothing here is required for correctness, so the endpoint is a diagnostic
+/// and never a gate: a machine with no accelerators answers with a complete
+/// report of absences, not an error.
+#[derive(Serialize)]
+struct HardwareDto {
+    /// One line per capability dimension, exactly as the startup log prints it.
+    report: String,
+    /// Physical topology, one line.
+    topology: String,
+    /// Processor identity, cache geometry and locality summary.
+    topology_summary: String,
+    /// Instruction sets the running binary can use.
+    isa: Vec<String>,
+    /// Memory nodes, with technology class and capacity.
+    memory_nodes: Vec<HardwareNodeDto>,
+    /// CXL and pmem regions, with the persistence flag a durability contract
+    /// would depend on.
+    memory_regions: Vec<HardwareRegionDto>,
+    /// I/O devices with disclosed NUMA locality.
+    devices: Vec<HardwareDeviceDto>,
+    /// The placement strategy in force and what it could not do.
+    placement: String,
+    /// Where the calling thread actually is, so a reader can tell a plan from a
+    /// binding.
+    current_cpu: Option<u32>,
+    /// Every worker slot and the processor it was given.
+    workers: Vec<HardwareWorkerDto>,
+    /// Every researched track and why it was or was not adopted.
+    tracks: Vec<HardwareTrackDto>,
+}
+
+#[derive(Serialize)]
+struct HardwareNodeDto {
+    node: u32,
+    cpus: usize,
+    total_bytes: Option<u64>,
+    tier: String,
+    huge_pages_2mib: u64,
+    huge_pages_1gib: u64,
+}
+
+#[derive(Serialize)]
+struct HardwareRegionDto {
+    path: String,
+    capacity_bytes: u64,
+    align_bytes: u64,
+    numa_node: Option<u32>,
+    /// False for every region Kivi can currently discover: CXL memory may be
+    /// volatile, and Kivi never assumes otherwise.
+    persistent: bool,
+}
+
+#[derive(Serialize)]
+struct HardwareDeviceDto {
+    class: String,
+    name: String,
+    numa_node: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct HardwareWorkerDto {
+    role: String,
+    ordinal: usize,
+    cpus: String,
+    core: Option<String>,
+    numa_node: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct HardwareTrackDto {
+    track: String,
+    classification: String,
+    decision: String,
+}
+
+async fn hardware() -> Json<HardwareDto> {
+    let capabilities = kivi_hardware::snapshot();
+    let topology = &capabilities.topology;
+    let workers = kivi_hardware::PlacementRole::ALL
+        .iter()
+        .flat_map(|role| {
+            let role = *role;
+            (0..4_usize).map(move |ordinal| (role, ordinal))
+        })
+        .filter_map(|(role, ordinal)| {
+            let slot = kivi_hardware::WorkerSlot::new(role, ordinal);
+            let plan = kivi_hardware::plan(topology, capabilities.placement, &[slot]);
+            plan.placement(slot).map(|placement| HardwareWorkerDto {
+                role: format!("{role:?}"),
+                ordinal,
+                cpus: placement.cpus.to_string(),
+                core: placement.core.map(|core| core.to_string()),
+                numa_node: placement.numa_node.map(|node| node.0),
+            })
+        })
+        .collect();
+    Json(HardwareDto {
+        report: capabilities.report(),
+        topology: capabilities.report(),
+        topology_summary: topology.summary(),
+        isa: capabilities
+            .isa
+            .iter()
+            .map(|feature| feature.to_string())
+            .collect(),
+        memory_nodes: topology
+            .memory_nodes
+            .iter()
+            .map(|node| HardwareNodeDto {
+                node: node.id.0,
+                cpus: node.cpus.len(),
+                total_bytes: node.total_bytes,
+                tier: format!("{:?}", node.tier),
+                huge_pages_2mib: node.huge_pages.pages_2mib,
+                huge_pages_1gib: node.huge_pages.pages_1gib,
+            })
+            .collect(),
+        memory_regions: capabilities
+            .memory_regions
+            .iter()
+            .map(|region| HardwareRegionDto {
+                path: region.path.clone(),
+                capacity_bytes: region.capacity_bytes,
+                align_bytes: region.align_bytes,
+                numa_node: region.numa_node.map(|node| node.0),
+                persistent: region.persistent,
+            })
+            .collect(),
+        devices: topology
+            .devices
+            .iter()
+            .map(|device| HardwareDeviceDto {
+                class: format!("{:?}", device.class),
+                name: device.name.clone(),
+                numa_node: device.numa_node.map(|node| node.0),
+            })
+            .collect(),
+        placement: kivi_hardware::plan(
+            topology,
+            capabilities.placement,
+            &[kivi_hardware::WorkerSlot::new(
+                kivi_hardware::PlacementRole::DataWorker,
+                0,
+            )],
+        )
+        .diagnostics
+        .summary(),
+        current_cpu: kivi_hardware::current_cpu().map(|cpu| cpu.0),
+        workers,
+        tracks: kivi_hardware::accelerator::AcceleratorTrack::ALL
+            .iter()
+            .map(|track| HardwareTrackDto {
+                track: format!("{track:?}"),
+                classification: track.classification().to_owned(),
+                decision: track.decision().to_owned(),
+            })
+            .collect(),
+    })
+}
+
 /// Memory Fabric observability rollup across workers plus summed totals.
 #[derive(Serialize)]
 struct FabricDto {
@@ -886,6 +1049,30 @@ async fn adaptive(State(state): State<AdminState>) -> Json<serde_json::Value> {
         return Json(serde_json::json!({"enabled": false}));
     };
     let snapshot = runtime.snapshot();
+    // The hardware summaries are reported whole rather than as a boolean,
+    // because the interesting question is not "is it on" but "what did the
+    // machine say" — and a summary with `measured: false` and every counter at
+    // zero is a real answer about a real machine.
+    let hardware: Vec<serde_json::Value> = snapshot
+        .hardware
+        .iter()
+        .map(|(worker, summary)| {
+            serde_json::json!({
+                "worker": worker,
+                "measured": summary.measured,
+                "trust": summary.trust,
+                "worst_stall_fraction": summary.worst_stall_fraction,
+                "worst_cache_miss_ratio": summary.worst_cache_miss_ratio,
+                "worst_branch_miss_ratio": summary.worst_branch_miss_ratio,
+                "best_ipc": summary.best_ipc,
+                "page_faults": summary.page_faults,
+                "context_switches": summary.context_switches,
+                "migrations": summary.migrations,
+                "worst_cost_multiplier": summary.worst_cost_multiplier,
+                "cache_sensitivity": format!("{:?}", summary.cache_sensitivity),
+            })
+        })
+        .collect();
     Json(serde_json::json!({
         "enabled": true,
         "mode": snapshot.mode,
@@ -896,6 +1083,7 @@ async fn adaptive(State(state): State<AdminState>) -> Json<serde_json::Value> {
         "observation_window": snapshot.observation_window,
         "observation_scopes": snapshot.observation_scopes,
         "observation_freshness": snapshot.observation_freshness,
+        "hardware": hardware,
         "proposed": snapshot.proposed,
         "accepted": snapshot.accepted,
         "rejected": snapshot.rejected,
@@ -920,6 +1108,7 @@ pub fn router(state: AdminState) -> axum::Router {
         .route("/v1/durability", get(durability))
         .route("/v1/checkpoints", get(checkpoints))
         .route("/v1/fabric", get(fabric))
+        .route("/v1/hardware", get(hardware))
         .route("/v1/redis", get(redis))
         .route("/v1/control/adaptive", get(adaptive))
         .layer(
@@ -976,6 +1165,7 @@ mod tests {
         .expect("active root");
         LocalEngine::start(EngineConfig {
             namespace: NS,
+            hardware: kivi_engine::HardwareConfig::default(),
             directory,
             placement: Placement::new([(TabletId::from_u64(1), WorkerId::from_u64(0))]),
             worker_count: 2,

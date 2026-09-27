@@ -89,7 +89,7 @@ Stop-KiviServer 9100
 $ephemeralPid = 0
 try {
     # --- Ephemeral server: pure transport numbers (native + RESP). ---
-    $ephemeralPid = Start-KiviServer @("--ephemeral", "--port", "9000", "--workers", "2", "--pin", "none", "--admin", "127.0.0.1:19080", "--redis-listen", "127.0.0.1:6380") (Join-Path $outDir "server-ephemeral.log") 9000
+    $ephemeralPid = Start-KiviServer @("--ephemeral", "--port", "9000", "--workers", "2", "--placement", "none", "--admin", "127.0.0.1:19080", "--redis-listen", "127.0.0.1:6380") (Join-Path $outDir "server-ephemeral.log") 9000
     Invoke-Bench "native-ephemeral-set-b16-1t" "--target native --server 127.0.0.1:9000 --threads 1 --ops 5000 --warmup 500 --workload set --keys uniform:256 --prefix base:ephem:set1: --value-size b16"
     Invoke-Bench "native-ephemeral-set-b16-8t" "--target native --server 127.0.0.1:9000 --threads 8 --ops 5000 --warmup 500 --workload set --keys uniform:256 --prefix base:ephem:set8: --value-size b16"
     Invoke-Bench "native-ephemeral-get-b16-1t" "--target native --server 127.0.0.1:9000 --threads 1 --ops 5000 --warmup 500 --workload get --keys uniform:256 --prefix base:ephem:set1: --value-size b16"
@@ -105,7 +105,7 @@ try {
     # --- Durable server: production-like numbers (WAL group commit). ---
     $dataDir = Join-Path $outDir "data-durable"
     Remove-Item -LiteralPath $dataDir -Recurse -Force -ErrorAction SilentlyContinue
-    $durablePid = Start-KiviServer @("--data-dir", $dataDir, "--port", "9100", "--workers", "2", "--pin", "none", "--admin", "127.0.0.1:19081", "--no-checkpoint") (Join-Path $outDir "server-durable.log") 9100
+    $durablePid = Start-KiviServer @("--data-dir", $dataDir, "--port", "9100", "--workers", "2", "--placement", "none", "--admin", "127.0.0.1:19081", "--no-checkpoint") (Join-Path $outDir "server-durable.log") 9100
     Invoke-Bench "native-durable-set-b16-1t" "--target native --server 127.0.0.1:9100 --threads 1 --ops 5000 --warmup 500 --workload set --keys uniform:256 --prefix base:dur:set1: --value-size b16"
     Invoke-Bench "native-durable-set-b16-8t" "--target native --server 127.0.0.1:9100 --threads 8 --ops 5000 --warmup 500 --workload set --keys uniform:256 --prefix base:dur:set8: --value-size b16"
     Invoke-Bench "native-durable-get-b16-8t" "--target native --server 127.0.0.1:9100 --threads 8 --ops 5000 --warmup 500 --workload get --keys uniform:256 --prefix base:dur:set8: --value-size b16"

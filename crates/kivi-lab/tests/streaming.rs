@@ -39,7 +39,7 @@ fn network() -> EngineNetwork {
         ports: Vec::new(),
         bind_ip: [127, 0, 0, 1].into(),
         max_frame: kivi_protocol::DEFAULT_MAX_FRAME,
-        affinity: kivi_engine::AffinityMode::Disabled,
+        placement: kivi_engine::ThreadPlacement::unbound(),
         node_id: NodeId::from_u64(1),
         cluster_id: ClusterId::from_u128(1),
         incarnation: NodeIncarnation::INITIAL,
@@ -51,6 +51,7 @@ fn network() -> EngineNetwork {
 fn start_ephemeral(chunks: ChunkFabricConfig) -> LocalEngine {
     LocalEngine::start(EngineConfig {
         namespace: NS,
+        hardware: kivi_engine::HardwareConfig::default(),
         directory: directory(),
         placement: placement(),
         worker_count: 2,
@@ -67,6 +68,7 @@ fn start_durable(dir: &std::path::Path) -> LocalEngine {
     let opened = kivi_durability::open_data_dir(dir).expect("data dir opens");
     LocalEngine::start(EngineConfig {
         namespace: NS,
+        hardware: kivi_engine::HardwareConfig::default(),
         directory: directory(),
         placement: placement(),
         worker_count: 2,

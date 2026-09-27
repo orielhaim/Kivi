@@ -21,6 +21,7 @@ members = [
     "crates/kivi-observation",
     "crates/kivi-lab",
     "crates/kivi-redundancy",
+    "crates/kivi-hardware",
 ]
 
 [workspace.package]
@@ -47,6 +48,7 @@ kivi-memory = { path = "crates/kivi-memory", version = "0.1.0" }
 kivi-control = { path = "crates/kivi-control", version = "0.1.0" }
 kivi-redundancy = { path = "crates/kivi-redundancy", version = "0.1.0" }
 kivi-observation = { path = "crates/kivi-observation", version = "0.1.0" }
+kivi-hardware = { path = "crates/kivi-hardware", version = "0.1.0" }
 
 # Mechanism crates borrowed per RFC §209 ("borrow mechanisms, own semantics").
 # The project owns all wire/durable formats; these crates never define them.
@@ -85,6 +87,7 @@ http = "1.5"
 rcgen = "0.14"
 rustls = "0.23"
 core_affinity2 = "0.16"
+multiversion = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"

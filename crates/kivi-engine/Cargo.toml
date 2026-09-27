@@ -23,7 +23,7 @@ bytes.workspace = true
 arc-swap.workspace = true
 crossbeam-channel.workspace = true
 compio.workspace = true
-core_affinity2.workspace = true
+kivi-hardware.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 # Ephemeral-mode chunk lane root: a per-process TempDir (auto-removed on

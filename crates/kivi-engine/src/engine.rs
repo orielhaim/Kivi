@@ -30,6 +30,7 @@ use kivi_types::{
     ClusterId, NamespaceId, NodeId, NodeIncarnation, TabletId, WallTimestamp, WorkerId,
 };
 
+use crate::placement::ThreadPlacement;
 use crate::routing::{Placement, RoutingError, RoutingSnapshot};
 use crate::tablet::{LiveTablet, TabletError};
 use crate::worker::{
@@ -93,6 +94,8 @@ struct CheckpointSpawn {
     tablets: Vec<TabletId>,
     /// Owner worker per tablet (authoritative placement for WAL attribution).
     placement: std::collections::HashMap<TabletId, WorkerId>,
+    /// Where this node's owner threads run.
+    thread_placement: crate::placement::ThreadPlacement,
     /// Whether all workers share WAL lane 0.
     shared_wal: bool,
     /// Engine-global in-flight staging pins for chunk GC roots.
@@ -145,8 +148,13 @@ pub struct EngineConfig {
     /// journals seal locators for recovery).
     pub fabric: crate::fabric::FabricConfig,
     /// Network serving. `None` keeps channel-only workers (embedded use,
-    /// tests); `Some` binds one native endpoint per worker with CPU affinity.
+    /// tests); `Some` binds one native endpoint per worker.
     pub network: Option<crate::net::EngineNetwork>,
+    /// Where this node's owner threads run, decided from the real machine.
+    /// Physical placement, entirely separate from the logical `placement`
+    /// above: that one says which worker owns which tablet, this one says
+    /// which core that worker runs on.
+    pub hardware: crate::placement::HardwareConfig,
     /// Durability mode. `Ephemeral` keeps the pure in-memory behavior;
     /// `Durable` persists every mutating request through per-worker WAL
     /// lanes and replays them at startup before any listener binds.
@@ -308,7 +316,7 @@ pub enum EngineError {
     /// Tablet logic rejected or failed the operation.
     #[error("{0}")]
     Tablet(#[from] TabletError),
-    /// A networked worker failed to start (affinity, runtime, or bind).
+    /// A networked worker failed to start (placement, runtime, or bind).
     #[error("networked worker failed to start: {0}")]
     NetStart(#[from] crate::net::NetStartError),
     /// Routing construction or replacement was incoherent.
@@ -635,6 +643,35 @@ impl AdminHandle {
         out
     }
 
+    /// Reads every worker's own performance counters for the interval that
+    /// just ended.
+    ///
+    /// The counters are read *on* each worker thread, because that is the only
+    /// thread whose instructions they describe; this call is a rendezvous, not
+    /// a measurement. Blocks on each worker's bounded control channel, so
+    /// serve it from `spawn_blocking`. A worker whose kernel refused to open
+    /// counters reports the software-only reading rather than being omitted,
+    /// so "no hardware" and "no worker" stay distinguishable downstream.
+    #[must_use]
+    pub fn hardware_samples_snapshot(
+        &self,
+    ) -> Vec<(WorkerId, kivi_memory::hardware::HardwareSample)> {
+        let mut out = Vec::new();
+        for (id, control) in &self.controls {
+            let (respond, receive) = crossbeam_channel::bounded(1);
+            if control
+                .try_send(crate::worker::WorkerControl::HardwareSample { respond })
+                .is_err()
+            {
+                continue;
+            }
+            if let Ok(sample) = receive.recv() {
+                out.push((*id, sample));
+            }
+        }
+        out
+    }
+
     /// Snapshots the redundancy fabric for the admin plane (`None` in
     /// ephemeral mode, which holds no fabric). Additive: existing admin
     /// DTOs are untouched; a future `kivi-server` `/v1/redundancy`
@@ -687,6 +724,9 @@ impl LocalEngine {
                 reason: "request_capacity must be nonzero".to_owned(),
             });
         }
+        let hardware = config.hardware;
+        let thread_placement = ThreadPlacement::resolve(hardware.strategy, config.worker_count);
+        tracing::info!(placement = %thread_placement.summary(), "thread placement resolved");
         let routing = RoutingSnapshot::build(
             config.namespace,
             config.directory,
@@ -849,6 +889,7 @@ impl LocalEngine {
                 paths,
                 config.fabric.arena_bytes_per_worker,
                 config.fabric.demotion_bytes_per_worker,
+                &thread_placement,
             )
             .map_err(EngineError::Fabric)?;
             fabrics.push(fabric);
@@ -883,6 +924,7 @@ impl LocalEngine {
                     &routing,
                     config.namespace,
                     config.worker_count,
+                    &thread_placement,
                 )?;
                 let info = EngineDurability {
                     data_dir: cfg.data_dir.clone(),
@@ -917,6 +959,7 @@ impl LocalEngine {
                     incarnation: cfg.incarnation,
                     tablets,
                     placement,
+                    thread_placement: thread_placement.clone(),
                     shared_wal: cfg.shared_wal,
                     pins: Arc::clone(&chunk_pins),
                     chunk_lanes: chunk_access
@@ -970,6 +1013,7 @@ impl LocalEngine {
                     lanes,
                     chunk_access,
                     fabrics,
+                    &thread_placement,
                 );
                 (workers, senders, Vec::new())
             }
@@ -1035,7 +1079,7 @@ impl LocalEngine {
                 admin: Arc::clone(&checkpoint_admin),
                 redundancy: spawn.redundancy.clone(),
             };
-            crate::checkpoint::CheckpointWorkerHandle::spawn(context)
+            crate::checkpoint::CheckpointWorkerHandle::spawn(context, spawn.thread_placement)
         });
         Ok(Self {
             shared: Arc::new(EngineShared {
@@ -1072,6 +1116,7 @@ impl LocalEngine {
         routing: &RoutingSnapshot,
         namespace: NamespaceId,
         worker_count: usize,
+        placement: &ThreadPlacement,
     ) -> Result<DurableBootstrap, EngineError> {
         let identity = LaneIdentity {
             cluster: cfg.cluster,
@@ -1165,7 +1210,14 @@ impl LocalEngine {
             for live in &mut by_worker[index] {
                 live.enable_band_tracking(namespace);
             }
-            let durable = WorkerDurability::spawn(namespace, worker, cfg.batch, access, initial)?;
+            let durable = WorkerDurability::spawn(
+                namespace,
+                worker,
+                cfg.batch,
+                access,
+                initial,
+                placement.clone(),
+            )?;
             maintenance.push((worker, durable.maintenance()));
             out.push(durable);
         }
@@ -1567,6 +1619,7 @@ impl LocalEngine {
         lanes: Vec<Option<WorkerDurability>>,
         chunks: Vec<crate::worker::WorkerChunks>,
         fabrics: Vec<crate::fabric::TabletFabric>,
+        placement: &ThreadPlacement,
     ) -> (Vec<WorkerHandle>, Vec<RequestIngress>) {
         let mut workers = Vec::with_capacity(worker_count);
         let mut senders = Vec::with_capacity(worker_count);
@@ -1578,8 +1631,15 @@ impl LocalEngine {
             .zip(fabrics)
         {
             let id = WorkerId::from_u64(index as u64);
-            let handle =
-                WorkerHandle::spawn(id, tablets, request_capacity, durability, chunks, fabric);
+            let handle = WorkerHandle::spawn(
+                id,
+                tablets,
+                request_capacity,
+                durability,
+                chunks,
+                fabric,
+                placement.clone(),
+            );
             senders.push(handle_sender(&handle));
             workers.push(handle);
         }
@@ -1676,9 +1736,8 @@ impl LocalEngine {
                 crate::net::NetLaunch {
                     routing: Arc::clone(routing),
                     net,
-                    affinity: network.affinity.clone(),
+                    placement: network.placement.clone(),
                     worker_index: index,
-                    worker_count,
                 },
             )
             .map_err(EngineError::NetStart)?;

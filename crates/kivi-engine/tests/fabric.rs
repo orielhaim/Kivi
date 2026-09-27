@@ -116,6 +116,7 @@ fn start_ephemeral(
 ) -> LocalEngine {
     LocalEngine::start(EngineConfig {
         namespace: NS,
+        hardware: kivi_engine::HardwareConfig::default(),
         directory,
         placement,
         worker_count,
@@ -143,6 +144,7 @@ fn durable(dir: &Path, fabric: FabricConfig) -> EngineConfig {
     let opened = kivi_durability::open_data_dir(dir).expect("data dir opens");
     EngineConfig {
         namespace: NS,
+        hardware: kivi_engine::HardwareConfig::default(),
         directory: root_snapshot(),
         placement: Placement::new([(TABLET, worker(0))]),
         worker_count: 2,
@@ -589,6 +591,7 @@ fn durable_split(dir: &Path, fabric: FabricConfig) -> EngineConfig {
     let opened = kivi_durability::open_data_dir(dir).expect("data dir opens");
     EngineConfig {
         namespace: NS,
+        hardware: kivi_engine::HardwareConfig::default(),
         directory: split_snapshot(),
         placement: Placement::new([
             (TabletId::from_u64(2), worker(0)),

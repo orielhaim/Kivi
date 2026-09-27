@@ -12,9 +12,10 @@ use crate::metadata::{
 use crate::scope::ObservationScope;
 use crate::signals::{
     CompressionSignal, ComputeSignal, ConsensusLagSignal, CriticalityScore, DegradedAssetsSignal,
-    ExecutionCriticalityApproximation, ExecutionCriticalitySignal, IoSignal, MaintenanceDebtSignal,
-    MemoryPressureSignal, MemorySignal, MigrationCostSignal, ObservationSample, QueueingSignal,
-    RedundancySignal, RequestSignal, TopologyImbalanceSignal, TypedSignal, UnitInterval,
+    ExecutionCriticalityApproximation, ExecutionCriticalitySignal, HardwareSignal, HardwareSummary,
+    IoSignal, MaintenanceDebtSignal, MemoryPressureSignal, MemorySignal, MigrationCostSignal,
+    ObservationSample, QueueingSignal, RedundancySignal, RequestSignal, TopologyImbalanceSignal,
+    TypedSignal, UnitInterval,
 };
 use crate::sketch::{HotKeyConcentration, HotKeyEntry, HotKeySketch};
 use crate::window::{ObservationSequence, ObservationWindowId};
@@ -439,6 +440,8 @@ pub struct ScopeSnapshot {
     pub hot_keys: HotKeySummary,
     /// Execution criticality summary.
     pub execution_criticality: Option<ExecutionCriticalitySummary>,
+    /// Hardware performance evidence for this scope.
+    pub hardware: HardwareSummary,
 }
 
 /// Deterministic point-in-time observation snapshot.
@@ -639,6 +642,8 @@ struct ScopeState {
     topology: Option<TopologySummary>,
     hot_keys: HotKeySketch,
     criticality: CriticalityAccumulator,
+    /// Hardware performance evidence, folded by extremes rather than by mean.
+    hardware: HardwareSummary,
 }
 
 impl ScopeState {
@@ -675,6 +680,7 @@ impl ScopeState {
             hot_keys: HotKeySketch::new(limits.hot_key_capacity)
                 .expect("validated hot-key capacity is nonzero"),
             criticality: CriticalityAccumulator::default(),
+            hardware: HardwareSummary::absent(),
         }
     }
 
@@ -713,6 +719,7 @@ impl ScopeState {
                 .observe(&signal)
                 .map_err(|_| ApplyError::HotKey)?,
             TypedSignal::ExecutionCriticality(signal) => self.criticality.observe(&signal),
+            TypedSignal::Hardware(signal) => merge_hardware(&mut self.hardware, &signal),
         }
         self.oldest_observed_at = self.oldest_observed_at.min(sample.metadata.observed_at);
         self.latest_observed_at = self.latest_observed_at.max(sample.metadata.observed_at);
@@ -800,6 +807,7 @@ impl ScopeState {
                 entries: self.hot_keys.entries(),
             },
             execution_criticality: self.criticality.summary(),
+            hardware: self.hardware,
         }
     }
 }
@@ -1176,6 +1184,50 @@ fn merge_degraded_assets(
     })
 }
 
+/// Folds one hardware sample into a scope's summary.
+///
+/// The rule is *extremes, never means*: a window that multiplexed its counters
+/// lowers trust for the whole scope and cannot be averaged away, a window that
+/// stalled badly is the worst window rather than the mean one, and a controller
+/// asking whether a worker ever reached full issue needs the best window rather
+/// than the average. A sample that measured nothing leaves the summary exactly
+/// as it was, which is what makes "no PMU" and "a PMU that reported nothing"
+/// the same case all the way to the consumer.
+fn merge_hardware(into: &mut HardwareSummary, signal: &HardwareSignal) {
+    // Counters are additive even when a sample is not measured, because a page
+    // fault count is a page fault count whether a stall counter was readable or
+    // not. A software PMU event is a hardware observation.
+    into.page_faults = into.page_faults.saturating_add(signal.page_faults);
+    into.context_switches = into
+        .context_switches
+        .saturating_add(signal.context_switches);
+    into.migrations = into.migrations.saturating_add(signal.migrations);
+    if !signal.hardware_measured {
+        return;
+    }
+    into.measured = true;
+    let trust = signal.trust();
+    into.trust = if into.trust == 0.0 {
+        trust
+    } else {
+        into.trust.min(trust)
+    };
+    into.worst_stall_fraction = into
+        .worst_stall_fraction
+        .max(signal.stall_fraction.as_f64());
+    into.worst_cache_miss_ratio = into
+        .worst_cache_miss_ratio
+        .max(signal.cache_miss_ratio.as_f64());
+    into.worst_branch_miss_ratio = into
+        .worst_branch_miss_ratio
+        .max(signal.branch_miss_ratio.as_f64());
+    into.best_ipc = into.best_ipc.max(signal.ipc);
+    into.worst_cost_multiplier = into.worst_cost_multiplier.max(signal.cost_multiplier());
+    if signal.cache_sensitivity > into.cache_sensitivity {
+        into.cache_sensitivity = signal.cache_sensitivity;
+    }
+}
+
 fn topology(signal: &TopologyImbalanceSignal) -> TopologySummary {
     TopologySummary {
         worker_max_to_mean: nonunit_ratio(signal.busiest_worker_load, signal.mean_worker_load),
@@ -1255,6 +1307,121 @@ mod tests {
 
     fn worker(id: u64) -> ObservationScope {
         ObservationScope::Worker(WorkerId::from_u64(id))
+    }
+
+    /// A measured hardware reading with the given shape.
+    fn hardware(
+        stall: f64,
+        cache_miss: f64,
+        ipc: f64,
+        measured: bool,
+        confidence_ppm: u32,
+    ) -> crate::signals::HardwareSignal {
+        crate::signals::HardwareSignal {
+            ipc,
+            stall_fraction: UnitInterval::new(stall).unwrap_or(UnitInterval::ZERO),
+            cache_miss_ratio: UnitInterval::new(cache_miss).unwrap_or(UnitInterval::ZERO),
+            branch_miss_ratio: UnitInterval::new(0.05).unwrap_or(UnitInterval::ZERO),
+            page_faults: 7,
+            context_switches: 3,
+            migrations: 1,
+            cache_sensitivity: crate::signals::HardwareCacheSensitivity::MemoryBound,
+            cost_multiplier_ppm: 1_500_000,
+            hardware_measured: measured,
+            hardware_confidence_ppm: confidence_ppm,
+        }
+    }
+
+    /// Folds a series of hardware signals into one scope snapshot.
+    fn fold(signals: impl IntoIterator<Item = crate::signals::HardwareSignal>) -> HardwareSummary {
+        let mut fabric = ObservationFabric::new(limits(1, 32, 4));
+        for (index, signal) in signals.into_iter().enumerate() {
+            let sequence = u64::try_from(index + 1).expect("sequence");
+            fabric
+                .collect(&sample(worker(1), sequence, TypedSignal::Hardware(signal)))
+                .expect("collect");
+        }
+        fabric
+            .snapshot(Ticks::from_micros(1_000))
+            .scopes
+            .first()
+            .expect("worker scope")
+            .hardware
+    }
+
+    #[test]
+    fn hardware_keeps_the_worst_window_and_the_best_issue_rate() {
+        // The rule is deliberately not a mean. A controller asking "did this
+        // worker ever stall badly" needs the worst window, and a controller
+        // asking "could it ever reach full issue" needs the best. Averaging
+        // either one is how the event that mattered disappears.
+        let summary = fold([
+            hardware(0.10, 0.05, 3.5, true, 1_000_000),
+            hardware(0.80, 0.60, 0.4, true, 1_000_000),
+            hardware(0.30, 0.40, 2.0, true, 1_000_000),
+        ]);
+        assert!(summary.measured);
+        assert!(
+            (summary.worst_stall_fraction - 0.80).abs() < 1e-9,
+            "the worst stall"
+        );
+        assert!(
+            (summary.worst_cache_miss_ratio - 0.60).abs() < 1e-9,
+            "the worst miss ratio"
+        );
+        assert!((summary.best_ipc - 3.5).abs() < 1e-9, "the best issue rate");
+        assert!((summary.worst_cost_multiplier - 1.5).abs() < 1e-9);
+        assert_eq!(
+            summary.cache_sensitivity,
+            crate::signals::HardwareCacheSensitivity::MemoryBound
+        );
+        // Counts are events, not ratios: they accumulate.
+        assert_eq!(summary.page_faults, 21);
+        assert_eq!(summary.context_switches, 9);
+        assert_eq!(summary.migrations, 3);
+    }
+
+    #[test]
+    fn hardware_trust_is_the_worst_sample_not_the_average() {
+        // One multiplexed window out of three must not be averaged away by two
+        // exact ones. A consumer either believes the whole window or does not
+        // believe it; "mostly" is not a number it can act on.
+        let summary = fold([
+            hardware(0.1, 0.1, 2.0, true, 1_000_000),
+            hardware(0.1, 0.1, 2.0, true, 400_000),
+            hardware(0.1, 0.1, 2.0, true, 1_000_000),
+        ]);
+        assert!((summary.trust - 0.4).abs() < 1e-9, "{}", summary.trust);
+    }
+
+    #[test]
+    fn an_unmeasured_hardware_sample_contributes_counts_but_no_verdict() {
+        // A software PMU event (a page fault, a migration) is a fact about the
+        // machine whether or not a stall counter was readable. But an
+        // unmeasured sample must not set `measured`, must not lower trust, and
+        // must not contribute a ratio.
+        let summary = fold([
+            hardware(0.5, 0.4, 1.0, true, 1_000_000),
+            crate::signals::HardwareSignal::software_only(),
+        ]);
+        assert!(summary.measured, "an earlier real reading still stands");
+        assert!(
+            (summary.trust - 1.0).abs() < 1e-9,
+            "an unmeasured sample cannot lower trust"
+        );
+        assert!((summary.worst_stall_fraction - 0.5).abs() < 1e-9);
+        assert_eq!(summary.page_faults, 7, "the count still arrived");
+    }
+
+    #[test]
+    fn a_scope_with_no_hardware_at_all_is_absent_not_measured() {
+        // The distinction the whole design turns on: "no counter" and "a
+        // counter that reported nothing" are the same case, and neither is
+        // evidence.
+        let summary = fold([crate::signals::HardwareSignal::software_only()]);
+        assert!(!summary.measured);
+        assert!(summary.trust <= 0.0);
+        assert_eq!(summary, HardwareSummary::absent());
     }
 
     #[test]
@@ -1371,6 +1538,7 @@ mod tests {
                 access_latency_ns: 200,
                 logical_bytes: 64,
             }),
+            TypedSignal::Hardware(hardware(0.4, 0.3, 3.0, true, 1_000_000)),
         ];
         let mut fabric = ObservationFabric::new(limits(1, 32, 4));
         for (index, signal) in signals.into_iter().enumerate() {
@@ -1381,7 +1549,7 @@ mod tests {
         }
         let snapshot = fabric.snapshot(Ticks::from_micros(1_000));
         let state = snapshot.scopes.first().expect("worker state");
-        assert_eq!(state.sample_count, 17);
+        assert_eq!(state.sample_count, 18);
         assert_eq!(state.evidence.confidence, Confidence::High);
         assert_eq!(state.evidence.freshness.status, FreshnessStatus::Current);
         assert!(
@@ -1419,6 +1587,10 @@ mod tests {
         );
         assert_eq!(state.hot_keys.entries.len(), 1);
         assert!(state.execution_criticality.is_some());
+        assert!(
+            state.hardware.measured,
+            "the hardware sample is not dropped"
+        );
     }
 
     #[test]

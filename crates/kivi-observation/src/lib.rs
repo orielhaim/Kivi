@@ -31,10 +31,11 @@ pub use scope::ObservationScope;
 pub use signals::{
     CheckpointDebt, CompressionSignal, ComputeSignal, ConsensusLagSignal, CriticalityScore,
     DegradedAssetsSignal, ExecutionCriticalityApproximation, ExecutionCriticalitySignal,
-    HotKeySignal, IoSignal, LatencySignal, MaintenanceDebtSignal, MemoryPressureSignal,
-    MemorySignal, MigrationCostSignal, NetworkBytes, ObservationSample, OffcoreLatencySignal,
-    QueueingSignal, RedundancySignal, RepairDebt, RequestSignal, ScrubDebt, StorageBytes,
-    TopologyImbalanceSignal, TypedSignal, UnitInterval,
+    HardwareCacheSensitivity, HardwareSignal, HardwareSummary, HotKeySignal, IoSignal,
+    LatencySignal, MaintenanceDebtSignal, MemoryPressureSignal, MemorySignal, MigrationCostSignal,
+    NetworkBytes, ObservationSample, OffcoreLatencySignal, QueueingSignal, RedundancySignal,
+    RepairDebt, RequestSignal, ScrubDebt, StorageBytes, TopologyImbalanceSignal, TypedSignal,
+    UnitInterval,
 };
 pub use sketch::{
     ExecutionClass, HotKeyClassification, HotKeyConcentration, HotKeyEntry, HotKeyError, HotKeyId,

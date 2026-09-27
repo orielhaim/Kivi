@@ -51,6 +51,7 @@ fn root_engine() -> LocalEngine {
     .expect("active root");
     LocalEngine::start(EngineConfig {
         namespace: NS,
+        hardware: kivi_engine::HardwareConfig::default(),
         directory,
         placement: Placement::new([(tablet, WorkerId::from_u64(0))]),
         worker_count: 1,
@@ -185,6 +186,7 @@ fn net_engine() -> LocalEngine {
     .expect("active root");
     LocalEngine::start(EngineConfig {
         namespace: NS,
+        hardware: kivi_engine::HardwareConfig::default(),
         directory,
         placement: Placement::new([(tablet, WorkerId::from_u64(0))]),
         worker_count: 1,
@@ -196,7 +198,7 @@ fn net_engine() -> LocalEngine {
             ports: Vec::new(),
             bind_ip: [127, 0, 0, 1].into(),
             max_frame: kivi_protocol::DEFAULT_MAX_FRAME,
-            affinity: kivi_engine::AffinityMode::Disabled,
+            placement: kivi_engine::ThreadPlacement::unbound(),
             node_id: NodeId::from_u64(1),
             cluster_id: ClusterId::from_u128(1),
             incarnation: NodeIncarnation::INITIAL,

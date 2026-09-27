@@ -277,6 +277,65 @@ pub struct ExecutionCriticalitySignal {
     pub logical_bytes: u64,
 }
 
+/// Aggregated hardware performance evidence for one scope.
+///
+/// The aggregation is deliberately a *minimum* for trust and a *maximum* for
+/// distress, which is the same rule the fabric uses everywhere else: a window in
+/// which the counters were multiplexed lowers confidence for the whole scope
+/// and cannot be averaged away, and a window in which the core stalled badly is
+/// the worst window, not the mean one. Averaging a stall fraction would hide
+/// exactly the event a controller needs to see.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HardwareSummary {
+    /// Worst stall fraction observed, in `[0, 1]`.
+    pub worst_stall_fraction: f64,
+    /// Worst last-level cache miss ratio observed, in `[0, 1]`.
+    pub worst_cache_miss_ratio: f64,
+    /// Worst branch misprediction ratio observed, in `[0, 1]`.
+    pub worst_branch_miss_ratio: f64,
+    /// Best instructions-per-cycle observed, in `[0, 8]`. The *best*, because a
+    /// controller deciding whether a worker is CPU bound needs to know whether
+    /// it ever reached full issue, not whether it usually did.
+    pub best_ipc: f64,
+    /// Total minor page faults across the window.
+    pub page_faults: u64,
+    /// Total involuntary context switches across the window.
+    pub context_switches: u64,
+    /// Total CPU migrations across the window.
+    pub migrations: u64,
+    /// Whether any sample in the window carried hardware evidence.
+    pub measured: bool,
+    /// Lowest source trust across the window, in `(0, 1]`. Zero when nothing
+    /// was measured.
+    pub trust: f64,
+    /// Worst cost multiplier observed, in `[1, 4]`.
+    pub worst_cost_multiplier: f64,
+    /// Cache sensitivity of the worst window.
+    pub cache_sensitivity: HardwareCacheSensitivity,
+}
+
+impl HardwareSummary {
+    /// The summary of a window with no hardware evidence: every field neutral
+    /// and `measured` false, so a consumer's "was this measured" question has
+    /// one answer.
+    #[must_use]
+    pub const fn absent() -> Self {
+        Self {
+            worst_stall_fraction: 0.0,
+            worst_cache_miss_ratio: 0.0,
+            worst_branch_miss_ratio: 0.0,
+            best_ipc: 0.0,
+            page_faults: 0,
+            context_switches: 0,
+            migrations: 0,
+            measured: false,
+            trust: 0.0,
+            worst_cost_multiplier: 1.0,
+            cache_sensitivity: HardwareCacheSensitivity::Resident,
+        }
+    }
+}
+
 /// Nonnegative integer execution-criticality score.
 ///
 /// The unit is an approximate weighted nanosecond of pressure per logical
@@ -369,6 +428,129 @@ fn fraction(numerator: u64, denominator: u64) -> f64 {
     }
 }
 
+/// How sensitive a serving thread's working set is to cache capacity.
+///
+/// Ordered by severity, so a fold that keeps the worst window is a comparison
+/// rather than a hand-written match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum HardwareCacheSensitivity {
+    /// The working set fits wherever it is put.
+    Resident,
+    /// Larger than the last-level cache, so tier and core both matter.
+    Sensitive,
+    /// Memory bound wherever it lives; only *where* it lives is a lever.
+    MemoryBound,
+}
+
+/// Hardware performance observations for one worker over one window.
+///
+/// This is the *only* shape in which hardware evidence enters the fabric. It
+/// is dimensionless and bounded, and it carries its own provenance
+/// (`hardware_measured`, `hardware_confidence_ppm`) rather than relying on the
+/// sample's metadata, because a consumer reads the signal and the metadata
+/// separately and must not have to guess which of the two describes the
+/// evidence.
+///
+/// Every field is a zero when no hardware source was available, which is
+/// deliberately the same value a source that measured nothing would produce:
+/// a machine without a PMU and a PMU that reported nothing are the same case,
+/// and nothing downstream can tell them apart or needs to.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HardwareSignal {
+    /// Instructions retired per hardware cycle, in `[0, 8]`. Zero when the
+    /// denominator was not hardware cycles.
+    pub ipc: f64,
+    /// Fraction of the interval the core could not issue.
+    pub stall_fraction: UnitInterval,
+    /// Last-level cache misses per cache reference.
+    pub cache_miss_ratio: UnitInterval,
+    /// Branch mispredictions per branch.
+    pub branch_miss_ratio: UnitInterval,
+    /// Minor page faults in the interval.
+    pub page_faults: u64,
+    /// Involuntary context switches in the interval.
+    pub context_switches: u64,
+    /// CPU migrations of the serving thread in the interval.
+    pub migrations: u64,
+    /// Cache sensitivity implied by the traffic and the machine's behaviour.
+    pub cache_sensitivity: HardwareCacheSensitivity,
+    /// Relative cost of the interval's work in parts per million, where
+    /// `1_000_000` is unchanged and the cap is `4_000_000`.
+    pub cost_multiplier_ppm: u32,
+    /// Whether a hardware source actually contributed. `false` means every
+    /// numeric field above is neutral and nothing may be concluded from it.
+    pub hardware_measured: bool,
+    /// How much the source can be trusted, in parts per million where
+    /// `1_000_000` is exact. A multiplexed counter set reports less.
+    pub hardware_confidence_ppm: u32,
+}
+
+impl HardwareSignal {
+    /// The software-only reading: every hardware field at its neutral value.
+    #[must_use]
+    pub const fn software_only() -> Self {
+        Self {
+            ipc: 0.0,
+            stall_fraction: UnitInterval::ZERO,
+            cache_miss_ratio: UnitInterval::ZERO,
+            branch_miss_ratio: UnitInterval::ZERO,
+            page_faults: 0,
+            context_switches: 0,
+            migrations: 0,
+            cache_sensitivity: HardwareCacheSensitivity::Resident,
+            cost_multiplier_ppm: 1_000_000,
+            hardware_measured: false,
+            hardware_confidence_ppm: 0,
+        }
+    }
+
+    /// Whether the serving thread was moved between cores, which means the
+    /// placement plan's core is not the core the work happened on.
+    #[must_use]
+    pub const fn placement_unstable(&self) -> bool {
+        self.migrations > 0
+    }
+
+    /// Whether the serving thread looks memory bound: heavy stalls *and* heavy
+    /// last-level misses.
+    #[must_use]
+    pub const fn memory_bound(&self) -> bool {
+        self.stall_fraction.as_f64() > 0.35 && self.cache_miss_ratio.as_f64() > 0.2
+    }
+
+    /// Whether the serving thread looks CPU bound.
+    #[must_use]
+    pub const fn cpu_bound(&self) -> bool {
+        self.ipc >= 1.5 && self.stall_fraction.as_f64() < 0.15
+    }
+
+    /// How much the hardware raised the estimated cost of the interval, as a
+    /// multiple. Exactly `1.0` when nothing was measured.
+    #[must_use]
+    pub fn cost_multiplier(&self) -> f64 {
+        f64::from(self.cost_multiplier_ppm) / 1_000_000.0
+    }
+
+    /// How much the hardware source can be trusted, in `[0, 1]`.
+    #[must_use]
+    pub fn trust(&self) -> f64 {
+        f64::from(self.hardware_confidence_ppm) / 1_000_000.0
+    }
+
+    /// Whether a controller may act on this reading without corroboration.
+    ///
+    /// A hardware sample alone is never enough. The threshold is deliberately
+    /// high: a counter group the kernel had to multiplex is a real measurement
+    /// but a coarse one, and a decision that moves data between tiers should be
+    /// corroborated by a software counter that saw the same work.
+    #[must_use]
+    pub const fn is_actionable(&self, corroborating_accesses: u64) -> bool {
+        self.hardware_measured
+            && self.hardware_confidence_ppm >= 900_000
+            && corroborating_accesses > 0
+    }
+}
+
 /// Closed set of signals accepted by the observation fabric.
 ///
 /// Adding a signal requires adding a named variant and an explicit
@@ -409,6 +591,8 @@ pub enum TypedSignal {
     HotKey(HotKeySignal),
     /// Execution-criticality evidence.
     ExecutionCriticality(ExecutionCriticalitySignal),
+    /// Hardware performance evidence for the serving thread.
+    Hardware(HardwareSignal),
 }
 
 /// One complete typed observation ready for collection.
@@ -463,6 +647,111 @@ mod tests {
         assert_eq!(UnitInterval::new(-0.01), None);
         assert_eq!(UnitInterval::new(1.01), None);
         assert_eq!(UnitInterval::new(0.25), Some(UnitInterval(0.25)));
+    }
+
+    /// A measured reading, for the classification tests below.
+    fn measured(
+        ipc: f64,
+        stall: f64,
+        cache_miss: f64,
+        migrations: u64,
+        confidence_ppm: u32,
+    ) -> HardwareSignal {
+        HardwareSignal {
+            ipc,
+            stall_fraction: UnitInterval::new(stall).unwrap_or(UnitInterval::ZERO),
+            cache_miss_ratio: UnitInterval::new(cache_miss).unwrap_or(UnitInterval::ZERO),
+            branch_miss_ratio: UnitInterval::new(0.05).unwrap_or(UnitInterval::ZERO),
+            page_faults: 0,
+            context_switches: 0,
+            migrations,
+            cache_sensitivity: HardwareCacheSensitivity::Resident,
+            cost_multiplier_ppm: 1_000_000,
+            hardware_measured: true,
+            hardware_confidence_ppm: confidence_ppm,
+        }
+    }
+
+    #[test]
+    fn a_software_only_hardware_signal_concludes_nothing() {
+        // The whole design turns on this: "no counter" and "a counter that
+        // reported nothing" must be the same case, and neither is evidence.
+        let signal = HardwareSignal::software_only();
+        assert!(!signal.hardware_measured);
+        assert!(!signal.placement_unstable());
+        assert!(!signal.memory_bound());
+        assert!(!signal.cpu_bound());
+        assert!(signal.trust() <= 0.0);
+        assert!(
+            (signal.cost_multiplier() - 1.0).abs() <= f64::EPSILON,
+            "an unmeasured interval costs exactly what it would have cost anyway"
+        );
+    }
+
+    #[test]
+    fn a_migration_is_distinguishable_from_a_context_switch() {
+        // A context switch is the scheduler's business; a migration means the
+        // work happened on a core the placement plan did not choose, which is a
+        // different fact and the only one a controller can act on.
+        let switched = measured(2.0, 0.1, 0.1, 0, 1_000_000);
+        assert!(!switched.placement_unstable());
+        let migrated = measured(2.0, 0.1, 0.1, 1, 1_000_000);
+        assert!(migrated.placement_unstable());
+    }
+
+    #[test]
+    fn memory_bound_needs_both_stalls_and_misses() {
+        // Stalls alone could be a dependency chain; misses alone could be a cold
+        // start. Only the pair is a working set that does not fit.
+        let stalls_only = measured(0.4, 0.9, 0.05, 0, 1_000_000);
+        assert!(!stalls_only.memory_bound());
+        let misses_only = measured(0.4, 0.05, 0.9, 0, 1_000_000);
+        assert!(!misses_only.memory_bound());
+        let both = measured(0.4, 0.9, 0.9, 0, 1_000_000);
+        assert!(both.memory_bound());
+    }
+
+    #[test]
+    fn cpu_bound_needs_full_issue_and_few_stalls() {
+        let hot = measured(3.0, 0.01, 0.5, 0, 1_000_000);
+        assert!(hot.cpu_bound());
+        let stalled = measured(3.0, 0.9, 0.1, 0, 1_000_000);
+        assert!(
+            !stalled.cpu_bound(),
+            "a core that cannot issue is not compute bound"
+        );
+        let slow = measured(0.4, 0.01, 0.1, 0, 1_000_000);
+        assert!(
+            !slow.cpu_bound(),
+            "more cores would not help a serial chain"
+        );
+    }
+
+    #[test]
+    fn a_multiplexed_source_reports_partial_trust() {
+        // The value a controller gates on, so it is asserted directly rather than
+        // only through the fabric fold.
+        let exact = measured(2.0, 0.1, 0.1, 0, 1_000_000);
+        let scaled = measured(2.0, 0.1, 0.1, 0, 400_000);
+        assert!((exact.trust() - 1.0).abs() < 1e-9);
+        assert!((scaled.trust() - 0.4).abs() < 1e-9);
+        assert!(scaled.trust() < exact.trust());
+    }
+
+    #[test]
+    fn cache_sensitivity_is_ordered_so_a_worst_window_is_a_comparison() {
+        // The fold in the fabric keeps the maximum, so the ordering is what makes
+        // "keep the worst" one operation rather than a hand-written match.
+        assert!(HardwareCacheSensitivity::Resident < HardwareCacheSensitivity::Sensitive);
+        assert!(HardwareCacheSensitivity::Sensitive < HardwareCacheSensitivity::MemoryBound);
+        let worst = [
+            HardwareCacheSensitivity::Resident,
+            HardwareCacheSensitivity::MemoryBound,
+        ];
+        assert_eq!(
+            worst.into_iter().max(),
+            Some(HardwareCacheSensitivity::MemoryBound)
+        );
     }
 
     #[test]

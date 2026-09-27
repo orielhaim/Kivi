@@ -56,6 +56,7 @@ fn durable_config(dir: &std::path::Path) -> DurabilityMode {
 fn start(dir: &std::path::Path) -> LocalEngine {
     LocalEngine::start(EngineConfig {
         namespace: NS,
+        hardware: kivi_engine::HardwareConfig::default(),
         directory: directory(),
         placement: placement(),
         worker_count: 2,

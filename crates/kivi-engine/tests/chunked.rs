@@ -56,6 +56,7 @@ fn pattern_bytes(len: usize, seed: u64) -> bytes::Bytes {
 fn ephemeral(chunks: ChunkFabricConfig) -> LocalEngine {
     LocalEngine::start(EngineConfig {
         namespace: NS,
+        hardware: kivi_engine::HardwareConfig::default(),
         directory: directory(),
         placement: placement(),
         worker_count: 2,
@@ -85,6 +86,7 @@ fn durable_config(dir: &std::path::Path) -> DurabilityMode {
 fn durable(dir: &std::path::Path, chunks: ChunkFabricConfig) -> LocalEngine {
     LocalEngine::start(EngineConfig {
         namespace: NS,
+        hardware: kivi_engine::HardwareConfig::default(),
         directory: directory(),
         placement: placement(),
         worker_count: 2,
@@ -238,6 +240,7 @@ fn missing_chunk_packs_fail_startup_loudly() {
     std::fs::remove_dir_all(scratch.path().join("chunks")).expect("chunks destroyed");
     let error = LocalEngine::start(EngineConfig {
         namespace: NS,
+        hardware: kivi_engine::HardwareConfig::default(),
         directory: directory(),
         placement: placement(),
         worker_count: 2,

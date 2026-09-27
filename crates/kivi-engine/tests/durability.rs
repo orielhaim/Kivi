@@ -58,6 +58,7 @@ fn start(dir: &std::path::Path) -> (LocalEngine, NodeIncarnation) {
     let (durability, _, _, incarnation) = durable_config(dir);
     let engine = LocalEngine::start(EngineConfig {
         namespace: NS,
+        hardware: kivi_engine::HardwareConfig::default(),
         directory: directory(),
         placement: placement(),
         worker_count: 2,
@@ -117,6 +118,7 @@ fn recovery_rejects_forgotten_tablet() {
     let (durability, _, _, _) = durable_config(scratch.path());
     let err = LocalEngine::start(EngineConfig {
         namespace: NS,
+        hardware: kivi_engine::HardwareConfig::default(),
         directory: sealed,
         placement: placement(),
         worker_count: 2,

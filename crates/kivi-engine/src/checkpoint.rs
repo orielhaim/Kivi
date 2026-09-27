@@ -26,6 +26,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, bounded};
+use kivi_hardware::{PlacementRole, WorkerSlot};
+
+use crate::placement::ThreadPlacement;
 use kivi_checkpoint::{
     ArtifactHash, CheckpointIdentity, CheckpointPolicy, CurrentRecord, LoadedManifest,
     TabletSnapshot, build_tablet, publish_tablet,
@@ -202,11 +205,28 @@ pub(crate) struct CheckpointWorkerHandle {
 
 impl CheckpointWorkerHandle {
     /// Spawns the checkpoint worker thread.
-    pub(crate) fn spawn(context: CheckpointContext) -> Self {
+    pub(crate) fn spawn(context: CheckpointContext, placement: ThreadPlacement) -> Self {
         let (submit, receive) = bounded::<CheckpointCommand>(16);
         let thread = thread::Builder::new()
             .name("kivi-checkpoint".to_owned())
-            .spawn(move || run_checkpoint(context, &receive))
+            .spawn(move || {
+                // Checkpoint building is bandwidth bound and runs in the
+                // background, so it takes the last of the planned cores rather
+                // than the first. A refusal is reported, not swallowed: a
+                // checkpoint thread that believes it is placed and is not
+                // produces throughput numbers that mean nothing.
+                let slot = WorkerSlot::new(PlacementRole::CheckpointWorker, 0);
+                match placement.bind(slot) {
+                    Ok(_) => tracing::debug!(
+                        cpu = ?placement.current_cpu(),
+                        "checkpoint worker placed",
+                    ),
+                    Err(error) => {
+                        tracing::error!(?error, "checkpoint worker could not be placed");
+                    }
+                }
+                run_checkpoint(context, &receive);
+            })
             .expect("checkpoint thread spawns");
         Self {
             submit,

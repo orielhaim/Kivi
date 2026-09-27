@@ -979,6 +979,18 @@ pub enum ActionReason {
     ColdLargeAsset,
     /// Hot small assets.
     HotSmallAsset,
+    /// Sustained memory-bound serving thread, from hardware counters.
+    ///
+    /// The first reason in this enum whose evidence comes from outside the
+    /// process's own software counters. A reason that appears in an action
+    /// record is therefore also a claim about the machine, and the record's
+    /// evidence carries the source's trust.
+    SustainedMemoryBoundWorker,
+    /// Sustained CPU migrations of the serving thread, from hardware counters.
+    ///
+    /// The unambiguous statement that placement is not holding: the worker was
+    /// moved off the core it was given.
+    SustainedWorkerMigration,
     /// Safe learned alternative.
     LearnedAlternative,
 }
@@ -2360,6 +2372,27 @@ pub struct ObservationFeatures {
     pub cold_large_assets: bool,
     /// Whether retained assets are hot and small.
     pub hot_small_assets: bool,
+    /// Worst CPU stall fraction this window, in parts per million. Zero when no
+    /// hardware evidence contributed, which is deliberately the same value a
+    /// source that measured nothing would produce.
+    pub cpu_stall_ppm: u32,
+    /// Worst last-level cache miss ratio, in parts per million.
+    pub cache_miss_ppm: u32,
+    /// CPU migrations of the serving thread, which is the direct measurement
+    /// that placement is not holding.
+    pub cpu_migrations: u64,
+    /// How much the hardware source could be trusted, in parts per million.
+    /// Zero when nothing was measured, which is the gate every hardware-driven
+    /// decision is conditioned on.
+    pub hardware_trust_ppm: u32,
+    /// Whether a hardware source contributed at all.
+    pub hardware_measured: bool,
+    /// Whether the serving thread looked memory bound: heavy stalls *and* heavy
+    /// last-level misses.
+    pub memory_bound: bool,
+    /// Whether the serving thread looked CPU bound: high issue rate and few
+    /// stalls.
+    pub cpu_bound: bool,
 }
 
 impl ObservationFeatures {
@@ -2434,6 +2467,7 @@ impl ObservationFeatures {
             && entries
                 .iter()
                 .any(|entry| entry.classification.hotness == HotnessClass::Hot);
+        let hardware = HardwareFeatures::from_summary(snapshot.hardware);
         Self {
             memory_pressure_ppm,
             criticality,
@@ -2458,6 +2492,73 @@ impl ObservationFeatures {
             storage_hotspot,
             cold_large_assets,
             hot_small_assets,
+            cpu_stall_ppm: hardware.cpu_stall_ppm,
+            cache_miss_ppm: hardware.cache_miss_ppm,
+            cpu_migrations: hardware.cpu_migrations,
+            hardware_trust_ppm: hardware.hardware_trust_ppm,
+            hardware_measured: hardware.hardware_measured,
+            memory_bound: hardware.memory_bound,
+            cpu_bound: hardware.cpu_bound,
+        }
+    }
+}
+
+/// The hardware half of a feature vector.
+///
+/// A machine with no counters and a machine whose counters were multiplexed
+/// both land in the same struct, and the difference is `trust_ppm`, which every
+/// hardware-driven decision is gated on. Nothing in here reads a hardware field
+/// without first checking it, so a consumer cannot accidentally treat "no
+/// counter" as "no problem".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HardwareFeatures {
+    cpu_stall_ppm: u32,
+    cache_miss_ppm: u32,
+    cpu_migrations: u64,
+    hardware_trust_ppm: u32,
+    hardware_measured: bool,
+    memory_bound: bool,
+    cpu_bound: bool,
+}
+
+impl HardwareFeatures {
+    /// The all-zero half, for a scope with no hardware evidence.
+    const ABSENT: Self = Self {
+        cpu_stall_ppm: 0,
+        cache_miss_ppm: 0,
+        cpu_migrations: 0,
+        hardware_trust_ppm: 0,
+        hardware_measured: false,
+        memory_bound: false,
+        cpu_bound: false,
+    };
+
+    /// Derives the hardware features from a folded window summary.
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    fn from_summary(hardware: kivi_observation::HardwareSummary) -> Self {
+        if !hardware.measured {
+            return Self::ABSENT;
+        }
+        // A stall fraction or miss ratio outside the unit interval is not a
+        // measurement, it is a bug in a producer. Clamping keeps it from
+        // reaching a threshold comparison as a value the controller has never
+        // been reasoned about.
+        let cpu_stall_ppm = (hardware.worst_stall_fraction.clamp(0.0, 1.0) * 1_000_000.0) as u32;
+        let cache_miss_ppm = (hardware.worst_cache_miss_ratio.clamp(0.0, 1.0) * 1_000_000.0) as u32;
+        let hardware_trust_ppm = (hardware.trust.clamp(0.0, 1.0) * 1_000_000.0) as u32;
+        Self {
+            cpu_stall_ppm,
+            cache_miss_ppm,
+            cpu_migrations: hardware.migrations,
+            hardware_trust_ppm,
+            hardware_measured: true,
+            memory_bound: hardware.worst_stall_fraction > 0.35
+                && hardware.worst_cache_miss_ratio > 0.2,
+            cpu_bound: hardware.best_ipc >= 1.5 && hardware.worst_stall_fraction < 0.15,
         }
     }
 }
@@ -2489,6 +2590,16 @@ pub struct BaselineConfig {
     pub latency_p99_ns: u64,
     /// Topology imbalance threshold.
     pub topology_imbalance_ppm: u32,
+    /// Minimum hardware-source trust, in parts per million, before any
+    /// hardware-derived condition may be counted.
+    ///
+    /// The default is `900_000`, which excludes a counter group the kernel had
+    /// to multiplex. That is deliberate: a multiplexed ratio measured a
+    /// *different* set of instructions than the one the controller is reasoning
+    /// about, and acting on it is worse than not acting. A machine with no
+    /// counters at all reports zero trust and is therefore unaffected by every
+    /// hardware-driven branch.
+    pub hardware_min_trust_ppm: u32,
     /// Number of hot keys required for a many-key hotspot.
     pub many_hot_keys: usize,
     /// Many-key share threshold.
@@ -2538,6 +2649,7 @@ impl Default for BaselineConfig {
             repair_debt_age: Duration::from_secs(5),
             latency_p99_ns: 1_000_000,
             topology_imbalance_ppm: 2_000_000,
+            hardware_min_trust_ppm: 900_000,
             many_hot_keys: 2,
             many_hot_key_share_ppm: 500_000,
             strict_single_key_share_ppm: 900_000,
@@ -2575,6 +2687,12 @@ struct WindowSignals {
     many_hotspot: u16,
     cold_large: u16,
     hot_small: u16,
+    /// Consecutive windows in which the serving thread looked memory bound on
+    /// hardware evidence.
+    memory_bound: u16,
+    /// Consecutive windows in which the serving thread was migrated off the
+    /// core it was placed on.
+    migrated: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -2646,6 +2764,15 @@ impl SustainedWindows {
         update_count(&mut state.many_hotspot, features.many_key_hotspot);
         update_count(&mut state.cold_large, features.cold_large_assets);
         update_count(&mut state.hot_small, features.hot_small_assets);
+        // Hardware-derived conditions are gated on trust before they are
+        // counted at all. A window with no counters, or with counters the
+        // kernel had to multiplex, cannot make a worker's placement worse or
+        // better, and counting it as "not memory bound" would let a quiet
+        // window erase the evidence from a real one.
+        let trusted = features.hardware_measured
+            && features.hardware_trust_ppm >= config.hardware_min_trust_ppm;
+        update_count(&mut state.memory_bound, trusted && features.memory_bound);
+        update_count(&mut state.migrated, trusted && features.cpu_migrations > 0);
         self.states.insert(window, state);
         self.order.push_back(window);
         while self.order.len() > self.capacity {
@@ -2842,6 +2969,12 @@ impl BaselineController {
         let hot_small = self
             .sustained
             .sustained(|state| state.hot_small, self.config.sustained_windows);
+        let memory_bound = self
+            .sustained
+            .sustained(|state| state.memory_bound, self.config.sustained_windows);
+        let migrated = self
+            .sustained
+            .sustained(|state| state.migrated, self.config.sustained_windows);
 
         if memory_high {
             reason = ActionReason::SustainedMemoryPressure;
@@ -2917,6 +3050,53 @@ impl BaselineController {
                     observation,
                 );
             }
+        } else if memory_bound {
+            // The serving thread is stalling on memory the cache cannot hold.
+            // Every other branch in this loop would respond by doing *more*
+            // background work, and background work is what competes for the
+            // bandwidth the working set needs. So the response is to spend
+            // less: shrink the maintenance budgets rather than grow them.
+            //
+            // The evidence is gated twice — once on source trust, once on
+            // `sustained_windows` — so a single window in which a worker
+            // happened to miss the cache cannot change any policy.
+            reason = ActionReason::SustainedMemoryBoundWorker;
+            let action = Action::AdjustScrubBudget {
+                scope: context.scope,
+                target: context.primary_target,
+                budget: self.scrub_budget.saturating_sub(self.config.scrub_step),
+                expected_benefit: expected(400_000, 0, 0, 0, 0, 0, 0, 100_000, 0, 80_000),
+            };
+            self.push_validated(
+                &mut actions,
+                &mut violations,
+                action,
+                reason,
+                context,
+                validator,
+                observation,
+            );
+        } else if migrated {
+            // The worker was moved off the core it was placed on. Whatever
+            // placement planned for it is not what it got, so the cheapest
+            // correct response is to stop spending foreground CPU on work that
+            // competes with a worker that is already paying for a migration.
+            reason = ActionReason::SustainedWorkerMigration;
+            let action = Action::AdjustScrubBudget {
+                scope: context.scope,
+                target: context.primary_target,
+                budget: self.scrub_budget.saturating_sub(self.config.scrub_step),
+                expected_benefit: expected(300_000, 0, 0, 0, 0, 0, 0, 100_000, 0, 60_000),
+            };
+            self.push_validated(
+                &mut actions,
+                &mut violations,
+                action,
+                reason,
+                context,
+                validator,
+                observation,
+            );
         } else if latency_bad {
             reason = ActionReason::ForegroundLatencyProtection;
             let action = Action::AdjustScrubBudget {
@@ -4580,6 +4760,11 @@ mod tests {
                 observation_count: 1,
                 access_count: 1,
             }),
+            // The default for a hand-built snapshot is the absent reading, which
+            // is what a machine with no counters produces. Tests that exercise
+            // the hardware-driven branches override it explicitly rather than
+            // relying on a value that happens to be convenient.
+            hardware: kivi_observation::HardwareSummary::absent(),
         }
     }
 
@@ -4619,6 +4804,140 @@ mod tests {
             ActionScope::new(ClusterId::from_u128(1), NamespaceId::from_u64(1)),
             TabletId::from_u64(1),
         )
+    }
+
+    /// A frame whose worker scope carries the given hardware reading.
+    ///
+    /// Built by replacing the scope rather than by parameterising `frame`,
+    /// because the hardware path is the exception and a defaulted parameter
+    /// would let the ordinary tests quietly stop exercising it.
+    fn hardware_frame(
+        window: u64,
+        sequence: u64,
+        hardware: kivi_observation::HardwareSummary,
+    ) -> ControllerFrame {
+        let mut base = frame(window, sequence, 0.1, 0, 100_000, 0);
+        let scopes = &mut base.observation.scopes;
+        scopes[0].hardware = hardware;
+        base
+    }
+
+    /// A reading from an exact counter group on a memory-bound worker.
+    fn memory_bound_reading() -> kivi_observation::HardwareSummary {
+        kivi_observation::HardwareSummary {
+            worst_stall_fraction: 0.62,
+            worst_cache_miss_ratio: 0.48,
+            worst_branch_miss_ratio: 0.02,
+            best_ipc: 0.4,
+            page_faults: 100,
+            context_switches: 20,
+            migrations: 0,
+            measured: true,
+            trust: 1.0,
+            worst_cost_multiplier: 1.48,
+            cache_sensitivity: kivi_observation::HardwareCacheSensitivity::MemoryBound,
+        }
+    }
+
+    #[test]
+    fn a_memory_bound_worker_thins_maintenance_work() {
+        // The decision under test: a worker that hardware says is stalling on
+        // memory gets *less* background work scheduled against it, not more.
+        let config = BaselineConfig {
+            sustained_windows: 1,
+            ..BaselineConfig::default()
+        };
+        let mut controller = BaselineController::new(config);
+        let validator = SafetyValidator::default();
+        let frame = hardware_frame(1, 1, memory_bound_reading());
+        let proposal = controller.propose(&frame, &context(), &validator);
+        // The response is a *reduction*. Growing the maintenance budget is
+        // what every other branch of this loop does, so asserting the direction
+        // matters more than asserting that some action happened.
+        assert!(
+            proposal.actions.iter().any(|action| matches!(
+                action,
+                Action::AdjustScrubBudget { budget, .. } if *budget < controller.scrub_budget
+            )),
+            "expected a scrub reduction, got {:?}",
+            proposal.actions
+        );
+        // The reason must name the hardware, so an operator reading the action
+        // ledger knows the evidence came from the machine and not from a
+        // software estimate.
+        assert_eq!(
+            proposal.trace.reason,
+            ActionReason::SustainedMemoryBoundWorker,
+            "the ledger must attribute the decision to hardware"
+        );
+    }
+
+    #[test]
+    fn a_multiplexed_reading_never_reaches_a_decision() {
+        // The same stall, the same misses, the same workload — but the kernel
+        // had to multiplex the counter group, so the ratio measured a different
+        // set of instructions than the controller is reasoning about.
+        let config = BaselineConfig {
+            sustained_windows: 1,
+            ..BaselineConfig::default()
+        };
+        let mut controller = BaselineController::new(config);
+        let validator = SafetyValidator::default();
+        let mut multiplexed = memory_bound_reading();
+        multiplexed.trust = 0.5;
+        let frame = hardware_frame(1, 1, multiplexed);
+        let proposal = controller.propose(&frame, &context(), &validator);
+        assert!(
+            !proposal
+                .actions
+                .iter()
+                .any(|action| matches!(action, Action::AdjustScrubBudget { .. })),
+            "a multiplexed reading is not evidence, got {:?}",
+            proposal.actions
+        );
+    }
+
+    #[test]
+    fn a_machine_without_counters_is_unaffected() {
+        // The fallback case, which is the common one. A worker with no hardware
+        // evidence must produce exactly the decision the software-only path
+        // produced before hardware telemetry existed.
+        let config = BaselineConfig {
+            sustained_windows: 1,
+            ..BaselineConfig::default()
+        };
+        let validator = SafetyValidator::default();
+        let mut controller = BaselineController::new(config);
+        let without = controller.propose(&frame(1, 1, 0.1, 0, 100_000, 0), &context(), &validator);
+        let mut explicit = frame(1, 1, 0.1, 0, 100_000, 0);
+        explicit.observation.scopes[0].hardware = kivi_observation::HardwareSummary::absent();
+        let mut second = BaselineController::new(config);
+        let absent = second.propose(&explicit, &context(), &validator);
+        assert_eq!(without.actions, absent.actions);
+        assert_eq!(without.trace.reason, absent.trace.reason);
+    }
+
+    #[test]
+    fn a_migrated_worker_thins_maintenance_work() {
+        let config = BaselineConfig {
+            sustained_windows: 1,
+            ..BaselineConfig::default()
+        };
+        let mut controller = BaselineController::new(config);
+        let validator = SafetyValidator::default();
+        let migrated = kivi_observation::HardwareSummary {
+            migrations: 3,
+            measured: true,
+            trust: 1.0,
+            ..kivi_observation::HardwareSummary::absent()
+        };
+        let frame = hardware_frame(1, 1, migrated);
+        let proposal = controller.propose(&frame, &context(), &validator);
+        assert_eq!(
+            proposal.trace.reason,
+            ActionReason::SustainedWorkerMigration,
+            "a migration is the unambiguous placement failure"
+        );
     }
 
     fn memory_action(target: u64, budget: u32) -> Action {

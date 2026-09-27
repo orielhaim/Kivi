@@ -38,9 +38,12 @@
 //! names it per tablet). Redis clients never learn consensus concepts,
 //! and no unsafe fallback ever executes a strong write off-leader.
 
+#[cfg(feature = "redis-compat")]
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(feature = "redis-compat")]
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -62,9 +65,11 @@ use kivi_state::Operation;
 use kivi_state::{DurableOutcome, OpError, OperationResult};
 use kivi_tablet::DirectorySnapshot;
 use kivi_types::{
-    ClusterId, CommitPosition, CommitToken, MutationIdentity, NamespaceId, NodeId, ReadContract,
-    TabletEpoch, TabletId, WallTimestamp, WorkerId, WriteGuardGeneration,
+    ClusterId, MutationIdentity, NamespaceId, NodeId, ReadContract, TabletEpoch, TabletId,
+    WallTimestamp, WorkerId, WriteGuardGeneration,
 };
+#[cfg(feature = "redis-compat")]
+use kivi_types::{CommitPosition, CommitToken};
 use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower_http::limit::RequestBodyLimitLayer;

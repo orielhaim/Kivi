@@ -163,14 +163,13 @@ fn process_thread_count(process_id: &str) -> String {
         return "unknown".to_owned();
     };
     #[cfg(target_os = "linux")]
-    if let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) {
-        if let Some(value) = status
+    if let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status"))
+        && let Some(value) = status
             .lines()
             .find_map(|line| line.strip_prefix("Threads:"))
             .and_then(|value| value.split_whitespace().next())
-        {
-            return value.to_owned();
-        }
+    {
+        return value.to_owned();
     }
     #[cfg(target_os = "windows")]
     {

@@ -28,9 +28,12 @@ use crate::chunk_lane::{
     ChunkLaneHandle, LargeSetSplit, RangeBase, RangeRootFence, SetRangePlan, StagingPins,
     plan_set_range, split_large_set,
 };
+use kivi_hardware::{PlacementRole, WorkerSlot};
+
 use crate::commit::{BatchPolicy, CommitCoordinator, PendingEntry};
 use crate::fabric::TabletFabric;
 use crate::net::NetStartError;
+use crate::placement::ThreadPlacement;
 
 use crate::tablet::{LiveTablet, TabletError};
 
@@ -281,11 +284,18 @@ impl WorkerDurability {
         policy: BatchPolicy,
         lane: LaneAccess,
         initial_stats: WorkerLaneStats,
+        placement: ThreadPlacement,
     ) -> Result<Self, DurabilityError> {
         Ok(Self {
             namespace,
             worker,
-            commit: CommitCoordinator::spawn(policy, lane, initial_stats)?,
+            commit: CommitCoordinator::spawn(
+                policy,
+                lane,
+                initial_stats,
+                placement,
+                usize::try_from(worker.as_u64()).unwrap_or(usize::MAX),
+            )?,
         })
     }
 
@@ -413,6 +423,15 @@ pub enum WorkerControl {
         /// Where the object signals go.
         respond: Sender<Vec<(u64, kivi_memory::AccessSignals)>>,
     },
+    /// Read the serving thread's own performance counters and end the window.
+    ///
+    /// Served from the control channel rather than from a collector thread
+    /// because a counter opened on thread A counts thread A's instructions, and
+    /// the requester cannot open a counter that describes somebody else's work.
+    HardwareSample {
+        /// Where the interval's reading goes.
+        respond: Sender<kivi_memory::hardware::HardwareSample>,
+    },
 }
 
 /// Per-worker fabric observability for the admin plane.
@@ -512,6 +531,7 @@ impl WorkerHandle {
         durability: Option<WorkerDurability>,
         chunks: WorkerChunks,
         fabric: TabletFabric,
+        placement: ThreadPlacement,
     ) -> Self {
         let (request_tx, request_rx) = bounded::<TabletRequest>(request_capacity.max(1));
         let (control_tx, control_rx) = bounded::<WorkerControl>(CONTROL_CAPACITY);
@@ -522,6 +542,20 @@ impl WorkerHandle {
         let thread = thread::Builder::new()
             .name(format!("kivi-worker-{}", id.as_u64()))
             .spawn(move || {
+                // The networked path binds inside its reactor thread; the
+                // channel-only path binds here, so an embedded engine gets the
+                // same treatment as a served one.
+                let slot = WorkerSlot::new(
+                    PlacementRole::DataWorker,
+                    usize::try_from(id.as_u64()).unwrap_or(0),
+                );
+                if let Err(error) = placement.bind(slot) {
+                    tracing::error!(
+                        ?error,
+                        worker = id.as_u64(),
+                        "data worker could not be placed"
+                    );
+                }
                 run(
                     id, tablets, request_rx, control_rx, durability, chunks, fabric,
                 );
@@ -710,6 +744,12 @@ fn run(
 ) {
     let _ = id;
     let metrics = core::cell::Cell::new(WorkerMetrics::default());
+    // Opened here, on the thread whose work it describes, and never moved: a
+    // counter group is `!Send` and a counter opened elsewhere would count
+    // somebody else's instructions. Attaching is best effort — a machine or
+    // privilege level that refuses counters yields a sampler that reports the
+    // software-only reading, and the worker starts normally either way.
+    let mut hardware = kivi_memory::hardware::HardwareSampler::new();
     let mut tablets: HashMap<TabletId, LiveTablet> = tablets
         .into_iter()
         .map(|tablet| (tablet.id(), tablet))
@@ -734,6 +774,7 @@ fn run(
                 &metrics,
                 durability.as_ref(),
                 &mut fabric,
+                &mut hardware,
             ) {
                 flush_for_shutdown(&mut tablets, durability.as_mut(), &mut fabric);
                 break;
@@ -749,7 +790,7 @@ fn run(
                 recv(control) -> message => {
                     match message {
                         Ok(message) => {
-                            if !handle_control(message, &mut tablets, &metrics, durability.as_ref(), &mut fabric) {
+                            if !handle_control(message, &mut tablets, &metrics, durability.as_ref(), &mut fabric, &mut hardware) {
                                 flush_for_shutdown(&mut tablets, durability.as_mut(), &mut fabric);
                                 break;
                             }
@@ -772,7 +813,7 @@ fn run(
                 recv(control) -> message => {
                     match message {
                         Ok(message) => {
-                            if !handle_control(message, &mut tablets, &metrics, durability.as_ref(), &mut fabric) {
+                            if !handle_control(message, &mut tablets, &metrics, durability.as_ref(), &mut fabric, &mut hardware) {
                                 flush_for_shutdown(&mut tablets, durability.as_mut(), &mut fabric);
                                 break;
                             }
@@ -881,6 +922,7 @@ pub(crate) fn handle_control(
     metrics: &core::cell::Cell<WorkerMetrics>,
     durability: Option<&WorkerDurability>,
     fabric: &mut crate::fabric::TabletFabric,
+    hardware: &mut kivi_memory::hardware::HardwareSampler,
 ) -> bool {
     match message {
         WorkerControl::Shutdown => false,
@@ -977,6 +1019,17 @@ pub(crate) fn handle_control(
         }
         WorkerControl::MemorySignals { respond } => {
             let _ = respond.try_send(fabric.drain_access_signals());
+            true
+        }
+        WorkerControl::HardwareSample { respond } => {
+            // The serving thread's own counters, read on the serving thread,
+            // with its own request count as the corroboration. A window that
+            // served nothing is reported as unmeasured work, not as a clean
+            // bill of health: the counters were not running against a request.
+            let served = metrics.get();
+            let _ = respond.try_send(
+                hardware.end_of_window(served.channel_ops.saturating_add(served.direct_ops)),
+            );
             true
         }
     }
@@ -2177,9 +2230,13 @@ mod tests {
         let paths = crate::fabric::FabricPaths {
             root: dir.path().to_owned(),
         };
-        let (fabric, guard) =
-            crate::fabric::TabletFabric::open(WorkerId::from_u64(0), &paths, 1 << 20, 16 << 20)
-                .expect("fabric opens");
+        let (fabric, guard) = crate::fabric::TabletFabric::open_unbound(
+            WorkerId::from_u64(0),
+            &paths,
+            1 << 20,
+            16 << 20,
+        )
+        .expect("fabric opens");
         (fabric, guard, dir)
     }
 
@@ -2224,6 +2281,7 @@ mod tests {
             None,
             chunks.chunks.clone(),
             fabric,
+            ThreadPlacement::unbound(),
         );
         let set = round_trip(
             &handle,
@@ -2477,6 +2535,7 @@ mod tests {
             None,
             chunks.chunks.clone(),
             fabric,
+            ThreadPlacement::unbound(),
         );
         round_trip(
             &handle,

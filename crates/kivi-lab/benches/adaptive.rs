@@ -73,6 +73,7 @@ fn snapshot(window: u64) -> ObservationSnapshot {
             observation_count: 1,
             access_count: 1,
         }),
+        hardware: kivi_observation::HardwareSummary::absent(),
     };
     ObservationSnapshot {
         as_of: observed,

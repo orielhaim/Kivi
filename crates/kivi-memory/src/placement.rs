@@ -69,6 +69,11 @@ pub struct PlacementInput<'a> {
     pub migration_cost_ns: u64,
     /// Ticks since the last move of this object.
     pub ticks_since_move: u64,
+    /// Memory node the thread asking for this placement runs on, from the
+    /// resolved worker placement. `None` means the platform did not disclose
+    /// locality, in which case every provider is treated as local and no
+    /// placement decision is made on a guess.
+    pub home_node: Option<u32>,
 }
 
 /// A placement policy: pure function of input + calibrated providers.
@@ -164,7 +169,22 @@ impl CriticalityPlanner {
         } else {
             0.0
         };
-        access_cost + storage_cost * 1.0e-6 + migration - relief
+        // Locality: a provider on another memory node is reachable, but every
+        // access pays the inter-socket hop. The penalty is added to access cost
+        // rather than compared against a hard filter, because crossing a node
+        // is a cost and not an impossibility — except when the intent pinned a
+        // node, which `satisfies` has already enforced.
+        let remote = match (
+            caps.locality.numa_node,
+            input.intent.locality,
+            input.home_node,
+        ) {
+            (Some(provider_node), _, Some(home)) if provider_node != home => {
+                (caps.locality.remote_penalty_ns as f64) * loaded
+            }
+            _ => 0.0,
+        };
+        access_cost + storage_cost * 1.0e-6 + migration - relief + remote
     }
 }
 
@@ -431,6 +451,7 @@ mod tests {
             pressure: 0.1,
             migration_cost_ns: 1_000,
             ticks_since_move: 10_000,
+            home_node: None,
         };
         let decision = planner.plan(&input, &registry);
         let caps = registry.get(decision.target).expect("target");
@@ -448,6 +469,7 @@ mod tests {
             pressure: 0.9,
             migration_cost_ns: 1_000,
             ticks_since_move: 10_000,
+            home_node: None,
         };
         let decision = planner.plan(&cold_input, &registry);
         let caps = registry.get(decision.target).expect("target");
@@ -470,6 +492,7 @@ mod tests {
             pressure: 0.1,
             migration_cost_ns: 1_000,
             ticks_since_move: 3,
+            home_node: None,
         };
         let decision = planner.plan(&input, &registry);
         assert_eq!(decision.target, ProviderId::NONE);

@@ -125,6 +125,12 @@ pub struct MemoryFabricConfig {
     /// Optional file-backed `NVMe` directory. When `None`, the fabric
     /// uses the deterministic sim backend.
     pub nvme_dir: Option<PathBuf>,
+    /// Memory node the owner thread runs on, from the resolved placement.
+    /// `None` means the platform did not disclose locality, which is a valid
+    /// machine and not an error.
+    pub numa_node: Option<u32>,
+    /// How many memory nodes the machine has. One on a uniform machine.
+    pub numa_node_count: u32,
 }
 
 impl Default for MemoryFabricConfig {
@@ -139,8 +145,23 @@ impl Default for MemoryFabricConfig {
             budget: MovementBudget::production(),
             nvme_options: NvmeOptions::default(),
             nvme_dir: None,
+            numa_node: None,
+            numa_node_count: 1,
         }
     }
+}
+
+/// What the fabric's memory locality looks like, for diagnostics and the admin
+/// surface. `numa_node` is the node the owner thread's arena bytes belong to;
+/// the node counts are how many the planner can see and score.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalityView {
+    /// Node the owner thread's resident bytes belong to.
+    pub numa_node: Option<u32>,
+    /// Memory nodes registered with a DRAM provider.
+    pub dram_nodes: usize,
+    /// Memory nodes registered with a compressed provider.
+    pub compressed_nodes: usize,
 }
 
 /// One device operation for an external executor (single-writer
@@ -275,8 +296,18 @@ pub struct MemoryFabric {
     registry: ProviderRegistry,
     calibrator: Calibrator,
     planner: CriticalityPlanner,
-    dram_provider: ProviderId,
-    compressed_provider: ProviderId,
+    /// DRAM provider for the node this fabric's owner thread runs on. Arena
+    /// bytes are the owner's own process memory, so a resident residence always
+    /// names the local node's provider.
+    local_dram: ProviderId,
+    /// Compressed provider for the same node, for the same reason.
+    local_compressed: ProviderId,
+    /// Every DRAM provider the machine has, in node order. The planner scores
+    /// all of them so a node preference is a real choice rather than a
+    /// comment.
+    dram_providers: Vec<ProviderId>,
+    /// Every compressed provider, in node order.
+    compressed_providers: Vec<ProviderId>,
     nvme_provider: ProviderId,
     backend: NvmeBackend,
     objects: HashMap<u64, ObjectEntry>,
@@ -320,12 +351,38 @@ impl MemoryFabric {
     /// cannot be opened.
     pub fn new(config: MemoryFabricConfig) -> Result<Self, MemoryError> {
         let mut registry = ProviderRegistry::new();
-        let dram_provider =
-            registry.register(ProviderCaps::dram(Some(0), config.arena_capacity_bytes));
-        let compressed_provider = registry.register(ProviderCaps::compressed(
-            Some(0),
-            config.arena_capacity_bytes / 2,
-        ));
+        // One DRAM provider per memory node, plus one per node for the
+        // compressed representation. The provider set is the machine's memory
+        // topology, not a fixed ladder: a two-node box gets two DRAM providers
+        // and a one-node box gets one, and the planner scores them by measured
+        // cost plus the locality the caller asked for.
+        let node_count = config.numa_node_count.max(1);
+        // The local node is the one the owner thread actually runs on. When the
+        // caller did not say, node 0 is the only defensible guess: it is the
+        // node the boot processor belongs to, and on a one-node machine it is
+        // the whole machine.
+        let local = config
+            .numa_node
+            .unwrap_or(0)
+            .min(node_count.saturating_sub(1));
+        let mut dram_providers: Vec<ProviderId> = Vec::with_capacity(node_count as usize);
+        let mut compressed_providers: Vec<ProviderId> = Vec::with_capacity(node_count as usize);
+        let nodes = u64::from(node_count);
+        for node in 0..node_count {
+            // The caller's arena bound is one worker's budget, and every worker
+            // on a node advertises the same share of it. Splitting evenly keeps
+            // the sum honest on a uniform machine and under-claims rather than
+            // over-claims on an uneven one.
+            let share = config.arena_capacity_bytes / nodes;
+            let share = if u64::from(node) + 1 == nodes {
+                config.arena_capacity_bytes - (share * (nodes - 1))
+            } else {
+                share
+            };
+            dram_providers.push(registry.register(ProviderCaps::dram(Some(node), share)));
+            compressed_providers
+                .push(registry.register(ProviderCaps::compressed(Some(node), share / 2)));
+        }
         let nvme_provider = registry.register(ProviderCaps::nvme(config.nvme_capacity_bytes));
         let backend = if let Some(dir) = &config.nvme_dir {
             NvmeBackend::File(NvmeProvider::open(dir, config.nvme_options)?)
@@ -343,8 +400,10 @@ impl MemoryFabric {
             registry,
             calibrator: Calibrator::new(),
             planner: CriticalityPlanner::production(),
-            dram_provider,
-            compressed_provider,
+            local_dram: dram_providers[usize::try_from(local).unwrap_or(0)],
+            local_compressed: compressed_providers[usize::try_from(local).unwrap_or(0)],
+            dram_providers,
+            compressed_providers,
             nvme_provider,
             backend,
             objects: HashMap::new(),
@@ -452,7 +511,7 @@ impl MemoryFabric {
             Residence::Arena {
                 class,
                 handle,
-                provider: self.dram_provider,
+                provider: self.local_dram,
             }
         };
         let mut materialization = ObjectMaterialization::new(object, 1, primary);
@@ -524,7 +583,7 @@ impl MemoryFabric {
             Residence::Arena {
                 class,
                 handle,
-                provider: self.dram_provider,
+                provider: self.local_dram,
             }
         };
         let mut materialization = ObjectMaterialization::new(object, version, primary);
@@ -598,7 +657,7 @@ impl MemoryFabric {
         match Self::resolve(&self.arenas, &primary) {
             Ok(bytes) => {
                 self.stats.hits += 1;
-                let provider = Self::provider_of(self.dram_provider, &primary);
+                let provider = Self::provider_of(self.local_dram, &primary);
                 self.calibrator
                     .for_provider(provider)
                     .observe_read(bytes.len() as u64, 100);
@@ -720,7 +779,7 @@ impl MemoryFabric {
             Residence::Arena {
                 class,
                 handle,
-                provider: self.dram_provider,
+                provider: self.local_dram,
             }
         };
         {
@@ -1211,7 +1270,7 @@ impl MemoryFabric {
             };
             entry.pending_promotion = None;
             entry.ticks_since_move = 0;
-            (entry.class, self.dram_provider)
+            (entry.class, self.local_dram)
         };
         if inline {
             if let Some(entry) = self.objects.get_mut(&object) {
@@ -1669,6 +1728,17 @@ impl MemoryFabric {
     /// [`drain_external_ops`](Self::drain_external_ops)) instead of the
     /// internal off-core queue, so one outside writer owns all device
     /// appends. Compressed/evict moves still execute inline.
+    /// The memory node this fabric's resident providers live on.
+    #[must_use]
+    pub fn numa_node(&self) -> Option<u32> {
+        self.registry
+            .get(self.local_dram)
+            .and_then(|caps| caps.locality.numa_node)
+    }
+
+    /// Records whether an external executor drives this fabric's movement
+    /// queue. The engine sets it because the engine's workers own the
+    /// transitions; the fabric still plans them.
     pub fn set_external_executor(&mut self, external: bool) {
         self.external_executor = external;
     }
@@ -1823,6 +1893,7 @@ impl MemoryFabric {
             pressure: self.control_policy.planning_pressure(actual_pressure),
             migration_cost_ns: migration_cost * 2,
             ticks_since_move,
+            home_node: self.numa_node(),
         };
         let decision = self.planner.plan(&input, &self.registry);
         if decision.target == ProviderId::NONE {
@@ -1854,7 +1925,7 @@ impl MemoryFabric {
             }
             TransitionTarget::Dram => {
                 if current.is_some()
-                    && current != Some(self.dram_provider)
+                    && current != Some(self.local_dram)
                     && !self
                         .control_policy
                         .allows_promotion(weighted_criticality.score, actual_pressure)
@@ -1893,7 +1964,7 @@ impl MemoryFabric {
 
     fn current_provider(&self, entry: &ObjectEntry) -> Option<ProviderId> {
         match &entry.materialization.primary {
-            Residence::Inline(_) => Some(self.dram_provider),
+            Residence::Inline(_) => Some(self.local_dram),
             Residence::Arena { provider, .. }
             | Residence::Compressed { provider, .. }
             | Residence::Offcore { provider, .. } => Some(*provider),
@@ -1901,9 +1972,23 @@ impl MemoryFabric {
         }
     }
 
+    /// Resolves a chosen provider to a transition this fabric can perform.
+    ///
+    /// A DRAM or compressed target always means *the owner's node*, because
+    /// arena bytes are this thread's own process memory: a provider on another
+    /// node is a real entry in the registry — the planner scores it, and a
+    /// `PinnedNuma` preference can select it — but the bytes of a resident
+    /// residence cannot be placed there by this fabric. The other nodes'
+    /// providers exist so the planner can *see* the machine's memory and its
+    /// relative cost instead of pretending the machine has one node.
     fn transition_target_for(&self, provider: ProviderId) -> Option<TransitionTarget> {
         let caps = self.registry.get(provider)?;
         if caps.kind == crate::provider::ProviderKind::DRAM {
+            debug_assert!(
+                self.dram_providers.contains(&provider),
+                "a dram provider outside this fabric's node set would be \
+                 unrepresentable: arena bytes are the owner's own memory",
+            );
             Some(TransitionTarget::Dram)
         } else if caps.kind == crate::provider::ProviderKind::COMPRESSED {
             Some(TransitionTarget::Compressed)
@@ -1911,6 +1996,20 @@ impl MemoryFabric {
             Some(TransitionTarget::Nvme)
         } else {
             None
+        }
+    }
+
+    /// The memory node this fabric's arena bytes belong to, and the count of
+    /// nodes the planner can see. Diagnostics and the admin surface.
+    #[must_use]
+    pub fn locality(&self) -> LocalityView {
+        LocalityView {
+            numa_node: self
+                .registry
+                .get(self.local_dram)
+                .and_then(|caps| caps.locality.numa_node),
+            dram_nodes: self.dram_providers.len(),
+            compressed_nodes: self.compressed_providers.len(),
         }
     }
 
@@ -2120,7 +2219,7 @@ impl MemoryFabric {
         // publish, then retire the old primary (safety proved: two
         // valid representations exist between publish and retire).
         let (class, compressed_provider) = match self.objects.get(&object) {
-            Some(entry) => (entry.class, self.compressed_provider),
+            Some(entry) => (entry.class, self.local_compressed),
             None => return,
         };
         let Ok(handle) = self.arenas.alloc(class, block.stored.clone()) else {
@@ -2160,7 +2259,7 @@ impl MemoryFabric {
         self.compressed_logical += logical;
         self.compressed_stored += stored;
         self.calibrator
-            .for_provider(self.compressed_provider)
+            .for_provider(self.local_compressed)
             .observe_compression(logical, stored, 2.0);
         self.stats.migration_bytes += logical;
         let _ = version;

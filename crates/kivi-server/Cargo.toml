@@ -39,6 +39,7 @@ kivi-chunk.workspace = true
 kivi-codec.workspace = true
 kivi-control = { path = "../kivi-control", version = "0.1.0" }
 kivi-memory = { path = "../kivi-memory", version = "0.1.0" }
+kivi-hardware.workspace = true
 kivi-observation = { path = "../kivi-observation", version = "0.1.0" }
 kivi-redundancy.workspace = true
 base64 = "0.23"

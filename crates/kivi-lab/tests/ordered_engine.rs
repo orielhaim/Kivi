@@ -25,7 +25,7 @@ fn network() -> EngineNetwork {
         ports: Vec::new(),
         bind_ip: [127, 0, 0, 1].into(),
         max_frame: kivi_protocol::DEFAULT_MAX_FRAME,
-        affinity: kivi_engine::AffinityMode::Disabled,
+        placement: kivi_engine::ThreadPlacement::unbound(),
         node_id: NodeId::from_u64(1),
         cluster_id: ClusterId::from_u128(1),
         incarnation: NodeIncarnation::INITIAL,
@@ -41,6 +41,7 @@ fn start_ordered() -> LocalEngine {
 fn start_ordered_with_boundaries(boundaries: &[Vec<u8>]) -> LocalEngine {
     LocalEngine::start(EngineConfig {
         namespace: NS,
+        hardware: kivi_engine::HardwareConfig::default(),
         directory: DirectorySnapshot::static_ordered_tiles(NS, boundaries)
             .expect("ordered tiling builds"),
         placement: Placement::new([

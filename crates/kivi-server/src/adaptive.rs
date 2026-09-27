@@ -58,7 +58,11 @@ impl Default for AdaptiveRuntimeConfig {
 }
 
 /// Runtime counters and current controller state for the admin plane.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Not `Eq`: the hardware summaries it now carries hold ratios, and a snapshot
+// that compared its own evidence for equality would be asserting that two
+// measured stall fractions are interchangeable, which is exactly the averaging
+// this design refuses.
+#[derive(Debug, Clone, PartialEq)]
 pub struct AdaptiveRuntimeSnapshot {
     /// Current execution mode.
     pub mode: &'static str,
@@ -90,6 +94,13 @@ pub struct AdaptiveRuntimeSnapshot {
     pub active_actions: usize,
     /// Number of retained decision traces.
     pub traces: usize,
+    /// Per-worker hardware evidence the latest window carried.
+    ///
+    /// Reported because "the hardware path is wired" is not a claim anyone can
+    /// check, and a summary that silently stayed absent would look exactly like
+    /// a machine with no counters. An operator reading this can tell the two
+    /// apart, and so can a test.
+    pub hardware: Vec<(u64, kivi_observation::HardwareSummary)>,
     /// Last bounded collection or actuation error.
     pub last_error: Option<String>,
 }
@@ -119,6 +130,7 @@ struct RuntimeInputs {
     checkpoint: kivi_engine::CheckpointAdminState,
     redundancy: Option<kivi_engine::RedundancyAdminSnapshot>,
     memory: Vec<(WorkerId, Vec<(u64, kivi_memory::AccessSignals)>)>,
+    hardware: Vec<(WorkerId, kivi_memory::hardware::HardwareSample)>,
 }
 
 /// Asynchronous controller runtime shared by the engine and admin plane.
@@ -290,6 +302,23 @@ impl AdaptiveRuntime {
             failed: baseline.failed,
             active_actions: state.controller.ledger().active_records().count(),
             traces: state.controller.traces().count(),
+            hardware: state
+                .last_snapshot
+                .as_ref()
+                .map(|snapshot| {
+                    snapshot
+                        .scopes
+                        .iter()
+                        .filter(|scope| matches!(scope.scope, ObservationScope::Worker(_)))
+                        .map(|scope| {
+                            let ObservationScope::Worker(id) = scope.scope else {
+                                unreachable!("filtered to worker scopes")
+                            };
+                            (id.as_u64(), scope.hardware)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             last_error: state.last_error.clone(),
         }
     }
@@ -363,6 +392,12 @@ impl AdaptiveRuntime {
         let checkpoint = engine.checkpoint_state();
         let redundancy = engine.redundancy_snapshot();
         let memory = engine.memory_signals_snapshot();
+        // Read after the software counters, so the window the hardware sample
+        // describes contains the requests those counters counted: a hardware
+        // reading about work the software side has not seen yet would be
+        // describing a different interval than the one the controller reasons
+        // over.
+        let hardware = engine.hardware_samples_snapshot();
         RuntimeInputs {
             workers,
             fabrics,
@@ -370,6 +405,7 @@ impl AdaptiveRuntime {
             checkpoint,
             redundancy,
             memory,
+            hardware,
         }
     }
 
@@ -401,11 +437,16 @@ impl AdaptiveRuntime {
         let mut max_pressure = 0.0f64;
         let mut max_queue = 0u64;
         let mut max_latency = 0u64;
+        // Eight fixed signals precede the per-object hot keys (request,
+        // queueing, compute, memory, pressure, io, criticality, hardware), so
+        // the hot-key budget is whatever the scope limit leaves. Hardware is
+        // counted because dropping it would silently restore the software-only
+        // controller while every other signal kept arriving.
         let hot_key_limit = state
             .observations
             .limits()
             .max_samples_per_scope()
-            .saturating_sub(7)
+            .saturating_sub(8)
             .min(32);
         for (worker, metrics) in &workers {
             let total = metrics.channel_ops.saturating_add(metrics.direct_ops);
@@ -521,6 +562,21 @@ impl AdaptiveRuntime {
                     metadata,
                     period,
                     TypedHotKey(hot_key_signal(*object, access)),
+                );
+            }
+            // The hardware reading carries its own provenance, so it is the one
+            // sample in this loop that does not share the fabric metadata. A
+            // worker with no counters still reports — the software-only reading
+            // is a fact about the machine, and a consumer must be able to tell
+            // "measured nothing" from "was not asked".
+            if let Some((_, reading)) = inputs.hardware.iter().find(|(id, _)| id == worker) {
+                self.push_sample(
+                    state,
+                    samples,
+                    scope,
+                    reading.metadata(state.ticks),
+                    period,
+                    TypedHardware(reading.to_hardware_signal()),
                 );
             }
             total_ops = total_ops.saturating_add(delta);
@@ -879,6 +935,7 @@ enum RuntimeSignal {
     Degraded(DegradedAssetsSignal),
     Topology(TopologyImbalanceSignal),
     Consensus(ConsensusLagSignal),
+    Hardware(kivi_observation::HardwareSignal),
 }
 
 impl RuntimeSignal {
@@ -901,6 +958,7 @@ impl RuntimeSignal {
             Self::Degraded(signal) => kivi_observation::TypedSignal::DegradedAssets(signal),
             Self::Topology(signal) => kivi_observation::TypedSignal::TopologyImbalance(signal),
             Self::Consensus(signal) => kivi_observation::TypedSignal::ConsensusLag(signal),
+            Self::Hardware(signal) => kivi_observation::TypedSignal::Hardware(signal),
         }
     }
 }
@@ -918,6 +976,13 @@ struct TypedRedundancy(RedundancySignal);
 struct TypedDegraded(DegradedAssetsSignal);
 struct TypedTopology(TopologyImbalanceSignal);
 struct TypedConsensus(ConsensusLagSignal);
+struct TypedHardware(kivi_observation::HardwareSignal);
+
+impl From<TypedHardware> for RuntimeSignal {
+    fn from(value: TypedHardware) -> Self {
+        Self::Hardware(value.0)
+    }
+}
 
 impl From<TypedRequest> for RuntimeSignal {
     fn from(value: TypedRequest) -> Self {

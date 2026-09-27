@@ -28,6 +28,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
+use kivi_hardware::{PlacementRole, WorkerSlot};
+
+use crate::placement::ThreadPlacement;
+
 use kivi_memory::{
     BehaviorClass, ExternalOp, MemoryError, MemoryFabric, MemoryFabricConfig, Mutability,
 };
@@ -279,9 +283,33 @@ pub struct TabletFabric {
 }
 
 impl TabletFabric {
+    /// Opens a worker fabric with no thread placement, for tests and for
+    /// embedders that manage their own threads. Real callers pass the node's
+    /// [`ThreadPlacement`] so the fabric's locality matches the thread that
+    /// owns it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FabricError::Unavailable`] when the memory fabric or the
+    /// demotion lane cannot be opened.
+    pub fn open_unbound(
+        worker: WorkerId,
+        paths: &FabricPaths,
+        arena_bytes: u64,
+        demotion_bytes: u64,
+    ) -> Result<(Self, OffcoreLaneGuard), FabricError> {
+        Self::open(
+            worker,
+            paths,
+            arena_bytes,
+            demotion_bytes,
+            &ThreadPlacement::unbound(),
+        )
+    }
+
     /// Opens a worker fabric: memory fabric (external-executor mode,
-    /// bounded plan slices), demotion lane thread, NUMA-advisory
-    /// provider note. Never fails on topology probes.
+    /// bounded plan slices), demotion lane thread, and the memory node the
+    /// owner thread was placed on.
     ///
     /// # Errors
     ///
@@ -292,35 +320,78 @@ impl TabletFabric {
         paths: &FabricPaths,
         arena_bytes: u64,
         demotion_bytes: u64,
+        placement: &ThreadPlacement,
     ) -> Result<(Self, OffcoreLaneGuard), FabricError> {
         std::fs::create_dir_all(&paths.root).map_err(|_| FabricError::Unavailable)?;
+
+        // Locality is read from the *planned* core of the thread that owns this
+        // fabric, not guessed from the worker index. The previous
+        // `worker % nodes` arithmetic happened to be right on a one-node
+        // machine and wrong on every multi-node one, because the owner thread
+        // and the worker's index have no relationship to which node the
+        // scheduler put the thread on.
+        //
+        // It also has to arrive *before* construction: the fabric registers one
+        // provider per memory node so the planner can see the whole machine and
+        // score remote residency, which is only possible if the node set is
+        // known when providers are registered. Setting it afterwards updated a
+        // field nobody read and left the local provider on node 0.
+        let ordinal = usize::try_from(worker.as_u64()).unwrap_or(0);
+        let owner_slot = WorkerSlot::new(PlacementRole::DataWorker, ordinal);
+        let topology = &kivi_hardware::snapshot().topology;
+        let numa_node = placement
+            .plan()
+            .placement(owner_slot)
+            .and_then(|p| p.numa_node);
+        if let Some(node) = numa_node {
+            tracing::debug!(
+                worker = worker.as_u64(),
+                node = node.0,
+                "fabric locality follows the planned core",
+            );
+        }
         let mut fabric = MemoryFabric::new(MemoryFabricConfig {
             arena_capacity_bytes: arena_bytes,
             nvme_capacity_bytes: demotion_bytes,
             nvme_dir: Some(paths.demotion_dir()),
+            numa_node: numa_node.map(|node| node.0),
+            numa_node_count: u32::try_from(topology.memory_nodes.len()).unwrap_or(u32::MAX),
             ..MemoryFabricConfig::default()
         })
         .map_err(FabricError::from)?;
         fabric.set_external_executor(true);
         fabric.set_plan_slice(64);
-        // NUMA is advisory: probe, record the worker's preferred node,
-        // continue on any failure (single-node fallback degrades the
-        // preference to `Any`). Staging intents carry the preference;
-        // providers never hard-require it.
-        let topology = kivi_memory::OsNuma::topology();
-        let numa_node = (topology.nodes > 1)
-            .then(|| u32::try_from(worker.as_u64() % u64::from(topology.nodes)).unwrap_or(0));
-        tracing::debug!(
-            worker = worker.as_u64(),
-            nodes = topology.nodes,
-            source = ?topology.source,
-            numa_node,
-            "fabric NUMA preference",
-        );
+        if let Some(node) = numa_node.map(|node| node.0) {
+            // The invariant that matters: when placement named a node, the
+            // fabric's resident provider is on it. An unplanned fabric is not
+            // wrong, it just has no preference and falls back to node 0.
+            debug_assert_eq!(
+                fabric.locality().numa_node,
+                Some(node),
+                "the fabric's resident provider must be the owner's planned node",
+            );
+        }
+
+        let bind = placement.clone();
         let (lane, guard) = kivi_memory::offcore_lane::spawn_offcore_lane(
             worker,
             &paths.root,
             kivi_memory::NvmeOptions::default(),
+            Some(Box::new(move || {
+                let slot = WorkerSlot::new(PlacementRole::OffcoreLane, ordinal);
+                match bind.bind(slot) {
+                    Ok(_) => tracing::debug!(
+                        worker = worker.as_u64(),
+                        cpu = ?bind.current_cpu(),
+                        "offcore lane placed",
+                    ),
+                    Err(error) => tracing::error!(
+                        ?error,
+                        worker = worker.as_u64(),
+                        "offcore lane could not be placed",
+                    ),
+                }
+            })),
         )
         .map_err(FabricError::from)?;
         Ok((
@@ -335,7 +406,7 @@ impl TabletFabric {
                 stale_completions: 0,
                 parked_resumes: 0,
                 admission_rejects: 0,
-                numa_node,
+                numa_node: numa_node.map(|node| node.0),
             },
             guard,
         ))
@@ -1060,7 +1131,7 @@ mod tests {
         };
         let worker = WorkerId::from_u64(0);
         let (mut fabric, guard) =
-            TabletFabric::open(worker, &paths, 1 << 20, 16 << 20).expect("fabric opens");
+            TabletFabric::open_unbound(worker, &paths, 1 << 20, 16 << 20).expect("fabric opens");
         let tablet = TabletId::from_u64(1);
         let bytes = Bytes::from(vec![0xABu8; 1024]);
         let (staging_id, staged_len) = fabric.stage(tablet, bytes.clone(), true).expect("stage");
@@ -1113,7 +1184,7 @@ mod tests {
             root: dir.path().to_owned(),
         };
         let (mut fabric, guard) =
-            TabletFabric::open(WorkerId::from_u64(0), &paths, 1 << 20, 16 << 20)
+            TabletFabric::open_unbound(WorkerId::from_u64(0), &paths, 1 << 20, 16 << 20)
                 .expect("fabric opens");
         let tablet = TabletId::from_u64(1);
         let bytes = Bytes::from(vec![0xABu8; 1024]);
@@ -1164,7 +1235,7 @@ mod tests {
             root: dir.path().to_owned(),
         };
         let (mut fabric, guard) =
-            TabletFabric::open(WorkerId::from_u64(0), &paths, 1 << 12, 16 << 20)
+            TabletFabric::open_unbound(WorkerId::from_u64(0), &paths, 1 << 12, 16 << 20)
                 .expect("fabric opens");
         let tablet = TabletId::from_u64(1);
         let bytes = Bytes::from(vec![0xCDu8; 1024]);
@@ -1209,7 +1280,7 @@ mod tests {
         let worker = WorkerId::from_u64(0);
         // Tiny arena so one cold object demotes promptly.
         let (mut fabric, guard) =
-            TabletFabric::open(worker, &paths, 1 << 12, 16 << 20).expect("fabric opens");
+            TabletFabric::open_unbound(worker, &paths, 1 << 12, 16 << 20).expect("fabric opens");
         let tablet = TabletId::from_u64(1);
         let bytes = Bytes::from(vec![0xCDu8; 1024]);
         let (staging_id, staged_len) = fabric.stage(tablet, bytes.clone(), false).expect("stage");

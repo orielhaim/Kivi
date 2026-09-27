@@ -41,10 +41,12 @@ pub mod arena;
 pub mod calibrate;
 pub mod compressed;
 pub mod criticality;
+pub mod cxl;
 pub mod dram;
 pub mod error;
 pub mod fabric;
 pub mod handle;
+pub mod hardware;
 pub mod intent;
 pub mod movement;
 pub mod numa;
@@ -67,17 +69,22 @@ pub use calibrate::{Calibrator, Ewma, ProviderCalibration};
 pub use criticality::{
     AccessSignals, ExecutionCriticality, Mutability, TelemetrySource, criticality_of,
 };
+pub use cxl::{CXL_UNIT_BYTES, CxlProvider, CxlRegion};
 pub use error::MemoryError;
 pub use fabric::{
     ExternalOp, FabricStats, Footprint, GetOutcome, MemoryFabric, MemoryFabricConfig, OffcoreImport,
 };
 pub use handle::{BehaviorClass, ObjectHandle};
+pub use hardware::{
+    HardwareReading, HardwareSample, HardwareSampler, ReadingSource, confidence_ppm,
+    cost_multiplier_ppm,
+};
 pub use intent::{
     CoherenceRequirement, LocalityRequirement, MaterializationIntent, SharingScope, TenantTag,
     VolatilityAllowed,
 };
 pub use movement::{BoundedMoveQueue, MovementBudget, MovementScheduler};
-pub use numa::{NumaTopology, OsNuma};
+pub use numa::{MemoryNode, MemoryTier, NumaNodeId, Topology, TopologySource};
 pub use nvme::{
     Admission, AdmissionController, NvmeOptions, NvmeProvider, demote_async, promote_async,
 };

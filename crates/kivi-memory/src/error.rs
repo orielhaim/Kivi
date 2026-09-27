@@ -116,6 +116,14 @@ pub enum MemoryError {
         /// OS error rendered at the failure site.
         message: String,
     },
+    /// A provider has no capacity left for the request. Distinct from
+    /// [`MemoryError::ProviderFailed`] because nothing is wrong with the
+    /// device: it is full, which is a placement decision and not a failure.
+    #[error("provider {provider} is out of capacity")]
+    ProviderExhausted {
+        /// Provider kind tag, for diagnostics.
+        provider: &'static str,
+    },
     /// Invalid caller use (empty bytes where nonempty required, unknown
     /// object, ...). A caller bug, never storage damage.
     #[error("invalid memory request: {detail}")]

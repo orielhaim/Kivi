@@ -40,8 +40,14 @@ impl ProviderKind {
     pub const NVME: Self = Self("nvme");
     /// Deterministic simulated provider for tests.
     pub const SIM: Self = Self("sim");
-    /// Future extension point (CXL, PM, RDMA, DPA, ...).
-    pub const EXTENSION: Self = Self("extension");
+    /// CXL or pmem capacity mapped as a memory provider.
+    pub const CXL: Self = Self("cxl");
+    /// Anonymous memory standing in for a CXL region, for machines without one.
+    ///
+    /// A distinct tag rather than a flag on `CXL` so that no capability
+    /// snapshot, log line, or benchmark can present an anonymous mapping as a
+    /// CXL device.
+    pub const CXL_EMULATED: Self = Self("cxl-emulated");
 }
 
 /// NUMA/locality properties of a provider.

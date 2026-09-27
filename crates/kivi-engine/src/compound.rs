@@ -1371,9 +1371,13 @@ mod tests {
         let paths = crate::fabric::FabricPaths {
             root: dir.path().to_owned(),
         };
-        let (fabric, guard) =
-            crate::fabric::TabletFabric::open(WorkerId::from_u64(0), &paths, 1 << 20, 16 << 20)
-                .expect("fabric opens");
+        let (fabric, guard) = crate::fabric::TabletFabric::open_unbound(
+            WorkerId::from_u64(0),
+            &paths,
+            1 << 20,
+            16 << 20,
+        )
+        .expect("fabric opens");
         let fabric = std::rc::Rc::new(std::cell::RefCell::new(fabric));
         let (response, opcode) =
             compio::runtime::Runtime::new()
