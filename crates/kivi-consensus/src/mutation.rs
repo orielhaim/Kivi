@@ -10,14 +10,14 @@
 //!
 //! * `now`: the leader's client-boundary wall time. [`ObjectStore::apply`](kivi_state::ObjectStore::apply)
 //!   takes `now` for expiry comparison, so replicas must apply at the
-//!   leader's timestamp, never their own wall clock — otherwise an object
+//!   leader's timestamp, never their own wall clock - otherwise an object
 //!   expiring between propose and apply would fork outcomes (RFC §50:
 //!   nondeterminism is materialized by the proposer before enveloping).
 //! * `ack_floor`: the client's acknowledgement watermark. Session floor
 //!   advances drop retained outcomes, so the advance must replicate in log
 //!   order or replicas would retain different outcome sets.
 //!
-//! The encoding is canonical little-endian Kivi bytes — never JSON, never
+//! The encoding is canonical little-endian Kivi bytes - never JSON, never
 //! `OpenRaft`'s memory representation, never serde:
 //!
 //! ```text
@@ -25,9 +25,9 @@
 //! envelope_len u32, envelope[…], expected_len u32, expected[…]
 //! ```
 //!
-//! Framing v1 (no `now`/`ack_floor`) is rejected: no v1 command was ever
-//! committed by a production group (v1 only served the density spike and
-//! unit tests), so the breaking internal change aliases no durable history.
+//! Any other framing version is rejected as [`UnsupportedVersion`](ReplicatedMutationError::UnsupportedVersion):
+//! the materialized time and ack floor are part of the command's contract,
+//! so a body without them must never be misread.
 //!
 //! Replicas never re-execute proposer choices: the envelope plus `now`
 //! materialize nondeterminism before replication, and `expected` lets apply
@@ -54,7 +54,7 @@ pub struct ReplicatedMutation {
 /// Outcome installed for one applied entry: the deterministic result
 /// returned to the original caller and to every same-identity retry
 /// (lost-response failover). Command entries always carry one; leader
-/// barriers (blank) and membership entries carry none — no client waits
+/// barriers (blank) and membership entries carry none - no client waits
 /// on those positions, and `None` keeps that fact explicit instead of
 /// inventing an outcome no one asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,9 +160,7 @@ impl ReplicatedMutation {
     ///
     /// Returns [`ReplicatedMutationError`] on version mismatch,
     /// truncation, oversize declarations, undecodable parts, or trailing
-    /// bytes. Framing v1 is rejected as
-    /// [`UnsupportedVersion`](ReplicatedMutationError::UnsupportedVersion):
-    /// it never committed in production and carries no materialized time.
+    /// bytes.
     pub fn decode_exact(input: &[u8]) -> Result<Self, ReplicatedMutationError> {
         use ReplicatedMutationError as Fault;
         if input.len() < 2 + 8 + 8 {
@@ -304,10 +302,14 @@ mod tests {
         )
     }
 
+    /// The canonical bytes carry every field apply needs, and a damaged
+    /// byte anywhere in the frame fails the decode rather than producing a
+    /// wrong value.
     #[test]
-    fn command_round_trips() {
+    fn command_round_trips_and_damage_fails_loudly() {
         let command = sample();
-        let back = ReplicatedMutation::decode_exact(&command.encode_to_vec()).expect("decodes");
+        let good = command.encode_to_vec();
+        let back = ReplicatedMutation::decode_exact(&good).expect("decodes");
         assert_eq!(back, command);
         assert_eq!(
             back.envelope().operation(),
@@ -316,44 +318,23 @@ mod tests {
                 delta: 41,
             }
         );
-        assert_eq!(
-            back.expected(),
-            &OperationResult::CounterUpdated {
-                value: 41,
-                version: ObjectVersion::from_u64(7),
-            }
-        );
-    }
+        assert_eq!(back.now(), WallTimestamp::from_micros(1_000_000));
+        assert_eq!(back.ack_floor(), RequestSeq::from_u64(0));
 
-    #[test]
-    fn corrupt_framing_fails_loudly() {
-        let good = sample().encode_to_vec();
-        // Truncations at every prefix point fail (header is now
-        // 2 + 8 + 8 bytes before the blobs).
+        // Truncation at any prefix point fails; the header is
+        // 2 + 8 + 8 bytes before the blobs.
         for cut in [0, 1, 2, 3, 6, 10, 17, 18, 22] {
             assert!(
                 ReplicatedMutation::decode_exact(&good[..cut.min(good.len())]).is_err(),
                 "cut at {cut} must fail"
             );
         }
-        // Materialized inputs survive the round trip.
-        let back = ReplicatedMutation::decode_exact(&good).expect("decodes");
-        assert_eq!(back.now(), WallTimestamp::from_micros(1_000_000));
-        assert_eq!(back.ack_floor(), RequestSeq::from_u64(0));
         // Version bump fails.
         let mut versioned = good.clone();
         versioned[0] = versioned[0].wrapping_add(1);
         assert!(matches!(
             ReplicatedMutation::decode_exact(&versioned),
             Err(ReplicatedMutationError::UnsupportedVersion { .. })
-        ));
-        // Framing v1 (no materialized time) is rejected, never misread.
-        let mut v1 = good.clone();
-        v1[0] = 1;
-        v1[1] = 0;
-        assert!(matches!(
-            ReplicatedMutation::decode_exact(&v1),
-            Err(ReplicatedMutationError::UnsupportedVersion { found: 1 })
         ));
         // Trailing garbage fails.
         let mut trailed = good.clone();

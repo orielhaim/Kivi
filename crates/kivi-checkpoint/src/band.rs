@@ -27,11 +27,11 @@
 //!   version u64, expiry (Expiry codec),
 //!   payload: inline bytes → len u32 + raw; inline counter → i64;
 //!            chunked bytes → manifest [32] + logical_len u64
-//!            (small roots only — bulk bytes stay in chunk packs)
+//!            (small roots only - bulk bytes stay in chunk packs)
 //! footer (40 bytes, fixed):
 //!   0   4  CRC32C of the stored body bytes
 //!   4  32  BLAKE3 of header[0..56] + stored body (content identity:
-//!          covers artifact identity, not just the body — empty bands of
+//!          covers artifact identity, not just the body - empty bands of
 //!          different ids share an empty body but never an identity)
 //!   36  4  CRC32C of bytes [0..36]
 //! ```
@@ -87,7 +87,7 @@ pub const TYPE_STREAM_SHARD: u8 = 6;
 
 /// Compression codec for a band body. `NONE` is the production default;
 /// `LZ4` is the evaluated optional experiment (see the checkpoint
-/// benchmark) — never silent, always explicit in the header.
+/// benchmark) - never silent, always explicit in the header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CompressionCodecId(u8);
 
@@ -210,7 +210,7 @@ pub fn build_band(
     }
     // Codec branch (the only place compression lands): NONE stores the raw
     // body verbatim; LZ4 stores the deterministic block-compressed body
-    // (empty bodies stay empty — no codec edge cases, and header identity
+    // (empty bodies stay empty - no codec edge cases, and header identity
     // still separates the codecs). Content identity covers the stored body,
     // so identical logical content under the same codec has identical
     // identity; different codecs never share identity (headers differ).
@@ -973,7 +973,7 @@ mod tests {
     #[test]
     fn empty_bands_of_different_ids_have_distinct_identities() {
         // Regression: content identity covers header identity, not just
-        // the body — empty bands share an empty body but must never share
+        // the body - empty bands share an empty body but must never share
         // a filename.
         let first = build_band(
             TabletId::from_u64(1),
@@ -1146,7 +1146,7 @@ mod tests {
         )
         .expect("builds");
         // Flip bytes across the stored body (past the 60-byte header):
-        // body CRC, content hash, or decompression must fail — never a
+        // body CRC, content hash, or decompression must fail - never a
         // silent wrong record.
         let body_start = BAND_HEADER_LEN;
         let body_end = built.bytes.len() - BAND_FOOTER_LEN;

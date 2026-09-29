@@ -7,7 +7,7 @@
 //! * `--ephemeral`: pure in-memory (benchmarks, development).
 //! * `--data-dir <path>`: crash-recoverable local database. The directory
 //!   is locked, node identity loaded or minted, the incarnation advanced,
-//!   WAL lanes recovered and replayed — all before any listener binds.
+//!   WAL lanes recovered and replayed - all before any listener binds.
 
 mod adaptive;
 mod admin;
@@ -35,7 +35,6 @@ use kivi_engine::{
     ConnLimits, DurabilityMode, DurableConfig, EngineConfig, EngineNetwork, HardwareConfig,
     LocalEngine, Placement, ThreadPlacement, TurnBudget,
 };
-use kivi_state::PartitionHasher;
 use kivi_tablet::DirectorySnapshot;
 use kivi_types::{
     ClusterId, NamespaceId, NodeId, NodeIncarnation, TabletEpoch, TabletId, WorkerId,
@@ -117,7 +116,7 @@ struct Args {
     #[arg(long)]
     shared_wal: bool,
     /// Maximum mutations per WAL batch (durable mode only). `1` reproduces
-    /// immediate per-mutation durability on the same pipeline — the
+    /// immediate per-mutation durability on the same pipeline - the
     /// baseline group commit measures against.
     #[arg(long, default_value_t = kivi_engine::BatchPolicy::DEFAULT_MAX_OPS)]
     batch_max_ops: usize,
@@ -218,7 +217,7 @@ struct Args {
     pub(crate) cluster_native: SocketAddr,
     /// Admin endpoints `node=host:port,...` for cluster mode
     /// (reconciler forwarding targets; required, and distinct per
-    /// node — the registry records each node's own admin endpoint,
+    /// node - the registry records each node's own admin endpoint,
     /// never the local flag).
     #[arg(long, value_delimiter = ',', value_parser = parse_node_endpoint)]
     pub(crate) cluster_admins: Vec<(u64, SocketAddr)>,
@@ -409,7 +408,7 @@ fn even_split_ordered(count: usize, workers: usize) -> (DirectorySnapshot, Place
 }
 
 /// Opens the durability layer: explicit mode choice, data-directory lock,
-/// identity, and incarnation advance — all before any listener binds.
+/// identity, and incarnation advance - all before any listener binds.
 /// Returns node/cluster/incarnation, the engine durability mode, and the
 /// lock guard (held for the whole process).
 fn open_durability(
@@ -435,7 +434,7 @@ fn open_durability(
             ))
         }
         (false, Some(dir)) => {
-            // Lock, identity, incarnation advance, WAL root — all before
+            // Lock, identity, incarnation advance, WAL root - all before
             // any listener binds (see `open_data_dir`).
             let opened = kivi_durability::open_data_dir(dir, None)
                 .with_context(|| format!("open data directory {}", dir.display()))?;
@@ -593,8 +592,7 @@ fn main() -> anyhow::Result<()> {
     // The RESP edge is configured here, before the engine starts, because the
     // engine's own workers serve it: a connection is answered by the thread
     // that owns the tablet, with no queue and no second wakeup. Binding it
-    // from the admin runtime instead would put a thread hop back on every
-    // request, which is the entire cost this edge used to pay.
+    // from the admin runtime would put a thread hop back on every request.
     #[cfg(feature = "redis-compat")]
     let resp_stats = std::sync::Arc::new(kivi_resp::RespStats::default());
     #[cfg(feature = "redis-compat")]
@@ -661,7 +659,7 @@ fn main() -> anyhow::Result<()> {
         tablets = tablet_count,
         workers = args.workers,
         namespace = NS.as_u64(),
-        partitioning = %PartitionHasher::V1.algorithm(),
+        partitioning = %kivi_state::ROUTE_HASH_NAME,
         "serving native endpoints"
     );
 

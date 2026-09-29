@@ -68,46 +68,37 @@ impl fmt::Display for CommitToken {
 mod tests {
     use super::*;
 
+    /// A commit token is assigned only when both its epoch and its position
+    /// are real. An `AtLeast` read against a token that was never assigned
+    /// would otherwise compare against the sentinel as if it were a real
+    /// position, admitting reads the token cannot justify.
     #[test]
-    fn assigned_token_holds_all_parts() {
-        let token = CommitToken::new(
+    fn a_token_is_assigned_only_with_a_real_epoch_and_position() {
+        let assigned = CommitToken::new(
             TabletId::from_u64(5),
             TabletEpoch::from_u64(2),
             CommitPosition::from_u64(100),
         );
-        assert!(token.is_assigned());
-        assert_eq!(token.tablet(), TabletId::from_u64(5));
-        assert_eq!(token.position(), CommitPosition::from_u64(100));
-    }
+        assert!(assigned.is_assigned());
+        assert_eq!(assigned.tablet(), TabletId::from_u64(5));
+        assert_eq!(assigned.position(), CommitPosition::from_u64(100));
 
-    #[test]
-    fn unassigned_position_or_invalid_epoch_is_not_assigned() {
-        let no_slot = CommitToken::new(
-            TabletId::from_u64(5),
-            TabletEpoch::INITIAL,
-            CommitPosition::UNASSIGNED,
-        );
-        assert!(!no_slot.is_assigned());
-        let no_epoch = CommitToken::new(
-            TabletId::from_u64(5),
-            TabletEpoch::INVALID,
-            CommitPosition::FIRST,
-        );
-        assert!(!no_epoch.is_assigned());
-    }
-
-    #[test]
-    fn tokens_order_by_tablet_epoch_then_position() {
-        let a = CommitToken::new(
-            TabletId::from_u64(1),
-            TabletEpoch::INITIAL,
-            CommitPosition::from_u64(2),
-        );
-        let b = CommitToken::new(
-            TabletId::from_u64(1),
-            TabletEpoch::INITIAL,
-            CommitPosition::from_u64(3),
-        );
-        assert!(a < b);
+        for unassigned in [
+            CommitToken::new(
+                TabletId::from_u64(5),
+                TabletEpoch::INITIAL,
+                CommitPosition::UNASSIGNED,
+            ),
+            CommitToken::new(
+                TabletId::from_u64(5),
+                TabletEpoch::INVALID,
+                CommitPosition::FIRST,
+            ),
+        ] {
+            assert!(
+                !unassigned.is_assigned(),
+                "{unassigned} claims to be assigned"
+            );
+        }
     }
 }

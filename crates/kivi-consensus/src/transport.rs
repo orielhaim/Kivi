@@ -3,9 +3,9 @@
 //! One QUIC endpoint per node. Per node pair, **two** H3 connections:
 //!
 //! ```text
-//! peer-control H3 connection — votes, heartbeats, append metadata,
+//! peer-control H3 connection - votes, heartbeats, append metadata,
 //!                               snapshot fragments (small bodies)
-//! peer-bulk H3 connection    — manifests, chunks (bulk bodies)
+//! peer-bulk H3 connection    - manifests, chunks (bulk bodies)
 //! ```
 //!
 //! Two connections (not one, not a custom priority scheduler) because both
@@ -34,7 +34,7 @@
 //!
 //! Bodies are compact Kivi-owned binary formats (never JSON). HTTP carries
 //! only method, resource identity, status, and stream lifetime. One request
-//! carries one payload — no second framing layer inside H3 bodies.
+//! carries one payload - no second framing layer inside H3 bodies.
 //!
 //! ## Identity
 //!
@@ -63,7 +63,7 @@
 //! 8 MiB + 512 B fragment for the proto envelope),
 //! bounded concurrent streams per connection (QUIC transport tuning),
 //! bounded dial backoff, per-RPC timeouts. Timeouts drop the H3 stream,
-//! which resets it — the cancellation primitive for truncated suffixes,
+//! which resets it - the cancellation primitive for truncated suffixes,
 //! superseded snapshots, and shutdown.
 
 use std::collections::HashMap;
@@ -122,9 +122,9 @@ pub const MAX_BULK_BODY_BYTES: usize = 8 * 1024 * 1024;
 /// A largest-legal `Put` (8 MiB fragment bytes) encodes to 8 MiB + 129 B
 /// (111 B fixed fields + 18 B header/trailer) and the matching `Bytes`
 /// reply to 8 MiB + 54 B, both past [`MAX_BULK_BODY_BYTES`]. Single-Put
-/// (no offset-chunked upload) is the deliberate choice — fragments are
+/// (no offset-chunked upload) is the deliberate choice - fragments are
 /// already the unit of erasure-coded repair, so chunking them again would
-/// add a second reassembly protocol for 129 B — and the 512 B headroom
+/// add a second reassembly protocol for 129 B - and the 512 B headroom
 /// keeps every legal proto message servable while staying bounded (the
 /// proto caps still reject anything larger before allocation).
 pub const MAX_FRAGMENT_BODY_BYTES: usize = MAX_BULK_BODY_BYTES + 512;
@@ -171,7 +171,7 @@ pub struct TransportConfig {
     /// Reconnect delay ceiling.
     pub backoff_max: Duration,
     /// Open paused: dial and serve loops wait for [`PeerTransport::start`].
-    /// Static bootstrap needs this — every node installs the same joint
+    /// Static bootstrap needs this - every node installs the same joint
     /// membership while the mesh is quiet, so no node can grant a vote
     /// before its own `initialize` runs.
     pub start_paused: bool,
@@ -306,7 +306,7 @@ pub trait PeerHandler: Send + Sync + 'static {
 /// TLS material for the mesh: this node's certificate plus how to verify
 /// everyone else. Static `peer_certs` seed verification;
 /// [`TrustRegistry`](crate::tls::TrustRegistry) extends it as the
-/// replicated control plane commits node admissions — authenticated
+/// replicated control plane commits node admissions - authenticated
 /// node identity comes from the registry, not from restarting every
 /// node with new flags. Exactly one of pins / `insecure_skip_verify`
 /// authenticates outgoing connections.
@@ -402,7 +402,7 @@ struct TransportInner {
     config: TransportConfig,
     /// Dialable peer links. Behind a read-write lock so the replicated
     /// control plane can admit nodes at runtime: `add_peer` inserts the
-    /// joining node's link and the driver's heal loop dials it — no
+    /// joining node's link and the driver's heal loop dials it - no
     /// restart, no flag edits.
     links: std::sync::RwLock<HashMap<NodeId, Arc<PeerLink>>>,
     /// Dynamic trust pins shared with the node front (see
@@ -450,7 +450,7 @@ impl PeerTransport {
     /// Opens the mesh: binds one UDP endpoint, spawns the accept loop plus
     /// one dial loop per higher-addressed peer, and returns the transport
     /// with its bound address. `peers` holds every node (including local,
-    /// whose address is the bind address — port `0` selects an ephemeral
+    /// whose address is the bind address - port `0` selects an ephemeral
     /// port); only higher-`NodeId` entries are dialed.
     ///
     /// # Errors
@@ -506,7 +506,7 @@ impl PeerTransport {
         // installs right after for incoming connections. Binds retry
         // through release races: a previous generation's UDP socket frees
         // asynchronously in the QUIC worker, and parallel formations may
-        // steal a probed port — both fail loudly after the window instead
+        // steal a probed port - both fail loudly after the window instead
         // of serving a half mesh.
         let endpoint = {
             let deadline = std::time::Instant::now() + Duration::from_secs(15);
@@ -929,7 +929,7 @@ struct MeshDriver {
     /// Incoming QUIC connections by validated peer (suspend drops them).
     incoming: std::rc::Rc<std::cell::RefCell<HashMap<NodeId, Vec<IncomingConn>>>>,
     /// Shutdown ack, answered only after every driver loop exited and the
-    /// endpoint dropped — so the socket releases before the caller rebinds.
+    /// endpoint dropped - so the socket releases before the caller rebinds.
     shutdown_ack: std::rc::Rc<std::cell::RefCell<Option<futures::channel::oneshot::Sender<()>>>>,
 }
 
@@ -941,7 +941,7 @@ impl MeshDriver {
         let _ = futures::join!(accept, dial, serve);
         // Every loop exited: shut the endpoint down (its worker closes
         // the UDP socket; plain drop would leave it to worker teardown
-        // timing) and only then ack shutdown — restarts rebind promptly.
+        // timing) and only then ack shutdown - restarts rebind promptly.
         // (Partial move of owned `self`: disjoint fields, no live borrows.)
         let _ = self.endpoint.shutdown().await;
         if let Some(reply) = self.shutdown_ack.borrow_mut().take() {
@@ -1251,7 +1251,7 @@ impl MeshDriver {
         let mut sender = self.outgoing(command.target, command.lane, link).await?;
         // H3 requires absolute request targets: the authority names the
         // dialed peer (routing uses the path; the authority is never
-        // trusted for identity — TLS plus Kivi headers decide that).
+        // trusted for identity - TLS plus Kivi headers decide that).
         let uri = format!(
             "https://{}{}",
             crate::tls::server_name_for(command.target),
@@ -1758,7 +1758,7 @@ impl MeshDriver {
                     return;
                 }
                 // Bulk bodies stream in bounded segments (never one giant
-                // write call holding the whole value unnecessarily long —
+                // write call holding the whole value unnecessarily long -
                 // 1 MiB chunks stay single-segment in practice).
                 for piece in bytes.chunks(256 * 1024) {
                     if stream.send_data(piece.to_vec().into()).await.is_err() {
@@ -1852,27 +1852,32 @@ mod tests {
     use crate::types::ConsensusGroupId;
 
     const CLUSTER: u128 = 0x0C10_57E2;
+    const GROUP: ConsensusGroupId = ConsensusGroupId::of_tablet(kivi_types::TabletId::from_u64(9));
 
-    fn identity(node: u64, incarnation: u64) -> PeerIdentity {
+    fn identity_in(cluster: u128, node: u64, incarnation: u64) -> PeerIdentity {
         PeerIdentity {
-            cluster: ClusterId::from_u128(CLUSTER),
+            cluster: ClusterId::from_u128(cluster),
             node: NodeId::from_u64(node),
             incarnation: NodeIncarnation::from_u64(incarnation),
         }
+    }
+
+    fn identity(node: u64, incarnation: u64) -> PeerIdentity {
+        identity_in(CLUSTER, node, incarnation)
     }
 
     /// In-memory sidecar origin plus a fixed vote answer. `hang_once`
     /// pends the next request forever (a `Send`-safe stall: compio timers
     /// are reactor-local and cannot cross the `PeerHandler` boundary) to
     /// force deterministic client timeouts while later requests serve.
-    struct Echo {
+    struct Origin {
         vote: crate::peer::PeerVote,
         manifests: HashMap<[u8; 32], Vec<u8>>,
         chunks: HashMap<[u8; 32], Vec<u8>>,
         hang_once: Arc<std::sync::atomic::AtomicBool>,
     }
 
-    impl PeerHandler for Echo {
+    impl PeerHandler for Origin {
         fn handle(
             &self,
             _from: NodeId,
@@ -1925,19 +1930,15 @@ mod tests {
                         }))
                     }
                     _ => Err(PeerRpcError {
-                        detail: "echo serves votes, snapshots, and sidecars only".to_owned(),
+                        detail: "origin serves votes, snapshots, and sidecars only".to_owned(),
                     }),
                 }
             })
         }
     }
 
-    fn echo() -> Arc<dyn PeerHandler> {
-        echo_hang(false)
-    }
-
-    fn echo_hang(hang_once: bool) -> Arc<dyn PeerHandler> {
-        Arc::new(Echo {
+    fn origin(hang_once: bool) -> Arc<dyn PeerHandler> {
+        Arc::new(Origin {
             vote: crate::peer::PeerVote {
                 term: 1,
                 node: 1,
@@ -1976,24 +1977,19 @@ mod tests {
         socket.local_addr().expect("probe addr")
     }
 
-    /// Opens two loopback transports sharing one runtime generation each
-    /// (each `open` spawns its driver on the calling reactor). Returns the
-    /// scratch directory guard alongside so parallel tests never share
+    /// Two loopback transports over probed ports. Returns the scratch
+    /// directory guard alongside so parallel tests never share
     /// certificate paths.
-    async fn pair() -> (PeerTransport, PeerTransport, tempfile::TempDir) {
-        pair_with(echo(), echo()).await
-    }
-
-    async fn pair_with(
+    async fn pair(
         handler_a: Arc<dyn PeerHandler>,
         handler_b: Arc<dyn PeerHandler>,
     ) -> (PeerTransport, PeerTransport, tempfile::TempDir) {
-        let addr_a = probe_udp();
-        let addr_b = probe_udp();
-        let peers: HashMap<NodeId, std::net::SocketAddr> =
-            [(NodeId::from_u64(1), addr_a), (NodeId::from_u64(2), addr_b)]
-                .into_iter()
-                .collect();
+        let peers: HashMap<NodeId, std::net::SocketAddr> = [
+            (NodeId::from_u64(1), probe_udp()),
+            (NodeId::from_u64(2), probe_udp()),
+        ]
+        .into_iter()
+        .collect();
         let dir = tempfile::tempdir().expect("scratch");
         let (first, _) = PeerTransport::open(
             TransportConfig::default(),
@@ -2020,7 +2016,7 @@ mod tests {
 
     /// Waits for the waiter's side to observe the peer (outbound dial for
     /// the dialing side, first validated inbound request for the serving
-    /// side — so pair this with traffic, not bare dialer-only waits).
+    /// side - so pair this with traffic, not bare dialer-only waits).
     async fn wait_connected(transport: &PeerTransport, peer: NodeId) {
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
         loop {
@@ -2051,66 +2047,37 @@ mod tests {
         })
     }
 
-    #[test]
-    fn mesh_connects_and_serves_votes() {
-        block_on(async {
-            let (first, second, _dir) = pair().await;
-            wait_connected(&first, NodeId::from_u64(2)).await;
-            let group = ConsensusGroupId::of_tablet(kivi_types::TabletId::from_u64(9));
-            let response = first
-                .call(
-                    NodeId::from_u64(2),
-                    group,
-                    vote_request(),
-                    Duration::from_secs(10),
-                )
-                .await
-                .expect("vote served");
-            assert!(matches!(response, PeerResponse::Vote(_)));
-            // The server side learns connectivity from validated inbound
-            // requests; the reverse RPC exercises on-demand dial from the
-            // non-dialing side.
-            wait_connected(&second, NodeId::from_u64(1)).await;
-            let reverse = second
-                .call(
-                    NodeId::from_u64(1),
-                    group,
-                    vote_request(),
-                    Duration::from_secs(10),
-                )
-                .await
-                .expect("reverse vote served");
-            assert!(matches!(reverse, PeerResponse::Vote(_)));
-            first.shutdown().await;
-            second.shutdown().await;
-        });
+    fn chunk_request() -> PeerRequest {
+        PeerRequest::Chunk(crate::peer::PeerChunkRequest { chunk: [0x22; 32] })
     }
 
+    /// Both lanes serve their own families over two connections: a vote
+    /// over the control lane, a chunk over the bulk lane, and a missing
+    /// object refuses retryably instead of hanging. Both directions dial:
+    /// the server side learns connectivity from validated inbound
+    /// requests, so the reverse RPC exercises on-demand dial.
     #[test]
-    fn bulk_sidecars_stream_over_their_own_connection() {
+    fn mesh_serves_votes_and_bulk_sidecars_on_separate_lanes() {
         block_on(async {
-            let (first, second, _dir) = pair().await;
+            let (first, second, _dir) = pair(origin(false), origin(false)).await;
             wait_connected(&first, NodeId::from_u64(2)).await;
-            let group = ConsensusGroupId::of_tablet(kivi_types::TabletId::from_u64(9));
-            let manifest = first
-                .call_bulk(
-                    NodeId::from_u64(2),
-                    group,
-                    PeerRequest::Manifest(crate::peer::PeerManifestRequest {
-                        manifest: [0x11; 32],
-                    }),
-                    Duration::from_secs(10),
-                )
-                .await
-                .expect("manifest served");
-            assert!(
-                matches!(manifest, PeerResponse::Manifest(ref answer) if answer.canonical == vec![7u8; 78])
-            );
+            assert!(matches!(
+                first
+                    .call(
+                        NodeId::from_u64(2),
+                        GROUP,
+                        vote_request(),
+                        Duration::from_secs(10)
+                    )
+                    .await
+                    .expect("vote served"),
+                PeerResponse::Vote(_)
+            ));
             let chunk = first
                 .call_bulk(
                     NodeId::from_u64(2),
-                    group,
-                    PeerRequest::Chunk(crate::peer::PeerChunkRequest { chunk: [0x22; 32] }),
+                    GROUP,
+                    chunk_request(),
                     Duration::from_secs(10),
                 )
                 .await
@@ -2118,22 +2085,37 @@ mod tests {
             assert!(
                 matches!(chunk, PeerResponse::Chunk(ref answer) if answer.bytes == vec![9u8; 1024])
             );
-            // Missing objects refuse (retry-safe), never hang.
             let missing = first
                 .call_bulk(
                     NodeId::from_u64(2),
-                    group,
+                    GROUP,
                     PeerRequest::Chunk(crate::peer::PeerChunkRequest { chunk: [0x33; 32] }),
                     Duration::from_secs(10),
                 )
                 .await
                 .expect_err("missing chunk refuses");
             assert!(matches!(missing, TransportError::RemoteRefused { .. }));
+
+            wait_connected(&second, NodeId::from_u64(1)).await;
+            assert!(matches!(
+                second
+                    .call(
+                        NodeId::from_u64(1),
+                        GROUP,
+                        vote_request(),
+                        Duration::from_secs(10)
+                    )
+                    .await
+                    .expect("reverse vote served"),
+                PeerResponse::Vote(_)
+            ));
             first.shutdown().await;
             second.shutdown().await;
         });
     }
 
+    /// Shutdown acks only after the endpoint shut down, so the bound port
+    /// is immediately rebindable.
     #[test]
     fn shutdown_releases_the_port_for_rebind() {
         block_on(async {
@@ -2151,7 +2133,7 @@ mod tests {
                         ClusterId::from_u128(CLUSTER),
                         &peers,
                         insecure_tls(&dir, node),
-                        echo(),
+                        origin(false),
                     )
                     .await
                 }
@@ -2159,22 +2141,19 @@ mod tests {
             let (first, bound) = open(1).await.expect("first opens");
             assert_eq!(bound, addr);
             first.shutdown().await;
-            // Rebinding the same port must succeed immediately: shutdown
-            // acked only after the endpoint shut down and freed the socket.
             let (second, rebound) = open(1).await.expect("rebind opens");
             assert_eq!(rebound, addr);
             second.shutdown().await;
         });
     }
 
-    /// Many simultaneous H3 streams share two connections: Raft RPCs
+    /// Many simultaneous H3 streams share the two connections: Raft RPCs
     /// and chunk GETs multiplex without head-of-line blocking.
     #[test]
     fn concurrent_streams_all_succeed() {
         block_on(async {
-            let (first, second, _dir) = pair().await;
+            let (first, second, _dir) = pair(origin(false), origin(false)).await;
             wait_connected(&first, NodeId::from_u64(2)).await;
-            let group = ConsensusGroupId::of_tablet(kivi_types::TabletId::from_u64(9));
             let mut tasks = Vec::new();
             for _ in 0..32 {
                 let first = first.clone();
@@ -2182,7 +2161,7 @@ mod tests {
                     first
                         .call(
                             NodeId::from_u64(2),
-                            group,
+                            GROUP,
                             vote_request(),
                             Duration::from_secs(15),
                         )
@@ -2195,16 +2174,15 @@ mod tests {
                     first
                         .call_bulk(
                             NodeId::from_u64(2),
-                            group,
-                            PeerRequest::Chunk(crate::peer::PeerChunkRequest { chunk: [0x22; 32] }),
+                            GROUP,
+                            chunk_request(),
                             Duration::from_secs(15),
                         )
                         .await
                 }));
             }
             for task in tasks {
-                let result = task.await.expect("task joins");
-                assert!(result.is_ok(), "concurrent stream succeeds");
+                assert!(task.await.expect("task joins").is_ok(), "stream succeeds");
             }
             first.shutdown().await;
             second.shutdown().await;
@@ -2217,25 +2195,20 @@ mod tests {
     #[test]
     fn wrong_cluster_identity_is_refused() {
         block_on(async {
-            let addr_a = probe_udp();
-            let addr_b = probe_udp();
-            let peers: HashMap<NodeId, std::net::SocketAddr> =
-                [(NodeId::from_u64(1), addr_a), (NodeId::from_u64(2), addr_b)]
-                    .into_iter()
-                    .collect();
+            let peers: HashMap<NodeId, std::net::SocketAddr> = [
+                (NodeId::from_u64(1), probe_udp()),
+                (NodeId::from_u64(2), probe_udp()),
+            ]
+            .into_iter()
+            .collect();
             let dir = tempfile::tempdir().expect("scratch");
-            let foreign = PeerIdentity {
-                cluster: ClusterId::from_u128(0xDEAD),
-                node: NodeId::from_u64(2),
-                incarnation: NodeIncarnation::from_u64(1),
-            };
             let (first, _) = PeerTransport::open(
                 TransportConfig::default(),
                 identity(1, 1),
                 ClusterId::from_u128(CLUSTER),
                 &peers,
                 insecure_tls(&dir.path().join("a"), 1),
-                echo(),
+                origin(false),
             )
             .await
             .expect("first opens");
@@ -2243,19 +2216,18 @@ mod tests {
             // name a foreign cluster.
             let (second, _) = PeerTransport::open(
                 TransportConfig::default(),
-                foreign,
+                identity_in(0xDEAD, 2, 1),
                 ClusterId::from_u128(0xDEAD),
                 &peers,
                 insecure_tls(&dir.path().join("b"), 2),
-                echo(),
+                origin(false),
             )
             .await
             .expect("second opens");
-            let group = ConsensusGroupId::of_tablet(kivi_types::TabletId::from_u64(9));
             let error = first
                 .call(
                     NodeId::from_u64(2),
-                    group,
+                    GROUP,
                     vote_request(),
                     Duration::from_secs(8),
                 )
@@ -2270,15 +2242,13 @@ mod tests {
         });
     }
 
-    /// Oversized bodies refuse on both sides: the sender checks caps
-    /// before transmitting, the receiver caps while accumulating.
+    /// An oversize body refuses on the sender's cap without ever hitting
+    /// the wire, and the lane stays usable afterwards.
     #[test]
     fn oversized_bodies_refuse_without_allocation() {
         block_on(async {
-            let (first, second, _dir) = pair().await;
+            let (first, second, _dir) = pair(origin(false), origin(false)).await;
             wait_connected(&first, NodeId::from_u64(2)).await;
-            let group = ConsensusGroupId::of_tablet(kivi_types::TabletId::from_u64(9));
-            // A 20 MiB snapshot fragment exceeds the 16 MiB Raft cap.
             let big = PeerRequest::Snapshot(crate::peer::PeerSnapshotRequest {
                 vote: crate::peer::PeerVote {
                     term: 1,
@@ -2297,7 +2267,7 @@ mod tests {
                 done: true,
             });
             let error = first
-                .call(NodeId::from_u64(2), group, big, Duration::from_secs(15))
+                .call(NodeId::from_u64(2), GROUP, big, Duration::from_secs(15))
                 .await
                 .expect_err("oversize refuses");
             // The server guards its cap by resetting the stream, which
@@ -2311,61 +2281,102 @@ mod tests {
                 ),
                 "oversize fails retryably, got {error:?}"
             );
+            assert!(
+                first
+                    .call(
+                        NodeId::from_u64(2),
+                        GROUP,
+                        vote_request(),
+                        Duration::from_secs(10)
+                    )
+                    .await
+                    .is_ok(),
+                "lane stays usable after an oversize refusal"
+            );
             first.shutdown().await;
             second.shutdown().await;
         });
     }
 
-    /// A starved deadline times out without poisoning the lane: the next
-    /// call on the same connection succeeds (stream cancellation works).
+    /// A starved deadline times out without poisoning the lane, and a
+    /// suspended link times out then heals on resume.
     #[test]
-    fn tiny_timeout_cancels_without_poisoning_the_lane() {
+    fn timeouts_do_not_poison_the_lane_and_suspension_heals() {
         block_on(async {
             // The responder hangs forever; a 500 ms deadline starves
             // deterministically even on loopback.
-            let (first, second, _dir) = pair_with(echo(), echo_hang(true)).await;
+            let (first, second, _dir) = pair(origin(false), origin(true)).await;
             wait_connected(&first, NodeId::from_u64(2)).await;
-            let group = ConsensusGroupId::of_tablet(kivi_types::TabletId::from_u64(9));
             let error = first
                 .call(
                     NodeId::from_u64(2),
-                    group,
+                    GROUP,
                     vote_request(),
                     Duration::from_millis(500),
                 )
                 .await
                 .expect_err("hang starves the deadline");
             assert_eq!(error, TransportError::Timeout);
-            let response = first
-                .call(
-                    NodeId::from_u64(2),
-                    group,
-                    vote_request(),
-                    Duration::from_secs(10),
-                )
-                .await
-                .expect("lane reusable after cancel");
-            assert!(matches!(response, PeerResponse::Vote(_)));
+            assert!(matches!(
+                first
+                    .call(
+                        NodeId::from_u64(2),
+                        GROUP,
+                        vote_request(),
+                        Duration::from_secs(10)
+                    )
+                    .await
+                    .expect("lane reusable after cancel"),
+                PeerResponse::Vote(_)
+            ));
+            // Suspension partitions the link: calls starve, then the
+            // resume heals the same lane.
+            first.suspend_peer(NodeId::from_u64(2)).await;
+            assert_eq!(
+                first
+                    .call(
+                        NodeId::from_u64(2),
+                        GROUP,
+                        vote_request(),
+                        Duration::from_secs(5)
+                    )
+                    .await
+                    .expect_err("suspended link times out"),
+                TransportError::Timeout
+            );
+            first.resume_peer(NodeId::from_u64(2)).await;
+            wait_connected(&first, NodeId::from_u64(2)).await;
+            assert!(matches!(
+                first
+                    .call(
+                        NodeId::from_u64(2),
+                        GROUP,
+                        vote_request(),
+                        Duration::from_secs(10)
+                    )
+                    .await
+                    .expect("healed link serves"),
+                PeerResponse::Vote(_)
+            ));
             first.shutdown().await;
             second.shutdown().await;
         });
     }
 
-    /// Shutdown with active streams terminates every in-flight call
-    /// (no hang): a hanging responder plus shutdown on both ends still
+    /// Shutdown with active streams terminates every in-flight call (no
+    /// hang): a hanging responder plus shutdown on both ends still
     /// resolves every pending RPC.
     #[test]
     fn shutdown_with_active_streams_terminates_calls() {
         block_on(async {
-            let (first, second, _dir) = pair_with(echo(), echo_hang(true)).await;
+            let (first, second, _dir) = pair(origin(false), origin(true)).await;
             wait_connected(&first, NodeId::from_u64(2)).await;
-            let group = ConsensusGroupId::of_tablet(kivi_types::TabletId::from_u64(9));
             let first_clone = first.clone();
             let pending = compio::runtime::spawn(async move {
                 first_clone
                     .call(
                         NodeId::from_u64(2),
-                        group,
+                        GROUP,
                         vote_request(),
                         Duration::from_secs(30),
                     )
@@ -2374,23 +2385,25 @@ mod tests {
             compio::time::sleep(Duration::from_millis(200)).await;
             first.shutdown().await;
             second.shutdown().await;
-            let outcome = compio::time::timeout(Duration::from_secs(10), pending).await;
             assert!(
-                outcome.is_ok(),
+                compio::time::timeout(Duration::from_secs(10), pending)
+                    .await
+                    .is_ok(),
                 "in-flight call terminates on shutdown, never hangs"
             );
         });
     }
 
+    /// An unconfigured node fails fast with a named verdict instead of
+    /// dials backing off.
     #[test]
     fn unknown_peer_fails_fast() {
         block_on(async {
-            let (first, second, _dir) = pair().await;
-            let group = ConsensusGroupId::of_tablet(kivi_types::TabletId::from_u64(9));
+            let (first, second, _dir) = pair(origin(false), origin(false)).await;
             let error = first
                 .call(
                     NodeId::from_u64(99),
-                    group,
+                    GROUP,
                     vote_request(),
                     Duration::from_secs(5),
                 )
@@ -2406,61 +2419,23 @@ mod tests {
         });
     }
 
-    #[test]
-    fn suspended_links_time_out_and_heal() {
-        block_on(async {
-            let (first, second, _dir) = pair().await;
-            let group = ConsensusGroupId::of_tablet(kivi_types::TabletId::from_u64(9));
-            wait_connected(&first, NodeId::from_u64(2)).await;
-            first.suspend_peer(NodeId::from_u64(2)).await;
-            let error = first
-                .call(
-                    NodeId::from_u64(2),
-                    group,
-                    vote_request(),
-                    Duration::from_secs(5),
-                )
-                .await
-                .expect_err("suspended link times out");
-            assert_eq!(error, TransportError::Timeout);
-            first.resume_peer(NodeId::from_u64(2)).await;
-            wait_connected(&first, NodeId::from_u64(2)).await;
-            let response = first
-                .call(
-                    NodeId::from_u64(2),
-                    group,
-                    vote_request(),
-                    Duration::from_secs(10),
-                )
-                .await
-                .expect("healed link serves");
-            assert!(matches!(response, PeerResponse::Vote(_)));
-            first.shutdown().await;
-            second.shutdown().await;
-        });
-    }
-
+    /// With TLS verification on, a pinned certificate the peer never
+    /// presents fails the QUIC handshake itself: unreachable, never a
+    /// hang.
     #[test]
     fn pinned_tls_rejects_foreign_certificates() {
         block_on(async {
-            let addr_a = probe_udp();
-            let addr_b = probe_udp();
-            let peers: HashMap<NodeId, std::net::SocketAddr> =
-                [(NodeId::from_u64(1), addr_a), (NodeId::from_u64(2), addr_b)]
-                    .into_iter()
-                    .collect();
-            // Node 1 pins a certificate node 2 never presents (wrong trust
-            // anchor): the QUIC handshake itself must fail, surfacing as
-            // unreachable rather than a hang.
+            let peers: HashMap<NodeId, std::net::SocketAddr> = [
+                (NodeId::from_u64(1), probe_udp()),
+                (NodeId::from_u64(2), probe_udp()),
+            ]
+            .into_iter()
+            .collect();
             let dir = tempfile::tempdir().expect("scratch");
             let cert_a = NodeCert::load_or_generate(&dir.path().join("a"), NodeId::from_u64(1))
                 .expect("cert a");
-            // A certificate the pinned set never names: presenting anything
-            // else must fail verification (a distinct key, not a re-read).
-            let foreign =
-                NodeCert::load_or_generate(&dir.path().join("foreign"), NodeId::from_u64(99))
-                    .expect("foreign");
-            let _ = foreign;
+            // Node 1 pins a certificate node 2 never presents (wrong trust
+            // anchor).
             let pinned: HashMap<NodeId, Vec<u8>> = [(NodeId::from_u64(2), cert_a.cert_der.clone())]
                 .into_iter()
                 .collect();
@@ -2475,7 +2450,7 @@ mod tests {
                     trust: None,
                     insecure_skip_verify: false,
                 },
-                echo(),
+                origin(false),
             )
             .await
             .expect("first opens");
@@ -2486,15 +2461,14 @@ mod tests {
                 ClusterId::from_u128(CLUSTER),
                 &peers,
                 insecure_tls(dir_b.path(), 2),
-                echo(),
+                origin(false),
             )
             .await
             .expect("second opens");
-            let group = ConsensusGroupId::of_tablet(kivi_types::TabletId::from_u64(9));
             let error = first
                 .call(
                     NodeId::from_u64(2),
-                    group,
+                    GROUP,
                     vote_request(),
                     Duration::from_secs(8),
                 )

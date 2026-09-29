@@ -1,6 +1,6 @@
 //! Physical consensus records for the replicated tablet.
 //!
-//! In replicated mode the Raft log — not the tablet commit chain — is the
+//! In replicated mode the Raft log - not the tablet commit chain - is the
 //! authoritative mutation history (no double-logging: one ordered truth).
 //! These versioned, Kivi-owned record types persist exactly what the
 //! `OpenRaft` storage contract needs, and nothing of `OpenRaft`'s Rust
@@ -14,7 +14,7 @@
 //!     tag 0 BLANK:         (no further bytes)
 //!     tag 1 NORMAL:        u32 len, command bytes (opaque deterministic
 //!                          `ReplicatedMutation` encoding, owned by the
-//!                          consensus adapter — never JSON, never `OpenRaft`
+//!                          consensus adapter - never JSON, never `OpenRaft`
 //!                          memory layout)
 //!     tag 2 MEMBERSHIP:    u32 voters, u64 ids…, u32 nodes,
 //!                          (u64 id, u32 addr len, addr bytes)…
@@ -102,7 +102,7 @@ pub struct RaftEntry {
     pub namespace: NamespaceId,
     /// Consensus group (tablet) this entry belongs to.
     pub group: TabletId,
-    /// Per-group log index (consecutive — no holes). `OpenRaft` 0.10
+    /// Per-group log index (consecutive - no holes). `OpenRaft` 0.10
     /// numbers its first entry 0, so 0 is a legal index here.
     pub index: u64,
     /// Term that produced the entry.
@@ -134,7 +134,7 @@ pub struct RaftMembership {
 }
 
 /// Logical conflicting-suffix removal from `from_index` (inclusive).
-/// Recovery rebuilds the group history by applying the marker — the shared
+/// Recovery rebuilds the group history by applying the marker - the shared
 /// physical file is never `ftruncate`d for one group.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RaftTruncate {
@@ -421,8 +421,8 @@ fn decode_entry(body: &[u8]) -> Result<RaftRecord, RecordFault> {
         }
         _ => return Err(RecordFault::Corrupt("unknown raft entry payload tag")),
     };
-    // Note: index 0 is legal — `OpenRaft` 0.10 numbers its first entry
-    // 0 — so no nonzero check here (unlike truncate/purge markers,
+    // Note: index 0 is legal - `OpenRaft` 0.10 numbers its first entry
+    // 0 - so no nonzero check here (unlike truncate/purge markers,
     // whose zero values are never minted).
     Ok(RaftRecord::Entry(RaftEntry {
         namespace: NamespaceId::from_u64(namespace),

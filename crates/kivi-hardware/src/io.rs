@@ -2,13 +2,13 @@
 //!
 //! Three separate mechanisms, deliberately kept apart:
 //!
-//! * **Aligned buffers** ([`AlignedBuf`]) — a heap buffer whose address is a
+//! * **Aligned buffers** ([`AlignedBuf`]) - a heap buffer whose address is a
 //!   multiple of a chosen power of two. Needed by any unbuffered path and
 //!   useful to any SIMD kernel, and safe on every platform.
-//! * **Direct I/O** ([`DirectFile`]) — telling the operating system not to cache
+//! * **Direct I/O** ([`DirectFile`]) - telling the operating system not to cache
 //!   the pages a read or write touches. Saves a copy and a page-cache entry per
 //!   operation, and costs a synchronisation point.
-//! * **Aligned transfers** ([`AlignedTransfer`]) — the reusable, owner-local
+//! * **Aligned transfers** ([`AlignedTransfer`]) - the reusable, owner-local
 //!   buffer an unbuffered read needs. A direct read at an arbitrary offset
 //!   cannot use a caller-supplied `&mut [u8]`, because the buffer's address
 //!   must satisfy the volume's alignment, so the machinery to reconcile the
@@ -327,7 +327,7 @@ mod sys {
     /// Two mechanisms, in this order, because they answer different questions:
     ///
     /// * `statx(STATX_DIOALIGN)` (Linux 6.1) reports the *filesystem's* own
-    ///   requirement — `stx_dio_mem_align` and `stx_dio_offset_align`. That is
+    ///   requirement - `stx_dio_mem_align` and `stx_dio_offset_align`. That is
     ///   strictly more accurate than the block size, because a filesystem can
     ///   require a larger alignment than its device's sectors: `btrfs` on a
     ///   4 KiB device commonly wants 4 KiB, and `XFS` with a realtime
@@ -337,7 +337,7 @@ mod sys {
     /// * `/sys/dev/block/<major>:<minor>/queue/logical_block_size` is the
     ///   fallback for kernels before 6.1. It names the device's logical block
     ///   size, which is a lower bound on the requirement and therefore safe to
-    ///   satisfy only when it happens to be a power of two — which every real
+    ///   satisfy only when it happens to be a power of two - which every real
     ///   block size is, and which is checked rather than assumed.
     ///
     /// The returned value is the alignment a caller must satisfy for the buffer
@@ -402,7 +402,7 @@ mod sys {
     /// The device's logical block size, through the sysfs queue tree.
     ///
     /// For a *partition* (`sda1`, `nvme0n1p2`) sysfs has no `queue` directory
-    /// — the queue belongs to the whole disk. So a lookup that finds a
+    /// - the queue belongs to the whole disk. So a lookup that finds a
     /// `partition` file follows it to the parent, which is the hop `lsblk` and
     /// `blockdev` both perform. Skipping it is why a naive implementation
     /// reports "unknown alignment" on every ordinary Linux install and the
@@ -677,9 +677,9 @@ impl DirectFile {
     ///
     /// The alignment is learned from the file's own device. When it cannot be
     /// learned, the request resolves to `Buffered`. When the platform *reports*
-    /// an alignment but the unbuffered open is then **refused** — a `tmpfs`, an
+    /// an alignment but the unbuffered open is then **refused** - a `tmpfs`, an
     /// `overlayfs`, a 9p share, a Windows volume that will not report its
-    /// geometry — the buffered open is used instead and
+    /// geometry - the buffered open is used instead and
     /// [`DirectFile::mode`] reports what the handle actually is.
     ///
     /// That second fallback is the point. Deciding `Unbuffered` from the

@@ -36,6 +36,7 @@ pub mod blocking;
 pub mod command;
 pub mod connection;
 pub mod error;
+pub mod fast;
 pub mod frame;
 pub mod stats;
 pub mod translate;

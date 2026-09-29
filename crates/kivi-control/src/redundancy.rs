@@ -9,7 +9,6 @@
 //! and [`kivi_redundancy::RedundancyFabric::drain_node`].
 
 use kivi_redundancy::{AssetId, FailureDomain, NodeDescriptor, NodeHealth, PublishedLayout};
-use kivi_types::NodeId;
 
 use crate::layouts::LayoutKey;
 use crate::state::ControlState;
@@ -19,8 +18,7 @@ use crate::{NodeRecord, NodeState};
 ///
 /// The mapping is one-to-one: every control state has exactly one fabric
 /// counterpart, so no liveness nuance is lost or invented here.
-#[must_use]
-pub const fn health_of(state: NodeState) -> NodeHealth {
+const fn health_of(state: NodeState) -> NodeHealth {
     match state {
         NodeState::Active => NodeHealth::Active,
         NodeState::Draining => NodeHealth::Draining,
@@ -50,23 +48,7 @@ pub fn descriptors_from_registry(records: &[NodeRecord]) -> Vec<NodeDescriptor> 
                 String::new(),
             ),
             health: health_of(record.state),
-            weight: record.weight.max(1),
         })
-        .collect()
-}
-
-/// Returns the placement view during a drain: the registry view without the
-/// draining node.
-///
-/// Install the result via `fabric.set_nodes` (or pass it to
-/// `plan_placement` for a dry run) and move data with
-/// `fabric.drain_node(draining)`; the drained node receives no new
-/// fragments while its existing fragments migrate away verified.
-#[must_use]
-pub fn drain_plan(records: &[NodeRecord], draining: NodeId) -> Vec<NodeDescriptor> {
-    descriptors_from_registry(records)
-        .into_iter()
-        .filter(|descriptor| descriptor.id != draining)
         .collect()
 }
 
@@ -74,15 +56,6 @@ pub fn drain_plan(records: &[NodeRecord], draining: NodeId) -> Vec<NodeDescripto
 #[must_use]
 pub fn layout_key(asset: &AssetId) -> LayoutKey {
     LayoutKey::from_asset(asset)
-}
-
-/// Returns the control-plane generation fencing redundancy publishes.
-///
-/// The control Raft group owns publication order, so the current cluster
-/// generation is the fencing value coordinators attach to the next publish.
-#[must_use]
-pub fn control_generation_of(state: &ControlState) -> u64 {
-    state.generation().as_u64()
 }
 
 /// Returns the published layout for an asset, if any.
@@ -104,7 +77,6 @@ pub fn published_layout(state: &ControlState, asset: &AssetId) -> Option<Publish
 
 #[cfg(test)]
 mod tests {
-    use kivi_redundancy::{FailureScope, plan_placement};
     use kivi_types::NodeId;
 
     use super::*;
@@ -124,48 +96,16 @@ mod tests {
     }
 
     #[test]
-    fn health_mapping_covers_every_lifecycle_state() {
-        assert_eq!(health_of(NodeState::Active), NodeHealth::Active);
-        assert_eq!(health_of(NodeState::Draining), NodeHealth::Draining);
-        assert_eq!(health_of(NodeState::Unavailable), NodeHealth::Unavailable);
-        assert_eq!(health_of(NodeState::Suspect), NodeHealth::Suspect);
-        assert_eq!(health_of(NodeState::Joining), NodeHealth::Joining);
-        assert_eq!(health_of(NodeState::Drained), NodeHealth::Drained);
-        assert_eq!(health_of(NodeState::Removed), NodeHealth::Removed);
-    }
-
-    #[test]
-    fn drain_excludes_node_from_placement() {
+    fn descriptors_carry_domain_and_health() {
         let records = vec![
             record(1, NodeState::Active, "rack-a"),
-            record(2, NodeState::Active, "rack-b"),
+            record(2, NodeState::Draining, "rack-b"),
             record(3, NodeState::Active, "rack-c"),
-            record(4, NodeState::Active, "rack-d"),
-            record(5, NodeState::Draining, "rack-e"),
         ];
         let descriptors = descriptors_from_registry(&records);
-        assert_eq!(descriptors.len(), 5);
+        assert_eq!(descriptors.len(), 3);
         assert_eq!(descriptors[0].domain.rack, "rack-a");
-        assert_eq!(descriptors[4].health, NodeHealth::Draining);
-
-        // Draining node 5 out: the placement view drops it entirely.
-        let view = drain_plan(&records, NodeId::from_u64(5));
-        assert_eq!(view.len(), 4);
-        assert!(view.iter().all(|d| d.id != NodeId::from_u64(5)));
-
-        let asset = kivi_redundancy::InformationAsset::chunk_for_bytes(
-            b"drain-test",
-            kivi_types::SecurityDomainId::from_u64(1),
-        );
-        let placement = plan_placement(asset.id, 1, 3, FailureScope::Node, &view, &[])
-            .expect("places without the drained node");
-        assert_eq!(placement.fragments.len(), 3);
-        assert!(
-            placement
-                .nodes()
-                .iter()
-                .all(|node| *node != NodeId::from_u64(5))
-        );
+        assert_eq!(descriptors[1].health, NodeHealth::Draining);
     }
 
     fn published_asset() -> kivi_redundancy::AssetId {
@@ -204,7 +144,6 @@ mod tests {
         assert_ne!(layout_key(&asset), layout_key(&other));
 
         let mut state = ControlState::empty();
-        assert_eq!(control_generation_of(&state), 1);
         assert!(published_layout(&state, &asset).is_none());
         state
             .apply(&crate::ControlMutation::PublishRedundancyLayout {

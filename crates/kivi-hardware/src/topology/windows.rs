@@ -60,8 +60,8 @@ const RECORD_HEADER_BYTES: usize = 8;
 /// | 8 | reserved | reserved | `Type` |
 /// | 22 | `GroupCount` | `GroupCount` | reserved |
 /// | 24 | `GroupMask` | `GroupMask` | reserved |
-/// | 30 | — | — | `GroupCount` |
-/// | 32 | — | — | `GroupMask` |
+/// | 30 | - | - | `GroupCount` |
+/// | 32 | - | - | `GroupMask` |
 mod field {
     /// `Flags` in a `PROCESSOR_RELATIONSHIP`.
     pub(super) const FLAGS: usize = 0;

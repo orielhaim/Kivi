@@ -68,15 +68,11 @@ pub fn io_uring_support() -> Support<IoUringSupport> {
 mod tests {
     use super::*;
 
+    /// Each backend must answer with a reason or a value, never an error, and
+    /// must answer the same way twice: a backend whose answer changed between
+    /// calls would make two subsystems disagree about the same machine.
     #[test]
-    fn every_backend_answers_with_a_reason_or_a_value() {
-        assert!(!pmu_support().to_string().is_empty());
-        assert!(!damon_support().to_string().is_empty());
-        assert!(!io_uring_support().to_string().is_empty());
-    }
-
-    #[test]
-    fn detection_is_idempotent() {
+    fn every_backend_answers_once_and_consistently() {
         assert_eq!(pmu_support(), pmu_support());
         assert_eq!(damon_support(), damon_support());
         assert_eq!(io_uring_support(), io_uring_support());

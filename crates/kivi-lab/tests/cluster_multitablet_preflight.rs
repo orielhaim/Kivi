@@ -11,41 +11,8 @@ use std::time::{Duration, Instant};
 
 use kivi_client::{ClientConfig, NativeClient};
 use kivi_lab::cluster::Cluster;
-use kivi_state::Key;
-use kivi_types::{NamespaceId, RequestSeq, SessionId};
-
-fn key(name: &str) -> Key {
-    Key::from(name)
-}
-
-/// Deterministic pseudo-random fill (splitmix64).
-fn fill(len: usize, seed: u64) -> Vec<u8> {
-    let mut state = seed;
-    let mut out = vec![0u8; len];
-    for byte in &mut out {
-        state = state
-            .wrapping_add(0x9E37_79B9_7F4A_7C15)
-            .wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        state ^= state >> 29;
-        *byte = (state % 251) as u8;
-    }
-    out
-}
-
-fn put_stream(client: &kivi_client::NativeClient, name: &str, value: &[u8]) {
-    let mut source: &[u8] = value;
-    client
-        .put_stream(&key(name), Some(value.len() as u64), &mut source)
-        .unwrap_or_else(|error| panic!("put_stream {name} commits: {error:?}"));
-}
-
-fn get_stream(client: &kivi_client::NativeClient, name: &str) -> Vec<u8> {
-    client
-        .get_stream(&key(name))
-        .unwrap_or_else(|error| panic!("get_stream {name} reads: {error:?}"))
-        .unwrap_or_else(|| panic!("{name} present"))
-        .to_vec()
-}
+use kivi_lab::testkit::{NS, fill, get_stream, key, put_stream};
+use kivi_types::{RequestSeq, SessionId};
 
 /// Sorted percentiles (ms) of client-measured latencies.
 #[allow(
@@ -67,43 +34,20 @@ fn percentiles(mut latencies: Vec<Duration>) -> (f64, f64, f64, f64) {
     (at(0.50), at(0.95), at(0.99), at(0.999))
 }
 
-/// Sum of `/v1/preflight` attempts across live members.
-fn preflight_attempts(cluster: &Cluster) -> u64 {
+/// Sums one `/v1/preflight` counter across the live members.
+fn preflight(cluster: &Cluster, field: &str) -> u64 {
     (0..3)
-        .filter(|i| cluster.alive(*i))
-        .map(|i| {
-            let (_, body) = cluster.admin_get(i, "/v1/preflight");
-            body["attempts"].as_u64().unwrap_or(0)
+        .filter(|index| cluster.alive(*index))
+        .map(|index| {
+            let (_, body) = cluster.admin_get(index, "/v1/preflight");
+            body[field].as_u64().unwrap_or(0)
         })
         .sum()
 }
 
-/// Sum of quorum-ready rounds across live members.
-fn preflight_ready(cluster: &Cluster) -> u64 {
-    (0..3)
-        .filter(|i| cluster.alive(*i))
-        .map(|i| {
-            let (_, body) = cluster.admin_get(i, "/v1/preflight");
-            body["quorum_ready"].as_u64().unwrap_or(0)
-        })
-        .sum()
-}
-
-/// Sum of append-gate fallbacks across live members.
-fn preflight_fallbacks(cluster: &Cluster) -> u64 {
-    (0..3)
-        .filter(|i| cluster.alive(*i))
-        .map(|i| {
-            let (_, body) = cluster.admin_get(i, "/v1/preflight");
-            body["fallbacks"].as_u64().unwrap_or(0)
-        })
-        .sum()
-}
-
-/// Same-tablet preflight (§45): while a 64 MiB value's sidecars move
-/// before its root proposes, 100 small SETs on the SAME tablet keep
-/// committing — the seconds-long queue of the old append-blocking design
-/// (p99 ≈ 2.3 s) is gone.
+/// Same-tablet preflight: while a 64 MiB value's sidecars move before its
+/// root proposes, 100 small SETs on the SAME tablet keep committing, instead
+/// of queueing behind the upload.
 #[test]
 fn preflight_same_tablet_small_writes_stay_fast() {
     let cluster = Cluster::spawn_with_tablets(4, 2, false).expect("cluster spawns");
@@ -142,14 +86,17 @@ fn preflight_same_tablet_small_writes_stay_fast() {
     eprintln!("  p50 {p50:.2} ms, p95 {p95:.2} ms, p99 {p99:.2} ms, p99.9 {p999:.2} ms");
     eprintln!(
         "  preflight attempts {}, quorum-ready {}",
-        preflight_attempts(&cluster),
-        preflight_ready(&cluster)
+        preflight(&cluster, "attempts"),
+        preflight(&cluster, "quorum_ready")
     );
     assert!(
         p99 < 1500.0,
         "same-tablet p99 {p99:.2} ms must stay far below the old 2.3 s queue"
     );
-    assert!(preflight_ready(&cluster) >= 1, "preflight reached quorum");
+    assert!(
+        preflight(&cluster, "quorum_ready") >= 1,
+        "preflight reached quorum"
+    );
     cluster.wait_converged_all();
     assert_eq!(
         get_stream(&cluster.client(), &names[0]).len(),
@@ -158,7 +105,7 @@ fn preflight_same_tablet_small_writes_stay_fast() {
 }
 
 /// Cross-tablet isolation (§46): a 32 MiB upload on tablet A leaves
-/// tablet B latency nearly untouched — no Raft-log head-of-line crosses
+/// tablet B latency nearly untouched - no Raft-log head-of-line crosses
 /// tablet boundaries (only shared CPU/storage/network couple them).
 #[test]
 fn preflight_other_tablet_stays_isolated() {
@@ -260,12 +207,12 @@ fn preflight_disabled_falls_back_to_append_gate() {
     cluster.wait_converged_all();
     assert_eq!(get_stream(&cluster.client(), &name), value);
     assert!(
-        preflight_fallbacks(&cluster) >= 1,
+        preflight(&cluster, "fallbacks") >= 1,
         "disabled preflight counts append-gate fallbacks"
     );
 }
 
-/// Leader loss during preflight (§49): sidecars alone never commit — the
+/// Leader loss during preflight (§49): sidecars alone never commit - the
 /// key stays absent or fully present, and the same identity retried on
 /// the new leader converges exactly once.
 #[test]
@@ -318,7 +265,7 @@ fn preflight_leader_loss_abandons_without_commit() {
         loop {
             let retry_client = NativeClient::new(ClientConfig {
                 seeds: cluster.native_endpoints(),
-                namespace: NamespaceId::from_u64(1),
+                namespace: NS,
                 session: Some(session),
                 request_timeout: Duration::from_secs(120),
                 ..ClientConfig::default()
@@ -363,7 +310,7 @@ fn preflight_leader_loss_abandons_without_commit() {
 }
 
 /// Stale-state race (§50): a large write started before a small write to
-/// the same key still obeys proposal ordering — the large root proposes
+/// the same key still obeys proposal ordering - the large root proposes
 /// after its preflight, so it wins deterministically.
 #[test]
 fn preflight_stale_state_race_last_proposal_wins() {
@@ -388,7 +335,7 @@ fn preflight_stale_state_race_last_proposal_wins() {
         // (condition-driven, not a blind sleep), then commit the small
         // write mid-preflight.
         let deadline = Instant::now() + Duration::from_secs(120);
-        while preflight_attempts(&cluster) == 0 {
+        while preflight(&cluster, "attempts") == 0 {
             assert!(Instant::now() < deadline, "preflight never starts");
             std::thread::sleep(Duration::from_millis(100));
         }

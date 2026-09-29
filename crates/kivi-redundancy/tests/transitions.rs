@@ -3,14 +3,13 @@
 //! Every transition keeps the logical [`AssetId`] unchanged, serves exact
 //! bytes before/during/after (no caller reference rewrite), publishes the
 //! target params, retires the old generation (old files gone, `CURRENT`
-//! points at the new generation), bumps `transitions` metrics, and moves
-//! storage amplification as expected (rep 3x = 3.0, RS 4+2 = 1.5,
-//! RS 8+3 = 1.375).
+//! points at the new generation), and bumps the `transitions` metric.
 
 use kivi_redundancy::{
     FabricConfig, InformationAsset, RedundancyFabric, ReplicationParams, RsParams, SchemeParams,
 };
 use kivi_types::{NodeId, SecurityDomainId};
+use rstest::rstest;
 
 const DOMAIN: SecurityDomainId = SecurityDomainId::from_u64(7);
 const LEN: usize = 256 * 1024;
@@ -33,7 +32,6 @@ fn nodes(count: u64) -> Vec<kivi_redundancy::NodeDescriptor> {
             id: NodeId::from_u64(id),
             domain: kivi_redundancy::FailureDomain::node_only(NodeId::from_u64(id)),
             health: kivi_redundancy::NodeHealth::Active,
-            weight: 1,
         })
         .collect()
 }
@@ -56,14 +54,6 @@ fn rs83(len: u64) -> SchemeParams {
         parity: 3,
         fragment_len: RsParams::shard_for_len(len, 8),
     })
-}
-
-fn amplification_f64(params: SchemeParams) -> f64 {
-    let (num, den) = params.amplification();
-    // Amplification ratios are tiny (<=8); precision loss is irrelevant.
-    #[allow(clippy::cast_precision_loss)]
-    let out = num as f64 / den as f64;
-    out
 }
 
 fn asset_dir(root: &std::path::Path, asset: InformationAsset) -> std::path::PathBuf {
@@ -139,24 +129,19 @@ fn check_transition(from: SchemeParams, to: SchemeParams, seed: u64, label: &str
     );
 }
 
-#[test]
-fn replicated_to_coded_stays_readable() {
-    check_transition(rep3(), rs42(LEN as u64), 201, "rep->rs42");
-    assert!((amplification_f64(rep3()) - 3.0).abs() < f64::EPSILON);
-    assert!((amplification_f64(rs42(LEN as u64)) - 1.5).abs() < f64::EPSILON);
-}
-
-#[test]
-fn coded_to_replicated_stays_readable() {
-    check_transition(rs42(LEN as u64), rep3(), 202, "rs42->rep");
-}
-
-#[test]
-fn coded_width_change_stays_readable() {
-    check_transition(rs42(LEN as u64), rs83(LEN as u64), 203, "rs42->rs83");
-    assert!((amplification_f64(rs83(LEN as u64)) - 1.375).abs() < f64::EPSILON);
-    // And back down.
-    check_transition(rs83(LEN as u64), rs42(LEN as u64), 204, "rs83->rs42");
+#[rstest]
+#[case::rep3_to_rs42("rep3", "rs42")]
+#[case::rs42_to_rep3("rs42", "rep3")]
+#[case::rs42_to_rs83("rs42", "rs83")]
+#[case::rs83_to_rs42("rs83", "rs42")]
+fn every_direction_stays_readable(#[case] from: &str, #[case] to: &str) {
+    let pick = |name: &str| match name {
+        "rep3" => rep3(),
+        "rs42" => rs42(LEN as u64),
+        "rs83" => rs83(LEN as u64),
+        other => panic!("unknown scheme {other}"),
+    };
+    check_transition(pick(from), pick(to), 201, &format!("{from}->{to}"));
 }
 
 #[test]

@@ -2,16 +2,14 @@
 //!
 //! Runs [`kivi_lab::conformance::exact_vectors`] against a spawned Kivi
 //! (ephemeral + RESP) and the reference Redis, then diffs normalized
-//! observables. Only `Exact` commands compare — deviations and unsupported
+//! observables. Only `Exact` commands compare - deviations and unsupported
 //! forms have their own tests and never fail this harness.
 //!
 //! External Redis is opt-in: without `KIVI_LAB_REDIS_URL` these tests skip
 //! with a notice (ordinary `cargo test` stays self-contained); a set but
 //! unreachable URL fails loudly. This file additionally needs the lab
-//! `redis-compat` feature (a RESP-capable Kivi binary); without it the
+//! edge (a RESP-capable Kivi binary, which is the default build); without it
 //! file compiles to nothing.
-
-#![cfg(feature = "redis-compat")]
 
 use kivi_lab::conformance::{
     cleanup_prefix, diff_vectors, redis_config, redis_opted_in, redis_url, run_scope, run_vectors,

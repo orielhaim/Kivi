@@ -11,7 +11,7 @@ use kivi_core::{EventView, FaultDecision, FaultPolicy, RandomSource};
 
 use crate::net::NetDeliveryContext;
 
-/// Never interferes: every event is allowed. The replay baseline — a faulted
+/// Never interferes: every event is allowed. The replay baseline - a faulted
 /// run must reduce to the unfaulted run when the policy allows everything.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AllowAll;
@@ -39,7 +39,7 @@ impl FaultPolicy<NetDeliveryContext> for AllowAll {
 ///
 /// With `every = 1` everything is dropped; with `every = N` the Nth, 2Nth,
 /// ... decisions drop. Ignores randomness entirely, so drop positions are
-/// a fixed function of event order — ideal for testing fencing and retry
+/// a fixed function of event order - ideal for testing fencing and retry
 /// paths deterministically.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropEveryNth {
@@ -169,15 +169,6 @@ mod tests {
     }
 
     #[test]
-    fn allow_all_never_interferes() {
-        let mut policy = AllowAll;
-        let mut rng = ZeroRng;
-        for n in 0..16 {
-            assert_eq!(policy.decide(&view(n), &(), &mut rng), FaultDecision::Allow);
-        }
-    }
-
-    #[test]
     fn drop_every_nth_has_exact_period() {
         use FaultDecision::{Allow, Drop};
 
@@ -194,7 +185,19 @@ mod tests {
     }
 
     #[test]
-    fn probability_policy_is_deterministic_given_the_stream() {
+    fn probability_policy_is_a_pure_function_of_the_rng_stream() {
+        use FaultDecision::{Allow, Drop};
+        // Clamped constructor: any ppm above the maximum is 100% drop.
+        assert_eq!(DropWithProbability::new(u32::MAX).threshold_ppm(), MAX_PPM);
+        let mut always = DropWithProbability::new(MAX_PPM);
+        let mut never = DropWithProbability::new(0);
+        let mut rng = SimRng::seed_from_u64(1);
+        for n in 0..32 {
+            assert_eq!(always.decide(&view(n), &(), &mut rng), Drop);
+            assert_eq!(never.decide(&view(n), &(), &mut rng), Allow);
+        }
+        // Same seed plus same policy: the same drop positions, every run.
+        // Each policy gets its own stream, so both see the same draws.
         let mut left = DropWithProbability::new(500_000);
         let mut right = DropWithProbability::new(500_000);
         let mut left_rng = SimRng::seed_from_u64(11);
@@ -204,14 +207,6 @@ mod tests {
                 left.decide(&view(n), &(), &mut left_rng),
                 right.decide(&view(n), &(), &mut right_rng)
             );
-        }
-        assert_eq!(DropWithProbability::new(u32::MAX).threshold_ppm(), MAX_PPM);
-        let mut never = DropWithProbability::new(0);
-        let mut always = DropWithProbability::new(MAX_PPM);
-        let mut rng = SimRng::seed_from_u64(1);
-        for n in 0..16 {
-            assert_eq!(never.decide(&view(n), &(), &mut rng), FaultDecision::Allow);
-            assert_eq!(always.decide(&view(n), &(), &mut rng), FaultDecision::Drop);
         }
     }
 }

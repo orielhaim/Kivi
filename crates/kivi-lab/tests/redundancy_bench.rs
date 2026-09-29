@@ -8,17 +8,15 @@
 //! must restore the lost copy, and a coded layout must store less than a
 //! replicated one.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use kivi_lab::cluster::Cluster;
+use kivi_lab::testkit::redundancy::{
+    asset_hex, await_health, await_until, fragments_root, health, payload, protect, read, repair,
+    transition, unb64,
+};
+use kivi_lab::testkit::summarize;
 use serde_json::{Value, json};
-
-/// Generous deadlines: process spawn plus Raft commits dominates wall time.
-const DEADLINE: Duration = Duration::from_secs(180);
-const POLL: Duration = Duration::from_millis(250);
-
-/// Asset family discriminant for generic immutable bytes (BLAKE3 identity).
-const KIND_GENERIC: u8 = 5;
 
 /// Bench payload size: 64 KiB is the replication/coding threshold, so this
 /// size is replicated under an intent (cheap direct reads).
@@ -30,96 +28,6 @@ const ASSETS: usize = 8;
 /// Coded-layout comparison payload (above the threshold, so the baseline
 /// planner picks erasure coding).
 const CODED_BYTES: usize = 512 * 1024;
-
-/// Deterministic pseudo-random payload (splitmix64): incompressible enough
-/// to be representative, fully reproducible.
-fn payload(len: usize, seed: u64) -> Vec<u8> {
-    let mut state = seed;
-    let mut out = Vec::with_capacity(len);
-    while out.len() < len {
-        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^= z >> 31;
-        out.extend_from_slice(&z.to_le_bytes());
-    }
-    out.truncate(len);
-    out
-}
-
-/// Standard padded base64 (the admin plane's image encoding).
-fn b64(bytes: &[u8]) -> String {
-    use base64::Engine as _;
-    base64::engine::general_purpose::STANDARD.encode(bytes)
-}
-
-/// Decodes standard padded base64.
-fn unb64(text: &str) -> Option<Vec<u8>> {
-    use base64::Engine as _;
-    base64::engine::general_purpose::STANDARD.decode(text).ok()
-}
-
-/// Lowercase hex identity of a generic immutable asset.
-fn asset_hex(bytes: &[u8]) -> String {
-    use core::fmt::Write as _;
-    let digest = kivi_codec::integrity::blake3_256(bytes);
-    let mut out = String::with_capacity(64);
-    for byte in digest {
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
-}
-
-/// Fragment store root of one cluster member.
-fn fragments_root(cluster: &Cluster, index: usize) -> std::path::PathBuf {
-    cluster.data_dir(index).join("redundancy").join("fragments")
-}
-
-/// Protects bytes through the admin plane.
-fn protect(cluster: &Cluster, index: usize, bytes: &[u8], tolerance: u8) -> (u16, Value) {
-    let body = json!({
-        "kind": KIND_GENERIC,
-        "domain": 0,
-        "bytes_b64": b64(bytes),
-        "tolerance": tolerance,
-    });
-    cluster.admin_post(index, "/v1/redundancy/protect", &body)
-}
-
-/// Reads an asset back through the admin plane.
-fn read(cluster: &Cluster, index: usize, hash: &str) -> (u16, Value) {
-    cluster.admin_get(
-        index,
-        &format!("/v1/redundancy/read?kind={KIND_GENERIC}&domain=0&hash_hex={hash}"),
-    )
-}
-
-/// Reads one asset's health.
-fn health(cluster: &Cluster, index: usize, hash: &str) -> (u16, Value) {
-    cluster.admin_get(
-        index,
-        &format!("/v1/redundancy/health?kind={KIND_GENERIC}&domain=0&hash_hex={hash}"),
-    )
-}
-
-/// Repairs one asset.
-fn repair(cluster: &Cluster, index: usize, hash: &str) -> (u16, Value) {
-    cluster.admin_post(
-        index,
-        "/v1/redundancy/repair",
-        &json!({ "kind": KIND_GENERIC, "domain": 0, "hash_hex": hash }),
-    )
-}
-
-/// Transitions one asset to an explicit scheme.
-fn transition(cluster: &Cluster, index: usize, hash: &str, scheme: &Value) -> (u16, Value) {
-    cluster.admin_post(
-        index,
-        "/v1/redundancy/transition",
-        &json!({ "kind": KIND_GENERIC, "domain": 0, "hash_hex": hash, "scheme": scheme }),
-    )
-}
 
 /// Snapshot of one node's fabric metrics.
 fn metrics(cluster: &Cluster, index: usize) -> Value {
@@ -141,49 +49,6 @@ fn stored_bytes(body: &Value) -> u64 {
 
 /// Sorted latencies (ms) reported as p50/p95/p99.
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-fn summarize(name: &str, mut latencies: Vec<Duration>) {
-    latencies.sort_unstable();
-    let at = |q: f64| {
-        let rank = (q * latencies.len() as f64)
-            .ceil()
-            .max(1.0)
-            .min(latencies.len() as f64);
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let index = rank as usize - 1;
-        latencies[index].as_secs_f64() * 1000.0
-    };
-    eprintln!(
-        "{name}: n={} p50={:.2}ms p95={:.2}ms p99={:.2}ms",
-        latencies.len(),
-        at(0.50),
-        at(0.95),
-        at(0.99),
-    );
-}
-
-/// Polls until `check` returns a value or the deadline passes.
-fn await_until<T>(label: &str, mut check: impl FnMut() -> Option<T>) -> T {
-    let deadline = Instant::now() + DEADLINE;
-    loop {
-        if let Some(value) = check() {
-            return value;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out after {DEADLINE:?} waiting for {label}"
-        );
-        std::thread::sleep(POLL);
-    }
-}
-
-/// Waits until an asset reports `wanted` health on a node.
-fn await_health(cluster: &Cluster, index: usize, hash: &str, wanted: &str) -> Value {
-    await_until(&format!("health {wanted} on node {index}"), || {
-        let (status, body) = health(cluster, index, hash);
-        (status == 200 && body["health"].as_str() == Some(wanted)).then_some(body)
-    })
-}
-
 /// Protect throughput and cross-node byte accounting: eight 64 KiB assets,
 /// three copies each, all placed on distinct holders.
 ///

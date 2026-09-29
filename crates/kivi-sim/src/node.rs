@@ -18,7 +18,7 @@
 //! Stale-incarnation fencing lives here too: [`check_endpoint`](NodeTable::check_endpoint)
 //! rejects traffic for obsolete incarnations, so a delayed message sent by
 //! incarnation 7 can never become valid after the node restarts as 8. The
-//! simulator is generic on purpose — tablets, Raft groups, control-plane
+//! simulator is generic on purpose - tablets, Raft groups, control-plane
 //! actors, and durability providers will all run inside it later.
 
 use core::fmt;
@@ -311,69 +311,32 @@ mod tests {
     }
 
     #[test]
-    fn full_lifecycle_advances_state_and_incarnation() {
-        let mut table = NodeTable::new();
-        table.add_node(node(1)).expect("add");
-        let first = table.current_endpoint(node(1)).expect("endpoint");
-        assert_eq!(first.incarnation(), NodeIncarnation::INITIAL);
-
-        let crashed = table.crash(node(1)).expect("crash");
-        assert_eq!(crashed, first);
-        assert_eq!(
-            table.get(node(1)).expect("info").state(),
-            NodeState::Crashed
-        );
-
-        let restarting = table.begin_restart(node(1)).expect("begin");
-        assert_eq!(
-            restarting.incarnation().as_u64(),
-            first.incarnation().as_u64() + 1
-        );
-        let running = table.finish_restart(node(1)).expect("finish");
-        assert_eq!(running, restarting);
-        assert_eq!(
-            table.get(node(1)).expect("info").state(),
-            NodeState::Running
-        );
-    }
-
-    #[test]
     fn stale_incarnation_never_becomes_valid_again() {
         let mut table = NodeTable::new();
         table.add_node(node(1)).expect("add");
         let old = table.current_endpoint(node(1)).expect("endpoint");
-        table.crash(node(1)).expect("crash");
-        // Crashed instance is not running.
+        assert_eq!(old.incarnation(), NodeIncarnation::INITIAL);
+        // Crashing hands back the endpoint that just went away.
+        assert_eq!(table.crash(node(1)).expect("crash"), old);
         assert!(matches!(
             table.check_endpoint(&old),
             Err(EndpointError::NotRunning { .. })
         ));
         let next = table.begin_restart(node(1)).expect("begin");
-        // Restarting instance is not running either.
+        assert_eq!(next.incarnation().as_u64(), old.incarnation().as_u64() + 1);
         assert!(matches!(
             table.check_endpoint(&next),
             Err(EndpointError::NotRunning { .. })
         ));
-        table.finish_restart(node(1)).expect("finish");
-        // The old endpoint is now stale — permanently rejected.
-        assert_eq!(
-            table.check_endpoint(&old),
-            Err(EndpointError::StaleIncarnation {
-                node: node(1),
-                presented: old.incarnation(),
-                current: next.incarnation(),
-            })
-        );
-        // The new endpoint works.
+        assert_eq!(table.finish_restart(node(1)).expect("finish"), next);
+        let stale = EndpointError::StaleIncarnation {
+            node: node(1),
+            presented: old.incarnation(),
+            current: next.incarnation(),
+        };
+        // The old endpoint is now stale - permanently rejected.
+        assert_eq!(table.check_endpoint(&old), Err(stale));
         assert_eq!(table.check_endpoint(&next), Ok(()));
-        assert_eq!(
-            table.check_endpoint(&old),
-            Err(EndpointError::StaleIncarnation {
-                node: node(1),
-                presented: old.incarnation(),
-                current: next.incarnation(),
-            })
-        );
     }
 
     /// Histories as (action, expect-ok) scripts over one node.

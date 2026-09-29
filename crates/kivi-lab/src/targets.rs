@@ -4,9 +4,9 @@
 //! sees. The two implementations execute the *same* [`WorkloadOp`]
 //! stream:
 //!
-//! * [`KiviNativeTarget`] — typed [`NativeClient`]
+//! * [`KiviNativeTarget`] - typed [`NativeClient`]
 //!   calls against the native protocol.
-//! * [`RespTarget`] — standard RESP commands through the shared raw client
+//! * [`RespTarget`] - standard RESP commands through the shared raw client
 //!   ([`crate::resp_client`]). Deliberately generic: the exact same code
 //!   points at Kivi RESP, Redis, Valkey, or Dragonfly, so comparisons stay
 //!   apples-to-apples. There is intentionally no separate `RedisTarget`.
@@ -23,7 +23,7 @@ use crate::resp_client::{Reply, RespClient};
 use crate::workload::{PAYLOAD_SEED, RANGE_WINDOW, WorkloadOp, fill_pattern};
 
 /// One workload outcome. Reads of absent keys are `Ok` (seeding makes
-/// absence rare; deletes make it legal) — only transport/type errors fail.
+/// absence rare; deletes make it legal) - only transport/type errors fail.
 pub type OpOutcome = Result<(), String>;
 
 const RESP_RETRY_LIMIT: u32 = 12;
@@ -42,7 +42,7 @@ pub struct TargetStats {
 /// Minimal interface the [`runner`](crate::runner) needs. Adapters own
 /// every protocol-specific conversion; batching shape (one round-trip per
 /// batch when the transport pipelines) lives here, while threading,
-/// warmup, timing, and histograms live in the runner — identical for all
+/// warmup, timing, and histograms live in the runner - identical for all
 /// targets.
 pub trait BenchTarget: Send {
     /// Executes a batch of ops in order, returning per-op outcomes.

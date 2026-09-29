@@ -5,16 +5,10 @@
 //! [`MaterializationIntent`]: access behavior, bytes, mutability,
 //! read/write ratio, reconstruction cost, compression ratio, loaded
 //! provider latency, memory pressure, tail-latency contribution,
-//! migration cost, and tenant policy. Simple [`SieveBaseline`] and
-//! [`S3FifoBaseline`] implementations exist for measurement comparison;
-//! benchmarks decide, but the production default is criticality-aware,
-//! never LRU or hot/cold alone.
+//! migration cost, and tenant policy.
 //!
-//! Every decision carries hysteresis: minimum improvement, sustained
-//! duration, and cooldown. No object bounces between representations
-//! every few seconds.
-
-use std::collections::HashMap;
+//! Every decision carries hysteresis: a minimum improvement and a
+//! cooldown. No object bounces between representations every few seconds.
 
 use crate::criticality::ExecutionCriticality;
 use crate::intent::MaterializationIntent;
@@ -172,7 +166,7 @@ impl CriticalityPlanner {
         // Locality: a provider on another memory node is reachable, but every
         // access pays the inter-socket hop. The penalty is added to access cost
         // rather than compared against a hard filter, because crossing a node
-        // is a cost and not an impossibility — except when the intent pinned a
+        // is a cost and not an impossibility - except when the intent pinned a
         // node, which `satisfies` has already enforced.
         let remote = match (
             caps.locality.numa_node,
@@ -239,169 +233,6 @@ impl Planner for CriticalityPlanner {
             confidence: 0.8,
             cooldown_ticks: self.cooldown_ticks,
             reason: "criticality/cost optimum",
-        }
-    }
-}
-
-/// SIEVE-style baseline: single-clock FIFO with second-chance bits.
-///
-/// Kept for measurement comparison (RFC §141). Request-path simple by
-/// design; the benchmark harness decides whether it survives.
-#[derive(Debug, Default)]
-pub struct SieveBaseline {
-    visited: HashMap<u64, bool>,
-    order: Vec<u64>,
-}
-
-impl SieveBaseline {
-    /// Creates an empty baseline.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            visited: HashMap::new(),
-            order: Vec::new(),
-        }
-    }
-
-    /// Records a cache hit (sets the second-chance bit).
-    pub fn hit(&mut self, object: u64) {
-        self.visited.insert(object, true);
-        if !self.order.contains(&object) {
-            self.order.push(object);
-        }
-    }
-}
-
-impl Planner for SieveBaseline {
-    fn plan(
-        &mut self,
-        input: &PlacementInput<'_>,
-        providers: &ProviderRegistry,
-    ) -> PlacementDecision {
-        // Baseline heuristic: objects with any recent hit stay on the
-        // fastest eligible provider; misses go to the cheapest.
-        let hot = self.visited.get(&input.object).copied().unwrap_or(false);
-        let mut eligible: Vec<_> = providers
-            .all()
-            .iter()
-            .filter(|p| {
-                p.caps.satisfies(
-                    input.intent.coherence,
-                    input.intent.sharing,
-                    input.intent.durability_required,
-                    input.intent.locality,
-                    input.intent.encryption_required,
-                )
-            })
-            .collect();
-        if eligible.is_empty() {
-            return PlacementDecision::stay("no eligible provider");
-        }
-        eligible.sort_by_key(|p| {
-            if hot {
-                p.caps.read_latency_ns
-            } else {
-                u64::MAX - p.caps.cost_per_byte
-            }
-        });
-        let target = eligible[0].id;
-        if Some(target) == input.current {
-            PlacementDecision::stay("sieve: already placed")
-        } else {
-            PlacementDecision {
-                target,
-                improvement: 0.05,
-                confidence: 0.4,
-                cooldown_ticks: 0,
-                reason: "sieve baseline",
-            }
-        }
-    }
-}
-
-/// S3-FIFO-style baseline: small ghost queue plus main FIFO.
-///
-/// Kept for measurement comparison (RFC §141). Like SIEVE, the harness
-/// measures it; the production planner does not depend on it.
-#[derive(Debug, Default)]
-pub struct S3FifoBaseline {
-    small: Vec<u64>,
-    ghost: Vec<u64>,
-    small_capacity: usize,
-}
-
-impl S3FifoBaseline {
-    /// Creates a baseline with the given small-queue capacity.
-    #[must_use]
-    pub fn new(small_capacity: usize) -> Self {
-        Self {
-            small: Vec::new(),
-            ghost: Vec::new(),
-            small_capacity: if small_capacity == 0 {
-                1
-            } else {
-                small_capacity
-            },
-        }
-    }
-
-    /// Records an access.
-    pub fn access(&mut self, object: u64) {
-        if self.small.contains(&object) || self.ghost.contains(&object) {
-            return;
-        }
-        if self.small.len() >= self.small_capacity {
-            let evicted = self.small.remove(0);
-            self.ghost.push(evicted);
-            if self.ghost.len() > self.small_capacity * 2 {
-                self.ghost.remove(0);
-            }
-        }
-        self.small.push(object);
-    }
-}
-
-impl Planner for S3FifoBaseline {
-    fn plan(
-        &mut self,
-        input: &PlacementInput<'_>,
-        providers: &ProviderRegistry,
-    ) -> PlacementDecision {
-        let promoted = self.ghost.contains(&input.object);
-        let mut eligible: Vec<_> = providers
-            .all()
-            .iter()
-            .filter(|p| {
-                p.caps.satisfies(
-                    input.intent.coherence,
-                    input.intent.sharing,
-                    input.intent.durability_required,
-                    input.intent.locality,
-                    input.intent.encryption_required,
-                )
-            })
-            .collect();
-        if eligible.is_empty() {
-            return PlacementDecision::stay("no eligible provider");
-        }
-        eligible.sort_by_key(|p| {
-            if promoted {
-                p.caps.read_latency_ns
-            } else {
-                u64::MAX - p.caps.cost_per_byte
-            }
-        });
-        let target = eligible[0].id;
-        if Some(target) == input.current {
-            PlacementDecision::stay("s3-fifo: already placed")
-        } else {
-            PlacementDecision {
-                target,
-                improvement: 0.05,
-                confidence: 0.4,
-                cooldown_ticks: 0,
-                reason: "s3-fifo baseline",
-            }
         }
     }
 }

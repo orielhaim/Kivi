@@ -26,7 +26,7 @@
 //! fails clearly with [`DurabilityError::Locked`]); then either create
 //! identity (CSPRNG cluster + node, incarnation `INITIAL`, durably
 //! published) or load, validate, advance the incarnation by exactly one,
-//! and durably republish — all before any network listener binds. Restart
+//! and durably republish - all before any network listener binds. Restart
 //! preserves cluster/node and strictly advances incarnation; exhaustion
 //! fails startup instead of wrapping.
 
@@ -212,7 +212,7 @@ pub fn open_data_dir(path: &Path, seed: Option<NodeSeed>) -> Result<OpenDir, Dur
         .map_err(|error| DurabilityError::io("create data directory", path, &error))?;
     // The lock guards every mutation below against concurrent processes.
     // `File::try_lock` (std, stable since 1.89): non-blocking and
-    // unambiguous — a held lock is an immediate clear error, no waiting.
+    // unambiguous - a held lock is an immediate clear error, no waiting.
     let lock_path = path.join(LOCK_FILE_NAME);
     let lock = File::create(&lock_path)
         .map_err(|error| DurabilityError::io("create data-directory lock", &lock_path, &error))?;

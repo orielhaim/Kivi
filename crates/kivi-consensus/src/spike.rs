@@ -4,7 +4,7 @@
 //! the production store implements
 //! ([`openraft::storage::RaftLogStorage`] +
 //! [`openraft::storage::RaftStateMachine`]), so the density experiment and
-//! storage-adjacent unit tests exercise the real integration surface — but
+//! storage-adjacent unit tests exercise the real integration surface - but
 //! they persist nothing and must never back a real group (see
 //! [`crate::store`] for the WAL-backed store).
 //!
@@ -12,7 +12,7 @@
 //! never send RPCs; if one ever does, the error is loud, never silent.
 //!
 //! The state machine installs the proposer's deterministic outcome verbatim
-//! (the command's `expected`). This is deliberately NOT execution — the
+//! (the command's `expected`). This is deliberately NOT execution - the
 //! production state machine re-applies and compares against `expected`
 //! instead of trusting it.
 

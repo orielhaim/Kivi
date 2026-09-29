@@ -64,7 +64,7 @@
 //! admission path reserve intent memory and payload capacity *before*
 //! acknowledging prepare, so a prepared transaction can always be finalized.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use bytes::Bytes;
 use kivi_codec::{CodecError, Decode, Encode, decode_byte_vec, encode_bytes};
@@ -73,7 +73,7 @@ use kivi_types::{NamespaceId, TabletId};
 use crate::object::{Key, ObjectVersion};
 
 /// Maximum participant tablets in one transaction.
-pub const MAX_TXN_PARTICIPANTS: usize = 32;
+const MAX_TXN_PARTICIPANTS: usize = 32;
 /// Maximum keys in one transaction (sized so a transaction's steps fit one
 /// session's retained-outcome window with headroom).
 pub const MAX_TXN_KEYS: usize = 256;
@@ -467,15 +467,6 @@ pub enum TxnState {
 }
 
 impl TxnState {
-    /// Whether this state is a terminal decision.
-    #[must_use]
-    pub const fn is_decided(self) -> bool {
-        match self {
-            Self::Begun => false,
-            Self::Committed | Self::Aborted => true,
-        }
-    }
-
     /// Applies a decision transition, enforcing the irreversible state
     /// machine structurally:
     ///
@@ -504,64 +495,6 @@ impl TxnState {
     }
 }
 
-/// One transaction participant: the tablet that must prepare and finalize.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct TxnParticipant {
-    /// Participant tablet.
-    pub tablet: TabletId,
-    /// Directory version the plan was routed against (fencing: a prepare
-    /// against a different lineage is rejected, never remapped).
-    pub dir_version: u64,
-}
-
-/// The deterministic coordinator: the lowest participant [`TabletId`].
-/// Derivable after any failure from the participant set alone — never a
-/// service, never control-plane state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TxnCoordinator {
-    /// Coordinator tablet (owns the durable decision record).
-    pub tablet: TabletId,
-}
-
-impl TxnCoordinator {
-    /// Selects the coordinator for a participant set: the lowest tablet.
-    #[must_use]
-    pub fn select(participants: &BTreeSet<TabletId>) -> Option<Self> {
-        participants.first().map(|tablet| Self { tablet: *tablet })
-    }
-}
-
-/// Exact validation evidence captured by one transactional read: the live
-/// version observed, or observed absence. Absence is evidence — a missing
-/// key created concurrently must fail validation, or lost-create anomalies
-/// become possible.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum TxnReadVersion {
-    /// The key was present at this version.
-    Present(ObjectVersion),
-    /// The key was absent.
-    Absent,
-}
-
-/// One participant's prepare request: the exact mutation it must reserve,
-/// with the read evidence it was validated against.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TxnPrepare {
-    /// Transaction identity.
-    pub id: TxnId,
-    /// Coordinator owning the decision record.
-    pub coordinator: TxnCoordinator,
-    /// Participant being prepared.
-    pub participant: TxnParticipant,
-    /// Reserved write.
-    pub write: TxnWrite,
-    /// Read evidence captured at validation time.
-    pub read: TxnReadVersion,
-    /// Digest over the full write set (the participant verifies it was
-    /// prepared for this exact transaction, never a confused deputy).
-    pub digest: [u8; 32],
-}
-
 /// The durable coordinator decision: the single source of truth for the
 /// transaction's outcome. Replicated as an ordinary system-key write on the
 /// coordinator tablet, so it survives coordinator crash, participant crash,
@@ -585,27 +518,10 @@ impl TxnDecision {
     }
 }
 
-/// The durable, replayable observable outcome of a transaction: what a
-/// client retry after a lost reply receives instead of re-executing.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TxnOutcome {
-    /// Committed: resulting versions in request order (`None` for deletes,
-    /// which carry no version).
-    Committed {
-        /// Resulting versions in request order.
-        versions: Vec<Option<ObjectVersion>>,
-    },
-    /// Aborted with the terminal reason.
-    Aborted {
-        /// Why the transaction aborted.
-        reason: TxnError,
-    },
-}
-
 /// One participant's durable intent: the prepared write plus the version
 /// it was validated against, bound to the exact write-set digest it was
 /// prepared for (a different digest under the same `TxnId` is a conflicting
-/// driver, never a retry — rejected loudly, never overwritten silently).
+/// driver, never a retry - rejected loudly, never overwritten silently).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TxnIntent {
     /// Transaction identity.
@@ -662,29 +578,13 @@ pub enum TxnError {
     UnsupportedRange,
 }
 
-impl TxnError {
-    /// Whether the client may retry with a fresh attempt number.
-    #[must_use]
-    pub const fn is_retryable(self) -> bool {
-        match self {
-            Self::Conflict | Self::RoutingChanged | Self::CoordinatorUnavailable => true,
-            Self::UniqueViolation
-            | Self::TooLarge
-            | Self::Aborted
-            | Self::InvalidWrite
-            | Self::DecisionConflict
-            | Self::UnsupportedRange => false,
-        }
-    }
-}
-
 /// Validates transaction bounds before any intent is written.
 ///
 /// # Errors
 ///
 /// Returns [`TxnError::TooLarge`] when participants, keys, or bytes exceed
 /// [`MAX_TXN_PARTICIPANTS`], [`MAX_TXN_KEYS`], or [`MAX_TXN_BYTES`].
-pub fn check_bounds(participants: usize, writes: &[TxnWrite]) -> Result<(), TxnError> {
+fn check_bounds(participants: usize, writes: &[TxnWrite]) -> Result<(), TxnError> {
     if participants > MAX_TXN_PARTICIPANTS || writes.len() > MAX_TXN_KEYS {
         return Err(TxnError::TooLarge);
     }
@@ -701,7 +601,7 @@ pub fn check_bounds(participants: usize, writes: &[TxnWrite]) -> Result<(), TxnE
 /// collapse last-wins (matching the intent-overwrite rule and
 /// [`ObjectStore::commit_local`](crate::store::ObjectStore::commit_local)),
 /// then keys sort. Replicas, re-drives, and recovery probes presenting the
-/// same transaction in any order — duplicates included — bind the same
+/// same transaction in any order - duplicates included - bind the same
 /// digest, so a conflicting digest under one [`TxnId`] always means a
 /// conflicting transaction, never a reshuffled one.
 ///
@@ -767,43 +667,11 @@ pub fn write_set_digest(writes: &[TxnWrite], namespace: NamespaceId) -> [u8; 32]
     *hasher.finalize().as_bytes()
 }
 
-/// Cost of reserving `writes` as prepared intents: intent memory plus write
-/// payload capacity. Admission reserves this *before* acknowledging prepare,
-/// so `prepared → commit → impossible local apply` (OOM, payload capacity)
-/// is structurally unreachable rather than a runtime surprise.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TxnReservation {
-    /// Intent-table entries required (one per key).
-    pub intents: usize,
-    /// Payload bytes required (keys + inline values + chunk roots).
-    pub payload_bytes: usize,
-}
-
-/// Computes the reservation cost of a write set.
-///
-/// # Errors
-///
-/// Returns [`TxnError::TooLarge`] when the set exceeds
-/// [`MAX_TXN_KEYS`] or [`MAX_TXN_BYTES`].
-pub fn reservation_cost(writes: &[TxnWrite]) -> Result<TxnReservation, TxnError> {
-    if writes.len() > MAX_TXN_KEYS {
-        return Err(TxnError::TooLarge);
-    }
-    let payload_bytes: usize = writes.iter().map(TxnWrite::estimated_bytes).sum();
-    if payload_bytes > MAX_TXN_BYTES {
-        return Err(TxnError::TooLarge);
-    }
-    Ok(TxnReservation {
-        intents: writes.len(),
-        payload_bytes,
-    })
-}
-
 /// Verifies a paired escrow transfer against live shares: `donor` narrows
 /// by exactly `amount` and `recipient` widens by exactly `amount`, keeping
 /// total width constant. Pure: inputs are the four share bounds. Used by
 /// the same-tablet atomic transfer (both objects visible) and, later, by
-/// cross-tablet transfer drivers once the geography dimension lands —
+/// cross-tablet transfer drivers once the geography dimension lands -
 /// the per-side moves are already typed for it.
 ///
 /// # Errors
@@ -906,12 +774,6 @@ pub fn select_coordinator(
         .iter()
         .filter_map(|write| route(write.key.as_bytes()))
         .min()
-}
-
-/// Distinct tablets touched by `writes` (introspection for tests/metrics).
-#[must_use]
-pub fn participant_set(groups: &BTreeMap<TabletId, Vec<usize>>) -> BTreeSet<TabletId> {
-    groups.keys().copied().collect()
 }
 
 /// Builds one transactional write from wire fields (the protocol validates
@@ -1043,10 +905,10 @@ pub const TXN_RECORD_VERSION: u16 = 1;
 
 /// Length of a well-formed transaction record key in bytes:
 /// `1 + 9 + 8 + 16` (`\xff`, `kivi/txn/`, coordinator BE64, txn id).
-pub const TXN_RECORD_KEY_LEN: usize = 34;
+pub(crate) const TXN_RECORD_KEY_LEN: usize = 34;
 
 /// Record-key prefix after the system byte: `kivi/txn/`.
-pub const TXN_RECORD_PREFIX: &[u8; 9] = b"kivi/txn/";
+pub(crate) const TXN_RECORD_PREFIX: &[u8; 9] = b"kivi/txn/";
 
 /// Parses a transaction record key into `(coordinator, txn)`.
 ///
@@ -1305,22 +1167,49 @@ mod tests {
     }
 
     #[test]
-    fn coordinator_selects_lowest_participant() {
-        let participants: BTreeSet<TabletId> =
-            [9, 3, 7].into_iter().map(TabletId::from_u64).collect();
+    fn record_round_trips_through_the_wire() {
+        let record = TxnRecord {
+            id: TxnId::derive(1, 2, 0),
+            coordinator: TabletId::from_u64(1),
+            participants: vec![TabletId::from_u64(1), TabletId::from_u64(4)],
+            state: TxnState::Committed,
+            dir_version: 7,
+            digest: [0xAB; 32],
+        };
         assert_eq!(
-            TxnCoordinator::select(&participants),
-            Some(TxnCoordinator {
-                tablet: TabletId::from_u64(3)
-            })
+            TxnRecord::decode(&record.encode()).expect("round trip"),
+            record
         );
-        assert_eq!(TxnCoordinator::select(&BTreeSet::new()), None);
+
+        // Every structural rejection, not just the happy path.
+        assert_eq!(TxnRecord::decode(b""), Err(TxnDecodeError::Truncated));
+        let mut wrong_version = record.encode();
+        wrong_version[0] = 9;
+        assert_eq!(
+            TxnRecord::decode(&wrong_version),
+            Err(TxnDecodeError::BadVersion)
+        );
+        let mut bad_state = record.encode();
+        bad_state[26] = 7;
+        assert_eq!(TxnRecord::decode(&bad_state), Err(TxnDecodeError::BadState));
+        let mut too_many = record.encode();
+        too_many[35..39].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(TxnRecord::decode(&too_many), Err(TxnDecodeError::Oversized));
     }
 
+    /// A record key is a system key naming its coordinator, and the parser
+    /// must reject anything of the right length that is not one.
     #[test]
-    fn reservation_cost_bounds_before_prepare() {
-        assert!(reservation_cost(&[write("a")]).is_ok());
-        let many: Vec<TxnWrite> = (0..513).map(|i| write(&format!("k{i}"))).collect();
-        assert_eq!(reservation_cost(&many), Err(TxnError::TooLarge));
+    fn record_keys_parse_back_to_their_coordinator() {
+        let txn = TxnId::derive(5, 6, 0);
+        let key = crate::txn_record_key(TabletId::from_u64(9), txn);
+        assert_eq!(
+            parse_txn_record_key(key.as_bytes()),
+            Some((TabletId::from_u64(9), txn))
+        );
+        assert_eq!(parse_txn_record_key(b"user:1"), None);
+        let mut wrong_prefix = key.as_bytes().to_vec();
+        wrong_prefix[2] = b'X';
+        assert_eq!(parse_txn_record_key(&wrong_prefix), None);
     }
 }

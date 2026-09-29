@@ -6,7 +6,7 @@
 //! fans out across tablets and resumes by logical key. An `AtomicBatch`
 //! commits as one ordered atomic record (`TxnCommitLocal`) through the
 //! normal propose path: one validation, one consensus round, one ordered
-//! apply — no coordinator record, no prepare/finalize waves. Multi-tablet
+//! apply - no coordinator record, no prepare/finalize waves. Multi-tablet
 //! batches are rejected with `TxnTooLarge`; the client driver runs those
 //! over `TxnPrepare`/`TxnFinalize`.
 //!
@@ -381,7 +381,7 @@ fn invalid(detail: &str) -> Response {
 /// Fans one co-located term window out per tablet: every active ordered
 /// tablet lists its own `(index, term)` entries and the pages merge
 /// client-side. The term prefix is not a user key, so tiling routing
-/// cannot place it — fan-out replaces routing here.
+/// cannot place it - fan-out replaces routing here.
 async fn scan_term_fanout(
     shared: &ClusterShared,
     directory: &DirectorySnapshot,
@@ -444,7 +444,7 @@ async fn scan_term_fanout(
                 }
                 // No early break on the merged cap: per-tablet slices are
                 // individually budgeted, but tablets serve in storage
-                // order, not key order — stopping at the first full slice
+                // order, not key order - stopping at the first full slice
                 // would silently omit lower-sorting keys from later
                 // tablets. Query every tablet, then sort + truncate once
                 // for an exact top-N page by key.
@@ -464,7 +464,7 @@ async fn scan_term_fanout(
     // budgeted slice and return the exact top-N by key. There is no
     // cursor protocol across calls (clients bound with their own limit
     // at or below the server cap), so `exhausted` is always true and
-    // `last_key` unset — callers must size their bound to their
+    // `last_key` unset - callers must size their bound to their
     // cardinality, never page a term window.
     (
         Response {
@@ -591,8 +591,7 @@ fn route_normal_key(
     if let Some(tablet) = directory.lookup_by_key(key) {
         return Some(tablet);
     }
-    let hash = kivi_state::PartitionHasher::V1.hash(namespace, key)?;
-    directory.lookup_by_hash(hash)
+    directory.lookup_by_hash(kivi_state::route_hash(namespace, key))
 }
 
 /// Executes a validated single-participant plan as one ordered atomic
@@ -709,14 +708,18 @@ pub async fn handle_guard_abort(
         seq += 1;
         id
     };
+    // Bound once and shared by both steps: the prepare reserves it and the
+    // finalize states it. Two spellings of one write in one function is exactly
+    // how the two can come to mean different things.
+    let record_write = TxnWrite {
+        key: record_key.clone(),
+        kind: TxnWriteKind::Put(bytes::Bytes::from(record_bytes.clone())),
+        expect: TxnExpect::Version(expected),
+    };
     let prepare = Operation::TxnPrepare {
         txn: abort_txn,
         coordinator: tablet,
-        write: TxnWrite {
-            key: record_key.clone(),
-            kind: TxnWriteKind::Put(bytes::Bytes::from(record_bytes.clone())),
-            expect: TxnExpect::Version(expected),
-        },
+        write: record_write.clone(),
         // Record-key steps bind the zero digest (no user write set).
         digest: [0u8; 32],
     };
@@ -738,6 +741,10 @@ pub async fn handle_guard_abort(
         txn: abort_txn,
         key: record_key,
         commit: true,
+        // The write `prepare` above reserved. Naming it is what makes this entry
+        // a complete description of the step: apply reads the log, not the
+        // reservation the log does not carry.
+        write: record_write,
         digest: [0u8; 32],
     };
     let _ = node

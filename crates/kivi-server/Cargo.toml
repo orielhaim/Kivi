@@ -18,10 +18,17 @@ name = "kivi-peer-cert"
 path = "src/bin/kivi-peer-cert.rs"
 
 [features]
-default = []
-# Optional Redis/RESP compatibility edge (default-off). Production serving
-# needs only kivi-resp + redis-protocol; benchmark/reference clients live
-# in kivi-lab and never enter this graph.
+# The RESP edge is on by default. It is a first-class serving surface, not an
+# experiment: the conformance and differential suites, the CLI's interactive mode
+# and every benchmark target all speak it. Defaulting it *off* meant a plain
+# `cargo build -p kivi-server` produced a binary with no wire protocol at all and
+# no warning - a failure that surfaces as a connection refused much later, in a
+# different process, with nothing pointing back here.
+#
+# A native-protocol-only build is a real deployment shape, so the distinction is
+# kept rather than removed: `--no-default-features` gives it, and the server reports
+# the edge as absent instead of pretending it is there but disabled.
+default = ["redis-compat"]
 redis-compat = ["dep:kivi-resp"]
 
 [dependencies]

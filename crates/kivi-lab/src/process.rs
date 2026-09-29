@@ -3,14 +3,13 @@
 //! Every system test and lab command spawns `kivi-server` the same way: the
 //! server binds ephemeral ports (`--port 0`, `--admin 127.0.0.1:0`,
 //! `--redis-listen 127.0.0.1:0`) and reports the actual endpoints on stdout
-//! (`KIVI_READY ...`). Tests connect to the reported addresses, so the old
-//! probe-then-bind window — where a parallel test could steal a "reserved"
-//! port between probe and bind — no longer exists anywhere. Restarts take
-//! fresh ports: crash recovery never depends on socket addresses, only on
-//! the data directory.
+//! (`KIVI_READY ...`). Tests connect to the reported addresses, so no
+//! probe-then-bind window exists for a parallel test to steal a port in.
+//! Restarts take fresh ports: crash recovery never depends on socket
+//! addresses, only on the data directory.
 //!
 //! [`Server::spawn_ephemeral_resp`] fails loudly when the server binary was
-//! built without `redis-compat` (rebuild hint included). It never silently
+//! built without the RESP edge (rebuild hint included). It never silently
 //! skips: a lab run that explicitly requires RESP must fail clearly.
 
 use std::collections::{BTreeMap, VecDeque};
@@ -49,10 +48,14 @@ pub enum SpawnError {
     /// No `KIVI_READY` inside the window (stderr tail included).
     #[error("server not ready after {0:?}\nstderr tail:\n{1}")]
     TimedOut(Duration, String),
-    /// A RESP endpoint was required but the binary was built without the
-    /// `redis-compat` feature (no `redis=` in `KIVI_READY`).
+    /// A RESP endpoint was required but the binary reports none (no `redis=` in
+    /// `KIVI_READY`).
+    ///
+    /// The edge is a default feature, so this means the binary is either stale or was
+    /// built with `--no-default-features`.
     #[error(
-        "server binary has no RESP endpoint; rebuild kivi-server with `--features redis-compat`"
+        "server binary reports no RESP endpoint; rebuild kivi-server (the edge is a \
+         default feature) or drop --no-default-features"
     )]
     RespUnavailable,
     /// A plain I/O failure driving the child.
@@ -88,7 +91,8 @@ pub fn server_binary_path() -> Result<PathBuf, SpawnError> {
         dir = parent.parent();
     }
     Err(SpawnError::BinaryMissing(format!(
-        "no server binary beside {}; run `cargo build --release -p kivi-server --features redis-compat` (or a debug build for tests) or set KIVI_SERVER_BIN",
+        "no server binary beside {}; run `cargo build --release -p kivi-server`, \
+         or a debug build for tests, or set KIVI_SERVER_BIN",
         exe.display()
     )))
 }
@@ -124,7 +128,8 @@ pub fn release_server_binary_path() -> Result<PathBuf, SpawnError> {
         dir = parent.parent();
     }
     Err(SpawnError::BinaryMissing(format!(
-        "no release server binary beside {}; run `cargo build --release -p kivi-server --features redis-compat` or set KIVI_SERVER_BIN",
+        "no release server binary beside {}; run `cargo build --release -p kivi-server`, \
+         or set KIVI_SERVER_BIN",
         exe.display()
     )))
 }
@@ -138,7 +143,7 @@ fn configured_server_binary() -> Result<Option<PathBuf>, SpawnError> {
         return Ok(Some(path));
     }
     Err(SpawnError::BinaryMissing(format!(
-        "KIVI_SERVER_BIN={} is not a file; run `cargo build --release -p kivi-server --features redis-compat` first",
+        "KIVI_SERVER_BIN={} is not a file; run `cargo build --release -p kivi-server` first",
         path.display()
     )))
 }
@@ -168,7 +173,10 @@ pub struct Server {
     admin: String,
     resp: Option<String>,
     namespace: NamespaceId,
-    stderr_lines: Arc<Mutex<VecDeque<String>>>,
+    stderr_lines: LineTail,
+    /// The child's stdout. A Kivi server logs through `tracing` to stdout, so
+    /// this is where the explanation for a failure actually is.
+    stdout_lines: LineTail,
 }
 
 impl std::fmt::Debug for Server {
@@ -186,7 +194,7 @@ impl std::fmt::Debug for Server {
 impl Server {
     /// Spawns with ephemeral ports and waits for `KIVI_READY` (which the
     /// server prints after every listener binds, so recovery already ran).
-    /// An early exit fails with the stderr tail — startup failure stays
+    /// An early exit fails with the stderr tail - startup failure stays
     /// loud, never a silent hang.
     ///
     /// # Errors
@@ -247,7 +255,7 @@ impl Server {
     }
 
     /// Spawns an ephemeral server with a RESP endpoint. Fails loudly when
-    /// the binary lacks the feature — never a silent skip.
+    /// the binary lacks the feature - never a silent skip.
     ///
     /// # Errors
     ///
@@ -306,10 +314,11 @@ impl Server {
         values.insert("pid".to_owned(), self.child.id().to_string());
         let alive = self.child.try_wait().ok().flatten().is_none();
         values.insert("alive".to_owned(), alive.to_string());
-        values.insert(
-            "stderr_tail".to_owned(),
-            stderr_snapshot(&self.stderr_lines),
-        );
+        values.insert("stderr_tail".to_owned(), snapshot(&self.stderr_lines));
+        // A Kivi server logs through `tracing` to stdout, so a stderr-only tail
+        // explains nothing. This is the field that makes a harness-reported
+        // failure diagnosable.
+        values.insert("stdout_tail".to_owned(), snapshot(&self.stdout_lines));
         #[cfg(target_os = "linux")]
         if let Ok(status) = std::fs::read_to_string(format!("/proc/{}/status", self.child.id())) {
             for line in status.lines().filter(|line| {
@@ -519,10 +528,18 @@ fn probe_server_with_binary(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| SpawnError::Io(error.to_string()))?;
-    let stderr_lines = spawn_stderr_reader(&mut child);
+    let Some(errstream) = child.stderr.take() else {
+        panic!("server stderr not piped");
+    };
+    let stderr_lines = drain_stream(errstream, Arc::new(|_| {}));
     let outcome = wait_ready_or_exit(&mut child, timeout);
     Ok(match outcome {
-        WaitOutcome::Ready(native, admin, resp) => {
+        WaitOutcome::Ready {
+            native,
+            admin,
+            resp,
+            stdout,
+        } => {
             if want_resp && resp.is_none() {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -535,30 +552,53 @@ fn probe_server_with_binary(
                 resp,
                 namespace: NamespaceId::from_u64(1),
                 stderr_lines,
+                stdout_lines: stdout,
             })
         }
-        WaitOutcome::Exited(status) => {
+        WaitOutcome::Exited { status, stdout } => {
             let success = status.success();
             ProbeOutcome::Exited {
                 status: status.to_string(),
                 success,
-                stderr: stderr_snapshot(&stderr_lines),
+                // The server logs to stdout, so a bare stderr tail explains
+                // nothing. Quote both.
+                stderr: format!("{}\n--- stdout ---\n{stdout}", snapshot(&stderr_lines)),
             }
         }
-        WaitOutcome::TimedOut => ProbeOutcome::TimedOut {
-            stderr: stderr_snapshot(&stderr_lines),
+        WaitOutcome::TimedOut { stdout } => ProbeOutcome::TimedOut {
+            stderr: format!("{}\n--- stdout ---\n{stdout}", snapshot(&stderr_lines)),
         },
     })
 }
 
 /// Internal ready-wait outcome (child ownership stays with the caller).
 pub(crate) enum WaitOutcome {
-    /// `KIVI_READY` parsed: native endpoints, admin endpoint, optional RESP.
-    Ready(Vec<String>, String, Option<String>),
+    /// `KIVI_READY` parsed: native endpoints, admin endpoint, optional RESP, and
+    /// the stdout tail so far.
+    Ready {
+        /// Worker endpoints (single-node) or the one native endpoint (cluster).
+        native: Vec<String>,
+        /// Admin HTTP endpoint.
+        admin: String,
+        /// RESP endpoint, when the child was asked for one and has it.
+        resp: Option<String>,
+        /// The live tail of the child's stdout. It keeps filling after this
+        /// point, and the lines that explain a later failure are the ones written
+        /// *after* readiness - so this is the tail itself, not a snapshot of it.
+        stdout: LineTail,
+    },
     /// The process exited before reporting readiness.
-    Exited(std::process::ExitStatus),
+    Exited {
+        /// How it ended.
+        status: std::process::ExitStatus,
+        /// Its stdout, which is where a server logs.
+        stdout: String,
+    },
     /// Neither readiness nor exit inside the window (child already killed).
-    TimedOut,
+    TimedOut {
+        /// Its stdout, which is where a server logs.
+        stdout: String,
+    },
 }
 
 /// Checks `--help` output for the RESP flag (fast capability probe that
@@ -576,29 +616,47 @@ fn binary_supports_resp(binary: &Path) -> Result<bool, SpawnError> {
     Ok(text.contains("redis-listen"))
 }
 
-fn spawn_stderr_reader(child: &mut Child) -> Arc<Mutex<VecDeque<String>>> {
-    let lines = Arc::new(Mutex::new(VecDeque::new()));
-    let Some(stderr) = child.stderr.take() else {
-        return lines;
-    };
+/// A ring of the last [`LINE_HISTORY`] lines a child stream produced.
+type LineTail = Arc<Mutex<VecDeque<String>>>;
+
+/// How many lines of a child's output to keep for diagnostics.
+const LINE_HISTORY: usize = 64;
+
+/// Drains one of a child's output streams on its own thread until EOF.
+///
+/// # It never stops early
+///
+/// Both streams must be drained for the child's whole life. A reader that returns
+/// after the line it was looking for closes the pipe, and the child's next write
+/// blocks once the kernel buffer fills - which, for a server that logs every
+/// consensus decision to stdout, is a matter of a few kilobytes. The process stays
+/// alive, so a supervisor watching only for liveness sees a healthy child while
+/// the server is wedged mid-log-write. That is the worst shape a harness bug can
+/// take: it produces failures that look like the system under test.
+fn drain_stream<R>(stream: R, on_line: Arc<dyn Fn(&str) + Send + Sync>) -> LineTail
+where
+    R: std::io::Read + Send + 'static,
+{
+    let lines: LineTail = Arc::new(Mutex::new(VecDeque::new()));
     let captured = Arc::clone(&lines);
     std::thread::spawn(move || {
         use std::io::BufRead as _;
-        let mut reader = std::io::BufReader::new(stderr);
+        let mut reader = std::io::BufReader::new(stream);
         let mut line = String::new();
         loop {
             line.clear();
             match reader.read_line(&mut line) {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {
-                    if let Ok(mut captured) = captured.lock()
-                        && !line.trim().is_empty()
+                    if !line.trim().is_empty()
+                        && let Ok(mut captured) = captured.lock()
                     {
-                        if captured.len() == 64 {
+                        if captured.len() == LINE_HISTORY {
                             captured.pop_front();
                         }
                         captured.push_back(line.trim_end().to_owned());
                     }
+                    on_line(&line);
                 }
             }
         }
@@ -606,7 +664,7 @@ fn spawn_stderr_reader(child: &mut Child) -> Arc<Mutex<VecDeque<String>>> {
     lines
 }
 
-fn stderr_snapshot(lines: &Arc<Mutex<VecDeque<String>>>) -> String {
+fn snapshot(lines: &LineTail) -> String {
     lines
         .lock()
         .map(|captured| captured.iter().cloned().collect::<Vec<_>>().join("\n"))
@@ -616,54 +674,78 @@ fn stderr_snapshot(lines: &Arc<Mutex<VecDeque<String>>>) -> String {
 /// Waits for `KIVI_READY` on the child's stdout, watching for early exit
 /// on a reader thread so a silent stall can never hang the harness past
 /// the deadline: the reader only produces lines, the loop owns the clock.
+///
+/// The stdout reader started here runs until EOF, not until readiness. It used to
+/// stop at `KIVI_READY`, which closed the pipe and let the server block on a log
+/// write a few kilobytes later - see [`drain_stream`]. Its line tail comes back on
+/// every arm so a failure can quote what the child actually said.
 pub(crate) fn wait_ready_or_exit(child: &mut Child, timeout: Duration) -> WaitOutcome {
+    let (tx, rx) = std::sync::mpsc::channel::<Option<(Vec<String>, String, Option<String>)>>();
     let Some(stdout) = child.stdout.take() else {
         // Internal contract: the harness always pipes stdout before this
         // call, so a missing pipe is a harness bug, never runtime noise.
         panic!("server stdout not piped");
     };
-    let (tx, rx) = std::sync::mpsc::channel::<Option<(Vec<String>, String, Option<String>)>>();
-    std::thread::spawn(move || {
-        use std::io::BufRead as _;
-        let mut reader = std::io::BufReader::new(stdout);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match reader.read_line(&mut line) {
-                Ok(0) | Err(_) => {
-                    let _ = tx.send(None);
-                    break;
-                }
-                Ok(_) => {
-                    if let Some(ports) = parse_ready(&line) {
-                        let _ = tx.send(Some(ports));
-                        break;
-                    }
+    let ready_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(tx)));
+    let lines = drain_stream(
+        stdout,
+        Arc::new({
+            let ready_tx = std::sync::Arc::clone(&ready_tx);
+            move |line| {
+                // Parse before taking the slot. Taking it first meant the first
+                // line that was not a readiness line - and a server that logs to
+                // stdout emits several before it is ready - consumed the one-shot
+                // sender, so `KIVI_READY` could never be seen and every spawn
+                // timed out against a server that had in fact bound its ports and
+                // printed them. The harness reported "no RESP endpoint" and
+                // "connection refused" for processes that were serving.
+                let Some(ports) = parse_ready(line) else {
+                    return;
+                };
+                if let Ok(mut slot) = ready_tx.lock()
+                    && let Some(tx) = slot.take()
+                {
+                    let _ = tx.send(Some(ports));
                 }
             }
-        }
-    });
+        }),
+    );
     let deadline = Instant::now() + timeout;
     loop {
         if let Ok(Some(status)) = child.try_wait() {
-            return WaitOutcome::Exited(status);
+            return WaitOutcome::Exited {
+                status,
+                stdout: snapshot(&lines),
+            };
         }
         match rx.recv_timeout(Duration::from_millis(25)) {
-            Ok(Some(ports)) => return WaitOutcome::Ready(ports.0, ports.1, ports.2),
+            Ok(Some(ports)) => {
+                return WaitOutcome::Ready {
+                    native: ports.0,
+                    admin: ports.1,
+                    resp: ports.2,
+                    stdout: Arc::clone(&lines),
+                };
+            }
             // EOF before readiness, or a quiet quantum: the child is
             // either dying (exit status collected above) or still starting;
             // loop on and let the deadline decide.
             Ok(None) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 if let Ok(Some(status)) = child.try_wait() {
-                    return WaitOutcome::Exited(status);
+                    return WaitOutcome::Exited {
+                        status,
+                        stdout: snapshot(&lines),
+                    };
                 }
             }
         }
         if Instant::now() > deadline {
             let _ = child.kill();
             let _ = child.wait();
-            return WaitOutcome::TimedOut;
+            return WaitOutcome::TimedOut {
+                stdout: snapshot(&lines),
+            };
         }
     }
 }

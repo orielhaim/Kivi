@@ -1,32 +1,6 @@
-# Real-process and fsync-heavy suites are bounded; everything else keeps
-# full parallelism.
-#
-# Why: running dozens of 3-process QUIC/H3 clusters, fsync storms, and
-# checkpoint hammers in parallel saturates Windows fsync and loopback
-# throughput, which made `stale_leader_hint` flake under a full parallel
-# suite while passing standalone — and later starved a single-node
-# durability upload of a 10 s read under the same conditions. Bounding
-# only the heavy suites is preferable to nondeterministic timing
-# failures (and to blindly multiplying timeouts).
-#
-# `heavy-cluster` (2-way): every lab integration binary spawns real
-# server processes (single-node ephemeral servers as well as 3-node
-# QUIC/H3 clusters).
-#
-# Stress placement: `four_node_rebalance_drain_money` (100 tablets,
-# ~100 MB bulk, mid-flight chaos kills) is wall-clock-coupled to an
-# otherwise idle box, so it is `#[ignore]`d out of the default suite
-# and runs only via the explicit stress invocation documented on the
-# test (`--run-ignored all -E 'test(four_node_rebalance_drain_money)'`).
-# Deterministic drain-plus-crash correctness stays in the default
-# suite (`drain_survives_bystander_crash_small`, seconds, tight caps).
 [test-groups.heavy-cluster]
 max-threads = 2
 
-# `bulk-serial` (1-way): the tens-of-MiB bulk-transfer tests move ~130 MB
-# per test over loopback QUIC plus matching fsync storms; serializing
-# just these keeps the disk/loopback headroom the latency-sensitive
-# suites need. Listed after `heavy-cluster` so the narrower group wins.
 [test-groups.bulk-serial]
 max-threads = 1
 

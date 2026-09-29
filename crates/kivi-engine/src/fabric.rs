@@ -19,7 +19,7 @@
 //!
 //! A fabric id, arena slot, `NVMe` offset, or provider id never enters
 //! Mutation IR beyond the opaque [`FabricRef`](kivi_state::FabricRef)
-//! name — exactly like [`ChunkedRef`](kivi_state::ChunkedRef) names a
+//! name - exactly like [`ChunkedRef`](kivi_state::ChunkedRef) names a
 //! manifest without naming packs. Topology moves logical bytes and
 //! re-stages fresh ids; single-writer rules keep both append files
 //! consistent without locks.
@@ -91,8 +91,6 @@ impl Default for FabricConfig {
 
 /// Journal filename inside the worker fabric directory.
 const JOURNAL_FILE: &str = "fabric.journal";
-/// Durable record filename inside the worker fabric directory.
-const MATERIAL_FILE_DIR: &str = "material";
 /// Demotion lane subdirectory name.
 const DEMOTION_DIR: &str = "demotion";
 
@@ -137,44 +135,6 @@ pub struct StagedSeal {
     pub key: Key,
     /// Staged payload bytes.
     pub bytes: Bytes,
-}
-
-/// One staged payload riding a seal to the durability lane: bytes plus
-/// the logical coordinates the journal records. Bounded by the batch
-/// byte cap like the WAL records themselves.
-#[derive(Debug, Clone)]
-pub struct FabricSealPayload {
-    /// Fabric-scoped object id staged at admission.
-    pub fabric_id: u64,
-    /// Owning tablet.
-    pub tablet: TabletId,
-    /// Logical key (journal observability).
-    pub key: Key,
-    /// Predicted authoritative version (equals the applied version by
-    /// predict/apply agreement; recovery re-links on it).
-    pub version: u64,
-    /// Staged payload bytes.
-    pub bytes: Bytes,
-}
-
-/// One sealed locator riding home on the seal outcome: the durable
-/// reconstruction source the worker mirrors into memory.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FabricSealLocator {
-    /// Fabric-scoped object id.
-    pub fabric_id: u64,
-    /// Owning tablet.
-    pub tablet: TabletId,
-    /// Logical key.
-    pub key: Key,
-    /// Sealed version.
-    pub version: u64,
-    /// Device offset of the durable record.
-    pub offset: u64,
-    /// Stored payload length.
-    pub len: u64,
-    /// CRC32C of the payload.
-    pub checksum: u32,
 }
 
 /// One parked off-core wait: a suspended operation plus everything the
@@ -250,15 +210,9 @@ impl FabricPaths {
         self.root.join(JOURNAL_FILE)
     }
 
-    /// Durable record directory (durability-lane single writer).
-    #[must_use]
-    pub fn material_dir(&self) -> PathBuf {
-        self.root.join(MATERIAL_FILE_DIR)
-    }
-
     /// Demotion lane directory (offcore-lane single writer).
     #[must_use]
-    pub fn demotion_dir(&self) -> PathBuf {
+    pub(crate) fn demotion_dir(&self) -> PathBuf {
         self.root.join(DEMOTION_DIR)
     }
 }
@@ -302,7 +256,8 @@ impl TabletFabric {
     ///
     /// Returns [`FabricError::Unavailable`] when the memory fabric or the
     /// demotion lane cannot be opened.
-    pub fn open_unbound(
+    #[cfg(test)]
+    pub(crate) fn open_unbound(
         worker: WorkerId,
         paths: &FabricPaths,
         arena_bytes: u64,
@@ -358,16 +313,6 @@ impl TabletFabric {
         .map_err(FabricError::from)?;
         fabric.set_external_executor(true);
         fabric.set_plan_slice(64);
-        if let Some(node) = numa_node.map(|node| node.0) {
-            // The invariant that matters: when placement named a node, the
-            // fabric's resident provider is on it. An unplanned fabric is not
-            // wrong, it just has no preference and falls back to node 0.
-            debug_assert_eq!(
-                fabric.locality().numa_node,
-                Some(node),
-                "the fabric's resident provider must be the owner's planned node",
-            );
-        }
 
         let bind = placement.clone();
         let (lane, guard) = kivi_memory::offcore_lane::spawn_offcore_lane(
@@ -461,7 +406,7 @@ impl TabletFabric {
     /// Stages a value on the off-core tier because the hot arena cannot take
     /// it.
     ///
-    /// The write is a relaxed append — no fsync — because a demotion record
+    /// The write is a relaxed append - no fsync - because a demotion record
     /// is an optimization copy that nothing references durably. The bytes
     /// still ride the WAL as a `MaterialRecord` when the mutation seals, so
     /// the cold tier changes where a value lives, never whether it survives.
@@ -499,7 +444,7 @@ impl TabletFabric {
     ///
     /// Residence mirrors the pressure the write path would have faced. The
     /// value goes into the arena when there is room, and to the off-core
-    /// device when there is not — recovery must not be the moment a bounded
+    /// device when there is not - recovery must not be the moment a bounded
     /// fabric discovers it cannot hold a working set it already accepted, so
     /// the arena is a preference and the device is the fallback. Either way
     /// the first read promotes back on demand.
@@ -1038,7 +983,7 @@ impl TabletFabric {
 
     /// Observability snapshot.
     #[must_use]
-    pub fn stats_snapshot(&self) -> FabricStatsSnapshot {
+    pub(crate) fn stats_snapshot(&self) -> FabricStatsSnapshot {
         let stats = self.fabric.stats();
         FabricStatsSnapshot {
             objects: stats.objects,
@@ -1065,7 +1010,7 @@ impl TabletFabric {
 
     /// Direct access for commit application (retire-old hooks) and
     /// recovery (imports). All mutation goes through fenced helpers.
-    pub fn fabric_mut(&mut self) -> &mut MemoryFabric {
+    pub(crate) fn fabric_mut(&mut self) -> &mut MemoryFabric {
         &mut self.fabric
     }
 

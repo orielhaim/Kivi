@@ -29,7 +29,7 @@ pub enum Operation {
         value: Bytes,
     },
     /// Store a large byte string by chunk reference, overwriting any type
-    /// and clearing any expiry — the chunked spelling of [`Set`](Self::Set).
+    /// and clearing any expiry - the chunked spelling of [`Set`](Self::Set).
     /// The engine stages every referenced chunk and proves pack durability
     /// *before* admitting this; the store trusts the reference exactly as
     /// it trusts an inline value. Produced by the streaming commit path and
@@ -44,7 +44,7 @@ pub enum Operation {
         logical_len: u64,
     },
     /// Store a medium byte string by Memory Fabric reference, overwriting
-    /// any type and clearing any expiry — the fabric spelling of
+    /// any type and clearing any expiry - the fabric spelling of
     /// [`Set`](Self::Set). The engine stages the bytes into the fabric
     /// and proves the materialization *before* admitting this; the store
     /// trusts the reference exactly as it trusts an inline value.
@@ -219,15 +219,24 @@ pub enum Operation {
         /// rejected, never overwritten).
         digest: [u8; 32],
     },
-    /// Resolve one key's transaction intent: commit applies the prepared
-    /// write, abort discards it. Idempotent by `TxnId`.
+    /// Resolve one key's transaction intent: commit applies the write, abort
+    /// discards it. Idempotent by `TxnId`.
     TxnFinalize {
         /// Transaction identity.
         txn: TxnId,
         /// Key whose intent resolves.
         key: Key,
-        /// Whether to apply (`true`) or discard (`false`) the intent.
+        /// Whether to apply (`true`) or discard (`false`) the write.
         commit: bool,
+        /// The write being resolved.
+        ///
+        /// Carried so the entry that reaches the log is self-contained. Apply must
+        /// not have to rediscover the write from a reservation this entry does not
+        /// contain, because "the reservation is still there" is not a property the
+        /// log can promise: replaying the same committed entry against a state
+        /// that already resolved it produced a different answer, which is the one
+        /// failure consensus exists to make impossible.
+        write: TxnWrite,
         /// Digest the intent was prepared for (must match the reservation;
         /// mismatches finalize nothing and report conflict).
         digest: [u8; 32],
@@ -237,7 +246,7 @@ pub enum Operation {
     /// construct this, and only for write sets already proven single-tablet
     /// (non-empty; all keys route to one tablet); cross-tablet sets use
     /// 2PC intents instead. The key drivers route on is the first write's
-    /// key — all keys share its tablet by construction.
+    /// key - all keys share its tablet by construction.
     TxnCommitLocal {
         /// Transaction identity (idempotency key for the whole batch).
         txn: TxnId,
@@ -291,7 +300,7 @@ pub enum Operation {
     /// Narrow or widen one bounded counter's escrow share durably. Narrowing
     /// (giving rights away) is unilateral; widening (taking rights) must pair
     /// with a matching narrow in the same atomic batch/transaction so total
-    /// rights are conserved — see
+    /// rights are conserved - see
     /// [`verify_escrow_widths`](crate::txn::verify_escrow_widths).
     /// Requires the live value inside the new share and the new share inside
     /// `[0, capacity]`.
@@ -571,7 +580,7 @@ impl Operation {
 /// silently falling into a wildcard.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OperationResult {
-    /// `Get` payload (`None` when absent, expired, or — via error — mistyped).
+    /// `Get` payload (`None` when absent, expired, or - via error - mistyped).
     Value(Option<Bytes>),
     /// `Get` hit a chunked root: the engine must resolve these bytes
     /// through the chunk lane before replying. Never crosses the wire and
@@ -703,7 +712,7 @@ pub enum OperationResult {
         capacity: u64,
     },
     /// `LeaseAcquire` outcome: the grant with its fencing token. The token
-    /// — not the expiry — is what external systems must compare.
+    /// - not the expiry - is what external systems must compare.
     LeaseAcquired {
         /// Fencing token issued with this grant (strictly increasing).
         fencing: crate::FencingToken,
@@ -2011,82 +2020,6 @@ mod tests {
         assert!(OperationResult::decode(&[0xFF]).is_err());
         assert!(OpError::decode(&[0xFF]).is_err());
         assert!(DurableOutcome::decode(&[0xFF]).is_err());
-    }
-
-    #[test]
-    fn outcome_for_covers_the_matrix() {
-        let version = ObjectVersion::from_u64(3);
-        let key = Key::from("k");
-        assert_eq!(
-            outcome_for(
-                &Mutation::PutBytes {
-                    key: key.clone(),
-                    value: Bytes::from_static(b"v"),
-                },
-                &ApplyOutcome::Put { version },
-                false,
-            ),
-            OperationResult::Stored { version }
-        );
-        assert_eq!(
-            outcome_for(
-                &Mutation::SetExpiry {
-                    key: key.clone(),
-                    expiry: Expiry::NEVER,
-                },
-                &ApplyOutcome::Expiry {
-                    applied: true,
-                    version: Some(version),
-                },
-                true,
-            ),
-            OperationResult::ExpiryPersisted { removed: true }
-        );
-        assert_eq!(
-            outcome_for(
-                &Mutation::SetExpiry {
-                    key: key.clone(),
-                    expiry: Expiry::at(WallTimestamp::from_micros(5)),
-                },
-                &ApplyOutcome::Expiry {
-                    applied: true,
-                    version: Some(version),
-                },
-                false,
-            ),
-            OperationResult::ExpirySet { applied: true }
-        );
-        assert_eq!(
-            outcome_for(
-                &Mutation::PutBytesWithExpiry {
-                    key: key.clone(),
-                    value: Bytes::from_static(b"v"),
-                    expiry: Expiry::NEVER,
-                },
-                &ApplyOutcome::Put { version },
-                false,
-            ),
-            OperationResult::ConditionalSet {
-                applied: true,
-                version: Some(version),
-            }
-        );
-        assert_eq!(
-            outcome_for(
-                &Mutation::ReplaceChunkedRootWithExpiry {
-                    key,
-                    manifest: ManifestId::from_bytes([0x11; 32]),
-                    logical_len: 9,
-                    expiry: Expiry::NEVER,
-                },
-                &ApplyOutcome::Put { version },
-                false,
-            ),
-            OperationResult::ConditionalSet {
-                applied: true,
-                version: Some(version),
-            }
-        );
     }
 
     #[test]

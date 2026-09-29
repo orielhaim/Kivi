@@ -7,8 +7,8 @@
 //! first on every iteration, then blocks in `select!` on both channels.
 //!
 //! One thread per worker, never per tablet or per request. The ownership
-//! model this establishes — one mutable owner per tablet, synchronous
-//! execution, bounded admission — is what the reactor frontend in
+//! model this establishes - one mutable owner per tablet, synchronous
+//! execution, bounded admission - is what the reactor frontend in
 //! [`crate::net`] also relies on.
 
 use core::fmt;
@@ -33,6 +33,7 @@ use crate::fabric::TabletFabric;
 use crate::net::NetStartError;
 use crate::placement::ThreadPlacement;
 
+use crate::slots::LocalTabletSet;
 use crate::tablet::{LiveTablet, TabletError};
 
 /// Capacity of each worker's control channel. Control traffic is rare
@@ -40,20 +41,16 @@ use crate::tablet::{LiveTablet, TabletError};
 /// site handles `Full` explicitly anyway.
 pub const CONTROL_CAPACITY: usize = 16;
 
-/// Event-driven wakeup for the networked-worker embedded bridge.
+/// Event-driven wakeup for the networked-worker's embedded bridge.
 ///
-/// The bridge lives on the Compio reactor thread, which cannot block on
-/// the crossbeam ingress channels — so it used to poll them every 100 µs,
-/// taxing every embedded wake (admin, tests, the RESP edge) with a fixed
-/// latency floor and idle wakeups. Every ingress send now carries a
-/// coalesced ping on this side channel: the bridge parks in
-/// `recv().await` instead of a timer. The ping is a hint, never a
-/// count — one ping per send attempt, collapsed to a single slot — and
-/// the bridge drains the real channels on every wake, so a collapsed
-/// ping loses nothing. Sends that find the bridge already awake (or a
-/// channel-only worker with no bridge) have nowhere to notify and that
-/// is fine. `async_channel` is runtime-agnostic (waker-based parking, no
-/// runtime of its own), so this adds no async runtime to the engine.
+/// The bridge lives on the Compio reactor thread and cannot block on the
+/// crossbeam ingress channels, so every ingress send carries a coalesced
+/// ping here and the bridge parks in `recv().await` rather than on a
+/// timer. The ping is a hint, never a count - one ping per send attempt,
+/// collapsed to a single slot - and the bridge drains the real channels on
+/// every wake, so a collapsed ping loses nothing. `async_channel` is
+/// runtime-agnostic (waker-based parking, no runtime of its own), so this
+/// adds no async runtime to the engine.
 #[derive(Debug, Clone)]
 pub struct BridgeWaker {
     wake: async_channel::Sender<()>,
@@ -72,7 +69,7 @@ impl BridgeWaker {
 
     /// Pings the bridge. Best-effort by construction: a full slot means
     /// a wake is already pending, a closed channel means no bridge is
-    /// listening — both are correct without the ping.
+    /// listening - both are correct without the ping.
     pub fn ping(&self) {
         let _ = self.wake.try_send(());
     }
@@ -81,7 +78,7 @@ impl BridgeWaker {
 /// Bundled ingress to one worker's request queue: the bounded crossbeam
 /// sender (admission, backpressure) plus the bridge wakeup (promptness on
 /// networked workers). Every send pings; the ping never blocks, fails, or
-/// changes admission — ingress stays bounded by the channel capacity.
+/// changes admission - ingress stays bounded by the channel capacity.
 #[derive(Debug, Clone)]
 pub struct RequestIngress {
     sender: Sender<TabletRequest>,
@@ -142,7 +139,7 @@ const REQUEST_DRAIN_PER_WAKE: usize = 63;
 /// alone one wake at a time.
 fn admit_drained(
     first: TabletRequest,
-    tablets: &mut HashMap<TabletId, LiveTablet>,
+    tablets: &mut LocalTabletSet,
     metrics: &core::cell::Cell<WorkerMetrics>,
     durability: &mut Option<WorkerDurability>,
     chunks: &WorkerChunks,
@@ -230,7 +227,7 @@ pub enum WorkerRequestError {
     #[error("memory fabric failed: {0}")]
     Fabric(#[source] crate::fabric::FabricError),
     /// The request is not admittable (absurd range, oversize patch):
-    /// caller bug, state untouched, never persisted — fix and retry.
+    /// caller bug, state untouched, never persisted - fix and retry.
     #[error("invalid request: {detail}")]
     InvalidRequest {
         /// Human-readable reason (returned verbatim).
@@ -257,7 +254,7 @@ pub struct WorkerDurability {
 /// never touches it again.
 ///
 /// The private lane is boxed because it is an order of magnitude larger than
-/// the shared arm, and the enum is moved into a spawned thread exactly once —
+/// the shared arm, and the enum is moved into a spawned thread exactly once -
 /// so the box costs one allocation at startup and keeps the enum small
 /// everywhere else.
 #[derive(Debug)]
@@ -520,7 +517,7 @@ impl WorkerHandle {
     /// # Panics
     ///
     /// Panics if the OS refuses to spawn the thread (resource exhaustion at
-    /// startup is fatal — there is no worker to report through).
+    /// startup is fatal - there is no worker to report through).
     #[must_use]
     pub fn spawn(
         id: WorkerId,
@@ -584,44 +581,11 @@ impl WorkerHandle {
     /// Clones the bundled control ingress (metrics queries, sweeps,
     /// shutdown). Every send through the bundle pings the bridge.
     #[must_use]
-    pub fn control_sender(&self) -> ControlIngress {
+    pub(crate) fn control_sender(&self) -> ControlIngress {
         ControlIngress {
             sender: self.control.clone(),
             bridge: self.bridge.clone(),
         }
-    }
-
-    /// Admits one request without blocking: `Ok` when queued, `Err` when the
-    /// bounded queue is full (fast `Overloaded`-style rejection upstream) or
-    /// the worker is gone.
-    ///
-    /// # Errors
-    ///
-    /// Returns the `TrySendError` (full queue or disconnected worker) for
-    /// the caller to map onto engine errors.
-    ///
-    /// # Large error type
-    ///
-    /// The `Err` variant carries the whole request back (it must, so the
-    /// caller can observe what was refused). The single caller maps it to
-    /// the small [`crate::engine::EngineError`] immediately without storing it, so the
-    /// stack cost never materializes.
-    #[allow(clippy::result_large_err)]
-    pub fn try_send(&self, request: TabletRequest) -> Result<(), TrySendError<TabletRequest>> {
-        self.requests.try_send(request)
-    }
-
-    /// Sends one control message without blocking, then pings the bridge
-    /// (covers engine shutdown and test-harness control sends).
-    ///
-    /// # Errors
-    ///
-    /// Returns the `TrySendError` (full control queue or disconnected
-    /// worker) for the caller to handle.
-    pub fn try_control(&self, control: WorkerControl) -> Result<(), TrySendError<WorkerControl>> {
-        let outcome = self.control.try_send(control);
-        self.bridge.ping();
-        outcome
     }
 
     /// Joins the worker thread. Returns the thread's outcome: `Ok(())` on
@@ -647,7 +611,7 @@ impl WorkerHandle {
     /// # Errors
     ///
     /// Returns [`NetStartError`] for affinity, runtime, bind, or handshake
-    /// failures — always before serving. Partially started siblings clean
+    /// failures - always before serving. Partially started siblings clean
     /// themselves up when their handles drop (channel disconnect exits).
     pub fn spawn_net(
         id: WorkerId,
@@ -697,7 +661,7 @@ impl WorkerHandle {
 
     /// Whether the thread handle is still unjoined.
     #[must_use]
-    pub fn is_joined(&self) -> bool {
+    pub(crate) fn is_joined(&self) -> bool {
         self.thread.is_none()
     }
 }
@@ -718,7 +682,7 @@ impl fmt::Debug for WorkerHandle {
 ///
 /// In durable mode the loop also pumps the commit coordinator after every
 /// wake, and parks boundedly (not indefinitely) while a batch is admitted
-/// or in flight — the embedded client waits blocked in its rendezvous, so
+/// or in flight - the embedded client waits blocked in its rendezvous, so
 /// an indefinite park would deadlock its reply. The park quantum only
 /// bounds completion detection, never batching: batches seal on
 /// drain/full/deadline/linger regardless.
@@ -740,17 +704,14 @@ fn run(
     let metrics = core::cell::Cell::new(WorkerMetrics::default());
     // Opened here, on the thread whose work it describes, and never moved: a
     // counter group is `!Send` and a counter opened elsewhere would count
-    // somebody else's instructions. Attaching is best effort — a machine or
+    // somebody else's instructions. Attaching is best effort - a machine or
     // privilege level that refuses counters yields a sampler that reports the
     // software-only reading, and the worker starts normally either way.
     let mut hardware = kivi_memory::hardware::HardwareSampler::new();
-    let mut tablets: HashMap<TabletId, LiveTablet> = tablets
-        .into_iter()
-        .map(|tablet| (tablet.id(), tablet))
-        .collect();
+    let mut tablets = LocalTabletSet::from_tablets(tablets);
     // Pumps the coordinator once (no-op in ephemeral mode) plus amortized
     // fabric maintenance (planning slice, lane submissions, retire sweep).
-    let pump = |tablets: &mut HashMap<TabletId, LiveTablet>,
+    let pump = |tablets: &mut LocalTabletSet,
                 durability: Option<&mut WorkerDurability>,
                 fabric: &mut TabletFabric| {
         if let Some(durable) = durability {
@@ -833,7 +794,7 @@ fn run(
 /// request is answered (committed or explicitly failed) before the worker
 /// exits, so shutdown never strands a blocked client.
 fn flush_for_shutdown(
-    tablets: &mut HashMap<TabletId, LiveTablet>,
+    tablets: &mut LocalTabletSet,
     durability: Option<&mut WorkerDurability>,
     fabric: &mut TabletFabric,
 ) {
@@ -848,7 +809,7 @@ fn flush_for_shutdown(
 /// in-flight batch payloads (sealed but unapplied) join at the call
 /// site that can see the commit coordinator.
 fn tablet_fabric_roots(
-    tablets: &HashMap<TabletId, LiveTablet>,
+    tablets: &LocalTabletSet,
 ) -> HashMap<TabletId, std::collections::HashSet<u64>> {
     let mut out: HashMap<TabletId, std::collections::HashSet<u64>> = HashMap::new();
     for live in tablets.values() {
@@ -871,7 +832,7 @@ fn tablet_fabric_roots(
 /// roots plus prepared intent references plus open/in-flight batch
 /// payloads. The union is exactly what journal GC must keep.
 fn fabric_live_roots(
-    tablets: &HashMap<TabletId, LiveTablet>,
+    tablets: &LocalTabletSet,
     durability: Option<&WorkerDurability>,
 ) -> std::collections::HashSet<u64> {
     // Roots name committed ids; prepared intents name staged ids
@@ -890,7 +851,7 @@ fn fabric_live_roots(
 /// Builds one worker's fabric observability report: snapshot,
 /// per-tablet footprints, and queue depths.
 fn fabric_stats_report(
-    tablets: &HashMap<TabletId, LiveTablet>,
+    tablets: &LocalTabletSet,
     fabric: &mut crate::fabric::TabletFabric,
 ) -> FabricWorkerReport {
     let roots = tablet_fabric_roots(tablets);
@@ -912,7 +873,7 @@ fn fabric_stats_report(
 /// Handles one control message. Returns `false` when the worker must exit.
 /// Every prepared transaction intent across this worker's tablets, paired
 /// with the tablet that holds it.
-fn list_intents(tablets: &HashMap<TabletId, LiveTablet>) -> Vec<(TabletId, kivi_state::TxnIntent)> {
+fn list_intents(tablets: &LocalTabletSet) -> Vec<(TabletId, kivi_state::TxnIntent)> {
     tablets
         .values()
         .flat_map(|live| {
@@ -926,7 +887,7 @@ fn list_intents(tablets: &HashMap<TabletId, LiveTablet>) -> Vec<(TabletId, kivi_
 
 pub(crate) fn handle_control(
     message: WorkerControl,
-    tablets: &mut HashMap<TabletId, LiveTablet>,
+    tablets: &mut LocalTabletSet,
     metrics: &core::cell::Cell<WorkerMetrics>,
     durability: Option<&WorkerDurability>,
     fabric: &mut crate::fabric::TabletFabric,
@@ -947,9 +908,7 @@ pub(crate) fn handle_control(
             let touched = durability.map(|durable| durable.commit.touched_keys());
             let mut reclaimed = 0usize;
             for tablet in tablets.values_mut() {
-                reclaimed += tablet
-                    .sweep_expired_except(now, limit, touched.as_ref())
-                    .len();
+                reclaimed += tablet.sweep_expired(now, limit, touched.as_ref()).len();
             }
             let _ = respond.try_send(reclaimed);
             true
@@ -968,7 +927,7 @@ pub(crate) fn handle_control(
         }
         WorkerControl::CaptureTablet { tablet, respond } => {
             let view = tablets
-                .get_mut(&tablet)
+                .get_mut(tablet)
                 .map(|live| live.capture_view(capture_namespace(durability)));
             let _ = respond.try_send(view);
             true
@@ -1036,16 +995,16 @@ pub(crate) fn handle_control(
 }
 
 /// Peeks the tablet-visible base a range patch applies against: one
-/// synchronous store read, no mutation. Unknown tablets read as absent —
+/// synchronous store read, no mutation. Unknown tablets read as absent -
 /// the plan outcome is then unused because downstream answers
 /// `UnknownTablet` before preparing anything.
 pub(crate) fn peek_range_base(
-    tablets: &HashMap<TabletId, LiveTablet>,
+    tablets: &LocalTabletSet,
     tablet: TabletId,
     key: &kivi_state::Key,
     now: WallTimestamp,
 ) -> RangeBase {
-    let Some(live) = tablets.get(&tablet) else {
+    let Some(live) = tablets.get(tablet) else {
         return RangeBase::Absent;
     };
     match live.store().get(key, now) {
@@ -1079,7 +1038,7 @@ pub(crate) fn peek_range_base(
 /// Checks a range root fence against the live committed tablet state.
 pub(crate) fn range_fence_matches(
     fence: Option<RangeRootFence>,
-    tablets: &HashMap<TabletId, LiveTablet>,
+    tablets: &LocalTabletSet,
     tablet: TabletId,
     key: &kivi_state::Key,
     now: WallTimestamp,
@@ -1087,7 +1046,7 @@ pub(crate) fn range_fence_matches(
     fence.is_none_or(|fence| {
         fence.matches(
             tablets
-                .get(&tablet)
+                .get(tablet)
                 .and_then(|live| live.store().get(key, now)),
         )
     })
@@ -1121,7 +1080,7 @@ enum StageWork {
     },
 }
 
-/// Stages one value-or-splice on the owner's lane (blocking lane call —
+/// Stages one value-or-splice on the owner's lane (blocking lane call -
 /// plain worker threads only) and rewrites it as a small `SetChunked`
 /// with its pin guard. Answers the failure and reports `Err(())` with
 /// state untouched when staging fails.
@@ -1223,7 +1182,7 @@ fn stage_value_work(
     }
 }
 
-/// Stages one plain value on the owner's lane (blocking lane call — plain
+/// Stages one plain value on the owner's lane (blocking lane call - plain
 /// worker threads only) and submits best-effort protection of the staged
 /// bytes to the redundancy lane (fire-and-forget, never blocking). Answers
 /// the failure and reports `Err(())` with state untouched when staging
@@ -1347,7 +1306,7 @@ fn stage_txn_write(
 /// commits.
 fn seal_finalize_intent(
     op: Operation,
-    tablets: &HashMap<TabletId, LiveTablet>,
+    tablets: &LocalTabletSet,
     tablet: TabletId,
     fabric: &mut crate::fabric::TabletFabric,
     metrics: &core::cell::Cell<WorkerMetrics>,
@@ -1366,7 +1325,7 @@ fn seal_finalize_intent(
         return Some((op, Vec::new(), Vec::new()));
     }
     let fabric_id = tablets
-        .get(&tablet)
+        .get(tablet)
         .and_then(|live| live.store().intent_for_key(&key))
         .and_then(|intent| match &intent.write.kind {
             kivi_state::TxnWriteKind::PutFabric { fabric_id, .. } => Some(*fabric_id),
@@ -1519,7 +1478,7 @@ fn stage_restaged(
     )
 }
 
-/// Stages one medium value into the fabric (blocking lane-free call —
+/// Stages one medium value into the fabric (blocking lane-free call -
 /// plain worker threads only; the reactor bridge defers through its
 /// continuation queue instead) and rewrites it as a small `SetFabric`
 /// root. Answers the failure and reports `Err(())` with state untouched
@@ -1643,7 +1602,7 @@ fn resolve_channel_outcome(
     now: WallTimestamp,
     op: &Operation,
     outcome: OperationResult,
-    tablets: &HashMap<TabletId, LiveTablet>,
+    tablets: &LocalTabletSet,
     fabric: &mut crate::fabric::TabletFabric,
 ) -> WorkerResponse {
     let OperationResult::FabricValue {
@@ -1657,7 +1616,7 @@ fn resolve_channel_outcome(
         _ => None,
     };
     let current = tablets
-        .get(&tablet)
+        .get(tablet)
         .and_then(|live| live.store().get(key, now));
     let reference = kivi_state::FabricRef {
         id: fabric_id,
@@ -1688,7 +1647,7 @@ fn capture_namespace(durability: Option<&WorkerDurability>) -> NamespaceId {
 /// Executes one request: ephemeral tablets run inline; durable requests
 /// join the commit coordinator's admission queue and complete when their
 /// batch proves durable. Large legacy `Set`s convert to staged chunked
-/// roots first, medium `Set`s to staged fabric roots (blocking calls —
+/// roots first, medium `Set`s to staged fabric roots (blocking calls -
 /// plain worker threads only; the reactor bridge defers through its
 /// continuation queue instead). Reads may complete as
 /// [`ChunkedValue`](OperationResult::ChunkedValue) or
@@ -1701,7 +1660,7 @@ fn capture_namespace(durability: Option<&WorkerDurability>) -> NamespaceId {
 /// placement change), everything else plans as-is. `None` means the
 /// request already answered with state untouched.
 fn resolve_range_base(
-    tablets: &HashMap<TabletId, LiveTablet>,
+    tablets: &LocalTabletSet,
     tablet: TabletId,
     key: &kivi_state::Key,
     now: WallTimestamp,
@@ -1760,7 +1719,7 @@ fn stage_range_request(
     key: kivi_state::Key,
     offset: u64,
     patch: bytes::Bytes,
-    tablets: &HashMap<TabletId, LiveTablet>,
+    tablets: &LocalTabletSet,
     now: WallTimestamp,
     chunks: &WorkerChunks,
     fabric: &mut crate::fabric::TabletFabric,
@@ -1895,7 +1854,7 @@ fn stage_txn_batch(
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn stage_request_representation(
     op: Operation,
-    tablets: &mut HashMap<TabletId, LiveTablet>,
+    tablets: &mut LocalTabletSet,
     tablet: TabletId,
     now: WallTimestamp,
     chunks: &WorkerChunks,
@@ -2036,7 +1995,7 @@ fn stage_request_representation(
 #[allow(clippy::too_many_lines)]
 pub(crate) fn handle_request(
     request: TabletRequest,
-    tablets: &mut HashMap<TabletId, LiveTablet>,
+    tablets: &mut LocalTabletSet,
     metrics: &core::cell::Cell<WorkerMetrics>,
     durability: Option<&mut WorkerDurability>,
     chunks: &WorkerChunks,
@@ -2098,7 +2057,7 @@ pub(crate) fn handle_request(
         *holder = TabletId::from_u64(tablet.as_u64());
     }
     match durability {
-        None => match tablets.get_mut(&tablet) {
+        None => match tablets.get_mut(tablet) {
             None => {
                 let _ = respond.try_send(Err(WorkerRequestError::UnknownTablet { tablet }));
             }
@@ -2133,8 +2092,8 @@ pub(crate) fn handle_request(
                         Ok(result) => {
                             // A read still resolves: a value that lives in the
                             // Memory Fabric comes back as a reference, and
-                            // turning that into bytes — and applying a range
-                            // read's window to them — is this step's job.
+                            // turning that into bytes - and applying a range
+                            // read's window to them - is this step's job.
                             // Skipping it answers a fabric-backed `GETRANGE`
                             // with a manifest instead of its bytes.
                             match resolve_channel_outcome(
@@ -2171,7 +2130,7 @@ pub(crate) fn handle_request(
                         }
                         Ok(result) => {
                             if let Some(post) = tablets
-                                .get(&tablet)
+                                .get(tablet)
                                 .and_then(|live| live.store().get(&key, now))
                             {
                                 fabric.retire_superseded(previous, post);
@@ -2215,17 +2174,11 @@ pub(crate) fn handle_request(
 
 /// Retires staged fabric ids that never committed (prepare failure,
 /// ephemeral execute failure): they are fresh, unpinned, and referenced
-/// nowhere, so retirement always succeeds — failures are ignored.
+/// nowhere, so retirement always succeeds - failures are ignored.
 fn retire_staged(fabric: &mut crate::fabric::TabletFabric, staged: Vec<crate::fabric::StagedSeal>) {
     for seal in staged {
         fabric.retire_or_defer(seal.fabric_id);
     }
-}
-
-/// Builds a one-shot response rendezvous for tests and the engine.
-#[cfg(test)]
-pub(crate) fn response_pair() -> (Sender<WorkerResponse>, Receiver<WorkerResponse>) {
-    bounded(1)
 }
 
 #[cfg(test)]
@@ -2318,8 +2271,9 @@ mod tests {
     }
 
     fn round_trip(handle: &WorkerHandle, tablet: TabletId, op: Operation) -> WorkerResponse {
-        let (respond, receive) = response_pair();
+        let (respond, receive) = bounded(1);
         handle
+            .sender()
             .try_send(TabletRequest {
                 tablet,
                 op,
@@ -2365,7 +2319,8 @@ mod tests {
             Err(WorkerRequestError::UnknownTablet { .. })
         ));
         handle
-            .try_control(WorkerControl::Shutdown)
+            .control_sender()
+            .try_send(WorkerControl::Shutdown)
             .expect("control");
         handle.join().expect("clean exit");
         assert!(handle.is_joined());
@@ -2376,7 +2331,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn splice_plan_routes_every_base() {
         use crate::chunk_lane::{RangeBase, SetRangePlan, plan_set_range};
-        use kivi_chunk::policy::MAX_LEGACY_VALUE_BYTES;
+        use kivi_chunk::policy::MAX_INLINE_VALUE_BYTES;
         use kivi_state::{FabricRef, ObjectVersion};
         let key = || Key::from("k");
         // Absent bases: small results splice inline, large restage.
@@ -2439,7 +2394,7 @@ mod tests {
                 bytes::Bytes::from_static(b"v"),
                 RangeBase::Chunked {
                     manifest: kivi_types::ManifestId::from_bytes([0x11; 32]),
-                    logical_len: MAX_LEGACY_VALUE_BYTES + 1,
+                    logical_len: MAX_INLINE_VALUE_BYTES + 1,
                     object_version: ObjectVersion::FIRST,
                 },
                 1024
@@ -2461,7 +2416,7 @@ mod tests {
         assert!(matches!(
             plan_set_range(
                 key(),
-                MAX_LEGACY_VALUE_BYTES + 1,
+                MAX_INLINE_VALUE_BYTES + 1,
                 bytes::Bytes::new(),
                 RangeBase::Absent,
                 1024
@@ -2473,7 +2428,7 @@ mod tests {
         assert!(matches!(
             plan_set_range(
                 key(),
-                MAX_LEGACY_VALUE_BYTES,
+                MAX_INLINE_VALUE_BYTES,
                 bytes::Bytes::from_static(b"v"),
                 RangeBase::Inline {
                     bytes: bytes::Bytes::from_static(b"v"),
@@ -2618,7 +2573,8 @@ mod tests {
         .expect("expiry attaches");
         let (respond, receive) = bounded::<usize>(1);
         handle
-            .try_control(WorkerControl::Sweep {
+            .control_sender()
+            .try_send(WorkerControl::Sweep {
                 now: WallTimestamp::from_micros(100),
                 limit: 100,
                 respond,
@@ -2626,7 +2582,8 @@ mod tests {
             .expect("control");
         assert_eq!(receive.recv().expect("sweep count"), 1);
         handle
-            .try_control(WorkerControl::Shutdown)
+            .control_sender()
+            .try_send(WorkerControl::Shutdown)
             .expect("control");
         handle.join().expect("clean exit");
         chunks.shutdown();

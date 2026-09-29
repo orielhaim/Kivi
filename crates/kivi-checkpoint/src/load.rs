@@ -7,7 +7,7 @@
 //!
 //! Fallback rule (spec Y): falling back is LOUD (`fell_back`) and only
 //! safe because reclamation never removes WAL the previous checkpoint
-//! needs — the caller guarantees that invariant, and the loader checks
+//! needs - the caller guarantees that invariant, and the loader checks
 //! the catalog chain is monotonic (a previous that leads the current is
 //! catalog corruption, refused without guessing).
 
@@ -37,7 +37,7 @@ pub struct InstalledCheckpoint {
 }
 
 /// Loads the installed checkpoint for one tablet (`None` when never
-/// published — recovery replays the WAL from genesis).
+/// published - recovery replays the WAL from genesis).
 ///
 /// Tries the current chain first, then the retained previous chain with a
 /// loud fallback. Both chains failing is a hard error: history is never

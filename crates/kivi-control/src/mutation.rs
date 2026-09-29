@@ -140,7 +140,6 @@ pub enum ControlMutation {
 
 /// Why a control mutation was rejected.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
 pub enum ControlMutationError {
     /// Framing version this binary cannot speak.
     #[error("unsupported control-mutation version {found}")]
@@ -584,7 +583,7 @@ mod tests {
             },
             ControlMutation::AdvanceSplit {
                 plan: PlanId::from_u64(7),
-                phase: crate::split::SplitPhase::ChildrenAllocated,
+                phase: crate::split::SplitPhase::ChildrenProvisioning,
                 generation: PlacementVersion::from_u64(2),
             },
             ControlMutation::RemoveSplit {

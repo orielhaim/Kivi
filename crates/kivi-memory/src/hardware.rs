@@ -401,7 +401,7 @@ impl HardwareSampler {
     ///
     /// One call rather than three because the three are one operation, and
     /// splitting them invites a caller that reads the counters and forgets to
-    /// close the window — which silently carries one window's corroboration
+    /// close the window - which silently carries one window's corroboration
     /// into the next.
     pub fn end_of_window(&mut self, total_work: u64) -> HardwareSample {
         self.observe_work(total_work);

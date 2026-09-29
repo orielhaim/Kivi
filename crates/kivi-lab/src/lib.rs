@@ -14,24 +14,26 @@
 //!
 //! Contents:
 //!
-//! * [`process`] — one reusable race-free server harness (spawn, endpoint
+//! * [`process`] - one reusable race-free server harness (spawn, endpoint
 //!   discovery, kill/restart, admin queries).
-//! * [`workload`] — target-neutral workload model (mix, key distribution,
+//! * [`workload`] - target-neutral workload model (mix, key distribution,
 //!   value sizes, TTL behavior). Knows nothing about chunk ids, manifests,
 //!   worker routing, or connection structs.
-//! * [`targets`] — [`targets::BenchTarget`] adapters (`KiviNativeTarget`,
+//! * [`targets`] - [`targets::BenchTarget`] adapters (`KiviNativeTarget`,
 //!   generic `RespTarget`). One RESP implementation serves Kivi RESP,
 //!   Redis, Valkey, and Dragonfly alike.
-//! * [`resp_client`] — minimal raw RESP2 client over blocking TCP, shared
+//! * [`resp_client`] - minimal raw RESP2 client over blocking TCP, shared
 //!   by benchmarks and conformance so comparisons isolate server
 //!   differences, not client libraries.
-//! * [`campaign`] — bounded, correctness-gated Kivi/Redis comparison runs
+//! * [`campaign`] - bounded, correctness-gated Kivi/Redis comparison runs
 //!   with raw JSON and Markdown artifacts.
-//! * [`runner`] — concurrency, pipelining, warmup, timing, and histogram
+//! * [`runner`] - concurrency, pipelining, warmup, timing, and histogram
 //!   methodology, identical for every target.
-//! * [`metrics`] — machine-readable benchmark schema (JSON tooling output).
-//! * [`conformance`] — differential-testing helpers: key-prefix isolation,
+//! * [`metrics`] - machine-readable benchmark schema (JSON tooling output).
+//! * [`conformance`] - differential-testing helpers: key-prefix isolation,
 //!   normalization, and reference-Redis configuration inspection.
+//! * [`testkit`] - scaffolding the integration suites share: the in-process
+//!   engine, client wrappers, key layout, and the redundancy admin plane.
 
 pub mod campaign;
 pub mod cluster;
@@ -41,6 +43,7 @@ pub mod process;
 pub mod resp_client;
 pub mod runner;
 pub mod targets;
+pub mod testkit;
 pub mod workload;
 /// Far-future expiry stamp for benchmark and campaign expirations: one
 /// production wall read plus sixty seconds, clamped to the max stamp.

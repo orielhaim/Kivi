@@ -2,7 +2,7 @@
 //!
 //! Every variant names what broke and where. A corrupt immutable artifact
 //! is never accepted, and recovery distinguishes *interrupted publication*
-//! (invisible by construction — retry or use the previous checkpoint)
+//! (invisible by construction - retry or use the previous checkpoint)
 //! from *real corruption* (fail the database rather than serve a lie).
 
 /// Checkpoint failure modes.
@@ -32,14 +32,14 @@ pub enum CheckpointError {
         detail: String,
     },
     /// A band references an unsupported layout or codec. New formats need
-    /// new code — never guess a physical layout.
+    /// new code - never guess a physical layout.
     #[error("unsupported checkpoint feature: {detail}")]
     Unsupported {
         /// What is not implemented by this build.
         detail: String,
     },
     /// No installed checkpoint exists (fresh database or nothing published
-    /// yet). Not an error for recovery — it means WAL replay from genesis.
+    /// yet). Not an error for recovery - it means WAL replay from genesis.
     #[error("no installed checkpoint")]
     Absent,
 }

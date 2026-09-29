@@ -2,7 +2,7 @@
 //!
 //! Thin typed wrapper over [`NativeClient`]: parses arguments, prints
 //! human-readable results, and exits nonzero with the stable machine error
-//! on failure. Not Redis compatibility — native semantics only.
+//! on failure. Not Redis compatibility - native semantics only.
 
 use bytes::Bytes;
 use clap::{Parser, Subcommand};

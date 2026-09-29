@@ -21,30 +21,13 @@ use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use kivi_client::ordered::{
-    BatchExpect, BatchWriteKind, BatchWriteSpec, ScanConsistency, ScanDirection, ScanOptions,
-    ScanProjection,
-};
+use kivi_client::ordered::{ScanConsistency, ScanDirection, ScanOptions, ScanProjection};
 use kivi_lab::cluster::Cluster;
+use kivi_lab::testkit::{NS, batch_checked, spread_key};
 use kivi_state::Key;
-use kivi_types::NamespaceId;
-
-const NS: NamespaceId = NamespaceId::from_u64(1);
 const CYCLES: usize = 10;
 const SEED_KEYS: usize = 40;
 const PER_PHASE_WRITES: usize = 8;
-
-fn spread_key(slot: usize, index: usize) -> Vec<u8> {
-    let prefix = match slot % 4 {
-        0 => 0x10u8,
-        1 => b'A',
-        2 => 0x90u8,
-        _ => 0xF0u8,
-    };
-    let mut key = vec![prefix];
-    key.extend_from_slice(format!("{index:06}").as_bytes());
-    key
-}
 
 fn value_for(index: usize) -> Vec<u8> {
     format!("rejoin-{index:06}").into_bytes()
@@ -97,28 +80,6 @@ fn read_checked(
     );
 }
 
-fn batch_checked(
-    client: &kivi_client::NativeClient,
-    model: &mut HashMap<Vec<u8>, Vec<u8>>,
-    writes: Vec<(Vec<u8>, Vec<u8>)>,
-    context: &str,
-) {
-    let specs: Vec<BatchWriteSpec> = writes
-        .iter()
-        .map(|(key, value)| BatchWriteSpec {
-            key: key.clone(),
-            kind: BatchWriteKind::Put(value.clone()),
-            expect: BatchExpect::Any,
-        })
-        .collect();
-    client
-        .atomic_batch(NS, &specs)
-        .unwrap_or_else(|error| panic!("{context}: batch failed: {error:?}"));
-    for (key, value) in writes {
-        model.insert(key, value);
-    }
-}
-
 fn stream_checked(
     client: &kivi_client::NativeClient,
     model: &mut HashMap<Vec<u8>, Vec<u8>>,
@@ -127,7 +88,7 @@ fn stream_checked(
     context: &str,
 ) {
     // NOTE (found bug, deferred): `put_stream` uploads do not follow
-    // `StaleRoute` at commit — the commit is single-attempt, so a
+    // `StaleRoute` at commit - the commit is single-attempt, so a
     // leadership/topology move between route-probe and commit surfaces as
     // `Internal("unexpected stale-route here")` instead of converging
     // (reproduced on a fresh 4-tablet ordered cluster, no churn). The

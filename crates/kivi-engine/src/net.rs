@@ -2,11 +2,11 @@
 //!
 //! Each networked worker owns an OS thread running a single-threaded Compio
 //! runtime. The accept loop and every connection task execute on that same
-//! thread and share tablets through `Rc<RefCell<..>>` — no locks, no
+//! thread and share tablets through `Rc<RefCell<..>>` - no locks, no
 //! cross-thread tablet access, ever. (`spawn` requires only `Future`, never
 //! `Send`, which is what makes this sound.)
 //!
-//! Request flow on the owning worker (the fast path):
+//! Request flow on the owning worker:
 //!
 //! ```text
 //! socket → frame parser → route validation → LiveTablet::execute
@@ -63,7 +63,8 @@ use crate::commit::PendingEntry;
 use crate::placement::ThreadPlacement;
 use crate::resp_net::serve_resp;
 use crate::routing::RoutingSnapshot;
-use crate::tablet::LiveTablet;
+use crate::slots::LocalTabletSet;
+use crate::tablet::{LiveTablet, TabletError};
 use crate::worker::{
     WorkerChunks, WorkerControl, WorkerDurability, WorkerMetrics, WorkerRequestError,
     WorkerResponse, handle_control, handle_request, range_fence_matches,
@@ -71,7 +72,7 @@ use crate::worker::{
 use kivi_core::SystemClock;
 
 /// Per-connection unparsed-junk bound default (4 MiB). This caps bytes
-/// with no validated meaning yet — never a declared in-progress frame,
+/// with no validated meaning yet - never a declared in-progress frame,
 /// which [`kivi_protocol::FrameReader::buffer_ceiling`] covers exactly up
 /// to `max_frame`. A legal frame therefore always fits.
 pub const DEFAULT_MAX_INPUT_BYTES: usize = 4 * 1024 * 1024;
@@ -82,21 +83,17 @@ pub const DEFAULT_MAX_PIPELINED: usize = 1024;
 pub const DEFAULT_TURN_FRAMES: usize = 32;
 /// Per-turn byte budget default (256 KiB of request payload).
 pub const DEFAULT_TURN_BYTES: usize = 256 * 1024;
-/// Embedded-bridge idle backstop: the bridge parks event-driven on its
+/// Embedded-bridge idle backstop. The bridge parks event-driven on its
 /// wakeup channel (every ingress send pings it), so idle workers sleep
-/// until traffic arrives with no poll quantum and no latency floor.
+/// until traffic arrives with no poll quantum and no latency floor; this
+/// only bounds a lost ping, which the ingress bundles make unreachable.
 /// `LocalClient` traffic against a networked worker carries admin calls,
-/// tests, and the RESP compatibility edge (which deliberately reuses local
-/// ingress instead of proxying through the native wire protocol) — never
-/// the native fast path, which lives on the connection tasks and never
-/// waits on this timer. This backstop only bounds a lost-ping bug (every
-/// send site pings through its ingress bundle, so it never fires in
-/// practice); normal wakes are immediate.
+/// tests, and the RESP compatibility edge - never the native fast path,
+/// which lives on the connection tasks and never waits on this timer.
 ///
 /// While the commit coordinator holds admitted work, the bridge parks on
 /// the shorter completion quantum instead so embedded replies track batch
-/// proofs rather than this interval. The quantum only bounds completion
-/// detection, never batching.
+/// proofs. The quantum only bounds completion detection, never batching.
 const BRIDGE_IDLE_BACKSTOP: Duration = Duration::from_millis(20);
 /// Accept-loop shutdown poll interval.
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -114,7 +111,7 @@ pub struct ConnLimits {
     /// Maximum unparsed input bytes with no validated frame meaning
     /// buffered per connection. A declared in-progress frame (header
     /// parsed, length within `max_frame`) may buffer exactly its
-    /// declared length — see `FrameReader::buffer_ceiling`.
+    /// declared length - see `FrameReader::buffer_ceiling`.
     pub max_input_bytes: usize,
     /// Maximum accepted frame payload (≤ 64 MiB protocol ceiling).
     pub max_frame: usize,
@@ -219,11 +216,10 @@ pub struct NetConfig {
 }
 
 /// Networked worker startup failure: placement, runtime, or bind problems
-/// report here before serving begins — never as a silent dead worker.
+/// report here before serving begins - never as a silent dead worker.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum NetStartError {
-    /// The thread could not be placed.
     /// Runtime creation failed.
     #[error("runtime creation failed: {0}")]
     Runtime(String),
@@ -237,9 +233,10 @@ pub enum NetStartError {
 
 /// Executor-agnostic cooperative yield: returns `Pending` once (after
 /// re-arming the waker) so the reactor can run other tasks. Used for turn
-/// budgets and shutdown draining without coupling to any runtime's yield API.
+/// budgets, shutdown draining, and the RESP edge's wait for the engine
+/// client, without coupling to any runtime's yield API.
 #[derive(Debug, Default)]
-struct YieldNow(bool);
+pub(crate) struct YieldNow(bool);
 
 impl Future for YieldNow {
     type Output = ();
@@ -255,12 +252,42 @@ impl Future for YieldNow {
     }
 }
 
+impl WorkerNet {
+    /// This worker's compiled routes, recompiled if the publication has moved on.
+    ///
+    /// The check is a version compare against the `Arc` already published, so a
+    /// steady-state request costs two relaxed atomic loads and a compare. A split
+    /// pays the compile once, on the first request after the new publication lands.
+    ///
+    /// Returning `Arc` rather than a guard is deliberate: the guard borrows the
+    /// `ArcSwap`, and the recompile below has to store through it.
+    pub(crate) fn local_routes(&self) -> Arc<crate::routing::LocalRoutes> {
+        let routing = self.routing.load();
+        let current = self.local_routes.load();
+        if current.is_current_for(&routing) {
+            return Arc::clone(&current);
+        }
+        let compiled =
+            crate::routing::LocalRoutes::compile(&routing, self.id, &self.tablets.borrow());
+        let published = Arc::new(compiled);
+        self.local_routes.store(Arc::clone(&published));
+        published
+    }
+}
+
 /// Shared per-worker serving state (single-threaded; `Rc` never crosses threads).
 pub(crate) struct WorkerNet {
     pub(crate) id: WorkerId,
-    pub(crate) tablets: Rc<RefCell<HashMap<TabletId, LiveTablet>>>,
+    pub(crate) tablets: Rc<RefCell<LocalTabletSet>>,
     pub(crate) metrics: Rc<Cell<WorkerMetrics>>,
     pub(crate) routing: Arc<ArcSwap<RoutingSnapshot>>,
+    /// This worker's routing, compiled down to [`LocalTabletSlot`]s.
+    ///
+    /// The data plane's routing state. [`Self::routing`] answers *which tablet*;
+    /// this answers *which slot*. Compiled on first use after each publication
+    /// and read without a lock, so the request path pays an atomic load rather
+    /// than a control-plane lookup.
+    pub(crate) local_routes: Arc<ArcSwap<crate::routing::LocalRoutes>>,
     pub(crate) endpoints: Arc<ArcSwap<EndpointMap>>,
     pub(crate) shutdown: Rc<Cell<bool>>,
     pub(crate) active: Rc<Cell<usize>>,
@@ -272,12 +299,12 @@ pub(crate) struct WorkerNet {
     pub(crate) durability: Option<Rc<RefCell<WorkerDurability>>>,
     /// Chunk lane access plus the representation policy. Shared across
     /// connection tasks and bridge like durability above. Staging and
-    /// resolution suspend the awaiting task only — never the reactor.
+    /// resolution suspend the awaiting task only - never the reactor.
     pub(crate) chunks: crate::worker::WorkerChunks,
     /// Memory Fabric integration. Shared across connection tasks and
     /// bridge like durability above. Staging is synchronous (arena
     /// insert, never blocking); promotion suspends the awaiting task
-    /// (connection tasks) or parks on the frontier (bridge) — the
+    /// (connection tasks) or parks on the frontier (bridge) - the
     /// reactor thread itself never blocks on storage.
     pub(crate) fabric: Rc<RefCell<crate::fabric::TabletFabric>>,
 }
@@ -328,15 +355,21 @@ pub(crate) fn run_net(
         // forbids.
         tracing::warn!(worker = id.as_u64(), ?error, "data worker unbound");
     }
-    let tablet_map: HashMap<TabletId, LiveTablet> = tablets
-        .into_iter()
-        .map(|tablet| (tablet.id(), tablet))
-        .collect();
+    let tablet_map = LocalTabletSet::from_tablets(tablets);
+    // Seeded empty and compiled on first use: a namespace with no active tablet
+    // compiles to "I own nothing", and the executor declines every command to the
+    // forwarder rather than answering from a tablet that is mid-retire.
+    let local_routes = Arc::new(ArcSwap::from_pointee(crate::routing::LocalRoutes::compile(
+        &launch.routing.load(),
+        id,
+        &tablet_map,
+    )));
     let shared = Rc::new(WorkerNet {
         id,
         tablets: Rc::new(RefCell::new(tablet_map)),
         metrics: Rc::new(Cell::new(WorkerMetrics::default())),
         routing: launch.routing,
+        local_routes,
         endpoints: launch.net.endpoints.clone(),
         shutdown: Rc::new(Cell::new(false)),
         active: Rc::new(Cell::new(0)),
@@ -433,7 +466,7 @@ async fn serve(
         })
     };
     // Accept loop WITHOUT a timeout: cancelling a pending AcceptEx leaks
-    // the listener on this compio version (proven by test — a single
+    // the listener on this compio version (proven by test - a single
     // cancelled accept keeps the FD bound past runtime drop, breaking
     // same-port restart). The loop parks in `accept()` uncancellable and
     // wakes only on real connections; shutdown wakes it with a dummy
@@ -466,8 +499,8 @@ async fn serve(
     }
     // Flush admitted durable work: proofs already on the lane still need
     // ordered apply so committed state (not just the WAL) reflects every
-    // acknowledged write at shutdown. Replies go nowhere — connection
-    // tasks already exited — but the state advance is what matters, and
+    // acknowledged write at shutdown. Replies go nowhere - connection
+    // tasks already exited - but the state advance is what matters, and
     // recovery would replay it anyway.
     if let Some(cell) = shared.durability.as_ref() {
         let namespace = shared.routing.load().namespace();
@@ -489,8 +522,8 @@ async fn serve(
     }
     tracing::info!(worker = %shared.id.as_u64(), "worker listener stopped");
     // Join the bridge explicitly: no detached task may outlive this
-    // runtime (a lingering task keeps driver state — and potentially
-    // sockets — alive past thread join, breaking same-port restart).
+    // runtime (a lingering task keeps driver state - and potentially
+    // sockets - alive past thread join, breaking same-port restart).
     // The bridge exits on the Shutdown control already sent, so this
     // join is prompt, never a hang.
     let _ = bridge.await;
@@ -502,7 +535,7 @@ struct BridgeContext {
     requests: crossbeam_channel::Receiver<crate::worker::TabletRequest>,
     control: crossbeam_channel::Receiver<WorkerControl>,
     bridge_wake: async_channel::Receiver<()>,
-    tablets: Rc<RefCell<HashMap<TabletId, LiveTablet>>>,
+    tablets: Rc<RefCell<LocalTabletSet>>,
     metrics: Rc<Cell<WorkerMetrics>>,
     durability: Option<Rc<RefCell<WorkerDurability>>>,
     chunks: crate::worker::WorkerChunks,
@@ -521,7 +554,7 @@ struct BridgeContext {
 /// the bridge loop stays reviewable; borrows end with the call.
 fn bridge_control(
     message: WorkerControl,
-    tablets: &Rc<RefCell<HashMap<TabletId, LiveTablet>>>,
+    tablets: &Rc<RefCell<LocalTabletSet>>,
     metrics: &Rc<Cell<WorkerMetrics>>,
     durability: Option<&Rc<RefCell<WorkerDurability>>>,
     fabric: &Rc<RefCell<crate::fabric::TabletFabric>>,
@@ -555,7 +588,7 @@ enum ControlDrain {
 /// hold the loop's whole state in view. Every borrow ends with the call.
 fn drain_bridge_control(
     control: &crossbeam_channel::Receiver<WorkerControl>,
-    tablets: &Rc<RefCell<HashMap<TabletId, LiveTablet>>>,
+    tablets: &Rc<RefCell<LocalTabletSet>>,
     metrics: &Rc<Cell<WorkerMetrics>>,
     durability: Option<&Rc<RefCell<WorkerDurability>>>,
     fabric: &Rc<RefCell<crate::fabric::TabletFabric>>,
@@ -586,7 +619,7 @@ fn drain_bridge_control(
 /// Wakeups are event-driven: every ingress send pings `bridge_wake`, so an
 /// idle bridge parks in `recv()` with no poll quantum, no latency floor,
 /// and no idle CPU. A short backstop bounds a lost ping (which cannot
-/// happen through the ingress bundles — this is defense in depth, not a
+/// happen through the ingress bundles - this is defense in depth, not a
 /// pacing interval). While admitted work is outstanding the bridge parks
 /// on the completion quantum so replies track batch proofs.
 async fn bridge_loop(context: BridgeContext) {
@@ -706,7 +739,7 @@ async fn bridge_loop(context: BridgeContext) {
         } else {
             // Event-driven idle: every ingress send pings this channel, so
             // the bridge sleeps until traffic arrives. The backstop only
-            // bounds a lost ping (defense in depth — send sites always
+            // bounds a lost ping (defense in depth - send sites always
             // ping, and a closed channel here just re-checks the queues).
             let _ = compio::time::timeout(BRIDGE_IDLE_BACKSTOP, bridge_wake.recv()).await;
         }
@@ -744,22 +777,36 @@ struct BridgeStage {
     range_fence: Option<RangeRootFence>,
 }
 
-/// One embedded fabric read parked while the offcore lane promotes it.
-/// Resume re-checks residency synchronously before serving (the reactor
-/// never blocks on storage); bounded re-parks absorb races, then the
-/// request answers backpressure instead of wedging the bridge.
 /// Medium-tier routing outcome: staged, already answered, or not a
 /// medium write (caller falls through to the chunk path).
 #[derive(Debug)]
 enum RoutedMedium {
     /// Staged: admitted op plus its seal payloads (caller attaches its pin).
-    Staged(Operation, Vec<crate::fabric::StagedSeal>),
+    ///
+    /// Boxed because the other two arms carry nothing and are the common ones: an
+    /// enum that is 208 bytes to say "pass" is a size every caller moves on every
+    /// request, paid for by the arm that almost never happens.
+    Staged(Box<StagedMedium>),
     /// Saturation: the request already answered overload.
     Answered,
     /// Not a medium write: caller continues to the chunk path.
     Pass,
 }
 
+/// The payload of [`RoutedMedium::Staged`], behind a box for the reason on that
+/// variant.
+#[derive(Debug)]
+struct StagedMedium {
+    /// The admitted operation.
+    op: Operation,
+    /// Seal payloads the caller attaches its pin to.
+    seals: Vec<crate::fabric::StagedSeal>,
+}
+
+/// One embedded fabric read parked while the offcore lane promotes it.
+/// Resume re-checks residency synchronously before serving (the reactor
+/// never blocks on storage); bounded re-parks absorb races, then the
+/// request answers backpressure instead of wedging the bridge.
 struct FabricReadPark {
     /// Owning tablet (routed before parking; placement is static).
     tablet: TabletId,
@@ -783,7 +830,7 @@ struct FabricReadPark {
 #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 fn bridge_intake(
     request: crate::worker::TabletRequest,
-    tablets: &Rc<RefCell<HashMap<TabletId, LiveTablet>>>,
+    tablets: &Rc<RefCell<LocalTabletSet>>,
     metrics: &Rc<Cell<WorkerMetrics>>,
     durability: Option<&Rc<RefCell<WorkerDurability>>>,
     chunks: &WorkerChunks,
@@ -799,14 +846,14 @@ fn bridge_intake(
         respond,
     } = request;
     // Fabric reads pre-check residency synchronously: a hit flows into
-    // the normal path below (whose internal resolve will also hit —
+    // the normal path below (whose internal resolve will also hit -
     // check and act share one synchronous turn, so no race); a miss
     // parks here instead of entering `handle_request`, whose blocking
     // resolve must never run on the reactor.
     if let Operation::Get { key } | Operation::GetRange { key, .. } = &op
         && let Some(reference) = tablets
             .borrow()
-            .get(&tablet)
+            .get(tablet)
             .and_then(|live| live.store().get(key, now))
             .and_then(kivi_state::StoredObject::fabric_ref)
     {
@@ -816,7 +863,7 @@ fn bridge_intake(
                 &reference,
                 tablets
                     .borrow()
-                    .get(&tablet)
+                    .get(tablet)
                     .and_then(|live| live.store().get(key, now)),
             )
             .ok()
@@ -1011,14 +1058,14 @@ fn park_fabric_read(
     now: kivi_types::WallTimestamp,
     respond: crossbeam_channel::Sender<crate::worker::WorkerResponse>,
     reference: kivi_state::FabricRef,
-    tablets: &Rc<RefCell<HashMap<TabletId, LiveTablet>>>,
+    tablets: &Rc<RefCell<LocalTabletSet>>,
     metrics: &Rc<Cell<WorkerMetrics>>,
     fabric: &Rc<RefCell<crate::fabric::TabletFabric>>,
     fabric_parks: &mut VecDeque<FabricReadPark>,
 ) {
     let current = tablets
         .borrow()
-        .get(&tablet)
+        .get(tablet)
         .and_then(|live| live.store().get(op.key(), now).cloned());
     let park = fabric.borrow_mut().submit_parked_promote(
         tablet,
@@ -1061,7 +1108,7 @@ fn bridge_stage_fabric(
     now: kivi_types::WallTimestamp,
     identity: Option<MutationIdentity>,
     respond: crossbeam_channel::Sender<crate::worker::WorkerResponse>,
-    tablets: &Rc<RefCell<HashMap<TabletId, LiveTablet>>>,
+    tablets: &Rc<RefCell<LocalTabletSet>>,
     metrics: &Rc<Cell<WorkerMetrics>>,
     durability: Option<&Rc<RefCell<WorkerDurability>>>,
     fabric: &Rc<RefCell<crate::fabric::TabletFabric>>,
@@ -1128,7 +1175,7 @@ fn bridge_stage_fabric(
     match durability {
         None => {
             let mut tablets = tablets.borrow_mut();
-            let outcome = match tablets.get_mut(&tablet) {
+            let outcome = match tablets.get_mut(tablet) {
                 None => Err(crate::worker::WorkerRequestError::UnknownTablet { tablet }),
                 Some(live) => {
                     let previous = live
@@ -1180,7 +1227,7 @@ fn bridge_plan_range(
     now: kivi_types::WallTimestamp,
     identity: Option<MutationIdentity>,
     respond: crossbeam_channel::Sender<crate::worker::WorkerResponse>,
-    tablets: &Rc<RefCell<HashMap<TabletId, LiveTablet>>>,
+    tablets: &Rc<RefCell<LocalTabletSet>>,
     metrics: &Rc<Cell<WorkerMetrics>>,
     chunks: &WorkerChunks,
     fabric: &Rc<RefCell<crate::fabric::TabletFabric>>,
@@ -1205,7 +1252,7 @@ fn bridge_plan_range(
             };
             let current = tablets
                 .borrow()
-                .get(&tablet)
+                .get(tablet)
                 .and_then(|live| live.store().get(&key, now).cloned());
             if !fence.matches(current.as_ref()) {
                 let mut snapshot = metrics.get();
@@ -1310,7 +1357,7 @@ fn bridge_plan_range(
 /// retry. Pending parks stay.
 fn poll_fabric_parks(
     parks: &mut VecDeque<FabricReadPark>,
-    tablets: &Rc<RefCell<HashMap<TabletId, LiveTablet>>>,
+    tablets: &Rc<RefCell<LocalTabletSet>>,
     metrics: &Rc<Cell<WorkerMetrics>>,
     fabric: &Rc<RefCell<crate::fabric::TabletFabric>>,
 ) {
@@ -1327,7 +1374,7 @@ fn poll_fabric_parks(
         };
         let current = tablets
             .borrow()
-            .get(&tablet)
+            .get(tablet)
             .and_then(|live| live.store().get(&key, now).cloned());
         match fabric.borrow_mut().poll_parked(park, current.as_ref()) {
             Ok(None) => {
@@ -1342,7 +1389,7 @@ fn poll_fabric_parks(
                 // bytes are only servable while the root is still live.
                 let live = tablets
                     .borrow()
-                    .get(&tablet)
+                    .get(tablet)
                     .and_then(|live| live.store().get(&key, now).cloned());
                 let answer = match (live, &parked.op) {
                     (None, _) => OperationResult::Value(None),
@@ -1369,11 +1416,11 @@ fn poll_fabric_parks(
     }
 }
 /// Polls parked chunk stagings: completions admit (durable) or execute
-/// (ephemeral) with the commit timestamp taken at completion — the
+/// (ephemeral) with the commit timestamp taken at completion - the
 /// logical commit happens at admission, not at the original arrival.
 fn poll_bridge_stages(
     frontier: &mut VecDeque<BridgeStage>,
-    tablets: &Rc<RefCell<HashMap<TabletId, LiveTablet>>>,
+    tablets: &Rc<RefCell<LocalTabletSet>>,
     metrics: &Rc<Cell<WorkerMetrics>>,
     durability: Option<&Rc<RefCell<WorkerDurability>>>,
     fabric: &Rc<RefCell<crate::fabric::TabletFabric>>,
@@ -1443,7 +1490,7 @@ fn poll_bridge_stages(
         }
         match durability {
             None => {
-                let outcome = match tablets.borrow_mut().get_mut(&staged.tablet) {
+                let outcome = match tablets.borrow_mut().get_mut(staged.tablet) {
                     None => Err(WorkerRequestError::UnknownTablet {
                         tablet: staged.tablet,
                     }),
@@ -1508,7 +1555,7 @@ struct Conn {
     /// Write half (post-handshake; `None` only while splitting).
     stream: Option<TcpStream>,
     worker: WorkerId,
-    tablets: Rc<RefCell<HashMap<TabletId, LiveTablet>>>,
+    tablets: Rc<RefCell<LocalTabletSet>>,
     metrics: Rc<Cell<WorkerMetrics>>,
     routing: Arc<ArcSwap<RoutingSnapshot>>,
     endpoints: Arc<ArcSwap<EndpointMap>>,
@@ -1523,7 +1570,7 @@ struct Conn {
     chunks: WorkerChunks,
     /// Memory Fabric integration (medium-`Set` conversion and
     /// fabric-read resolution). Staging is synchronous (arena insert);
-    /// promotion suspends the awaiting task only — never the reactor.
+    /// promotion suspends the awaiting task only - never the reactor.
     /// Every borrow is synchronous and ends before any `.await`.
     fabric: Rc<RefCell<crate::fabric::TabletFabric>>,
     /// Parser state (post-handshake; moved to the reader task on split).
@@ -1540,7 +1587,7 @@ struct Conn {
     /// admission order. Intake never waits on these: each loop turn pumps
     /// the coordinator, replies to whatever proved, then takes more.
     /// Responses match by request id, so barrier completions may answer
-    /// out of admission order — the client dispatches by id.
+    /// out of admission order - the client dispatches by id.
     outbox: std::collections::VecDeque<OutboxEntry>,
     /// Open streaming uploads by client-chosen stream id. Connection-local
     /// by construction: ids never leave this connection, and connection
@@ -1631,7 +1678,7 @@ impl Conn {
     /// client thus keeps many mutations in flight through one
     /// connection, and concurrent connections genuinely overlap in the
     /// commit pipeline instead of serializing behind one wait at a time.
-    /// (The handshake runs first, on the unified stream — see
+    /// (The handshake runs first, on the unified stream - see
     /// `serve_conn`.)
     async fn run(&mut self) -> ConnExit {
         loop {
@@ -1651,7 +1698,7 @@ impl Conn {
             // poll frames promptly so linger expiries and completions
             // resolve in hundreds of microseconds; idle connections park
             // longer. Either way this timeout cancels only a channel
-            // wait — never a socket read — so no frame is ever at risk.
+            // wait - never a socket read - so no frame is ever at risk.
             let active = !self.outbox.is_empty() || self.coordinator_has_pending();
             let wait = if active {
                 OUTBOX_ACTIVE_POLL
@@ -1701,7 +1748,7 @@ impl Conn {
     /// here); any pipelined frames arriving with the hello are returned
     /// for the reader task's channel so nothing is lost in the handoff.
     /// The handshake carries no outer timeout (one racing hello cannot
-    /// lose bytes — nothing else is in flight yet).
+    /// lose bytes - nothing else is in flight yet).
     async fn handshake(&mut self) -> Result<Vec<kivi_protocol::Frame>, ConnExit> {
         let (frame, extras) = self.read_handshake_frames().await?;
         if frame.kind != kivi_protocol::FrameKind::ClientHello {
@@ -1872,9 +1919,7 @@ impl Conn {
             return self.abort_upload(stream, "stream id already in use").await;
         }
         let routing = self.routing.load();
-        let Some(tablet) =
-            crate::compound::route_point_key(routing.directory(), begin.namespace, &begin.key)
-        else {
+        let Some(tablet) = crate::compound::route_point_key(&routing, &begin.key) else {
             return self.abort_upload(stream, "no tablet covers key").await;
         };
         let tablet = match self.route_tablet(tablet) {
@@ -1974,7 +2019,7 @@ impl Conn {
 
     /// Stages every full buffered piece for one upload. Split-then-stage:
     /// pieces divide under the state borrow, stage over lane awaits, and
-    /// land back under a fresh borrow — the borrow never crosses an await.
+    /// land back under a fresh borrow - the borrow never crosses an await.
     async fn drain_upload_pieces(&mut self, stream: u64) -> Result<(), ConnExit> {
         loop {
             let piece = match self.uploads.get_mut(&stream) {
@@ -2003,7 +2048,7 @@ impl Conn {
     }
 
     /// Commits one upload: flushes the tail piece, proves the manifest
-    /// durable with one sync barrier, and admits the small root — the
+    /// durable with one sync barrier, and admits the small root - the
     /// same chunks-first ordering as every other write path, with the
     /// stored version answered under the stream id.
     async fn handle_stream_commit(&mut self, stream: u64, payload: &[u8]) -> Result<(), ConnExit> {
@@ -2014,7 +2059,7 @@ impl Conn {
             return self.abort_upload(stream, "unknown stream").await;
         };
         // `received` counts every accepted payload byte, buffered or
-        // staged alike — the commit total needs no adjustment.
+        // staged alike - the commit total needs no adjustment.
         let total = state.received;
         if state.declared.is_some_and(|declared| declared != total) {
             return self
@@ -2023,7 +2068,7 @@ impl Conn {
         }
         // Take the owned parts out of the removed state; the state is
         // already gone, so a failure below answers abort with nothing to
-        // roll back — the client re-uploads under a fresh id.
+        // roll back - the client re-uploads under a fresh id.
         let UploadState {
             key,
             tablet,
@@ -2155,7 +2200,7 @@ impl Conn {
         }
         // Index entries are maintained transactionally: direct single-key
         // writes to the reserved index prefix are rejected (the coherent
-        // paths — `AtomicBatch` and `TxnPrepare` — bypass this check).
+        // paths - `AtomicBatch` and `TxnPrepare` - bypass this check).
         // Reads and scans still serve them (index queries are scans).
         if is_direct_single_key_write(request.opcode) && kivi_state::is_index_key(&request.key) {
             return self
@@ -2174,9 +2219,7 @@ impl Conn {
                 .await;
         }
         let routing = self.routing.load();
-        let Some(tablet) =
-            crate::compound::route_point_key(routing.directory(), namespace, &request.key)
-        else {
+        let Some(tablet) = crate::compound::route_point_key(&routing, &request.key) else {
             return self
                 .respond(
                     request_id,
@@ -2263,14 +2306,14 @@ impl Conn {
     ) -> Result<(), ConnExit> {
         let identity = request.identity;
         let ack_floor = request.ack_floor;
-        // The response envelope keeps the requested opcode — never the
-        // post-split one — so `GetStream` answers stream-shaped even
+        // The response envelope keeps the requested opcode - never the
+        // post-split one - so `GetStream` answers stream-shaped even
         // though it executes the same read as `Get`.
         let requested = request.opcode;
         let streamed = requested == kivi_protocol::Opcode::GetStream;
         // Scan and AtomicBatch ride dedicated payloads with their own
         // consistency selectors; a freshness contract on them is a
-        // caller bug — reject loudly instead of silently ignoring it.
+        // caller bug - reject loudly instead of silently ignoring it.
         if matches!(
             requested,
             kivi_protocol::Opcode::Scan | kivi_protocol::Opcode::AtomicBatch
@@ -2395,7 +2438,7 @@ impl Conn {
             *holder = tablet;
         }
         // Single-node contract gate: this replica holds the only copy, so
-        // local applied state is definitionally fresh — Latest,
+        // local applied state is definitionally fresh - Latest,
         // BoundedStale, and Any serve directly. AtLeast still validates
         // lineage (a foreign tablet/epoch token never validates) and
         // coverage; a token beyond applied names a write this owner has
@@ -2465,7 +2508,7 @@ impl Conn {
                 let (previous, reference) = {
                     let tablets = self.tablets.borrow();
                     let previous = tablets
-                        .get(&tablet)
+                        .get(tablet)
                         .and_then(|live| live.store().get(&key, now))
                         .and_then(kivi_state::StoredObject::fabric_ref);
                     let reference = match &result {
@@ -2508,7 +2551,7 @@ impl Conn {
                     let post = self
                         .tablets
                         .borrow()
-                        .get(&tablet)
+                        .get(tablet)
                         .and_then(|live| live.store().get(&key, now).cloned());
                     if let Some(post) = post {
                         self.fabric.borrow_mut().retire_superseded(previous, &post);
@@ -2652,7 +2695,7 @@ impl Conn {
         token: CommitToken,
     ) -> Result<(), kivi_types::FreshnessReject> {
         let tablets = self.tablets.borrow();
-        let Some(live) = tablets.get(&tablet) else {
+        let Some(live) = tablets.get(tablet) else {
             return Ok(());
         };
         // Single-node validation covers lineage and position only: the
@@ -2883,7 +2926,7 @@ impl Conn {
 
     /// Answers a chunk fabric failure with its stable status. Overload and
     /// oversize are retriable signals; missing or corrupt immutable data
-    /// is `Internal` (loud, never wrong bytes — later multi-source
+    /// is `Internal` (loud, never wrong bytes - later multi-source
     /// recovery will repair what local verification condemns).
     async fn respond_chunk_error(
         &mut self,
@@ -2909,10 +2952,6 @@ impl Conn {
                 tracing::warn!(%request_id, %error, "chunk fabric failure");
                 (Status::Internal, "chunk fabric failure")
             }
-            // `ChunkError` is non-exhaustive across crates: future
-            // variants fail loudly retriable-agnostic here by
-            // construction (never wrong bytes, never a crash).
-            _ => (Status::Internal, "chunk fabric failure"),
         };
         self.respond(
             request_id,
@@ -3037,7 +3076,7 @@ impl Conn {
         let current = self
             .tablets
             .borrow()
-            .get(&tablet)
+            .get(tablet)
             .and_then(|live| live.store().get(key, now).cloned());
         if !fence.matches(current.as_ref()) {
             self.respond_diagnostic(
@@ -3150,7 +3189,7 @@ impl Conn {
             let current = self
                 .tablets
                 .borrow()
-                .get(&tablet)
+                .get(tablet)
                 .and_then(|live| live.store().get(key, now).cloned());
             let mut fabric = self.fabric.borrow_mut();
             match fabric.resolve_sync(&reference, current.as_ref()) {
@@ -3174,7 +3213,7 @@ impl Conn {
         let current = self
             .tablets
             .borrow()
-            .get(&tablet)
+            .get(tablet)
             .and_then(|live| live.store().get(key, now).cloned());
         self.fabric
             .borrow_mut()
@@ -3243,7 +3282,10 @@ impl Conn {
                 expiry,
             },
         };
-        Ok(RoutedMedium::Staged(staged, seals))
+        Ok(RoutedMedium::Staged(Box::new(StagedMedium {
+            op: staged,
+            seals,
+        })))
     }
 
     /// Best-effort redundancy for one staged value on the connection task.
@@ -3289,8 +3331,8 @@ impl Conn {
             .stage_routed_medium(request_id, tablet, &operation)
             .await?
         {
-            RoutedMedium::Staged(op, seals) => {
-                return Ok(Some((op, pinned, seals, range_fence)));
+            RoutedMedium::Staged(staged) => {
+                return Ok(Some((staged.op, pinned, staged.seals, range_fence)));
             }
             RoutedMedium::Answered => return Ok(None),
             RoutedMedium::Pass => {}
@@ -3497,7 +3539,7 @@ impl Conn {
             .then(|| {
                 self.tablets
                     .borrow()
-                    .get(&tablet)
+                    .get(tablet)
                     .and_then(|live| live.store().intent_for_key(&finalize_key))
                     .and_then(|intent| match &intent.write.kind {
                         kivi_state::TxnWriteKind::PutFabric { fabric_id, .. } => Some(*fabric_id),
@@ -3515,7 +3557,7 @@ impl Conn {
                 let reference = self
                     .tablets
                     .borrow()
-                    .get(&tablet)
+                    .get(tablet)
                     .and_then(|live| live.store().get(&finalize_key, now).cloned())
                     .and_then(|object| object.fabric_ref())
                     .filter(|reference| reference.id == fabric_id);
@@ -3855,7 +3897,7 @@ impl Conn {
     }
 
     /// Durable write intake on the owning worker: validates, admits to the
-    /// commit coordinator, and queues the reply slot — never waits.
+    /// commit coordinator, and queues the reply slot - never waits.
     /// Never replies success before the record is file-synced: the reply
     /// leaves through [`flush_outbox`](Self::flush_outbox) once the batch
     /// proves. All borrows end before any `.await`, so connection tasks on
@@ -3909,7 +3951,7 @@ impl Conn {
         // response `.await` below would panic a sibling task that
         // borrows while we wait on the socket (same thread, no
         // preemption between the two borrows, so no race).
-        if !self.tablets.borrow().contains_key(&tablet) {
+        if !self.tablets.borrow().contains_key(tablet) {
             return self
                 .respond(
                     request_id,
@@ -4023,7 +4065,7 @@ impl Conn {
         let now = kivi_core::wall_now_or_max(&SystemClock);
         let mut tablets = self.tablets.borrow_mut();
         tablets
-            .get_mut(&tablet)
+            .get_mut(tablet)
             .map(|live| live.execute(operation, now))
     }
 
@@ -4085,7 +4127,7 @@ impl Conn {
     fn authority_of(&self, tablet: TabletId) -> Option<kivi_types::TabletAuthority> {
         self.tablets
             .borrow()
-            .get(&tablet)
+            .get(tablet)
             .map(crate::tablet::LiveTablet::authority)
     }
 
@@ -4406,7 +4448,7 @@ impl Conn {
             // reads through the chunk lane (and fabric reads through the
             // Memory Fabric) before responding, so a reference value here
             // is a missed resolution path. Answer loudly retriable
-            // `Internal` (never wrong bytes, never a crash) — and the
+            // `Internal` (never wrong bytes, never a crash) - and the
             // resolution tests below pin the real paths.
             R::ChunkedValue { .. } => Response {
                 proof: None,
@@ -4431,15 +4473,15 @@ impl Conn {
         &mut self,
         request_id: u64,
         opcode: kivi_protocol::Opcode,
-        error: &kivi_engine_tablet_error_TabletError,
+        error: &TabletError,
     ) -> Result<(), ConnExit> {
-        use kivi_engine_tablet_error_TabletError as E;
+        use crate::tablet::TabletError as E;
         use kivi_protocol::{Response, ResponseBody, Status};
         let (status, message) = match error {
             E::Op(kivi_state::OpError::WrongType { .. }) => (Status::WrongType, "wrong type"),
             E::Op(kivi_state::OpError::CounterOverflow) => (Status::CounterOverflow, "overflow"),
             // Transient admission race: the range base changed
-            // representation under the request. Safe to retry at once —
+            // representation under the request. Safe to retry at once -
             // the retry re-plans against the new root.
             E::Op(kivi_state::OpError::StaleRangeBase) => {
                 (Status::Overloaded, "range base changed; retry")
@@ -4449,7 +4491,7 @@ impl Conn {
             }
             // Prepare-time and apply-time verdicts share the wire shape:
             // admission validates before the WAL, so an apply-side
-            // semantic error means same-log/same-state divergence — fail
+            // semantic error means same-log/same-state divergence - fail
             // closed with the same typed status either way.
             E::Op(kivi_state::OpError::BoundedExceeded)
             | E::Apply(kivi_state::ApplyError::BoundedExceeded) => (
@@ -4481,7 +4523,7 @@ impl Conn {
                 (Status::WrongType, "wrong type")
             }
             // Divergent-state splice: a corrupt or forked record met a
-            // chunked base. Never a client retry — surface as internal.
+            // chunked base. Never a client retry - surface as internal.
             E::Apply(kivi_state::ApplyError::UnresolvableSplice) => {
                 (Status::Internal, "splice cannot apply")
             }
@@ -4556,17 +4598,12 @@ fn is_direct_single_key_write(opcode: kivi_protocol::Opcode) -> bool {
     )
 }
 
-/// Maps an operation back to its opcode for response encoding.
 /// Bumps the direct-path execution counter.
 fn bump_direct(metrics: &Rc<Cell<WorkerMetrics>>) {
     let mut snapshot = metrics.get();
     snapshot.direct_ops += 1;
     metrics.set(snapshot);
 }
-
-// Re-exported tablet error under an unambiguous local path for the deeply
-// nested response mapping above.
-use crate::tablet::TabletError as kivi_engine_tablet_error_TabletError;
 
 async fn serve_conn(stream: TcpStream, peer: SocketAddr, shared: Rc<WorkerNet>) {
     let _guard = ActiveGuard::hold(&shared.active);

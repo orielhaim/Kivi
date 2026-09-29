@@ -8,7 +8,7 @@
 //!
 //! Determinism contract: identical initial state, seed, scheduled events,
 //! and fault policy produce identical event order, virtual timestamps,
-//! random decisions, fault decisions, trace, and final state — across
+//! random decisions, fault decisions, trace, and final state - across
 //! repeated runs in one binary and across dependency upgrades (the kernel
 //! owns its algorithms; no behavior flows from external crate versions).
 //!

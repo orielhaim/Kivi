@@ -19,7 +19,7 @@
 //!
 //! The lane owns the only append handle to `demotion.dat` (single writer;
 //! torn tails truncate at open). Worker threads may hold read-only
-//! handles to the same file for direct checkpoint/migration reads —
+//! handles to the same file for direct checkpoint/migration reads -
 //! concurrent reads are safe, appends never race.
 //!
 //! Durable admission records live elsewhere (the durability lane's

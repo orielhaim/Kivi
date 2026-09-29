@@ -42,7 +42,6 @@ pub mod calibrate;
 pub mod compressed;
 pub mod criticality;
 pub mod cxl;
-pub mod dram;
 pub mod error;
 pub mod fabric;
 pub mod handle;
@@ -65,9 +64,7 @@ pub use kivi_observation::UnitInterval;
 
 pub use arena::{ArenaStats, WorkerArenas};
 pub use calibrate::{Calibrator, Ewma, ProviderCalibration};
-pub use criticality::{
-    AccessSignals, ExecutionCriticality, Mutability, TelemetrySource, criticality_of,
-};
+pub use criticality::{AccessSignals, ExecutionCriticality, Mutability, criticality_of};
 pub use cxl::{CXL_UNIT_BYTES, CxlProvider, CxlRegion};
 pub use error::MemoryError;
 pub use fabric::{
@@ -91,9 +88,7 @@ pub use offcore_lane::{
     DemotedRecord, OFFCORE_JOB_DEPTH, OffcoreLaneGuard, OffcoreLaneHandle, OffcoreLaneStats,
     OffcoreReply, PromotedBytes, spawn_offcore_lane,
 };
-pub use placement::{
-    CriticalityPlanner, PlacementDecision, Planner, S3FifoBaseline, SieveBaseline,
-};
+pub use placement::{CriticalityPlanner, PlacementDecision, Planner};
 pub use policy::{
     DEFAULT_COMPRESSION_AGGRESSIVENESS, DEFAULT_CRITICALITY_WEIGHTING,
     DEFAULT_DRAM_RESIDENCY_TARGET, DEFAULT_NVME_DEMOTION_PRESSURE, DEFAULT_PROMOTION_THRESHOLD,
@@ -102,7 +97,7 @@ pub use policy::{
 pub use provider::{
     LocalityCaps, ProviderCaps, ProviderDescriptor, ProviderId, ProviderKind, ProviderRegistry,
 };
-pub use repr::{ObjectMaterialization, PhysicalRepr, ReconstructionSource, Residence};
+pub use repr::{ObjectMaterialization, ReconstructionSource, Residence};
 pub use sim::{SimFault, SimProvider};
 pub use tablet::{TabletEnvelope, TabletMaterializations};
 pub use telemetry::{AccessCounters, DEFAULT_OBJECT_CAPACITY, SoftwareTelemetry, TelemetryLimits};
@@ -120,7 +115,3 @@ pub const TINY_INLINE_MAX: usize = 256;
 /// immutable content-addressed chunks owned by `kivi-chunk`, never arena
 /// residents.
 pub const MEDIUM_MAX: usize = 262_144;
-
-/// Current physical-format version for `NVMe` materialization records.
-/// Bumped on any incompatible change; old versions fail loudly on load.
-pub const MATERIALIZATION_FORMAT_VERSION: u16 = 1;

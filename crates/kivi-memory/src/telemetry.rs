@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 
 use kivi_observation::ExecutionCriticalitySignal;
 
-use crate::criticality::{AccessSignals, Mutability, TelemetrySource};
+use crate::criticality::{AccessSignals, Mutability};
 
 /// Default number of objects retained by software telemetry.
 pub const DEFAULT_OBJECT_CAPACITY: usize = 4096;
@@ -28,7 +28,7 @@ pub struct AccessCounters {
     pub bytes_touched: u64,
 }
 
-/// Fixed capacity limits for [`SoftwareTelemetry`].
+/// Maximum number of object entries a [`SoftwareTelemetry`] retains.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TelemetryLimits {
     /// Maximum number of retained object entries.
@@ -51,24 +51,6 @@ impl TelemetryLimits {
     /// Returns the maximum number of retained objects.
     #[must_use]
     pub const fn object_capacity(self) -> usize {
-        self.object_capacity
-    }
-
-    /// Returns the maximum number of retained objects.
-    #[must_use]
-    pub const fn max_objects(self) -> usize {
-        self.object_capacity
-    }
-
-    /// Returns the configured object capacity.
-    #[must_use]
-    pub const fn capacity(self) -> usize {
-        self.object_capacity
-    }
-
-    /// Returns the configured object capacity.
-    #[must_use]
-    pub const fn limit(self) -> usize {
         self.object_capacity
     }
 }
@@ -148,24 +130,6 @@ impl SoftwareTelemetry {
         self.limits.object_capacity()
     }
 
-    /// Returns the maximum number of retained objects.
-    #[must_use]
-    pub const fn object_capacity(&self) -> usize {
-        self.capacity()
-    }
-
-    /// Returns the maximum number of retained objects.
-    #[must_use]
-    pub const fn max_objects(&self) -> usize {
-        self.capacity()
-    }
-
-    /// Returns the maximum number of retained objects.
-    #[must_use]
-    pub const fn limit(&self) -> usize {
-        self.capacity()
-    }
-
     /// Returns the number of retained objects.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -176,12 +140,6 @@ impl SoftwareTelemetry {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
-    }
-
-    /// Returns whether the fixed object capacity is reached.
-    #[must_use]
-    pub fn is_full(&self) -> bool {
-        self.entries.len() >= self.capacity()
     }
 
     /// Returns whether an object currently has metadata or counters.
@@ -337,8 +295,12 @@ impl SoftwareTelemetry {
     }
 }
 
-impl TelemetrySource for SoftwareTelemetry {
-    fn sample(&mut self, object: u64) -> Option<AccessSignals> {
+impl SoftwareTelemetry {
+    /// Samples access signals for one object without draining its window.
+    ///
+    /// Returns `None` when the object saw no access since the last drain.
+    #[must_use]
+    pub fn sample(&self, object: u64) -> Option<AccessSignals> {
         self.entries
             .get(&object)
             .filter(|entry| entry.counters.reads != 0 || entry.counters.writes != 0)

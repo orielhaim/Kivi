@@ -6,7 +6,7 @@
 //! through the current directory (splits and merges need no cursor state).
 //! An `AtomicBatch` commits as one ordered atomic record
 //! (`TxnCommitLocal`): one validation, one WAL record, one durability
-//! barrier, one ordered apply — no coordinator record, no prepare/finalize
+//! barrier, one ordered apply - no coordinator record, no prepare/finalize
 //! waves, no 2PC recovery machinery. Multi-tablet batches are rejected
 //! here with `TxnTooLarge`; the client driver runs those over
 //! `TxnPrepare`/`TxnFinalize`.
@@ -16,7 +16,6 @@
 //! driver never bypasses the WAL.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -29,12 +28,11 @@ use kivi_state::{
     TxnDriverPlan, TxnError, TxnId, plan_transaction, txn_write_from_wire,
 };
 use kivi_tablet::{DirectorySnapshot, PartitionRange};
-use kivi_types::{
-    MutationIdentity, NamespaceId, RequestSeq, SessionId, TabletAuthority, TabletId, WorkerId,
-};
+use kivi_types::{MutationIdentity, RequestSeq, SessionId, TabletAuthority, TabletId, WorkerId};
 
 use crate::commit::PendingEntry;
 use crate::routing::RoutingSnapshot;
+use crate::slots::LocalTabletSet;
 use crate::tablet::LiveTablet;
 use crate::worker::WorkerDurability;
 use kivi_core::SystemClock;
@@ -50,7 +48,7 @@ const STEP_POLL: Duration = Duration::from_micros(250);
 const STEP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Tablet map shared by a worker's tasks (single-threaded `Rc`).
-pub type TabletMap = Rc<RefCell<HashMap<TabletId, LiveTablet>>>;
+pub type TabletMap = Rc<RefCell<LocalTabletSet>>;
 
 /// Answers one `Scan` or `AtomicBatch` request against local tablets.
 /// Returns the response plus its opcode for framing.
@@ -217,7 +215,7 @@ fn handle_scan(
     };
     let now = kivi_core::wall_now_or_max(&SystemClock);
     let mut borrowed = tablets.borrow_mut();
-    let Some(live) = borrowed.get_mut(&tablet) else {
+    let Some(live) = borrowed.get_mut(tablet) else {
         return Response {
             proof: None,
             status: S::NotLocal,
@@ -344,7 +342,7 @@ fn handle_index_term_scan(
     };
     let now = kivi_core::wall_now_or_max(&SystemClock);
     let mut borrowed = tablets.borrow_mut();
-    let Some(live) = borrowed.get_mut(&tablet) else {
+    let Some(live) = borrowed.get_mut(tablet) else {
         return Response {
             proof: None,
             status: S::NotLocal,
@@ -552,7 +550,7 @@ fn scan_tablet_slice(
     };
     let now = kivi_core::wall_now_or_max(&SystemClock);
     let mut borrowed = tablets.borrow_mut();
-    let Some(live) = borrowed.get_mut(&tablet) else {
+    let Some(live) = borrowed.get_mut(tablet) else {
         return Response {
             proof: None,
             status: S::NotLocal,
@@ -690,7 +688,7 @@ fn placement_redirect(
         let Some(descriptor) = descriptor else {
             return Placement::Nowhere;
         };
-        let authority = tablets.borrow().get(&tablet).map_or_else(
+        let authority = tablets.borrow().get(tablet).map_or_else(
             || {
                 TabletAuthority::new(
                     tablet,
@@ -712,7 +710,7 @@ fn placement_redirect(
         };
         return Placement::Redirect(info);
     }
-    if tablets.borrow().contains_key(&tablet) {
+    if tablets.borrow().contains_key(tablet) {
         Placement::Local
     } else {
         Placement::Nowhere
@@ -902,7 +900,7 @@ async fn drive_batch(
             Err(_) => return invalid("invalid batch write"),
         }
     }
-    let route = |key: &[u8]| route_batch_key(directory, request.namespace, key);
+    let route = |key: &[u8]| route_point_key(routing, key);
     let plan = match plan_transaction(
         txn,
         writes,
@@ -979,15 +977,6 @@ async fn drive_batch(
     run_single_tablet_plan(tablets, durability, fabric, &plan, seals).await
 }
 
-/// Routes one batch key through the directory by namespace layout.
-fn route_batch_key(
-    directory: &DirectorySnapshot,
-    namespace: NamespaceId,
-    key: &[u8],
-) -> Option<TabletId> {
-    route_point_key(directory, namespace, key)
-}
-
 /// Routes one point key through a directory snapshot by the unified rule
 /// (mirrored in `kivi-server/src/compound.rs` and
 /// `kivi-server/src/cluster.rs`; keep the three in sync):
@@ -1004,12 +993,20 @@ fn route_batch_key(
 /// - Everything else routes by layout: ordered ranges by key bytes, hash
 ///   ranges by partition hash (snapshots are single-layout, so exactly one
 ///   lookup can hit).
+///
+/// # The single-tablet case short-circuits all of it
+///
+/// When the snapshot has exactly one active tablet, every key - ordinary,
+/// transaction record, projection, or index entry - belongs to that tablet, so
+/// the key-prefix parsing below is work whose result cannot change the answer.
+/// It is skipped, and no route hash is computed: one comparison on a field
+/// resolved when the snapshot was published.
 #[must_use]
-pub fn route_point_key(
-    directory: &DirectorySnapshot,
-    namespace: NamespaceId,
-    key: &[u8],
-) -> Option<TabletId> {
+pub fn route_point_key(snapshot: &RoutingSnapshot, key: &[u8]) -> Option<TabletId> {
+    if let crate::routing::CompiledRoute::Single(route) = snapshot.compiled() {
+        return Some(route.tablet());
+    }
+    let directory = snapshot.directory();
     if let Some((coordinator, _)) = kivi_state::parse_txn_record_key(key)
         && directory
             .get(coordinator)
@@ -1018,25 +1015,22 @@ pub fn route_point_key(
         return Some(coordinator);
     }
     if let Some(primary) = kivi_state::parse_projection_primary(key) {
-        return route_normal_key(directory, namespace, primary);
+        return route_normal_key(snapshot, primary);
     }
     if let Some(primary) = kivi_state::parse_index_primary(key) {
-        return route_normal_key(directory, namespace, &primary);
+        return route_normal_key(snapshot, &primary);
     }
-    route_normal_key(directory, namespace, key)
+    route_normal_key(snapshot, key)
 }
 
-/// Layout routing for ordinary keys (ordered by bytes, hash by hash).
-fn route_normal_key(
-    directory: &DirectorySnapshot,
-    namespace: NamespaceId,
-    key: &[u8],
-) -> Option<TabletId> {
-    if let Some(tablet) = directory.lookup_by_key(key) {
-        return Some(tablet);
-    }
-    let hash = kivi_state::PartitionHasher::V1.hash(namespace, key)?;
-    directory.lookup_by_hash(hash)
+/// Layout routing for ordinary keys, through the snapshot's compiled route.
+///
+/// Takes the snapshot rather than the directory so the single-tablet fast path and
+/// the precomputed namespace seed are both reachable, and so no caller can route
+/// with a directory that does not match the placement it will look the worker up in.
+#[must_use]
+fn route_normal_key(snapshot: &RoutingSnapshot, key: &[u8]) -> Option<TabletId> {
+    snapshot.route_key(key).ok().map(|(tablet, _)| tablet)
 }
 
 /// Executes a validated single-participant plan as one ordered atomic
@@ -1153,7 +1147,7 @@ async fn drive_one(
     let Some(durable) = durability else {
         let now = kivi_core::wall_now_or_max(&SystemClock);
         let mut borrowed = tablets.borrow_mut();
-        let live = borrowed.get_mut(&tablet).ok_or(StepFault::Unavailable)?;
+        let live = borrowed.get_mut(tablet).ok_or(StepFault::Unavailable)?;
         return live.execute(op, now).map_err(step_tablet_error);
     };
     // Durable: admit one pipeline entry and await its proof without ever
@@ -1273,6 +1267,7 @@ mod tests {
     use super::*;
     use kivi_state::Key;
 
+    use kivi_types::NamespaceId;
     const NS: NamespaceId = NamespaceId::from_u64(1);
 
     fn tablet_map() -> (TabletMap, RoutingSnapshot) {
@@ -1283,7 +1278,7 @@ mod tests {
             (TabletId::from_u64(2), WorkerId::from_u64(0)),
         ]);
         let routing = RoutingSnapshot::build(NS, directory, placement, 1).expect("routing builds");
-        let tablets: TabletMap = Rc::new(RefCell::new(HashMap::new()));
+        let tablets: TabletMap = Rc::new(RefCell::new(LocalTabletSet::new()));
         for descriptor in routing.directory().tablets() {
             if !descriptor.state().is_writable() {
                 continue;
@@ -1296,7 +1291,7 @@ mod tests {
             let mut live =
                 LiveTablet::from_descriptor(descriptor, authority).expect("tablet builds");
             live.store_mut().set_ordered_indexing(true);
-            tablets.borrow_mut().insert(descriptor.id(), live);
+            tablets.borrow_mut().insert(live);
         }
         // Seed data on both tablets through the tablets directly.
         {
@@ -1306,7 +1301,7 @@ mod tests {
                     .directory()
                     .lookup_by_key(key.as_bytes())
                     .expect("covered");
-                let live = borrowed.get_mut(&tablet).expect("live");
+                let live = borrowed.get_mut(tablet).expect("live");
                 live.execute(
                     &kivi_state::Operation::Set {
                         key: Key::from(key),

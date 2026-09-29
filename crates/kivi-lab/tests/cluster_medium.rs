@@ -14,27 +14,7 @@
 //! `wait_converged`); no wall-clock sleeps.
 
 use kivi_lab::cluster::Cluster;
-use kivi_state::Key;
-
-fn key(name: &str) -> Key {
-    Key::from(name)
-}
-
-/// Deterministic 2 KiB value (matches the consensus unit test fill).
-fn medium_value() -> Vec<u8> {
-    (0..2048u32)
-        .map(|i| u8::try_from(i % 251).expect("remainder fits in u8"))
-        .collect()
-}
-
-/// Follower sidecar bulk bytes received, per member.
-fn bulk_received(cluster: &Cluster) -> [u64; 3] {
-    [0, 1, 2].map(|i| {
-        let (status, body) = cluster.admin_get(i, "/v1/sidecar");
-        assert_eq!(status, 200);
-        body["bulk_bytes_received"].as_u64().unwrap_or(0)
-    })
-}
+use kivi_lab::testkit::{bulk_received, key, medium_value};
 
 /// Sidecar request counters per member: `(manifest_requests, chunk_requests)`.
 fn sidecar_requests(cluster: &Cluster) -> [(u64, u64); 3] {
@@ -54,7 +34,7 @@ fn sidecar_requests(cluster: &Cluster) -> [(u64, u64); 3] {
 fn medium_2kib_replicates_as_chunked_sidecar() {
     let mut cluster = Cluster::spawn().expect("cluster spawns");
     let leader = cluster.wait_leader();
-    let value = medium_value();
+    let value = medium_value(0);
     assert_eq!(value.len(), 2048);
     let before_bulk = bulk_received(&cluster);
     // Plain `set` (not `put_stream`): the propose path restages medium

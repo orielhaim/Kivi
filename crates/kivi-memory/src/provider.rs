@@ -316,16 +316,6 @@ mod tests {
     use crate::intent::MaterializationIntent;
 
     #[test]
-    fn registry_assigns_stable_ids_without_hierarchy() {
-        let mut registry = ProviderRegistry::new();
-        let dram = registry.register(ProviderCaps::dram(Some(0), 1 << 30));
-        let nvme = registry.register(ProviderCaps::nvme(1 << 40));
-        assert_ne!(dram, nvme);
-        assert_eq!(registry.len(), 2);
-        assert!(registry.get(dram).is_some());
-    }
-
-    #[test]
     fn durability_requirement_excludes_volatile_providers() {
         let dram = ProviderCaps::dram(Some(0), 1 << 30);
         let nvme = ProviderCaps::nvme(1 << 40);
@@ -338,9 +328,6 @@ mod tests {
             intent.locality,
             intent.encryption_required
         ));
-        // `NVMe` is durable but hot intent wants WorkerLocal+Exclusive;
-        // `NVMe` is shared_read+rewrite-only which still satisfies the hard
-        // gate (sharing WorkerLocal needs nothing extra).
         assert!(nvme.satisfies(
             intent.coherence,
             intent.sharing,

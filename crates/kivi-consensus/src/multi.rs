@@ -19,7 +19,7 @@
 //! groups' handles to its own Compio reactor, and cross-thread callers
 //! communicate through bounded worker ingress channels. No locks wrap
 //! `Raft` internals. Thread count scales with workers plus fixed services
-//! (mesh, shared writer, sidecar blocking) — never with tablet count.
+//! (mesh, shared writer, sidecar blocking) - never with tablet count.
 //!
 //! ## Dynamic placement
 //!
@@ -129,7 +129,7 @@ pub struct MultiNodeConfig {
     /// control plane either by forming it (fresh directories with no
     /// seeds) or by waiting for the control leader to add it as learner
     /// (fresh directories with seeds, or any restart recovering durable
-    /// control state — restarts never re-initialize).
+    /// control state - restarts never re-initialize).
     pub control: Option<ControlGroupConfig>,
     /// Redundancy-fragment store root. `Some` opens a node-local
     /// [`LocalFragmentStore`] there (recovering indexed state) and serves
@@ -175,6 +175,10 @@ pub struct ConsensusNode {
     /// Node-local redundancy fragment store (`None` when disabled).
     /// Shared by every replica (content-addressed, group-independent).
     fragments: Option<Arc<LocalFragmentStore>>,
+    /// Content-resolution seams shared by every replica's durability gate and
+    /// by the propose path (see [`crate::resolve`]). Installed after the node
+    /// opens, because the redundancy plane is built from an already-open node.
+    slots: std::sync::Arc<crate::resolve::ResolutionSlots>,
     preflight: Arc<crate::preflight::PreflightMetrics>,
     durability: SharedRaftDurability,
     /// Shared H3 mesh handle: dynamic peer admission (`add_peer_dial`)
@@ -187,7 +191,7 @@ pub struct ConsensusNode {
     /// Caller-side consistency hub: evidence, lease engines, strong
     /// cache, providers, metrics shared by every tablet group on this
     /// node. Shared with the workers (which drive lease engines through
-    /// it). Memory-held by construction — a restart starts empty.
+    /// it). Memory-held by construction - a restart starts empty.
     hub: std::sync::Arc<crate::consistency::ConsistencyHub>,
     /// Lazy-ALR batch coordinators per hosted tablet.
     alr: Mutex<HashMap<TabletId, std::sync::Arc<crate::alr::AlrCoordinator>>>,
@@ -229,7 +233,7 @@ struct GroupWiring {
 
 /// Group registry: the receiving side of the shared H3 mesh. Routes
 /// inbound Raft RPCs directly to the owning worker by group; the network
-/// layer knows only target group, RPC type, and binary body — never
+/// layer knows only target group, RPC type, and binary body - never
 /// tablet state-machine semantics.
 ///
 /// Dynamically created replicas (migration targets) have no entry in the
@@ -397,7 +401,7 @@ impl ConsensusNode {
         // tablets are skipped (never resurrected from durable state),
         // and exempted from the tablet-set/WAL agreement checks below
         // (their records linger conservatively in the shared WAL until
-        // rotation, which is retention — not resurrection).
+        // rotation, which is retention - not resurrection).
         let tombstoned = Self::tombstoned_tablets(&config.data_dir);
         let live_tablets: Vec<TabletId> = tablets
             .iter()
@@ -424,7 +428,7 @@ impl ConsensusNode {
                 ),
             });
         }
-        // Tablet-set disagreement fails loudly before any state opens —
+        // Tablet-set disagreement fails loudly before any state opens -
         // except dynamic topology tablets (split children / merge targets
         // created via `ensure_group` after boot): state-machine tablets or
         // shared-WAL groups outside the static configured set recover as
@@ -457,10 +461,10 @@ impl ConsensusNode {
         .map_err(|error| Fault::LogStore {
             reason: error.to_string(),
         })?;
-        // First boot ever (no durable trace anywhere — no state
+        // First boot ever (no durable trace anywhere - no state
         // machines, not even tombstoned or control ones, and no WAL
         // records): the only boot that may initialize data groups.
-        // Every later boot is a rejoin — it recovers groups with
+        // Every later boot is a rejoin - it recovers groups with
         // durable traces and NEVER initializes (initializing a group
         // the live cluster already runs would fork its history;
         // unknown groups arrive later through learner replication,
@@ -548,7 +552,7 @@ impl ConsensusNode {
         // System control replica first: its snapshot-loaded image is the
         // desired-placement oracle fencing removed-while-down data
         // replicas below. Same stores, machines, and wiring as every
-        // tablet group — one dedicated Raft group committing typed
+        // tablet group - one dedicated Raft group committing typed
         // control mutations through the shared envelope, mesh, and WAL.
         // The control tablet id is reserved and never a user tablet.
         if let Some(control_cfg) = &config.control {
@@ -584,7 +588,7 @@ impl ConsensusNode {
         // Snapshot-loaded control image for the removal oracle below
         // (committed-but-unapplied tails lag by milliseconds; desired
         // sets only move through plans, so staleness fails closed
-        // toward recovery, never toward serving stale state — except a
+        // toward recovery, never toward serving stale state - except a
         // concurrently-removed node, which the reconciler retires
         // within a pass).
         let control_image: Option<kivi_control::ControlState> = match config.control.as_ref() {
@@ -726,6 +730,13 @@ impl ConsensusNode {
                     })
             })
             .transpose()?;
+        // Content-resolution seams, one set for the whole node. Created before
+        // the workers so every replica's gate shares them, and filled later by
+        // the redundancy plane (which is built from this very node). Empty
+        // until then, which is the honest state: without a redundancy plane
+        // there is nothing to resolve from, and the gate's peer path is
+        // complete on its own.
+        let slots = std::sync::Arc::new(crate::resolve::ResolutionSlots::new());
         // Peer TLS identity plus the static dial maps.
         let peer_tls_cert = NodeCert::load_or_generate(&config.data_dir, opened.meta.node)
             .map_err(|error| Fault::Tls {
@@ -901,6 +912,7 @@ impl ConsensusNode {
                 transport: transport.clone(),
                 sidecar: sidecar.clone(),
                 fragments: fragments.clone(),
+                slots: std::sync::Arc::clone(&slots),
                 namespace: config.namespace,
                 local: opened.meta.node,
                 cluster: opened.meta.cluster,
@@ -1015,6 +1027,7 @@ impl ConsensusNode {
             authorities: Mutex::new(authorities),
             sidecar,
             fragments,
+            slots,
             preflight,
             durability,
             mesh: transport.clone(),
@@ -1086,7 +1099,7 @@ impl ConsensusNode {
 
     /// Reads the locally replicated control image, if this node hosts a
     /// control replica. Used by routing (leader hints), the admin plane,
-    /// and the reconciler — all read-only observers, never writers.
+    /// and the reconciler - all read-only observers, never writers.
     pub async fn control_state(&self) -> Option<kivi_control::ControlState> {
         let machine = {
             self.machines
@@ -1124,6 +1137,44 @@ impl ConsensusNode {
     #[must_use]
     pub fn fragments(&self) -> Option<&LocalFragmentStore> {
         self.fragments.as_deref()
+    }
+
+    /// Returns the shared content-resolution seams.
+    ///
+    /// Every replica's durability gate reads the resolver from here and the
+    /// propose path hands staged roots to the protector here, so a redundancy
+    /// plane installed once covers reads and writes on all tablets rather than
+    /// being wired per group.
+    #[must_use]
+    pub fn resolution_slots(&self) -> &std::sync::Arc<crate::resolve::ResolutionSlots> {
+        &self.slots
+    }
+
+    /// Hands a freshly staged root to the installed protector.
+    ///
+    /// On the node rather than the server so the caller needs no handle to the
+    /// slots and no adapter to reach them: the node owns the seams, so the node
+    /// offers the operation.
+    pub fn protect_staged_root(&self, root: crate::resolve::ProtectedRoot) {
+        crate::resolve::protect_staged_root(&self.slots, root);
+    }
+
+    /// Installs the content resolver used when no peer can serve a sidecar.
+    ///
+    /// Called by the redundancy plane once it is open, which is necessarily
+    /// after this node - the plane is built from it. Idempotent: the last
+    /// install wins, so a plane that is rebuilt replaces the old one instead
+    /// of leaving a stale resolver behind.
+    pub fn install_sidecar_resolver(&self, resolver: Arc<dyn crate::resolve::SidecarResolver>) {
+        self.slots.install_resolver(resolver);
+    }
+
+    /// Installs the protector that takes custody of freshly staged roots.
+    ///
+    /// Same lifecycle and idempotence as
+    /// [`Self::install_sidecar_resolver`].
+    pub fn install_sidecar_protector(&self, protector: Arc<dyn crate::resolve::SidecarProtector>) {
+        self.slots.install_protector(protector);
     }
 
     /// Returns the node-local redundancy fragment store as a shared handle,
@@ -1242,6 +1293,8 @@ impl ConsensusNode {
         propose_caller_side(
             &machine,
             &self.sidecar,
+            &self.slots,
+            kivi_types::SecurityDomainId::from_u64(self.namespace.as_u64()),
             self.namespace,
             authority,
             &worker,
@@ -1376,8 +1429,6 @@ impl ConsensusNode {
                     std::sync::Arc::clone(&self.hub),
                     ConsensusGroupId::of_tablet(tablet),
                     tablet,
-                    authority,
-                    self.incarnation,
                     self.local,
                 ))
             })
@@ -1896,7 +1947,7 @@ impl ConsensusNode {
     /// goes left, else right) and installs the child's half plus the full
     /// parent session set (both children keep every session for
     /// exactly-once retries). Chunked roots reference the same immutable
-    /// `ManifestId`s — no chunk bytes are copied or retransferred.
+    /// `ManifestId`s - no chunk bytes are copied or retransferred.
     ///
     /// Colocated by design (children inherit the parent replica set), so
     /// no bulk network transfer is needed: every replica seeds locally.
@@ -1908,7 +1959,7 @@ impl ConsensusNode {
     /// locally.
     /// Seeds a hash split child from its local parent: keys whose partition
     /// hash falls on this side go here, including system (`\xff`) keys by
-    /// the same hash rule — transaction decision records therefore land in
+    /// the same hash rule - transaction decision records therefore land in
     /// exactly the child that post-cutover hash routing finds, so recovery
     /// always finds them. Sessions copy wholesale to both children
     /// (bounded, and required for exactly-once retries across the cutover);
@@ -1943,10 +1994,10 @@ impl ConsensusNode {
         let (objects, sessions) = parent_machine.export_topology_copy().await;
         let mut half = Vec::new();
         for (key, object) in objects {
-            let hash = kivi_state::PartitionHasher::V1
-                .hash(self.namespace, key.as_bytes())
-                .map(kivi_types::PartitionHash::as_u128);
-            let is_left = hash.is_some_and(|hash| hash < split_hash);
+            // The same routing identity every other site uses, so an object lands
+            // on the child half exactly when `route_key` would have sent it there.
+            let hash = kivi_state::route_hash(self.namespace, key.as_bytes()).as_u128();
+            let is_left = hash < split_hash;
             if is_left == left {
                 half.push((key, object));
             }
@@ -2014,7 +2065,7 @@ impl ConsensusNode {
     /// Seeds an ordered split child from its local parent: routable keys
     /// partition by the half-open `[start, end)` boundary, never a hash
     /// midpoint. Routed-by-fiat keys (system `\xff` records) copy to the
-    /// right child deterministically — and post-cutover record reads
+    /// right child deterministically - and post-cutover record reads
     /// route by the same ordered rule, so recovery always finds them.
     /// Non-unique index entries copy by embedded primary, so each entry
     /// stays beside the primary the unified router co-locates it with
@@ -2076,37 +2127,6 @@ impl ConsensusNode {
         child_machine.install_topology_copy((half, sessions)).await;
         child_machine.set_ordered_indexing(ordered).await;
         Ok((object_count, session_count))
-    }
-
-    /// Propagates the ordered-index flag from parent to child after a hash
-    /// split seed (hash children of an ordered parent cannot happen —
-    /// layouts never mix — but the flag copy keeps the helper total).
-    ///
-    /// # Errors
-    ///
-    /// Returns a human-readable reason when either replica is not hosted
-    /// locally.
-    pub async fn inherit_ordered_indexing(
-        &self,
-        parent: TabletId,
-        child: TabletId,
-    ) -> Result<(), String> {
-        let (parent_machine, child_machine) = self
-            .machines
-            .lock()
-            .map_err(|_| "machine map poisoned".to_owned())
-            .and_then(|machines| {
-                let parent = machines.get(&parent).cloned().ok_or_else(|| {
-                    format!("parent tablet {} not served by this node", parent.as_u64())
-                })?;
-                let child = machines.get(&child).cloned().ok_or_else(|| {
-                    format!("child tablet {} not served by this node", child.as_u64())
-                })?;
-                Ok((parent, child))
-            })?;
-        let ordered = parent_machine.ordered_index_enabled().await;
-        child_machine.set_ordered_indexing(ordered).await;
-        Ok(())
     }
 
     /// Enables or disables the ordered key index on one local replica
@@ -2236,7 +2256,7 @@ impl ConsensusNode {
 
     /// Suspends one peer link (partition test hook, drain tooling). Hops
     /// through worker ingress: the suspend itself awaits compio-reactor
-    /// timer state (`!Send`), so it must run on a worker reactor — never
+    /// timer state (`!Send`), so it must run on a worker reactor - never
     /// directly on a Tokio caller. The shared transport suspends once no
     /// matter which worker serves it.
     pub async fn suspend_peer(&self, peer: NodeId) {
@@ -2457,7 +2477,7 @@ fn write_tombstone(data_dir: &std::path::Path, tablet: TabletId, generation: u64
 /// Unions two parent session sets for a merge target: sessions keyed by
 /// id, outcomes keyed by sequence (globally unique per session, so no
 /// collision in practice). A conflicting duplicate keeps the higher
-/// commit and never re-executes — ordinary key state cannot conflict
+/// commit and never re-executes - ordinary key state cannot conflict
 /// because the parent ranges are disjoint.
 fn union_sessions(
     left: Vec<(
@@ -2671,6 +2691,8 @@ struct WorkerParams {
     sidecar: SidecarStore,
     /// Node-local fragment store (shared by every replica on the node).
     fragments: Option<Arc<LocalFragmentStore>>,
+    /// Content-resolution seams shared by every replica's gate.
+    slots: std::sync::Arc<crate::resolve::ResolutionSlots>,
     namespace: NamespaceId,
     local: NodeId,
     cluster: ClusterId,
@@ -2712,6 +2734,9 @@ struct WorkerBuildCtx {
     incarnation: kivi_types::NodeIncarnation,
     sidecar: SidecarStore,
     fragments: Option<Arc<LocalFragmentStore>>,
+    /// Node-wide content-resolution seams; a replica created later still sees
+    /// an already-installed resolver because it reads the same cells.
+    slots: std::sync::Arc<crate::resolve::ResolutionSlots>,
     transport: PeerTransport,
     router: PeerRouter,
     preflight: Arc<crate::preflight::PreflightMetrics>,
@@ -2773,6 +2798,7 @@ async fn worker_main(mut params: WorkerParams) {
         incarnation: params.incarnation,
         sidecar: params.sidecar.clone(),
         fragments: params.fragments.clone(),
+        slots: std::sync::Arc::clone(&params.slots),
         transport: params.transport.clone(),
         router: router.clone(),
         preflight: Arc::clone(&params.preflight),
@@ -2894,6 +2920,7 @@ async fn build_replica(
         group,
         domain,
         params.transport_config.bulk_timeout,
+        std::sync::Arc::clone(&params.slots),
     );
     store.set_gate(gate.clone());
     let raft = spawn_raft(params.local, group, router.clone(), &store, &machine).await?;
@@ -3131,6 +3158,7 @@ async fn build_dynamic_replica(
         group,
         domain,
         build.bulk_timeout,
+        std::sync::Arc::clone(&build.slots),
     );
     store.set_gate(gate.clone());
     let raft = spawn_raft(build.local, group, build.router.clone(), &store, &machine)
@@ -3165,7 +3193,7 @@ async fn build_dynamic_replica(
 }
 
 /// Serves one worker's ingress until `Shutdown`: group-scoped requests
-/// dispatch to the owning replica's [`OwnerCtx`] (each on its own task —
+/// dispatch to the owning replica's [`OwnerCtx`] (each on its own task -
 /// a pending large-write preflight never blocks small writes or peer
 /// RPCs); node-wide suspend/resume run against the shared transport;
 /// dynamic [`EnsureGroup`](OwnerRequest::EnsureGroup) /
@@ -3322,6 +3350,34 @@ mod tests {
         }
     }
 
+    /// Baseline multi-node config: one voter on `local`, no control group,
+    /// no fragment store, insecure loopback TLS.
+    fn config(
+        data_dir: &std::path::Path,
+        topology: ClusterTopology,
+        tablets: &[TabletId],
+        worker_count: usize,
+        control: Option<ControlGroupConfig>,
+    ) -> MultiNodeConfig {
+        MultiNodeConfig {
+            data_dir: data_dir.to_owned(),
+            namespace: NS,
+            tablets: tablets.to_vec(),
+            local: NodeId::from_u64(1),
+            topology,
+            segment_target_bytes: 1024 * 1024,
+            transport: TransportConfig::default(),
+            peer_certs: HashMap::new(),
+            insecure_peer_tls: true,
+            preflight_enabled: true,
+            lease_params: kivi_types::LeaseParams::default(),
+            worker_count,
+            durability: SharedDurabilityConfig::default(),
+            control,
+            fragment_store_root: None,
+        }
+    }
+
     /// Proposes until a leader emerges (single voter self-elects after its
     /// election timeout) or the deadline passes.
     async fn propose_until_leader(
@@ -3356,30 +3412,21 @@ mod tests {
 
     /// Two tablets on two workers of one node share the mesh and the WAL
     /// writer while keeping independent Raft histories.
+    /// Two tablets striped across two workers keep independent Raft
+    /// histories while sharing one mesh and one WAL writer.
     #[test]
     fn two_tablets_two_workers_share_mesh_and_writer() {
         block_on(async {
             let dir = tempfile::tempdir().expect("scratch");
             let addr = probe_udp();
             let tablets = vec![TabletId::from_u64(1), TabletId::from_u64(2)];
-            let topology = single_topology(addr, &tablets);
-            let node = ConsensusNode::open(MultiNodeConfig {
-                data_dir: dir.path().to_owned(),
-                namespace: NS,
-                tablets: tablets.clone(),
-                local: NodeId::from_u64(1),
-                topology,
-                segment_target_bytes: 1024 * 1024,
-                transport: TransportConfig::default(),
-                peer_certs: HashMap::new(),
-                insecure_peer_tls: true,
-                preflight_enabled: true,
-                lease_params: kivi_types::LeaseParams::default(),
-                worker_count: 2,
-                durability: SharedDurabilityConfig::default(),
-                control: None,
-                fragment_store_root: None,
-            })
+            let node = ConsensusNode::open(config(
+                dir.path(),
+                single_topology(addr, &tablets),
+                &tablets,
+                2,
+                None,
+            ))
             .await
             .expect("multi opens");
             assert_eq!(node.tablets(), tablets);
@@ -3387,7 +3434,8 @@ mod tests {
             // Deterministic worker striping: tablet 1 on worker 0.
             assert_eq!(crate::worker::worker_for_tablet(tablets[0], 2), 0);
             assert_eq!(crate::worker::worker_for_tablet(tablets[1], 2), 1);
-            // Independent histories: write different keys per tablet.
+            // Independent histories: write and read a different key per
+            // tablet, so a crossed route would show a wrong value.
             for (tablet, key) in [(tablets[0], "a"), (tablets[1], "b")] {
                 let outcome = propose_until_leader(
                     &node,
@@ -3403,9 +3451,6 @@ mod tests {
                     "tablet {} applies, got {outcome:?}",
                     tablet.as_u64()
                 );
-            }
-            // Each tablet reads its own key (linearizable on the leader).
-            for (tablet, key) in [(tablets[0], "a"), (tablets[1], "b")] {
                 let read = node
                     .read(
                         tablet,
@@ -3421,12 +3466,10 @@ mod tests {
                 assert_eq!(
                     read.outcome,
                     OperationResult::Value(Some(bytes::Bytes::from_static(b"v"))),
-                    "tablet {} serves its key",
+                    "tablet {} serves its own key, never its neighbour's",
                     tablet.as_u64()
                 );
             }
-            // Both groups healthy with independent leadership; the shared
-            // writer batched their barriers physically.
             let statuses = node.status_all().await;
             assert_eq!(statuses.len(), 2, "one status per group");
             assert!(statuses.iter().all(|status| status.healthy), "both healthy");
@@ -3442,9 +3485,8 @@ mod tests {
     /// created without restart, observed, retired with a tombstone, and
     /// stays retired across reopen while control state recovers.
     ///
-    /// Long because it walks the whole lifecycle in one scenario (each
-    /// phase builds on the last); splitting it would re-pay open/boot
-    /// costs per phase for no isolation gain.
+    /// One scenario because each phase builds on the last; splitting it
+    /// would re-pay open/boot costs per phase for no isolation gain.
     #[allow(clippy::too_many_lines)]
     #[test]
     fn control_plane_propose_observe_and_dynamic_lifecycle() {
@@ -3453,28 +3495,19 @@ mod tests {
             let addr = probe_udp();
             let tablets = vec![TabletId::from_u64(1)];
             let topology = single_topology(addr, &tablets);
-            let voters = BTreeSet::from([1u64]);
-            let peer_addrs = BTreeMap::from([(1u64, addr.to_string())]);
-            let config = || MultiNodeConfig {
-                data_dir: dir.path().to_owned(),
-                namespace: NS,
-                tablets: tablets.clone(),
-                local: NodeId::from_u64(1),
-                topology: topology.clone(),
-                segment_target_bytes: 1024 * 1024,
-                transport: TransportConfig::default(),
-                peer_certs: HashMap::new(),
-                insecure_peer_tls: true,
-                preflight_enabled: true,
-                lease_params: kivi_types::LeaseParams::default(),
-                worker_count: 1,
-                durability: SharedDurabilityConfig::default(),
-                control: Some(ControlGroupConfig {
-                    voters: voters.clone(),
-                    peer_addrs: peer_addrs.clone(),
-                    seeds: Vec::new(),
-                }),
-                fragment_store_root: None,
+            let control_group = ControlGroupConfig {
+                voters: BTreeSet::from([1u64]),
+                peer_addrs: BTreeMap::from([(1u64, addr.to_string())]),
+                seeds: Vec::new(),
+            };
+            let config = || {
+                config(
+                    dir.path(),
+                    topology.clone(),
+                    &tablets,
+                    1,
+                    Some(control_group.clone()),
+                )
             };
             let node = ConsensusNode::open(config())
                 .await
@@ -3527,8 +3560,13 @@ mod tests {
             // through learner replication, never fork with a second
             // initialize), so it observes empty membership until the
             // tablet leader replicates to it.
-            let observed = node.observe_membership(fresh).await.expect("observed");
-            assert!(observed.voters.is_empty());
+            assert!(
+                node.observe_membership(fresh)
+                    .await
+                    .expect("observed")
+                    .voters
+                    .is_empty()
+            );
             // Idempotent re-create answers success.
             node.ensure_group(fresh, BTreeSet::from([1u64]), 7)
                 .await
@@ -3604,35 +3642,28 @@ mod tests {
                 (2, addrs[1].to_string()),
                 (3, addrs[2].to_string()),
             ]);
+            let control_group = ControlGroupConfig {
+                voters: voters.clone(),
+                peer_addrs: peer_addrs.clone(),
+                seeds: Vec::new(),
+            };
             let mut nodes = Vec::new();
             let mut dirs = Vec::new();
-            for (index, _peer) in addrs.iter().enumerate() {
+            for index in 0..addrs.len() {
                 let dir = tempfile::tempdir().expect("scratch");
-                let node = ConsensusNode::open(MultiNodeConfig {
-                    data_dir: dir.path().to_owned(),
-                    namespace: NS,
-                    tablets: vec![TabletId::from_u64(1)],
-                    local: NodeId::from_u64(index as u64 + 1),
-                    topology: topology.clone(),
-                    segment_target_bytes: 1024 * 1024,
-                    transport: TransportConfig::default(),
-                    peer_certs: HashMap::new(),
-                    insecure_peer_tls: true,
-                    preflight_enabled: true,
-                    lease_params: kivi_types::LeaseParams::default(),
-                    worker_count: 1,
-                    durability: SharedDurabilityConfig::default(),
-                    control: Some(ControlGroupConfig {
-                        voters: voters.clone(),
-                        peer_addrs: peer_addrs.clone(),
-                        seeds: Vec::new(),
-                    }),
-                    fragment_store_root: None,
-                })
-                .await
-                .expect("control replica opens");
-                nodes.push(node);
-
+                let mut node_config = config(
+                    dir.path(),
+                    topology.clone(),
+                    &[TabletId::from_u64(1)],
+                    1,
+                    Some(control_group.clone()),
+                );
+                node_config.local = NodeId::from_u64(index as u64 + 1);
+                nodes.push(
+                    ConsensusNode::open(node_config)
+                        .await
+                        .expect("control replica opens"),
+                );
                 dirs.push(dir);
             }
 
@@ -3718,47 +3749,29 @@ mod tests {
             let dir = tempfile::tempdir().expect("scratch");
             let addr = probe_udp();
             let tablets = vec![TabletId::from_u64(1)];
-            let topology = single_topology(addr, &tablets);
-            let node = ConsensusNode::open(MultiNodeConfig {
-                data_dir: dir.path().to_owned(),
-                namespace: NS,
-                tablets,
-                local: NodeId::from_u64(1),
-                topology,
-                segment_target_bytes: 1024 * 1024,
-                transport: TransportConfig::default(),
-                peer_certs: HashMap::new(),
-                insecure_peer_tls: true,
-                preflight_enabled: true,
-                lease_params: kivi_types::LeaseParams::default(),
-                worker_count: 1,
-                durability: SharedDurabilityConfig::default(),
-                control: None,
-                fragment_store_root: None,
-            })
+            let node = ConsensusNode::open(config(
+                dir.path(),
+                single_topology(addr, &tablets),
+                &tablets,
+                1,
+                None,
+            ))
             .await
             .expect("multi opens");
             let missing = TabletId::from_u64(99);
+            let get = || Operation::Get {
+                key: Key::from("x"),
+            };
             assert!(
-                node.propose(
-                    missing,
-                    &Operation::Get {
-                        key: Key::from("x")
-                    },
-                    None,
-                    None,
-                    NOW
-                )
-                .await
-                .is_err(),
+                node.propose(missing, &get(), None, None, NOW)
+                    .await
+                    .is_err(),
                 "unknown tablet proposes loudly"
             );
             assert!(
                 node.read(
                     missing,
-                    &Operation::Get {
-                        key: Key::from("x")
-                    },
+                    &get(),
                     ReadContract::Any,
                     CTX,
                     kivi_types::LeaseEligibility::Eligible,
@@ -3768,23 +3781,14 @@ mod tests {
                 "unknown tablet reads loudly"
             );
             // Tablet 0 is reserved for group-independent bulk routing.
-            let bad = MultiNodeConfig {
-                data_dir: dir.path().join("other"),
-                namespace: NS,
-                tablets: vec![TabletId::from_u64(0)],
-                local: NodeId::from_u64(1),
-                topology: single_topology(addr, &[TabletId::from_u64(0)]),
-                segment_target_bytes: 1024 * 1024,
-                transport: TransportConfig::default(),
-                peer_certs: HashMap::new(),
-                insecure_peer_tls: true,
-                preflight_enabled: true,
-                lease_params: kivi_types::LeaseParams::default(),
-                worker_count: 1,
-                durability: SharedDurabilityConfig::default(),
-                control: None,
-                fragment_store_root: None,
-            };
+            let reserved = [TabletId::from_u64(0)];
+            let bad = config(
+                &dir.path().join("other"),
+                single_topology(addr, &reserved),
+                &reserved,
+                1,
+                None,
+            );
             assert!(ConsensusNode::open(bad).await.is_err(), "tablet 0 refused");
             node.shutdown().await;
         });

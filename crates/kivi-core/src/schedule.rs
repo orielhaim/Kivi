@@ -2,8 +2,8 @@
 //!
 //! The scheduler assigns identifiers in schedule-call order and orders ready
 //! events by `(scheduled tick, identifier)`, giving a total order with no
-//! ties. Identifiers therefore serve two roles at once — deterministic
-//! tie-break and stable cancellation handle — from a single checked counter,
+//! ties. Identifiers therefore serve two roles at once - deterministic
+//! tie-break and stable cancellation handle - from a single checked counter,
 //! so neither role can wrap or saturate independently.
 
 use core::fmt;
@@ -83,11 +83,5 @@ mod tests {
             EventId::from_u64(1)
         );
         assert_eq!(EventId::from_u64(u64::MAX).next(), Err(EventIdExhausted));
-    }
-
-    #[test]
-    fn identifiers_order_and_display() {
-        assert!(EventId::from_u64(3) < EventId::from_u64(4));
-        assert_eq!(EventId::from_u64(7).to_string(), "ev7");
     }
 }

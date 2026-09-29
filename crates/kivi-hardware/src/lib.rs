@@ -2,19 +2,19 @@
 //!
 //! This crate is Kivi's only window onto the machine. It owns:
 //!
-//! * [`topology`] — a project-owned model of logical processors, physical
+//! * [`topology`] - a project-owned model of logical processors, physical
 //!   cores, SMT siblings, packages, memory nodes, cache instances, processor
 //!   classes and I/O device locality.
-//! * [`capability`] — one snapshot of every optional accelerator, each with a
+//! * [`capability`] - one snapshot of every optional accelerator, each with a
 //!   reason when it is absent.
-//! * [`placement`] — how Kivi's existing owner threads map onto that topology.
-//! * [`cpuset`] — cross-platform CPU sets and thread binding.
-//! * [`pages`] — huge-page policy for long-lived arenas.
-//! * [`numa`] — arenas with a memory policy applied before first touch, and
+//! * [`placement`] - how Kivi's existing owner threads map onto that topology.
+//! * [`cpuset`] - cross-platform CPU sets and thread binding.
+//! * [`pages`] - huge-page policy for long-lived arenas.
+//! * [`numa`] - arenas with a memory policy applied before first touch, and
 //!   the kernel's own page census to prove where the pages went.
-//! * [`io`] — direct I/O and aligned buffers.
-//! * [`dax`] — CXL and pmem memory regions.
-//! * [`telemetry`] — hardware observation backends and the one translation
+//! * [`io`] - direct I/O and aligned buffers.
+//! * [`dax`] - CXL and pmem memory regions.
+//! * [`telemetry`] - hardware observation backends and the one translation
 //!   layer that keeps them from being double counted.
 //!
 //! ## The invariant

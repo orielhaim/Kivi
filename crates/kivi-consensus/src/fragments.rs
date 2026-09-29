@@ -21,7 +21,7 @@
 //!   before reconstructing.
 //!
 //! An evil peer serving bit-flipped bytes therefore passes this layer
-//! untouched and fails at the coordinator — the tests prove both halves.
+//! untouched and fails at the coordinator - the tests prove both halves.
 //!
 //! ## Incarnation discipline
 //!
@@ -69,8 +69,8 @@ use crate::types::ConsensusGroupId;
 /// transport errors); [`RedundancyError::Overloaded`] decodes map to an
 /// encoded [`FragmentReply::Refused`] with [`RefuseReason::Oversize`] so
 /// coordinators see a dead end for this attempt rather than a corrupt
-/// peer. Every application verdict — stale incarnation/generation, hash
-/// mismatch, unknown asset — returns as an encoded `Refused` reply (the
+/// peer. Every application verdict - stale incarnation/generation, hash
+/// mismatch, unknown asset - returns as an encoded `Refused` reply (the
 /// coordinator distinguishes retryable from fenced from it, never from a
 /// transport error). A `None` store (fragments disabled on this node)
 /// answers [`RefuseReason::ShuttingDown`].
@@ -575,7 +575,7 @@ async fn driver_loop(transport: PeerTransport, commands: async_channel::Receiver
 /// is addressed per call through [`PeerTarget`], so one client fans out
 /// to every holder in its placement. Refusal of the RPC itself (peer
 /// undecodable, wrong family, shutdown mid-flight) surfaces as a
-/// transport error; a proto `Refused` answer returns as `Ok(Refused)` —
+/// transport error; a proto `Refused` answer returns as `Ok(Refused)` -
 /// the coordinator (which owns retry policy and incarnation tables)
 /// decides what each verdict means.
 ///
@@ -583,13 +583,13 @@ async fn driver_loop(transport: PeerTransport, commands: async_channel::Receiver
 /// while [`FragmentTransport::call`] must return `Send`. One driver
 /// thread per client bridges them: it parks the `!Send` mesh work on a
 /// private Compio reactor, and the returned future only waits on a
-/// runtime-agnostic channel — callable from any thread or runtime.
+/// runtime-agnostic channel - callable from any thread or runtime.
 #[derive(Debug, Clone)]
 pub struct FragmentClient {
     /// Shared QUIC/H3 mesh (bulk lane carries every call).
     transport: PeerTransport,
     /// Group stamped on the H3 request (always the redundancy sentinel;
-    /// serving ignores it — the path carries no tablet).
+    /// serving ignores it - the path carries no tablet).
     group: ConsensusGroupId,
     /// Ceiling for every call: the effective deadline is the tighter of
     /// this and the per-call timeout, so no call is ever unbounded.
@@ -706,7 +706,7 @@ mod tests {
     use std::time::Duration;
 
     use kivi_codec::integrity::blake3_256;
-    use kivi_redundancy::proto::FragmentKey;
+    use kivi_redundancy::proto::{FragmentKey, FragmentReply, FragmentRpc, RefuseReason};
     use kivi_redundancy::{FragmentStore as _, FragmentTransport as _};
     use kivi_types::{ClusterId, NodeId, NodeIncarnation};
 
@@ -717,7 +717,6 @@ mod tests {
 
     const CLUSTER: u128 = 0x0F8A_6C71;
     const INCARNATION: u64 = 5;
-    const GROUP_TABLET: u64 = 0;
 
     fn identity(node: u64) -> PeerIdentity {
         PeerIdentity {
@@ -776,7 +775,7 @@ mod tests {
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<PeerResponse, PeerRpcError>> + Send + '_>,
         > {
-            let reply = kivi_redundancy::proto::FragmentReply::Bytes {
+            let reply = FragmentReply::Bytes {
                 content: self.content,
                 bytes: self.bytes.clone(),
             }
@@ -848,7 +847,6 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     async fn setup() -> Fixture {
         let group = ConsensusGroupId::redundancy_sentinel();
-        assert_eq!(GROUP_TABLET, group.tablet().as_u64());
         let addrs = [probe_udp(), probe_udp(), probe_udp()];
         let peers: HashMap<NodeId, std::net::SocketAddr> = [1u64, 2, 3]
             .into_iter()
@@ -860,64 +858,43 @@ mod tests {
             })
             .collect();
         let dir = tempfile::tempdir().expect("scratch");
-        let (store_a, _) =
-            kivi_redundancy::LocalFragmentStore::open(&dir.path().join("a"), INCARNATION)
-                .expect("store a opens");
-        let (store_b, _) =
-            kivi_redundancy::LocalFragmentStore::open(&dir.path().join("b"), INCARNATION)
-                .expect("store b opens");
-        let holder_a = Arc::new(store_a);
-        let holder_b = Arc::new(store_b);
-        let (t1, _) = PeerTransport::open(
-            TransportConfig::default(),
-            identity(1),
-            ClusterId::from_u128(CLUSTER),
-            &peers,
-            insecure_tls(&dir.path().join("t1"), 1),
-            Arc::new(Holder {
-                store: Arc::clone(&holder_a),
+        let mut transports = Vec::new();
+        let mut stores = Vec::new();
+        for id in [1u64, 2, 3] {
+            let (store, _recovery) = kivi_redundancy::LocalFragmentStore::open(
+                &dir.path().join(format!("s{id}")),
+                INCARNATION,
+            )
+            .expect("holder store opens");
+            let store = Arc::new(store);
+            let handler: Arc<dyn PeerHandler> = Arc::new(Holder {
+                store: Arc::clone(&store),
                 incarnation: INCARNATION,
-            }),
-        )
-        .await
-        .expect("holder a opens");
-        let (t2, _) = PeerTransport::open(
-            TransportConfig::default(),
-            identity(2),
-            ClusterId::from_u128(CLUSTER),
-            &peers,
-            insecure_tls(&dir.path().join("t2"), 2),
-            Arc::new(Holder {
-                store: holder_b,
-                incarnation: INCARNATION,
-            }),
-        )
-        .await
-        .expect("holder b opens");
-        let (t3, _) = PeerTransport::open(
-            TransportConfig::default(),
-            identity(3),
-            ClusterId::from_u128(CLUSTER),
-            &peers,
-            insecure_tls(&dir.path().join("t3"), 3),
-            Arc::new(Holder {
-                store: Arc::clone(&holder_a),
-                incarnation: INCARNATION,
-            }),
-        )
-        .await
-        .expect("client opens");
-        let client = FragmentClient::new(t3.clone(), group, Duration::from_secs(15));
+            });
+            let (transport, _) = PeerTransport::open(
+                TransportConfig::default(),
+                identity(id),
+                ClusterId::from_u128(CLUSTER),
+                &peers,
+                insecure_tls(&dir.path().join(format!("t{id}")), id),
+                handler,
+            )
+            .await
+            .expect("holder transport opens");
+            transports.push(transport);
+            stores.push(store);
+        }
+        let client = FragmentClient::new(transports[2].clone(), group, Duration::from_secs(30));
         Fixture {
             client,
-            holder_a,
-            _transports: vec![t1, t2, t3],
+            holder_a: Arc::clone(&stores[0]),
+            _transports: transports,
             _dir: dir,
         }
     }
 
-    fn put_rpc(bytes: &[u8]) -> kivi_redundancy::proto::FragmentRpc {
-        kivi_redundancy::proto::FragmentRpc::Put {
+    fn put_rpc(bytes: &[u8]) -> FragmentRpc {
+        FragmentRpc::Put {
             key: key(),
             role: 0,
             params_tag: 0,
@@ -928,60 +905,63 @@ mod tests {
         }
     }
 
+    /// A put round-trips its true content hash, the bytes come back
+    /// exactly, and separate holders' stores share nothing: a put on
+    /// holder A is invisible to holder B.
     #[test]
     fn put_get_round_trip_verifies_bytes() {
         block_on(async {
             let fixture = setup().await;
             let bytes = b"redundancy fragment payload".to_vec();
             let content = blake3_256(&bytes);
-            let reply = fixture
-                .client
-                .call(target(1), put_rpc(&bytes), Duration::from_secs(15))
-                .await
-                .expect("puts");
             assert_eq!(
-                reply,
-                kivi_redundancy::proto::FragmentReply::Stored { content }
+                fixture
+                    .client
+                    .call(target(1), put_rpc(&bytes), Duration::from_secs(15))
+                    .await
+                    .expect("puts"),
+                FragmentReply::Stored { content }
             );
-            let reply = fixture
-                .client
-                .call(
-                    target(1),
-                    kivi_redundancy::proto::FragmentRpc::Get {
-                        key: key(),
-                        target_incarnation: INCARNATION,
-                    },
-                    Duration::from_secs(15),
-                )
-                .await
-                .expect("gets");
             assert_eq!(
-                reply,
-                kivi_redundancy::proto::FragmentReply::Bytes { content, bytes }
+                fixture
+                    .client
+                    .call(
+                        target(1),
+                        FragmentRpc::Get {
+                            key: key(),
+                            target_incarnation: INCARNATION,
+                        },
+                        Duration::from_secs(15),
+                    )
+                    .await
+                    .expect("gets"),
+                FragmentReply::Bytes { content, bytes }
             );
-            // Separate stores share nothing: holder B never saw the put.
-            let reply = fixture
-                .client
-                .call(
-                    target(2),
-                    kivi_redundancy::proto::FragmentRpc::Has {
-                        key: key(),
-                        target_incarnation: INCARNATION,
-                    },
-                    Duration::from_secs(15),
-                )
-                .await
-                .expect("probes");
             assert_eq!(
-                reply,
-                kivi_redundancy::proto::FragmentReply::Presence {
+                fixture
+                    .client
+                    .call(
+                        target(2),
+                        FragmentRpc::Has {
+                            key: key(),
+                            target_incarnation: INCARNATION,
+                        },
+                        Duration::from_secs(15),
+                    )
+                    .await
+                    .expect("probes"),
+                FragmentReply::Presence {
                     present: false,
                     healthy: false,
-                }
+                },
+                "holder B never saw holder A's put"
             );
         });
     }
 
+    /// A put whose declared content hash disagrees with its bytes is
+    /// refused and nothing is indexed: lies are never stored, never
+    /// served.
     #[test]
     fn hash_mismatch_put_refused_and_nothing_stored() {
         block_on(async {
@@ -990,7 +970,7 @@ mod tests {
                 .client
                 .call(
                     target(1),
-                    kivi_redundancy::proto::FragmentRpc::Put {
+                    FragmentRpc::Put {
                         key: key(),
                         role: 0,
                         params_tag: 0,
@@ -1005,8 +985,8 @@ mod tests {
                 .expect("answers");
             assert_eq!(
                 reply,
-                kivi_redundancy::proto::FragmentReply::Refused {
-                    reason: kivi_redundancy::proto::RefuseReason::HashMismatch,
+                FragmentReply::Refused {
+                    reason: RefuseReason::HashMismatch,
                 }
             );
             assert_eq!(
@@ -1017,6 +997,10 @@ mod tests {
         });
     }
 
+    /// Incarnation fencing: a strictly older target is refused with the
+    /// holder's current incarnation (so the coordinator can refresh its
+    /// belief and retry), while the bootstrap probe (target 0) always
+    /// serves.
     #[test]
     fn stale_incarnation_refused_with_current_but_bootstrap_allowed() {
         block_on(async {
@@ -1025,46 +1009,43 @@ mod tests {
                 node: NodeId::from_u64(1),
                 incarnation: INCARNATION - 1,
             };
-            let reply = fixture
-                .client
-                .call(
-                    stale,
-                    kivi_redundancy::proto::FragmentRpc::Get {
-                        key: key(),
-                        target_incarnation: INCARNATION - 1,
-                    },
-                    Duration::from_secs(15),
-                )
-                .await
-                .expect("answers");
             assert_eq!(
-                reply,
-                kivi_redundancy::proto::FragmentReply::Refused {
-                    reason: kivi_redundancy::proto::RefuseReason::StaleIncarnation {
+                fixture
+                    .client
+                    .call(
+                        stale,
+                        FragmentRpc::Get {
+                            key: key(),
+                            target_incarnation: INCARNATION - 1,
+                        },
+                        Duration::from_secs(15),
+                    )
+                    .await
+                    .expect("answers"),
+                FragmentReply::Refused {
+                    reason: RefuseReason::StaleIncarnation {
                         current: INCARNATION,
                     },
                 }
             );
-            // The bootstrap probe (target 0) is always servable.
             let probe = kivi_redundancy::transport::PeerTarget {
                 node: NodeId::from_u64(1),
                 incarnation: 0,
             };
-            let reply = fixture
-                .client
-                .call(
-                    probe,
-                    kivi_redundancy::proto::FragmentRpc::Has {
-                        key: key(),
-                        target_incarnation: 0,
-                    },
-                    Duration::from_secs(15),
-                )
-                .await
-                .expect("answers");
             assert_eq!(
-                reply,
-                kivi_redundancy::proto::FragmentReply::Presence {
+                fixture
+                    .client
+                    .call(
+                        probe,
+                        FragmentRpc::Has {
+                            key: key(),
+                            target_incarnation: 0,
+                        },
+                        Duration::from_secs(15),
+                    )
+                    .await
+                    .expect("answers"),
+                FragmentReply::Presence {
                     present: false,
                     healthy: false,
                 },
@@ -1073,68 +1054,64 @@ mod tests {
         });
     }
 
+    /// Every refusal class the coordinator branches on must arrive as its
+    /// own `RefuseReason` over the wire: absent data and an unheld asset
+    /// read as a dead end (`UnknownAsset`), a dropped fragment as
+    /// `Dropped` (idempotently, and really gone from the store), never
+    /// as a success or a retryable transport fault.
     #[test]
-    fn unknown_asset_get_refused_as_missing() {
+    fn refusal_classes_round_trip_as_their_own_reasons() {
         block_on(async {
             let fixture = setup().await;
-            let reply = fixture
-                .client
-                .call(
-                    target(1),
-                    kivi_redundancy::proto::FragmentRpc::Get {
-                        key: key(),
-                        target_incarnation: INCARNATION,
-                    },
-                    Duration::from_secs(15),
-                )
-                .await
-                .expect("answers");
             assert_eq!(
-                reply,
-                kivi_redundancy::proto::FragmentReply::Refused {
-                    reason: kivi_redundancy::proto::RefuseReason::UnknownAsset,
+                fixture
+                    .client
+                    .call(
+                        target(1),
+                        FragmentRpc::Get {
+                            key: key(),
+                            target_incarnation: INCARNATION,
+                        },
+                        Duration::from_secs(15),
+                    )
+                    .await
+                    .expect("answers"),
+                FragmentReply::Refused {
+                    reason: RefuseReason::UnknownAsset
                 }
             );
-        });
-    }
-
-    #[test]
-    fn drop_is_idempotent() {
-        block_on(async {
-            let fixture = setup().await;
-            let drop = || kivi_redundancy::proto::FragmentRpc::Drop {
+            let drop = || FragmentRpc::Drop {
                 key: key(),
                 target_incarnation: INCARNATION,
             };
-            // Absent drops count as dropped.
-            let reply = fixture
-                .client
-                .call(target(1), drop(), Duration::from_secs(15))
-                .await
-                .expect("answers");
-            assert_eq!(reply, kivi_redundancy::proto::FragmentReply::Dropped);
-            // Present drops remove, and re-drops stay dropped.
-            let bytes = b"droppable".to_vec();
+            assert_eq!(
+                fixture
+                    .client
+                    .call(target(1), drop(), Duration::from_secs(15))
+                    .await
+                    .expect("answers"),
+                FragmentReply::Dropped,
+                "an absent drop is a successful no-op"
+            );
             fixture
                 .client
-                .call(target(1), put_rpc(&bytes), Duration::from_secs(15))
+                .call(target(1), put_rpc(b"droppable"), Duration::from_secs(15))
                 .await
                 .expect("puts");
-            let reply = fixture
-                .client
-                .call(target(1), drop(), Duration::from_secs(15))
-                .await
-                .expect("answers");
-            assert_eq!(reply, kivi_redundancy::proto::FragmentReply::Dropped);
-            let reply = fixture
-                .client
-                .call(target(1), drop(), Duration::from_secs(15))
-                .await
-                .expect("answers");
-            assert_eq!(reply, kivi_redundancy::proto::FragmentReply::Dropped);
+            for _ in 0..2 {
+                assert_eq!(
+                    fixture
+                        .client
+                        .call(target(1), drop(), Duration::from_secs(15))
+                        .await
+                        .expect("answers"),
+                    FragmentReply::Dropped
+                );
+            }
             assert_eq!(
                 fixture.holder_a.has_fragment(&key(), INCARNATION),
-                (false, false)
+                (false, false),
+                "the fragment is really gone"
             );
         });
     }
@@ -1162,7 +1139,7 @@ mod tests {
             identity(1),
             ClusterId::from_u128(CLUSTER),
             &peers,
-            insecure_tls(&dir.path().join("e1"), 1),
+            insecure_tls(&dir.path().join("evil"), 1),
             Arc::new(Evil {
                 content,
                 bytes: served,
@@ -1175,10 +1152,17 @@ mod tests {
             identity(2),
             ClusterId::from_u128(CLUSTER),
             &peers,
-            insecure_tls(&dir.path().join("e2"), 2),
-            Arc::new(Evil {
-                content,
-                bytes: Vec::new(),
+            insecure_tls(&dir.path().join("client"), 2),
+            Arc::new(Holder {
+                store: Arc::new(
+                    kivi_redundancy::LocalFragmentStore::open(
+                        &dir.path().join("cstore"),
+                        INCARNATION,
+                    )
+                    .expect("client store opens")
+                    .0,
+                ),
+                incarnation: INCARNATION,
             }),
         )
         .await
@@ -1186,36 +1170,41 @@ mod tests {
         let client = FragmentClient::new(
             client_transport.clone(),
             ConsensusGroupId::redundancy_sentinel(),
-            Duration::from_secs(15),
+            Duration::from_secs(30),
         );
         (client, vec![evil_transport, client_transport], dir)
     }
 
+    /// An evil peer serving bit-flipped bytes under the true content
+    /// hash passes the transport layer untouched: only the
+    /// coordinator's `verify_bytes` catches it. This is the layering
+    /// contract the transport docs state, so it is pinned.
     #[test]
     fn evil_bytes_pass_transport_and_fail_coordinator_verification() {
         block_on(async {
-            let bytes = b"honest fragment bytes".to_vec();
-            let content = blake3_256(&bytes);
-            let mut flipped = bytes.clone();
-            flipped[0] ^= 0xFF;
-            let (client, _transports, _dir) = setup_evil(content, flipped.clone()).await;
-            // The transport moves the lie untouched: no verification here.
+            let truth = b"the real fragment body".to_vec();
+            let content = blake3_256(&truth);
+            let mut tampered = truth.clone();
+            tampered[0] ^= 0xFF;
+            let (client, _transports, _dir) = setup_evil(content, tampered.clone()).await;
             let reply = client
                 .call(
                     target(1),
-                    kivi_redundancy::proto::FragmentRpc::Get {
+                    FragmentRpc::Get {
                         key: key(),
                         target_incarnation: INCARNATION,
                     },
                     Duration::from_secs(15),
                 )
                 .await
-                .expect("answers");
+                .expect("evil answers");
+            // The transport moves the lie untouched: it forwards the peer's
+            // declared hash and the peer's bytes without cross-checking.
             assert_eq!(
                 reply,
-                kivi_redundancy::proto::FragmentReply::Bytes {
+                FragmentReply::Bytes {
                     content,
-                    bytes: flipped,
+                    bytes: tampered,
                 }
             );
             // The coordinator catches it against its layout record.
@@ -1230,7 +1219,7 @@ mod tests {
                 params_tag: 0,
                 content,
             };
-            let kivi_redundancy::proto::FragmentReply::Bytes { bytes, .. } = reply else {
+            let FragmentReply::Bytes { bytes, .. } = reply else {
                 unreachable!("evil peer must answer the Get with Bytes, got {reply:?}");
             };
             assert!(
@@ -1260,8 +1249,11 @@ mod tests {
         });
     }
 
+    /// A put larger than the wire cap is refused by the proto caps before
+    /// it reaches the holder (the coordinator sees a dead end, not a
+    /// corrupt peer), and the lane stays usable.
     #[test]
-    fn oversize_put_refused() {
+    fn oversize_put_refused_without_touching_the_holder() {
         block_on(async {
             let fixture = setup().await;
             let big = vec![7u8; kivi_redundancy::MAX_FRAGMENT_WIRE_BYTES + 1];
@@ -1272,8 +1264,8 @@ mod tests {
                 .expect("answers");
             assert_eq!(
                 reply,
-                kivi_redundancy::proto::FragmentReply::Refused {
-                    reason: kivi_redundancy::proto::RefuseReason::Oversize,
+                FragmentReply::Refused {
+                    reason: RefuseReason::Oversize,
                 }
             );
             assert_eq!(

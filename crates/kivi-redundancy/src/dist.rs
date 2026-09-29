@@ -4,7 +4,7 @@
 //! [`crate::RedundancyFabric`]: it plans layouts with the same
 //! [`crate::plan_baseline`] and [`crate::plan_placement`] helpers, encodes
 //! with the same replication/RS providers, verifies with the same content
-//! hashes — but stores fragments on remote holders through a
+//! hashes - but stores fragments on remote holders through a
 //! [`crate::transport::FragmentTransport`] and publishes authority through a
 //! [`crate::catalog::CatalogPublish`] instead of a local `CURRENT` file.
 //!
@@ -30,10 +30,11 @@ use kivi_codec::integrity::blake3_256;
 use kivi_types::{NodeId, Ticks};
 
 use crate::proto::{FragmentKey, FragmentReply, FragmentRpc, MAX_PROTECTED_KEYS, RefuseReason};
+use crate::repair::RepairEngine;
 use crate::{
     AssetAssessment, AssetId, FailureScope, FragmentId, FragmentRecord, InformationAsset,
-    NodeDescriptor, RedundancyError, RedundancyIntent, RedundancyLayout, RepairEngine,
-    RepairReason, SchemeParams, assess_with_min_available,
+    NodeDescriptor, RedundancyError, RedundancyIntent, RedundancyLayout, RepairReason,
+    SchemeParams, assess_with_min_available,
     catalog::{CatalogPublish, LayoutCatalog, PublishedLayout},
     healing::{
         ControllerSnapshot, DebtCounters, MaintenanceBudgets, MaintenanceReport, RepairDebt,
@@ -324,7 +325,7 @@ impl DistributedFabric {
             catalog,
             publisher,
             repair: Mutex::new(RepairEngine::with_budgets(
-                crate::RepairBudgets::conservative(),
+                crate::repair::RepairBudgets::conservative(),
             )),
             metrics,
             config,
@@ -353,41 +354,10 @@ impl DistributedFabric {
         self.config
     }
 
-    /// Builds a plane with explicit maintenance budgets.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RedundancyError::InvalidParams`] when transport bounds are
-    /// invalid or the maintenance limits cannot make progress.
-    pub fn with_maintenance_budgets(
-        transport: Arc<dyn FragmentTransport>,
-        catalog: Arc<dyn LayoutCatalog>,
-        publisher: Arc<dyn CatalogPublish>,
-        metrics: Arc<crate::FabricMetrics>,
-        config: DistConfig,
-        budgets: MaintenanceBudgets,
-    ) -> Result<Self, RedundancyError> {
-        if !budgets.validate() {
-            return Err(RedundancyError::invalid_params(
-                "maintenance budgets cannot make progress",
-            ));
-        }
-        let mut fabric = Self::new(transport, catalog, publisher, metrics, config)?;
-        fabric.maintenance_budgets = budgets;
-        Ok(fabric)
-    }
-
     /// Returns the active maintenance budgets.
     #[must_use]
     pub const fn maintenance_budgets(&self) -> MaintenanceBudgets {
         self.maintenance_budgets
-    }
-
-    /// Replaces maintenance budgets and returns the previous value.
-    pub fn set_maintenance_budgets(&mut self, budgets: MaintenanceBudgets) -> MaintenanceBudgets {
-        let previous = self.maintenance_budgets;
-        self.maintenance_budgets = budgets;
-        previous
     }
 
     /// Sets the grace period before a non-critical unavailable holder is
@@ -399,14 +369,6 @@ impl DistributedFabric {
     /// Sets the age grace used by background orphan reclamation.
     pub fn set_orphan_grace(&mut self, grace: Duration) {
         self.orphan_grace = grace;
-    }
-
-    /// Replaces the scrub schedule while retaining its current cursor when
-    /// the new schedule has compatible bounds.
-    pub fn set_scrub_schedule(&mut self, schedule: ScrubSchedule) {
-        if let Ok(mut state) = self.maintenance.lock() {
-            state.schedule = schedule;
-        }
     }
 
     /// Returns a point-in-time self-healing controller snapshot.
@@ -732,9 +694,9 @@ impl DistributedFabric {
             .filter(|(_, verdict)| {
                 matches!(
                     verdict,
-                    crate::FragmentVerdict::ChecksumMismatch
-                        | crate::FragmentVerdict::ReconstructableCorruption
-                        | crate::FragmentVerdict::UnrecoverableCorruption
+                    crate::repair::FragmentVerdict::ChecksumMismatch
+                        | crate::repair::FragmentVerdict::ReconstructableCorruption
+                        | crate::repair::FragmentVerdict::UnrecoverableCorruption
                 )
             })
             .count();
@@ -747,7 +709,8 @@ impl DistributedFabric {
             .filter(|(_, verdict)| {
                 matches!(
                     verdict,
-                    crate::FragmentVerdict::Missing | crate::FragmentVerdict::Unreadable
+                    crate::repair::FragmentVerdict::Missing
+                        | crate::repair::FragmentVerdict::Unreadable
                 )
             })
             .count();
@@ -809,7 +772,7 @@ impl DistributedFabric {
 
     /// Assesses installed health: `Has`-probes every published fragment,
     /// then computes survivability over the actually-healthy holders (not
-    /// the desired placement — collided or drifted installs never inflate
+    /// the desired placement - collided or drifted installs never inflate
     /// protection).
     pub async fn assess(
         &self,
@@ -881,12 +844,12 @@ impl DistributedFabric {
                     .find(|(observed_index, _)| observed_index == index)
                     .and_then(|(_, present)| *present);
                 let verdict = if *healthy {
-                    crate::FragmentVerdict::Healthy
+                    crate::repair::FragmentVerdict::Healthy
                 } else {
                     match observed {
-                        Some(Some(true)) => crate::FragmentVerdict::ChecksumMismatch,
-                        Some(Some(false)) => crate::FragmentVerdict::Missing,
-                        _ => crate::FragmentVerdict::Unreadable,
+                        Some(Some(true)) => crate::repair::FragmentVerdict::ChecksumMismatch,
+                        Some(Some(false)) => crate::repair::FragmentVerdict::Missing,
+                        _ => crate::repair::FragmentVerdict::Unreadable,
                     }
                 };
                 (*index, verdict)
@@ -1007,13 +970,13 @@ impl DistributedFabric {
             let probe_failed = probe.is_err();
             let (present, healthy) = probe.unwrap_or((false, false));
             let mut verdict = if healthy {
-                crate::FragmentVerdict::Healthy
+                crate::repair::FragmentVerdict::Healthy
             } else if probe_failed {
-                crate::FragmentVerdict::Unreadable
+                crate::repair::FragmentVerdict::Unreadable
             } else if present {
-                crate::FragmentVerdict::ChecksumMismatch
+                crate::repair::FragmentVerdict::ChecksumMismatch
             } else {
-                crate::FragmentVerdict::Missing
+                crate::repair::FragmentVerdict::Missing
             };
             if mode.reads_payloads() && healthy {
                 match self.fetch_one(record).await {
@@ -1026,12 +989,12 @@ impl DistributedFabric {
                         verdict = match error {
                             RedundancyError::CorruptFragment { .. } => {
                                 report.truncated += 1;
-                                crate::FragmentVerdict::ChecksumMismatch
+                                crate::repair::FragmentVerdict::ChecksumMismatch
                             }
                             RedundancyError::MissingFragment { .. } => {
-                                crate::FragmentVerdict::Missing
+                                crate::repair::FragmentVerdict::Missing
                             }
-                            _ => crate::FragmentVerdict::Unreadable,
+                            _ => crate::repair::FragmentVerdict::Unreadable,
                         };
                     }
                 }
@@ -1044,9 +1007,9 @@ impl DistributedFabric {
             .filter(|(_, verdict)| {
                 matches!(
                     verdict,
-                    crate::FragmentVerdict::ChecksumMismatch
-                        | crate::FragmentVerdict::ReconstructableCorruption
-                        | crate::FragmentVerdict::UnrecoverableCorruption
+                    crate::repair::FragmentVerdict::ChecksumMismatch
+                        | crate::repair::FragmentVerdict::ReconstructableCorruption
+                        | crate::repair::FragmentVerdict::UnrecoverableCorruption
                 )
             })
             .count();
@@ -1056,7 +1019,8 @@ impl DistributedFabric {
             .filter(|(_, verdict)| {
                 matches!(
                     verdict,
-                    crate::FragmentVerdict::Missing | crate::FragmentVerdict::Unreadable
+                    crate::repair::FragmentVerdict::Missing
+                        | crate::repair::FragmentVerdict::Unreadable
                 )
             })
             .count();
@@ -1125,7 +1089,9 @@ impl DistributedFabric {
                 .verdicts
                 .iter()
                 .find(|(candidate, _)| *candidate == index)
-                .map_or(crate::FragmentVerdict::Missing, |(_, verdict)| *verdict);
+                .map_or(crate::repair::FragmentVerdict::Missing, |(_, verdict)| {
+                    *verdict
+                });
             let placement_bad = assessed
                 .desired
                 .node_for(record.id.index)
@@ -1709,7 +1675,8 @@ impl DistributedFabric {
                 .filter(|(_, verdict)| {
                     matches!(
                         verdict,
-                        crate::FragmentVerdict::Missing | crate::FragmentVerdict::Unreadable
+                        crate::repair::FragmentVerdict::Missing
+                            | crate::repair::FragmentVerdict::Unreadable
                     )
                 })
                 .count();
@@ -2081,7 +2048,8 @@ impl DistributedFabric {
             .filter_map(|(index, verdict)| {
                 matches!(
                     verdict,
-                    crate::FragmentVerdict::Missing | crate::FragmentVerdict::ChecksumMismatch
+                    crate::repair::FragmentVerdict::Missing
+                        | crate::repair::FragmentVerdict::ChecksumMismatch
                 )
                 .then_some(*index)
             })
@@ -2198,8 +2166,8 @@ impl DistributedFabric {
             .map(|record| record.node)
             .collect();
         let reason = if assessment.verdicts.iter().any(|(_, verdict)| {
-            *verdict != crate::FragmentVerdict::Healthy
-                && *verdict != crate::FragmentVerdict::Missing
+            *verdict != crate::repair::FragmentVerdict::Healthy
+                && *verdict != crate::repair::FragmentVerdict::Missing
         }) {
             RepairReason::CorruptionDetected
         } else {
@@ -2213,7 +2181,8 @@ impl DistributedFabric {
             .filter_map(|(index, verdict)| {
                 matches!(
                     verdict,
-                    crate::FragmentVerdict::Missing | crate::FragmentVerdict::ChecksumMismatch
+                    crate::repair::FragmentVerdict::Missing
+                        | crate::repair::FragmentVerdict::ChecksumMismatch
                 )
                 .then_some(*index)
             })
@@ -2298,7 +2267,7 @@ impl DistributedFabric {
     /// Drains a node for one asset: reads through the current layout, builds
     /// a full replacement generation on the view without `node`, publishes,
     /// and drops the old fragments best-effort. Callers iterate assets (the
-    /// catalog lists nothing by design — the control plane owns
+    /// catalog lists nothing by design - the control plane owns
     /// enumeration).
     ///
     /// # Errors
@@ -2355,7 +2324,7 @@ impl DistributedFabric {
     /// Repair never relocates: replacement bytes land on the holder the
     /// published layout names (when it serves reads), so the layout stays
     /// authoritative without a new generation. Holders that no longer serve
-    /// fail the task — relocation is a new generation owned by
+    /// fail the task - relocation is a new generation owned by
     /// [`Self::drain`] and [`Self::transition`], never silent adoption.
     async fn execute_repair_task(
         &self,
@@ -2509,7 +2478,7 @@ impl DistributedFabric {
             verify_installed_independence(&records, params, min_available, scope, view)?;
             self.verify_placed(asset, generation, &records).await?;
             // Re-fetch the minimum set and decode: a successful encode alone
-            // never suffices — the image must verify against the asset id.
+            // never suffices - the image must verify against the asset id.
             let layout_probe = RedundancyLayout::new_with_contract(
                 asset.id,
                 asset.logical_len,
@@ -2901,7 +2870,7 @@ impl DistributedFabric {
         let outcome = match reply {
             FragmentReply::Bytes { content, bytes } => {
                 // The reply's content tag is a hint; the layout record is
-                // the authority — bytes verify against it, never the hint.
+                // the authority - bytes verify against it, never the hint.
                 let _ = content;
                 if bytes.len() as u64 != record.stored_len
                     || record.id.verify_bytes(&bytes).is_err()
@@ -3019,7 +2988,7 @@ impl DistributedFabric {
 
     /// Pushes the accepted layout bytes to every actual holder (layout
     /// association: binds staged fragments to authority on each node).
-    /// Strict: any refusal fails the build (fencing works — a holder ahead
+    /// Strict: any refusal fails the build (fencing works - a holder ahead
     /// of this generation must not be overwritten); transport errors get one
     /// retry.
     async fn push_layout(
@@ -3095,7 +3064,7 @@ impl DistributedFabric {
     ///
     /// Orphans are disk hygiene only: they were never authoritative and can
     /// never answer a read, so an unreachable holder is reported rather than
-    /// failing the whole sweep. The local holder is included — local RPCs
+    /// failing the whole sweep. The local holder is included - local RPCs
     /// short-circuit through the in-process peer handler.
     ///
     /// # Errors
@@ -3546,7 +3515,6 @@ mod tests {
                 id: node,
                 domain: crate::FailureDomain::node_only(node),
                 health: crate::NodeHealth::Active,
-                weight: 1,
             });
         }
         let catalog = Arc::new(crate::catalog::MemCatalog::new());
@@ -3629,7 +3597,7 @@ mod tests {
         // The baseline planner picks RS(8,2) for a 1 MiB cold asset, so the
         // cluster must be wide enough to place all ten fragments on
         // independent failure domains (a narrower cluster fails closed at
-        // publish — proven by `placement_refuses_independent_domains`).
+        // publish - proven by `placement_refuses_independent_domains`).
         let cluster = cluster_with_nodes(10);
         // Modulo 251 bounds the value to `0..251`, fits `u8`.
         #[allow(clippy::cast_possible_truncation)]

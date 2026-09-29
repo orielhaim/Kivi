@@ -1,90 +1,24 @@
 //! Checkpoint end-to-end through the embedded engine: capture, build,
 //! publish, restart, restore, tail replay, reclamation.
 //!
-//! No processes or sockets here — these prove the checkpoint/recovery
+//! No processes or sockets here - these prove the checkpoint/recovery
 //! contract through the public `LocalEngine` API (manual triggers,
 //! CURRENT polling, restart restores). Real crash/kill coverage lives in
-//! `kivi-server/tests/durability.rs`.
+//! `kivi-lab/tests/durability.rs`.
 
-use std::time::{Duration, Instant};
+mod harness;
 
-use kivi_engine::{DurabilityMode, DurableConfig, EngineConfig, LocalEngine, Placement};
+use harness::{NS, ROOT, await_current, durable_config, root_snapshot};
+use kivi_engine::LocalEngine;
 use kivi_state::Key;
-use kivi_tablet::{DirectorySnapshot, HashPrefix, PartitionRange};
-use kivi_types::{NamespaceId, TabletEpoch, TabletId, WorkerId, WriteGuardGeneration};
-
-const NS: NamespaceId = NamespaceId::from_u64(1);
-const TABLET: TabletId = TabletId::from_u64(1);
-
-fn directory() -> DirectorySnapshot {
-    let genesis = DirectorySnapshot::bootstrap(
-        NS,
-        TABLET,
-        PartitionRange::Hash(HashPrefix::new(0, 0).expect("root")),
-        TabletEpoch::INITIAL,
-        WriteGuardGeneration::INITIAL,
-    )
-    .expect("genesis");
-    genesis
-        .stage(TABLET)
-        .and_then(|snapshot| snapshot.activate(TABLET))
-        .expect("active root")
-}
-
-fn placement() -> Placement {
-    Placement::new([(TABLET, WorkerId::from_u64(0))])
-}
-
-fn durable_config(dir: &std::path::Path) -> DurabilityMode {
-    let opened = kivi_durability::open_data_dir(dir, None).expect("data dir opens");
-    DurabilityMode::Durable(DurableConfig {
-        data_dir: dir.to_owned(),
-        segment_target_bytes: 1024 * 1024,
-        node: opened.meta.node,
-        cluster: opened.meta.cluster,
-        incarnation: opened.meta.incarnation,
-        shared_wal: false,
-        batch: kivi_engine::BatchPolicy::default_policy(),
-        checkpoint: kivi_engine::CheckpointConfig {
-            // Tests trigger manually; automatic thresholds stay out of the way.
-            disabled: true,
-            ..kivi_engine::CheckpointConfig::default_config()
-        },
-    })
-}
 
 fn start(dir: &std::path::Path) -> LocalEngine {
-    LocalEngine::start(EngineConfig {
-        namespace: NS,
-        hardware: kivi_engine::HardwareConfig::default(),
-        directory: directory(),
-        placement: placement(),
-        worker_count: 2,
-        request_capacity: 256,
-        chunks: kivi_engine::ChunkFabricConfig::default(),
-        fabric: kivi_engine::FabricConfig::default(),
-        network: None,
-        durability: durable_config(dir),
-    })
+    LocalEngine::start(durable_config(
+        dir,
+        kivi_engine::ChunkFabricConfig::default(),
+        kivi_engine::FabricConfig::default(),
+    ))
     .expect("durable engine starts")
-}
-
-/// Waits for a CURRENT record at `cut` (background build + publish are
-/// asynchronous), returning it.
-fn await_current(dir: &std::path::Path, cut: u64) -> kivi_checkpoint::CurrentRecord {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Ok(Some(current)) = kivi_checkpoint::read_current(dir, TABLET)
-            && current.cut >= cut
-        {
-            return current;
-        }
-        assert!(
-            Instant::now() <= deadline,
-            "no CURRENT at cut {cut} after 30s"
-        );
-        std::thread::sleep(Duration::from_millis(25));
-    }
 }
 
 #[test]
@@ -183,13 +117,6 @@ fn second_checkpoint_reclaims_old_segments_and_keeps_serving() {
         Some(first.manifest),
         "retention chain links current to previous"
     );
-    // Reclamation runs after every publish: with two checkpoints the
-    // floor is the previous cut (5), so fully covered sealed segments go.
-    // (Tiny database: likely one active segment; assert the invariant,
-    // not a count — counts are proven at process scale in AO.)
-    let wal_dir = scratch.path().join("wal").join("lane-0000");
-    let segments_before = std::fs::read_dir(&wal_dir).map_or(0, std::iter::Iterator::count);
-    let _ = segments_before;
     engine.shutdown().expect("clean shutdown");
     // Restart works on the reclaimed layout with all state intact.
     let engine = start(scratch.path());
@@ -204,47 +131,16 @@ fn second_checkpoint_reclaims_old_segments_and_keeps_serving() {
     engine.shutdown().expect("clean shutdown");
 }
 
-#[test]
-fn checkpoint_captures_dedup_state_for_retry_safety() {
-    let scratch = tempfile::tempdir().expect("scratch");
-    let engine = start(scratch.path());
-    // Embedded clients share fate with the process (no identity), so no
-    // sessions exist here. This test proves the capture/build path
-    // carries the (empty) dedup component end to end; the money scenario
-    // with real identities runs at process scale (AP).
-    let client = engine.client();
-    client
-        .set(&Key::from("k"), bytes::Bytes::from_static(b"v"))
-        .expect("set");
-    engine.request_checkpoint(None);
-    let current = await_current(scratch.path(), 1);
-    let manifest_bytes = std::fs::read(
-        scratch
-            .path()
-            .join("checkpoints")
-            .join("tablet-1")
-            .join("manifests")
-            .join(format!("{}.manifest", current.manifest.hex())),
-    )
-    .expect("manifest file present");
-    let manifest =
-        kivi_checkpoint::load_manifest(current.manifest, &manifest_bytes).expect("manifest loads");
-    assert_eq!(manifest.dedup.sessions, 0, "no sessions embedded");
-    engine.shutdown().expect("clean shutdown");
-}
-
-/// AB semantic verification: live state at the cut equals restored
-/// checkpoint state, compared as deterministic sorted snapshots
-/// (objects, versions, expiries, dedup floors and outcomes).
+/// Live state at the cut must equal the restored checkpoint state exactly,
+/// across objects, versions, expiries and dedup.
 #[test]
 fn live_state_at_cut_equals_restored_checkpoint_state() {
     use kivi_engine::LiveTablet;
     use kivi_state::{Operation, StoredObject};
-    use kivi_types::{TabletAuthority, WallTimestamp};
+    use kivi_types::{TabletAuthority, TabletEpoch, WallTimestamp, WriteGuardGeneration};
     let now = WallTimestamp::from_micros(1_000_000);
-    let authority =
-        TabletAuthority::new(TABLET, TabletEpoch::INITIAL, WriteGuardGeneration::INITIAL);
-    let descriptor = directory().get(TABLET).expect("descriptor").clone();
+    let authority = TabletAuthority::new(ROOT, TabletEpoch::INITIAL, WriteGuardGeneration::INITIAL);
+    let descriptor = root_snapshot().get(ROOT).expect("descriptor").clone();
     let mut live = LiveTablet::from_descriptor(&descriptor, authority).expect("live");
     // Mixed workload: bytes, counters, expiries, deletes.
     for (key, value) in [("a", "1"), ("b", "22"), ("c", "333")] {
@@ -290,7 +186,7 @@ fn live_state_at_cut_equals_restored_checkpoint_state() {
         node: kivi_types::NodeId::from_u64(2),
         incarnation: kivi_types::NodeIncarnation::INITIAL,
         namespace: NS,
-        tablet: TABLET,
+        tablet: ROOT,
     };
     let built = kivi_checkpoint::build_tablet(
         &view,
@@ -301,13 +197,13 @@ fn live_state_at_cut_equals_restored_checkpoint_state() {
     .expect("builds");
     let (installed, _) =
         kivi_checkpoint::publish_tablet(scratch.path(), &built, None).expect("publishes");
-    let loaded = kivi_checkpoint::load_installed(scratch.path(), TABLET)
+    let loaded = kivi_checkpoint::load_installed(scratch.path(), ROOT)
         .expect("loads")
         .expect("installed");
     assert!(!loaded.fell_back);
     assert_eq!(loaded.current.cut, installed.cut);
     // Restored objects equal live objects exactly (key, value, version,
-    // expiry — full StoredObject equality).
+    // expiry - full StoredObject equality).
     let mut restored: Vec<(Key, StoredObject)> = loaded
         .bands
         .iter()

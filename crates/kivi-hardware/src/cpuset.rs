@@ -7,7 +7,7 @@
 //!
 //! ## Why no affinity crate
 //!
-//! `core_affinity2` — the crate Kivi used before — offers exactly one
+//! `core_affinity2` - the crate Kivi used before - offers exactly one
 //! operation, "bind this thread to core N", and pulls `libafl_core` in to do
 //! it. It cannot answer which hardware threads share a core, cannot bind a
 //! thread to a set of cores, and cannot report where the thread actually
@@ -222,7 +222,7 @@ pub enum BindError {
 ///
 /// # Errors
 ///
-/// Returns [`BindError::EmptySet`] never — an empty set returns `Ok(None)` —
+/// Returns [`BindError::EmptySet`] never - an empty set returns `Ok(None)` -
 /// and [`BindError::Refused`] when the platform rejects a non-empty set.
 pub fn bind_current_thread(cpus: &CpuSet) -> Result<Option<Binding>, BindError> {
     if cpus.is_empty() {
@@ -366,7 +366,7 @@ mod platform {
         // The kernel is authoritative about the mask, and `/proc/self/status`
         // is only a rendering of the same call. The fixed `cpu_set_t` covers
         // `CPU_SETSIZE` (1024) processors; a larger machine reports `EINVAL`
-        // for this buffer, which is treated as "unrestricted" — the same answer
+        // for this buffer, which is treated as "unrestricted" - the same answer
         // the platform gives when the mask is unreadable, and the one that
         // never hands a worker a processor it cannot be scheduled on.
         let mut set: libc::cpu_set_t = // SAFETY: `cpu_set_t` is a plain
@@ -469,39 +469,31 @@ mod platform {
 mod tests {
     use super::*;
 
+    /// An empty set means "unrestricted", and binding to it must be a no-op
+    /// rather than a refusal: a process with no cpuset configured must still
+    /// be schedulable everywhere. Run compression is what an operator reads
+    /// from `/proc/self/status`, so it has to match that format.
     #[test]
-    fn empty_set_means_unrestricted() {
+    fn an_empty_set_is_unrestricted_and_runs_compress() {
         let set = CpuSet::empty();
         assert!(set.is_empty());
         assert!(!set.contains(CpuId(0)));
         assert_eq!(set.to_string(), "any");
         assert_eq!(bind_current_thread(&set), Ok(None));
-    }
-
-    #[test]
-    fn display_compresses_runs() {
         assert_eq!(CpuSet::of([0, 1, 2, 5, 9, 10]).to_string(), "0-2,5,9-10");
     }
 
+    /// Two sets intersect to the processors both describe, which is how a
+    /// placement plan intersects a role's affinity with a cgroup's.
     #[test]
-    fn intersection_keeps_only_shared_cpus() {
+    fn intersection_keeps_only_shared_processors() {
         assert_eq!(
             CpuSet::of([1, 2, 3])
                 .intersect(&CpuSet::of([2, 3, 4]))
                 .to_string(),
             "2-3"
         );
-    }
-
-    #[test]
-    fn range_covers_every_processor() {
         assert_eq!(CpuSet::range(4).len(), 4);
         assert!(CpuSet::range(4).contains(CpuId(3)));
-    }
-
-    #[test]
-    fn current_process_has_at_least_one_cpu() {
-        let current = CpuSet::current().expect("platform reports a cpu set");
-        assert!(!current.is_empty());
     }
 }

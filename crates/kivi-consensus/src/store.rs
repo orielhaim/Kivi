@@ -5,7 +5,7 @@
 //! [`openraft::storage::RaftLogReader`]). It is a thin façade over one
 //! [`GroupRaftStore`](crate::shared::GroupRaftStore): Kivi-owned
 //! [`kivi_durability::RaftRecord`]s persist through the node-wide shared
-//! WAL writer — the same segmented, checksummed, crash-safe
+//! WAL writer - the same segmented, checksummed, crash-safe
 //! infrastructure as tablet history, with one physical WAL holding every
 //! group and no format change.
 //!
@@ -17,18 +17,18 @@
 //! commit pointer, installed-snapshot metadata). Single-node durable mode
 //! is untouched.
 //!
-//! ## Durability contracts (exact — audited against 0.10, never 0.9)
+//! ## Durability contracts
 //!
-//! 0.10 expresses storage errors as `std::io::Error` (no more
-//! `StorageError` enum); Kivi maps [`kivi_durability::DurabilityError`]
-//! through `std::io::Error::other`, preserving the message. Per-method
-//! completion semantics, quoted from the 0.10 trait docs:
+//! `OpenRaft` 0.10 expresses storage errors as `std::io::Error`; Kivi maps
+//! [`kivi_durability::DurabilityError`] through `std::io::Error::other`,
+//! preserving the message. Per-method completion semantics, quoted from the
+//! 0.10 trait docs:
 //!
-//! * `save_vote` — "**must be persisted on disk before returning**". The
+//! * `save_vote` - "**must be persisted on disk before returning**". The
 //!   vote is the fencing contract: the barrier runs first, the cache
 //!   installs second, so a crash between the two replays the record and
 //!   converges identically.
-//! * `append` — "**should return immediately after saving in memory**" and
+//! * `append` - "**should return immediately after saving in memory**" and
 //!   "**when the callback is called, the entries must be persisted**".
 //!   Entries land in the cache (readable on return, as required) while
 //!   the shared writer persists; the [`openraft::storage::IOFlushed`]
@@ -36,17 +36,16 @@
 //!   the staged suffix so the cache never advertises undurable history.
 //!   Replication acknowledgements therefore always imply durable
 //!   persistence: a follower never ACKs memory-only state.
-//! * `truncate_after(last_kept)` — exclusive keep-through marker (0.10
-//!   renamed 0.9's inclusive `truncate`). The Kivi-owned durable format is
-//!   unchanged: the live path still persists
+//! * `truncate_after(last_kept)` - exclusive keep-through marker. The
+//!   live path persists
 //!   [`kivi_durability::RaftTruncate`] `{ from_index }` (inclusive removal)
 //!   with `from_index = last_kept + 1` (`None` maps to `from_index = 0`,
-//!   which drops everything — index 0 is a legal entry, so the marker
+//!   which drops everything - index 0 is a legal entry, so the marker
 //!   carries no off-by-one). Marker first, cache second.
-//! * `purge` — logical prefix removal, inclusive; marker first, cache
+//! * `purge` - logical prefix removal, inclusive; marker first, cache
 //!   second. Distinct from physical segment deletion, which stays
 //!   conservative.
-//! * `save_committed` / `read_committed` — the commit pointer persists for
+//! * `save_committed` / `read_committed` - the commit pointer persists for
 //!   real; restart re-derives nothing. 0.10 documents this as optional but
 //!   recommended; Kivi implements it (the `RaftCommitted` record already
 //!   exists) so a restart never reverts applied state behind reads.
@@ -58,7 +57,7 @@
 //! The WAL barrier is synchronous `std::fs` plus `fsync`. On a
 //! single-threaded Compio reactor blocking is forbidden, so barriers
 //! cross as bounded channel jobs with oneshot acks to the node-wide
-//! shared writer thread — the reactor yields while `fsync` runs
+//! shared writer thread - the reactor yields while `fsync` runs
 //! elsewhere. There is no thread per group: one writer serves every
 //! group on the node (RFC §60), batching concurrent groups' records into
 //! single physical batches.
@@ -74,9 +73,8 @@
 //! production apply path (`MutationIR` into `LiveTablet`) live in
 //! [`crate::state_machine`].
 
-use std::collections::BTreeSet;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::config::KiviTypeConfig;
 use crate::types::ConsensusGroupId;
@@ -121,11 +119,6 @@ pub enum StoreOpenError {
 /// façade ([`DurableRaftStore`]) over it, so one code path serves every
 /// group count and no OS thread is ever owned per group.
 ///
-/// Lightweight logical group view over physical consensus durability:
-/// one object per `OpenRaft` group implementing its storage traits, with
-/// no hidden writer thread inside the view itself (physical writing lives
-/// in the node-wide shared writer).
-///
 /// Both the single-group [`DurableRaftStore`] façade and the multi-group
 /// [`GroupRaftStore`](crate::shared::GroupRaftStore) implement this, so
 /// the owner machinery (proposals, barriers, peer RPCs, snapshots,
@@ -136,12 +129,6 @@ pub trait ConsensusLogStore:
     /// Installs the sidecar durability gate (wired after the peer mesh and
     /// sidecar store exist).
     fn set_gate(&mut self, gate: crate::gate::SidecarGate);
-    /// Returns the installed gate, if any.
-    fn gate(&self) -> Option<&crate::gate::SidecarGate>;
-    /// Returns the newest committed-membership voter set visible in the
-    /// retained log (newest-first scan). Empty when none survives — the
-    /// caller falls back to the state machine's snapshot membership.
-    fn membership_voters(&self) -> impl Future<Output = BTreeSet<u64>> + Send;
 }
 
 /// Durable single-group Raft log store: a thin façade over one
@@ -151,7 +138,7 @@ pub trait ConsensusLogStore:
 ///
 /// There is deliberately no per-group lane thread here (nor anywhere
 /// else): one OS thread per Raft group does not scale to many tablets, so
-/// every group — one or one thousand — shares the physical writer (see
+/// every group - one or one thousand - shares the physical writer (see
 /// [`crate::shared`]).
 ///
 /// The gate enforces the core invariant: a replica never reports a Raft
@@ -230,50 +217,11 @@ impl DurableRaftStore {
         })?;
         Ok(Self { view })
     }
-
-    /// Installs the sidecar durability gate (node open wires this after
-    /// the peer mesh and sidecar store exist; the log open itself stays
-    /// synchronous and runtime-free).
-    pub fn set_gate(&mut self, gate: crate::gate::SidecarGate) {
-        self.view.set_gate(gate);
-    }
-
-    /// Returns the installed gate, if any.
-    #[must_use]
-    pub fn gate(&self) -> Option<&crate::gate::SidecarGate> {
-        self.view.gate()
-    }
-
-    /// Returns the newest committed-membership voter set visible in the
-    /// retained log (scanned newest-first). Empty when no membership
-    /// entry survives (purged past, or never committed) — the caller
-    /// falls back to the state machine's snapshot membership, which
-    /// grounds every purge.
-    pub async fn membership_voters(&self) -> std::collections::BTreeSet<u64> {
-        self.view.membership_voters().await
-    }
-
-    /// Data directory path backing this store (operator introspection).
-    #[must_use]
-    pub fn data_dir_hint(&self) -> PathBuf {
-        // The lane owns its directory; this hint exists so health
-        // endpoints can name the files without reaching into the lane.
-        PathBuf::from(kivi_durability::node::WAL_DIR_NAME)
-            .join(kivi_durability::wal::lane_dir_name(CONSENSUS_LANE))
-    }
 }
 
 impl ConsensusLogStore for DurableRaftStore {
     fn set_gate(&mut self, gate: crate::gate::SidecarGate) {
-        DurableRaftStore::set_gate(self, gate);
-    }
-
-    fn gate(&self) -> Option<&crate::gate::SidecarGate> {
-        DurableRaftStore::gate(self)
-    }
-
-    async fn membership_voters(&self) -> BTreeSet<u64> {
-        DurableRaftStore::membership_voters(self).await
+        self.view.set_gate(gate);
     }
 }
 
@@ -402,7 +350,7 @@ mod tests {
 
     /// Builds one deterministic test command: counter `n += value` with
     /// its exact expected outcome.
-    pub(crate) fn test_command(value: i64) -> crate::command::ConsensusCommand {
+    fn test_command(value: i64) -> crate::command::ConsensusCommand {
         use kivi_state::{Key, Mutation, MutationEnvelope, ObjectVersion, OperationResult};
         use kivi_types::{
             RequestIdentity, RequestSeq, SessionId, TabletAuthority, TabletEpoch, WallTimestamp,
@@ -437,9 +385,9 @@ mod tests {
     }
 
     /// Full framework path: a live single-voter group on the durable
-    /// store elects, commits, truncates logically, and survives reopen —
-    /// the log-conflict scenario against real barriers, on the Compio
-    /// runtime with no Tokio anywhere.
+    /// store elects, commits through real log barriers, and survives
+    /// reopen - the log-conflict scenario against real barriers, on the
+    /// Compio runtime with no Tokio anywhere.
     #[test]
     fn durable_log_store_serves_a_live_group() {
         block_on(async {
@@ -447,7 +395,7 @@ mod tests {
 
             use openraft::Raft;
 
-            use crate::config::{KiviTypeConfig, spike_config};
+            use crate::config::spike_config;
             use crate::spike::{MemStateMachine, StubNetworkFactory};
             let scratch = tempfile::tempdir().expect("scratch");
             let group_dir = scratch.path().join("node-a");
@@ -470,7 +418,6 @@ mod tests {
             .await
             .expect("initializes");
             wait_for_leader(&raft, 1).await;
-            // Drive committed history through the real log and barrier.
             for value in [10i64, 20, 30] {
                 let response = raft
                     .client_write(test_command(value))
@@ -486,7 +433,7 @@ mod tests {
                 );
             }
             // Membership at 0, the leader's initial blank at 1, then the
-            // three writes at 2–4.
+            // three writes at 2-4.
             assert_eq!(store.cached_indexes().await, vec![0, 1, 2, 3, 4]);
             raft.shutdown().await.expect("shutdown");
 
@@ -505,11 +452,14 @@ mod tests {
             .await
             .expect("raft respawns");
             wait_for_leader(&raft, 1).await;
-            let response = raft
-                .client_write(test_command(40))
-                .await
-                .expect("writes continue after reopen");
-            assert_eq!(response.log_id.index, 5);
+            assert_eq!(
+                raft.client_write(test_command(40))
+                    .await
+                    .expect("writes continue after reopen")
+                    .log_id
+                    .index,
+                5
+            );
             assert_eq!(store.cached_indexes().await, vec![0, 1, 2, 3, 4, 5]);
             raft.shutdown().await.expect("shutdown");
         });
@@ -599,8 +549,9 @@ mod tests {
     /// Recovery fold: entries, logical truncate/purge markers, vote, and
     /// commit pointer rebuild exactly across reopen (direct trait calls
     /// with framework-constructed callbacks are impossible, so this drives
-    /// `RaftRecord` batches through the lane and asserts the fold — the
-    /// same bytes the live paths above persist).
+    /// `RaftRecord` batches through the lane and asserts the fold - the
+    /// same bytes the live paths above persist). Foreign-group records on
+    /// the shared lane never leak across.
     #[test]
     fn recovery_fold_rebuilds_logical_history() {
         block_on(async {
@@ -625,14 +576,15 @@ mod tests {
             let state = reader.get_log_state().await.expect("log state");
             assert_eq!(state.last_log_id.map(|id| id.index), Some(5));
             assert_eq!(state.last_purged_log_id.map(|id| id.index), Some(2));
-            let entries = reader
-                .try_get_log_entries(3..6)
-                .await
-                .expect("reads suffix");
-            assert_eq!(entries.len(), 3);
-            // Foreign-group records on the shared lane never leak across.
-            let foreign = open(&dir, GROUP_B);
-            assert_eq!(foreign.cached_indexes().await, Vec::<u64>::new());
+            assert_eq!(
+                reader
+                    .try_get_log_entries(3..6)
+                    .await
+                    .expect("reads suffix")
+                    .len(),
+                3
+            );
+            assert!(open(&dir, GROUP_B).cached_indexes().await.is_empty());
         });
     }
 

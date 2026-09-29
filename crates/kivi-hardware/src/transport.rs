@@ -41,38 +41,36 @@
 //! Kivi therefore treats RDMA as a capability: absent means the normal
 //! transport, and the fallback is not a slower path but *the* path.
 
-/// One RDMA device the platform offers.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RdmaDevice {
-    /// Kernel name, for example `mlx5_0`.
-    pub name: String,
-    /// Port the device offers, for example `1`.
-    pub port: u8,
-    /// Memory node the device is closest to, when the platform says.
-    pub numa_node: Option<crate::topology::NumaNodeId>,
-    /// Link layer the port uses.
-    pub link_layer: String,
-}
-
-/// RDMA devices present on this machine.
+/// RDMA ports present on this machine, as `device/port` names.
 ///
 /// Empty means the machine has none, which is the overwhelming majority of
 /// deployments and is not a degraded mode: Kivi's peer transport is the
-/// normal transport and always works.
+/// normal transport and always works. Presence is all that is recorded -
+/// nothing in Kivi reads a port, so enumerating one any deeper would only
+/// invite a caller to depend on a field Kivi has no contract for.
 #[must_use]
 pub fn discover_rdma() -> Vec<String> {
-    discover()
-        .iter()
-        .map(|device| format!("{}/p{}", device.name, device.port))
-        .collect()
-}
-
-/// RDMA devices present, with their detail.
-#[must_use]
-pub fn discover() -> Vec<RdmaDevice> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        read_infiniband()
+        let Ok(entries) = std::fs::read_dir("/sys/class/infiniband") else {
+            return Vec::new();
+        };
+        let mut out: Vec<String> = entries
+            .filter_map(Result::ok)
+            .flat_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let Ok(ports) = std::fs::read_dir(entry.path().join("ports")) else {
+                    return Vec::new();
+                };
+                ports
+                    .filter_map(Result::ok)
+                    .filter_map(|port| port.file_name().to_str()?.parse::<u8>().ok())
+                    .map(move |port| format!("{name}/p{port}"))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        out.sort_unstable();
+        out
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
@@ -80,66 +78,5 @@ pub fn discover() -> Vec<RdmaDevice> {
         // one would need a different mechanism entirely, and pretending
         // otherwise would produce a capability report that lies.
         Vec::new()
-    }
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn read_infiniband() -> Vec<RdmaDevice> {
-    let mut devices: Vec<RdmaDevice> = Vec::new();
-    let Ok(entries) = std::fs::read_dir("/sys/class/infiniband") else {
-        return devices;
-    };
-    for entry in entries.filter_map(Result::ok) {
-        let path = entry.path();
-        let Ok(name) = entry.file_name().into_string() else {
-            continue;
-        };
-        let numa_node = std::fs::read_to_string(path.join("device/numa_node"))
-            .ok()
-            .and_then(|raw| raw.trim().parse::<i32>().ok())
-            // A negative value is the kernel's "no affinity", which is a
-            // different fact from node 0.
-            .filter(|node| *node >= 0)
-            .map(|node| crate::topology::NumaNodeId(node.cast_unsigned()));
-        let Ok(ports) = std::fs::read_dir(path.join("ports")) else {
-            continue;
-        };
-        for port in ports.filter_map(Result::ok) {
-            let Some(port) = port.file_name().to_str().and_then(|n| n.parse::<u8>().ok()) else {
-                continue;
-            };
-            let link_layer = std::fs::read_to_string(path.join(format!("ports/{port}/link_layer")))
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            devices.push(RdmaDevice {
-                name: name.clone(),
-                port,
-                numa_node,
-                link_layer,
-            });
-        }
-    }
-    devices.sort_by(|a, b| (&a.name, a.port).cmp(&(&b.name, b.port)));
-    devices
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn discovery_answers_on_every_platform() {
-        // Empty is the normal answer. It must be a value, not a failure.
-        let _ = discover();
-        let _ = discover_rdma();
-    }
-
-    #[test]
-    fn every_device_is_fully_described() {
-        for device in discover() {
-            assert!(!device.name.is_empty());
-            assert!(device.link_layer.len() < 16, "sanity on a sysfs read");
-        }
     }
 }

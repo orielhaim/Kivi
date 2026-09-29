@@ -1,9 +1,7 @@
-//! Baseline throughput benchmarks: direct tablet cost vs. embedded-client
-//! channel cost. Repeatable locally with `cargo bench -p kivi-engine`.
+//! Throughput benchmarks: direct tablet cost vs. embedded-client channel cost
+//! vs. the networked worker's embedded bridge.
 //!
-//! These numbers pin the pre-optimization baseline so future runtime, index,
-//! and allocator changes measure rather than guess. Run in release mode for
-//! meaningful figures; debug numbers only prove the harness works.
+//! Run in release mode; debug numbers only prove the harness works.
 
 use divan::{Bencher, black_box, counter::ItemsCount};
 
@@ -37,23 +35,28 @@ fn live_tablet() -> LiveTablet {
     LiveTablet::from_descriptor(&descriptor, authority).expect("live tablet")
 }
 
-fn root_engine() -> LocalEngine {
+/// The single active root tablet every bench here serves.
+fn root_directory() -> DirectorySnapshot {
     let tablet = TabletId::from_u64(1);
-    let directory = DirectorySnapshot::bootstrap(
+    DirectorySnapshot::bootstrap(
         NS,
         tablet,
         PartitionRange::Hash(HashPrefix::new(0, 0).expect("root")),
         TabletEpoch::INITIAL,
         WriteGuardGeneration::INITIAL,
     )
-    .and_then(|s| s.stage(tablet))
-    .and_then(|s| s.activate(tablet))
-    .expect("active root");
+    .and_then(|staged| staged.stage(tablet))
+    .and_then(|staged| staged.activate(tablet))
+    .expect("active root")
+}
+
+/// Channel-only engine: one worker owning the root tablet, no sockets.
+fn root_engine() -> LocalEngine {
     LocalEngine::start(EngineConfig {
         namespace: NS,
         hardware: kivi_engine::HardwareConfig::default(),
-        directory,
-        placement: Placement::new([(tablet, WorkerId::from_u64(0))]),
+        directory: root_directory(),
+        placement: Placement::new([(TabletId::from_u64(1), WorkerId::from_u64(0))]),
         worker_count: 1,
         request_capacity: 1024,
         chunks: kivi_engine::ChunkFabricConfig::default(),
@@ -169,26 +172,15 @@ fn client_get_chunked(bencher: Bencher) {
 }
 
 /// Networked engine: one worker serving loopback TCP plus the embedded
-/// channel bridge. `LocalClient` calls below traverse the bridge — the
-/// event-driven wakeup path — so these benches pin the A1 latency floor
-/// fix (the old 100 µs bridge poll quantum showed up here directly).
+/// channel bridge. `LocalClient` calls below traverse the bridge, so these
+/// measure the embedded ingress path as a networked worker experiences it -
+/// the event-driven wakeup, not a blocking `select!`.
 fn net_engine() -> LocalEngine {
-    let tablet = TabletId::from_u64(1);
-    let directory = DirectorySnapshot::bootstrap(
-        NS,
-        tablet,
-        PartitionRange::Hash(HashPrefix::new(0, 0).expect("root")),
-        TabletEpoch::INITIAL,
-        WriteGuardGeneration::INITIAL,
-    )
-    .and_then(|s| s.stage(tablet))
-    .and_then(|s| s.activate(tablet))
-    .expect("active root");
     LocalEngine::start(EngineConfig {
         namespace: NS,
         hardware: kivi_engine::HardwareConfig::default(),
-        directory,
-        placement: Placement::new([(tablet, WorkerId::from_u64(0))]),
+        directory: root_directory(),
+        placement: Placement::new([(TabletId::from_u64(1), WorkerId::from_u64(0))]),
         worker_count: 1,
         request_capacity: 1024,
         chunks: kivi_engine::ChunkFabricConfig::default(),
@@ -252,18 +244,9 @@ fn client_set_range_inline(bencher: Bencher) {
 }
 
 /// Medium-value round trip through the integrated fabric: a 2 KiB value
-/// stages in the per-worker memory fabric on set (arena path, not the
-/// 16 B inline `PutBytes` fast path) and resolves on get. Compare
-/// against `client_get` for the fabric staging overhead.
-///
-/// Overhead ratio (DEBUG dev-profile run, `--bench --sample-count 5`
-/// `--sample-size 10`; NOT for publication, release re-measures):
-/// `set_get_medium_fabric` median ≈ 39.6 µs per 2-op pair
-/// (≈19.8 µs/op) vs `client_get` median ≈ 23.2 µs per 16 B get →
-/// ≈0.9× per op (a repeat run measured ≈1.0×; debug noise dominates).
-/// In debug builds the fixed engine round-trip cost (channel plus
-/// tablet execute) dwarfs the 2 KiB fabric staging delta; release runs
-/// separate the memcpy and arena-insert terms.
+/// stages in the per-worker memory fabric on set (arena path, not the inline
+/// 16 B path) and resolves on get. Compare against `client_get` for the
+/// fabric staging overhead.
 const MEDIUM_LEN: usize = 2048;
 
 #[divan::bench]

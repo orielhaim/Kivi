@@ -14,24 +14,8 @@ use kivi_client::ordered::{
     ScanDirection, ScanOptions, ScanProjection,
 };
 use kivi_lab::cluster::Cluster;
+use kivi_lab::testkit::{NS, spread_key};
 use kivi_state::{IndexId, IndexKind, Key};
-use kivi_types::NamespaceId;
-
-const NS: NamespaceId = NamespaceId::from_u64(1);
-
-/// Keys spread over the genesis tiling (4 tablets: [0,64), [64,128),
-/// [128,192), [192,+inf)): first-byte prefixes per tablet.
-fn spread_key(tablet: u8, index: usize) -> Vec<u8> {
-    let prefix = match tablet {
-        0 => 0x10u8,
-        1 => b'A',
-        2 => 0x90u8,
-        _ => 0xF0u8,
-    };
-    let mut key = vec![prefix];
-    key.extend_from_slice(format!("{index:06}").as_bytes());
-    key
-}
 
 fn put(client: &kivi_client::NativeClient, key: &[u8], value: &[u8]) {
     client
@@ -614,7 +598,7 @@ fn ordered_automatic_split_then_merge() {
     let live = cluster.live_index();
     let client = cluster.client();
     // Background tablets stay quiet: 20 small keys each (above the merge
-    // object threshold, below the split byte threshold — never eligible).
+    // object threshold, below the split byte threshold - never eligible).
     for tablet in [0u8, 2, 3] {
         for index in 0..20usize {
             put(&client, &spread_key(tablet, index), b"v");

@@ -4,7 +4,7 @@
 //! directories form one tablet group over real peer TCP. These are the
 //! money tests: real election, `kill -9` leader failover, lost-response
 //! exactly-once across failover, full-cluster restart, and incarnation
-//! discipline — all against real processes, never in-process Raft.
+//! discipline - all against real processes, never in-process Raft.
 //!
 //! Each test spawns its own cluster (fresh directories, fixed test
 //! cluster id); drops kill every child, so no test leaks processes.
@@ -16,12 +16,8 @@
 use std::time::Duration;
 
 use kivi_lab::cluster::Cluster;
-use kivi_state::Key;
+use kivi_lab::testkit::key;
 use kivi_types::{RequestSeq, SessionId};
-
-fn key(name: &str) -> Key {
-    Key::from(name)
-}
 
 /// Applied index of the current leader (the commit watermark followers
 /// must reach).
@@ -97,7 +93,7 @@ fn lost_response_failover_is_exactly_once() {
     let leader = cluster.wait_leader();
     let session = SessionId::from_u128(0x505E_D9E5_0000_0001);
     // First attempt races the kill: it may commit (response lost) or
-    // fail outright — both are the ambiguous-delivery case. The client
+    // fail outright - both are the ambiguous-delivery case. The client
     // is built before the scope so the kill (mutable) never contends
     // with the attempt's borrow.
     let racing = cluster.client_with_session(session);

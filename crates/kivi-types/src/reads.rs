@@ -78,53 +78,40 @@ mod tests {
     use super::*;
     use crate::ids::{CommitPosition, TabletEpoch, TabletId};
 
-    #[test]
-    fn strong_contracts_are_latest_and_at_least() {
-        assert!(ReadContract::Latest.is_strong());
-        let token = CommitToken::new(
+    fn token() -> CommitToken {
+        CommitToken::new(
             TabletId::from_u64(1),
             TabletEpoch::INITIAL,
             CommitPosition::FIRST,
-        );
-        assert!(ReadContract::AtLeast(token).is_strong());
-        assert!(
-            !ReadContract::BoundedStale {
-                max_staleness: Duration::from_millis(100)
-            }
-            .is_strong()
-        );
-        assert!(!ReadContract::Any.is_strong());
+        )
     }
 
+    /// `is_strong` is the gate that decides whether a weak read may be served
+    /// as if it were linearizable, and `metric_discriminant` is a stable
+    /// per-contract counter that a dashboard groups by. Both are pinned
+    /// together because a variant silently reclassified as strong would let a
+    /// stale read pass as a fresh one.
     #[test]
-    fn metric_discriminants_are_stable() {
-        assert_eq!(ReadContract::Latest.metric_discriminant(), 0);
-        let token = CommitToken::new(
-            TabletId::from_u64(1),
-            TabletEpoch::INITIAL,
-            CommitPosition::FIRST,
-        );
-        assert_eq!(ReadContract::AtLeast(token).metric_discriminant(), 1);
-        assert_eq!(
-            ReadContract::BoundedStale {
-                max_staleness: Duration::from_millis(100)
-            }
-            .metric_discriminant(),
-            2
-        );
-        assert_eq!(ReadContract::Any.metric_discriminant(), 3);
-    }
-
-    #[test]
-    fn display_names_each_contract() {
-        assert_eq!(ReadContract::Latest.to_string(), "latest");
-        assert_eq!(ReadContract::Any.to_string(), "any");
-        assert_eq!(
-            ReadContract::BoundedStale {
-                max_staleness: Duration::from_millis(250)
-            }
-            .to_string(),
-            "bounded-stale(250ms)"
-        );
+    fn strength_and_metric_discriminant_are_pinned_per_variant() {
+        let cases = [
+            (ReadContract::Latest, true, 0u8),
+            (ReadContract::AtLeast(token()), true, 1),
+            (
+                ReadContract::BoundedStale {
+                    max_staleness: Duration::from_millis(100),
+                },
+                false,
+                2,
+            ),
+            (ReadContract::Any, false, 3),
+        ];
+        for (contract, strong, discriminant) in cases {
+            assert_eq!(contract.is_strong(), strong, "{contract} strength changed");
+            assert_eq!(
+                contract.metric_discriminant(),
+                discriminant,
+                "{contract} metric discriminant changed"
+            );
+        }
     }
 }

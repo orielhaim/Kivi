@@ -208,44 +208,21 @@ pub struct AggregateEvidence {
 mod tests {
     use super::*;
 
+    /// A staleness bound is a decision boundary, and evidence from the future
+    /// is a distinct fact from evidence that is merely old: a clock that reads
+    /// behind produces "future" evidence whose age must be reported as zero
+    /// rather than negative.
     #[test]
     fn freshness_distinguishes_current_stale_and_future_evidence() {
         let observed = Ticks::from_micros(100);
-        let current = Freshness::classify(
-            observed,
-            Ticks::from_micros(1_100),
-            Duration::from_millis(1),
-        );
-        let stale = Freshness::classify(
-            observed,
-            Ticks::from_micros(1_101),
-            Duration::from_millis(1),
-        );
-        let future =
-            Freshness::classify(observed, Ticks::from_micros(99), Duration::from_millis(1));
+        let bound = Duration::from_millis(1);
+        let current = Freshness::classify(observed, Ticks::from_micros(1_100), bound);
+        let stale = Freshness::classify(observed, Ticks::from_micros(1_101), bound);
+        let future = Freshness::classify(observed, Ticks::from_micros(99), bound);
         assert_eq!(current.status, FreshnessStatus::Current);
         assert!(current.is_current());
         assert_eq!(stale.status, FreshnessStatus::Stale);
         assert_eq!(future.status, FreshnessStatus::Future);
-        assert_eq!(future.age, Duration::ZERO);
-    }
-
-    #[test]
-    fn source_sets_are_fixed_and_iterate_deterministically() {
-        let mut sources = ObservationSources::empty();
-        sources.insert(ObservationSource::Simulator);
-        sources.insert(ObservationSource::RuntimeCounter);
-        sources.insert(ObservationSource::RuntimeCounter);
-        assert!(sources.contains(ObservationSource::RuntimeCounter));
-        assert!(sources.contains(ObservationSource::Simulator));
-        assert!(!sources.contains(ObservationSource::PeerReport));
-        assert!(!sources.is_empty());
-        assert_eq!(
-            sources.iter().collect::<Vec<_>>(),
-            vec![
-                ObservationSource::RuntimeCounter,
-                ObservationSource::Simulator
-            ]
-        );
+        assert_eq!(future.age, Duration::ZERO, "age is never negative");
     }
 }

@@ -19,7 +19,7 @@
 //!   [`ScannedValue::Chunked`] descriptors resolved through the normal
 //!   `get_stream` path. An inline value that does not fit the remaining
 //!   budget stops the page (it becomes the resume point), unless the page
-//!   is still empty — then it answers once as [`ScannedValue::Oversize`]
+//!   is still empty - then it answers once as [`ScannedValue::Oversize`]
 //!   so the scan always makes progress.
 //! * The page carries `exhausted` plus `last_key`: resume by scanning from
 //!   just after `last_key` (the cross-tablet cursor owns that increment).

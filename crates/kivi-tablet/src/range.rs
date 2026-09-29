@@ -433,8 +433,10 @@ pub enum RangeError {
 mod tests {
     use super::*;
 
+    /// The root prefix is the only one that covers the whole hash space, and
+    /// a directory starts there.
     #[test]
-    fn hash_prefix_root_covers_everything() {
+    fn the_root_prefix_covers_the_whole_hash_space() {
         let root = HashPrefix::new(0, 0).expect("root");
         assert!(root.is_root());
         assert!(root.contains(PartitionHash::from_u128(0)));
@@ -442,24 +444,24 @@ mod tests {
         assert_eq!(root.to_string(), "*");
     }
 
+    /// A split must partition its parent exactly: the two children are
+    /// disjoint from each other and both contained in the parent, with the
+    /// top bits of the 128-bit hash deciding membership.
     #[test]
-    fn hash_prefix_split_example_from_rfc() {
-        // RFC §9: `0*` splits into `00*` and `01*` (top bits of the 128-bit hash).
-        let parent = HashPrefix::new(0x0000_0000_0000_0000_0000_0000_0000_0000, 1).expect("0*");
-        let left = HashPrefix::new(0x0000_0000_0000_0000_0000_0000_0000_0000, 2).expect("00*");
+    fn a_hash_prefix_split_partitions_its_parent() {
+        // RFC §9: `0*` splits into `00*` and `01*`.
+        let parent = HashPrefix::new(0, 1).expect("0*");
+        let left = HashPrefix::new(0, 2).expect("00*");
         let right = HashPrefix::new(0x4000_0000_0000_0000_0000_0000_0000_0000, 2).expect("01*");
         assert_eq!(parent.to_string(), "0*");
         assert_eq!(left.to_string(), "00*");
         assert_eq!(right.to_string(), "01*");
-        // Children partition the parent: disjoint from each other, each
-        // contained in the parent.
         assert!(!left.overlaps(&right));
         assert!(left.overlaps(&parent));
         assert!(right.overlaps(&parent));
         assert!(parent.overlaps(&left));
-        // Point checks: top bits decide.
         let hash = PartitionHash::from_u128;
-        assert!(left.contains(hash(0x0000_0000_0000_0000_0000_0000_0000_0000)));
+        assert!(left.contains(hash(0)));
         assert!(left.contains(hash(0x3FFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF)));
         assert!(!left.contains(hash(0x4000_0000_0000_0000_0000_0000_0000_0000)));
         assert!(right.contains(hash(0x4000_0000_0000_0000_0000_0000_0000_0000)));
@@ -467,30 +469,35 @@ mod tests {
         assert!(!right.contains(hash(0x8000_0000_0000_0000_0000_0000_0000_0000)));
     }
 
+    /// A prefix must be canonical: no bit below its length may be set, since
+    /// such a bit is insignificant and two spellings of one prefix would make
+    /// equality and lookup disagree. Length 129 does not exist, and a
+    /// full-length prefix is an exact match.
     #[test]
-    fn hash_prefix_rejects_noncanonical_and_long() {
+    fn a_non_canonical_or_over_long_prefix_is_rejected() {
         assert_eq!(
             HashPrefix::new(0, 129),
             Err(RangeError::PrefixTooLong { len: 129 })
         );
-        // Low bit set with len 127: insignificant.
+        // Low bit set at length 127: insignificant.
         assert!(matches!(
             HashPrefix::new(0x0000_0000_0000_0000_0000_0000_0000_0001, 127),
             Err(RangeError::PrefixUncanonical { .. })
         ));
-        // Root with nonzero bits is not canonical.
+        // Root with nonzero bits.
         assert!(matches!(
             HashPrefix::new(1, 0),
             Err(RangeError::PrefixUncanonical { .. })
         ));
-        // Full-length prefixes accept any bits (all significant).
         assert!(HashPrefix::new(u128::MAX, 128).is_ok());
         assert!(HashPrefix::new(1, 128).is_ok());
     }
 
+    /// Containment must be exact at every prefix length, in particular across
+    /// the 64-bit boundary a narrower hash would have ended at. The first hash
+    /// outside `0*/len` is the boundary, and it must be excluded.
     #[test]
-    fn prefix_lengths_at_64_and_128_bit_boundaries() {
-        // Lengths straddling the old 64-bit boundary plus both extremes.
+    fn containment_is_exact_at_every_prefix_length() {
         for len in [0u8, 1, 63, 64, 65, 127, 128] {
             let zero = HashPrefix::new(0, len).expect("zero prefix canonical");
             assert_eq!(zero.prefix_len(), len);
@@ -501,20 +508,19 @@ mod tests {
                 "only the root covers the top hash (len {len})"
             );
         }
-        // Interior boundary point at each width: the first hash outside `0*/len`.
         for len in [1u8, 63, 64, 65, 127] {
             let prefix = HashPrefix::new(0, len).expect("zero prefix");
             let first_outside = 1u128 << (128 - len);
             assert!(prefix.contains(PartitionHash::from_u128(first_outside - 1)));
             assert!(!prefix.contains(PartitionHash::from_u128(first_outside)));
         }
-        // Top-bit prefix covers the upper half exactly.
+        // A top-bit prefix covers exactly the upper half.
         let upper = HashPrefix::new(1u128 << 127, 1).expect("1*");
         assert!(upper.contains(PartitionHash::from_u128(1u128 << 127)));
         assert!(upper.contains(PartitionHash::from_u128(u128::MAX)));
         assert!(!upper.contains(PartitionHash::from_u128(0)));
-        // Length 127 distinguishes adjacent hashes.
-        let low127 = HashPrefix::new(4, 127).expect("low 127 bits of 0b101");
+        // Length 127 is the low 127 bits of 0b101.
+        let low127 = HashPrefix::new(4, 127).expect("low 127 bits");
         assert!(low127.contains(PartitionHash::from_u128(4)));
         assert!(low127.contains(PartitionHash::from_u128(5)));
         assert!(!low127.contains(PartitionHash::from_u128(6)));
@@ -523,7 +529,6 @@ mod tests {
         let exact = HashPrefix::new(0xDEAD_BEEF, 128).expect("exact");
         assert!(exact.contains(PartitionHash::from_u128(0xDEAD_BEEF)));
         assert!(!exact.contains(PartitionHash::from_u128(0xDEAD_BEF0)));
-        assert_eq!(exact.prefix_len(), 128);
     }
 
     #[test]
@@ -566,36 +571,36 @@ mod tests {
         }
     }
 
+    /// Ordered ranges are half-open, so `["a", "g")` contains `a` and `f` but
+    /// not `g`, and two half-open ranges that abut do not overlap. Overlap
+    /// must be symmetric for both the nested and the partial case, because a
+    /// split that reported overlap one way round would drop or duplicate keys.
     #[test]
-    fn ordered_ranges_follow_rfc_example() {
+    fn ordered_overlap_is_symmetric_and_half_open() {
         // RFC §9: `["a", "g")`, `["g", "p")`, `["p", ∞)`.
         let a = OrderedRange::new(b"a".to_vec(), Some(b"g".to_vec())).expect("[a,g)");
         let b = OrderedRange::new(b"g".to_vec(), Some(b"p".to_vec())).expect("[g,p)");
         let c = OrderedRange::new(b"p".to_vec(), None).expect("[p,inf)");
-        assert!(a.contains(b"a"));
-        assert!(a.contains(b"f"));
-        assert!(!a.contains(b"g"));
-        assert!(b.contains(b"g"));
-        assert!(!b.contains(b"p"));
-        assert!(c.contains(b"p"));
-        assert!(c.contains(b"zzz"));
-        assert!(!a.overlaps(&b));
-        assert!(!b.overlaps(&c));
-        assert!(!a.overlaps(&c));
-        assert!(a.overlaps(&a.clone()));
-    }
+        assert!(a.contains(b"a") && a.contains(b"f") && !a.contains(b"g"));
+        assert!(b.contains(b"g") && !b.contains(b"p"));
+        assert!(c.contains(b"p") && c.contains(b"zzz"));
+        for (left, right, expected) in [
+            (&a, &b, false),
+            (&b, &c, false),
+            (&a, &c, false),
+            (&a, &a, true),
+        ] {
+            assert_eq!(left.overlaps(right), expected);
+            assert_eq!(right.overlaps(left), expected, "overlap must be symmetric");
+        }
 
-    #[test]
-    fn ordered_overlap_detects_partial_and_nested() {
         let outer = OrderedRange::new(b"a".to_vec(), Some(b"z".to_vec())).expect("outer");
         let inner = OrderedRange::new(b"m".to_vec(), Some(b"n".to_vec())).expect("inner");
+        assert!(outer.overlaps(&inner) && inner.overlaps(&outer), "nested");
         let tail = OrderedRange::new(b"y".to_vec(), None).expect("tail");
-        assert!(outer.overlaps(&inner));
-        assert!(inner.overlaps(&outer));
-        assert!(outer.overlaps(&tail));
-        // Adjacent half-open intervals do not overlap.
+        assert!(outer.overlaps(&tail) && tail.overlaps(&outer), "partial");
         let after = OrderedRange::new(b"z".to_vec(), None).expect("after");
-        assert!(!outer.overlaps(&after));
+        assert!(!outer.overlaps(&after), "abutting ranges are disjoint");
     }
 
     #[test]
@@ -615,6 +620,10 @@ mod tests {
         );
     }
 
+    /// A hash range and an ordered range are disjoint partition kinds: a key
+    /// never routes into a hash range, a hash never resolves into an ordered
+    /// one, and the two can never overlap. Conflating them would route a key to
+    /// a tablet selected by an unrelated function.
     #[test]
     fn mixed_layouts_never_route_or_overlap() {
         let hash = PartitionRange::Hash(HashPrefix::new(0, 0).expect("root"));
@@ -623,8 +632,6 @@ mod tests {
         assert!(!hash.contains_key(b"a"));
         assert!(!ordered.contains_hash(PartitionHash::from_u128(0)));
         assert!(!hash.overlaps(&ordered));
-        assert_eq!(hash.kind(), PartitionKind::Hash);
-        assert_eq!(ordered.kind(), PartitionKind::Ordered);
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! [`ChunkId`] is a content address with a fixed, pinned construction (RFC
 //! §29). [`PartitionHash`] is the opposite: an opaque 128-bit routing input
 //! whose producing algorithm is intentionally undecided. The directory routes
-//! on these values without ever choosing — or depending on — a hash function,
+//! on these values without ever choosing - or depending on - a hash function,
 //! so adopting a concrete stable partition hash later changes producers only,
 //! never the routing model.
 
@@ -24,7 +24,7 @@ pub const MANIFEST_DOMAIN_TAG: &[u8] = b"KIVI-MANIFEST-V1";
 
 /// 256-bit content address of an immutable chunk (RFC §28, §29).
 ///
-/// Construction (pinned — this formula is the durable contract):
+/// Construction (pinned - this formula is the durable contract):
 ///
 /// ```text
 /// ChunkId = BLAKE3("KIVI-CHUNK-V1" || le64(security_domain) || chunk_bytes)
@@ -82,7 +82,7 @@ impl fmt::Display for ChunkId {
 /// 256-bit content address of an immutable chunk manifest (ordered chunk
 /// list plus chunking parameters).
 ///
-/// Construction (pinned — this formula is the durable contract):
+/// Construction (pinned - this formula is the durable contract):
 ///
 /// ```text
 /// ManifestId = BLAKE3("KIVI-MANIFEST-V1" || le64(security_domain) || canonical_manifest_bytes)
@@ -141,7 +141,7 @@ impl fmt::Display for ManifestId {
 /// Stable partition hash routing input: the 128-bit value a key maps to before
 /// the adaptive prefix tree routes it to a tablet (RFC §9).
 ///
-/// Deliberately opaque — no algorithm is pinned here. Producers (a future
+/// Deliberately opaque - no algorithm is pinned here. Producers (a future
 /// key-hash layer) compute these; the directory only compares prefixes of
 /// them. Fixing 128 bits now (rather than 64) reserves the full prefix space
 /// for tablet growth without ever rehashing: deeper splits consume more bits
@@ -187,42 +187,34 @@ impl fmt::Display for PartitionHash {
 mod tests {
     use super::*;
 
+    /// All-zero is the invalid sentinel for both content addresses, and the
+    /// rendered form is exactly 64 lowercase hex digits - the width matters,
+    /// because a shorter rendering would collide two distinct addresses in a
+    /// log or a filename.
     #[test]
-    fn zero_is_invalid_and_nonzero_is_valid() {
+    fn content_addresses_are_fixed_width_hex_with_a_zero_sentinel() {
+        let chunk = ChunkId::from_bytes([0xABu8; 32]);
         assert!(!ChunkId::ZERO.is_valid());
-        assert!(ChunkId::from_bytes([1; 32]).is_valid());
+        assert!(chunk.is_valid());
+        assert_eq!(chunk.as_bytes(), &[0xABu8; 32]);
+        assert_eq!(<[u8; 32]>::from(chunk), [0xABu8; 32]);
+        assert_eq!(chunk.to_string(), "ab".repeat(32));
+
+        let manifest = ManifestId::from_bytes([0xCDu8; 32]);
         assert!(!ManifestId::ZERO.is_valid());
-        assert!(ManifestId::from_bytes([1; 32]).is_valid());
+        assert!(manifest.is_valid());
+        assert_eq!(manifest.to_string(), "cd".repeat(32));
+
+        // Ordering is byte-lexicographic, which is what manifest sorting relies on.
+        assert!(ChunkId::from_bytes([0x00; 32]) < ChunkId::from_bytes([0xFF; 32]));
+        assert!(ManifestId::ZERO < manifest);
     }
 
+    /// The routing hash renders as 32 hex digits and round-trips as a `u128`.
+    /// It is compared by prefix for routing, so a rendering that dropped
+    /// leading zeros would make two distinct hashes print identically.
     #[test]
-    fn manifest_ids_display_as_64_hex_chars() {
-        let id = ManifestId::from_bytes([0xCDu8; 32]);
-        assert_eq!(id.to_string(), "cd".repeat(32));
-        assert!(ManifestId::ZERO < id);
-    }
-
-    #[test]
-    fn bytes_round_trip_and_display_is_64_hex_chars() {
-        let bytes = [0xABu8; 32];
-        let id = ChunkId::from_bytes(bytes);
-        assert_eq!(id.as_bytes(), &bytes);
-        assert_eq!(<[u8; 32]>::from(id), bytes);
-        let text = id.to_string();
-        assert_eq!(text.len(), 64);
-        assert!(text.bytes().all(|b| b.is_ascii_hexdigit()));
-        assert_eq!(text, "ab".repeat(32));
-    }
-
-    #[test]
-    fn ordering_is_byte_lexicographic_for_manifest_sorting() {
-        let low = ChunkId::from_bytes([0x00; 32]);
-        let high = ChunkId::from_bytes([0xFF; 32]);
-        assert!(low < high);
-    }
-
-    #[test]
-    fn partition_hash_round_trips_as_128_bit_hex() {
+    fn partition_hash_renders_as_32_hex_digits() {
         let hash = PartitionHash::from_u128(0x1234_ABCD);
         assert_eq!(hash.as_u128(), 0x1234_ABCD);
         assert_eq!(u128::from(hash), 0x1234_ABCD);

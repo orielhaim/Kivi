@@ -6,86 +6,22 @@
 //! Channel-only engines (plain worker threads, no sockets): the embedded
 //! path exercises the same worker/chunk-lane/checkpoint flow as production.
 
+mod harness;
+
 use std::time::{Duration, Instant};
 
-use kivi_engine::{
-    ChunkFabricConfig, DurabilityMode, DurableConfig, EngineConfig, LocalEngine, Placement,
-    RedundancyAdminSnapshot,
+use harness::{
+    await_current, config, durable_config, pattern_bytes, root_placement, root_snapshot,
 };
+use kivi_engine::{ChunkFabricConfig, LocalEngine, RedundancyAdminSnapshot};
 use kivi_state::Key;
-use kivi_tablet::{DirectorySnapshot, HashPrefix, PartitionRange};
-use kivi_types::{NamespaceId, TabletEpoch, TabletId, WorkerId, WriteGuardGeneration};
-
-const NS: NamespaceId = NamespaceId::from_u64(1);
-const TABLET: TabletId = TabletId::from_u64(1);
-
-fn directory() -> DirectorySnapshot {
-    let genesis = DirectorySnapshot::bootstrap(
-        NS,
-        TABLET,
-        PartitionRange::Hash(HashPrefix::new(0, 0).expect("root")),
-        TabletEpoch::INITIAL,
-        WriteGuardGeneration::INITIAL,
-    )
-    .expect("genesis");
-    genesis
-        .stage(TABLET)
-        .and_then(|snapshot| snapshot.activate(TABLET))
-        .expect("active root")
-}
-
-fn placement() -> Placement {
-    Placement::new([(TABLET, WorkerId::from_u64(0))])
-}
-
-/// Deterministic pseudo-random bytes (splitmix64): representative,
-/// incompressible-ish content — never zeros-only.
-fn pattern_bytes(len: usize, seed: u64) -> bytes::Bytes {
-    let mut state = seed;
-    let mut out = Vec::with_capacity(len);
-    while out.len() < len {
-        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^= z >> 31;
-        out.extend_from_slice(&z.to_le_bytes());
-    }
-    out.truncate(len);
-    bytes::Bytes::from(out)
-}
-
-fn durable_config(dir: &std::path::Path) -> DurabilityMode {
-    let opened = kivi_durability::open_data_dir(dir, None).expect("data dir opens");
-    DurabilityMode::Durable(DurableConfig {
-        data_dir: dir.to_owned(),
-        segment_target_bytes: 1024 * 1024,
-        node: opened.meta.node,
-        cluster: opened.meta.cluster,
-        incarnation: opened.meta.incarnation,
-        shared_wal: false,
-        batch: kivi_engine::BatchPolicy::default_policy(),
-        checkpoint: kivi_engine::CheckpointConfig {
-            // Tests trigger manually; automatic thresholds stay out of the way.
-            disabled: true,
-            ..kivi_engine::CheckpointConfig::default_config()
-        },
-    })
-}
 
 fn start(dir: &std::path::Path) -> LocalEngine {
-    LocalEngine::start(EngineConfig {
-        namespace: NS,
-        hardware: kivi_engine::HardwareConfig::default(),
-        directory: directory(),
-        placement: placement(),
-        worker_count: 2,
-        request_capacity: 256,
-        chunks: ChunkFabricConfig::default(),
-        fabric: kivi_engine::FabricConfig::default(),
-        network: None,
-        durability: durable_config(dir),
-    })
+    LocalEngine::start(durable_config(
+        dir,
+        ChunkFabricConfig::default(),
+        kivi_engine::FabricConfig::default(),
+    ))
     .expect("durable engine starts")
 }
 
@@ -114,39 +50,10 @@ fn await_assets(engine: &LocalEngine, min: u64) -> RedundancyAdminSnapshot {
     }
 }
 
-/// Waits for a CURRENT record at `cut` (background build plus publish are
-/// asynchronous), returning it.
-fn await_current(dir: &std::path::Path, cut: u64) -> kivi_checkpoint::CurrentRecord {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Ok(Some(current)) = kivi_checkpoint::read_current(dir, TABLET)
-            && current.cut >= cut
-        {
-            return current;
-        }
-        assert!(
-            Instant::now() <= deadline,
-            "no CURRENT at cut {cut} after 30s"
-        );
-        std::thread::sleep(Duration::from_millis(25));
-    }
-}
-
 #[test]
 fn ephemeral_holds_no_redundancy_fabric() {
-    let engine = LocalEngine::start(EngineConfig {
-        namespace: NS,
-        hardware: kivi_engine::HardwareConfig::default(),
-        directory: directory(),
-        placement: placement(),
-        worker_count: 2,
-        request_capacity: 64,
-        chunks: ChunkFabricConfig::default(),
-        fabric: kivi_engine::FabricConfig::default(),
-        network: None,
-        durability: DurabilityMode::Ephemeral,
-    })
-    .expect("ephemeral engine starts");
+    let engine = LocalEngine::start(config(root_snapshot(), root_placement(), 2))
+        .expect("ephemeral engine starts");
     assert!(
         engine.redundancy_snapshot().is_none(),
         "ephemeral mode stages nothing durable, so it holds no fabric"

@@ -31,8 +31,8 @@
 //!
 //! The whole set is opened as one group, which the kernel only schedules when
 //! every member fits, so members are always commensurable. When a group still
-//! cannot be scheduled for the full interval — more events than the PMU has
-//! counters, and other software competing for them — the kernel reports
+//! cannot be scheduled for the full interval - more events than the PMU has
+//! counters, and other software competing for them - the kernel reports
 //! `time_running < time_enabled`, the sample is marked [`PmuSample::scaled`],
 //! and every consumer lowers its confidence.
 //!
@@ -46,11 +46,10 @@
 //! processes. An older CPU has cycles and instructions but no stall counter.
 //!
 //! The first version of this module opened a group led by hardware cycles and
-//! reported "unavailable" whenever that failed — which threw away page faults
-//! and context switches on exactly the machines where they are the only
-//! hardware evidence available, and where the placement-stability question is
-//! most worth asking. So the design is proportional:
-//!
+//! reported "unavailable" whenever that failed. That threw away page faults and
+//! context switches on exactly the machines where they are the only hardware
+//! evidence available, and where the placement-stability question is most worth
+//! asking, so the design is proportional:
 //! * the **denominator** is the best event the kernel will give: hardware
 //!   cycles if available, otherwise the per-thread task clock
 //!   (`PERF_COUNT_SW_TASK_CLOCK`, nanoseconds, never refused), and
@@ -141,9 +140,9 @@ pub struct PmuSample {
     /// the precondition for every ratio over them.
     ///
     /// `false` means the kernel would not form a group and each counter ran
-    /// independently. The absolute counts are then still exact — a
+    /// independently. The absolute counts are then still exact - a
     /// per-thread page-fault counter does not need a second counter to be
-    /// true — but nothing may be divided by anything else in the sample, so
+    /// true - but nothing may be divided by anything else in the sample, so
     /// every ratio method returns `None` rather than a plausible wrong number.
     pub comparable: bool,
 }
@@ -184,7 +183,7 @@ impl PmuSample {
     fn set(&mut self, counter: PmuCounter, count: u64) {
         match counter {
             // The task clock is a denominator, and `cycles` is where a sample
-            // keeps whichever denominator it got — hardware cycles when the
+            // keeps whichever denominator it got - hardware cycles when the
             // kernel had them, nanoseconds of scheduled time when it did not.
             // `cycle_source` records which one it was, so the two never have to
             // be told apart here.
@@ -272,9 +271,9 @@ impl PmuSample {
     }
 
     /// Whether the core looks memory bound: most cycles stalled *and* the last
-    /// level cache was missing. Either alone is ambiguous — stalls also come
+    /// level cache was missing. Either alone is ambiguous - stalls also come
     /// from a dependency chain, misses also come from a cold but small working
-    /// set — but together they are a statement about memory.
+    /// set - but together they are a statement about memory.
     #[must_use]
     pub fn memory_bound(&self) -> bool {
         self.stall_fraction() > 0.35 && self.cache_miss_ratio() > 0.2
@@ -459,10 +458,7 @@ impl PmuCounters {
     #[must_use]
     pub fn attach() -> Self {
         match backend::Counters::open() {
-            // The support set is derived from the live handles rather than
-            // carried alongside them, so the two cannot disagree about which
-            // counters exist.
-            Some((counters, _, source)) => {
+            Some((counters, source)) => {
                 let support = counters.support();
                 Self {
                     inner: Some(counters),
@@ -626,7 +622,7 @@ mod backend {
     }
 
     impl Counters {
-        pub(super) fn open() -> Option<(Self, PmuSupport, CycleSource)> {
+        pub(super) fn open() -> Option<(Self, CycleSource)> {
             // Count only user-mode instructions. An unprivileged process cannot
             // read kernel-mode events at `perf_event_paranoid >= 2`, and asking
             // for them anyway means the open fails rather than counting less.
@@ -672,18 +668,15 @@ mod backend {
             // group leader, which is exactly what a grouped event must do.
             let sibling = SiblingOpts::default();
             let mut order: Vec<Field> = Vec::new();
-            let mut support = PmuSupport::new([PmuCounter::Cycles], false);
 
             for (event, counter) in HW_MEMBERS {
                 if group.add(event, &sibling).is_ok() {
                     order.push(Field(counter));
-                    support.insert(counter);
                 }
             }
             for (event, counter) in SW_MEMBERS {
                 if group.add(event, &sibling).is_ok() {
                     order.push(Field(counter));
-                    support.insert(counter);
                 }
             }
             if order.is_empty() {
@@ -691,13 +684,12 @@ mod backend {
                 // hypervisor that filters grouped events produces exactly this:
                 // the leader succeeds, every `PERF_IOC_ADD_EVENT` is refused, and
                 // the only usable shape is one counter per descriptor. WSL2 is
-                // one such machine — `PERF_IOC_ADD_EVENT` on a software-event
+                // one such machine - `PERF_IOC_ADD_EVENT` on a software-event
                 // group returns EACCES while standalone software counters open
                 // cleanly.
                 return Self::open_independent().map(|counters| {
-                    let support = counters.support();
                     let source = counters.denominator_source();
-                    (counters, support, source)
+                    (counters, source)
                 });
             }
             Some((
@@ -706,7 +698,6 @@ mod backend {
                     order,
                     source,
                 },
-                support,
                 source,
             ))
         }
@@ -763,13 +754,10 @@ mod backend {
             })
         }
 
-        /// Exactly the counters this set actually opened.
-        ///
-        /// The previous version threaded a `PmuSupport` through the open path
-        /// and the independent fallback had no way to report what it got. A
-        /// support set that is not derived from the live handles is a support
-        /// set that can disagree with them, and every consumer here treats it
-        /// as a promise.
+        /// Exactly the counters this set actually opened, derived from the live
+        /// handles. A support set that is not derived from them is a support set
+        /// that can disagree with them, and every consumer here treats it as a
+        /// promise.
         pub(super) fn support(&self) -> PmuSupport {
             let mut support = PmuSupport::default();
             match self {
@@ -870,7 +858,7 @@ mod backend {
 
     pub(super) fn detect() -> Support<PmuSupport> {
         match Counters::open() {
-            Some((_, support, _)) => Support::Available(support),
+            Some((counters, _)) => Support::Available(counters.support()),
             None => Support::Unavailable(reason()),
         }
     }
@@ -878,7 +866,7 @@ mod backend {
     /// Why the *hardware* counters are missing, which is a different question
     /// from why no counter at all could be opened.
     ///
-    /// The probe asks for exactly what the real attempt asks for — user-mode
+    /// The probe asks for exactly what the real attempt asks for - user-mode
     /// only. Asking for kernel-mode too, as an earlier version did, returns
     /// `EACCES` on any machine with `perf_event_paranoid >= 2` and would have
     /// reported a permissions problem on a machine whose real problem is that
@@ -979,26 +967,28 @@ mod backend {
 
     use super::{CycleSource, PmuSample};
 
+    /// Never constructed: with no backend there is no counter set to hold.
+    ///
+    /// `support` and `read` exist only so the call sites in [`PmuCounters`] type
+    /// check on this branch. They are unreachable: `open` returns `None`, so
+    /// `attach` takes the empty arm and no `Counters` value is ever created. Their
+    /// bodies are therefore the conservative answer - an empty support set and a
+    /// zeroed sample - rather than an invented one, because a support set is a
+    /// promise about what can be measured and nothing here can measure anything.
     pub(super) struct Counters;
 
     impl Counters {
-        pub(super) fn open() -> Option<(Self, PmuSupport, CycleSource)> {
+        pub(super) fn open() -> Option<(Self, CycleSource)> {
             None
         }
 
-        #[allow(
-            clippy::unused_self,
-            reason = "the shape is shared with the backend that does have counters"
-        )]
         pub(super) fn support(&self) -> PmuSupport {
+            let _ = self;
             PmuSupport::default()
         }
 
-        #[allow(
-            clippy::unused_self,
-            reason = "the shape is shared with the backend that does have counters"
-        )]
         pub(super) fn read(&mut self) -> PmuSample {
+            let _ = self;
             PmuSample::zero()
         }
     }
@@ -1046,266 +1036,56 @@ mod tests {
         }
     }
 
+    /// A sample is only *evidence* when the kernel scheduled its counters
+    /// together and something was counted. A multiplexed group is still worth
+    /// something - it is a scaled estimate, not nothing - but it is never full
+    /// trust, and a non-comparable set or an idle counter set must read as
+    /// carrying nothing at all, or a controller would act on the absence of a
+    /// measurement.
     #[test]
-    fn a_zero_sample_defines_every_ratio() {
-        let zero = PmuSample::zero();
-        assert!(zero.ipc().is_none());
-        assert!(zero.instructions_per_ns().is_none());
-        assert!(zero.stall_fraction().abs() < f64::EPSILON);
-        assert!(zero.cache_miss_ratio().abs() < f64::EPSILON);
-        assert!(zero.branch_miss_ratio().abs() < f64::EPSILON);
-        assert!(!zero.memory_bound());
-        assert!(!zero.placement_unstable());
-    }
-
-    #[test]
-    fn ipc_separates_a_throughput_bound_core_from_a_chained_one() {
-        let throughput = sample(1000, 3000, 0, 0);
-        let chained = sample(1000, 200, 0, 0);
-        assert!(throughput.ipc().unwrap() > chained.ipc().unwrap());
-    }
-
-    #[test]
-    fn a_task_clock_denominator_is_not_ipc() {
-        // The failure this catches is a virtual machine, or a paranoid kernel,
-        // producing a plausible "IPC" from a nanosecond clock. Instructions per
-        // nanosecond moves with the core's frequency, so it is a different
-        // quantity and must not be reported as IPC.
-        let mut task_clock = sample(1_000_000, 3_000, 0, 0);
-        task_clock.cycle_source = CycleSource::TaskClockNanoseconds;
-        assert!(task_clock.ipc().is_none());
-        assert!((task_clock.instructions_per_ns().unwrap() - 0.003).abs() < 1e-9);
-        // A stall counter without a cycle denominator has no meaning either.
-        assert!(task_clock.stall_fraction().abs() < f64::EPSILON);
-        assert!(!task_clock.memory_bound());
-    }
-
-    #[test]
-    fn stalls_plus_cache_misses_mean_memory_bound() {
-        let mut bound = sample(1000, 500, 800, 1000);
-        bound.stalled_cycles = 800;
-        assert!(bound.memory_bound());
-        bound.cache_misses = 10;
-        assert!(!bound.memory_bound(), "stalls alone are a dependency chain");
-    }
-
-    #[test]
-    fn ratios_are_clamped_to_what_the_hardware_can_see() {
-        let impossible = PmuSample {
-            cycles: 1,
-            cycle_source: CycleSource::Hardware,
-            instructions: 10_000,
-            cache_references: 1,
-            cache_misses: 10,
-            stalled_cycles: 1_000,
-            branches: 1,
-            branch_misses: 1_000,
-            ..PmuSample::zero()
-        };
-        assert!(impossible.ipc().unwrap() <= 8.0);
-        assert!(impossible.cache_miss_ratio() <= 1.0);
-        assert!(impossible.stall_fraction() <= 1.0);
-        assert!(impossible.branch_miss_ratio() <= 1.0);
-    }
-
-    #[test]
-    fn a_reset_counter_is_reported_not_hidden() {
-        let earlier = sample(1000, 500, 10, 100);
-        let restarted = sample(10, 5, 0, 10);
-        let delta = restarted.since(&earlier);
-        assert_eq!(delta.ordering, Ordering::Relaxed);
-        assert_eq!(delta.cycles, 0, "a lower bound, not a negative");
-        assert_eq!(
-            sample(2000, 900, 20, 200).since(&earlier).ordering,
-            Ordering::Monotonic
+    fn only_a_measured_commensurable_sample_carries_full_trust() {
+        let measured = sample(1000, 500, 10, 100);
+        assert!(
+            measured.trust() > 0.99,
+            "a measured sample is fully trusted"
         );
-    }
+        assert!(!measured.signals().is_neutral());
 
-    #[test]
-    fn a_scaled_sample_reports_lower_confidence() {
-        let exact = sample(100, 100, 10, 100);
+        // Multiplexed: a real but scaled estimate.
         let scaled = PmuSample {
             scaled: true,
-            ..exact
+            ..measured
         };
-        assert!(scaled.signals().confidence < exact.signals().confidence);
-    }
+        assert!(scaled.trust() > 0.0, "a scaled count is still evidence");
+        assert!(scaled.trust() < measured.trust(), "but not full trust");
 
-    #[test]
-    fn a_baseline_is_not_trusted_evidence() {
-        // A counter set that has counted nothing yet is the state every
-        // counter set is in when it is opened. Reporting full confidence for
-        // it would let a controller act on the absence of evidence.
-        let baseline = PmuSample::zero();
-        assert!(baseline.comparable(), "it is scheduled, just not busy");
-        assert!(baseline.trust() <= f64::EPSILON, "nothing was measured");
-        assert!(baseline.signals().is_neutral());
-    }
-
-    #[test]
-    fn a_non_comparable_sample_is_never_trusted() {
-        let independent = PmuSample {
-            cycles: 1_000_000,
-            cycle_source: CycleSource::Hardware,
-            instructions: 2_000_000,
-            page_faults: 12,
-            comparable: false,
-            ..PmuSample::zero()
-        };
-        assert!(independent.trust() <= f64::EPSILON);
-        assert!(independent.signals().is_neutral());
-        // The absolute counts are still exact, and they are still reported.
-        assert_eq!(independent.page_faults, 12);
-    }
-
-    #[test]
-    fn unattached_counters_read_as_zero_rather_than_failing() {
-        let mut counters = PmuCounters::attach();
-        let sample = counters.sample();
-        if !counters.is_attached() {
-            assert_eq!(sample, PmuSample::zero());
-            assert_eq!(counters.support().iter().count(), 0);
-            assert_eq!(counters.cycle_source(), CycleSource::None);
-        }
-        assert!(!sample.memory_bound());
-    }
-
-    #[test]
-    fn an_attached_counter_set_always_keeps_its_denominator() {
-        // The bug this guards: when the kernel refuses to form a group, the
-        // independent fallback used to report `CycleSource::None` and discard the
-        // task clock it had just opened. Every sample then read as unmeasured
-        // with a zero denominator, on a machine that *had* a working counter —
-        // the reading looked exactly like "no PMU", which is a different fault
-        // with a different fix.
-        let mut counters = PmuCounters::attach();
-        if !counters.is_attached() {
-            return;
-        }
-        let first = counters.sample();
-        let second = counters.sample();
-        assert_ne!(
-            counters.cycle_source(),
-            CycleSource::None,
-            "an attached set always has some denominator"
-        );
-        assert_eq!(
-            counters.cycle_source(),
-            first.cycle_source,
-            "the source is a property of the set, not of the interval"
-        );
-        assert_eq!(first.cycle_source, second.cycle_source);
-        // Whatever the denominator is, it must advance: a source that never
-        // moves is a counter the kernel opened and then never scheduled.
-        assert!(
-            second.cycles >= first.cycles,
-            "the denominator only moves forward"
-        );
-    }
-
-    #[test]
-    fn commutability_is_decided_per_sample_not_assumed_from_the_shape() {
-        // Independently opened counters are commensurable whenever the kernel
-        // scheduled every one of them for the whole interval, which
-        // `time_running == time_enabled` is the kernel's own statement about.
-        // The counter set used to be marked non-commensurable the moment it
-        // fell back, which withheld every ratio on a machine that never
-        // multiplexed anything.
-        let mut counters = PmuCounters::attach();
-        if !counters.is_attached() {
-            return;
-        }
-        // Whatever this machine does, the two answers must never disagree:
-        // a sample claims commensurability exactly when it is not scaled.
-        for _ in 0..4 {
-            let mut work = 0_u64;
-            for i in 0..200_000_u64 {
-                work = work.wrapping_add(i);
-            }
-            std::hint::black_box(work);
-            let sample = counters.sample();
-            assert_eq!(
-                sample.comparable(),
-                !sample.scaled,
-                "comparability and multiplexing are the same fact here"
+        for no_evidence in [
+            // Independently scheduled, so nothing may be divided by anything.
+            PmuSample {
+                comparable: false,
+                ..measured
+            },
+            // Scheduled but idle: the state every counter set is in at open.
+            PmuSample::zero(),
+        ] {
+            assert!(
+                no_evidence.trust().abs() < f64::EPSILON,
+                "{no_evidence} must not trust"
+            );
+            assert!(
+                no_evidence.signals().is_neutral(),
+                "{no_evidence} must read as neutral"
             );
         }
     }
 
-    #[test]
-    fn a_task_clock_denominator_yields_nothing_a_cycle_counter_would() {
-        // Instructions-per-cycle and stall fraction both need hardware cycles.
-        // With a task-clock denominator they must report "no ratio" rather than
-        // a plausible number, because a frequency change would move it.
-        let software = PmuSample {
-            cycles: 1_000_000,
-            cycle_source: CycleSource::TaskClockNanoseconds,
-            instructions: 2_000_000,
-            stalled_cycles: 500_000,
-            comparable: true,
-            ..PmuSample::zero()
-        };
-        assert_eq!(software.ipc(), None, "no hardware cycles, no IPC");
-        assert!(
-            (software.stall_fraction() - 0.0).abs() <= f64::EPSILON,
-            "a stall count with no cycle denominator is not a fraction"
-        );
-        // The absolute counts are unaffected, and the denominator is a real one.
-        assert_eq!(software.instructions, 2_000_000);
-        assert_eq!(software.cycles, 1_000_000);
-    }
-
-    #[test]
-    fn the_support_set_names_the_denominator_it_actually_opened() {
-        // A caller planning against the support set has to be able to tell "the
-        // kernel gave me hardware cycles" from "the kernel gave me the task
-        // clock", because the first supports ratios the second does not.
-        let counters = PmuCounters::attach();
-        if !counters.is_attached() {
-            return;
-        }
-        let support = counters.support();
-        match counters.cycle_source() {
-            CycleSource::Hardware => {
-                assert!(support.has(PmuCounter::Cycles), "hardware cycles are named");
-            }
-            CycleSource::TaskClockNanoseconds => assert!(
-                support.has(PmuCounter::TaskClock),
-                "the task clock is named, not passed off as cycles"
-            ),
-            CycleSource::None => panic!("an attached set never has no denominator"),
-        }
-    }
-
-    #[test]
-    fn an_attached_group_reports_exactly_what_it_opened() {
-        // The whole reason the support set is derived from the live handles:
-        // whatever the kernel granted must be exactly what the support
-        // description claims, or a consumer would trust a ratio whose
-        // denominator is not being counted.
-        let mut counters = PmuCounters::attach();
-        if !counters.is_attached() {
-            return;
-        }
-        for counter in counters.support().iter() {
-            let _ = counter;
-        }
-        let first = counters.sample();
-        let mut acc = 0_u64;
-        for i in 0..50_000_u64 {
-            acc = acc.wrapping_add(i);
-        }
-        std::hint::black_box(acc);
-        let after = counters.sample();
-        assert_eq!(after.cycle_source, first.cycle_source);
-    }
-
+    /// A non-comparable sample withholds every ratio rather than reporting a
+    /// number computed from counters that never counted the same
+    /// instructions. The absolute counts survive, because a per-thread
+    /// page-fault counter does not need a second counter to be true.
     #[test]
     fn a_non_comparable_sample_withholds_every_ratio() {
-        // A machine with no virtualised PMU gets exact absolute counts and no
-        // ratios at all. Reporting a ratio here would be a number computed from
-        // two counters that never counted the same instructions.
-        let mut sample = PmuSample {
+        let mut s = PmuSample {
             page_faults: 1000,
             context_switches: 5,
             migrations: 2,
@@ -1320,20 +1100,24 @@ mod tests {
             comparable: false,
             scaled: false,
         };
-        assert!(sample.ipc().is_none());
-        assert!(sample.instructions_per_ns().is_none());
-        assert!(sample.stall_fraction().abs() < f64::EPSILON);
-        assert!(sample.cache_miss_ratio().abs() < f64::EPSILON);
-        assert!(sample.branch_miss_ratio().abs() < f64::EPSILON);
-        assert!(!sample.memory_bound());
-        // The absolute counts survive, because a per-thread page-fault counter
-        // does not need a second counter to be true.
-        assert_eq!(sample.page_faults, 1000);
-        assert!(sample.placement_unstable());
-        sample.comparable = true;
-        assert!(sample.ipc().is_some(), "a group restores the ratios");
+        assert!(s.ipc().is_none());
+        assert!(s.instructions_per_ns().is_none());
+        assert!(s.stall_fraction().abs() < f64::EPSILON);
+        assert!(s.cache_miss_ratio().abs() < f64::EPSILON);
+        assert!(s.branch_miss_ratio().abs() < f64::EPSILON);
+        assert!(!s.memory_bound());
+        assert_eq!(s.page_faults, 1000);
+        assert!(s.placement_unstable());
+
+        // Forming a group restores the ratios.
+        s.comparable = true;
+        assert!(s.ipc().is_some());
     }
 
+    /// A migration is unambiguous evidence that placement is not holding: the
+    /// thread was moved between cores, so the cache the plan chose is not the
+    /// one the worker has. A context switch is not evidence - a thread that
+    /// simply was not the one running has not been misplaced.
     #[test]
     fn a_migration_is_unambiguous_and_a_context_switch_is_not() {
         let mut switched = sample(1000, 500, 0, 0);
@@ -1343,8 +1127,133 @@ mod tests {
         assert!(switched.placement_unstable());
     }
 
+    /// A denominator that is not hardware cycles cannot support a cycle ratio.
+    /// Instructions per nanosecond moves with the core's frequency, so
+    /// reporting it as IPC would make a frequency change look like a change in
+    /// the workload - and a stall count with no cycle denominator has no
+    /// fraction to be a fraction of.
     #[test]
-    fn detection_always_answers() {
-        assert!(!detect().to_string().is_empty());
+    fn a_task_clock_denominator_yields_no_cycle_ratio() {
+        let software = PmuSample {
+            cycles: 1_000_000,
+            cycle_source: CycleSource::TaskClockNanoseconds,
+            instructions: 2_000_000,
+            stalled_cycles: 500_000,
+            comparable: true,
+            ..PmuSample::zero()
+        };
+        assert_eq!(software.ipc(), None, "no hardware cycles, no IPC");
+        assert!((software.stall_fraction()).abs() <= f64::EPSILON);
+        assert!(!software.memory_bound());
+        // The absolute counts and the real denominator are unaffected.
+        assert_eq!(software.instructions, 2_000_000);
+        assert_eq!(software.cycles, 1_000_000);
+        assert!((software.instructions_per_ns().expect("per-ns is defined") - 2.0).abs() < 1e-9);
+    }
+
+    /// A multiplexed or reset counter set must be visible, not smoothed over.
+    /// A counter that stopped incrementing makes an estimate worse; hiding it
+    /// makes the estimate a lie.
+    #[test]
+    fn a_scaled_or_reset_counter_is_reported_not_hidden() {
+        let exact = sample(100, 100, 10, 100);
+        let scaled = PmuSample {
+            scaled: true,
+            ..exact
+        };
+        assert!(scaled.signals().confidence < exact.signals().confidence);
+
+        let earlier = sample(1000, 500, 10, 100);
+        let restarted = sample(10, 5, 0, 10);
+        let delta = restarted.since(&earlier);
+        assert_eq!(delta.ordering, Ordering::Relaxed);
+        assert_eq!(delta.cycles, 0, "a lower bound, not a negative");
+        assert_eq!(
+            sample(2000, 900, 20, 200).since(&earlier).ordering,
+            Ordering::Monotonic
+        );
+    }
+
+    /// An unattached counter set must still answer: `None` from every ratio,
+    /// not a division by zero and not a panic. This is the state a machine
+    /// with `perf_event_paranoid = 4` is permanently in.
+    #[test]
+    fn an_unattached_counter_set_reads_as_zero_rather_than_failing() {
+        let mut counters = PmuCounters::attach();
+        if counters.is_attached() {
+            return;
+        }
+        assert_eq!(counters.support().iter().count(), 0);
+        assert_eq!(counters.cycle_source(), CycleSource::None);
+        let sample = counters.sample();
+        assert_eq!(sample, PmuSample::zero());
+        assert!(!sample.memory_bound());
+    }
+
+    /// Whatever the kernel grants, the set must report a denominator and the
+    /// support set must name the one it actually got. Discarding the task
+    /// clock the independent fallback had just opened made a working machine
+    /// read as "no PMU", which is a different fault with a different fix.
+    #[test]
+    fn an_attached_set_keeps_and_names_its_denominator() {
+        let mut counters = PmuCounters::attach();
+        if !counters.is_attached() {
+            return;
+        }
+        match counters.cycle_source() {
+            CycleSource::Hardware => assert!(
+                counters.support().has(PmuCounter::Cycles),
+                "hardware cycles are named"
+            ),
+            CycleSource::TaskClockNanoseconds => assert!(
+                counters.support().has(PmuCounter::TaskClock),
+                "the task clock is named, not passed off as cycles"
+            ),
+            CycleSource::None => panic!("an attached set never has no denominator"),
+        }
+        // The source is a property of the set, not of the interval, and the
+        // denominator only moves forward: a source that never advances is a
+        // counter the kernel opened and then never scheduled.
+        let first = counters.sample();
+        let second = counters.sample();
+        assert_eq!(first.cycle_source, counters.cycle_source());
+        assert_eq!(first.cycle_source, second.cycle_source);
+        assert!(second.cycles >= first.cycles);
+        // Comparability and multiplexing are the same fact: a sample claims
+        // commensurability exactly when the kernel did not scale it.
+        assert_eq!(first.comparable(), !first.scaled);
+    }
+
+    /// Ratios are clamped to what the hardware can physically report, so a
+    /// counter reading above its own denominator produces a bounded number
+    /// rather than an impossible one.
+    #[test]
+    fn ratios_are_clamped_to_what_the_hardware_can_see() {
+        let impossible = PmuSample {
+            cycles: 1,
+            cycle_source: CycleSource::Hardware,
+            instructions: 10_000,
+            cache_references: 1,
+            cache_misses: 10,
+            stalled_cycles: 1_000,
+            branches: 1,
+            branch_misses: 1_000,
+            ..PmuSample::zero()
+        };
+        assert!(impossible.ipc().expect("cycles present") <= 8.0);
+        assert!(impossible.cache_miss_ratio() <= 1.0);
+        assert!(impossible.stall_fraction() <= 1.0);
+        assert!(impossible.branch_miss_ratio() <= 1.0);
+    }
+
+    /// A memory-bound reading needs both signals: stalls alone are a
+    /// dependency chain, and misses alone are a cold but small working set.
+    #[test]
+    fn memory_bound_needs_stalls_and_misses_together() {
+        let mut bound = sample(1000, 500, 800, 1000);
+        bound.stalled_cycles = 800;
+        assert!(bound.memory_bound());
+        bound.cache_misses = 10;
+        assert!(!bound.memory_bound(), "stalls alone are a dependency chain");
     }
 }

@@ -5,7 +5,7 @@
 //! Namespaces are the main semantic boundary (one layout each: hash for
 //! point-lookup partitioning, ordered for range scans and indexes).
 //! Indexes are ordered representations of primary data maintained
-//! transactionally — the control plane owns their definitions and
+//! transactionally - the control plane owns their definitions and
 //! lifecycle states, never their entries (entries are ordinary data-plane
 //! state in ordered namespaces).
 
@@ -201,7 +201,6 @@ impl IndexRecord {
 
 /// Catalog decode failure.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
 pub enum CatalogError {
     /// Truncated input.
     #[error("truncated catalog record")]

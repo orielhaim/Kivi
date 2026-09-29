@@ -1,6 +1,6 @@
 //! Deterministic virtual persistent storage.
 //!
-//! A conservative persistence model for crash-safety testing — not an ext4
+//! A conservative persistence model for crash-safety testing - not an ext4
 //! emulation. The single load-bearing rule is `write != durable`: every file
 //! carries a process-visible (pending) image and a crash-surviving (durable)
 //! image, and only explicit [`StorageOp`] barrier operations (`SyncFile`,
@@ -15,7 +15,7 @@
 //! ```
 //!
 //! Skip the parent sync and a crash loses the rename (entry revert) while
-//! the synced temp data survives orphaned — the precise bug class this model
+//! the synced temp data survives orphaned - the precise bug class this model
 //! exists to expose. Reads observe pending images (what the process sees);
 //! `durable_image` / `durable_entries` inspect what a crash would keep.
 //!
@@ -77,7 +77,7 @@ pub enum StorageOp {
 
 /// Deterministic injected device/file fault for one operation.
 ///
-/// Every variant is an explicit, reproducible behavior — the driver records
+/// Every variant is an explicit, reproducible behavior - the driver records
 /// the fault alongside the outcome, so faulted runs replay exactly.
 /// Bit rot uses the dedicated [`VirtualDisk::corrupt`] method instead of a
 /// variant here: corruption strikes durable state independently of any
@@ -123,7 +123,7 @@ pub enum StorageResult {
     /// Bytes read (pending image).
     Read(Vec<u8>),
     /// Bytes the caller believes were written (may exceed what stuck when
-    /// a write fault was injected — that deception is the fault).
+    /// a write fault was injected - that deception is the fault).
     Written {
         /// Acknowledged byte count.
         applied: usize,
@@ -538,7 +538,7 @@ impl VirtualDisk {
     }
 
     /// Inspects the crash-surviving (durable) image, if any. Test/driver
-    /// inspection only — never process I/O.
+    /// inspection only - never process I/O.
     #[must_use]
     pub fn durable_image(&self, path: &str) -> Option<Vec<u8>> {
         self.files.get(path).and_then(|file| file.durable.clone())

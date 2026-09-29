@@ -12,11 +12,18 @@ hashbrown.workspace = true
 bitflags.workspace = true
 bytes.workspace = true
 blake3.workspace = true
+twox-hash.workspace = true
+# The local table's bucket hash. Randomly keyed, designed for HashDoS resistance on
+# untrusted input, and explicitly not stable across versions or machines - which is
+# required here, because a bucket index must never be persisted and gains nothing
+# from being stable.
+ahash = "0.8"
 thiserror.workspace = true
 
 [dev-dependencies]
 divan.workspace = true
 proptest.workspace = true
+rstest.workspace = true
 
 [lints]
 workspace = true

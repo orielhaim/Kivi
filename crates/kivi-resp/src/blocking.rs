@@ -3,8 +3,8 @@
 //!
 //! The engine serves RESP from its own reactor, where a connection is answered
 //! by the thread that owns the tablet. That is the fast path and the one worth
-//! optimising. An embedder that routes operations somewhere else — a replicated
-//! node that has to run consensus before it can answer — has no such thread to
+//! optimising. An embedder that routes operations somewhere else - a replicated
+//! node that has to run consensus before it can answer - has no such thread to
 //! borrow, and still needs a correct, bounded, one-connection-per-thread
 //! server.
 //!

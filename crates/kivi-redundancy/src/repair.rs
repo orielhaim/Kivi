@@ -1,8 +1,8 @@
 //! Repair engine: the mechanism for repair (self-healing policy stays out).
 //!
-//! Repair reacts to explicit known deficits — node unavailable,
+//! Repair reacts to explicit known deficits - node unavailable,
 //! fragment missing, corruption detected, drain requires replacement, layout
-//! transition — and calculates whether each asset is healthy, degraded but
+//! transition - and calculates whether each asset is healthy, degraded but
 //! recoverable, critically degraded, or unrecoverable. Work is
 //! resumable/idempotent (re-issuing a repair for an already-healthy fragment
 //! is a no-op) and bounded: [`RepairBudgets`] caps repairs per tick, bytes
@@ -152,8 +152,6 @@ pub fn assess_with_min_available(
 pub struct RepairBudgets {
     /// Maximum repair actions per [`RepairEngine::tick`].
     pub max_repairs_per_tick: usize,
-    /// Maximum repair bytes per tick.
-    pub max_bytes_per_tick: u64,
     /// Maximum concurrent decodes fabric-wide.
     pub max_concurrent_decodes: usize,
     /// Maximum memory per decode (shard math guard).
@@ -168,7 +166,6 @@ impl RepairBudgets {
     pub const fn conservative() -> Self {
         Self {
             max_repairs_per_tick: 4,
-            max_bytes_per_tick: 16 * 1024 * 1024,
             max_concurrent_decodes: 2,
             max_decode_bytes: 64 * 1024 * 1024,
             max_queued_assets: 1024,
@@ -177,10 +174,10 @@ impl RepairBudgets {
 
     /// Test-friendly unbounded budgets (still exercises the code paths).
     #[must_use]
+    #[cfg(test)]
     pub const fn test_wide() -> Self {
         Self {
             max_repairs_per_tick: 64,
-            max_bytes_per_tick: u64::MAX,
             max_concurrent_decodes: 16,
             max_decode_bytes: u64::MAX,
             max_queued_assets: 65536,
@@ -203,7 +200,7 @@ pub struct RepairTask {
     pub targets: Vec<NodeId>,
 }
 
-/// Why a repair was queued (explicit deficits only — no learned policy).
+/// Why a repair was queued (explicit deficits only - no learned policy).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RepairReason {
     /// Node unavailable (health snapshot).
@@ -237,50 +234,29 @@ impl RepairReason {
 /// Duplicate tasks for the same `(asset, generation, fragment)` coalesce:
 /// re-queueing an already-queued repair is a no-op that reports `false`.
 /// Completed fragments dequeue; failed attempts re-queue with their reason
-/// intact (the caller decides retry policy — this engine never loops
+/// intact (the caller decides retry policy - this engine never loops
 /// unboundedly on its own).
-#[derive(Debug, Default)]
-pub struct RepairEngine {
+#[derive(Debug)]
+pub(crate) struct RepairEngine {
     /// Queued tasks in priority order (critical/unrecoverable first).
     queue: VecDeque<RepairTask>,
     /// Budgets enforced per tick.
-    budgets: RepairBudgetsState,
+    budgets: RepairBudgets,
 }
 
-/// Mutable budget counters (reset per tick where noted).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RepairBudgetsState {
-    /// Configured limits.
-    limits: RepairBudgets,
-    /// Bytes spent this tick.
-    bytes_this_tick: u64,
-}
-
-impl Default for RepairBudgetsState {
+impl Default for RepairEngine {
     fn default() -> Self {
-        Self {
-            limits: RepairBudgets::conservative(),
-            bytes_this_tick: 0,
-        }
+        Self::with_budgets(RepairBudgets::conservative())
     }
 }
 
 impl RepairEngine {
-    /// Creates an engine with conservative budgets.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Creates an engine with explicit budgets.
     #[must_use]
     pub const fn with_budgets(budgets: RepairBudgets) -> Self {
         Self {
             queue: VecDeque::new(),
-            budgets: RepairBudgetsState {
-                limits: budgets,
-                bytes_this_tick: 0,
-            },
+            budgets,
         }
     }
 
@@ -305,7 +281,7 @@ impl RepairEngine {
                 return Ok(added);
             }
         }
-        if self.queue.len() >= self.budgets.limits.max_queued_assets {
+        if self.queue.len() >= self.budgets.max_queued_assets {
             return Err(RedundancyError::Overloaded {
                 detail: "repair queue full".to_owned(),
             });
@@ -353,24 +329,16 @@ impl RepairEngine {
         self.queue(task)
     }
 
-    /// Number of queued tasks.
-    #[must_use]
-    pub fn pending(&self) -> usize {
-        self.queue.len()
-    }
-
     /// Drains up to the per-tick budget, returning the tasks to execute now.
     ///
     /// The caller executes them (reconstruct → verify → publish replacement
-    /// fragments) and reports completion via [`mark_done`](Self::mark_done).
-    /// Foreground pressure is honored through `foreground_pressure`: when
-    /// `true`, only one task drains regardless of budget.
+    /// fragments). Foreground pressure is honored through `foreground_pressure`:
+    /// when `true`, only one task drains regardless of budget.
     pub fn tick(&mut self, foreground_pressure: bool) -> Vec<RepairTask> {
-        self.budgets.bytes_this_tick = 0;
         let limit = if foreground_pressure {
             1
         } else {
-            self.budgets.limits.max_repairs_per_tick
+            self.budgets.max_repairs_per_tick
         };
         let mut out = Vec::new();
         while out.len() < limit {
@@ -382,18 +350,13 @@ impl RepairEngine {
         out
     }
 
-    /// Reports a completed repair's byte cost against this tick's budget.
-    pub fn mark_done(&mut self, _task: &RepairTask, bytes: u64) {
-        self.budgets.bytes_this_tick = self.budgets.bytes_this_tick.saturating_add(bytes);
-    }
-
     /// Re-queues a failed repair (keeps its reason; caller bounds retries).
     ///
     /// # Errors
     ///
     /// Returns [`RedundancyError::Overloaded`] when the queue is full.
     pub fn requeue(&mut self, task: RepairTask) -> Result<(), RedundancyError> {
-        if self.queue.len() >= self.budgets.limits.max_queued_assets {
+        if self.queue.len() >= self.budgets.max_queued_assets {
             return Err(RedundancyError::Overloaded {
                 detail: "repair queue full on requeue".to_owned(),
             });
@@ -404,7 +367,7 @@ impl RepairEngine {
 }
 
 /// Scrub report for one asset: per-fragment verdicts for operators and the
-/// self-healing policy. Pure classification — this function never repairs.
+/// self-healing policy. Pure classification - this function never repairs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScrubReport {
     /// Asset scrubbed.
@@ -580,9 +543,10 @@ mod tests {
         let mut wider = task.clone();
         wider.fragments = vec![2];
         assert!(engine.queue(wider).expect("merges"));
-        assert_eq!(engine.pending(), 1);
-        let drained = engine.tick(false);
+        // One merged task, and foreground pressure bounds a tick to one.
+        let drained = engine.tick(true);
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].fragments, vec![1, 2]);
+        assert!(engine.tick(false).is_empty(), "queue drained");
     }
 }

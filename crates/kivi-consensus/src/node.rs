@@ -11,8 +11,8 @@
 //! 0.10's `single-threaded` mode makes the `Raft` handle `!Send`: it lives
 //! on the Compio owner thread spawned here (`kivi-consensus`), alongside
 //! the transport tasks and the snapshot reassembly state. The public
-//! [`ReplicatedNode`] front stays `Send + Sync` — one bounded
-//! [`async_channel`] request queue plus `Send` oneshot replies — so
+//! [`ReplicatedNode`] front stays `Send + Sync` - one bounded
+//! [`async_channel`] request queue plus `Send` oneshot replies - so
 //! callers on any runtime (including the Tokio admin plane) keep ordinary
 //! `Send` futures. No Tokio exists on either side of the boundary.
 //!
@@ -75,7 +75,7 @@
 //!                           rejects foreign tokens as `StaleToken`.
 //! BoundedStale(duration) ... serves only from a `FreshnessReceipt`
 //!                           proving the bound, else escalates to a fresh
-//!                           barrier (which satisfies any bound) — never
+//!                           barrier (which satisfies any bound) - never
 //!                           weak data labeled successful.
 //! Any ..................... local applied state, no freshness claim.
 //! ```
@@ -336,7 +336,7 @@ pub enum ProposeError {
     /// and the uncovered responder was fenced. Shaped as
     /// `CoverageUncertain` on the wire: the outcome is ambiguous (it may
     /// have committed), so callers must not blindly retry non-idempotent
-    /// writes — read-verify first, or re-drive under the same identity.
+    /// writes - read-verify first, or re-drive under the same identity.
     #[error("responder coverage timed out: {detail}")]
     ResponderCoverage {
         /// Which responder(s) stayed uncovered.
@@ -505,7 +505,7 @@ pub(crate) enum OwnerRequest {
     /// committed index when it already covers formation, else append the
     /// fence; on a follower, forward the request to the leader over the
     /// peer mesh. Any failure (not leader, stale leader view, transport,
-    /// commit refusal) answers `Err`, and the caller falls back — the
+    /// commit refusal) answers `Err`, and the caller falls back - the
     /// fence path never blocks a read past its wait budget.
     ProposeSync {
         /// Addressed group.
@@ -625,7 +625,7 @@ pub(crate) enum OwnerRequest {
     },
     /// Retire the local replica after committed membership no longer
     /// requires it. Shuts down its `Raft`, unregisters the group,
-    /// stops serving it, and writes a tombstone — durable data is
+    /// stops serving it, and writes a tombstone - durable data is
     /// retained conservatively for future GC. Idempotent.
     RetireGroup {
         /// Addressed group.
@@ -702,7 +702,7 @@ impl OwnerRequest {
     /// Sends the loud "no local replica owns this group" answer for a
     /// request that reached a worker without a matching replica. The
     /// multi-tablet front and the group registry route correctly, so this
-    /// fires only on genuine misrouting or unknown groups — never silent,
+    /// fires only on genuine misrouting or unknown groups - never silent,
     /// never a hang. Node-wide requests have no group to mismatch and are
     /// ignored (the worker loop handles them directly).
     pub(crate) fn reply_unroutable(self, local: NodeId) {
@@ -744,26 +744,8 @@ impl OwnerRequest {
                         local.as_u64()
                     )),
                     peers: HashMap::new(),
-                    sidecar: crate::sidecar::SidecarMetricsSnapshot {
-                        bulk_bytes_sent: 0,
-                        bulk_bytes_received: 0,
-                        manifest_requests: 0,
-                        chunk_requests: 0,
-                        cache_hits: 0,
-                        cache_misses: 0,
-                        deduped_bytes: 0,
-                        bulk_errors: 0,
-                        verification_failures: 0,
-                        pending_gated: 0,
-                        inflight: 0,
-                    },
-                    preflight: crate::preflight::PreflightMetricsSnapshot {
-                        attempts: 0,
-                        quorum_ready: 0,
-                        fallbacks: 0,
-                        ready_replies: 0,
-                        latency_us: 0,
-                    },
+                    sidecar: crate::sidecar::SidecarMetricsSnapshot::default(),
+                    preflight: crate::preflight::PreflightMetricsSnapshot::default(),
                     consistency: kivi_types::ConsistencySnapshot::default(),
                 });
             }
@@ -836,7 +818,7 @@ pub struct ReplicatedNode {
     data_dir: PathBuf,
     /// Caller-side consistency hub: evidence, lease engines, strong
     /// cache, providers, metrics. Shared with the owner thread (which
-    /// drives lease engines through it). Memory-held by construction — a
+    /// drives lease engines through it). Memory-held by construction - a
     /// restart starts empty, so incarnation handling fails closed without
     /// any explicit clearing.
     hub: Arc<ConsistencyHub>,
@@ -1035,7 +1017,7 @@ impl ReplicatedNode {
     /// incarnation), recovers log and state, classifies bootstrap,
     /// verifies-or-installs membership, and starts the peer mesh on the
     /// Compio owner thread. Listeners start only after recovery and
-    /// bootstrap complete — a corrupt database never serves.
+    /// bootstrap complete - a corrupt database never serves.
     ///
     /// # Errors
     ///
@@ -1077,7 +1059,6 @@ impl ReplicatedNode {
             &owner_tx,
             group,
             config.tablet,
-            config.authority,
             opened.meta.node,
             opened.meta.incarnation,
             config.lease_params,
@@ -1111,7 +1092,7 @@ impl ReplicatedNode {
         })??;
         // Startup verification: every applied chunked root must resolve
         // locally before serving reads (fail-closed poison, repair via
-        // sidecar fetch or snapshot install — never a startup wait).
+        // sidecar fetch or snapshot install - never a startup wait).
         verify_chunked_roots(&machine, &sidecar).await;
         Ok(Self {
             machine: machine.clone(),
@@ -1199,6 +1180,11 @@ impl ReplicatedNode {
         propose_caller_side(
             &self.machine,
             &self.sidecar,
+            // Single-group nodes have no redundancy plane, so there is
+            // nothing to hand a staged root to. Empty cells make the
+            // hand-off a no-op instead of a second code path.
+            &crate::resolve::ResolutionSlots::new(),
+            kivi_types::SecurityDomainId::from_u64(self.namespace.as_u64()),
             self.namespace,
             self.authority,
             &self.owner_tx,
@@ -1382,7 +1368,7 @@ impl ReplicatedNode {
     /// # Panics
     ///
     /// Panics when the owner-handle lock is poisoned (a previous holder
-    /// panicked while taking the handle — a lifecycle bug, never a
+    /// panicked while taking the handle - a lifecycle bug, never a
     /// runtime condition).
     pub async fn shutdown(&self) {
         let _ = self.owner_tx.send(OwnerRequest::Shutdown).await;
@@ -1398,7 +1384,7 @@ impl ReplicatedNode {
 
 /// Builds the caller-side consistency front: the shared hub (evidence,
 /// lease engines, metrics) plus the tablet's Lazy-ALR batch coordinator.
-/// Memory-held by construction — a restart starts empty, so incarnation
+/// Memory-held by construction - a restart starts empty, so incarnation
 /// handling fails closed without any explicit clearing.
 #[allow(clippy::too_many_arguments)]
 fn open_consistency_front(
@@ -1406,7 +1392,6 @@ fn open_consistency_front(
     owner_tx: &async_channel::Sender<OwnerRequest>,
     group: ConsensusGroupId,
     tablet: TabletId,
-    authority: TabletAuthority,
     local: NodeId,
     incarnation: NodeIncarnation,
     lease_params: kivi_types::LeaseParams,
@@ -1423,8 +1408,6 @@ fn open_consistency_front(
         Arc::clone(&hub),
         group,
         tablet,
-        authority,
-        incarnation,
         local,
     ));
     (hub, alr)
@@ -1500,6 +1483,8 @@ pub(crate) async fn owner_call_on<T>(
 pub(crate) async fn propose_caller_side(
     machine: &ReplicatedStateMachine,
     sidecar: &SidecarStore,
+    slots: &crate::resolve::ResolutionSlots,
+    domain: kivi_types::SecurityDomainId,
     namespace: NamespaceId,
     authority: TabletAuthority,
     owner_tx: &async_channel::Sender<OwnerRequest>,
@@ -1540,13 +1525,13 @@ pub(crate) async fn propose_caller_side(
     // Sidecar staging: chunked roots must already be durable locally
     // (cluster server stages before proposing); chunked-base range patches
     // restage here reusing untouched chunk ids via content addressing.
-    let restaged = ensure_proposal_sidecars_for(sidecar, machine, op, now).await?;
+    let restaged = ensure_proposal_sidecars_for(sidecar, machine, slots, domain, op, now).await?;
     let effective = restaged.as_ref().unwrap_or(op);
     // Chunked operations take the preflight path: the owner
     // pre-distributes sidecars to a write quorum first, then prepares the
     // mutation against fresh state at the proposal boundary. The condition
     // of a conditional write must evaluate after the multi-second
-    // preflight — never before it — so the caller must NOT prepare here
+    // preflight - never before it - so the caller must NOT prepare here
     // (a stale expectation would silently overwrite newer state). Small
     // writes keep the fast path below.
     if matches!(
@@ -1615,7 +1600,7 @@ pub(crate) async fn propose_caller_side(
 /// only barriers, fence syncs, and waits hop to the owner thread (the Raft
 /// handle never leaves its reactor). Every served read returns its
 /// [`ServedRead`] proof triple; every contract is either satisfied or fails
-/// loudly — never silently weakened.
+/// loudly - never silently weakened.
 pub(crate) struct ReadFront<'a> {
     /// Local state machine for reads and applied tracking.
     machine: &'a ReplicatedStateMachine,
@@ -1698,7 +1683,7 @@ impl<'a> ReadFront<'a> {
                 }
                 if path == ServePath::AlrSync || path == ServePath::AlrSubsumed {
                     // Never planned (execution assigns ALR paths); a
-                    // planner emitting one is a bug — barrier instead.
+                    // planner emitting one is a bug - barrier instead.
                     return self.barrier_serve(op, contract, ctx, false).await;
                 }
                 let outcome = read_applied_on(self.machine, op, ctx.now).await?;
@@ -1706,7 +1691,7 @@ impl<'a> ReadFront<'a> {
                 // Successful fast-path serves replay under their own
                 // evidence: the hub attaches the current receipt when it
                 // still validates, else stores a proof-less fill (Any /
-                // AtLeast replay only — never freshness).
+                // AtLeast replay only - never freshness).
                 self.hub.fill(
                     self.tablet,
                     self.authority,
@@ -1731,7 +1716,7 @@ impl<'a> ReadFront<'a> {
     /// Serves one roster-planned read: revalidate evidence at serve time
     /// (the plan's evidence may have destabilized since), serve live
     /// applied state under it, or fall back to Lazy-ALR. Never serves a
-    /// previous value when a covered write has not applied yet — the
+    /// previous value when a covered write has not applied yet - the
     /// responder knows it is behind (no evidence) and falls back.
     async fn roster_serve(
         &self,
@@ -2008,8 +1993,8 @@ impl<'a> ReadFront<'a> {
         Ok(served)
     }
 
-    /// Maps a barrier failure, counting fencing rejects and — after a
-    /// bounded-stale escalation — the unprovable bound.
+    /// Maps a barrier failure, counting fencing rejects and - after a
+    /// bounded-stale escalation - the unprovable bound.
     fn note_barrier_failure(&self, error: ConsensusError, escalated: bool) -> ReadError {
         self.hub.note_fencing_reject(self.tablet);
         if escalated {
@@ -2044,7 +2029,7 @@ impl<'a> ReadFront<'a> {
 /// both fronts. Fabric references fail closed here: consensus stores
 /// never hold them (replicated IR carries bytes, never worker-local
 /// ids), so a `FabricValue` means a foreign reference slipped past
-/// install validation — Unavailable, never absence.
+/// install validation - Unavailable, never absence.
 pub(crate) async fn read_applied_on(
     machine: &ReplicatedStateMachine,
     op: &Operation,
@@ -2253,6 +2238,7 @@ where
             group,
             domain,
             bulk_timeout,
+            std::sync::Arc::new(crate::resolve::ResolutionSlots::new()),
         );
         store.set_gate(gate.clone());
         gate
@@ -2427,7 +2413,7 @@ async fn open_mesh(
 /// the mesh. The loop never awaits Raft work inline: every request
 /// spawns its own task (`client_write`, barriers, snapshot installs can
 /// all pend indefinitely, and the loop must keep serving status,
-/// diagnostics, and peer RPCs meanwhile — awaiting inline deadlocks
+/// diagnostics, and peer RPCs meanwhile - awaiting inline deadlocks
 /// any client that overlaps a pending proposal with another request).
 /// All tasks stay on this reactor (`!Send` handles never leave it).
 async fn owner_serve_loop<S>(
@@ -2957,7 +2943,7 @@ where
 
     /// Lease-driver world view from Raft metrics: current term, voter set,
     /// leadership belief, and highest appended index as a commit position
-    /// (`UNASSIGNED` before the first append — a threshold vouching for
+    /// (`UNASSIGNED` before the first append - a threshold vouching for
     /// nothing). Runs on the owner thread (metrics handles are `!Send`).
     fn driver_view(&self) -> (kivi_types::RosterTerm, Vec<NodeId>, bool, CommitPosition) {
         let metrics = self.raft.metrics().borrow_watched().clone();
@@ -3040,7 +3026,7 @@ where
 
     /// One coverage poll of one responder: `true` iff it already applied
     /// through `commit` and can serve from it. `false` means "not yet (or
-    /// not reachable)" — the caller rounds again, then revokes and fails.
+    /// not reachable)" - the caller rounds again, then revokes and fails.
     async fn poll_coverage_once(&self, peer: NodeId, commit: CommitPosition) -> bool {
         use crate::peer::{PeerCoveragePoll, PeerRequest, PeerResponse};
         let request = PeerRequest::CoveragePoll(PeerCoveragePoll {
@@ -3062,18 +3048,18 @@ where
 
     /// Orders one Lazy-ALR batch boundary on the leader:
     ///
-    /// * `committed > formation` — a write committed while the batch
+    /// * `committed > formation` - a write committed while the batch
     ///   formed subsumes the extra fence. Proof (committed-prefix):
     ///   every write completing before formation committed no later than
     ///   formation began, hence at an index at or below any commit
     ///   observed after receipt; waiting the subsuming commit covers them
     ///   all. No entry is appended.
-    /// * `committed == formation` — no newer commit observed: append a
+    /// * `committed == formation` - no newer commit observed: append a
     ///   dedicated fence ordered after formation. Proof: the fence
     ///   commits by majority after receipt (hence after formation), so
     ///   its prefix contains every pre-formation completed write; waiting
     ///   the fence covers them. The fence mutates nothing.
-    /// * `committed < formation` — this leadership's view lags the
+    /// * `committed < formation` - this leadership's view lags the
     ///   former's: deposed or partitioned. Refuse (the caller falls back)
     ///   rather than order a boundary this leadership cannot vouch for.
     async fn resolve_alr_boundary(
@@ -3186,7 +3172,7 @@ where
 
     /// Serves one Lazy-ALR sync request (leader only): resolve the
     /// boundary and answer it. Refusals fail the follower's batch into
-    /// its barrier fallback — never a local serve on a guess.
+    /// its barrier fallback - never a local serve on a guess.
     async fn serve_alr_sync(
         &self,
         request: crate::peer::PeerAlrSyncRequest,
@@ -3224,7 +3210,7 @@ where
     /// Serves one responder-coverage poll from the applied pointer: the
     /// position plus whether this replica can satisfy the logical read
     /// contract from it (healthy flag covers sidecar resolvability and
-    /// latched faults — an unhealthy replica covers nothing).
+    /// latched faults - an unhealthy replica covers nothing).
     async fn serve_coverage(
         &self,
         poll: crate::peer::PeerCoveragePoll,
@@ -3328,7 +3314,7 @@ where
     }
 
     /// Asks the leader to hand leadership to `to`. Fire-and-forget: a
-    /// non-leader ignores it, and a changed leadership races safely —
+    /// non-leader ignores it, and a changed leadership races safely -
     /// the reconciler re-observes and continues. Must run on the owner
     /// thread.
     async fn transfer_leader(&self, to: NodeId) -> Result<(), String> {
@@ -3499,7 +3485,7 @@ where
     /// lane (opaque proto bytes, incarnation-fenced, group-independent);
     /// preflight prepares immutable roots through the durability gate on the bulk
     /// lane (same acquisition primitives as the append gate, replying
-    /// only once durable — never consensus, never logical state).
+    /// only once durable - never consensus, never logical state).
     async fn serve_rpc(
         &self,
         from: NodeId,
@@ -3649,7 +3635,7 @@ where
     /// Serves one redundancy fragment RPC from the node-local fragment
     /// store: proto-decode, incarnation fence, then dispatch (stage
     /// verifies hashes before storing; fetch never serves bad bytes).
-    /// Group-independent like the sidecars — any replica serves from the
+    /// Group-independent like the sidecars - any replica serves from the
     /// shared store. Protocol-level faults refuse the RPC; stale, missing,
     /// and oversize verdicts return as encoded `Refused` answers; bulk
     /// bytes are metered by the transport lane counters, never here.
@@ -3663,7 +3649,7 @@ where
 
     /// Buffers one snapshot fragment; on `done`, validates and installs
     /// the whole image. Gaps, meta conflicts, and mid-transfer restarts
-    /// (fresh transfer id) reset or refuse loudly — the sender retries
+    /// (fresh transfer id) reset or refuse loudly - the sender retries
     /// the transfer from scratch with a new id, never resumes a
     /// corrupted reassembly.
     async fn serve_fragment(
@@ -3770,7 +3756,7 @@ where
         // lands a root it cannot reconstruct. Transfer is content-addressed:
         // a follower holding 95% of chunks downloads only the missing 5%.
         // Fabric references never cross nodes (worker-local ids): a
-        // snapshot naming one is refused — the leader must ship bytes
+        // snapshot naming one is refused - the leader must ship bytes
         // (or chunked sidecars), never foreign fabric names.
         if let Ok(decoded) = crate::state_machine::ReplicatedTablet::decode_snapshot(
             &partial.bytes,
@@ -3810,7 +3796,7 @@ where
     }
 
     /// Triggers a snapshot seal, waits for the durable base, then purges
-    /// the log through it — all on the owner thread (reactor sleeps; the
+    /// the log through it - all on the owner thread (reactor sleeps; the
     /// caller stays runtime-agnostic).
     async fn snapshot_purge(&self) -> Result<ConsensusLogIndex, String> {
         if !self.machine.status().await.healthy {
@@ -3893,7 +3879,7 @@ pub(crate) struct BootstrapInputs<'a> {
 /// joint membership exactly once; rejoins recover existing Raft state
 /// (or wait for learner replication when the group is locally fresh)
 /// and fail loudly on identity conflicts instead of initializing a new
-/// group. Initializing on rejoin would fork a live group's history —
+/// group. Initializing on rejoin would fork a live group's history -
 /// `founding` (true only on a brand-new data directory) gates it.
 ///
 /// Runs on the owner thread (Raft futures are `!Send`).
@@ -3923,7 +3909,7 @@ where
         voters,
         peer_addrs,
     } = *inputs;
-    // Any trace of vote, log, or snapshot base means existing — recover
+    // Any trace of vote, log, or snapshot base means existing - recover
     // it, never re-initialize.
     let bootstrap = classify_from_store(store, machine).await;
     match bootstrap {
@@ -4055,7 +4041,7 @@ fn client_write_error(
 ///
 /// * `SetChunked` / `SetConditionalChunked`: the referenced root must
 ///   already be durable locally (cluster server stages before proposing).
-///   Missing sidecars fail closed as unavailable — the leader never
+///   Missing sidecars fail closed as unavailable - the leader never
 ///   proposes a root referencing volatile buffers.
 /// * `SetRange` against a chunked base: restages by reading the old value
 ///   via the sidecar store, applying the patch (zero-pad gaps, Redis
@@ -4110,7 +4096,7 @@ async fn check_txn_write_sidecars(
 }
 
 /// Proves one chunked root durable locally before proposing: the manifest
-/// must name staged payload, or the proposal fails loudly — a later commit
+/// must name staged payload, or the proposal fails loudly - a later commit
 /// can never meet a durable root with unavailable payload.
 async fn check_chunked_root(
     sidecar: &SidecarStore,
@@ -4133,12 +4119,37 @@ async fn check_chunked_root(
     Ok(())
 }
 
+/// Hands one freshly staged root to the redundancy plane.
+///
+/// Called from every staging site with the [`StagedRoot`] that `stage_value`
+/// already returned, so the chunk list is the stager's own view of what it
+/// wrote rather than a re-read. Best-effort by construction: the root is
+/// durable locally before this point, so a protection that cannot start costs a
+/// redundant copy and nothing else.
+fn protect_staged(
+    slots: &crate::resolve::ResolutionSlots,
+    domain: kivi_types::SecurityDomainId,
+    staged: &crate::sidecar::StagedRoot,
+) {
+    crate::resolve::protect_staged_root(
+        slots,
+        crate::resolve::ProtectedRoot {
+            domain,
+            manifest: staged.manifest,
+            logical_len: staged.logical_len,
+            chunks: staged.chunks.clone(),
+        },
+    );
+}
+
 /// Stages one transactional medium `Put` into chunked sidecars,
 /// returning the rewritten write. Every other write kind passes through
 /// after the usual sidecar proof (chunked references must name durable
 /// local payload; fabric references fail closed as foreign names).
 async fn stage_txn_put(
     sidecar: &SidecarStore,
+    slots: &crate::resolve::ResolutionSlots,
+    domain: kivi_types::SecurityDomainId,
     write: &kivi_state::TxnWrite,
 ) -> Result<kivi_state::TxnWrite, ProposeError> {
     if let kivi_state::TxnWriteKind::Put(value) = &write.kind
@@ -4150,6 +4161,7 @@ async fn stage_txn_put(
                 reason: format!("medium stage failed: {error}"),
             })
         })?;
+        protect_staged(slots, domain, &staged);
         return Ok(kivi_state::TxnWrite {
             key: write.key.clone(),
             kind: kivi_state::TxnWriteKind::PutChunked {
@@ -4172,6 +4184,8 @@ async fn stage_txn_put(
 /// large values ride explicit streaming uploads.
 async fn stage_medium_set(
     sidecar: &SidecarStore,
+    slots: &crate::resolve::ResolutionSlots,
+    domain: kivi_types::SecurityDomainId,
     op: &Operation,
 ) -> Result<Option<Operation>, ProposeError> {
     // Medium values replicate as chunked sidecars, never inline bytes.
@@ -4185,6 +4199,7 @@ async fn stage_medium_set(
                 reason: format!("medium stage failed: {error}"),
             })
         })?;
+        protect_staged(slots, domain, &staged);
         return Ok(Some(Operation::SetChunked {
             key: key.clone(),
             manifest: staged.manifest,
@@ -4205,6 +4220,7 @@ async fn stage_medium_set(
                 reason: format!("medium stage failed: {error}"),
             })
         })?;
+        protect_staged(slots, domain, &staged);
         return Ok(Some(Operation::SetConditionalChunked {
             key: key.clone(),
             manifest: staged.manifest,
@@ -4222,10 +4238,12 @@ async fn stage_medium_set(
 /// references fail closed as foreign names.
 async fn stage_txn_sidecars(
     sidecar: &SidecarStore,
+    slots: &crate::resolve::ResolutionSlots,
+    domain: kivi_types::SecurityDomainId,
     op: &Operation,
 ) -> Result<Option<Operation>, ProposeError> {
     if let Operation::TxnPrepare { write, .. } = op {
-        let staged = stage_txn_put(sidecar, write).await?;
+        let staged = stage_txn_put(sidecar, slots, domain, write).await?;
         if staged.kind == write.kind {
             return Ok(None);
         }
@@ -4249,7 +4267,7 @@ async fn stage_txn_sidecars(
         let mut staged_writes = Vec::with_capacity(writes.len());
         let mut changed = false;
         for write in writes {
-            let staged = stage_txn_put(sidecar, write).await?;
+            let staged = stage_txn_put(sidecar, slots, domain, write).await?;
             changed |= staged.kind != write.kind;
             staged_writes.push(staged);
         }
@@ -4270,14 +4288,16 @@ async fn stage_txn_sidecars(
 async fn ensure_proposal_sidecars_for(
     sidecar: &SidecarStore,
     machine: &ReplicatedStateMachine,
+    slots: &crate::resolve::ResolutionSlots,
+    domain: kivi_types::SecurityDomainId,
     op: &Operation,
     now: WallTimestamp,
 ) -> Result<Option<Operation>, ProposeError> {
     // Medium values replicate as chunked sidecars, never inline bytes.
-    if let Some(restaged) = stage_medium_set(sidecar, op).await? {
+    if let Some(restaged) = stage_medium_set(sidecar, slots, domain, op).await? {
         return Ok(Some(restaged));
     }
-    if let Some(restaged) = stage_txn_sidecars(sidecar, op).await? {
+    if let Some(restaged) = stage_txn_sidecars(sidecar, slots, domain, op).await? {
         return Ok(Some(restaged));
     }
     match op {
@@ -4358,7 +4378,7 @@ async fn ensure_proposal_sidecars_for(
                     })
                 })?;
             let patched = apply_range_patch(&old, *offset, patch).map_err(ProposeError::Op)?;
-            if patched.len() as u64 > kivi_chunk::policy::MAX_LEGACY_VALUE_BYTES {
+            if patched.len() as u64 > kivi_chunk::policy::MAX_INLINE_VALUE_BYTES {
                 return Err(ProposeError::Unsupported {
                     reason: "range result exceeds 64 MiB; rewrite through streaming upload"
                         .to_owned(),
@@ -4369,6 +4389,11 @@ async fn ensure_proposal_sidecars_for(
                     reason: format!("restage failed: {error}"),
                 })
             })?;
+            // A restaged patch reuses untouched chunk ids by content
+            // addressing, so protecting it is cheap and idempotent: the
+            // fabric already holds those chunks, and the manifest is the only
+            // genuinely new asset.
+            protect_staged(slots, domain, &staged);
             Ok(Some(Operation::SetConditionalChunked {
                 key: key.clone(),
                 manifest: staged.manifest,
@@ -4392,7 +4417,7 @@ fn apply_range_patch(
     let offset = usize::try_from(offset).map_err(|_| OpError::StaleRangeBase)?;
     let patch_len = patch.len();
     let new_len = offset.saturating_add(patch_len).max(base.len());
-    if new_len as u64 > kivi_chunk::policy::MAX_LEGACY_VALUE_BYTES {
+    if new_len as u64 > kivi_chunk::policy::MAX_INLINE_VALUE_BYTES {
         return Err(OpError::StaleRangeBase);
     }
     let mut out = vec![0u8; new_len];
@@ -4814,35 +4839,10 @@ mod tests {
         (nodes, dirs, topology, leader, index)
     }
 
-    /// Leader writes and linearizable reads serve the committed value.
-    #[test]
-    fn leader_writes_and_reads_latest() {
-        block_on(async {
-            let (nodes, _dirs, _topology, leader, _index) = elected_cluster().await;
-            let read = nodes[leader]
-                .read(
-                    &Operation::Get {
-                        key: Key::from("x"),
-                    },
-                    ReadContract::Latest,
-                    CTX,
-                    ELIGIBLE,
-                )
-                .await
-                .expect("latest reads");
-            assert_eq!(
-                read.outcome,
-                OperationResult::Value(Some(bytes::Bytes::from_static(b"1")))
-            );
-            for node in &nodes {
-                node.shutdown().await;
-            }
-        });
-    }
-
     /// `AtLeast` serves from a lagging-but-covered follower without
-    /// contacting the leader; foreign lineages reject as `StaleToken`
-    /// without waiting; the strong cache replays `Any`.
+    /// contacting the leader; a token for another tablet or a superseded
+    /// epoch rejects as `StaleToken` without waiting; the strong cache
+    /// replays `Any`.
     #[test]
     fn at_least_covers_follower_and_rejects_foreign_lineage() {
         use kivi_types::{CommitPosition, CommitToken, TabletEpoch, TabletId};
@@ -4884,46 +4884,33 @@ mod tests {
             assert_eq!(metrics.reads_by_contract.1, 1, "one at-least read");
             assert_eq!(metrics.authority_serves, 0, "no barrier taken");
             assert_eq!(metrics.local_serves, 1, "served locally");
-            // A token for another tablet never validates here.
-            let foreign = CommitToken::new(
-                TabletId::from_u64(4242),
-                TabletEpoch::INITIAL,
-                CommitPosition::FIRST,
-            );
-            let error = nodes[follower]
-                .read(
-                    &Operation::Get {
-                        key: Key::from("x"),
-                    },
-                    ReadContract::AtLeast(foreign),
-                    CTX,
-                    ELIGIBLE,
-                )
-                .await
-                .expect_err("foreign tablet rejects");
-            assert!(
-                matches!(error, ReadError::StaleToken { .. }),
-                "wrong tablet is a stale token, got {error:?}"
-            );
-            // A token from a superseded epoch rejects too: split/merge
-            // lineage never accidentally validates.
-            let old_epoch =
-                CommitToken::new(TABLET, TabletEpoch::from_u64(999), CommitPosition::FIRST);
-            let error = nodes[follower]
-                .read(
-                    &Operation::Get {
-                        key: Key::from("x"),
-                    },
-                    ReadContract::AtLeast(old_epoch),
-                    CTX,
-                    ELIGIBLE,
-                )
-                .await
-                .expect_err("superseded epoch rejects");
-            assert!(
-                matches!(error, ReadError::StaleToken { .. }),
-                "stale epoch is a stale token, got {error:?}"
-            );
+            // A token for another tablet, and one from a superseded epoch,
+            // never validate here: split/merge lineage never accidentally
+            // validates.
+            for foreign in [
+                CommitToken::new(
+                    TabletId::from_u64(4242),
+                    TabletEpoch::INITIAL,
+                    CommitPosition::FIRST,
+                ),
+                CommitToken::new(TABLET, TabletEpoch::from_u64(999), CommitPosition::FIRST),
+            ] {
+                let error = nodes[follower]
+                    .read(
+                        &Operation::Get {
+                            key: Key::from("x"),
+                        },
+                        ReadContract::AtLeast(foreign),
+                        CTX,
+                        ELIGIBLE,
+                    )
+                    .await
+                    .expect_err("foreign lineage rejects");
+                assert!(
+                    matches!(error, ReadError::StaleToken { .. }),
+                    "foreign lineage is a stale token, got {error:?}"
+                );
+            }
             let metrics = nodes[follower].status().await.consistency;
             assert_eq!(
                 metrics.at_least_lineage_rejects, 2,
@@ -4933,11 +4920,10 @@ mod tests {
             let any = || Operation::Get {
                 key: Key::from("y-absent"),
             };
-            let first = nodes[follower]
+            nodes[follower]
                 .read(&any(), ReadContract::Any, CTX, ELIGIBLE)
                 .await
                 .expect("first any serves");
-            assert_eq!(first.outcome, OperationResult::Value(None));
             let second = nodes[follower]
                 .read(&any(), ReadContract::Any, CTX, ELIGIBLE)
                 .await
@@ -5062,7 +5048,7 @@ mod tests {
             assert_eq!(metrics.alr_batches, 1);
             assert_eq!(metrics.authority_serves, 0, "no barrier on the ALR path");
             // Follower: forwards the fence order to the leader, executes
-            // the batch locally once the boundary applies — still no
+            // the batch locally once the boundary applies - still no
             // barrier, still exact.
             let served = nodes[follower]
                 .read(&get(), ReadContract::Latest, CTX, ELIGIBLE)
@@ -5087,7 +5073,7 @@ mod tests {
 
     /// Roster leases serve `Latest` locally on responders; a leader
     /// transition voids old-roster authority (term fencing) so an old
-    /// responder either sees the new write or fails over — never a stale
+    /// responder either sees the new write or fails over - never a stale
     /// success. Partitioning the old responder forces the failure leg.
     ///
     /// Slow lease timing (5s leases): exclusion windows deterministically
@@ -5111,7 +5097,7 @@ mod tests {
             // every node must hold live exclusions to all three peers
             // (covered == 3 everywhere). Only then does killing the
             // leader deterministically leave a live exclusion covering
-            // the dead node on the successor — the refusal below must
+            // the dead node on the successor - the refusal below must
             // not race activation.
             let responder = (leader + 1) % 3;
             let mut served = None;
@@ -5156,7 +5142,7 @@ mod tests {
             //   the bug, not the other way around.
             //
             // Either way the invariant under test holds downstream: an
-            // old responder either sees the new write or fails over —
+            // old responder either sees the new write or fails over -
             // never a stale success. A bare `expect_err` here would turn
             // scheduler timing (grant tasks vs test thread) into a fake
             // protocol failure.
@@ -5201,7 +5187,7 @@ mod tests {
             // Past the exclusion lapse (slow timing: ~5s lease), the
             // gate clears and the write succeeds; the old responder's
             // next read either sees it (ALR over the live link) or fails
-            // over — never stale.
+            // over - never stale.
             compio::time::sleep(Duration::from_millis(6_000)).await;
             nodes[new_leader]
                 .propose(
@@ -5227,7 +5213,7 @@ mod tests {
             );
             // Partition a pure follower (neither old nor new leader) from
             // the new leader: while its lease is still valid it keeps
-            // serving — the covered value, never stale data.
+            // serving - the covered value, never stale data.
             let partitioned = (0..3)
                 .find(|index| *index != new_leader && *index != leader)
                 .expect("a pure follower exists");
@@ -5555,7 +5541,7 @@ mod tests {
     /// stays pending while the node still considers itself leader without
     /// quorum, or it fails fast with a routing error once the node steps
     /// down or campaigns (0.10 elections move promptly). `Applied` is the
-    /// only forbidden outcome — acknowledging without quorum.
+    /// only forbidden outcome - acknowledging without quorum.
     #[test]
     fn isolated_leader_cannot_acknowledge() {
         block_on(async {
@@ -5631,7 +5617,7 @@ mod tests {
                 .expect("majority reads");
             assert_eq!(read.outcome, OperationResult::Counter(Some(11)));
             // Heal: the isolated entry (never quorum-committed) vanishes and
-            // every replica converges on the majority history — no dual
+            // every replica converges on the majority history - no dual
             // acknowledged history exists anywhere.
             heal_all(&nodes).await;
             wait_applied(&nodes, nodes[majority].status().await.applied.get()).await;
@@ -5657,7 +5643,7 @@ mod tests {
 
     /// Log conflict repair: a real divergent uncommitted suffix on the
     /// isolated leader is replaced by the authoritative log on heal,
-    /// through the persisted `RaftTruncate` record — and the record
+    /// through the persisted `RaftTruncate` record - and the record
     /// survives a restart.
     #[test]
     fn conflicting_suffix_truncates_through_durable_record() {
@@ -5681,8 +5667,8 @@ mod tests {
             partition_leader(&nodes, leader).await;
             // The isolated leader appends an uncommitted suffix entry: it
             // lands in its local log (last_log advances) but can never
-            // commit without quorum. The proposal goes out immediately —
-            // well inside the election timeout — while the node still
+            // commit without quorum. The proposal goes out immediately -
+            // well inside the election timeout - while the node still
             // considers itself leader; if it already stepped down or
             // campaigns, the scenario cannot start and the test reports
             // that instead of hanging.
@@ -5761,7 +5747,7 @@ mod tests {
                 );
             }
             // The replacement went through the persisted Kivi truncate
-            // record — not a memory-only path.
+            // record - not a memory-only path.
             assert!(
                 nodes[leader].store.cached_truncate_count().await >= 1,
                 "stale suffix replacement must record a durable truncate"

@@ -16,25 +16,7 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use kivi_lab::cluster::Cluster;
-use kivi_state::Key;
-
-fn key(name: &str) -> Key {
-    Key::from(name)
-}
-
-fn put(client: &kivi_client::NativeClient, name: &str, value: &[u8]) {
-    client
-        .set(&key(name), bytes::Bytes::copy_from_slice(value))
-        .unwrap_or_else(|error| panic!("set {name} commits: {error:?}"));
-}
-
-fn get(client: &kivi_client::NativeClient, name: &str) -> Vec<u8> {
-    client
-        .get(&key(name))
-        .unwrap_or_else(|error| panic!("get {name} reads: {error:?}"))
-        .unwrap_or_else(|| panic!("{name} present"))
-        .to_vec()
-}
+use kivi_lab::testkit::{NS, get, key, put};
 
 /// Distinct leader node ids observed across tablets on one member.
 fn distinct_leaders(cluster: &Cluster, index: usize) -> Vec<u64> {
@@ -61,7 +43,7 @@ fn multi_tablets_startup_writes_failover_restart() {
     let keys = cluster.keys_for_tablets(2);
     assert_eq!(keys.len(), 16);
     // Independent logs (deterministic): writes to one tablet advance only
-    // that tablet's applied index on every member — a shared log would
+    // that tablet's applied index on every member - a shared log would
     // move all tablets together.
     let pioneer = *keys.keys().next().expect("a tablet");
     cluster.wait_converged_all();
@@ -170,7 +152,7 @@ fn multi_tablets_startup_writes_failover_restart() {
     }
     // Restart: every tablet replica converges with no manual repair.
     // (`survivor_key` is one tablet's `names[0]`, so the degraded wave
-    // overwrote it too — the during-outage value was already verified
+    // overwrote it too - the during-outage value was already verified
     // above, before the wave.)
     cluster.restart(victim).expect("victim restarts");
     cluster.wait_converged_all();
@@ -189,7 +171,7 @@ fn multi_tablets_startup_writes_failover_restart() {
 }
 
 /// Independent ordering (§44): a large write on tablet A creates no Raft
-/// ordering dependency on tablet B — B's writes commit while A's bulk
+/// ordering dependency on tablet B - B's writes commit while A's bulk
 /// moves.
 #[test]
 fn multi_tablet_independent_ordering() {
@@ -240,7 +222,6 @@ fn multi_tablet_independent_ordering() {
 #[test]
 fn multi_tablet_minority_fences_isolated_leader() {
     use kivi_client::{ClientConfig, NativeClient};
-    use kivi_types::NamespaceId;
 
     let cluster = Cluster::spawn_with_tablets(8, 2, false).expect("cluster spawns");
     let leaders = cluster.wait_all_leaders();
@@ -304,10 +285,10 @@ fn multi_tablet_minority_fences_isolated_leader() {
     assert_ne!(majority, leader_a);
     // Pinned on the isolate, the write must never acknowledge (its commit
     // can never reach quorum). Still-leader, still-pending, or prompt
-    // routing failure all count as fenced — only `Ok` fails.
+    // routing failure all count as fenced - only `Ok` fails.
     let isolate_client = NativeClient::new(ClientConfig {
         seeds: vec![cluster.native_endpoint(leader_a)],
-        namespace: NamespaceId::from_u64(1),
+        namespace: NS,
         request_timeout: Duration::from_secs(6),
         ..ClientConfig::default()
     })
@@ -368,7 +349,7 @@ fn multi_tablet_lost_response_exactly_once_non_default_tablet() {
 
 /// Shared-WAL crash recovery across many groups: writes, per-group
 /// snapshots/purges on different groups sharing one physical WAL, kill,
-/// restart — every group recovers its own exact history.
+/// restart - every group recovers its own exact history.
 #[test]
 fn multi_tablet_shared_wal_crash_recovery_and_purge() {
     let mut cluster = Cluster::spawn_with_tablets(8, 2, false).expect("cluster spawns");

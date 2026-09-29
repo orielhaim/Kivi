@@ -3,7 +3,7 @@
 //! Pure function of its inputs (no I/O, no threads): the engine runs it
 //! on a background thread while `DataWorkers` keep serving. Incremental
 //! rule: a clean band is reused descriptor-for-descriptor from the
-//! previous manifest (byte-for-byte identical — committed state for its
+//! previous manifest (byte-for-byte identical - committed state for its
 //! keys provably unchanged); a dirty band is rebuilt even when empty (an
 //! emptied band is explicit state, never inferred absence).
 //!
@@ -14,7 +14,6 @@
 
 use std::collections::HashMap;
 
-use kivi_state::PartitionHasher;
 use kivi_types::{ClusterId, NamespaceId, NodeId, NodeIncarnation};
 
 use crate::artifact::ArtifactHash;
@@ -135,7 +134,7 @@ pub struct BuildStats {
 /// `previous` carries the last published manifest plus its content hash
 /// (the retention-chain link). Clean bands reuse its descriptors; a
 /// missing descriptor for a clean band fails loudly (the previous
-/// manifest is incomplete — never fall back to rebuilding silently, which
+/// manifest is incomplete - never fall back to rebuilding silently, which
 /// would fork band identity).
 ///
 /// # Errors
@@ -175,11 +174,7 @@ pub fn build_tablet(
     // Group objects into bands (partition hash computed once per key).
     let mut grouped: HashMap<u16, Vec<BandRecord>> = HashMap::new();
     for (key, object) in &snapshot.objects {
-        let hash = PartitionHasher::V1
-            .hash(snapshot.namespace, key.as_bytes())
-            .ok_or_else(|| CheckpointError::Format {
-                detail: "partition hash unavailable for checkpoint banding".to_owned(),
-            })?;
+        let hash = kivi_state::route_hash(snapshot.namespace, key.as_bytes());
         let band = policy
             .layout
             .band_of(snapshot.namespace, key.as_bytes())
@@ -468,7 +463,7 @@ mod tests {
     }
 
     /// Deterministic PRNG (splitmix64) for representative incompressible
-    /// bytes — no test-only RNG dependency, same bytes every run.
+    /// bytes - no test-only RNG dependency, same bytes every run.
     fn splitmix_next(state: &mut u64) -> u64 {
         *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = *state;
@@ -634,7 +629,7 @@ mod tests {
         let _ = (none_publish, lz4_publish);
         // Report (use `cargo test -- --nocapture` to read): the test itself
         // asserts only correctness + the compressible win below (timings
-        // are informational, never asserted — too platform-sensitive).
+        // are informational, never asserted - too platform-sensitive).
         println!(
             "representative 3000 objects logical={logical_bytes}B \
              none stored={}B raw={}B build={:?} restore={:?} write={:?} disk_restore={:?} | \
@@ -689,7 +684,7 @@ mod tests {
             let mut objects = base.objects.clone();
             // Mutate objects until `wanted_dirty` distinct bands covered
             // (1000 objects over 256 bands ≈ 4 per band, so this terminates;
-            // 256 wants every band — mark all directly).
+            // 256 wants every band - mark all directly).
             if wanted_dirty >= 256 {
                 for band in 0..crate::layout::BAND_COUNT_U16 {
                     dirty.mark(band);

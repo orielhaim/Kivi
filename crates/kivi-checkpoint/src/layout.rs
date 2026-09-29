@@ -3,7 +3,7 @@
 //! A checkpoint divides each tablet into immutable bands so incremental
 //! checkpoints rewrite only what changed. Band mapping is a PHYSICAL
 //! format decision: it never affects logical routing, but it is versioned
-//! and pinned like every other format choice — a layout change mints a
+//! and pinned like every other format choice - a layout change mints a
 //! new [`BandLayoutId`], and manifests record which layout they use.
 //!
 //! Layout V1 (`hash-prefix-8`):
@@ -18,8 +18,7 @@
 //! must supply their own explicitly versioned physical function rather
 //! than coupling band boundaries to range semantics.
 
-use kivi_state::PartitionHasher;
-use kivi_types::{NamespaceId, PartitionHash};
+use kivi_types::NamespaceId;
 
 /// Bands per tablet in layout V1. A `[u64; 4]` bitset tracks a tablet's
 /// dirty bands without per-mutation allocation.
@@ -74,9 +73,14 @@ impl core::fmt::Display for BandLayoutId {
     }
 }
 
-/// Versioned physical band mapper. The hasher is fixed to
-/// [`PartitionHasher::V1`] in layout V1: band identity must be as stable
-/// as the partition hash itself.
+/// Versioned physical band mapper.
+///
+/// The band index is the top eight bits of [`kivi_state::route_hash`], the same
+/// routing identity every router uses. That is a requirement, not a convenience:
+/// a band is a physical grouping of keys, and if it were derived from a different
+/// construction then a key's band and a key's tablet would be two independent
+/// opinions about where it lives. It *was* derived from BLAKE3-128 while routing
+/// used XXH3-128, which is exactly that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BandLayout {
     id: BandLayoutId,
@@ -106,8 +110,7 @@ impl BandLayout {
     pub fn band_of(&self, namespace: NamespaceId, key: &[u8]) -> Option<u16> {
         match self.id {
             BandLayoutId::HASH_PREFIX_8 => {
-                let hash: PartitionHash = PartitionHasher::V1.hash(namespace, key)?;
-                Some((hash.as_u128() >> 120) as u16)
+                Some((kivi_state::route_hash(namespace, key).as_u128() >> 120) as u16)
             }
             _ => None,
         }

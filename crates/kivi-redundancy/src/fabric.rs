@@ -11,7 +11,7 @@
 //! replacement layout is fully encoded, written as pending, decoded and
 //! content-verified against the asset id, and only then published atomically;
 //! the old layout retires afterwards. Transitions may temporarily hold extra
-//! redundancy — preferable to a durability gap. Every asynchronous step is
+//! redundancy - preferable to a durability gap. Every asynchronous step is
 //! generation-fenced: stale completions cannot overwrite a newer layout.
 //!
 //! Crash recovery distinguishes published current layouts, incomplete new
@@ -27,15 +27,15 @@ use std::sync::atomic::Ordering;
 
 use kivi_types::NodeId;
 
+use crate::repair::{FragmentVerdict, RepairBudgets, RepairEngine};
 use crate::store::{
     fragment_name, publish_layout, read_fragment, retire_generation, sync_dir_best_effort,
     write_fragment, write_layout,
 };
 use crate::{
-    DesiredPlacement, FabricMetrics, FailureScope, FragmentRecord, FragmentVerdict,
-    InformationAsset, RedundancyError, RedundancyIntent, RedundancyLayout, RepairBudgets,
-    RepairEngine, RepairReason, SchemeParams, assess, plan_baseline, plan_placement,
-    reconstruction_targets,
+    DesiredPlacement, FabricMetrics, FailureScope, FragmentRecord, InformationAsset,
+    RedundancyError, RedundancyIntent, RedundancyLayout, RepairReason, SchemeParams, assess,
+    plan_baseline, plan_placement, reconstruction_targets,
 };
 
 /// Bounds for foreground reconstruction work.
@@ -195,12 +195,6 @@ impl RedundancyFabric {
     #[must_use]
     pub fn metrics(&self) -> &Arc<FabricMetrics> {
         &self.metrics
-    }
-
-    /// Replaces the cluster view (joins, drains, migrations, failures feed
-    /// through here; no separate membership system is built).
-    pub fn set_nodes(&mut self, nodes: Vec<crate::NodeDescriptor>) {
-        self.nodes = nodes;
     }
 
     /// Returns the published layout for an asset, if any.
@@ -463,7 +457,7 @@ impl RedundancyFabric {
 
     /// Executes up to the per-tick repair budget: reconstructs missing
     /// fragments from the current layout and publishes replacements in
-    /// place (same generation, new bytes — idempotent and resumable).
+    /// place (same generation, new bytes - idempotent and resumable).
     ///
     /// Foreground traffic retains priority: pass `foreground_pressure`
     /// when hot reads are active to drain a single repair.
@@ -654,7 +648,7 @@ impl RedundancyFabric {
         publish_layout(&dir, generation, &layout)?;
         let previous = self.layouts.insert(asset.id, layout.clone());
         // Retire the previous generation (safe: the replacement is proven
-        // usable — retire failures only cost disk, never correctness).
+        // usable - retire failures only cost disk, never correctness).
         if let Some(old) = previous {
             retire_generation(&dir, old.generation, old.params.total_fragments());
         }
@@ -738,10 +732,10 @@ impl RedundancyFabric {
     }
 
     /// Executes one queued repair: rebuilds the task's fragments from the
-    /// current layout and rewrites them in place (same generation —
+    /// current layout and rewrites them in place (same generation -
     /// idempotent: re-executing a completed repair rewrites identical
     /// verified bytes).
-    fn execute_repair(&mut self, task: &crate::RepairTask) -> Result<(), RedundancyError> {
+    fn execute_repair(&mut self, task: &crate::repair::RepairTask) -> Result<(), RedundancyError> {
         let layout = self.layouts.get(&task.asset).cloned().ok_or_else(|| {
             RedundancyError::MissingFragment {
                 asset: task.asset.to_string(),
@@ -904,7 +898,7 @@ fn recover_asset_dir(
         });
     }
     // Verify every referenced fragment file exists and hashes correctly;
-    // missing/corrupt fragments mark degraded (never fail recovery — the
+    // missing/corrupt fragments mark degraded (never fail recovery - the
     // repair engine, not startup, owns rebuilds).
     report.assets_recovered += 1;
     // Stale generations (any gen-*.layout not CURRENT) are retained here and
@@ -954,7 +948,6 @@ mod tests {
                 id: NodeId::from_u64(id),
                 domain: crate::FailureDomain::node_only(NodeId::from_u64(id)),
                 health: NodeHealth::Active,
-                weight: 1,
             })
             .collect()
     }

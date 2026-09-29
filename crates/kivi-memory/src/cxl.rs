@@ -5,8 +5,8 @@
 //! A CXL Type-3 device may be volatile or persistent, and the two are
 //! indistinguishable from the host without an explicit check. Kivi therefore
 //! registers every region here as a *volatile, node-attached* provider. The
-//! mapping is real capacity — the pages are really device-backed and really
-//! reachable — but nothing in Kivi may treat a byte in this tier as surviving
+//! mapping is real capacity - the pages are really device-backed and really
+//! reachable - but nothing in Kivi may treat a byte in this tier as surviving
 //! a restart, because a device that reports no persistence is a device that has
 //! none. A deployment that proves persistence adds it; Kivi does not guess.
 //!
@@ -16,8 +16,8 @@
 //! interleave granularity, the memory controller's settings, and how far the
 //! worker is from the node the device is attached to. Any table of "typical CXL
 //! latency" is a guess that is wrong on at least one of those axes. So this
-//! provider registers with an *uncalibrated* descriptor — every cost field zero,
-//! `healthy: false` — and [`CxlProvider::read`] / [`CxlProvider::write`] feed
+//! provider registers with an *uncalibrated* descriptor - every cost field zero,
+//! `healthy: false` - and [`CxlProvider::read`] / [`CxlProvider::write`] feed
 //! the real [`Calibrator`]. A region that has never been touched is therefore
 //! excluded by `ProviderCaps::satisfies`, which is the correct answer: the
 //! planner has no evidence to rank it with.
@@ -55,7 +55,7 @@ const CXL_KIND: &str = "cxl";
 /// Reported as invalid caller use rather than as a device failure: on a live
 /// region an out-of-range offset is a bug, and on a region the kernel removed
 /// under the process it is the only honest description available. Either way
-/// the fabric's response is the same — do not serve these bytes — which is why
+/// the fabric's response is the same - do not serve these bytes - which is why
 /// the two need not be distinguished.
 fn outside_region() -> MemoryError {
     MemoryError::Invalid {
@@ -163,7 +163,7 @@ pub struct CxlProvider {
 impl CxlProvider {
     /// Maps every tiered region the topology offers.
     ///
-    /// Returns an empty provider — not an error — on a machine with no CXL or
+    /// Returns an empty provider - not an error - on a machine with no CXL or
     /// pmem, because that is a normal deployment and must not stop startup. A
     /// region that fails to map is dropped and named in the reason; a provider
     /// that swallowed that would report capacity it cannot reach.
@@ -437,7 +437,7 @@ fn nanos(elapsed: core::time::Duration) -> u64 {
 /// running mean can briefly be negative when a sample arrives after a reset.
 /// Reporting that as a huge `u64` would make the provider look catastrophically
 /// slow rather than unmeasured, so the floor is zero and the ceiling is
-/// `2^53`, the largest integer an `f64` represents exactly — past that the
+/// `2^53`, the largest integer an `f64` represents exactly - past that the
 /// conversion would round, and a rounded nanosecond count is a fabricated one.
 /// Real latencies and bandwidths are many orders of magnitude below it.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -571,7 +571,7 @@ mod tests {
         };
         let mut provider = CxlProvider::from_regions(vec![region]);
         let mut calibrator = calibrator();
-        // Inside the mapping, so this succeeds — the region is a mapping, and
+        // Inside the mapping, so this succeeds - the region is a mapping, and
         // refusing an unallocated range would be a second allocator.
         assert!(provider.read(0, 1 << 20, &mut calibrator).is_ok());
         // One byte past the end, so this does not.

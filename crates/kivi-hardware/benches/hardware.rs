@@ -347,7 +347,7 @@ fn memory_normal_pages(b: Bencher) {
         let start = Instant::now();
         // Touch every page so the cost being measured is faulting, not
         // allocating: the question is what the mapping costs to fill. The
-        // `black_box` is load-bearing — without it the buffer is dead by the
+        // `black_box` is load-bearing - without it the buffer is dead by the
         // end of the closure, the stores are elided, and the whole benchmark
         // reports the cost of an allocation.
         for offset in (0..buffer.len()).step_by(4096) {
@@ -366,7 +366,7 @@ fn memory_normal_pages(b: Bencher) {
 /// the mapping, which `advise_region` returning `true` does not establish. So
 /// this benchmark reads the kernel's own accounting back out of
 /// `/proc/self/smaps` and reports no timing at all when the region was not
-/// promoted — a benchmark that compared two identical mappings and called the
+/// promoted - a benchmark that compared two identical mappings and called the
 /// difference a huge-page speedup is worse than no benchmark.
 #[divan::bench]
 fn memory_huge_page_advice(b: Bencher) {

@@ -1654,9 +1654,15 @@ mod tests {
         assert_eq!(latency.max_ns, 8);
     }
 
+    /// A snapshot must not depend on the order samples arrived in. The scopes
+    /// come back in a fixed order - workers by id, then cluster - so two nodes
+    /// reporting the same events produce byte-identical snapshots and a
+    /// diffable record.
     #[test]
-    fn replay_is_deterministic_and_scopes_are_sorted() {
-        let first_order = [
+    fn a_snapshot_is_ordered_by_scope_not_by_arrival() {
+        let mut fabric = ObservationFabric::new(limits(4, 8, 4));
+        // Arrival order: worker 1, cluster, worker 2.
+        let arrivals = [
             (
                 worker(1),
                 TypedSignal::HotKey(HotKeySignal {
@@ -1683,34 +1689,20 @@ mod tests {
                 }),
             ),
         ];
-        let second_order = first_order;
-        let mut first = ObservationFabric::new(limits(4, 8, 4));
-        let mut second = ObservationFabric::new(limits(4, 8, 4));
-        for (index, (scope, signal)) in first_order.into_iter().enumerate() {
-            first
+        for (index, (scope, signal)) in arrivals.into_iter().enumerate() {
+            fabric
                 .collect(&sample(
                     scope,
                     u64::try_from(index + 1).expect("sequence"),
                     signal,
                 ))
-                .expect("first replay");
+                .expect("collect");
         }
-        for (index, (scope, signal)) in second_order.into_iter().enumerate() {
-            second
-                .collect(&sample(
-                    scope,
-                    u64::try_from(index + 1).expect("sequence"),
-                    signal,
-                ))
-                .expect("second replay");
-        }
-        let first_snapshot = first.snapshot(Ticks::from_micros(1_000));
-        let second_snapshot = second.snapshot(Ticks::from_micros(1_000));
-        assert_eq!(first_snapshot, second_snapshot);
-        assert_eq!(first_snapshot.scopes[0].scope, worker(1));
-        assert_eq!(first_snapshot.scopes[1].scope, worker(2));
+        let snapshot = fabric.snapshot(Ticks::from_micros(1_000));
+        assert_eq!(snapshot.scopes[0].scope, worker(1));
+        assert_eq!(snapshot.scopes[1].scope, worker(2));
         assert_eq!(
-            first_snapshot.scopes[2].scope,
+            snapshot.scopes[2].scope,
             ObservationScope::Cluster(ClusterId::from_u128(3))
         );
     }

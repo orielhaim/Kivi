@@ -5,14 +5,6 @@ edition.workspace = true
 rust-version.workspace = true
 license = "Apache-2.0"
 
-[features]
-default = []
-# Test targets that need a RESP-capable server binary (built separately via
-# `-p kivi-server --features redis-compat`). Without it those test files
-# compile to nothing, so ordinary `cargo test --workspace` stays
-# self-contained. When enabled and the binary still lacks RESP, the harness
-# fails loudly — never a silent skip.
-redis-compat = []
 
 [[bin]]
 name = "kivi-lab"
@@ -34,6 +26,9 @@ kivi-checkpoint.workspace = true
 # (BLAKE3 for generic/checkpoint families) exactly like the coordinator.
 kivi-redundancy.workspace = true
 kivi-codec.workspace = true
+# The redundancy admin plane speaks base64 image encoding; the shared testkit
+# helpers encode for it.
+base64 = "0.23"
 bytes.workspace = true
 anyhow.workspace = true
 clap.workspace = true
@@ -45,10 +40,9 @@ tempfile.workspace = true
 
 [dev-dependencies]
 divan.workspace = true
+rstest.workspace = true
 kivi-control.workspace = true
 kivi-observation.workspace = true
-# Redundancy suites speak the admin plane's base64 image encoding.
-base64 = "0.23"
 # Ecosystem/reference client: conformance cross-checks and the redis-rs →
 # Kivi compatibility test only. Benchmark targets and the harness speak raw
 # RESP so Kivi-vs-Redis comparisons share one identical transport.

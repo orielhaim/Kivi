@@ -38,7 +38,7 @@ impl FailureScope {
 /// Where one node physically lives.
 ///
 /// Empty labels mean "unknown": the planner treats unknown labels as one
-/// shared domain (fail closed — never assumes independence it cannot see).
+/// shared domain (fail closed - never assumes independence it cannot see).
 /// Adding rack/zone/region enforcement later only reads more fields here;
 /// [`crate::AssetId`] semantics never change.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -110,7 +110,7 @@ impl FailureDomain {
 }
 
 /// Health of one node as seen by the fabric (mirror of the control-plane
-/// lifecycle, consumed as a snapshot — never owned here).
+/// lifecycle, consumed as a snapshot - never owned here).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NodeHealth {
     /// Serving and eligible for new placements.
@@ -149,7 +149,7 @@ impl NodeHealth {
     }
 }
 
-/// One placement candidate: identity, failure domain, health, weight.
+/// One placement candidate: identity, failure domain, and health.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeDescriptor {
     /// Stable node identity.
@@ -158,8 +158,6 @@ pub struct NodeDescriptor {
     pub domain: FailureDomain,
     /// Current health snapshot.
     pub health: NodeHealth,
-    /// Capacity weight (`1` = default; `0` is normalized to `1`).
-    pub weight: u32,
 }
 
 impl NodeDescriptor {
@@ -170,14 +168,7 @@ impl NodeDescriptor {
             id,
             domain: FailureDomain::node_only(id),
             health: NodeHealth::Active,
-            weight: 1,
         }
-    }
-
-    /// Effective weight (never zero).
-    #[must_use]
-    pub fn effective_weight(&self) -> u32 {
-        if self.weight == 0 { 1 } else { self.weight }
     }
 }
 

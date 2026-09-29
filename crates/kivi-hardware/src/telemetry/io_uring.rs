@@ -16,7 +16,7 @@
 //! open, and Kivi's rings are open for the process's lifetime. On a machine
 //! where every core matters to placement, that is a permanent tax. `IOPOLL`
 //! asks for completions only through polling, which removes the interrupt
-//! entirely — and with it the only thing that lets a completion queue be
+//! entirely - and with it the only thing that lets a completion queue be
 //! drained by a thread that is not spinning. It also requires `O_DIRECT` and a
 //! device that supports it.
 //!

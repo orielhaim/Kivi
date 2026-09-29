@@ -15,7 +15,7 @@
 //! backpressure, never a queue).
 //!
 //! Reclamation invariant (spec Y): the WAL floor is the oldest cut any
-//! retained checkpoint promises recovery from — the previous cut when a
+//! retained checkpoint promises recovery from - the previous cut when a
 //! previous checkpoint exists, else the current cut. Floors advance only
 //! after the justifying checkpoints are installed; segments are deleted
 //! only after the floor that covers them is durable.
@@ -39,7 +39,7 @@ use kivi_types::{ClusterId, NamespaceId, NodeId, NodeIncarnation, TabletId};
 use crate::worker::{ControlIngress, TabletCheckpointStatus, WorkerControl};
 
 /// Automatic checkpoint triggers. All thresholds are conservative:
-/// checkpoints are rare, bounded background work — never a fixed cadence
+/// checkpoints are rare, bounded background work - never a fixed cadence
 /// regardless of activity.
 #[derive(Debug, Clone)]
 pub struct CheckpointConfig {
@@ -103,7 +103,7 @@ pub struct CheckpointInfo {
 }
 
 /// Live checkpoint state shared with the admin plane (brief mutex,
-/// status only — never object state, never the data path).
+/// status only - never object state, never the data path).
 #[derive(Debug, Clone, Default)]
 pub struct CheckpointAdminState {
     /// Installed current checkpoint per tablet.
@@ -288,7 +288,7 @@ fn run_checkpoint(mut context: CheckpointContext, commands: &Receiver<Checkpoint
         }
         // Builds run synchronously and sequentially (at most one in
         // flight, trivially); triggers that arrive mid-build cannot exist
-        // — the ledger flags set above coalesce everything into the next
+        // - the ledger flags set above coalesce everything into the next
         // evaluation, which is the documented backpressure policy.
         let due = due_tablets(&context, &ledgers, &mut wal_baselines);
         for tablet in due {
@@ -304,7 +304,7 @@ fn due_tablets(
     wal_baselines: &mut HashMap<kivi_types::WorkerId, u64>,
 ) -> Vec<TabletId> {
     if context.config.disabled {
-        // Automatic triggers off — but manual requests still flow below.
+        // Automatic triggers off - but manual requests still flow below.
         return ledgers
             .iter()
             .filter(|(_, ledger)| ledger.manual_pending)
@@ -433,8 +433,8 @@ fn checkpoint_tablet(
             ledger.last_completed = Some(Instant::now());
             // Chunk GC under the new retention promise: collect journals
             // (pruned to the older retained cut) and reclaim fully-dead
-            // sealed chunk packs. Best-effort like WAL reclamation —
-            // failures cost disk, never correctness — so GC trouble warns
+            // sealed chunk packs. Best-effort like WAL reclamation -
+            // failures cost disk, never correctness - so GC trouble warns
             // without failing the checkpoint that just succeeded.
             collect_chunk_journals(context, chunk_journals);
             run_chunk_gc(context, chunk_journals);
@@ -481,8 +481,8 @@ fn checkpoint_tablet_inner(
     // 3. Build (CPU off the DataWorker), then publish. The build window
     // is the known background-heavy stretch, so lane foreground pressure
     // is held across it (released on every exit, including `?` early
-    // returns): spare-capacity protects park until the checkpoint — and
-    // its own protection submit below — are done.
+    // returns): spare-capacity protects park until the checkpoint - and
+    // its own protection submit below - are done.
     let (installed, publish_stats, band_count, bands_reused, stored_bytes) = {
         let _pressure = LanePressureGuard::hold(context.redundancy.as_ref());
         let identity = CheckpointIdentity {
@@ -542,7 +542,7 @@ fn checkpoint_tablet_inner(
 /// Collects chunked-commit journals after a publish, pruning each tablet
 /// to its older retained cut (whose bands plus the WAL floor cover older
 /// commits from here on). Workers return the pruned remainder, which
-/// replaces the retained copy wholesale — no merge logic to skew.
+/// replaces the retained copy wholesale - no merge logic to skew.
 fn collect_chunk_journals(
     context: &CheckpointContext,
     retained: &mut HashMap<TabletId, Vec<(u64, kivi_types::ManifestId)>>,
@@ -588,7 +588,7 @@ fn collect_chunk_journals(
 /// Chunk manifests referenced by the retained checkpoints (current plus
 /// previous per tablet), read from installed band files. `None` when any
 /// link in the chain is unreadable: GC then skips the round entirely
-/// (keep-on-doubt — disk usage, never corruption).
+/// (keep-on-doubt - disk usage, never corruption).
 fn retained_band_chunk_refs(
     context: &CheckpointContext,
 ) -> Option<std::collections::HashSet<kivi_types::ManifestId>> {
@@ -826,7 +826,7 @@ fn capture_tablet(
 }
 
 /// Loads the installed manifest for band reuse (None when never published
-/// or when the chain is damaged — damage surfaces at publish binding, and
+/// or when the chain is damaged - damage surfaces at publish binding, and
 /// building without reuse stays correct, just less incremental).
 fn load_previous_manifest(
     context: &CheckpointContext,
@@ -850,7 +850,7 @@ fn load_previous_manifest(
 /// obsolete segments. Returns reclaimed bytes.
 fn reclaim_wal(context: &mut CheckpointContext) -> Result<u64, CheckpointFailure> {
     use kivi_checkpoint::reclaim::plan_reclaim;
-    // Floors: oldest promise per installed tablet — the verified
+    // Floors: oldest promise per installed tablet - the verified
     // previous cut, or no promise at all. Tablets with a single
     // checkpoint (or an unverifiable previous) are omitted: their
     // records block reclamation, keeping genesis replay viable until

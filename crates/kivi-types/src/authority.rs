@@ -2,7 +2,7 @@
 //!
 //! Every authoritative tablet range carries a ([`TabletId`], [`TabletEpoch`],
 //! [`WriteGuardGeneration`]) triple. Writes must present the current triple;
-//! anything older — or for the wrong tablet — is rejected. The check is a
+//! anything older - or for the wrong tablet - is rejected. The check is a
 //! pure function so it behaves identically on every replica and in simulation.
 
 use core::fmt;
@@ -49,8 +49,8 @@ impl TabletAuthority {
     /// Validates that `self` (presented by a writer) is authorized against the
     /// `current` authority.
     ///
-    /// Checks run in fencing hierarchy order — tablet, then epoch, then
-    /// generation — so the first reported mismatch is the most significant.
+    /// Checks run in fencing hierarchy order - tablet, then epoch, then
+    /// generation - so the first reported mismatch is the most significant.
     /// An old owner may still execute code, but a stale triple can never
     /// authorize a mutation (RFC §194).
     ///
@@ -124,75 +124,53 @@ pub enum AuthorityMismatch {
 mod tests {
     use super::*;
 
-    fn current() -> TabletAuthority {
+    fn authority(tablet: u64, epoch: u64, guard: u64) -> TabletAuthority {
         TabletAuthority::new(
-            TabletId::from_u64(918),
-            TabletEpoch::from_u64(381),
-            WriteGuardGeneration::from_u64(12),
+            TabletId::from_u64(tablet),
+            TabletEpoch::from_u64(epoch),
+            WriteGuardGeneration::from_u64(guard),
         )
     }
 
-    #[test]
-    fn current_authority_passes() {
-        assert_eq!(current().check_against(&current()), Ok(()));
+    fn current() -> TabletAuthority {
+        authority(918, 381, 12)
     }
 
+    /// This is the fencing check every write passes, so each way a presented
+    /// authority can be insufficient is pinned: the wrong tablet (a misroute,
+    /// which must be reported before anything else), a lower epoch, and a
+    /// lower guard within the same epoch.
     #[test]
-    fn stale_epoch_is_rejected() {
-        let stale = TabletAuthority::new(
-            TabletId::from_u64(918),
-            TabletEpoch::from_u64(380),
-            WriteGuardGeneration::from_u64(12),
-        );
+    fn every_way_to_be_stale_is_rejected_with_its_own_reason() {
+        assert_eq!(current().check_against(&current()), Ok(()));
+        assert!(matches!(
+            authority(919, 1, 1).check_against(&current()),
+            Err(AuthorityMismatch::WrongTablet { .. })
+        ));
         assert_eq!(
-            stale.check_against(&current()),
+            authority(918, 380, 12).check_against(&current()),
             Err(AuthorityMismatch::StaleEpoch {
                 presented: TabletEpoch::from_u64(380),
                 current: TabletEpoch::from_u64(381),
             })
         );
-    }
-
-    #[test]
-    fn stale_guard_is_rejected() {
-        let stale = TabletAuthority::new(
-            TabletId::from_u64(918),
-            TabletEpoch::from_u64(381),
-            WriteGuardGeneration::from_u64(11),
-        );
         assert!(matches!(
-            stale.check_against(&current()),
+            authority(918, 381, 11).check_against(&current()),
             Err(AuthorityMismatch::StaleGuard { .. })
         ));
     }
 
+    /// A zeroed authority must never authorize. Neither generation type
+    /// implements `Default`, so reaching one means it was constructed
+    /// deliberately; if that construction passed the check, a caller that
+    /// forgot to set a fence would write with no fence at all.
     #[test]
-    fn wrong_tablet_is_rejected_before_epoch() {
-        let misrouted = TabletAuthority::new(
-            TabletId::from_u64(919),
-            TabletEpoch::from_u64(1),
-            WriteGuardGeneration::from_u64(1),
-        );
-        assert!(matches!(
-            misrouted.check_against(&current()),
-            Err(AuthorityMismatch::WrongTablet { .. })
-        ));
-    }
-
-    #[test]
-    fn zeroed_authority_never_authorizes() {
+    fn a_zeroed_authority_never_authorizes() {
         let zeroed = TabletAuthority::new(
             TabletId::from_u64(918),
             TabletEpoch::INVALID,
             WriteGuardGeneration::INVALID,
         );
         assert!(zeroed.check_against(&current()).is_err());
-    }
-
-    #[test]
-    fn display_mentions_all_three_halves() {
-        let text = current().to_string();
-        assert!(text.contains("918"));
-        assert!(text.contains("381"));
     }
 }

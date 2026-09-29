@@ -2,12 +2,10 @@
 //!
 //! Spawns a 3-node cluster with RESP edges and drives Redis commands
 //! through them: writes/reads round-trip on the leader, followers answer
-//! `NOTLEADER` (never `MOVED`/`ASK` — there is no Redis Cluster here),
-//! and counters work end to end. Without the lab `redis-compat` feature
+//! `NOTLEADER` (never `MOVED`/`ASK` - there is no Redis Cluster here),
+//! and counters work end to end. Requires a server binary with the RESP
 //! this file compiles to nothing; without a RESP-capable server binary
 //! the harness fails loudly.
-
-#![cfg(feature = "redis-compat")]
 
 use kivi_lab::cluster::Cluster;
 use kivi_lab::resp_client::{Reply, RespClient};

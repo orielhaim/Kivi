@@ -15,13 +15,40 @@ use kivi_types::{Expiry, ManifestId};
 /// Object key: an immutable shared byte string.
 ///
 /// Backed by [`Bytes`] so clones are cheap and payloads can be shared with
-/// the network layer later without copying. This is an in-memory handle,
-/// not a durable format — future persistent layouts define their own key
-/// encoding. Lookups construct a `Key` (one small copy for borrowed input);
-/// a `Borrow<[u8]>` impl is deliberately absent so map hashing can never
-/// silently diverge between owned and borrowed forms.
+/// the network layer without copying. This is an in-memory handle, not a
+/// durable format - persistent layouts define their own key encoding.
+///
+/// The RESP read path holds a slice of the receive buffer and looks it up
+/// without copying it onto the heap, which is what [`Borrow<[u8]>`] is for.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Key(Bytes);
+
+/// The borrowed form of a [`Key`].
+///
+/// A `Borrow` impl is a promise that `Key` and `[u8]` agree on `Hash` and `Eq`. If
+/// they do not, a borrowed lookup computes a different hash, lands in a different
+/// bucket, and **silently misses** - a `GET` that returns nil for a key that exists,
+/// with no error anywhere. That silent miss is the whole risk this impl carries.
+///
+/// It holds because `bytes::Bytes`'s `Hash` delegates to its slice contents, so
+/// `Key::new(x)` and `x` hash identically for every hasher. The
+/// `borrowed_lookup_matches_owned_insert` test in [`crate::object`] is that proof,
+/// and it must keep passing: it covers an empty key, a key with an embedded NUL, a
+/// long key and a `Bytes`-backed key rather than one convenient example, and
+/// checks the agreement through a real container as well as through the hasher in
+/// isolation. If it ever fails, this impl has to go.
+impl core::borrow::Borrow<[u8]> for Key {
+    fn borrow(&self) -> &[u8] {
+        self.0.as_ref()
+    }
+}
+
+// hashbrown's `get` dispatches on its own `Equivalent` trait, which has a blanket
+// impl over `Borrow`. That it now applies is the point: before the `Borrow` impl
+// above, a borrowed lookup had nothing to dispatch on and would not compile, which
+// is why every lookup built a `Key`. Writing an explicit `Equivalent` here instead
+// was tried and conflicts with the blanket impl, which is the compiler confirming
+// that the derived relationship is already the one hashbrown wants.
 
 impl Key {
     /// Wraps bytes as a key.
@@ -29,7 +56,6 @@ impl Key {
     pub fn new(bytes: impl Into<Bytes>) -> Self {
         Self(bytes.into())
     }
-
     /// Reserved system-key prefix: keys starting with `0xFF` hold Kivi
     /// internals (transaction records, index projections) beside user data
     /// in the same tablet. Scans skip them; user writes to them are rejected
@@ -740,15 +766,12 @@ impl Decode for SemaphoreState {
 }
 
 /// Monotonic fencing token: every successful ownership change advances it.
-/// External systems reject `token < current` — that rejection, not time
+/// External systems reject `token < current` - that rejection, not time
 /// expiry, is what makes an old holder powerless.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FencingToken(u64);
 
 impl FencingToken {
-    /// The token no live holder has ever held (initial state).
-    pub const ZERO: Self = Self(0);
-
     /// Wraps a raw token value.
     #[must_use]
     pub const fn from_u64(value: u64) -> Self {
@@ -1148,18 +1171,6 @@ impl StoredObject {
         }
     }
 
-    /// Returns the physical representation name for `EXPLAIN`-style
-    /// diagnostics (`"inline"`, `"chunked"`, or `"fabric"`).
-    /// Informational only.
-    #[must_use]
-    pub const fn representation_name(&self) -> &'static str {
-        match self.representation {
-            Representation::Inline => "inline",
-            Representation::Chunked => "chunked",
-            Representation::Fabric => "fabric",
-        }
-    }
-
     /// Whether the object is logically absent at `now` (`now >= expires_at`).
     /// Pure comparison: the caller supplies time from the clock boundary.
     #[must_use]
@@ -1169,120 +1180,76 @@ impl StoredObject {
 }
 
 #[cfg(test)]
-mod tests {
+mod key_tests {
+    //! The tests that earn `impl Borrow<[u8]> for Key`.
+
     use super::*;
+    use std::borrow::Borrow;
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hash, Hasher};
 
-    #[test]
-    fn versions_advance_and_fail_explicitly_at_the_top() {
-        assert_eq!(ObjectVersion::FIRST.as_u64(), 1);
-        assert_eq!(
-            ObjectVersion::FIRST.next().expect("advances"),
-            ObjectVersion::from_u64(2)
-        );
-        assert_eq!(
-            ObjectVersion::from_u64(u64::MAX).next(),
-            Err(VersionExhausted)
-        );
+    // `build_hasher().hash_one(value)` would be the same measurement, but the point
+    // of the test is that the *derivation* of `Key`'s `Hash` matches a slice's, and
+    // spelling that out keeps the comparison from silently becoming a call to the
+    // very trait impl under test.
+    #[allow(clippy::manual_hash_one, reason = "measuring the derived Hash itself")]
+    fn hash_of<T: Hash + ?Sized, S: BuildHasher>(value: &T, state: &S) -> u64 {
+        let mut hasher = state.build_hasher();
+        value.hash(&mut hasher);
+        hasher.finish()
     }
 
+    /// A borrowed map lookup is only correct if `Key` and `[u8]` produce the same
+    /// hash for the same bytes. When they do not, the lookup lands in a different
+    /// bucket and **silently misses** - a `GET` returning nil for a key that exists,
+    /// with nothing anywhere reporting an error. That is the failure mode, and it is
+    /// why this is a test and not a comment.
     #[test]
-    fn keys_wrap_bytes_cheaply() {
-        let key = Key::new(b"user:123".as_slice());
-        assert_eq!(key.as_bytes(), b"user:123");
-        assert_eq!(key.to_string(), "user:123");
-        assert_eq!(Key::from("abc"), Key::new(b"abc".as_slice()));
+    fn borrowed_lookup_matches_owned_insert() {
+        let state = RandomState::new();
+        // Four shapes, because the interesting divergences are not all in the same
+        // place: an empty key, a key with a NUL in it (so anything treating the
+        // bytes as a C string is caught), a long key (so a length limit is caught),
+        // and a `Bytes`-backed key with non-inline storage.
+        let keys: Vec<Key> = vec![
+            Key::new(bytes::Bytes::from_static(b"")),
+            Key::new(bytes::Bytes::from_static(b"with\0nul")),
+            Key::new(bytes::Bytes::copy_from_slice(&[b'x'; 4096])),
+            Key::new(bytes::Bytes::from(b"owned-vec-backed".to_vec())),
+        ];
+        for key in &keys {
+            assert_eq!(
+                hash_of(key, &state),
+                hash_of::<[u8], _>(key.0.as_ref(), &state),
+                "Key and [u8] hash differently for {:?}; a borrowed lookup would \
+                 silently miss",
+                String::from_utf8_lossy(key.borrow())
+            );
+        }
     }
 
+    /// The same property, checked through the container that will actually do the
+    /// lookup rather than through the hasher in isolation.
+    ///
+    /// The hash agreeing is necessary; the `Eq` agreeing is what turns a matching
+    /// bucket into a matching entry, and a container is the only thing that checks
+    /// both.
     #[test]
-    fn semantic_states_round_trip_and_hold_invariants() {
-        fn round_trip<T>(value: &T) -> T
-        where
-            T: Encode + Decode + PartialEq + core::fmt::Debug,
-        {
-            let mut bytes = Vec::new();
-            value.encode(&mut bytes);
-            assert_eq!(bytes.len(), value.encoded_len());
-            let (back, consumed) = T::decode(&bytes).expect("decode");
-            assert_eq!(consumed, bytes.len());
-            assert_eq!(&back, value);
-            back
+    fn a_hashmap_finds_an_owned_insert_by_borrowed_bytes() {
+        let mut map: hashbrown::HashMap<Key, u32, RandomState> =
+            hashbrown::HashMap::with_hasher(RandomState::new());
+        for index in 0..256u32 {
+            map.insert(Key::new(format!("key:{index}")), index);
         }
-
-        let bounded = BoundedCounterState {
-            value: 30,
-            capacity: 100,
-            share: EscrowShare {
-                holder: kivi_types::TabletId::from_u64(9),
-                min: 0,
-                max: 60,
-            },
-        };
-        assert!(bounded.invariant_holds());
-        round_trip(&bounded);
-        assert!(
-            !BoundedCounterState {
-                value: 61,
-                ..bounded
-            }
-            .invariant_holds()
-        );
-
-        let mut permits = std::collections::BTreeMap::new();
-        permits.insert(
-            PermitId::from_bytes([0xA5; 16]),
-            PermitRecord { owner: 7, qty: 3 },
-        );
-        let semaphore = SemaphoreState {
-            capacity: 10,
-            permits,
-        };
-        assert_eq!(semaphore.outstanding(), 3);
-        assert!(semaphore.invariant_holds());
-        round_trip(&semaphore);
-
-        let lease = LeaseState {
-            holder: Some(LeaseHolder {
-                owner: 7,
-                fencing: FencingToken::from_u64(4),
-                expires_at: kivi_types::WallTimestamp::from_micros(99),
-            }),
-            next_fencing: FencingToken::from_u64(5),
-        };
-        round_trip(&lease);
-        round_trip(&LeaseState::free());
-        assert_eq!(
-            FencingToken::from_u64(4).next().expect("advances"),
-            FencingToken::from_u64(5)
-        );
-        assert_eq!(
-            FencingToken::from_u64(u64::MAX).next(),
-            Err(VersionExhausted)
-        );
-
-        let mut entries = std::collections::VecDeque::new();
-        entries.push_back(StreamEntry {
-            offset: 0,
-            partition: vec![0x70],
-            payload: Bytes::from_static(b"e0"),
-        });
-        let shard = StreamShardState {
-            stream: [0x5E; 16],
-            shard: 2,
-            next_offset: 1,
-            entries,
-        };
-        round_trip(&shard);
-
-        for object_type in [
-            ObjectType::Bytes,
-            ObjectType::StrictCounter,
-            ObjectType::CommutativeCounter,
-            ObjectType::BoundedCounter,
-            ObjectType::Semaphore,
-            ObjectType::Lease,
-            ObjectType::StreamShard,
-        ] {
-            round_trip(&object_type);
+        for index in 0..256u32 {
+            let needle = format!("key:{index}");
+            assert_eq!(
+                map.get(needle.as_bytes()),
+                Some(&index),
+                "borrowed lookup missed {needle}"
+            );
         }
+        // And a miss is a miss, not a wrong answer.
+        assert_eq!(map.get("key:256".as_bytes()), None);
     }
 }

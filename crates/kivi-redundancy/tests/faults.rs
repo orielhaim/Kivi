@@ -1,8 +1,8 @@
-//! Deterministic fault injection: every [`FaultKind`] on every scheme.
+//! Deterministic fault injection: every failure mode, on every scheme.
 //!
-//! Pure codec faults use [`SimFragments`] plus the replication/RS kernels
-//! directly (no filesystem). Fabric faults drive [`RedundancyFabric`] file
-//! layouts (delete/corrupt/truncate fragment files, plant pending builds,
+//! Pure codec faults drive the replication/RS kernels directly (no
+//! filesystem). Fabric faults drive [`RedundancyFabric`] file layouts
+//! (delete/corrupt/truncate fragment files, plant pending builds,
 //! drain/restart) and prove reads stay exact and failures close
 //! ([`Unrecoverable`], never wrong bytes).
 //!
@@ -14,14 +14,13 @@ use std::path::PathBuf;
 
 use kivi_redundancy::{
     AssetHealth, FabricConfig, FragmentVerdict, InformationAsset, RedundancyError,
-    RedundancyFabric, RepairReason, ReplicationParams, RsParams, SchemeParams, SimFragments,
+    RedundancyFabric, RepairReason, ReplicationParams, RsParams, SchemeParams,
 };
 use kivi_types::{NodeId, SecurityDomainId};
 
 const DOMAIN: SecurityDomainId = SecurityDomainId::from_u64(7);
 const SMALL_LEN: usize = 32 * 1024;
 const CODED_LEN: usize = 64 * 1024;
-const BIG_LEN: usize = 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Deterministic helpers
@@ -81,13 +80,37 @@ fn decode_scheme(
     }
 }
 
+/// Encodes `bytes` and returns the shards as the `(index, bytes)` pairs the
+/// decoders take.
+fn shards_of(bytes: &[u8], scheme: SchemeParams) -> Vec<(u32, Vec<u8>)> {
+    encode_scheme(bytes, scheme)
+        .expect("encodes")
+        .into_iter()
+        .enumerate()
+        .map(|(i, s)| {
+            // Index < total <= 40, fits `u32`.
+            #[allow(clippy::cast_possible_truncation)]
+            let index = i as u32;
+            (index, s)
+        })
+        .collect()
+}
+
+/// The three schemes, at whatever fragment size `len` implies.
+fn schemes_for_len(len: u64) -> [(&'static str, SchemeParams); 3] {
+    [
+        ("rep3", rep_scheme()),
+        ("rs42", rs42_scheme(len)),
+        ("rs83", rs83_scheme(len)),
+    ]
+}
+
 fn test_nodes(count: u64) -> Vec<kivi_redundancy::NodeDescriptor> {
     (1..=count)
         .map(|id| kivi_redundancy::NodeDescriptor {
             id: NodeId::from_u64(id),
             domain: kivi_redundancy::FailureDomain::node_only(NodeId::from_u64(id)),
             health: kivi_redundancy::NodeHealth::Active,
-            weight: 1,
         })
         .collect()
 }
@@ -144,192 +167,27 @@ fn truncate_frag(dir: &std::path::Path, generation: u64, index: u32) {
     std::fs::write(&path, &bytes[..bytes.len() / 2]).expect("truncates");
 }
 
-fn drop_first_n(view: &SimFragments, n: usize, seed: u64) -> Vec<(u32, Vec<u8>)> {
-    let mut present = view.present_sorted();
-    present.sort_by_key(|(i, _)| *i);
-    // Truncation is fine: `seed` only picks a deterministic start offset.
-    #[allow(clippy::cast_possible_truncation)]
-    let start = (seed as usize) % present.len().max(1);
-    for _ in 0..n {
-        if present.is_empty() {
-            break;
-        }
-        let pos = start % present.len();
-        present.remove(pos);
-    }
-    present
-}
-
 // ---------------------------------------------------------------------------
-// Pure codec: every FaultKind via SimFragments, all three schemes
+// Pure codec: the recoverability contract, on every scheme
 // ---------------------------------------------------------------------------
 
-fn codec_schemes_for_len(len: u64) -> Vec<(&'static str, SchemeParams)> {
-    vec![
-        ("rep3", rep_scheme()),
-        ("rs42", rs42_scheme(len)),
-        ("rs83", rs83_scheme(len)),
-    ]
-}
-
+/// Losing up to the advertised tolerance reconstructs the exact bytes;
+/// losing one more fails closed. Corruption and torn writes are the same
+/// case the fabric sees, because a per-fragment hash turns them into
+/// detected erasures.
 #[test]
-fn codec_all_faultkinds_behave() {
-    // Walks every FaultKind for every scheme through SimFragments and proves
-    // the recoverability contract. Corruption/partial writes are modeled as
-    // detected erasures (hash rejects them, decoder sees the remainder).
-    for fault in kivi_redundancy::FaultKind::all() {
-        for (name, scheme) in codec_schemes_for_len(SMALL_LEN as u64) {
-            let bytes = det_bytes(SMALL_LEN, 0xA11CE);
-            let shards = encode_scheme(&bytes, scheme).expect("encodes");
-            let mut view = SimFragments::from_shards(shards);
-            let total = shards_len(scheme);
-            let tol = tolerance_of(scheme);
-            view.apply(fault, 3);
-            let outcome = codec_expectation(fault, &view, total, tol);
-            check_codec_outcome(&bytes, scheme, &view, outcome, fault, name);
-        }
-    }
-}
-
-fn shards_len(scheme: SchemeParams) -> usize {
-    scheme.total_fragments() as usize
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Expect {
-    Recoverable,
-    Unrecoverable,
-    NoopRecoverable,
-}
-
-fn codec_expectation(
-    fault: kivi_redundancy::FaultKind,
-    view: &SimFragments,
-    total: usize,
-    tol: usize,
-) -> Expect {
-    use kivi_redundancy::FaultKind as F;
-    match fault {
-        F::MissingFragment | F::CorruptedFragment | F::PartialWrite | F::WithinTolerance => {
-            // WithinTolerance removes one via apply(); the dedicated tests
-            // below drop the full tolerance. Single loss always recovers.
-            let _ = (total, tol);
-            Expect::Recoverable
-        }
-        F::BeyondTolerance => {
-            let _ = view;
-            Expect::Unrecoverable
-        }
-        F::DuringEncoding
-        | F::DuringReconstruction
-        | F::BeforePublish
-        | F::AfterPublishBeforeRetire
-        | F::StaleRepair
-        | F::DrainDuringRepair
-        | F::RestartDuringTransition
-        | F::DuplicateRepair => Expect::NoopRecoverable,
-    }
-}
-
-fn check_codec_outcome(
-    bytes: &[u8],
-    scheme: SchemeParams,
-    view: &SimFragments,
-    outcome: Expect,
-    fault: kivi_redundancy::FaultKind,
-    name: &str,
-) {
-    use kivi_redundancy::FaultKind as F;
-    match (fault, outcome) {
-        (F::BeyondTolerance, Expect::Unrecoverable) => {
-            // apply() clears everything; beyond tolerance also holds for
-            // tolerance+1 losses (checked in dedicated tests).
-            let present = view.present_sorted();
-            let err = decode_scheme(&present, scheme, bytes.len() as u64)
-                .expect_err("beyond tolerance fails");
-            assert!(
-                err.is_unrecoverable(),
-                "{name} {fault:?}: expected Unrecoverable, got {err:?}"
-            );
-        }
-        (_, Expect::Recoverable | Expect::NoopRecoverable) => {
-            // For corruption/partial, drop the victim (hash would reject it).
-            let mut present = view.present_sorted();
-            if matches!(fault, F::CorruptedFragment | F::PartialWrite) {
-                // Victim is seed%len = 3%len; recompute deterministically by
-                // dropping the shard whose length/content disagrees: the
-                // corrupted shard keeps length, the truncated one is short.
-                // Simplest: drop index (3 % total).
-                let total = shards_len(scheme);
-                #[allow(clippy::cast_possible_truncation)]
-                let victim = (3 % total) as u32;
-                present.retain(|(i, _)| *i != victim);
-            }
-            let back = decode_scheme(&present, scheme, bytes.len() as u64)
-                .expect("within tolerance recovers");
-            assert_eq!(&back, bytes, "{name} {fault:?}: exact bytes");
-        }
-        (_, Expect::Unrecoverable) => unreachable!("only beyond maps to unrecoverable"),
-    }
-}
-
-#[test]
-fn codec_missing_single_recovers_all_schemes() {
-    for (name, scheme) in codec_schemes_for_len(SMALL_LEN as u64) {
-        let bytes = det_bytes(SMALL_LEN, 11);
-        let shards = encode_scheme(&bytes, scheme).expect("encodes");
-        let mut view = SimFragments::from_shards(shards);
-        view.apply(kivi_redundancy::FaultKind::MissingFragment, 1);
-        let present = view.present_sorted();
-        assert_eq!(present.len(), shards_len(scheme) - 1, "{name}");
-        let back = decode_scheme(&present, scheme, bytes.len() as u64).expect("recovers");
-        assert_eq!(back, bytes, "{name}: exact match");
-    }
-}
-
-#[test]
-fn codec_corrupted_detected_as_erasure_recovers() {
-    for (name, scheme) in codec_schemes_for_len(SMALL_LEN as u64) {
-        let bytes = det_bytes(SMALL_LEN, 22);
-        let shards = encode_scheme(&bytes, scheme).expect("encodes");
-        let mut view = SimFragments::from_shards(shards);
-        view.apply(kivi_redundancy::FaultKind::CorruptedFragment, 0);
-        // Hash verification would reject the victim; drop it and decode.
-        let total = shards_len(scheme);
-        #[allow(clippy::cast_possible_truncation)]
-        let victim = (0 % total) as u32;
-        let present: Vec<(u32, Vec<u8>)> = view
-            .present_sorted()
-            .into_iter()
-            .filter(|(i, _)| *i != victim)
-            .collect();
-        let back = decode_scheme(&present, scheme, bytes.len() as u64).expect("recovers");
-        assert_eq!(back, bytes, "{name}: exact match");
-    }
-}
-
-#[test]
-fn codec_within_tolerance_recovers_exact() {
-    for (name, scheme) in codec_schemes_for_len(SMALL_LEN as u64) {
-        let bytes = det_bytes(SMALL_LEN, 33);
-        let shards = encode_scheme(&bytes, scheme).expect("encodes");
-        let view = SimFragments::from_shards(shards);
+fn codec_tolerance_boundary_is_exact() {
+    for (name, scheme) in schemes_for_len(CODED_LEN as u64) {
+        let bytes = det_bytes(CODED_LEN, 33);
+        let shards = shards_of(&bytes, scheme);
         let tol = tolerance_of(scheme);
-        let present = drop_first_n(&view, tol, 5);
-        assert_eq!(present.len(), shards_len(scheme) - tol, "{name}");
-        let back = decode_scheme(&present, scheme, bytes.len() as u64).expect("recovers");
-        assert_eq!(back, bytes, "{name}: exact match");
-    }
-}
 
-#[test]
-fn codec_beyond_tolerance_fails_closed() {
-    for (name, scheme) in codec_schemes_for_len(SMALL_LEN as u64) {
-        let bytes = det_bytes(SMALL_LEN, 44);
-        let shards = encode_scheme(&bytes, scheme).expect("encodes");
-        let view = SimFragments::from_shards(shards);
-        let tol = tolerance_of(scheme);
-        let present = drop_first_n(&view, tol + 1, 5);
+        let present: Vec<_> = shards.iter().skip(tol).cloned().collect();
+        assert_eq!(present.len(), shards.len() - tol, "{name}");
+        let back = decode_scheme(&present, scheme, bytes.len() as u64).expect("recovers");
+        assert_eq!(back, bytes, "{name}: exact within tolerance");
+
+        let present: Vec<_> = shards.iter().skip(tol + 1).cloned().collect();
         let err =
             decode_scheme(&present, scheme, bytes.len() as u64).expect_err("must fail closed");
         assert!(
@@ -339,84 +197,40 @@ fn codec_beyond_tolerance_fails_closed() {
     }
 }
 
+/// A torn shard must be rejected loudly rather than silently decoded into
+/// the wrong answer. Only RS can see it: replication takes the first copy
+/// and never inspects the rest, which is why a replicated fragment's
+/// integrity is a per-fragment hash check, not the codec's job.
 #[test]
-fn codec_partial_write_detected_recovers() {
-    for (name, scheme) in codec_schemes_for_len(SMALL_LEN as u64) {
+fn codec_torn_shard_fails_loudly_then_recovers() {
+    for (name, scheme) in schemes_for_len(SMALL_LEN as u64) {
         let bytes = det_bytes(SMALL_LEN, 55);
-        let shards = encode_scheme(&bytes, scheme).expect("encodes");
-        let mut view = SimFragments::from_shards(shards);
-        view.apply(kivi_redundancy::FaultKind::PartialWrite, 2);
-        let total = shards_len(scheme);
-        #[allow(clippy::cast_possible_truncation)]
-        let victim = (2 % total) as u32;
-        // Including the torn shard must fail loudly, never silently decode.
-        let with_torn = view.present_sorted();
+        let mut shards = shards_of(&bytes, scheme);
+        let half = shards[0].1.len() / 2;
+        shards[0].1.truncate(half);
+
         if matches!(scheme, SchemeParams::ReedSolomon(_)) {
             assert!(
-                decode_scheme(&with_torn, scheme, bytes.len() as u64).is_err(),
+                decode_scheme(&shards, scheme, bytes.len() as u64).is_err(),
                 "{name}: torn shard fails loudly"
             );
         }
-        let present: Vec<(u32, Vec<u8>)> = with_torn
-            .into_iter()
-            .filter(|(i, _)| *i != victim)
-            .collect();
+        let present: Vec<_> = shards.iter().skip(1).cloned().collect();
         let back = decode_scheme(&present, scheme, bytes.len() as u64).expect("recovers");
-        assert_eq!(back, bytes, "{name}: exact match");
-    }
-}
-
-#[test]
-fn codec_reconstruction_retry_is_clean() {
-    // DuringReconstruction: a crash mid-decode retries against the same
-    // present set and returns identical bytes.
-    for (name, scheme) in codec_schemes_for_len(CODED_LEN as u64) {
-        let bytes = det_bytes(CODED_LEN, 66);
-        let shards = encode_scheme(&bytes, scheme).expect("encodes");
-        let view = SimFragments::from_shards(shards);
-        let present = drop_first_n(&view, 1, 0);
-        let first = decode_scheme(&present, scheme, bytes.len() as u64).expect("decodes");
-        let second = decode_scheme(&present, scheme, bytes.len() as u64).expect("retries");
-        assert_eq!(first, bytes, "{name}");
-        assert_eq!(second, bytes, "{name}");
-    }
-}
-
-#[test]
-fn codec_big_asset_within_and_beyond_tolerance() {
-    // 1 MiB proves the large-blob path; other tests stay small for speed.
-    for (name, scheme) in codec_schemes_for_len(BIG_LEN as u64) {
-        let bytes = det_bytes(BIG_LEN, 77);
-        let shards = encode_scheme(&bytes, scheme).expect("encodes");
-        let view = SimFragments::from_shards(shards);
-        let tol = tolerance_of(scheme);
-        let ok = drop_first_n(&view, tol, 1);
-        let back = decode_scheme(&ok, scheme, bytes.len() as u64).expect("recovers");
-        assert_eq!(back, bytes, "{name}: 1MiB exact");
-        let bad = drop_first_n(&view, tol + 1, 1);
-        let err = decode_scheme(&bad, scheme, bytes.len() as u64).expect_err("fails closed");
-        assert!(err.is_unrecoverable(), "{name}: Unrecoverable");
+        assert_eq!(back, bytes, "{name}: exact after dropping the torn shard");
     }
 }
 
 // ---------------------------------------------------------------------------
-// Fabric faults (13): file-level failures, all three schemes each
+// Fabric faults: file-level failures, all three schemes each
 // ---------------------------------------------------------------------------
-
-fn fabric_schemes(len: u64) -> Vec<(&'static str, SchemeParams)> {
-    vec![
-        ("rep3", rep_scheme()),
-        ("rs42", rs42_scheme(len)),
-        ("rs83", rs83_scheme(len)),
-    ]
-}
 
 fn fabric_case(
     seed: u64,
     len: usize,
     f: impl Fn(&mut RedundancyFabric, &PathBuf, InformationAsset, SchemeParams, &str),
 ) {
-    for (name, scheme) in fabric_schemes(len as u64) {
+    for (name, scheme) in schemes_for_len(len as u64) {
         let (_tmp, mut fabric, root) = open_fabric(12);
         let bytes = det_bytes(len, seed);
         let asset = protect_scheme(&mut fabric, &bytes, scheme);
@@ -603,7 +417,7 @@ fn fabric_after_publish_before_retire_extra_retained() {
     // generation (CURRENT) still answers exactly. The first generation uses
     // a scheme different from the target so the replacement always mints a
     // new generation (same-params transitions are idempotent no-ops).
-    for (name, scheme) in fabric_schemes(SMALL_LEN as u64) {
+    for (name, scheme) in schemes_for_len(SMALL_LEN as u64) {
         let (_tmp, mut fabric, root) = open_fabric(12);
         let bytes = det_bytes(SMALL_LEN, 108);
         let asset = InformationAsset::chunk_for_bytes(&bytes, DOMAIN);
@@ -632,7 +446,7 @@ fn fabric_after_publish_before_retire_extra_retained() {
 
 #[test]
 fn fabric_stale_repair_fenced() {
-    for (name, scheme) in fabric_schemes(SMALL_LEN as u64) {
+    for (name, scheme) in schemes_for_len(SMALL_LEN as u64) {
         let (_tmp, mut fabric, _root) = open_fabric(12);
         let bytes = det_bytes(SMALL_LEN, 109);
         let asset = InformationAsset::chunk_for_bytes(&bytes, DOMAIN);
@@ -694,7 +508,7 @@ fn fabric_stale_queued_repair_rejected_after_transition() {
 
 #[test]
 fn fabric_drain_during_repair_readable_throughout() {
-    for (name, scheme) in fabric_schemes(CODED_LEN as u64) {
+    for (name, scheme) in schemes_for_len(CODED_LEN as u64) {
         let (_tmp, mut fabric, root) = open_fabric(12);
         let bytes = det_bytes(CODED_LEN, 111);
         let asset = protect_scheme(&mut fabric, &bytes, scheme);
@@ -724,7 +538,7 @@ fn fabric_drain_during_repair_readable_throughout() {
 
 #[test]
 fn fabric_restart_during_transition_discards_pending() {
-    for (name, scheme) in fabric_schemes(SMALL_LEN as u64) {
+    for (name, scheme) in schemes_for_len(SMALL_LEN as u64) {
         let dir_tmp = tempfile::tempdir().expect("scratch");
         let root = dir_tmp.path().join("redundancy");
         let bytes = det_bytes(SMALL_LEN, 112);

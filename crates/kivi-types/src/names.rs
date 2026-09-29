@@ -120,54 +120,48 @@ pub enum NamespaceNameError {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
-    #[test]
-    fn accepts_rfc_example_name() {
-        let name = NamespaceName::new("sessions").expect("valid name");
-        assert_eq!(name.as_str(), "sessions");
-        assert_eq!(name.len(), 8);
-        assert_eq!(name.to_string(), "sessions");
-    }
-
-    #[test]
-    fn accepts_dashes_underscores_and_digits() {
-        assert!(NamespaceName::new("a-1_b2").is_ok());
-        assert!(NamespaceName::new("n9").is_ok());
-    }
-
-    #[test]
-    fn rejects_empty_too_long_and_bad_charset() {
-        assert_eq!(NamespaceName::new(""), Err(NamespaceNameError::Empty));
-        let long = "a".repeat(MAX_NAMESPACE_NAME_LEN + 1);
+    /// A namespace name is the main semantic and policy boundary, so the
+    /// charset is enforced at construction and the rejection names the
+    /// offending byte position: that index is what a caller needs to point at
+    /// the input.
+    #[rstest]
+    #[case::leading_dash("-abc", 0)]
+    #[case::uppercase("Abc", 0)]
+    #[case::inner_space("a b", 1)]
+    #[case::slash("a/b", 1)]
+    fn a_bad_byte_is_reported_at_its_index(#[case] input: &str, #[case] index: usize) {
         assert!(matches!(
-            NamespaceName::new(&long),
-            Err(NamespaceNameError::TooLong { .. })
-        ));
-        assert!(matches!(
-            NamespaceName::new("-abc"),
-            Err(NamespaceNameError::InvalidByte { index: 0, .. })
-        ));
-        assert!(matches!(
-            NamespaceName::new("Abc"),
-            Err(NamespaceNameError::InvalidByte { index: 0, .. })
-        ));
-        assert!(matches!(
-            NamespaceName::new("a b"),
-            Err(NamespaceNameError::InvalidByte { index: 1, .. })
-        ));
-        assert!(matches!(
-            NamespaceName::new("a/b"),
-            Err(NamespaceNameError::InvalidByte { .. })
+            NamespaceName::new(input),
+            Err(NamespaceNameError::InvalidByte { index: found, .. }) if found == index
         ));
     }
 
+    /// The accepted charset is lowercase, digits, dash and underscore, starting
+    /// with a letter or digit. A name at exactly the length bound is accepted;
+    /// one byte over is rejected, and the boundary matters because the length
+    /// is persisted.
     #[test]
-    fn max_length_name_is_accepted() {
+    fn the_charset_and_length_bound_are_inclusive_at_the_edges() {
+        for input in ["sessions", "a-1_b2", "n9", "x"] {
+            let name = NamespaceName::new(input).unwrap_or_else(|e| panic!("{input:?}: {e}"));
+            assert_eq!(name.as_str(), input);
+        }
+        assert_eq!(
+            NamespaceName::new("").unwrap_err(),
+            NamespaceNameError::Empty
+        );
         let max = "a".repeat(MAX_NAMESPACE_NAME_LEN);
         assert_eq!(
             NamespaceName::new(&max).expect("max length").len(),
             MAX_NAMESPACE_NAME_LEN
         );
+        assert!(matches!(
+            NamespaceName::new(&"a".repeat(MAX_NAMESPACE_NAME_LEN + 1)),
+            Err(NamespaceNameError::TooLong { .. })
+        ));
     }
 }

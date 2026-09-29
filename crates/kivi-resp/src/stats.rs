@@ -1,8 +1,8 @@
 //! Frontend statistics for the RESP edge.
 //!
 //! These live beside the connection machinery rather than in the server so the
-//! frontend can be hosted anywhere the engine runs — on a worker's own
-//! reactor, or behind an embedder's listener — and still report one set of
+//! frontend can be hosted anywhere the engine runs - on a worker's own
+//! reactor, or behind an embedder's listener - and still report one set of
 //! numbers to the admin plane. Counters are relaxed atomics updated per
 //! connection close, never per request, so no request takes a contended
 //! atomic on the serving path.

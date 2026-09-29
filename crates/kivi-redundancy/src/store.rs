@@ -3,7 +3,7 @@
 //! [`LocalFragmentStore`] is the per-node basement of the redundancy plane:
 //! it stages hash-verified fragment bytes, durably accepts published layout
 //! bytes, and serves only bytes that verify now. It never plans, never
-//! places, never publishes authority — the control plane owns which
+//! places, never publishes authority - the control plane owns which
 //! generation is current, so this store keeps **no `CURRENT` file**: every
 //! accepted generation's `gen-N.layout` simply persists, and
 //! [`FragmentStore::probe_asset`] reports the newest one.
@@ -73,7 +73,7 @@ pub trait FragmentStore: Send + Sync + std::fmt::Debug {
     ///
     /// Returns [`RedundancyError::MissingFragment`] when absent and
     /// [`RedundancyError::CorruptFragment`] when the stored bytes fail
-    /// verification — bad bytes are never served.
+    /// verification - bad bytes are never served.
     fn fetch_fragment(
         &self,
         key: &FragmentKey,
@@ -146,7 +146,7 @@ pub trait FragmentStore: Send + Sync + std::fmt::Debug {
     ) -> (u64, [u8; 32]);
 
     /// Lists staged fragments whose `(asset, generation)` has no accepted
-    /// layout (staged ahead of — or surviving past — authority).
+    /// layout (staged ahead of - or surviving past - authority).
     fn orphans(&self) -> Vec<FragmentKey>;
 
     /// Removes orphan fragments (files plus index), returning how many were
@@ -235,7 +235,7 @@ struct LayoutEntry {
     /// BLAKE3 of `bytes` (probe answers without re-reading).
     hash: [u8; 32],
     /// Control generation that published it (retained for operators; the
-    /// store neither fences nor acts on it — authority lives in the
+    /// store neither fences nor acts on it - authority lives in the
     /// control plane).
     control_generation: u64,
 }
@@ -325,7 +325,7 @@ impl LocalFragmentStore {
             // The domain is not encoded in the directory name; recover it
             // from the first decodable layout (fragments alone cannot name
             // it, so domain-less orphans stay keyed under `0` until their
-            // layout arrives — coordinates still match by kind+hash).
+            // layout arrives - coordinates still match by kind+hash).
             let coords = (kind.as_u8(), 0u64, hash);
             Self::recover_asset_dir(&mut inner, &coords, &dir, &mut recovery);
         }
@@ -1347,7 +1347,7 @@ fn check_incarnation(current: u64, target: u64) -> Result<(), RedundancyError> {
 }
 
 /// Quarantines staged fragments that disagree with an accepted layout
-/// (role, params tag, content, or length mismatch — or no covering record
+/// (role, params tag, content, or length mismatch - or no covering record
 /// at all): strays staged under false pretenses are dropped, never served
 /// under authority. Runs inline in [`LocalFragmentStore::put_layout`].
 fn bind_staged_inline(decoded: &RedundancyLayout, dir: &Path, state: &mut AssetState) {
@@ -1604,7 +1604,7 @@ pub(crate) fn write_layout_bytes(
 /// Publishes a verified layout: durable `gen-N.layout` plus atomic CURRENT.
 ///
 /// CURRENT names the published generation for the embedded fabric only;
-/// cluster stores ([`LocalFragmentStore`]) never use it — authority lives
+/// cluster stores ([`LocalFragmentStore`]) never use it - authority lives
 /// in the control plane.
 pub(crate) fn publish_layout(
     dir: &Path,

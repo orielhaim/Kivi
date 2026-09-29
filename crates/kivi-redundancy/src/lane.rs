@@ -340,12 +340,6 @@ impl RedundancyLane {
         self.pressure.store(pressure, Ordering::Relaxed);
     }
 
-    /// Returns the foreground-pressure flag.
-    #[must_use]
-    pub fn foreground_pressure(&self) -> bool {
-        self.pressure.load(Ordering::Relaxed)
-    }
-
     /// Snapshots lane counters for operators.
     #[must_use]
     pub fn stats(&self) -> LaneStats {
@@ -397,7 +391,7 @@ fn serve(
             }
         } else {
             // Jobs are staged but parked (budget or pressure): brief sleep,
-            // then recheck — completions release budget and pressure clears
+            // then recheck - completions release budget and pressure clears
             // externally, so every park ends without new arrivals.
             std::thread::sleep(std::time::Duration::from_millis(1));
         }

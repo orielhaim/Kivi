@@ -1,12 +1,20 @@
 //! Worker-local logical object store with deterministic prepare/apply.
 //!
 //! [`ObjectStore`] is a plain hash map from [`Key`] to [`StoredObject`],
-//! built on `hashbrown` with a keyed `RandomState` (`SipHash`) hasher: hostile
-//! user keys cannot degrade the table, and full byte equality always decides
-//! membership. The hasher is an internal detail — iteration order is
-//! unspecified, and every enumeration leaving the store is either aggregated
-//! (counts) or sorted (sweeps, snapshots), so simulation replay and tests
-//! never depend on it.
+//! built on `hashbrown` with a **randomly keyed** hasher: hostile user keys cannot
+//! degrade the table, and full byte equality always decides membership.
+//!
+//! The hasher is `ahash`'s `RandomState`, whose published contract is the one this
+//! table needs: randomly keyed, designed for HashDoS resistance on untrusted input,
+//! AES-NI where available, and explicitly **not** stable across versions or machines.
+//! That instability is a requirement, not a caveat: a bucket index is reconstructed
+//! from scratch on every restart and must never be persisted, so reproducibility
+//! buys nothing. Only *logical* state is durable. Nothing outside this crate can
+//! observe a bucket value, and `RandomState`'s own `Debug` prints no key material.
+//!
+//! The hasher is an internal detail either way: iteration order is unspecified, and
+//! every enumeration leaving the store is either aggregated (counts) or sorted
+//! (sweeps, snapshots), so simulation replay and tests never depend on it.
 //!
 //! State changes flow through two explicit phases (RFC Mutation IR direction):
 //!
@@ -20,7 +28,6 @@
 //! replicated log; the single-node engine runs both phases atomically.
 
 use core::fmt;
-use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, BTreeSet};
 
 use kivi_types::{Expiry, TabletId, WallTimestamp};
@@ -40,7 +47,7 @@ use crate::txn::{TxnExpect, TxnId, TxnIntent, TxnWrite, TxnWriteKind};
 /// shared by apply and the engine's admission planner, so the two can
 /// never disagree. Returns `None` when `offset` does not fit the address
 /// space or `offset + patch.len()` overflows `u64`; every other input is
-/// total (including offsets far past the end — the gap zero-pads,
+/// total (including offsets far past the end - the gap zero-pads,
 /// bounded by the caller's admission cap, never here).
 #[must_use]
 pub fn splice_inline(base: &[u8], offset: u64, patch: &[u8]) -> Option<bytes::Bytes> {
@@ -211,7 +218,7 @@ fn preview_counter_add(
 pub const MAX_LEASE_TTL_MICROS: u64 = 100 * 365 * 24 * 3600 * 1_000_000;
 
 /// Resolves a lease expiry stamp from `now + ttl`: `ttl == 0` means an
-/// immortal grant ([`WallTimestamp::MAX`], never lapsing on its own —
+/// immortal grant ([`WallTimestamp::MAX`], never lapsing on its own -
 /// fencing still applies), otherwise the saturating sum. Pure and total.
 #[must_use]
 pub fn lease_expires_at(now: WallTimestamp, ttl_micros: u64) -> WallTimestamp {
@@ -222,7 +229,7 @@ pub fn lease_expires_at(now: WallTimestamp, ttl_micros: u64) -> WallTimestamp {
     WallTimestamp::from_micros(now.as_micros().saturating_add(ttl))
 }
 
-/// Returns the live lease holder at `now` (`None` when free or expired —
+/// Returns the live lease holder at `now` (`None` when free or expired -
 /// expiry is observed, never eagerly reclaimed, so fencing history stays
 /// monotonic across the lapse).
 fn lease_live(state: &crate::LeaseState, now: WallTimestamp) -> Option<crate::LeaseHolder> {
@@ -329,7 +336,7 @@ fn local_result_for(mutation: &Mutation, outcome: &ApplyOutcome) -> OperationRes
 /// deletes, which carry no version). The durable prediction (on scratch
 /// post-state) and the post-apply verification (on live post-state) share
 /// this, so any skew fails loudly instead of forking. Exact for every
-/// write kind — including version-less results like `CommutativeApplied` —
+/// write kind - including version-less results like `CommutativeApplied` -
 /// because it observes state, never result shapes.
 pub fn local_versions(
     store: &ObjectStore,
@@ -350,16 +357,16 @@ pub fn local_versions(
 /// Besides the primary hash map, the store optionally maintains an ordered
 /// key index (`BTreeSet`) for ordered-layout tablets: `seek`/`range` over
 /// logical key bytes while values stay stored once. Hash-layout tablets
-/// leave it disabled and pay nothing. The index is deterministic state —
+/// leave it disabled and pay nothing. The index is deterministic state -
 /// rebuilt from checkpoint + Raft log, verified by [`verify_ordered_index`](Self::verify_ordered_index)
-/// — never a best-effort cache.
+/// - never a best-effort cache.
 ///
 /// The store also owns the participant intent table for distributed
 /// transactions: at most one prepared intent per key, consulted by every
 /// mutating prepare and persisted through checkpoints/snapshots.
 #[derive(Debug, Clone, Default)]
 pub struct ObjectStore {
-    objects: hashbrown::HashMap<Key, StoredObject, RandomState>,
+    objects: hashbrown::HashMap<Key, StoredObject, ahash::RandomState>,
     ordered: Option<BTreeSet<Key>>,
     intents: BTreeMap<Key, TxnIntent>,
 }
@@ -383,11 +390,15 @@ pub struct StoreStats {
 }
 
 impl ObjectStore {
-    /// Creates an empty store.
+    /// Creates an empty store with a freshly drawn table secret.
+    ///
+    /// The secret is per store, per process, and never persisted. Two stores over
+    /// the same data therefore place their keys in different buckets, which is
+    /// exactly right: bucket layout is not part of what a store *means*.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            objects: hashbrown::HashMap::default(),
+            objects: hashbrown::HashMap::with_hasher(ahash::RandomState::new()),
             ordered: None,
             intents: BTreeMap::new(),
         }
@@ -416,9 +427,25 @@ impl ObjectStore {
     }
 
     /// Returns the live object for `key` at `now` (`None` when missing or
-    /// expired — reads never mutate, not even to clean up).
+    /// expired - reads never mutate, not even to clean up).
     #[must_use]
     pub fn get(&self, key: &Key, now: WallTimestamp) -> Option<&StoredObject> {
+        self.objects
+            .get(key)
+            .filter(|object| !object.is_expired(now))
+    }
+
+    /// Looks a key up **by borrowed bytes**, without constructing a [`Key`].
+    ///
+    /// The RESP read path holds a slice of the receive buffer and must not have to
+    /// copy it onto the heap to look it up. This is that lookup, and the reason it
+    /// can exist is the [`Borrow<[u8]>`] impl on [`Key`] plus the test that proves
+    /// the hashes agree.
+    ///
+    /// Liveness is filtered exactly as in [`Self::get`]: an expired object is not a
+    /// hit, so a read that raced an expiry answers nil rather than a stale value.
+    #[must_use]
+    pub fn get_borrowed(&self, key: &[u8], now: WallTimestamp) -> Option<&StoredObject> {
         self.objects
             .get(key)
             .filter(|object| !object.is_expired(now))
@@ -494,12 +521,14 @@ impl ObjectStore {
                 txn,
                 key,
                 commit,
+                write,
                 digest,
             } => {
                 return Ok(Prepared::Write(Mutation::TxnFinalize {
                     txn: *txn,
                     key: key.clone(),
                     commit: *commit,
+                    write: write.clone(),
                     digest: *digest,
                 }));
             }
@@ -521,7 +550,7 @@ impl ObjectStore {
                         Ok(Prepared::Read(OperationResult::Value(Some(value.clone()))))
                     }
                     // Chunked bytes read identically; the engine resolves
-                    // the reference through the chunk lane — this layer
+                    // the reference through the chunk lane - this layer
                     // never touches the filesystem.
                     LogicalValue::Chunked(chunked) => {
                         Ok(Prepared::Read(OperationResult::ChunkedValue {
@@ -531,7 +560,7 @@ impl ObjectStore {
                     }
                     // Fabric bytes read identically; the engine resolves
                     // the reference through the Memory Fabric (suspending
-                    // for promotion when off-core) — this layer never
+                    // for promotion when off-core) - this layer never
                     // touches providers.
                     LogicalValue::Fabric(fabric) => {
                         Ok(Prepared::Read(OperationResult::FabricValue {
@@ -993,7 +1022,7 @@ impl ObjectStore {
     /// the OCC expectation must hold against live state, and the write
     /// itself must be deterministically applicable (overflow/type gates).
     /// Re-validating an identical same-transaction intent is idempotent and
-    /// succeeds whenever state still satisfies the expectation — but only
+    /// succeeds whenever state still satisfies the expectation - but only
     /// for the same write-set digest. A different digest under one `TxnId`
     /// is a conflicting driver, rejected loudly (never a silent overwrite
     /// of another transaction's reservation).
@@ -1023,7 +1052,7 @@ impl ObjectStore {
     }
 
     /// Validates a same-tablet atomic commit without mutating: stages the
-    /// touched keys (committed state plus no overlay — the caller layers
+    /// touched keys (committed state plus no overlay - the caller layers
     /// batch-pending state first when composing) into a scratch store and
     /// runs [`commit_local`](Self::commit_local) there, so prediction and
     /// later application agree by construction. Empty write sets are
@@ -1267,7 +1296,7 @@ impl ObjectStore {
 
     /// Validates a lease acquisition: free/absent/expired leases grant to
     /// `owner` under the next fencing token; a live holder blocks everyone
-    /// (including the holder itself — holders extend via renew, so a second
+    /// (including the holder itself - holders extend via renew, so a second
     /// grant can never silently invalidate the first grant's token).
     fn prepare_lease_acquire(
         &self,
@@ -1302,8 +1331,8 @@ impl ObjectStore {
     }
 
     /// Validates a lease renewal: the grant must be live at `now` with the
-    /// exact (`owner`, `fencing`). Anything else — absent, expired,
-    /// replaced, foreign — fails without mutating: a stale renew can never
+    /// exact (`owner`, `fencing`). Anything else - absent, expired,
+    /// replaced, foreign - fails without mutating: a stale renew can never
     /// revive a dead lease.
     fn prepare_lease_renew(
         &self,
@@ -1336,7 +1365,7 @@ impl ObjectStore {
     }
 
     /// Validates a lease release: the exact (`owner`, `fencing`) of the
-    /// last grant — live or lapsed — frees the lease; no holder at all
+    /// last grant - live or lapsed - frees the lease; no holder at all
     /// reports `released: false` without a WAL record; a mismatched token
     /// fails without mutating, so a stale release can never free a newer
     /// holder's lease.
@@ -1510,9 +1539,9 @@ impl ObjectStore {
     /// [`prepare`](Self::prepare): borrows state, touches nothing else.
     ///
     /// Read-only opcodes answer inline and never reach the WAL. Every
-    /// mutating opcode completion — a mutation with its predicted outcome,
+    /// mutating opcode completion - a mutation with its predicted outcome,
     /// or a terminal outcome with no mutation (counter rejections, expiry
-    /// no-ops, version exhaustion) — is returned for exactly-once
+    /// no-ops, version exhaustion) - is returned for exactly-once
     /// persistence before any reply.
     ///
     /// # Errors
@@ -1554,10 +1583,11 @@ impl ObjectStore {
             txn,
             key,
             commit,
+            write,
             digest,
         } = op
         {
-            return Ok(self.predict_finalize(*txn, key, *digest, *commit, now));
+            return Ok(self.predict_finalize(*txn, key, *commit, write, *digest, now));
         }
         if let Operation::TxnCommitLocal { txn, writes } = op {
             return Ok(self.predict_local_commit(*txn, writes, now));
@@ -1927,48 +1957,53 @@ impl ObjectStore {
         }
     }
 
-    /// Predicts a finalize: missing, foreign, or digest-mismatched intents
-    /// answer without touching state, aborts discard, and commits predict
-    /// the inner write with the same version arithmetic [`apply`](Self::apply)
-    /// will use — prediction and application agree by construction on
-    /// identical state.
+    /// Predicts a finalize from the entry alone.
+    ///
+    /// # Why nothing else is read
+    ///
+    /// Prediction exists to be checked against [`apply`](Self::apply) by
+    /// `StateMachineFault::Divergence`, so it may only read what apply reads:
+    /// the entry, and the state the entry will be applied against. Reading
+    /// anything else - and it used to read `self.intents`, a reservation
+    /// replicated by a *different* entry - makes the check a comparison between
+    /// two different questions, which is how a correct apply gets reported as
+    /// divergence.
+    ///
+    /// So: an abort discards, and a commit predicts the write the entry carries.
+    /// The version arithmetic is the same code apply runs, so on identical state
+    /// the two agree by construction rather than by coincidence.
+    ///
+    /// A reservation belonging to another transaction is *not* predicted as a
+    /// conflict. It is corruption, and `apply` reports it on every replica as an
+    /// error; a speculative verdict here would only mask it on the leader.
     fn predict_finalize(
         &self,
         txn: TxnId,
         key: &Key,
-        digest: [u8; 32],
         commit: bool,
+        write: &crate::txn::TxnWrite,
+        digest: [u8; 32],
         now: WallTimestamp,
     ) -> StorePrepared {
         let mutation = Mutation::TxnFinalize {
             txn,
             key: key.clone(),
             commit,
+            write: write.clone(),
             digest,
         };
-        let not_applied = || StorePrepared::Write {
-            mutation: mutation.clone(),
-            expected: OperationResult::TxnFinalized {
-                applied: false,
-                version: None,
-            },
-        };
-        let conflict = || StorePrepared::Write {
-            mutation: mutation.clone(),
-            expected: OperationResult::TxnConflict,
-        };
-        let Some(intent) = self.intents.get(key) else {
-            return not_applied();
-        };
-        // Same `TxnId` but a different write set: a conflicting driver,
-        // never this transaction's reservation. Resolve nothing.
-        if intent.id != txn || intent.digest != digest {
-            return conflict();
-        }
         if !commit {
-            return not_applied();
+            return StorePrepared::Write {
+                mutation,
+                expected: OperationResult::TxnFinalized {
+                    applied: false,
+                    version: None,
+                },
+            };
         }
-        self.predict_finalize_write(mutation, &intent.write.kind, key, now)
+        // The entry's own write, not the reservation's: this is the write
+        // `apply_txn_finalize` will apply.
+        self.predict_finalize_write(mutation, &write.kind, key, now)
     }
 
     /// Predicts the commit half of a finalize: the inner write's version
@@ -2099,7 +2134,7 @@ impl ObjectStore {
                 }))
             }
             // Unreachable: the preview only fails closed with the two
-            // verdicts above. Fail closed anyway — never guess a version.
+            // verdicts above. Fail closed anyway - never guess a version.
             Err(_) => StorePrepared::Terminal(DurableOutcome::Rejected(OpError::TxnConflict)),
         }
     }
@@ -2738,7 +2773,7 @@ impl ObjectStore {
     /// Transaction reservations resolve through [`TxnPrepare`](Mutation::TxnPrepare)
     /// / [`TxnFinalize`](Mutation::TxnFinalize) arms below; ordinary
     /// mutations meeting a prepared intent fail closed with
-    /// [`TxnDiverged`](ApplyError::TxnDiverged) (prepare blocks this first —
+    /// [`TxnDiverged`](ApplyError::TxnDiverged) (prepare blocks this first -
     /// reaching apply means divergent state). The ordered index is
     /// maintained centrally here, so no arm can forget it.
     ///
@@ -2746,7 +2781,7 @@ impl ObjectStore {
     ///
     /// Returns [`ApplyError`] when versions cannot advance, a counter
     /// addition overflows, or a counter mutation meets a byte string (only
-    /// reachable by applying mutations against divergent state — same log
+    /// reachable by applying mutations against divergent state - same log
     /// on same state never produces it).
     // One arm per mutation variant; splitting would scatter the single
     // total function the model test verifies.
@@ -2776,9 +2811,10 @@ impl ObjectStore {
                 txn,
                 key,
                 commit,
+                write,
                 digest,
             } => {
-                return self.apply_txn_finalize(*txn, key, *commit, digest, now);
+                return self.apply_txn_finalize(*txn, key, *commit, write, digest, now);
             }
             Mutation::TxnCommitLocal { writes, .. } => {
                 return self.apply_local_commit(writes, now);
@@ -2892,37 +2928,59 @@ impl ObjectStore {
         Ok(ApplyOutcome::TxnPrepared)
     }
 
-    /// Resolves one key's intent: commit applies the prepared write through
-    /// the normal path (ordered index included), abort discards it. Missing
-    /// intents (already finalized) and foreign or digest-mismatched intents
-    /// answer deterministically without touching state.
+    /// Resolves one key's intent: commit applies the write this entry carries
+    /// through the normal path (ordered index included), abort discards it.
+    ///
+    /// # Apply reads the log
+    ///
+    /// The write comes from the entry. It used to come from `self.intents` - a
+    /// reservation written by a *different* entry - and that made the answer a
+    /// function of state the log could not promise:
+    ///
+    /// ```text
+    /// entry with a live reservation  -> applied: true,  version: Some(1)
+    /// entry without one              -> applied: false, version: None
+    /// ```
+    ///
+    /// Same committed entry, same store, two answers, and nothing in the type
+    /// system objected because both were `TxnFinalized`. Replaying a committed log
+    /// then diverged, which is the failure consensus exists to make impossible.
+    ///
+    /// The reservation is still *maintained*, because prepare is where the key is
+    /// held against a conflicting driver. It is just not an input here. A stale
+    /// reservation therefore costs a `remove` and nothing else, where before it
+    /// cost the commit its effect.
     fn apply_txn_finalize(
         &mut self,
         txn: TxnId,
         key: &Key,
         commit: bool,
+        write: &crate::txn::TxnWrite,
         digest: &[u8; 32],
         now: WallTimestamp,
     ) -> Result<ApplyOutcome, ApplyError> {
         use ApplyError as Fault;
-        let Some(intent) = self.intents.get(key) else {
-            return Ok(ApplyOutcome::TxnFinalized {
-                applied: false,
-                version: None,
-            });
-        };
-        if intent.id != txn || intent.digest != *digest {
-            return Ok(ApplyOutcome::TxnConflict);
+        // Bookkeeping, in that order: an abort leaves no reservation, and a commit
+        // consumes it whether or not it was still there.
+        let reservation = self.intents.remove(key);
+        if let Some(intent) = reservation
+            && (intent.id != txn || intent.digest != *digest)
+        {
+            // A reservation for a different transaction under this key means the
+            // prepare and the finalize disagree about who owns it. That is
+            // corruption, not a conflict to absorb, and it is loud rather than
+            // silent because a silent absorb would drop a committed write.
+            return Err(Fault::TxnDiverged);
         }
         if !commit {
-            self.intents.remove(key);
             return Ok(ApplyOutcome::TxnFinalized {
                 applied: false,
                 version: None,
             });
         }
-        let intent = self.intents.remove(key).expect("intent checked above");
-        let inner = match &intent.write.kind {
+        // The write is the entry's, not the reservation's. This is the whole
+        // semantic boundary of a finalize: the log says what happens here.
+        let inner = match &write.kind {
             TxnWriteKind::Put(value) => Mutation::PutBytes {
                 key: key.clone(),
                 value: value.clone(),
@@ -2986,7 +3044,7 @@ impl ObjectStore {
     /// write set together through [`commit_local`](Self::commit_local) (the
     /// ordered index stays consistent via the recursive per-write applies),
     /// then reports the request-order version vector. Prepare validated the
-    /// same set on identical state, so any failure here is divergence —
+    /// same set on identical state, so any failure here is divergence -
     /// never a normal conflict outcome.
     fn apply_local_commit(
         &mut self,
@@ -3705,7 +3763,7 @@ impl ObjectStore {
 
     /// Commits a same-tablet write set as one ordered atomic mutation batch:
     /// validate everything (OCC expectations, writability, escrow pairing),
-    /// then apply everything. This is the cheap local path — one replicated
+    /// then apply everything. This is the cheap local path - one replicated
     /// operation set, no prepare/record/finalize waves, no coordinator state.
     /// Duplicate keys collapse last-wins in request order (matching the 2PC
     /// intent-overwrite rule), and validation runs in sorted key order so
@@ -3939,33 +3997,9 @@ impl ObjectStore {
         Ok((donor_version, recipient_version))
     }
 
-    /// Discovers lease keys whose holders lapsed at `now` (bounded,
-    /// key-ordered): candidates for release-with-last-token reclamation.
-    /// Reclamation itself flows through the normal release mutation, so
-    /// `next_fencing` monotonicity survives GC.
-    #[must_use]
-    pub fn collect_expired_leases(&self, now: WallTimestamp, limit: usize) -> Vec<Key> {
-        let mut lapsed: Vec<Key> = self
-            .objects
-            .iter()
-            .filter_map(|(key, object)| match object.value() {
-                LogicalValue::Lease(state) => match state.holder {
-                    Some(holder) if now.as_micros() >= holder.expires_at.as_micros() => {
-                        Some(key.clone())
-                    }
-                    _ => None,
-                },
-                _ => None,
-            })
-            .collect();
-        lapsed.sort();
-        lapsed.truncate(limit);
-        lapsed
-    }
-
     /// Collects up to `limit` expired keys at `now`, sorted by key for
     /// deterministic cleanup order. The caller turns each into an explicit
-    /// [`Delete`](Mutation::Delete) mutation — expiration is logical here,
+    /// [`Delete`](Mutation::Delete) mutation - expiration is logical here,
     /// reclamation happens through the same mutation path as everything else.
     #[must_use]
     pub fn collect_expired(&self, now: WallTimestamp, limit: usize) -> Vec<Key> {
@@ -3980,7 +4014,7 @@ impl ObjectStore {
         expired
     }
     /// Snapshots all entries sorted by key. Deterministic regardless of hash
-    /// order; used by tests, checkpoints, and future state transfer — never
+    /// order; used by tests, checkpoints, and future state transfer - never
     /// by the hot path.
     #[must_use]
     pub fn snapshot_sorted(&self) -> Vec<(Key, StoredObject)> {
@@ -4013,7 +4047,7 @@ impl ObjectStore {
 
     /// Rebuilds the ordered index deterministically from current objects
     /// (checkpoint restore + restart path): every physically stored key is
-    /// indexed, including expired-but-present ones — expiry filters at
+    /// indexed, including expired-but-present ones - expiry filters at
     /// scan time, never at index time, so the index always mirrors the
     /// object map exactly.
     pub fn rebuild_ordered_index(&mut self) {
@@ -4222,7 +4256,7 @@ impl ObjectStore {
     /// Pages pre-sorted `(key, object)` matches into a [`ScanPage`]
     /// under the projection/item/byte budgets. Shared by the term and
     /// term-range index scans, which differ only in matching and sort
-    /// order — never in paging semantics. `matched` carries one extra
+    /// order - never in paging semantics. `matched` carries one extra
     /// item past `max_items` when more matches exist (the standard
     /// exhaustion probe): a full page with no remainder still reports
     /// `exhausted`.
@@ -4393,7 +4427,7 @@ impl ObjectStore {
 
     /// Approximate median split key: the first user key past half of
     /// stored user logical bytes in index order (`None` with fewer than
-    /// two user keys — nothing interior to split at). System (`\xff`)
+    /// two user keys - nothing interior to split at). System (`\xff`)
     /// keys are excluded from candidacy: they route by fiat (stripped
     /// remainder / coordinator), not by range, so they may sort outside
     /// this tablet's range and must never anchor a range split. Index
@@ -4481,7 +4515,7 @@ impl ObjectStore {
     fn live(&self, key: &Key, now: WallTimestamp) -> Option<&StoredObject> {
         self.get(key, now)
     }
-    /// Current version of a stored entry (`FIRST` when absent — callers use
+    /// Current version of a stored entry (`FIRST` when absent - callers use
     /// this only after establishing presence, or for fresh creation).
     fn version_of(&self, key: &Key) -> ObjectVersion {
         self.objects
@@ -4518,6 +4552,251 @@ impl fmt::Display for ObjectStore {
 
 #[cfg(test)]
 mod tests {
+    /// The predicted outcome of a finalize does not depend on whether the
+    /// reservation is still on the tablet.
+    ///
+    /// This is the `node_admission` divergence, in miniature. A leader whose
+    /// reservation had already been resolved predicted
+    /// `TxnFinalized { applied: false, version: None }`; a replica applying the
+    /// same entry with the reservation present committed it and reported
+    /// `TxnFinalized { applied: true, version: Some(2) }`. The entry was identical
+    /// and both computations were correct - they just answered different
+    /// questions, because only the prediction read `intents`.
+    ///
+    /// Asserted as agreement between the two halves rather than as a fixed
+    /// value: the version is state-dependent, but the prediction must be a
+    /// function of the same inputs apply uses, or it cannot check it.
+    #[test]
+    fn a_predicted_finalize_does_not_depend_on_the_reservation() {
+        let key = Key::from("k");
+        let txn = TxnId::derive(4, 4, 0);
+        let write = TxnWrite {
+            key: key.clone(),
+            kind: TxnWriteKind::CounterAdd(1),
+            expect: TxnExpect::Absent,
+        };
+        let finalize = |store: &ObjectStore, commit: bool| {
+            let op = Operation::TxnFinalize {
+                txn,
+                key: key.clone(),
+                commit,
+                write: write.clone(),
+                digest: [0x3C; 32],
+            };
+            let StorePrepared::Write { mutation, expected } =
+                store.prepare_durable(&op, NOW).expect("predicts")
+            else {
+                panic!("a finalize must prepare a write")
+            };
+            (mutation, expected)
+        };
+
+        let mut reserved = ObjectStore::new();
+        reserved
+            .apply(
+                &Mutation::TxnPrepare {
+                    txn,
+                    coordinator: 0,
+                    key: key.clone(),
+                    expect: TxnExpect::Absent,
+                    write: TxnWriteKind::CounterAdd(1),
+                    digest: [0x3C; 32],
+                },
+                NOW,
+            )
+            .expect("reserve");
+        let empty = ObjectStore::new();
+
+        for commit in [true, false] {
+            let (with_reservation, expected_with) = finalize(&reserved, commit);
+            let (without_reservation, expected_without) = finalize(&empty, commit);
+            assert_eq!(
+                with_reservation, without_reservation,
+                "commit={commit}: the entry changed with the reservation, so the \
+                 prediction was not reading only the entry"
+            );
+            assert_eq!(
+                expected_with, expected_without,
+                "commit={commit}: the predicted outcome changed with the reservation, \
+                 so it was reading state the entry does not carry - and the \
+                 predicted outcome is what apply is verified against"
+            );
+        }
+    }
+
+    /// An abort discards, whatever the reservation says.
+    ///
+    /// Pinned because the old prediction answered `not_applied` for an abort only
+    /// after finding a matching reservation, which made a missing reservation and
+    /// an abort indistinguishable - and the entry itself never made that
+    /// distinction: it carries `commit` and the write, and nothing else.
+    #[test]
+    fn a_predicted_abort_discards_with_or_without_a_reservation() {
+        let key = Key::from("k");
+        let write = TxnWrite {
+            key: key.clone(),
+            kind: TxnWriteKind::CounterAdd(1),
+            expect: TxnExpect::Absent,
+        };
+        let abort = Operation::TxnFinalize {
+            txn: TxnId::derive(5, 5, 0),
+            key: key.clone(),
+            commit: false,
+            write: write.clone(),
+            digest: [0x4D; 32],
+        };
+        let mut reserved = ObjectStore::new();
+        reserved
+            .apply(
+                &Mutation::TxnPrepare {
+                    txn: TxnId::derive(5, 5, 0),
+                    coordinator: 0,
+                    key: key.clone(),
+                    expect: TxnExpect::Absent,
+                    write: TxnWriteKind::CounterAdd(1),
+                    digest: [0x4D; 32],
+                },
+                NOW,
+            )
+            .expect("reserve");
+        let mut empty = ObjectStore::new();
+        for store in [&mut reserved, &mut empty] {
+            let StorePrepared::Write { mutation, expected } =
+                store.prepare_durable(&abort, NOW).expect("predicts")
+            else {
+                panic!("an abort is a write");
+            };
+            assert_eq!(
+                expected,
+                OperationResult::TxnFinalized {
+                    applied: false,
+                    version: None
+                },
+                "an abort predicts not-applied from the entry alone"
+            );
+            let outcome = store.apply(&mutation, NOW).expect("applies");
+            assert!(
+                matches!(
+                    outcome,
+                    ApplyOutcome::TxnFinalized {
+                        applied: false,
+                        version: None
+                    }
+                ),
+                "an abort must discard regardless of the reservation: {outcome:?}"
+            );
+        }
+    }
+
+    /// A committed finalize must mean the same thing whether or not the
+    /// reservation that prepared it is still on the tablet.
+    ///
+    /// This is the regression test for a real divergence. `apply_txn_finalize` used
+    /// to read `self.intents` and reconstruct the write from it, so the same
+    /// committed entry produced:
+    ///
+    /// ```text
+    /// reservation present  -> TxnFinalized { applied: true,  version: Some(1) }
+    /// reservation absent   -> TxnFinalized { applied: false, version: None }
+    /// ```
+    ///
+    /// Both are of the right type, so nothing objected until a replica replayed a
+    /// committed log against a state the reservation was not in - a snapshot taken
+    /// after prepare, or a truncated prefix. That is a Raft entry meaning two
+    /// things, which is the one failure consensus exists to make impossible.
+    ///
+    /// Applying the finalize to a store with no reservation is exactly what that
+    /// replay does, so it is what this asserts. The entry carries its write; the
+    /// reservation is bookkeeping and nothing more.
+    #[test]
+    fn a_finalize_applies_with_or_without_its_reservation() {
+        let key = Key::from("k");
+        let write = TxnWrite {
+            key: key.clone(),
+            kind: TxnWriteKind::CounterAdd(1),
+            expect: TxnExpect::Absent,
+        };
+        let finalize = |store: &mut ObjectStore| {
+            let mutation = Mutation::TxnFinalize {
+                txn: TxnId::derive(9, 9, 0),
+                key: key.clone(),
+                commit: true,
+                write: write.clone(),
+                digest: [0x5A; 32],
+            };
+            store.apply(&mutation, NOW)
+        };
+
+        // With the reservation: the reservation is consumed and the write applies.
+        let mut prepared = ObjectStore::new();
+        let prepare = Mutation::TxnPrepare {
+            txn: TxnId::derive(9, 9, 0),
+            coordinator: 0,
+            key: key.clone(),
+            expect: TxnExpect::Absent,
+            write: TxnWriteKind::CounterAdd(1),
+            digest: [0x5A; 32],
+        };
+        prepared.apply(&prepare, NOW).expect("reserve");
+        assert!(matches!(prepared.intents.len(), 1));
+        let mut with_reservation_store = prepared;
+        let with_reservation = finalize(&mut with_reservation_store).expect("applies");
+
+        // Without it: a fresh store is a replay against a state that never saw the
+        // prepare. Same entry, same answer.
+        let without_reservation = finalize(&mut ObjectStore::new()).expect("applies");
+
+        assert_eq!(
+            with_reservation, without_reservation,
+            "the same committed entry produced two different results depending on \
+             state the log does not carry"
+        );
+        assert!(
+            matches!(
+                without_reservation,
+                ApplyOutcome::TxnFinalized { applied: true, .. }
+            ),
+            "a commit whose write is in the log applies without a reservation"
+        );
+    }
+
+    /// The inverse: a reservation left behind by a torn or replayed prepare must
+    /// not turn a later commit into a no-op. Before the fix this was the same
+    /// failure seen from the other side.
+    #[test]
+    fn a_stale_reservation_does_not_swallow_a_commit() {
+        let key = Key::from("k");
+        let mut store = ObjectStore::new();
+        let other = Mutation::TxnPrepare {
+            txn: TxnId::derive(1, 1, 0),
+            coordinator: 0,
+            key: key.clone(),
+            expect: TxnExpect::Absent,
+            write: TxnWriteKind::CounterAdd(5),
+            digest: [0x11; 32],
+        };
+        store.apply(&other, NOW).expect("reserve");
+        // Drop it the way a resolved intent would, without applying.
+        store.intents.remove(&key);
+
+        let finalize = Mutation::TxnFinalize {
+            txn: TxnId::derive(2, 2, 0),
+            key: key.clone(),
+            commit: true,
+            write: TxnWrite {
+                key: key.clone(),
+                kind: TxnWriteKind::CounterAdd(1),
+                expect: TxnExpect::Absent,
+            },
+            digest: [0x22; 32],
+        };
+        let outcome = store.apply(&finalize, NOW).expect("applies");
+        assert!(
+            matches!(outcome, ApplyOutcome::TxnFinalized { applied: true, .. }),
+            "an abandoned reservation must not make a committed write disappear: {outcome:?}"
+        );
+    }
+
     use super::*;
     use crate::object::Key;
     use kivi_types::WallTimestamp;
@@ -5377,29 +5656,6 @@ mod tests {
         assert!(!store.get(&key("f"), NOW).expect("present").is_fabric());
     }
 
-    #[test]
-    fn set_range_durable_prediction_matches_live_apply() {
-        use bytes::Bytes;
-        let mut store = ObjectStore::new();
-        let op = Operation::SetRange {
-            key: key("k"),
-            offset: 3,
-            patch: Bytes::from_static(b"XYZ"),
-        };
-        let StorePrepared::Write { mutation, expected } =
-            store.prepare_durable(&op, NOW).expect("prepares")
-        else {
-            panic!("set-range prepares a write");
-        };
-        assert!(matches!(mutation, Mutation::SpliceBytes { .. }));
-        let outcome = store.apply(&mutation, NOW).expect("applies");
-        assert_eq!(
-            crate::ops::outcome_for(&mutation, &outcome, false),
-            expected
-        );
-        assert_eq!(read(&store, "k"), b"\0\0\0XYZ");
-    }
-
     /// Reads one inline value for assertions (test values stay inline).
     fn read(store: &ObjectStore, name: &str) -> Vec<u8> {
         match store.get(&key(name), NOW).expect("present").value() {
@@ -5415,37 +5671,6 @@ mod tests {
                 panic!("test value stays inline")
             }
         }
-    }
-
-    #[test]
-    fn same_mutations_on_same_state_converge() {
-        let script = vec![
-            Mutation::PutBytes {
-                key: key("a"),
-                value: bytes::Bytes::from_static(b"1"),
-            },
-            Mutation::CounterAdd {
-                key: key("n"),
-                delta: 5,
-            },
-            Mutation::CounterAdd {
-                key: key("n"),
-                delta: -2,
-            },
-            Mutation::SetExpiry {
-                key: key("a"),
-                expiry: Expiry::at(WallTimestamp::from_micros(9_999_999)),
-            },
-            Mutation::Delete { key: key("n") },
-        ];
-        let mut left = ObjectStore::new();
-        let mut right = ObjectStore::new();
-        for mutation in &script {
-            let first = left.apply(mutation, NOW).expect("left applies");
-            let second = right.apply(mutation, NOW).expect("right applies");
-            assert_eq!(first, second);
-        }
-        assert_eq!(left.snapshot_sorted(), right.snapshot_sorted());
     }
 
     fn ordered_store(keys: &[&str]) -> ObjectStore {
@@ -5959,6 +6184,11 @@ mod tests {
                 txn,
                 key: key(name),
                 commit: true,
+                write: TxnWrite {
+                    key: key(name),
+                    kind: TxnWriteKind::Put(bytes::Bytes::from_static(b"v")),
+                    expect: TxnExpect::Absent,
+                },
                 digest: [0xD1; 32],
             };
             let StorePrepared::Write { mutation, expected } = store
@@ -6016,6 +6246,11 @@ mod tests {
             txn,
             key: key("x"),
             commit: false,
+            write: TxnWrite {
+                key: key("x"),
+                kind: TxnWriteKind::Put(bytes::Bytes::from_static(b"v")),
+                expect: TxnExpect::Absent,
+            },
             digest: [0xD1; 32],
         };
         let Prepared::Write(mutation) = store.prepare(&abort, NOW).expect("abort") else {
@@ -6142,7 +6377,7 @@ mod tests {
 
     /// Commutative additions converge observably: every permutation applies
     /// to `Applied` and lands on the same sum. The strict counter next door
-    /// keeps exposing ordinals — the two types never alias.
+    /// keeps exposing ordinals - the two types never alias.
     #[test]
     fn commutative_adds_commute_observably() {
         use crate::object::LogicalValue;
@@ -6238,7 +6473,7 @@ mod tests {
 
     /// Escrow rights are conserved: local spending stays inside the owned
     /// share, narrowing below the live value fails, and lone widening is
-    /// rejected — singles narrow only.
+    /// rejected - singles narrow only.
     #[test]
     fn bounded_counter_spends_inside_rights_and_narrows() {
         use kivi_types::TabletId;

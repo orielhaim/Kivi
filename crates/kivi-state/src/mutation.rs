@@ -2,7 +2,7 @@
 //!
 //! User commands are never replicated as-is. [`prepare`](crate::ObjectStore::prepare)
 //! normalizes each write into a [`Mutation`] carrying everything a replica
-//! needs for deterministic replay: keys, values, deltas, and expiries —
+//! needs for deterministic replay: keys, values, deltas, and expiries -
 //! never wall-clock reads, randomness, or local decisions. [`CounterAdd`](Mutation::CounterAdd)
 //! deterministically derives its resulting value from prior ordered state on
 //! every replica identically.
@@ -48,7 +48,7 @@ pub enum Mutation {
     },
     /// Point `key` at a chunked value: the manifest addressing its
     /// immutable chunks plus the total logical length. The WAL carries
-    /// this small root transition only — bulk bytes live in chunk packs
+    /// this small root transition only - bulk bytes live in chunk packs
     /// whose durability precedes this record (§11, §12). Overwrites any
     /// type and clears expiry, exactly like [`PutBytes`](Self::PutBytes).
     ReplaceChunkedRoot {
@@ -61,7 +61,7 @@ pub enum Mutation {
     },
     /// Point `key` at a Memory Fabric value: the fabric-scoped object id
     /// plus the total logical length and the published version. The WAL
-    /// carries this small root transition only — staged bytes live in the
+    /// carries this small root transition only - staged bytes live in the
     /// fabric whose durability precedes this record (same chunks-first
     /// rule as [`ReplaceChunkedRoot`](Self::ReplaceChunkedRoot)).
     /// Overwrites any type and clears expiry, exactly like
@@ -155,17 +155,40 @@ pub enum Mutation {
         /// different digest under one `TxnId` conflicts, never overwrites).
         digest: [u8; 32],
     },
-    /// Resolve one key's intent for `txn`: commit applies the prepared
-    /// write, abort discards it. Idempotent: a missing intent (already
-    /// finalized or never prepared here) answers finalized-not-applied.
+    /// Resolve one key's intent for `txn`: commit applies the write, abort
+    /// discards it.
+    ///
+    /// # The write is in the entry
+    ///
+    /// The write this finalize resolves travels with it rather than being looked
+    /// up from the reservation that `TxnPrepare` left behind. That is the whole
+    /// point: apply is a pure function of this entry and the state before it, so
+    /// a committed entry means the same thing to every replica and to every replay.
+    ///
+    /// It used to read the intent, and to reconstruct the write from it. The same
+    /// entry then applied as `applied: true, version: Some(1)` where the
+    /// reservation survived and `applied: false, version: None` where it did not -
+    /// a divergence in the one property consensus exists to provide, invisible
+    /// because both answers were of the right type.
+    ///
+    /// `commit: false` discards, which is why the write is still carried on an
+    /// abort: an entry's bytes cannot depend on a flag inside it.
+    ///
+    /// # Idempotence
+    ///
+    /// Applying the same finalize twice is prevented by Raft, not by this entry.
+    /// A retry that re-proposes a transaction carries the same `txn` identity and
+    /// is answered by dedup before it reaches here.
     TxnFinalize {
         /// Transaction identity.
         txn: TxnId,
         /// Key whose intent resolves.
         key: Key,
-        /// Whether to apply (`true`) or discard (`false`) the intent.
+        /// Whether to apply (`true`) or discard (`false`) the write.
         commit: bool,
-        /// Digest the intent was prepared for (must match the reservation).
+        /// The write being resolved, carried so apply needs no out-of-log state.
+        write: crate::txn::TxnWrite,
+        /// Digest of the prepared write, for the retry-identity check.
         digest: [u8; 32],
     },
     /// Commit a same-tablet write set as one ordered atomic record: every
@@ -608,11 +631,13 @@ impl Mutation {
                 txn,
                 key,
                 commit,
+                write,
                 digest,
             } => Some(Operation::TxnFinalize {
                 txn: *txn,
                 key: key.clone(),
                 commit: *commit,
+                write: write.clone(),
                 digest: *digest,
             }),
             Self::TxnCommitLocal { txn, writes } => Some(Operation::TxnCommitLocal {
@@ -780,7 +805,15 @@ impl Encode for Mutation {
             Self::TxnPrepare {
                 key, expect, write, ..
             } => 1 + 16 + 8 + (4 + key.len()) + expect.encoded_len() + write.encoded_len() + 32,
-            Self::TxnFinalize { key, .. } => 1 + 16 + (4 + key.len()) + 1 + 32,
+            Self::TxnFinalize { key, write, .. } => {
+                1 + 16
+                    + (4 + key.len())
+                    + 1
+                    + (4 + write.key.len())
+                    + write.expect.encoded_len()
+                    + write.kind.encoded_len()
+                    + 32
+            }
             Self::TxnCommitLocal { writes, .. } => {
                 1 + 16
                     + 2
@@ -861,9 +894,10 @@ impl Encode for Mutation {
                 txn,
                 key,
                 commit,
+                write,
                 digest,
             } => {
-                Self::encode_txn_finalize(out, txn, key, *commit, digest);
+                Self::encode_txn_finalize(out, txn, key, *commit, write, digest);
             }
             Self::TxnCommitLocal { txn, writes } => Self::encode_txn_commit_local(out, txn, writes),
             Self::CommutativeAdd { key, delta } => {
@@ -982,6 +1016,8 @@ impl Mutation {
         coordinator.encode(out);
         encode_bytes(out, key.as_bytes());
         expect.encode(out);
+        // Prepare encodes the write's own shape; it has no `TxnWrite` because the
+        // caller holds the kind and the key separately.
         write.encode(out);
         out.extend_from_slice(digest);
     }
@@ -993,17 +1029,43 @@ impl Mutation {
         txn: &crate::txn::TxnId,
         key: &Key,
         commit: bool,
+        write: &crate::txn::TxnWrite,
         digest: &[u8; 32],
     ) {
         out.push(TAG_TXN_FINALIZE);
         txn.encode(out);
         encode_bytes(out, key.as_bytes());
         commit.encode(out);
+        // The write travels with the entry. See `Mutation::TxnFinalize`: without
+        // it, apply would have to read the reservation this entry does not contain.
+        Self::encode_txn_write(out, write);
         out.extend_from_slice(digest);
     }
 
     /// Encodes one same-tablet atomic commit: the id plus every write
     /// (key, expectation, kind) in request order.
+    /// Encodes one transaction write: key, expectation, then the write kind.
+    fn encode_txn_write(out: &mut Vec<u8>, write: &crate::txn::TxnWrite) {
+        encode_bytes(out, write.key.as_bytes());
+        write.expect.encode(out);
+        write.kind.encode(out);
+    }
+
+    /// Decodes one transaction write, returning it and the bytes consumed.
+    fn decode_txn_write(input: &[u8]) -> Result<(crate::txn::TxnWrite, usize), CodecError> {
+        let (key, first) = decode_byte_vec(input)?;
+        let (expect, second) = <crate::txn::TxnExpect>::decode(&input[first..])?;
+        let (kind, third) = <crate::txn::TxnWriteKind>::decode(&input[first + second..])?;
+        Ok((
+            crate::txn::TxnWrite {
+                key: Key::from(key),
+                kind,
+                expect,
+            },
+            first + second + third,
+        ))
+    }
+
     fn encode_txn_commit_local(
         out: &mut Vec<u8>,
         txn: &crate::txn::TxnId,
@@ -1014,9 +1076,7 @@ impl Mutation {
         let count = u16::try_from(writes.len()).unwrap_or(u16::MAX);
         out.extend_from_slice(&count.to_le_bytes());
         for write in writes {
-            encode_bytes(out, write.key.as_bytes());
-            write.expect.encode(out);
-            write.kind.encode(out);
+            Self::encode_txn_write(out, write);
         }
     }
 
@@ -1348,15 +1408,17 @@ impl Decode for Mutation {
                 let (key, third) = decode_byte_vec(&input[first + second..])?;
                 let (commit, fourth) = bool::decode(&input[first + second + third..])?;
                 let at = first + second + third + fourth;
-                let (digest, used) = <[u8; 32]>::decode(&input[at..])?;
+                let (write, fifth) = Self::decode_txn_write(&input[at..])?;
+                let (digest, used) = <[u8; 32]>::decode(&input[at + fifth..])?;
                 Ok((
                     Self::TxnFinalize {
                         txn,
                         key: Key::from(key),
                         commit,
+                        write,
                         digest,
                     },
-                    at + used,
+                    at + fifth + used,
                 ))
             }
             TAG_TXN_COMMIT_LOCAL => {
@@ -1729,7 +1791,7 @@ mod tests {
     #[test]
     fn mutation_codecs_round_trip() {
         let key = Key::from("user:1");
-        let cases = legacy_codec_cases(&key)
+        let cases = core_codec_cases(&key)
             .into_iter()
             .chain(txn_codec_cases(&key))
             .chain(semantic_codec_cases(&key));
@@ -1742,7 +1804,7 @@ mod tests {
         }
     }
 
-    fn legacy_codec_cases(key: &Key) -> Vec<Mutation> {
+    fn core_codec_cases(key: &Key) -> Vec<Mutation> {
         vec![
             Mutation::PutBytes {
                 key: key.clone(),
@@ -1817,6 +1879,11 @@ mod tests {
                 txn: crate::txn::TxnId::derive(3, 4, 0),
                 key: key.clone(),
                 commit: true,
+                write: crate::txn::TxnWrite {
+                    key: key.clone(),
+                    kind: crate::txn::TxnWriteKind::CounterAdd(7),
+                    expect: crate::txn::TxnExpect::Absent,
+                },
                 digest: [0xD1; 32],
             },
             Mutation::TxnCommitLocal {

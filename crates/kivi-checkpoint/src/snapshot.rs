@@ -1,6 +1,6 @@
 //! Checkpoint capture views: plain-data snapshots of one tablet at a cut.
 //!
-//! The engine builds these from live tablets (committed state only —
+//! The engine builds these from live tablets (committed state only -
 //! never speculative or pending batches) and hands them to the background
 //! builder. Everything here is owned plain data with no locks, no threads,
 //! and no engine types: the checkpoint crate never depends on the engine.

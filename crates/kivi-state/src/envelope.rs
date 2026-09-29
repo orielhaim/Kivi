@@ -9,7 +9,7 @@
 //!
 //! Framing version is 1. The pre-release opaque-bytes payload was replaced by
 //! typed Mutation IR before anything durable existed anywhere, so no
-//! compatibility burden carries over — v1 simply always meant this layout.
+//! compatibility burden carries over - v1 simply always meant this layout.
 
 use kivi_codec::{CodecError, Decode, Encode, MAX_FRAME_BYTES};
 use kivi_types::{

@@ -8,7 +8,6 @@ license = "AGPL-3.0-or-later"
 [dependencies]
 kivi-types.workspace = true
 kivi-codec.workspace = true
-kivi-observation.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

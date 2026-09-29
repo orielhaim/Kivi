@@ -9,7 +9,6 @@ use kivi_types::{ChunkId, ManifestId};
 
 /// Every way the immutable chunk substrate can refuse.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
 pub enum ChunkError {
     /// Filesystem I/O failure with the operation, path, and OS detail.
     #[error("chunk I/O during {op} on {}: {message}", path.display())]

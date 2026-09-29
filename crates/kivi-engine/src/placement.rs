@@ -22,15 +22,14 @@
 use std::sync::Arc;
 
 use kivi_hardware::{
-    BindError, CpuId, PlacementDiagnostics, PlacementPlan, PlacementRole, PlacementStrategy,
-    Topology, WorkerSlot, plan,
+    BindError, PlacementPlan, PlacementRole, PlacementStrategy, Topology, WorkerSlot, plan,
 };
 
 /// Every worker slot the engine places.
 ///
 /// The count per role is fixed by the engine's own ownership model, so this is
 /// the single place that says "Kivi runs exactly this many of these".
-pub const DEFAULT_ROLES: &[(PlacementRole, usize)] = &[
+const DEFAULT_ROLES: &[(PlacementRole, usize)] = &[
     (PlacementRole::DurabilityLane, 1),
     (PlacementRole::DataWorker, 4),
     (PlacementRole::ConsensusWorker, 2),
@@ -119,25 +118,14 @@ pub struct ThreadPlacement {
 }
 
 impl ThreadPlacement {
-    /// Resolves a plan for `worker_count` data workers and the fixed number of
-    /// every other role.
+    /// Resolves a plan for `worker_count` data workers and [`DEFAULT_ROLES`]
+    /// for every other role. `worker_count` also raises the per-worker roles
+    /// (off-core lanes, network reactors) to match.
     #[must_use]
     pub fn resolve(strategy: PlacementStrategy, worker_count: usize) -> Self {
-        Self::resolve_with(strategy, DEFAULT_ROLES, worker_count)
-    }
-
-    /// Resolves a plan for an explicit role census. `worker_count` sets how many
-    /// data workers, chunk-facing off-core lanes and network reactors the plan
-    /// should expect, because those are per worker.
-    #[must_use]
-    pub fn resolve_with(
-        strategy: PlacementStrategy,
-        roles: &[(PlacementRole, usize)],
-        worker_count: usize,
-    ) -> Self {
         let topology = Topology::discover();
         let mut slots = Vec::new();
-        for (role, count) in roles {
+        for (role, count) in DEFAULT_ROLES {
             let count = if *role == PlacementRole::DataWorker
                 || *role == PlacementRole::OffcoreLane
                 || *role == PlacementRole::NetworkReactor
@@ -183,23 +171,12 @@ impl ThreadPlacement {
         self.plan.bind(slot).map_err(refused)
     }
 
-    /// The plan, for diagnostics and for subsystems that want to read their own
-    /// assignment without binding.
+    /// The plan, so a subsystem can read its own assignment without binding.
+    /// Must arrive before construction, because the memory fabric registers
+    /// one provider per node from the planned locality of its owner slot.
     #[must_use]
     pub fn plan(&self) -> &PlacementPlan {
         &self.plan
-    }
-
-    /// The machine this plan was resolved against.
-    #[must_use]
-    pub fn topology(&self) -> &Topology {
-        &self.topology
-    }
-
-    /// What the plan did and what it could not do.
-    #[must_use]
-    pub fn diagnostics(&self) -> &PlacementDiagnostics {
-        &self.plan.diagnostics
     }
 
     /// One line for the startup log and the admin surface.
@@ -210,13 +187,6 @@ impl ThreadPlacement {
             self.topology.summary(),
             self.plan.diagnostics.summary()
         )
-    }
-
-    /// The processor a bound thread landed on, for a diagnostic that records
-    /// where a thread actually is rather than where it was asked to go.
-    #[must_use]
-    pub fn current_cpu(&self) -> Option<CpuId> {
-        kivi_hardware::current_cpu()
     }
 }
 
@@ -232,7 +202,7 @@ mod tests {
             let placed = (0..wanted)
                 .filter(|ordinal| {
                     placement
-                        .plan()
+                        .plan
                         .placement(WorkerSlot::new(*role, *ordinal))
                         .is_some()
                 })

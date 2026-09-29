@@ -262,7 +262,7 @@ fn read_memory_nodes() -> Vec<MemoryNode> {
 
 /// `MemTotal` in `nodeN/meminfo` is in kibibytes.
 ///
-/// The line is prefixed with the node id — `Node 0 MemTotal:  32485044 kB` — so
+/// The line is prefixed with the node id - `Node 0 MemTotal:  32485044 kB` - so
 /// matching on the bare field name is what makes every node report zero
 /// capacity and the memory fabric conclude the machine has no memory.
 fn meminfo_total_bytes(path: &Path) -> Option<u64> {

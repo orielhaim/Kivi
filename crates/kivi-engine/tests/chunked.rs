@@ -5,97 +5,26 @@
 //! Channel-only engines (plain worker threads, no sockets): the embedded
 //! path exercises the same tablet/commit/chunk-lane flow as production,
 //! with blocking lane calls on worker threads that already block. Native
-//! streaming-protocol coverage lives in `kivi-server` process tests.
+//! streaming-protocol coverage lives in `kivi-lab/tests/streaming.rs`.
 
-use kivi_engine::{
-    ChunkFabricConfig, DurabilityMode, DurableConfig, EngineConfig, EngineError, FabricConfig,
-    LocalEngine, Placement,
-};
+mod harness;
+
+use harness::{config, durable_config, pattern_bytes, root_placement, root_snapshot};
+use kivi_engine::{ChunkFabricConfig, EngineError, LocalEngine};
 use kivi_state::Key;
-use kivi_tablet::{DirectorySnapshot, HashPrefix, PartitionRange};
-use kivi_types::{NamespaceId, TabletEpoch, TabletId, WorkerId, WriteGuardGeneration};
-
-const NS: NamespaceId = NamespaceId::from_u64(1);
-
-fn directory() -> DirectorySnapshot {
-    let genesis = DirectorySnapshot::bootstrap(
-        NS,
-        TabletId::from_u64(1),
-        PartitionRange::Hash(HashPrefix::new(0, 0).expect("root")),
-        TabletEpoch::INITIAL,
-        WriteGuardGeneration::INITIAL,
-    )
-    .expect("genesis");
-    genesis
-        .stage(TabletId::from_u64(1))
-        .and_then(|snapshot| snapshot.activate(TabletId::from_u64(1)))
-        .expect("active root")
-}
-
-fn placement() -> Placement {
-    Placement::new([(TabletId::from_u64(1), WorkerId::from_u64(0))])
-}
-
-/// Deterministic pseudo-random bytes (splitmix64): representative,
-/// incompressible-ish content — never zeros-only.
-fn pattern_bytes(len: usize, seed: u64) -> bytes::Bytes {
-    let mut state = seed;
-    let mut out = Vec::with_capacity(len);
-    while out.len() < len {
-        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^= z >> 31;
-        out.extend_from_slice(&z.to_le_bytes());
-    }
-    out.truncate(len);
-    bytes::Bytes::from(out)
-}
 
 fn ephemeral(chunks: ChunkFabricConfig) -> LocalEngine {
-    LocalEngine::start(EngineConfig {
-        namespace: NS,
-        hardware: kivi_engine::HardwareConfig::default(),
-        directory: directory(),
-        placement: placement(),
-        worker_count: 2,
-        request_capacity: 64,
-        chunks,
-        fabric: kivi_engine::FabricConfig::default(),
-        network: None,
-        durability: DurabilityMode::Ephemeral,
-    })
-    .expect("ephemeral engine starts")
-}
-
-fn durable_config(dir: &std::path::Path) -> DurabilityMode {
-    let opened = kivi_durability::open_data_dir(dir, None).expect("data dir opens");
-    DurabilityMode::Durable(DurableConfig {
-        data_dir: dir.to_owned(),
-        segment_target_bytes: 1024 * 1024,
-        node: opened.meta.node,
-        cluster: opened.meta.cluster,
-        incarnation: opened.meta.incarnation,
-        shared_wal: false,
-        batch: kivi_engine::BatchPolicy::default_policy(),
-        checkpoint: kivi_engine::CheckpointConfig::default_config(),
-    })
+    let mut config = config(root_snapshot(), root_placement(), 2);
+    config.chunks = chunks;
+    LocalEngine::start(config).expect("ephemeral engine starts")
 }
 
 fn durable(dir: &std::path::Path, chunks: ChunkFabricConfig) -> LocalEngine {
-    LocalEngine::start(EngineConfig {
-        namespace: NS,
-        hardware: kivi_engine::HardwareConfig::default(),
-        directory: directory(),
-        placement: placement(),
-        worker_count: 2,
-        request_capacity: 64,
+    LocalEngine::start(durable_config(
+        dir,
         chunks,
-        fabric: kivi_engine::FabricConfig::default(),
-        network: None,
-        durability: durable_config(dir),
-    })
+        kivi_engine::FabricConfig::default(),
+    ))
     .expect("durable engine starts")
 }
 
@@ -143,7 +72,6 @@ fn large_values_read_identically_whatever_the_representation() {
     client.set(&Key::from("big"), big.clone()).expect("regrow");
     assert_eq!(client.get(&Key::from("big")).expect("get"), Some(big));
     // Typed operations treat chunked bytes as bytes.
-    assert!(client.counter_add(&Key::from("big"), 1).is_err());
     assert!(matches!(
         client.counter_add(&Key::from("big"), 1),
         Err(EngineError::Tablet(_))
@@ -203,8 +131,8 @@ fn chunked_durable_restart_recovers_bytes_exactly() {
         .expect("set");
     assert_eq!(client.counter_add(&Key::from("n"), 7).expect("add"), 7);
     engine.shutdown().expect("clean shutdown");
-    // Restart on the same directory: every acknowledged root — inline or
-    // chunked — comes back byte-exact before serving.
+    // Restart on the same directory: every acknowledged root - inline or
+    // chunked - comes back byte-exact before serving.
     let engine = durable(scratch.path(), ChunkFabricConfig::default());
     let client = engine.client();
     assert_eq!(client.get(&Key::from("huge")).expect("get"), Some(huge));
@@ -238,18 +166,11 @@ fn missing_chunk_packs_fail_startup_loudly() {
     // root names chunks that no longer exist. Restart must refuse to
     // serve, never fabricate absence.
     std::fs::remove_dir_all(scratch.path().join("chunks")).expect("chunks destroyed");
-    let error = LocalEngine::start(EngineConfig {
-        namespace: NS,
-        hardware: kivi_engine::HardwareConfig::default(),
-        directory: directory(),
-        placement: placement(),
-        worker_count: 2,
-        request_capacity: 64,
-        chunks: ChunkFabricConfig::default(),
-        fabric: FabricConfig::default(),
-        network: None,
-        durability: durable_config(scratch.path()),
-    })
+    let error = LocalEngine::start(durable_config(
+        scratch.path(),
+        ChunkFabricConfig::default(),
+        kivi_engine::FabricConfig::default(),
+    ))
     .expect_err("missing chunks fail startup");
     let message = format!("{error:?}");
     assert!(
@@ -302,7 +223,7 @@ fn set_range_restages_chunked_bases_reusing_prefix_chunks() {
     let engine = ephemeral(ChunkFabricConfig::default());
     let client = engine.client();
     // Three chunks at 1 MiB: patching the last chunk must retain the
-    // first two by reference — one new chunk, never a rewrite.
+    // first two by reference - one new chunk, never a rewrite.
     let base = pattern_bytes(3_000_000, 0x5EED);
     client.set(&Key::from("big"), base.clone()).expect("set");
     assert_eq!(total_chunks(&engine), 3, "three chunks staged");

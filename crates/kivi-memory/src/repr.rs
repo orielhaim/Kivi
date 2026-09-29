@@ -247,37 +247,6 @@ impl ObjectMaterialization {
     }
 }
 
-/// Physical representation tag for diagnostics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PhysicalRepr {
-    /// Tiny inline bytes.
-    Inline,
-    /// Arena-resident medium object.
-    ArenaResident,
-    /// Compressed DRAM block.
-    CompressedMemory,
-    /// NVMe-resident record.
-    LocalStorage,
-    /// Chunked large value (external fabric).
-    Chunked,
-    /// Future extension (CXL, remote, ...).
-    Remote,
-}
-
-impl PhysicalRepr {
-    /// Derives the tag from a residence.
-    #[must_use]
-    pub const fn of(residence: &Residence) -> Self {
-        match residence {
-            Residence::Inline(_) => Self::Inline,
-            Residence::Arena { .. } => Self::ArenaResident,
-            Residence::Compressed { .. } => Self::CompressedMemory,
-            Residence::Offcore { .. } => Self::LocalStorage,
-            Residence::Chunked { .. } => Self::Chunked,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

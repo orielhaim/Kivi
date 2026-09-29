@@ -51,7 +51,7 @@ impl_int_encoding!(RequestSeq, u64, 8);
 impl_int_encoding!(SecurityDomainId, u64, 8);
 impl_int_encoding!(Ticks, u64, 8);
 
-// Wall-clock stamps encode as 8-byte little-endian _signed_ Unix micros —
+// Wall-clock stamps encode as 8-byte little-endian _signed_ Unix micros -
 // the Kivi-owned durable representation. Written by hand (not the macro)
 // because `WallTimestamp` deliberately has no `From<i64>`: raw integers
 // cross the boundary only here and at clock edges.
@@ -300,47 +300,121 @@ fn duration_micros(duration: Duration) -> u64 {
 mod tests {
     use super::*;
 
+    /// Field order and width are the wire contract: a `TabletAuthority` that
+    /// encoded its three `u64`s in a different order, or dropped one, would
+    /// silently mis-fence on a peer running the same build. `encoded_len` is
+    /// included because callers pre-allocate with it.
     #[test]
-    fn fixed_width_ids_have_stable_sizes() {
-        assert_eq!(TabletId::from_u64(918).encode_to_vec().len(), 8);
-        assert_eq!(SessionId::from_u128(1).encode_to_vec().len(), 16);
-
-        assert_eq!(ChunkId::ZERO.encode_to_vec().len(), 32);
-        assert_eq!(
-            PartitionHash::from_u128(u128::MAX).encode_to_vec(),
-            u128::MAX.to_le_bytes().to_vec()
-        );
-        assert_eq!(
-            TabletAuthority::new(
-                TabletId::from_u64(1),
-                TabletEpoch::INITIAL,
-                WriteGuardGeneration::INITIAL,
-            )
-            .encode_to_vec()
-            .len(),
-            24
-        );
-    }
-
-    #[test]
-    fn encoded_len_matches_actual_output() {
+    fn every_composite_encodes_to_its_declared_width() {
         let authority = TabletAuthority::new(
             TabletId::from_u64(918),
             TabletEpoch::from_u64(381),
             WriteGuardGeneration::from_u64(12),
         );
-        let encoded = authority.encode_to_vec();
-        assert_eq!(authority.encoded_len(), encoded.len());
         let token = CommitToken::new(
             TabletId::from_u64(5),
             TabletEpoch::from_u64(2),
             CommitPosition::from_u64(100),
         );
-        assert_eq!(token.encoded_len(), token.encode_to_vec().len());
-        let contract = ReadContract::AtLeast(token);
-        assert_eq!(contract.encoded_len(), contract.encode_to_vec().len());
+        let identity =
+            RequestIdentity::new(SessionId::from_u128(0x00C0_FFEE), RequestSeq::from_u64(41));
+        let dated = Expiry::at(WallTimestamp::from_micros(500));
+
+        // (label, encoded bytes, declared width)
+        let cases: [(&str, Vec<u8>, usize); 14] = [
+            ("tablet-id", TabletId::from_u64(918).encode_to_vec(), 8),
+            ("session-id", SessionId::from_u128(1).encode_to_vec(), 16),
+            (
+                "partition-hash",
+                PartitionHash::from_u128(u128::MAX).encode_to_vec(),
+                16,
+            ),
+            ("chunk-id", ChunkId::ZERO.encode_to_vec(), 32),
+            (
+                "wall-timestamp",
+                WallTimestamp::from_micros(-1).encode_to_vec(),
+                8,
+            ),
+            ("authority", authority.encode_to_vec(), 24),
+            ("commit-token", token.encode_to_vec(), 24),
+            ("request-identity", identity.encode_to_vec(), 24),
+            ("expiry-never", Expiry::NEVER.encode_to_vec(), 1),
+            ("expiry-dated", dated.encode_to_vec(), 9),
+            ("contract-latest", ReadContract::Latest.encode_to_vec(), 1),
+            ("contract-any", ReadContract::Any.encode_to_vec(), 1),
+            (
+                "contract-at-least",
+                ReadContract::AtLeast(token).encode_to_vec(),
+                25,
+            ),
+            (
+                "contract-bounded",
+                ReadContract::BoundedStale {
+                    max_staleness: Duration::from_millis(100),
+                }
+                .encode_to_vec(),
+                9,
+            ),
+        ];
+        for (label, bytes, width) in cases {
+            assert_eq!(bytes.len(), width, "{label} changed width");
+        }
     }
 
+    /// Every composite must survive a full encode/decode cycle: an identity
+    /// that decodes to a *different* value is silent mis-fencing.
+    #[test]
+    fn every_composite_round_trips() {
+        let token = CommitToken::new(
+            TabletId::from_u64(5),
+            TabletEpoch::INITIAL,
+            CommitPosition::FIRST,
+        );
+        let authority = TabletAuthority::new(
+            TabletId::from_u64(918),
+            TabletEpoch::from_u64(381),
+            WriteGuardGeneration::from_u64(12),
+        );
+        let identity =
+            RequestIdentity::new(SessionId::from_u128(0x00C0_FFEE), RequestSeq::from_u64(41));
+        assert_eq!(
+            TabletAuthority::decode_exact(&authority.encode_to_vec()).expect("authority"),
+            authority
+        );
+        assert_eq!(
+            CommitToken::decode_exact(&token.encode_to_vec()).expect("token"),
+            token
+        );
+        assert_eq!(
+            RequestIdentity::decode_exact(&identity.encode_to_vec()).expect("identity"),
+            identity
+        );
+        assert_eq!(
+            Expiry::decode_exact(&Expiry::NEVER.encode_to_vec()).expect("never"),
+            Expiry::NEVER
+        );
+        assert_eq!(
+            Expiry::decode_exact(&Expiry::at(WallTimestamp::from_micros(500)).encode_to_vec())
+                .expect("dated"),
+            Expiry::at(WallTimestamp::from_micros(500))
+        );
+        for contract in [
+            ReadContract::Latest,
+            ReadContract::AtLeast(token),
+            ReadContract::BoundedStale {
+                max_staleness: Duration::from_millis(100),
+            },
+            ReadContract::Any,
+        ] {
+            assert_eq!(
+                ReadContract::decode_exact(&contract.encode_to_vec()).expect("contract"),
+                contract
+            );
+        }
+    }
+
+    /// Signed microseconds: a pre-epoch stamp must survive the wire and must
+    /// not be confused with the unsigned reading of the same bytes.
     #[test]
     fn wall_timestamps_round_trip_signed() {
         for micros in [
@@ -361,78 +435,25 @@ mod tests {
                 "micros {micros} must round-trip"
             );
         }
-        // Signed encoding: -1 is all-ones, observably distinct from the old
-        // unsigned reading of the same bytes.
+        // `-1` is all ones, observably distinct from an unsigned zero.
         assert_eq!(
             WallTimestamp::from_micros(-1).encode_to_vec(),
             [0xFF; 8].to_vec()
         );
     }
 
+    /// Namespace names cross a security-relevant boundary, so a length prefix
+    /// that lies, or a charset violation, must be rejected rather than
+    /// normalised into something valid.
     #[test]
-    fn composites_round_trip() {
-        let authority = TabletAuthority::new(
-            TabletId::from_u64(918),
-            TabletEpoch::from_u64(381),
-            WriteGuardGeneration::from_u64(12),
-        );
-        assert_eq!(
-            TabletAuthority::decode_exact(&authority.encode_to_vec()).expect("authority"),
-            authority
-        );
-        let identity =
-            RequestIdentity::new(SessionId::from_u128(0x00C0_FFEE), RequestSeq::from_u64(41));
-        assert_eq!(
-            RequestIdentity::decode_exact(&identity.encode_to_vec()).expect("identity"),
-            identity
-        );
-        let token = CommitToken::new(
-            TabletId::from_u64(5),
-            TabletEpoch::INITIAL,
-            CommitPosition::FIRST,
-        );
-        assert_eq!(
-            CommitToken::decode_exact(&token.encode_to_vec()).expect("token"),
-            token
-        );
-        for contract in [
-            ReadContract::Latest,
-            ReadContract::AtLeast(token),
-            ReadContract::BoundedStale {
-                max_staleness: Duration::from_millis(100),
-            },
-            ReadContract::Any,
-        ] {
-            assert_eq!(
-                ReadContract::decode_exact(&contract.encode_to_vec()).expect("contract"),
-                contract
-            );
-        }
-        assert_eq!(
-            Expiry::decode_exact(&Expiry::NEVER.encode_to_vec()).expect("never"),
-            Expiry::NEVER
-        );
-        let dated = Expiry::at(WallTimestamp::from_micros(500));
-        assert_eq!(
-            Expiry::decode_exact(&dated.encode_to_vec()).expect("dated"),
-            dated
-        );
-    }
-
-    #[test]
-    fn namespace_names_round_trip_and_reject_garbage() {
+    fn namespace_names_reject_a_lying_prefix_and_a_bad_charset() {
         let name = NamespaceName::new("sessions").expect("valid");
-        let encoded = name.encode_to_vec();
-        assert_eq!(encoded.len(), 4 + 8);
-        assert_eq!(
-            NamespaceName::decode_exact(&encoded).expect("round trip"),
-            name
-        );
-        // Length prefix lies: declared 8, only 2 present.
+        assert_eq!(name.encode_to_vec().len(), 4 + 8);
+
         let mut short = 8u32.to_le_bytes().to_vec();
         short.extend_from_slice(b"se");
         assert!(NamespaceName::decode(&short).is_err());
-        // Valid UTF-8 but invalid name charset.
+
         let mut bad = Vec::new();
         encode_bytes(&mut bad, "UPPER".as_bytes());
         assert!(matches!(
@@ -441,8 +462,10 @@ mod tests {
         ));
     }
 
+    /// Every tag byte outside the assigned set must be refused: decoding one
+    /// as a known value would fabricate a read contract or an expiry.
     #[test]
-    fn unknown_contract_and_expiry_tags_are_rejected() {
+    fn unknown_tags_and_truncation_are_rejected() {
         assert_eq!(
             ReadContract::decode(&[0xFF]),
             Err(CodecError::InvalidTag {
@@ -457,18 +480,13 @@ mod tests {
                 tag: 0xFF
             })
         );
-    }
-
-    #[test]
-    fn truncated_composites_report_truncation() {
         let authority = TabletAuthority::new(
             TabletId::from_u64(1),
             TabletEpoch::INITIAL,
             WriteGuardGeneration::INITIAL,
         );
-        let encoded = authority.encode_to_vec();
         assert!(matches!(
-            TabletAuthority::decode(&encoded[..10]),
+            TabletAuthority::decode(&authority.encode_to_vec()[..10]),
             Err(CodecError::Truncated { .. })
         ));
     }

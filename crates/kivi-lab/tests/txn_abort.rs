@@ -1,6 +1,6 @@
 //! Deterministic transaction-abort recovery: every OCC-aborted batch
 //! must release its prepared intents through the persisted Abort
-//! decision + durable driver abort wave — never by waiting out the 60s
+//! decision + durable driver abort wave - never by waiting out the 60s
 //! transaction lease.
 //!
 //! Each iteration forces an abort deterministically (a cross-tablet batch
@@ -21,10 +21,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use kivi_client::ordered::{BatchExpect, BatchWriteKind, BatchWriteSpec};
 use kivi_lab::cluster::Cluster;
+use kivi_lab::testkit::NS;
 use kivi_state::Key;
-use kivi_types::NamespaceId;
-
-const NS: NamespaceId = NamespaceId::from_u64(1);
 const ITERATIONS: usize = 10;
 /// Short semantic bound for intent clearance: resolver grace is 2s, so
 /// 20s is grace + ample margin yet 3× below the 60s transaction lease.

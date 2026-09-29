@@ -7,9 +7,7 @@
 //!
 //! Deterministic seed, bounded length, CI-reasonable runtime. Gating matches
 //! `redis_conformance.rs`: opt in with `KIVI_LAB_REDIS_URL`, plus the lab
-//! `redis-compat` feature for the Kivi side.
-
-#![cfg(feature = "redis-compat")]
+//! edge for the Kivi side.
 
 use kivi_lab::conformance::{
     Observable, cleanup_prefix, redis_opted_in, redis_url, run_scope, setup_edge_keys,

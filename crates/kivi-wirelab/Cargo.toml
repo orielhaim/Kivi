@@ -1,0 +1,49 @@
+[package]
+name = "kivi-wirelab"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "Apache-2.0"
+
+# The external latency laboratory. Not a product crate and not a library: it
+# exists to answer one question - where do the thousands of nanoseconds between
+# a 46 ns internal GET and a socket-visible GET go - by building the smallest
+# possible servers on either side of each layer and subtracting.
+#
+# One client, several servers. That is the whole design: a comparison where the
+# two sides were driven by different generators measures the generators.
+# `kivi-wirelab-server` runs the same code path with the work removed, stage by
+# stage; `kivi-wirelab-client` speaks every variant, so a difference between two
+# rows is a difference in the server and nothing else.
+
+[dependencies]
+kivi-core.workspace = true
+kivi-resp.workspace = true
+kivi-state.workspace = true
+kivi-types.workspace = true
+bytes.workspace = true
+# `net` + `io` for the compio controls. No `macros`: the controls are written as
+# explicit futures so the code under measurement is the code on the page.
+#
+# `io-uring` is named explicitly and the defaults are off, because a control that
+# silently fell back to compio's stub driver would measure nothing at all and still
+# produce a number. A first version of this crate omitted the feature and panicked
+# with "Stub driver does not support any operations" - which is at least a loud
+# failure, and the reason this is written down rather than left to be rediscovered.
+compio = { version = "0.19", default-features = false, features = [
+    "net",
+    "io",
+    "runtime",
+    "io-uring",
+] }
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "kivi-wirelab-server"
+path = "src/bin/server.rs"
+
+[[bin]]
+name = "kivi-wirelab-client"
+path = "src/bin/client.rs"

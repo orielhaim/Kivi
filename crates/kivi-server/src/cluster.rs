@@ -1,9 +1,9 @@
 //! Replicated cluster mode: many tablet groups per process set.
 //!
 //! This module is the explicit cluster configuration. Each process opens
-//! one [`ConsensusNode`] — many tablet
+//! one [`ConsensusNode`] - many tablet
 //! replicas on fixed Compio workers sharing one H3 peer mesh and one
-//! shared WAL writer — and serves:
+//! shared WAL writer - and serves:
 //!
 //! * the native Kivi protocol on Tokio (handshake, requests, redirects),
 //! * a read-only admin plane with per-tablet diagnostics,
@@ -20,7 +20,7 @@
 //! `TabletId` → local replica. Only the tablet's leader proposes.
 //! Followers answer `StaleRoute` with a `Redirect` carrying the tablet's
 //! real range (plus directory version, tablet, and leader native
-//! endpoint) — the existing client machinery (sparse range cache,
+//! endpoint) - the existing client machinery (sparse range cache,
 //! same-identity retries, bounded redirect budget) then carries the
 //! request to the leader without any protocol change and without
 //! exposing `OpenRaft` concepts. Different tablets have different
@@ -93,9 +93,10 @@ const CLUSTER_CHUNK_SIZE: usize = 1_048_576;
 /// Maximum `StreamData` payload per frame on cluster uploads (bounded
 /// bulk framing; well under the peer and native ceilings).
 const CLUSTER_STREAM_MAX_DATA: u32 = 1_048_576;
-/// Admin per-request ceiling (60 s: redundancy protects/uploads plus Raft
-/// commits exceed the old 5 s budget; ordinary diagnostics stay fast).
-const ADMIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Cluster admin per-request ceiling. Higher than the single-node admin
+/// plane's 5 s because this plane also serves redundancy protects/uploads and
+/// Raft commits; ordinary diagnostics still answer in milliseconds.
+const CLUSTER_ADMIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// Admin body limit (16 MiB: redundancy `protect` carries base64 images
 /// whose decoded form caps at 8 MiB; base64 inflates 33%, so ~10.7 MiB
 /// encoded fits with headroom; every redundancy handler additionally
@@ -216,9 +217,7 @@ impl ClusterShared {
 /// `Response` bodies are built at the call sites).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RouteError {
-    /// The partition hash algorithm is unavailable in this build.
-    UnsupportedHash,
-    /// No active tablet owns the key (unreachable on a static tiling —
+    /// No active tablet owns the key (unreachable on a static tiling -
     /// loud internal, never a silent misroute).
     NoTablet,
 }
@@ -308,31 +307,27 @@ async fn successor_endpoint(shared: &ClusterShared, tablet: TabletId) -> Option<
 }
 
 /// Layout routing for ordinary keys: byte lookup first, then the hash-layout
-/// fallback. Every routing site in the server resolves through here so the
-/// two-step rule exists once.
+/// fallback.
+///
+/// The two-step rule exists once, and the hash is [`kivi_state::route_hash`], so
+/// this router and the engine's `RoutingSnapshot` cannot disagree about where a
+/// key lives.
 pub(crate) fn route_normal_key(
     snapshot: &kivi_tablet::DirectorySnapshot,
     namespace: NamespaceId,
     key: &[u8],
 ) -> Result<TabletId, RouteError> {
-    use kivi_state::PartitionHasher;
     if let Some(tablet) = snapshot.lookup_by_key(key) {
         return Ok(tablet);
     }
-    let hash = PartitionHasher::V1
-        .hash(namespace, key)
-        .ok_or(RouteError::UnsupportedHash)?;
-    snapshot.lookup_by_hash(hash).ok_or(RouteError::NoTablet)
+    snapshot
+        .lookup_by_hash(kivi_state::route_hash(namespace, key))
+        .ok_or(RouteError::NoTablet)
 }
 
 /// Shapes a routing failure as a wire response.
 fn route_error(error: RouteError) -> Response {
     match error {
-        RouteError::UnsupportedHash => Response {
-            proof: None,
-            status: Status::InvalidRequest,
-            body: ResponseBody::Diagnostic("partition hash unsupported".to_owned()),
-        },
         RouteError::NoTablet => Response {
             proof: None,
             status: Status::Internal,
@@ -442,7 +437,7 @@ pub fn run_from_args(args: &super::Args) -> anyhow::Result<()> {
     // The server's Tokio runtime drives the consensus front (whose
     // futures stay `Send` across runtimes) and the Tokio-native edges
     // only. Consensus itself runs on its own Compio owner thread inside
-    // `ReplicatedNode` — no Tokio exists in `kivi-consensus`.
+    // `ReplicatedNode` - no Tokio exists in `kivi-consensus`.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("kivi-server")
@@ -516,13 +511,59 @@ impl ReplayOp {
     }
 }
 
+/// Reports a cutover this node cannot apply, once per distinct reason.
+///
+/// The replay runs on every reconciler pass, forever, against a directory and a
+/// committed image that do not change between attempts. Logging the refusal each
+/// pass turns a single stuck plan into a permanent 20 Hz stream that buries
+/// every other line in the file - including the ones that would explain what
+/// actually went wrong. So a reason is reported when it first appears and again
+/// only when it changes; the operator-facing view is `GET /v1/control/splits`.
+///
+/// Process-global because the replay has two callers with no shared owner (the
+/// startup path, before any handle exists, and the reconciler loop) and the
+/// state is a de-duplication cache rather than cluster truth: a fresh process
+/// re-reports, which is the correct amount of reporting for a fresh process.
+fn report_replay_refusal(kind: &str, plan: u64, tablet: u64, reason: &str) {
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+
+    /// Keyed by kind and plan id only: the plan's lineage never changes, and the
+    /// tablet is reported so a reader can find it without reconstructing ids.
+    static LAST: OnceLock<Mutex<std::collections::BTreeMap<(&'static str, u64), String>>> =
+        OnceLock::new();
+    let Some(kind) = ["split", "merge"].into_iter().find(|known| *known == kind) else {
+        return;
+    };
+    let last = LAST.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()));
+    let Ok(mut last) = last.lock() else {
+        // A poisoned cache means the only cost is a duplicate line.
+        tracing::warn!(kind, plan, tablet, %reason, "topology replay cannot apply cutover");
+        return;
+    };
+    let entry = last.entry((kind, plan)).or_default();
+    if *entry == reason {
+        return;
+    }
+    entry.clear();
+    entry.push_str(reason);
+    tracing::warn!(
+        kind,
+        plan,
+        tablet,
+        %reason,
+        "topology replay cannot apply a committed cutover; the serving directory keeps \
+         its current version until the gap closes"
+    );
+}
+
 /// Replays completed topology cutovers over the genesis tiling so a full
 /// cluster restart recovers the post-split/merge directory. Only plans at
 /// or past `CutoverCommitted` affect the directory (earlier phases keep
 /// children inactive and the parent authoritative); replay applies them in
 /// global plan-id order (splits and merges interleave: split→merge→split
 /// lineages only rebuild when each cutover sees its parents), deterministically
-/// rebuilding the same ranges. Old parents stay retired with redirects —
+/// rebuilding the same ranges. Old parents stay retired with redirects -
 /// they never reappear as active.
 #[allow(clippy::too_many_lines)]
 async fn replay_topology_from_control(shared: &ClusterShared) {
@@ -537,7 +578,7 @@ async fn replay_topology_from_control(shared: &ClusterShared) {
 /// Runs at startup (restart recovery) AND on every reconciler pass on
 /// every node: a freshly admitted member starts from its genesis tiling
 /// and missed every past cutover, and a member down during a cutover push
-/// misses it — without continuous replay their serving directories diverge
+/// misses it - without continuous replay their serving directories diverge
 /// permanently and produce contradictory tombstone redirects. The admin
 /// cutover push stays the fast path (same-pass convergence); this is the
 /// correctness backstop that makes "every member eventually applies every
@@ -615,19 +656,32 @@ pub(crate) async fn replay_committed_topology(
             break;
         }
         if !progress {
+            // A fixpoint reached with work still outstanding is not a transient
+            // condition to retry quietly: a later plan in the sequence depends on
+            // an earlier one, and the earlier one cannot be applied to this
+            // node's directory. Retrying cannot change that - the same committed
+            // image and the same directory produce the same refusal - so the only
+            // thing a per-pass log line would add is noise.
+            //
+            // The reason is reported once, and again only when it changes. Where
+            // it shows up for an operator is `GET /v1/control/splits`, which
+            // reports each plan's blocking prerequisite from live observation.
             for op in &ops {
-                match op {
-                    ReplayOp::Split(plan) => tracing::warn!(
-                        plan = plan.id.as_u64(),
-                        parent = plan.parent.as_u64(),
-                        "topology replay skipped split cutover"
+                let (kind, plan, tablet, reason) = match op {
+                    ReplayOp::Split(plan) => (
+                        "split",
+                        plan.id.as_u64(),
+                        plan.parent.as_u64(),
+                        "the cutover cannot be applied to this node's directory",
                     ),
-                    ReplayOp::Merge(plan) => tracing::warn!(
-                        plan = plan.id.as_u64(),
-                        merged = plan.merged.as_u64(),
-                        "topology replay skipped merge cutover"
+                    ReplayOp::Merge(plan) => (
+                        "merge",
+                        plan.id.as_u64(),
+                        plan.merged.as_u64(),
+                        "the cutover cannot be applied to this node's directory",
                     ),
-                }
+                };
+                report_replay_refusal(kind, plan, tablet, reason);
             }
             break;
         }
@@ -635,6 +689,14 @@ pub(crate) async fn replay_committed_topology(
     if changed {
         if let Err(reason) = snapshot.validate() {
             tracing::warn!(%reason, "topology replay publish failed");
+            return;
+        }
+        if !crate::control::routes_somewhere(&snapshot) {
+            // The replay reconstructs a directory from a committed image; if the
+            // result routes nowhere, the image and this node's genesis tiling
+            // disagree about which tablets exist, and publishing would replace a
+            // serving directory with one that fails every request.
+            report_replay_refusal("replay", 0, 0, "the rebuilt directory has no active tablet");
             return;
         }
         let version = snapshot.version().as_u64();
@@ -1027,7 +1089,7 @@ fn build_topology(
 
 /// Opens the multi-tablet node. The QUIC endpoint binds its UDP socket
 /// inside the consensus mesh thread (no pre-bound listener, no
-/// `TIME_WAIT` dance — QUIC has no TCP listener backlog); a bind
+/// `TIME_WAIT` dance - QUIC has no TCP listener backlog); a bind
 /// conflict fails loudly so the harness retries formation. Peer
 /// certificates come from `--cluster-peer-certs`; without them the node
 /// opens only when `KIVI_INSECURE_PEER_TLS=1` (lab tests).
@@ -1162,7 +1224,37 @@ pub async fn run(config: ClusterServeConfig) -> anyhow::Result<()> {
         Arc::clone(&node),
         kivi_consensus::distcoord::CoordinatorConfig::conservative(),
     ) {
-        Ok(coordinator) => Some(Arc::new(coordinator)),
+        Ok(coordinator) => {
+            let coordinator = Arc::new(coordinator);
+            // Both seams, one coordinator. The gate's resolver is what turns a
+            // lost whole copy into a reconstruction instead of a failed
+            // append; the protector is what puts a plain `set`'s value into
+            // the fabric in the first place, so the resolver has something to
+            // work from. Installed together deliberately: a resolver with
+            // nothing protected cannot help, and protection with no resolver
+            // cannot be used by replication.
+            let shared_plane =
+                kivi_consensus::distcoord::SharedCoordinator::new(Arc::clone(&coordinator));
+            match shared_plane {
+                Ok(plane) => {
+                    node.install_sidecar_resolver(Arc::new(plane.clone()));
+                    node.install_sidecar_protector(Arc::new(plane));
+                    Some(coordinator)
+                }
+                Err(error) => {
+                    // Nothing protects or reconstructs a sidecar without the
+                    // seams, so disable the plane outright rather than leave a
+                    // half-wired node whose admin surface reports health it
+                    // does not have.
+                    tracing::warn!(
+                        %error,
+                        "redundancy seams unavailable: sidecar protection and \
+                         reconstruction are disabled"
+                    );
+                    None
+                }
+            }
+        }
         Err(error) => {
             tracing::warn!(%error, "redundancy plane disabled");
             None
@@ -1225,7 +1317,7 @@ pub async fn run(config: ClusterServeConfig) -> anyhow::Result<()> {
     let redis_part = String::new();
     // NOTE: the token is `consensus_workers=`, never `workers=`: the
     // harness readiness parser treats `workers=<a>,<b>` as the single-node
-    // native list and prefers it over `native=` — a bare `workers=2`
+    // native list and prefers it over `native=` - a bare `workers=2`
     // would parse as the native endpoint "2".
     println!(
         "KIVI_READY native={native_addr} peer={} admin={admin_addr}{redis_part} node={} cluster={} incarnation={} tablets={} consensus_workers={} dir_version={}",
@@ -1292,12 +1384,16 @@ fn start_resp_edge(
     let stats = Arc::new(kivi_resp::RespStats::default());
     let node = Arc::clone(node);
     let directory = Arc::clone(&shared.directory);
+    // Taken here, where the start path is inside the serving runtime, and moved
+    // into the per-connection threads that are not.
+    let handle = tokio::runtime::Handle::current();
     let serve = kivi_resp::BlockingServe::new(
         move |_id| {
             Box::new(ClusterExecutor::new(
                 Arc::clone(&node),
                 Arc::clone(&directory),
                 namespace,
+                handle.clone(),
             ))
         },
         kivi_resp::ConnConfig::default(),
@@ -1785,42 +1881,26 @@ async fn drain_upload_pieces(
     Ok(())
 }
 
+/// Hands a streamed value's staged root to the redundancy plane.
+///
+/// The same seam the propose path uses, reached with a different reason: a
+/// streamed value is staged by the server before it is proposed, so it never
+/// passes through the medium-write staging that protects plain sets. One seam,
+/// two callers, no second mechanism.
 fn schedule_sidecar_protection(
     shared: &ClusterShared,
     manifest: kivi_types::ManifestId,
-    chunks: Vec<(kivi_types::ChunkId, u64)>,
-    _logical_len: u64,
+    chunks: Vec<kivi_types::ChunkId>,
+    logical_len: u64,
 ) {
-    let Some(coordinator) = shared.redundancy.clone() else {
-        return;
-    };
-    let domain = kivi_types::SecurityDomainId::from_u64(shared.namespace.as_u64());
-    tokio::spawn(async move {
-        let owned = Arc::clone(&coordinator);
-        // Each arm below already names the artifact it could not protect;
-        // a runtime that would not start is the only failure without one.
-        if tokio::task::spawn_blocking(move || {
-            let runtime = compio::runtime::Runtime::new().map_err(|error| error.to_string())?;
-            runtime.block_on(async move {
-                for (chunk, len) in chunks {
-                    if let Err(error) = owned.protect_chunk(chunk, domain, len, 1).await {
-                        tracing::warn!(%error, ?chunk, "sidecar chunk protection deferred");
-                        return Err::<(), String>(error.to_string());
-                    }
-                }
-                if let Err(error) = owned.protect_manifest_auto(manifest, domain).await {
-                    tracing::warn!(%error, ?manifest, "sidecar manifest protection deferred");
-                    return Err::<(), String>(error.to_string());
-                }
-                Ok::<(), String>(())
-            })
-        })
-        .await
-        .is_err()
-        {
-            tracing::warn!("sidecar protection worker panicked");
-        }
-    });
+    shared
+        .node
+        .protect_staged_root(kivi_consensus::ProtectedRoot {
+            domain: kivi_types::SecurityDomainId::from_u64(shared.namespace.as_u64()),
+            manifest,
+            logical_len,
+            chunks,
+        });
 }
 
 /// Handles `StreamCommit`: stages the tail, builds the manifest, syncs
@@ -1953,7 +2033,12 @@ async fn handle_stream_commit(
             ProposeOutcome::Applied { outcome, .. }
             | ProposeOutcome::Duplicate { outcome }
             | ProposeOutcome::Read { outcome } => {
-                schedule_sidecar_protection(shared, manifest, upload.chunks.clone(), total);
+                schedule_sidecar_protection(
+                    shared,
+                    manifest,
+                    upload.chunks.iter().map(|(id, _)| *id).collect(),
+                    total,
+                );
                 shape_result(kivi_protocol::Opcode::Set, tablet, &outcome)
             }
             ProposeOutcome::Rejected { outcome } => {
@@ -2203,7 +2288,7 @@ async fn handle_request(
     }
     // Index entries are maintained transactionally: direct single-key
     // writes to the reserved index prefix are rejected (the coherent
-    // paths — `AtomicBatch` and `TxnPrepare` — bypass this check).
+    // paths - `AtomicBatch` and `TxnPrepare` - bypass this check).
     if is_direct_single_key_write(opcode) && kivi_state::is_index_key(&request.key) {
         return Some((
             Response {
@@ -2330,7 +2415,7 @@ async fn handle_read(
     // Directory-vs-serving cross-check: the routing view and the commit
     // view must name the same authority. Any drift on a hosted tablet
     // (stale directory, half-applied topology change) fails closed before
-    // any state is read — evidence and tokens never validate across it.
+    // any state is read - evidence and tokens never validate across it.
     // Unhosted tablets skip the check: the read path below answers "not
     // served by this node" with a forward redirect (normal mid-migration),
     // which a mismatch error here would wrongly shadow.
@@ -2407,7 +2492,7 @@ async fn resolve_result(
             logical_len,
         } => match opcode {
             kivi_protocol::Opcode::Get => {
-                if *logical_len > kivi_chunk::policy::MAX_LEGACY_VALUE_BYTES {
+                if *logical_len > kivi_chunk::policy::MAX_INLINE_VALUE_BYTES {
                     return Response {
                         proof: None,
                         status: Status::ValueTooLarge,
@@ -3194,7 +3279,7 @@ const DEFAULT_READ_WAIT: std::time::Duration = std::time::Duration::from_secs(5)
 
 /// Process monotonic microseconds since first call: the staleness/lease
 /// clock for read contexts. Wall time measures expiry; this measures ages
-/// — the two are never equated (see `kivi_types::consistency`).
+/// - the two are never equated (see `kivi_types::consistency`).
 pub(crate) fn mono_now() -> kivi_types::Ticks {
     use std::sync::OnceLock;
     static START: OnceLock<std::time::Instant> = OnceLock::new();
@@ -3364,7 +3449,6 @@ struct SidecarDto {
     chunk_requests: u64,
     cache_hits: u64,
     cache_misses: u64,
-    deduped_bytes: u64,
     bulk_errors: u64,
     verification_failures: u64,
     pending_gated: u64,
@@ -3484,7 +3568,7 @@ async fn ready(State(shared): State<ClusterShared>) -> Json<serde_json::Value> {
     let statuses = shared.node.status_all().await;
     // Multi-tablet readiness: process alive is not enough. A node is
     // usable once its peer mesh started, every configured local replica
-    // loaded, and every group healthy — partial failure is reported
+    // loaded, and every group healthy - partial failure is reported
     // openly (counts), never hidden behind one boolean. A cluster can be
     // ready while rebalancing: migrations never gate readiness (§44).
     let total = statuses.len();
@@ -3795,7 +3879,6 @@ async fn sidecar(State(shared): State<ClusterShared>) -> Json<SidecarDto> {
         chunk_requests: snapshot.chunk_requests,
         cache_hits: snapshot.cache_hits,
         cache_misses: snapshot.cache_misses,
-        deduped_bytes: snapshot.deduped_bytes,
         bulk_errors: snapshot.bulk_errors,
         verification_failures: snapshot.verification_failures,
         pending_gated: snapshot.pending_gated,
@@ -3970,7 +4053,7 @@ async fn peers_trust(
 /// catch-up: a lagging follower behind the purge point recovers via
 /// snapshot install, then resumes log replication. Body: `{ "tablet":
 /// <u64> }`, optional when exactly one tablet is configured (otherwise
-/// required — snapshots stay per tablet, never one giant node image).
+/// required - snapshots stay per tablet, never one giant node image).
 async fn snapshot(
     State(shared): State<ClusterShared>,
     Json(body): Json<serde_json::Value>,
@@ -4128,27 +4211,65 @@ async fn migrations(State(shared): State<ClusterShared>) -> Json<serde_json::Val
 }
 
 /// Split plans with phases, ranges, and replicas (operator visibility).
+///
+/// Each plan also reports the prerequisite it is currently waiting on, so a
+/// split that is not moving says why instead of leaving an operator to read a
+/// reconciler log for a line that may have scrolled past an hour ago. The
+/// reason is computed from live observation, not stored: it is true right now or
+/// it is not, and a stored copy would be true of nothing.
 async fn control_splits(State(shared): State<ClusterShared>) -> Json<serde_json::Value> {
     let Some(state) = shared.node.control_state().await else {
         return Json(serde_json::json!({ "present": false, "splits": [] }));
     };
     let directory = shared.directory_snapshot();
+    // Whether the namespace still has somewhere to serve. A split between
+    // provisioning and cutover leaves the parent active and this is true; a
+    // split that published routing to a child that is not serving leaves it
+    // false, and that is the condition every other field here is explaining.
+    let serving: Vec<TabletId> = directory
+        .tablets()
+        .iter()
+        .filter(|descriptor| descriptor.state() == kivi_tablet::TabletState::Active)
+        .map(kivi_tablet::TabletDescriptor::id)
+        .collect();
+    let mut splits = Vec::new();
+    for plan in state.splits() {
+        let parent_range = directory
+            .get(plan.parent)
+            .map(|descriptor| descriptor.range().to_string());
+        // Only the phases gated on readiness can report a block; earlier ones
+        // are waiting on a request, later ones have already published.
+        let blocked = if plan.phase.needs_children_ready() {
+            crate::control::prove_tabsets_ready(
+                &shared.node,
+                &state,
+                &[plan.left, plan.right],
+                &plan.replicas,
+                plan.id,
+            )
+            .await
+            .err()
+            .map(|block| block.to_string())
+        } else {
+            None
+        };
+        splits.push(serde_json::json!({
+            "id": plan.id.as_u64(),
+            "parent": plan.parent.as_u64(),
+            "parent_range": parent_range,
+            "split_hash": format!("{:x}", plan.split_hash),
+            "left": plan.left.as_u64(),
+            "right": plan.right.as_u64(),
+            "replicas": plan.replicas.iter().map(|node| node.as_u64()).collect::<Vec<_>>(),
+            "generation": plan.generation.as_u64(),
+            "phase": format!("{:?}", plan.phase),
+            "blocked": blocked,
+        }));
+    }
     Json(serde_json::json!({
         "present": true,
-        "splits": state.splits().map(|plan| {
-            let parent_range = directory.get(plan.parent).map(|descriptor| descriptor.range().to_string());
-            serde_json::json!({
-                "id": plan.id.as_u64(),
-                "parent": plan.parent.as_u64(),
-                "parent_range": parent_range,
-                "split_hash": format!("{:x}", plan.split_hash),
-                "left": plan.left.as_u64(),
-                "right": plan.right.as_u64(),
-                "replicas": plan.replicas.iter().map(|node| node.as_u64()).collect::<Vec<_>>(),
-                "generation": plan.generation.as_u64(),
-                "phase": format!("{:?}", plan.phase),
-            })
-        }).collect::<Vec<_>>(),
+        "serving_tabs": serving.iter().map(|tablet| tablet.as_u64()).collect::<Vec<_>>(),
+        "splits": splits,
     }))
 }
 
@@ -4233,7 +4354,7 @@ async fn control_splits_create(
                 Json(serde_json::json!({ "error": "tablet allocator exhausted" })),
             );
         };
-        return match super::control::create_split_plan_full(
+        return match super::control::create_split_plan(
             &shared.node,
             parent,
             0,
@@ -4273,7 +4394,8 @@ async fn control_splits_create(
             Json(serde_json::json!({ "error": "tablet allocator exhausted" })),
         );
     };
-    match super::control::create_split_plan_at(&shared.node, parent, split_hash, left, right).await
+    match super::control::create_split_plan(&shared.node, parent, split_hash, None, left, right)
+        .await
     {
         Ok(id) => (
             StatusCode::OK,
@@ -4461,13 +4583,31 @@ async fn control_indexes_drop(
 }
 
 /// Merge plans with phases (operator visibility).
+///
+/// Reports the blocking prerequisite for the same reason the split view does: a
+/// merge that is not moving says which prerequisite is unmet, and both parents
+/// keep serving while it waits.
 async fn control_merges(State(shared): State<ClusterShared>) -> Json<serde_json::Value> {
     let Some(state) = shared.node.control_state().await else {
         return Json(serde_json::json!({ "present": false, "merges": [] }));
     };
-    Json(serde_json::json!({
-        "present": true,
-        "merges": state.merges().map(|plan| serde_json::json!({
+    let mut merges = Vec::new();
+    for plan in state.merges() {
+        let blocked = if plan.phase.needs_target_ready() {
+            crate::control::prove_tabsets_ready(
+                &shared.node,
+                &state,
+                &[plan.merged],
+                &plan.replicas,
+                plan.id,
+            )
+            .await
+            .err()
+            .map(|block| block.to_string())
+        } else {
+            None
+        };
+        merges.push(serde_json::json!({
             "id": plan.id.as_u64(),
             "left": plan.left.as_u64(),
             "right": plan.right.as_u64(),
@@ -4475,7 +4615,12 @@ async fn control_merges(State(shared): State<ClusterShared>) -> Json<serde_json:
             "replicas": plan.replicas.iter().map(|node| node.as_u64()).collect::<Vec<_>>(),
             "generation": plan.generation.as_u64(),
             "phase": format!("{:?}", plan.phase),
-        })).collect::<Vec<_>>(),
+            "blocked": blocked,
+        }));
+    }
+    Json(serde_json::json!({
+        "present": true,
+        "merges": merges,
     }))
 }
 
@@ -4822,7 +4967,7 @@ async fn tablet_members(
     // Converge the joint: the committed joint config needs its uniform
     // successor, proposed here on the tablet leader (the reconciler
     // covers migration plans the same way). Poll briefly, re-proposing
-    // while joint persists — re-proposing the same desired set after a
+    // while joint persists - re-proposing the same desired set after a
     // committed joint is safe (propose-after-commit holds) and lands
     // directly on the uniform config. Stays inside the admin deadline;
     // callers retry on 503.
@@ -5445,7 +5590,7 @@ async fn control_node_drain(
 
 /// Removes a node after safe drain. Fails loudly when the node still
 /// desires tablets, still votes anywhere observed locally, or still
-/// votes in the control group — never silently deletes an active
+/// votes in the control group - never silently deletes an active
 /// voter (§29). No force mode.
 async fn control_node_remove(
     State(shared): State<ClusterShared>,
@@ -5704,7 +5849,7 @@ async fn serve_admin(listener: tokio::net::TcpListener, shared: ClusterShared) {
                 .layer(RequestBodyLimitLayer::new(MAX_ADMIN_BODY_BYTES))
                 .layer(TimeoutLayer::with_status_code(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    ADMIN_REQUEST_TIMEOUT,
+                    CLUSTER_ADMIN_REQUEST_TIMEOUT,
                 )),
         )
         .with_state(shared);
@@ -5714,14 +5859,14 @@ async fn serve_admin(listener: tokio::net::TcpListener, shared: ClusterShared) {
 }
 
 /// RESP executor over the replicated node.
+///
 /// Anonymous identity throughout (Redis carries no sessions); leader
 /// routing failures surface as retryable `Overloaded` (`BUSY`, safe to
 /// retry with backoff). The `ExecuteError` surface carries no dynamic
-/// leader endpoint (fixed renderings by design), so cluster RESP
-/// clients discover the leader out of band (admin `/v1/tablet` names
-/// it) or simply retry: the error is retryable, never `MOVED`/`ASK`
-/// (there is no Redis Cluster here), and Redis clients never learn
-/// consensus concepts.
+/// leader endpoint (fixed renderings by design), so cluster RESP clients
+/// discover the leader out of band (admin `/v1/tablet` names it) or simply
+/// retry: the error is retryable, never `MOVED`/`ASK` (there is no Redis
+/// Cluster here), and Redis clients never learn consensus concepts.
 #[cfg(feature = "redis-compat")]
 #[derive(Debug)]
 pub struct ClusterExecutor {
@@ -5747,42 +5892,84 @@ impl Clone for ClusterExecutor {
 
 #[cfg(feature = "redis-compat")]
 impl ClusterExecutor {
-    /// Binds the executor to its node (call inside the serving runtime
-    /// so the handle is current).
+    /// Binds the executor to its node and the runtime it will read through.
+    ///
+    /// `handle` is taken by the caller rather than discovered here. The RESP edge
+    /// is thread-per-connection, so the thread that constructs an executor has no
+    /// Tokio runtime to discover one from - `Handle::current()` panicked on the
+    /// first command of every connection, and because a panic in a spawned task
+    /// does not stop the process, the edge failed every command while the server
+    /// reported itself ready. The start path does have a runtime, so it takes the
+    /// handle once and threads it here.
     #[must_use]
     pub fn new(
         node: Arc<ConsensusNode>,
         directory: Arc<arc_swap::ArcSwap<DirectorySnapshot>>,
         namespace: NamespaceId,
+        handle: tokio::runtime::Handle,
     ) -> Self {
         Self {
             node,
             directory,
             namespace,
-            handle: tokio::runtime::Handle::current(),
+            handle,
             last_writes: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Routes one operation to its tablet through the current directory
-    /// (same key → tablet mapping as the native edge).
+    /// Routes one operation to its tablet through the current directory.
+    ///
+    /// The routing identity is [`kivi_state::route_hash`], the same construction the
+    /// engine routes with, so the cluster edge and the engine place a key
+    /// identically.
     fn route(&self, op: &Operation) -> Result<TabletId, kivi_resp::ExecuteError> {
         use kivi_resp::ExecuteError as E;
-        use kivi_state::PartitionHasher;
-        let hash = PartitionHasher::V1
-            .hash(self.namespace, op.key().as_bytes())
-            .ok_or(E::Internal)?;
+        let hash = kivi_state::route_hash(self.namespace, op.key().as_bytes());
         self.directory
             .load()
             .lookup_by_hash(hash)
             .ok_or(E::Internal)
     }
 
+    /// Records the commit token of a just-applied write so a read of the same
+    /// tablet on this connection can ask for at least that position.
+    fn remember_write(&self, tablet: TabletId, index: kivi_consensus::ConsensusLogIndex) {
+        let Some(authority) = self.node.authority_for(tablet) else {
+            return;
+        };
+        let token = CommitToken::new(
+            tablet,
+            authority.epoch(),
+            CommitPosition::from_u64(index.get().saturating_add(1)),
+        );
+        if let Ok(mut writes) = self.last_writes.lock() {
+            writes.insert(tablet, token);
+        }
+    }
+}
+
+/// Whether an operation serves as a read (local applied state, no
+/// proposal) on the RESP edge.
+#[cfg(feature = "redis-compat")]
+fn op_is_read(op: &Operation) -> bool {
+    matches!(
+        op,
+        Operation::Get { .. }
+            | Operation::Exists { .. }
+            | Operation::CounterGet { .. }
+            | Operation::GetExpiry { .. }
+            | Operation::GetRange { .. }
+            | Operation::BytesLength { .. }
+    )
+}
+
+#[cfg(feature = "redis-compat")]
+impl kivi_resp::Executor for ClusterExecutor {
     /// Executes one typed operation against its tablet's replica:
     /// reads serve local applied state, mutations propose anonymously.
     /// Reads after this connection's writes use `AtLeast`; reads without a
     /// local write remain unconstrained and use `Any`.
-    fn execute_inner(&self, op: &Operation) -> Result<OperationResult, kivi_resp::ExecuteError> {
+    fn execute(&self, op: &Operation) -> Result<OperationResult, kivi_resp::ExecuteError> {
         use kivi_resp::ExecuteError as E;
         let tablet = self.route(op)?;
         if op_is_read(op) {
@@ -5830,42 +6017,6 @@ impl ClusterExecutor {
                 Err(_) => Err(E::Overloaded),
             }
         }
-    }
-
-    fn remember_write(&self, tablet: TabletId, index: kivi_consensus::ConsensusLogIndex) {
-        let Some(authority) = self.node.authority_for(tablet) else {
-            return;
-        };
-        let token = CommitToken::new(
-            tablet,
-            authority.epoch(),
-            CommitPosition::from_u64(index.get().saturating_add(1)),
-        );
-        if let Ok(mut writes) = self.last_writes.lock() {
-            writes.insert(tablet, token);
-        }
-    }
-}
-
-/// Whether an operation serves as a read (local applied state, no
-/// proposal) on the RESP edge.
-#[cfg(feature = "redis-compat")]
-fn op_is_read(op: &Operation) -> bool {
-    matches!(
-        op,
-        Operation::Get { .. }
-            | Operation::Exists { .. }
-            | Operation::CounterGet { .. }
-            | Operation::GetExpiry { .. }
-            | Operation::GetRange { .. }
-            | Operation::BytesLength { .. }
-    )
-}
-
-#[cfg(feature = "redis-compat")]
-impl kivi_resp::Executor for ClusterExecutor {
-    fn execute(&self, op: &Operation) -> Result<OperationResult, kivi_resp::ExecuteError> {
-        self.execute_inner(op)
     }
 
     fn now(&self) -> WallTimestamp {

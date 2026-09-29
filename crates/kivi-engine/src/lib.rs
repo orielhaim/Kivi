@@ -6,10 +6,9 @@
 //! over bounded channels; routing snapshots publish through RCU-style atomic
 //! swaps, never a global mutex.
 //!
-//! The embedded [`LocalEngine`]/[`LocalClient`] path is the local API —
-//! future network connections will live directly on workers and call tablet
-//! execution without this cross-thread hop. The two paths share tablet logic
-//! but are not optimized as one.
+//! Network frontends skip the cross-thread hop: their connection tasks live
+//! on the owning worker's reactor (see [`net`]). The two paths share tablet
+//! logic; only the transport differs.
 
 pub mod checkpoint;
 pub mod chunk_lane;
@@ -22,6 +21,7 @@ pub mod placement;
 pub mod redundancy;
 pub mod resp_net;
 pub mod routing;
+pub mod slots;
 pub mod tablet;
 pub mod worker;
 
@@ -34,7 +34,7 @@ pub use chunk_lane::{
 pub use commit::{BatchPolicy, CommitCoordinator, CommitMetricsSnapshot, LaneMaintenance};
 pub use engine::{
     AdminHandle, ChunkFabricConfig, DurabilityMode, DurableConfig, EngineConfig, EngineDurability,
-    EngineError, LocalClient, LocalEngine, ShutdownReport, TxnStatusReport,
+    EngineError, LocalClient, LocalEngine, ShutdownReport,
 };
 pub use fabric::{
     FABRIC_INLINE_MAX, FabricConfig, FabricError, FabricPaths, FabricStatsSnapshot, StagedSeal,
@@ -47,7 +47,7 @@ pub use kivi_memory::offcore_lane::{
 };
 pub use kivi_memory::{Footprint, MemoryControlPolicy, MemoryControlPolicyError};
 pub use net::{ConnLimits, EngineNetwork, NetConfig, NetStartError, TurnBudget};
-pub use placement::{DEFAULT_ROLES, HardwareConfig, PlacementError, ThreadPlacement};
+pub use placement::{HardwareConfig, ThreadPlacement};
 pub use redundancy::{
     CheckpointProtection, EngineRedundancy, ProtectedArtifact, RedundancyAdminSnapshot,
     protect_staged_value,

@@ -2,8 +2,8 @@
 //!
 //! [`SchemeParams`] is the planner's layout decision behind the declarative
 //! [`crate::RedundancyIntent`]. Replication and Reed-Solomon share every
-//! surrounding abstraction — asset identity, fragment identity, placement,
-//! publication, reconstruction, repair, observability — proving the fabric
+//! surrounding abstraction - asset identity, fragment identity, placement,
+//! publication, reconstruction, repair, observability - proving the fabric
 //! protects *information*, not "the erasure-code module".
 //!
 //! Bounds are hard and versioned: replication `1..=MAX_COPIES` copies,
@@ -55,8 +55,6 @@ pub struct RsParams {
 }
 
 impl RsParams {
-    /// Layout version minted here.
-    pub const VERSION: u16 = 1;
     /// Maximum data shards.
     pub const MAX_DATA: u8 = 32;
     /// Maximum parity shards.
@@ -67,9 +65,9 @@ impl RsParams {
     pub const MAX_FRAGMENT_LEN: u32 = 8 * 1024 * 1024;
     /// Alignment of padded shard sizes (64 bytes, cross-version compat).
     pub const ALIGNMENT: u32 = 64;
-    /// Maximum logical asset bytes protected by one coded layout (64 MiB,
-    /// matching the legacy value ceiling; larger assets use replication or
-    /// are split by the caller before protection).
+    /// Maximum logical asset bytes protected by one coded layout (64 MiB;
+    /// larger assets use replication or are split by the caller before
+    /// protection).
     pub const MAX_ASSET_BYTES: u64 = 64 * 1024 * 1024;
 
     /// Pads `shard` up to the versioned alignment.
@@ -273,43 +271,6 @@ impl SchemeParams {
     }
 }
 
-/// Provider capabilities (what a scheme offers, not its parameters).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SchemeCapabilities {
-    /// Scheme family.
-    pub scheme: SchemeId,
-    /// Maximum-data-symbol code (MDS: any `required` of `total` suffice).
-    pub mds: bool,
-    /// Ordinary reads can use one piece without decoding.
-    pub systematic: bool,
-    /// Exact `k`-of-`n` reconstruction threshold.
-    pub exact_threshold: bool,
-}
-
-impl SchemeCapabilities {
-    /// Capabilities of replication.
-    #[must_use]
-    pub const fn replication() -> Self {
-        Self {
-            scheme: SchemeId::Replication,
-            mds: true,
-            systematic: true,
-            exact_threshold: true,
-        }
-    }
-
-    /// Capabilities of the Reed-Solomon baseline.
-    #[must_use]
-    pub const fn reed_solomon() -> Self {
-        Self {
-            scheme: SchemeId::ReedSolomon,
-            mds: true,
-            systematic: true,
-            exact_threshold: true,
-        }
-    }
-}
-
 /// Fits an intent-derived layout to the cluster's independent failure
 /// domains.
 ///
@@ -357,7 +318,7 @@ pub fn fit_to_domains(params: SchemeParams, logical_len: u64, domains: usize) ->
 /// replication (`tolerance + 1` copies); larger cold assets use `RS` with a
 /// narrow width that meets the tolerance (`data = 8` baseline, wider when
 /// storage-cost minimization demands it). Specific widths are planner
-/// decisions — the intent never names them.
+/// decisions - the intent never names them.
 ///
 /// # Errors
 ///

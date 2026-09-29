@@ -308,7 +308,7 @@ impl Arena {
             // THP=`always` system is huge pages and on a THP=`madvise` system
             // is 4 KiB. That is not an action, so it is not requested. `Never`
             // is a refusal, and the outcome of a refusal is also that nothing
-            // was done, so both answer the same way — deliberately, because the
+            // was done, so both answer the same way - deliberately, because the
             // caller asked for neither an action nor a diagnostic here.
             HugePagePolicy::Never | HugePagePolicy::Inherit => PlacementOutcome::NotRequested,
         };
@@ -612,7 +612,7 @@ mod sys {
         // of the mask; rounding up to a whole word is always sufficient.
         let maxnode = (index + 1) * usize::try_from(bits).unwrap_or(64);
         // No `MPOL_MF_MOVE`: the mapping has no pages yet, so the policy simply
-        // governs the first fault. That is the whole mechanism — asking the
+        // governs the first fault. That is the whole mechanism - asking the
         // kernel to migrate pages instead would need privileges the process
         // does not have and would be the wrong order of operations anyway.
         //
@@ -906,8 +906,8 @@ mod tests {
         .expect("maps");
         // Either the kernel applied the policy or it said why. What must never
         // happen is an arena that cannot be used. The applied and failed arms
-        // assert the same thing — the request survived to whatever answer the
-        // platform gave — so they share one arm rather than repeating the
+        // assert the same thing - the request survived to whatever answer the
+        // platform gave - so they share one arm rather than repeating the
         // assertion and letting one drift.
         assert!(!arena.is_empty());
         match arena.node_outcome() {

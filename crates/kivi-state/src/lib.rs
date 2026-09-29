@@ -6,7 +6,7 @@
 //! [`StrictCounter`](LogicalValue::StrictCounter)) with explicit versions and
 //! expiry. Native [`Operation`]s are validated by [`prepare`](ObjectStore::prepare)
 //! into reads or typed [`Mutation`]s, which [`apply`](ObjectStore::apply)
-//! deterministically — the same mutation on the same state always yields the
+//! deterministically - the same mutation on the same state always yields the
 //! same outcome, with no clock reads or randomness inside.
 //!
 //! Physical representation is deliberately private: small values live inline
@@ -20,18 +20,18 @@ pub mod index;
 pub mod mutation;
 pub mod object;
 pub mod ops;
+pub mod route;
 pub mod scan;
-pub mod semantics;
 pub mod store;
 pub mod txn;
 pub use envelope::{EnvelopeError, MUTATION_ENVELOPE_VERSION, MutationEnvelope};
-pub use hash::{PARTITION_DOMAIN_TAG, PartitionHashAlgorithmId, PartitionHasher};
+pub use hash::{ROUTE_HASH_NAME, ROUTE_SEED, seed_for, xxh3_128};
 pub use index::{
-    INDEX_ENCODING_VERSION, INDEX_FORMAT_TAG, IndexCodecError, IndexDefinition, IndexId, IndexKind,
-    IndexProjections, IndexState, PROJECTION_PREFIX, decode_entry_value, decode_non_unique_key,
-    decode_unique_key, encode_non_unique_key, encode_non_unique_value, encode_unique_key,
-    encode_unique_value, is_index_key, parse_index_primary, parse_projection_primary,
-    prefix_successor, projection_key, term_prefix, term_prefix_parts,
+    INDEX_ENCODING_VERSION, INDEX_FORMAT_TAG, IndexCodecError, IndexId, IndexKind,
+    IndexProjections, decode_entry_value, decode_non_unique_key, encode_non_unique_key,
+    encode_non_unique_value, encode_unique_key, encode_unique_value, is_index_key,
+    parse_index_primary, parse_projection_primary, prefix_successor, projection_key, term_prefix,
+    term_prefix_parts,
 };
 use kivi_types::TabletId;
 pub use mutation::{ApplyError, ApplyOutcome, Mutation};
@@ -44,23 +44,21 @@ pub use object::{
 pub use ops::{
     DurableOutcome, ExpiryPolicy, OpError, Operation, OperationResult, SetCondition, outcome_for,
 };
+pub use route::{NamespaceRouteHasher, RouteHash128, route_hash};
 pub use scan::{
     IndexTermCursor, IndexTermRangeCursor, ScanDirection, ScanEntry, ScanError, ScanPage,
     ScanProjection, ScanSpec, ScannedValue,
 };
-pub use semantics::{Caps, ConflictScope, OperationSemantics, semantics_of};
 pub use store::{
     LocalCommitError, MAX_LEASE_TTL_MICROS, ObjectStore, Prepared, StorePrepared, StoreStats,
     lease_expires_at, local_versions, slice_range, splice_inline,
 };
 pub use txn::{
-    MAX_TXN_BYTES, MAX_TXN_KEYS, MAX_TXN_LIFETIME_MICROS, MAX_TXN_PARTICIPANTS, PlannedEscrowMove,
-    RESOLVE_GRACE_MICROS, TXN_RECORD_KEY_LEN, TXN_RECORD_PREFIX, TXN_RECORD_VERSION,
-    TxnCoordinator, TxnDecision, TxnDecodeError, TxnDriverPlan, TxnError, TxnExpect, TxnId,
-    TxnIntent, TxnOutcome, TxnParticipant, TxnPrepare, TxnReadVersion, TxnRecord, TxnReservation,
-    TxnState, TxnWrite, TxnWriteKind, check_bounds, group_by_tablet, parse_txn_record_key,
-    participant_set, plan_escrow_transfer, plan_transaction, reservation_cost, select_coordinator,
-    txn_write_from_wire, verify_escrow_widths, write_set_digest,
+    MAX_TXN_BYTES, MAX_TXN_KEYS, MAX_TXN_LIFETIME_MICROS, PlannedEscrowMove, RESOLVE_GRACE_MICROS,
+    TXN_RECORD_VERSION, TxnDecision, TxnDecodeError, TxnDriverPlan, TxnError, TxnExpect, TxnId,
+    TxnIntent, TxnRecord, TxnState, TxnWrite, TxnWriteKind, group_by_tablet, parse_txn_record_key,
+    plan_escrow_transfer, plan_transaction, select_coordinator, txn_write_from_wire,
+    verify_escrow_widths, write_set_digest,
 };
 
 /// System key holding the coordinator decision record for `txn` on

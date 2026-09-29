@@ -1,7 +1,7 @@
 //! Lazy-ALR batch coordinator: true asynchronous Almost-Local Reads.
 //!
 //! The LAW impossibility result says purely local linearizable reads are
-//! impossible under asynchrony with crashes — so this backend never claims
+//! impossible under asynchrony with crashes - so this backend never claims
 //! locality without ordering. Instead, pending `Latest` reads batch
 //! opportunistically behind one lightweight ordered fence:
 //!
@@ -20,21 +20,19 @@
 //! flight forms one and orders its fence immediately; reads arriving while
 //! the fence is outstanding join it; nobody ever waits to fill a batch.
 //! A concurrent write ordered after batch formation may subsume the extra
-//! fence (the leader says so with a proof — see `ProposeSync`), which the
+//! fence (the leader says so with a proof - see `ProposeSync`), which the
 //! coordinator records without changing the safety argument.
 //!
 //! The coordinator is node-local per tablet: all waiters share one state
 //! machine, so the initiator's boundary wait covers every waiter. Any
-//! failure — lost leadership, stale leader view, transport loss, boundary
-//! timeout, owner shutdown — resolves to `Err(())`, and the caller falls
+//! failure - lost leadership, stale leader view, transport loss, boundary
+//! timeout, owner shutdown - resolves to `Err(())`, and the caller falls
 //! back to the conservative barrier. Uncertainty always falls back, never
 //! serves.
 
 use std::sync::{Arc, Mutex};
 
-use kivi_types::{
-    CommitPosition, NodeId, NodeIncarnation, ReadContext, ServePath, TabletAuthority, TabletId,
-};
+use kivi_types::{CommitPosition, NodeId, ReadContext, ServePath, TabletId};
 
 use crate::command::AlrFenceSync;
 use crate::consistency::ConsistencyHub;
@@ -85,10 +83,6 @@ pub struct AlrCoordinator {
     group: ConsensusGroupId,
     /// Served tablet.
     tablet: TabletId,
-    /// Replica authority (diagnostics only; the fence carries the tablet).
-    authority: TabletAuthority,
-    /// This process's incarnation (fence requester binding).
-    incarnation: NodeIncarnation,
     /// This replica's node identity (fence requester).
     local: NodeId,
 }
@@ -112,8 +106,6 @@ impl AlrCoordinator {
         hub: Arc<ConsistencyHub>,
         group: ConsensusGroupId,
         tablet: TabletId,
-        authority: TabletAuthority,
-        incarnation: NodeIncarnation,
         local: NodeId,
     ) -> Self {
         Self {
@@ -126,15 +118,13 @@ impl AlrCoordinator {
             hub,
             group,
             tablet,
-            authority,
-            incarnation,
             local,
         }
     }
 
     /// Joins (or forms) the tablet's Lazy-ALR batch and waits for its
-    /// boundary to apply locally. Returns the serve path on success — the
-    /// caller then reads live applied state — or `None` when the batch
+    /// boundary to apply locally. Returns the serve path on success - the
+    /// caller then reads live applied state - or `None` when the batch
     /// cannot order, in which case the caller takes the conservative
     /// barrier. `None` is always a fallback, never a serve.
     pub async fn join_batch(&self, ctx: ReadContext) -> Option<ServePath> {
@@ -188,7 +178,7 @@ impl AlrCoordinator {
     /// Initiator path: read the live formation pointer, order the fence
     /// (or accept a subsuming boundary), wait for local apply, complete
     /// the waiters, and report the path. Exactly one metric note per
-    /// batch: the batch — not each read — is the unit of fence cost.
+    /// batch: the batch - not each read - is the unit of fence cost.
     async fn initiate_batch(
         &self,
         fence: kivi_types::AlrFence,
@@ -205,7 +195,7 @@ impl AlrCoordinator {
             return None;
         };
         // Defense in depth: a boundary below formation (stale or corrupt
-        // leader answer) can never cover the batch — fail rather than
+        // leader answer) can never cover the batch - fail rather than
         // serve from it.
         let formation_index = crate::state_machine::index_of_commit(formation).unwrap_or(0);
         if outcome.boundary < formation_index {
@@ -301,23 +291,5 @@ impl AlrCoordinator {
         // `None` drops the senders: every waiter observes the cancelled
         // batch and falls back. No waiter ever hangs on a dead initiator.
         Some(readers)
-    }
-
-    /// Returns the tablet served.
-    #[must_use]
-    pub const fn tablet(&self) -> TabletId {
-        self.tablet
-    }
-
-    /// Returns the replica authority (diagnostics).
-    #[must_use]
-    pub const fn authority(&self) -> TabletAuthority {
-        self.authority
-    }
-
-    /// Returns this process's incarnation.
-    #[must_use]
-    pub const fn incarnation(&self) -> NodeIncarnation {
-        self.incarnation
     }
 }

@@ -2,7 +2,7 @@
 //!
 //! A command frame is a slice of the connection's input buffer, not a
 //! freshly built tree. Arguments are borrowed in place, so a `GET` costs one
-//! allocation in total — the `Key` the engine has to own — instead of one per
+//! allocation in total - the `Key` the engine has to own - instead of one per
 //! argument, a copy of every argument while splitting the command name, and
 //! another copy while building the operation.
 //!
@@ -43,7 +43,7 @@ pub const MAX_COMMAND_NAME: usize = 24;
 /// Folds an ASCII command name to upper case in a fixed stack buffer.
 ///
 /// Redis accepts any case, so the name has to be folded somewhere. Doing it
-/// here — once per request, into an array on the stack — is what lets the
+/// here - once per request, into an array on the stack - is what lets the
 /// dispatcher be a single `match` on the result. The previous version
 /// allocated a `Vec` per request purely to make that `match` work, and then
 /// matched the same name a second and third time in two other places.
@@ -98,7 +98,7 @@ pub enum Parsed<'a> {
     /// `proto-max-bulk-len` refusal: the frame cannot be buffered, so its
     /// end is unknowable and the connection cannot be resynchronised.
     TooLarge,
-    /// A syntactically valid RESP frame that is not a command — an inline
+    /// A syntactically valid RESP frame that is not a command - an inline
     /// string, a bare integer, a lone bulk. Answered with an error and the
     /// connection stays open, which is what Kivi has always done here.
     NotACommand,

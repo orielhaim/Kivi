@@ -3,10 +3,8 @@
 //! Spawns `kivi-server` with `--redis-listen 127.0.0.1:0` (ephemeral,
 //! race-free via `KIVI_READY`), then drives the RESP edge with the real
 //! maintained `redis-rs` client plus raw sockets for error-shape checks.
-//! Without the `redis-compat` feature this file compiles to nothing, and
+//! Without a RESP-capable server binary this file cannot run, and
 //! native functionality never depends on it.
-
-#![cfg(feature = "redis-compat")]
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -16,13 +14,12 @@ use kivi_lab::process::Server;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Spawns an ephemeral RESP server. A binary without `redis-compat` fails
+/// Spawns an ephemeral RESP server. A binary without the edge fails
 /// here loudly (never a silent skip): this file only compiles with the lab
-/// `redis-compat` feature, and every test below explicitly requires RESP.
+/// deliberately, and every test below explicitly requires RESP.
 fn spawn_resp() -> Server {
-    Server::spawn_ephemeral_resp().expect(
-        "kivi-server binary has no RESP endpoint; rebuild with `-p kivi-server --features redis-compat`",
-    )
+    Server::spawn_ephemeral_resp()
+        .expect("kivi-server binary has no RESP endpoint; rebuild `-p kivi-server`")
 }
 
 /// Opens a redis-rs sync connection to the RESP edge.
@@ -167,7 +164,7 @@ fn redis_rs_client_flows_against_kivi_resp() {
     // Native endpoint still serves the same keys (shared engine).
     let native = kivi_client::NativeClient::new(kivi_client::ClientConfig {
         seeds: vec![server.endpoint()],
-        namespace: kivi_types::NamespaceId::from_u64(1),
+        namespace: kivi_lab::testkit::NS,
         ..kivi_client::ClientConfig::default()
     })
     .expect("native client builds");
@@ -277,7 +274,7 @@ fn a_pipeline_deeper_than_one_turn_stays_in_sync() {
 /// The engine serves a RESP connection on the worker that owns the tablet: a
 /// request it owns executes on that thread, and one it does not goes through
 /// the worker queue. A turn can contain both, and the two paths finish in
-/// different orders — the inline one returns before the turn moves on, the
+/// different orders - the inline one returns before the turn moves on, the
 /// forwarded one blocks on another thread. This test is the oracle for that
 /// interleaving: if replies were ever paired by completion rather than by
 /// position, a value would be attributed to the wrong key, and a length to the

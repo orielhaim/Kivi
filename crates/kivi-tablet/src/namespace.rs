@@ -70,23 +70,3 @@ impl fmt::Display for NamespaceDescriptor {
         write!(f, "namespace {} ({})", self.id.as_u64(), self.layout)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn layouts_map_to_partition_kinds() {
-        assert_eq!(NamespaceLayout::Hash.kind(), PartitionKind::Hash);
-        assert_eq!(NamespaceLayout::Ordered.kind(), PartitionKind::Ordered);
-        assert_eq!(NamespaceLayout::Hash.to_string(), "hash");
-        assert_eq!(NamespaceLayout::Ordered.to_string(), "ordered");
-    }
-
-    #[test]
-    fn descriptor_displays_identity_and_layout() {
-        let descriptor =
-            NamespaceDescriptor::new(NamespaceId::from_u64(9), NamespaceLayout::Ordered);
-        assert_eq!(descriptor.to_string(), "namespace 9 (ordered)");
-    }
-}

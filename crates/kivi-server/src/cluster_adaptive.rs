@@ -1272,7 +1272,13 @@ fn control_gate(
     Ok(ControlGate { generation })
 }
 
-fn quorum_reachable(
+/// Whether an observed group can be relied on to serve right now.
+///
+/// One definition, shared with the split readiness proof: "the children are
+/// ready" and "this tablet is healthy enough to base a decision on" are the
+/// same question, and answering it two ways is how a split ends up publishing
+/// routing to a group the adaptive gate had already written off.
+pub(crate) fn quorum_reachable(
     local: NodeId,
     membership: &ObservedMembership,
     state: Option<&ControlState>,
@@ -1736,13 +1742,14 @@ mod tests {
 
     #[test]
     fn non_leader_control_view_cannot_actuate() {
-        let membership = ObservedMembership::new(
+        let membership = ObservedMembership::with_lag(
             ConsensusGroupId::control(),
             [1_u64, 2, 3].into_iter().collect(),
             BTreeSet::new(),
             Some(ReplicaId::of_node(NodeId::from_u64(2))),
             kivi_consensus::ConsensusTerm::new(1),
             false,
+            BTreeMap::new(),
         );
         assert!(!quorum_reachable(
             NodeId::from_u64(1),

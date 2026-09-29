@@ -47,6 +47,8 @@ rustls.workspace = true
 sysinfo = "0.39"
 tempfile.workspace = true
 divan.workspace = true
+# Behavioural matrices (reconcile phase table) as compact named cases.
+rstest.workspace = true
 
 [[bench]]
 name = "reads"

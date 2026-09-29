@@ -4,12 +4,12 @@
 //!
 //! Scans walk the directory by logical key: each page resumes after the
 //! last emitted key through the current server directory, so splits,
-//! merges, and migrations cause at most one extra hop — never duplicates
+//! merges, and migrations cause at most one extra hop - never duplicates
 //! or omissions. No central coordinator exists; the cursor (namespace,
 //! direction, last key, bounds) is the only continuation truth.
 //!
 //! Transactions use one `TxnId` per attempt (stable across transport
-//! retries, fresh per OCC retry — transport retry vs transaction retry
+//! retries, fresh per OCC retry - transport retry vs transaction retry
 //! stay distinct). The single-tablet fast path runs server-side in one
 //! roundtrip; multi-tablet batches run client-driven 2PC over
 //! `TxnPrepare`/`TxnFinalize` with coordinator records for recovery.
@@ -639,7 +639,7 @@ pub enum BatchWriteKind {
     /// Add to a bounded counter (escrow rights checked at prepare).
     BoundedAdd(i64),
     /// Move one bounded counter's escrow share to `[min, max]` (one side
-    /// of a paired, conservation-checked transfer — see
+    /// of a paired, conservation-checked transfer - see
     /// [`kivi_state::plan_escrow_transfer`]).
     EscrowSetShare {
         /// New share lower bound (inclusive).
@@ -679,7 +679,7 @@ const MAX_BATCH_REDRIVES: u32 = 3;
 /// Maximum abort-finalize waves per prepared key: the Abort decision is
 /// already durable, so each wave redrives the same idempotent discard
 /// until the intent is observably resolved or the failure is terminal.
-/// Eight waves back off ~2.5s total — past any election/redirection
+/// Eight waves back off ~2.5s total - past any election/redirection
 /// window, far short of the 60s transaction lease the leak would
 /// otherwise wait out.
 const MAX_ABORT_WAVES: u32 = 8;
@@ -758,7 +758,7 @@ impl NativeClient {
     }
 
     /// Re-drives one transaction id to completion after ambiguity
-    /// (bounded): reads the record first — a durable Commit skips straight
+    /// (bounded): reads the record first - a durable Commit skips straight
     /// to finalizes, so re-drives never duplicate prepared intent effects.
     fn redrive(
         &self,
@@ -906,7 +906,7 @@ impl NativeClient {
         // Recovery-first: a durable decision from an earlier drive of this
         // transaction resolves without re-preparing. Only a decision
         // carrying this exact digest governs (a foreign digest under one
-        // `TxnId` is a conflicting driver — fail loudly, never follow).
+        // `TxnId` is a conflicting driver - fail loudly, never follow).
         let record_key = kivi_state::txn_record_key(attempt.coordinator, txn);
         if let Some(record) = self.read_txn_record(namespace, &record_key)? {
             match record.state {
@@ -1001,7 +1001,7 @@ impl NativeClient {
                         // entries covering this key go, so the next
                         // attempt re-probes fresh. Dropping the index
                         // here orphans the intent with no record and no
-                        // owner — a wedge until lease expiry.
+                        // owner - a wedge until lease expiry.
                         prepared.push(index);
                         observed.insert(tablet);
                         self.evict_covering_for(namespace, &write.key);
@@ -1024,7 +1024,7 @@ impl NativeClient {
                 }
                 // Deterministic semantic rejections (wrong type, overflow,
                 // rights, fencing, bounds) abort the attempt and surface
-                // intact — retrying the same writes would fail identically.
+                // intact - retrying the same writes would fail identically.
                 Err(error) => {
                     return Err((BatchAttempt::Error(error), prepared));
                 }
@@ -1039,7 +1039,7 @@ impl NativeClient {
     /// Verifies the prepared set against the probe, persists the Commit
     /// decision (guarded CAS), re-verifies the durable record, and
     /// finalizes. A lost decide race re-reads before aborting (an
-    /// ambiguous decide may actually have committed — never
+    /// ambiguous decide may actually have committed - never
     /// blind-overwrite a decision with an abort).
     fn decide_and_finalize(
         &self,
@@ -1090,7 +1090,7 @@ impl NativeClient {
             );
         }
         // All prepared: persist the Commit decision with the observed
-        // participants and the canonical digest — guarded (CAS): a
+        // participants and the canonical digest - guarded (CAS): a
         // concurrent resolver abort conflicts instead of being silently
         // overwritten, and the driver follows the abort.
         let record = Self::build_record(
@@ -1110,7 +1110,7 @@ impl NativeClient {
         );
         if !decided {
             // Decide failed: re-read before aborting (an ambiguous decide
-            // may actually have committed — never blind-overwrite a
+            // may actually have committed - never blind-overwrite a
             // decision with an abort).
             match self.read_txn_record(namespace, &record_key) {
                 Ok(Some(record)) if record.state == TxnState::Committed => {
@@ -1156,7 +1156,7 @@ impl NativeClient {
     }
 
     /// Persists one terminal decision through an absence-guarded
-    /// single-key transaction on the record tablet (CAS — never a blind
+    /// single-key transaction on the record tablet (CAS - never a blind
     /// overwrite). `decide_salt` separates the commit decide-transaction
     /// from the abort one so the two never share intent identity.
     fn decide_record(
@@ -1182,16 +1182,10 @@ impl NativeClient {
         }
         // Only an applied finalize persists the decision: `Gone` means
         // the intent vanished without applying (never happens for a fresh
-        // decide intent outside a racing abort — treat as failure and let
+        // decide intent outside a racing abort - treat as failure and let
         // the caller re-read the record).
         matches!(
-            self.txn_finalize(
-                namespace,
-                record_key.as_bytes(),
-                decide_txn,
-                true,
-                [0u8; 32]
-            ),
+            self.txn_finalize(namespace, &write, decide_txn, true, [0u8; 32]),
             Ok(FinalizeOutcome::Applied(_, _))
         )
     }
@@ -1297,9 +1291,9 @@ impl NativeClient {
     /// tablet. The next probe re-scans fresh instead of conflicting
     /// against a retired tablet forever.
     fn evict_covering_for(&self, namespace: NamespaceId, key: &[u8]) {
-        if let Some(hash) = kivi_state::PartitionHasher::V1.hash(namespace, key) {
-            self.shared.routes.evict_covering(key, hash);
-        }
+        self.shared
+            .routes
+            .evict_covering(key, kivi_state::route_hash(namespace, key));
     }
 
     /// Probes `route` for placement (route-cache first, one-entry scan
@@ -1309,8 +1303,10 @@ impl NativeClient {
         namespace: NamespaceId,
         route: &[u8],
     ) -> Result<(TabletId, u64), BatchAttempt> {
-        if let Some(hash) = kivi_state::PartitionHasher::V1.hash(namespace, route)
-            && let Some(entry) = self.shared.routes.lookup(hash)
+        if let Some(entry) = self
+            .shared
+            .routes
+            .lookup(kivi_state::route_hash(namespace, route))
         {
             return Ok((entry.tablet, entry.dir_version));
         }
@@ -1377,7 +1373,7 @@ impl NativeClient {
         let mut versions: Vec<Option<u64>> = vec![None; writes.len()];
         for (order, write) in writes.iter().enumerate() {
             let participant = expected.get(&write.key).copied();
-            match self.txn_finalize(namespace, &write.key, txn, commit, digest) {
+            match self.txn_finalize(namespace, write, txn, commit, digest) {
                 Ok(FinalizeOutcome::Applied(version, tablet)) => {
                     if participant.is_some_and(|expected| expected != tablet) {
                         // Same stale-probe class as a served-elsewhere
@@ -1417,7 +1413,7 @@ impl NativeClient {
     ) -> Result<AtomicBatchResult, BatchAttempt> {
         let mut versions: Vec<Option<u64>> = vec![None; writes.len()];
         for (order, write) in writes.iter().enumerate() {
-            match self.txn_finalize(namespace, &write.key, txn, commit, digest) {
+            match self.txn_finalize(namespace, write, txn, commit, digest) {
                 Ok(FinalizeOutcome::Applied(version, _)) => versions[order] = version,
                 Ok(FinalizeOutcome::Gone) => {}
                 Ok(FinalizeOutcome::Conflict) => return Err(BatchAttempt::Conflict),
@@ -1462,7 +1458,7 @@ impl NativeClient {
     /// converged to: a lost race means a concurrent drive of this
     /// transaction committed, and the caller must converge via commit.
     /// An ambiguous record read propagates as `Redrive` (the state is
-    /// unknown — the same-transaction re-drive resolves it recovery-first).
+    /// unknown - the same-transaction re-drive resolves it recovery-first).
     fn abort_prepared(
         &self,
         namespace: NamespaceId,
@@ -1484,7 +1480,7 @@ impl NativeClient {
         );
         if !self.decide_record(namespace, coordinator, &record_key, &record, 1) {
             // Lost the decide race: re-read (an ambiguous decide may
-            // actually have committed — never finalize-abort a committed
+            // actually have committed - never finalize-abort a committed
             // transaction). A foreign digest under one `TxnId` fails the
             // attempt instead of following another transaction.
             let reread = self.read_txn_record(namespace, &record_key);
@@ -1512,7 +1508,7 @@ impl NativeClient {
             };
         }
         for index in prepared {
-            self.finalize_abort_durable(namespace, &writes[*index].key, txn, digest);
+            self.finalize_abort_durable(namespace, &writes[*index], txn, digest);
         }
         Ok(AbortOutcome::Aborted)
     }
@@ -1522,22 +1518,22 @@ impl NativeClient {
     /// intent until transaction-lease expiry (the resolver only reaps
     /// expired or grace-aged intents, and only when its reader/proposer
     /// roles align). Retry transient failures on the SAME `TxnId`
-    /// (idempotent discard of our own intent — never a fresh identity),
+    /// (idempotent discard of our own intent - never a fresh identity),
     /// bounded by [`MAX_ABORT_WAVES`]. Terminal outcomes end the wave:
     /// `Applied`/`Gone` mean nothing of ours remains (a `Conflict` likewise
-    /// proves our intent is gone — prepares reserve the key, so no foreign
+    /// proves our intent is gone - prepares reserve the key, so no foreign
     /// intent can coexist with ours), and terminal errors leave the
     /// persisted record for the resolver/lease fallback.
     fn finalize_abort_durable(
         &self,
         namespace: NamespaceId,
-        key: &[u8],
+        write: &BatchWriteSpec,
         txn: TxnId,
         digest: [u8; 32],
     ) {
         let mut waves = 0u32;
         loop {
-            match self.txn_finalize(namespace, key, txn, false, digest) {
+            match self.txn_finalize(namespace, write, txn, false, digest) {
                 Err(error) if Self::retry_abort_wave(&error) && waves + 1 < MAX_ABORT_WAVES => {
                     waves += 1;
                     tracing::debug!(
@@ -1566,7 +1562,7 @@ impl NativeClient {
 
     /// Whether an abort-finalize failure is worth redriving on the same
     /// `TxnId`: transport/routing failures (the finalize definitely did
-    /// not execute, or may have — both safe under the same idempotent
+    /// not execute, or may have - both safe under the same idempotent
     /// discard) plus redirect-budget exhaustion after convergence churn
     /// (a backed-off redrive lands on the converged directory).
     /// Semantic rejections are terminal for the wave.
@@ -1577,7 +1573,7 @@ impl NativeClient {
     /// Sends one prepare (OCC + intent reservation, no visible mutation).
     /// Steps are idempotent by `TxnId` (same id + key replays the
     /// reservation rather than duplicating it), so transport retries carry
-    /// no separate identity — request identity and transaction identity
+    /// no separate identity - request identity and transaction identity
     /// stay distinct, with exactly-once resting on the latter.
     fn txn_prepare(
         &self,
@@ -1616,22 +1612,76 @@ impl NativeClient {
     /// Reports the serving tablet with every application so the driver can
     /// verify lineage (a finalize served elsewhere means the tablet moved
     /// mid-transaction).
+    /// The wire spelling of a write spec.
+    ///
+    /// One definition, shared with `TxnPrepare`: a request that spells a write two
+    /// ways is a request that can mean two things.
+    fn batch_write_of(write: &BatchWriteSpec) -> kivi_protocol::BatchWrite {
+        use kivi_protocol::{
+            BATCH_BOUNDED_ADD, BATCH_COMMUTATIVE_ADD, BATCH_COUNTER_ADD, BATCH_DELETE,
+            BATCH_ESCROW_SHARE, BATCH_EXPECT_ABSENT, BATCH_EXPECT_ANY, BATCH_EXPECT_VERSION,
+            BATCH_PUT, BATCH_PUT_CHUNKED,
+        };
+        let (kind, value, delta) = match &write.kind {
+            BatchWriteKind::Put(bytes) => (BATCH_PUT, bytes.clone(), 0_i64),
+            BatchWriteKind::Delete => (BATCH_DELETE, Vec::new(), 0),
+            BatchWriteKind::CounterAdd(delta) => (BATCH_COUNTER_ADD, Vec::new(), *delta),
+            BatchWriteKind::CommutativeAdd(delta) => (BATCH_COMMUTATIVE_ADD, Vec::new(), *delta),
+            BatchWriteKind::BoundedAdd(delta) => (BATCH_BOUNDED_ADD, Vec::new(), *delta),
+            BatchWriteKind::PutChunked {
+                manifest,
+                logical_len,
+            } => {
+                let mut encoded = Vec::with_capacity(40);
+                encoded.extend_from_slice(&manifest[..]);
+                encoded.extend_from_slice(&logical_len.to_le_bytes());
+                (BATCH_PUT_CHUNKED, encoded, 0)
+            }
+            BatchWriteKind::EscrowSetShare { min, max } => {
+                let mut encoded = Vec::with_capacity(16);
+                encoded.extend_from_slice(&min.to_le_bytes());
+                encoded.extend_from_slice(&max.to_le_bytes());
+                (BATCH_ESCROW_SHARE, encoded, 0)
+            }
+        };
+        let (expect, expect_version) = match write.expect {
+            BatchExpect::Absent => (BATCH_EXPECT_ABSENT, 0),
+            BatchExpect::Any => (BATCH_EXPECT_ANY, 0),
+            BatchExpect::Version(version) => (BATCH_EXPECT_VERSION, version),
+        };
+        kivi_protocol::BatchWrite {
+            key: write.key.clone(),
+            kind,
+            value,
+            delta,
+            expect,
+            expect_version,
+        }
+    }
+
+    /// Resolves a prepared intent.
+    ///
+    /// `write` is the spec the prepare was issued with, carried through so the
+    /// finalize is a self-contained request. It is not a hint: the log entry this
+    /// becomes has to apply the write without reading state the log does not
+    /// carry, and the driver is the only place the write exists.
     fn txn_finalize(
         &self,
         namespace: NamespaceId,
-        key: &[u8],
+        write: &BatchWriteSpec,
         txn: TxnId,
         commit: bool,
         digest: [u8; 32],
     ) -> Result<FinalizeOutcome, ClientError> {
         use kivi_protocol::{Opcode, ResponseBody};
-        let route_key = Key::from(key.to_vec());
+        let route_key = Key::from(write.key.clone());
         let mut request = self.request_base(&route_key, Opcode::TxnFinalize);
         request.namespace = namespace;
-        request.key = key.to_vec();
+        request.key.clone_from(&write.key);
         request.batch_txn = txn.as_bytes();
         request.txn_commit = commit;
         request.txn_digest = digest;
+        request.batch_writes = vec![Self::batch_write_of(write)];
         let response = self.execute_raw(
             &route_key,
             Opcode::TxnFinalize,
@@ -1846,7 +1896,7 @@ impl NativeClient {
     /// versions, plans the paired move
     /// ([`kivi_state::plan_escrow_transfer`], conservation by
     /// construction), and commits both share moves in one transaction with
-    /// version expectations — a concurrent move fails the OCC check and
+    /// version expectations - a concurrent move fails the OCC check and
     /// surfaces [`ClientError::TxnConflict`] for a fresh retry instead of
     /// minting or destroying rights.
     ///
@@ -2030,7 +2080,7 @@ impl NativeClient {
             }
         }
         // Dropped indexes (in old projection, absent now): remove all old.
-        // (Kind unknown post-drop; try unique-key delete by term — the
+        // (Kind unknown post-drop; try unique-key delete by term - the
         // non-unique form needs the primary suffix which we still have, so
         // delete both spellings to be thorough. Bounded: old term count.)
         for (index, old) in &old_terms {

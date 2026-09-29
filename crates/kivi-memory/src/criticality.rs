@@ -7,10 +7,6 @@
 //! into one cost-model input: frequency plus reuse distance, bytes,
 //! CPU/stall contribution, parallelism, critical-path and tail weights,
 //! mutability, and reconstruction cost.
-//!
-//! Future DAMON, PMU, CXL/NEMO, and learned controllers contribute signals
-//! through [`TelemetrySource`] without changing policy semantics: they
-//! fill the same struct fields the planner already scores.
 
 /// How an object is mutated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -189,20 +185,6 @@ pub fn criticality_of(signals: &AccessSignals, dram_read_ns: f64) -> ExecutionCr
         compression_worthy,
         write_hot,
     }
-}
-
-/// A source of access signals.
-///
-/// Software sampling implements this today; future DAMON age-bit scans,
-/// PMU stall counters, CXL/NEMO telemetry rules, and learned predictors
-/// implement the same method and fill the same [`AccessSignals`] fields.
-/// Policy code never branches on the concrete source.
-pub trait TelemetrySource {
-    /// Samples signals for one object over the last window.
-    ///
-    /// Returns `None` when the source has no data (cold objects report
-    /// [`AccessSignals::cold`] from the caller instead).
-    fn sample(&mut self, object: u64) -> Option<AccessSignals>;
 }
 
 #[cfg(test)]

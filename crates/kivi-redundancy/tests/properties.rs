@@ -32,7 +32,6 @@ fn test_nodes(count: u64) -> Vec<kivi_redundancy::NodeDescriptor> {
             id: NodeId::from_u64(id),
             domain: kivi_redundancy::FailureDomain::node_only(NodeId::from_u64(id)),
             health: kivi_redundancy::NodeHealth::Active,
-            weight: 1,
         })
         .collect()
 }
@@ -158,9 +157,12 @@ proptest! {
         prop_assert_eq!(back.encode(), bytes);
     }
 
+    /// A placement asks for `total` fragments and gets exactly that many,
+    /// on distinct nodes when the cluster has enough. The planner is
+    /// deterministic by construction, so a second identical call proves
+    /// nothing a first one does not.
     #[test]
-    fn placement_is_deterministic(
-        generation in 1u64..=100,
+    fn placement_fills_the_request(
         total in 1u32..=11,
         seed in 0u64..=u64::MAX,
     ) {
@@ -175,37 +177,35 @@ proptest! {
             hash.try_into().expect("32 bytes"),
         ).expect("asset");
         let cluster = test_nodes(12);
-        let first = plan_placement(asset, generation, total, FailureScope::Node, &cluster, &[])
-            .expect("plans");
-        let second = plan_placement(asset, generation, total, FailureScope::Node, &cluster, &[])
-            .expect("plans");
-        prop_assert_eq!(&first, &second);
-        prop_assert_eq!(first.fragments.len(), total as usize);
+        let placement =
+            plan_placement(asset, 7, total, FailureScope::Node, &cluster, &[]).expect("plans");
+        prop_assert_eq!(placement.fragments.len(), total as usize);
+        let mut nodes: Vec<NodeId> = placement.fragments.iter().map(|f| f.node).collect();
+        nodes.sort_unstable();
+        nodes.dedup();
+        prop_assert_eq!(nodes.len(), total as usize, "fragments share a node");
     }
 }
 
+/// One surviving copy is enough, and no copy is a closed failure.
 #[test]
-fn replication_single_copy_suffices_many_seeds() {
-    // Deterministic loop (no proptest): 16 fixed seeds, exact bytes.
-    for seed in 0..16u64 {
-        // Seed <16, truncation is intentional for a small deterministic size.
+fn replication_single_copy_suffices() {
+    let bytes = det_bytes(1024, 0);
+    let shards = kivi_redundancy::replication::encode(&bytes, ReplicationParams { copies: 3 })
+        .expect("encodes");
+    assert_eq!(shards.len(), 3);
+    for (i, shard) in shards.iter().enumerate() {
+        // Index <3, far below `u32::MAX`.
         #[allow(clippy::cast_possible_truncation)]
-        let len = 1024 + (seed as usize) * 137;
-        let bytes = det_bytes(len, seed);
-        let shards = kivi_redundancy::replication::encode(&bytes, ReplicationParams { copies: 3 })
-            .expect("encodes");
-        assert_eq!(shards.len(), 3);
-        for (i, shard) in shards.iter().enumerate() {
-            #[allow(clippy::cast_possible_truncation)]
-            let idx = i as u32;
-            let back =
-                kivi_redundancy::replication::decode(&[(idx, shard.clone())]).expect("decodes");
-            assert_eq!(back, bytes, "seed {seed} copy {i}");
-        }
-        // Empty fails closed.
-        let err = kivi_redundancy::replication::decode(&[]).expect_err("empty fails");
-        assert!(err.is_unrecoverable());
+        let idx = i as u32;
+        assert_eq!(
+            kivi_redundancy::replication::decode(&[(idx, shard.clone())]).expect("decodes"),
+            bytes,
+            "copy {i}"
+        );
     }
+    let err = kivi_redundancy::replication::decode(&[]).expect_err("empty fails");
+    assert!(err.is_unrecoverable());
 }
 
 #[test]

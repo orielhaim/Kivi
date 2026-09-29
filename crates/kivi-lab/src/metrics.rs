@@ -2,7 +2,7 @@
 //!
 //! Human text goes to stdout for operators; [`BenchReport`] goes to a file
 //! (or stdout with `--format json`) for tooling. JSON here is lab output,
-//! never a Kivi canonical storage format — serde lives only in this
+//! never a Kivi canonical storage format - serde lives only in this
 //! non-production crate.
 
 use std::collections::BTreeMap;

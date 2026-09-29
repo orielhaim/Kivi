@@ -1,90 +1,64 @@
 //! Engine redundancy integration: immutable assets behind the fabric.
 //!
 //! [`EngineRedundancy`] is the engine's single handle to one
-//! [`kivi_redundancy::RedundancyFabric`]. It protects immutable durable
-//! assets only — staged chunks, chunk manifests, checkpoint bands, dedup
-//! components, and checkpoint manifests — under the baseline
-//! [`kivi_redundancy::RedundancyIntent::survive_one`] intent. Raft state,
-//! WAL records, and every other mutable or consensus-ordered byte never go
-//! through here: the fabric never becomes another consensus protocol, and
-//! this layer never weakens the Raft durability gate. Local durability is
-//! always proven first (chunk-lane sync barrier, checkpoint publish); the
-//! fabric holds an additional verified copy of the same immutable bytes.
+//! [`kivi_redundancy::RedundancyFabric`]. It protects immutable durable assets
+//! only - staged chunks, chunk manifests, checkpoint bands, dedup components,
+//! and checkpoint manifests - under the baseline
+//! [`kivi_redundancy::RedundancyIntent::survive_one`] intent. Raft state, WAL
+//! records, and every other mutable or consensus-ordered byte never go through
+//! here: local durability is always proven first (chunk-lane sync barrier,
+//! checkpoint publish) and the fabric only ever adds a verified copy of the
+//! same immutable bytes after that proof. It never gates anything.
 //!
-//! The fabric itself enforces `build → verify → publish → retire` per
-//! asset, so callers never interleave their own verification: protect, then
-//! trust the published layout. Every synchronous method takes `&self` (the
-//! mutex is locked internally) and never panics; fallible methods surface
-//! failures as [`crate::engine::EngineError::Durability`] with an `Io`
-//! payload naming the redundancy operation. No new
-//! [`crate::engine::EngineError`] kinds are added by this module.
+//! The fabric enforces `build → verify → publish → retire` per asset, so
+//! callers never interleave their own verification: protect, then trust the
+//! published layout. Fallible methods surface failures as
+//! [`crate::engine::EngineError::Durability`] with an `Io` payload naming the
+//! operation; no new error kinds are added by this module.
 //!
-//! Hot-path callers (workers, connection tasks, the checkpoint worker)
-//! never touch the fabric directly: [`protect_staged_value`],
+//! Hot-path callers (workers, connection tasks, the checkpoint worker) never
+//! touch the fabric directly: [`protect_staged_value`],
 //! [`EngineRedundancy::submit_spliced_value`], and
-//! [`EngineRedundancy::submit_checkpoint`] submit one fire-and-forget job
-//! per staged value or published checkpoint onto the bounded background
-//! [`kivi_redundancy::RedundancyLane`] opened in
-//! [`EngineRedundancy::open`]. Submission never blocks the caller — the
-//! [`kivi_redundancy::LaneJoin`] is dropped, so the job still runs and only
-//! its reply is shed — and rejected submits warn without failing the commit
-//! or checkpoint they follow: local durability already proved the bytes, so
-//! a fabric miss only costs redundancy, never correctness. One job encodes
-//! all chunks plus the manifest (or all checkpoint artifacts) to preserve
-//! protection ordering; every job runs at
-//! [`kivi_redundancy::LanePriority::Background`]. Lane outcomes are
-//! observable through [`EngineRedundancy::lane_stats`] (surfaced on the
-//! admin plane as [`LocalEngine::redundancy_lane_stats`](crate::engine::LocalEngine::redundancy_lane_stats)
-//! and [`AdminHandle::redundancy_lane_stats`](crate::engine::AdminHandle::redundancy_lane_stats)).
+//! [`EngineRedundancy::submit_checkpoint`] submit one fire-and-forget job per
+//! staged value or published checkpoint onto the bounded background
+//! [`kivi_redundancy::RedundancyLane`]. Submission never blocks the caller -
+//! the [`kivi_redundancy::LaneJoin`] is dropped, so the job still runs and only
+//! its reply is shed - and a rejected submit warns without failing the commit
+//! or checkpoint it follows: a fabric miss costs redundancy, never
+//! correctness. One job encodes all chunks plus the manifest (or all
+//! checkpoint artifacts) so protection ordering is preserved; every job runs
+//! at [`kivi_redundancy::LanePriority::Background`]. Lane outcomes are
+//! observable through [`EngineRedundancy::lane_stats`].
 //!
 //! Cancellation is idempotency: re-protecting the same bytes returns the
 //! current layout, so protects submit with no generation-fence hook. A
 //! duplicate job is wasted work, never a wrong asset.
 //!
 //! Foreground pressure ([`EngineRedundancy::set_lane_pressure`]) parks
-//! [`kivi_redundancy::LanePriority::Background`] jobs while set. The engine
-//! holds it across the checkpoint build window (the known background-heavy
-//! stretch; see the checkpoint worker's pressure guard). No worker hot-path
-//! pressure signal exists yet — wiring one (commit backlog, hot-read debt)
-//! is future work, and the flag is documented as not wired there.
+//! background jobs while set; the engine holds it across the checkpoint build
+//! window. Nothing else raises it - a worker hot-path pressure signal is not
+//! wired.
 //!
-//! Raft durability semantics are unchanged: the local lane sync barrier
-//! still gates commits before any lane job is submitted, and the fabric
-//! never gates anything — it only ever adds a verified copy after the
-//! local proof.
+//! Shutdown drains: dropping [`EngineRedundancy`] closes the lane intake and
+//! lane workers finish staged jobs before joining, so pending protects
+//! complete instead of being shed. The checkpoint worker joins before the lane
+//! drops, and its pressure guard releases on unwind, so a parked lane can never
+//! wedge shutdown.
 //!
-//! Shutdown drains: dropping [`EngineRedundancy`] closes the lane intake,
-//! and lane workers finish staged jobs before joining, so pending protects
-//! complete instead of being shed. (The checkpoint worker joins before the
-//! lane drops, and its pressure guard releases on unwind, so a parked lane
-//! can never wedge shutdown.)
-//!
-//! Admin integration point: [`EngineRedundancy::admin_snapshot`] (surfaced
-//! through [`crate::engine::LocalEngine::redundancy_snapshot`] and
-//! [`crate::engine::AdminHandle::redundancy_snapshot`]) carries everything a
-//! future `kivi-server` `/v1/redundancy` endpoint needs. The existing admin
-//! DTOs are untouched (additive only).
-//!
-//! Coverage: worker channel staging (plain values, conditionals, splices —
-//! splices re-read the resolved value on the lane thread, never the
-//! worker), connection-task direct staging (plain and conditional `Set`s via
-//! lane submits), and checkpoint publication (one lane job per published
-//! checkpoint) are protected. Not yet covered: reactor bridge frontier
-//! completions (the parked value is not retained at completion),
-//! connection-task and bridge-parked splices (no caller value survives to
-//! submit; the worker splice re-read pattern could extend here), and
-//! streaming-upload finalizations — all need either value retention at
-//! completion or a lane re-read.
+//! Covered: worker channel staging (plain values, conditionals, and splices -
+//! splices re-read the resolved value on the lane thread), connection-task
+//! direct staging, and checkpoint publication. Not covered: reactor bridge
+//! frontier completions and streaming-upload finalizations, neither of which
+//! retains the value past the park.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use kivi_redundancy::{
-    AssetAssessment, AssetId, FabricConfig, FabricMetrics, FabricMetricsSnapshot, FragmentCensus,
-    LaneConfig, LanePriority, LaneStats, LaneValue, NodeDescriptor, RecoveryReport,
-    RedundancyError, RedundancyFabric, RedundancyIntent, RedundancyLane, RedundancyLayout,
-    RepairReason,
+    AssetId, FabricConfig, FabricMetrics, FabricMetricsSnapshot, LaneConfig, LanePriority,
+    LaneValue, NodeDescriptor, RecoveryReport, RedundancyError, RedundancyFabric, RedundancyIntent,
+    RedundancyLane, RedundancyLayout, RepairReason,
 };
 use kivi_types::{ChunkId, ManifestId, NodeId, SecurityDomainId};
 
@@ -271,7 +245,7 @@ impl EngineRedundancy {
     ///
     /// Returns [`EngineError::Durability`] on verification, planning,
     /// placement, or publication failure.
-    pub fn protect_checkpoint_manifest(
+    pub(crate) fn protect_checkpoint_manifest(
         &self,
         hash: [u8; 32],
         bytes: &[u8],
@@ -314,10 +288,10 @@ impl EngineRedundancy {
     /// Never blocks the caller and never fails it: slicing is
     /// bounds-checked (a length mismatch warns and submits nothing), a
     /// rejected submit warns, and job-internal fabric failures warn from
-    /// the lane thread. The join is dropped — the job still runs, only its
+    /// the lane thread. The join is dropped - the job still runs, only its
     /// reply is shed. `Bytes` slices share the allocation, so the job owns
     /// its bytes for one refcount bump per piece.
-    pub fn submit_staged_value(
+    pub(crate) fn submit_staged_value(
         &self,
         domain: SecurityDomainId,
         value: &Bytes,
@@ -346,7 +320,7 @@ impl EngineRedundancy {
     /// falls back to protecting the manifest from its canonical encoding,
     /// and submit/job failures warn like
     /// [`submit_staged_value`](Self::submit_staged_value).
-    pub fn submit_spliced_value(
+    pub(crate) fn submit_spliced_value(
         &self,
         lane: crate::chunk_lane::ChunkLaneHandle,
         domain: SecurityDomainId,
@@ -383,7 +357,7 @@ impl EngineRedundancy {
     /// Never blocks the caller and never fails it: a rejected submit warns,
     /// and job-internal fabric failures warn per artifact from the lane
     /// thread. The join is dropped like every other best-effort submit.
-    pub fn submit_checkpoint(&self, artifacts: CheckpointProtection) {
+    pub(crate) fn submit_checkpoint(&self, artifacts: CheckpointProtection) {
         if artifacts.is_empty() {
             return;
         }
@@ -423,29 +397,10 @@ impl EngineRedundancy {
     /// [`LanePriority::Foreground`] jobs run, so best-effort protects park.
     /// A poisoned lane mutex is a silent no-op (observability never breaks
     /// protection paths).
-    pub fn set_lane_pressure(&self, pressure: bool) {
+    pub(crate) fn set_lane_pressure(&self, pressure: bool) {
         if let Ok(lane) = self.lane.lock() {
             lane.set_foreground_pressure(pressure);
         }
-    }
-
-    /// Returns the lane's foreground-pressure flag (`false` on a poisoned
-    /// lane mutex, never fails).
-    #[must_use]
-    pub fn lane_pressure(&self) -> bool {
-        self.lane
-            .lock()
-            .is_ok_and(|lane| lane.foreground_pressure())
-    }
-
-    /// Snapshots the background lane counters for operators (lock-free
-    /// atomics; a poisoned lane mutex reports zeros rather than blocking
-    /// observability).
-    #[must_use]
-    pub fn lane_stats(&self) -> LaneStats {
-        self.lane
-            .lock()
-            .map_or_else(|_| LaneStats::default(), |lane| lane.stats())
     }
 
     /// Reads chunk bytes back through the fabric, content-verified against
@@ -473,30 +428,11 @@ impl EngineRedundancy {
     /// Snapshots fabric counters for the admin plane (lock-free atomics;
     /// a poisoned mutex reports zeros rather than blocking observability).
     #[must_use]
-    pub fn metrics_snapshot(&self) -> FabricMetricsSnapshot {
+    pub(crate) fn metrics_snapshot(&self) -> FabricMetricsSnapshot {
         self.fabric.lock().map_or_else(
             |_| FabricMetrics::default().snapshot(),
             |fabric| fabric.metrics().snapshot(),
         )
-    }
-
-    /// Assesses one asset's health (`None` when the asset is unknown or the
-    /// mutex is poisoned; never fails).
-    #[must_use]
-    pub fn assess(&self, asset: &AssetId) -> Option<AssetAssessment> {
-        self.fabric
-            .lock()
-            .ok()
-            .and_then(|fabric| fabric.assess_asset(asset))
-    }
-
-    /// Fragments by node and failure domain for operators (empty on a
-    /// poisoned mutex, never fails).
-    #[must_use]
-    pub fn census(&self) -> FragmentCensus {
-        self.fabric
-            .lock()
-            .map_or_else(|_| FragmentCensus::new(), |fabric| fabric.census())
     }
 
     /// Queues repairs for a degraded asset (explicit deficits only).
@@ -552,7 +488,7 @@ impl EngineRedundancy {
     /// Builds the admin-plane snapshot: metrics, live transition count,
     /// pending repairs, and census sizes.
     #[must_use]
-    pub fn admin_snapshot(&self) -> RedundancyAdminSnapshot {
+    pub(crate) fn admin_snapshot(&self) -> RedundancyAdminSnapshot {
         let metrics = self.metrics_snapshot();
         let (transitions, census_fragments, census_nodes) =
             self.fabric.lock().map_or((0, 0, 0), |fabric| {
@@ -613,7 +549,7 @@ impl CheckpointProtection {
     /// Declared lane bytes for admission accounting: the owned artifact
     /// bytes, saturating instead of overflowing.
     #[must_use]
-    pub fn declared_bytes(&self) -> u64 {
+    fn declared_bytes(&self) -> u64 {
         let mut total = 0u64;
         for artifact in &self.bands {
             total = total.saturating_add(bytes_u64(artifact.bytes.len()));
@@ -740,7 +676,7 @@ fn submit_best_effort(
 /// encoding each chunk sliced from `value` by the staged lengths plus the
 /// canonical manifest, preserving protection order.
 ///
-/// Never blocks the caller and never fails it — see
+/// Never blocks the caller and never fails it - see
 /// [`EngineRedundancy::submit_staged_value`]. `None` redundancy (ephemeral
 /// mode) is a silent no-op.
 pub fn protect_staged_value(

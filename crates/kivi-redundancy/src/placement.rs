@@ -60,26 +60,6 @@ impl DesiredPlacement {
     }
 }
 
-/// Currently-healthy placement: desired fragments that are live and verified.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HealthyPlacement {
-    /// Fragment indexes with verified healthy bytes.
-    pub healthy: Vec<u32>,
-    /// Fragment indexes known missing or corrupt.
-    pub missing: Vec<u32>,
-}
-
-/// Degraded placement: what remains plus what must move.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DegradedPlacement {
-    /// Healthy fragment indexes.
-    pub healthy: Vec<u32>,
-    /// Indexes needing replacement and why.
-    pub need_repair: Vec<u32>,
-    /// Whether reconstruction is still possible now.
-    pub reconstructable: bool,
-}
-
 /// Reconstruction targets: where replacement fragments should go.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconstructionTargets {
@@ -109,8 +89,6 @@ fn score(asset: &AssetId, generation: u64, index: u32, node: NodeId) -> u64 {
     state = mix(state, generation);
     state = mix(state, u64::from(index));
     state = mix(state, node.as_u64());
-    // Weight is applied by the caller (replicated scoring rounds); the hash
-    // itself stays weight-free so audits reproduce it exactly.
     state
 }
 
@@ -323,7 +301,6 @@ mod tests {
                 id: NodeId::from_u64(id),
                 domain: crate::FailureDomain::node_only(NodeId::from_u64(id)),
                 health: NodeHealth::Active,
-                weight: 1,
             })
             .collect()
     }
@@ -362,7 +339,6 @@ mod tests {
                     String::new(),
                 ),
                 health: NodeHealth::Active,
-                weight: 1,
             },
             NodeDescriptor {
                 id: NodeId::from_u64(2),
@@ -373,7 +349,6 @@ mod tests {
                     String::new(),
                 ),
                 health: NodeHealth::Active,
-                weight: 1,
             },
         ];
         assert!(

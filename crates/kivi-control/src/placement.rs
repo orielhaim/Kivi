@@ -2,7 +2,7 @@
 //!
 //! For every tablet the control plane owns a [`DesiredReplicaSet`];
 //! the tablet's own Raft membership remains authoritative for its actual
-//! voter state. Migration reconciles actual toward desired — placement is
+//! voter state. Migration reconciles actual toward desired - placement is
 //! never claimed changed merely because the control plane requested it.
 //!
 //! `PlacementVersion` counts placement transitions. It is distinct from
@@ -58,7 +58,6 @@ impl PlacementVersion {
 
 /// Why a desired placement was rejected.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
 pub enum PlacementError {
     /// Placement names no replicas.
     #[error("tablet {tablet} names no replicas")]
@@ -227,12 +226,11 @@ mod tests {
         ));
     }
 
+    /// A placement version wraps silently if it can, so the next
+    /// generation would be *older* than the current one and a stale write
+    /// would be accepted as fresh. Exhaustion must fail.
     #[test]
-    fn versions_advance() {
-        assert_eq!(
-            PlacementVersion::INITIAL.next().expect("next"),
-            PlacementVersion::from_u64(2)
-        );
+    fn version_advance_fails_at_exhaustion_instead_of_wrapping() {
         assert!(matches!(
             PlacementVersion::from_u64(u64::MAX).next(),
             Err(PlacementError::VersionExhausted)

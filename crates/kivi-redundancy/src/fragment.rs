@@ -6,7 +6,7 @@
 //! offsets never enter the identity: physical locations are replaceable.
 //!
 //! Durable layout metadata is versioned little-endian binary (magic, version,
-//! lengths, CRC32C — no serde/bincode/rkyv near durable bytes, mirroring the
+//! lengths, CRC32C - no serde/bincode/rkyv near durable bytes, mirroring the
 //! chunk and checkpoint crates). This is pre-1.0: unknown versions are
 //! rejected outright, never migrated.
 
@@ -87,7 +87,7 @@ pub struct FragmentId {
     /// Role within the layout.
     pub role: FragmentRole,
     /// Encoding parameters hash (0 for replication; `fragment_len` mix for
-    /// RS — binds the exact widths that produced these bytes).
+    /// RS - binds the exact widths that produced these bytes).
     pub params_tag: u32,
     /// Content/integrity identity (BLAKE3 of the fragment bytes).
     pub content: [u8; 32],

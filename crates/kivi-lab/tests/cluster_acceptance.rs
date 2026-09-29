@@ -36,10 +36,8 @@ use kivi_client::ordered::{
     ScanProjection,
 };
 use kivi_lab::cluster::Cluster;
+use kivi_lab::testkit::{NS, fill, hex_key, medium_value, spread_key, tablet_of};
 use kivi_state::Key;
-use kivi_types::NamespaceId;
-
-const NS: NamespaceId = NamespaceId::from_u64(1);
 
 const SMALL_COUNT: usize = 200;
 const MEDIUM_COUNT: usize = 200;
@@ -47,44 +45,10 @@ const COUNTER_COUNT: usize = 20;
 const ROUND_KEYS: usize = 50;
 const ROUNDS: usize = 3;
 
-/// Genesis tiling prefixes: `[0,64)`, `[64,128)`, `[128,192)`, `[192,+inf)`.
-fn spread_key(tablet: u8, index: usize) -> Vec<u8> {
-    let prefix = match tablet {
-        0 => 0x10u8,
-        1 => b'A',
-        2 => 0x90u8,
-        _ => 0xF0u8,
-    };
-    let mut key = vec![prefix];
-    key.extend_from_slice(format!("{index:06}").as_bytes());
-    key
-}
-
-/// Deterministic LCG bytes (no randomness, seeded patterns only).
-fn fill(len: usize, seed: u8) -> Vec<u8> {
-    let mut out = vec![0u8; len];
-    let mut state = u64::from(seed) | 1;
-    for byte in &mut out {
-        state = state
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407);
-        *byte = u8::try_from((state >> 33) & 0xFF).unwrap_or(0xFF);
-    }
-    out
-}
-
+/// A structured, human-readable value: the scan and range assertions name
+/// keys, so the bytes have to be legible rather than random.
 fn small_value(index: usize) -> Vec<u8> {
     format!("small-{index:06}").into_bytes()
-}
-
-fn medium_value(index: usize) -> Vec<u8> {
-    let len = 2048 + (index % 3) * 1024;
-    let seed = u8::try_from(index % 251).unwrap_or(0x5A);
-    fill(len, seed)
-}
-
-fn tablet_of(index: usize) -> u8 {
-    u8::try_from(index % 4).unwrap_or(0)
 }
 
 /// Best-effort liveness snapshot for failure messages (never masks the
@@ -176,15 +140,6 @@ fn counter_checked(
             )
         });
     model.insert(key, live);
-}
-
-fn hex_key(key: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::new();
-    for byte in key.iter().take(8) {
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
 }
 
 /// Where one key probes right now: `(tablet, dir_version)` or the error.
@@ -543,7 +498,7 @@ fn chaos_round(
     let base = 20_000 + round * 1_000;
     for index in 0..ROUND_KEYS {
         let key = spread_key(tablet_of(index), base + index);
-        let value = fill(64, u8::try_from((round * 31 + index) % 251).unwrap_or(1));
+        let value = fill(64, u64::try_from((round * 31 + index) % 251).unwrap_or(1));
         put_checked(cluster, client, bytes_model, key, value);
     }
     // One cross-tablet batch of medium puts (spans three tablets).
@@ -700,7 +655,7 @@ fn run_acceptance(largest_first: bool) {
     // One long-lived client across all phases (same seeds, reused pooled
     // connections, one route cache, one session): retired tablets redirect
     // transitively, non-progress redirects refresh from seeds, and every
-    // restart gates on tiling agreement — so cached routes converge
+    // restart gates on tiling agreement - so cached routes converge
     // instead of pinning dead ranges. The model (not fresh caches)
     // carries continuity across phases.
     let client = cluster.client();
@@ -740,10 +695,9 @@ fn full_cluster_acceptance_across_topology_chaos() {
 
 /// Regression catcher for the coordinator-retirement intent wedge:
 /// smallest-first rotation retires 2PC coordinator tablets, and any
-/// leaked prepare intent must still resolve (the resolver routes the
+/// leaked prepare intent must still resolve - the resolver routes the
 /// decision record by the unified rule instead of pinning the retired
-/// coordinator). Formerly ignored while the wedge was a product bug;
-/// now a gate.
+/// coordinator.
 #[test]
 fn coordinator_retirement_resolves_intents() {
     run_acceptance(false);

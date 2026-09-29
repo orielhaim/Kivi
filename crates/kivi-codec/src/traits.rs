@@ -283,46 +283,55 @@ pub fn decode_byte_vec(input: &[u8]) -> Result<(Vec<u8>, usize), CodecError> {
 mod tests {
     use super::*;
 
+    /// Little-endian is the durable byte order for every integer, and
+    /// `encoded_len` is what a caller pre-allocates with, so both are wire
+    /// contract rather than implementation detail.
     #[test]
-    fn integers_round_trip_little_endian() {
-        for value in [i64::MIN, -1, 0, 1, 918, i64::MAX] {
-            let bytes = value.encode_to_vec();
-            assert_eq!(bytes, value.to_le_bytes());
-            assert_eq!(i64::decode_exact(&bytes).expect("round trip"), value);
+    fn integers_are_little_endian_and_exactly_sized() {
+        macro_rules! check {
+            ($ty:ty, $value:expr, $expected:expr) => {{
+                let value: $ty = $value;
+                let mut out = Vec::new();
+                value.encode(&mut out);
+                assert_eq!(out, $expected, "{value} must be little-endian");
+                assert_eq!(value.encoded_len(), out.len());
+                assert_eq!(
+                    <$ty as Decode>::decode_exact(&out).expect("round trip"),
+                    value
+                );
+            }};
         }
-        for value in [0u64, 1, 918, u64::MAX] {
-            let bytes = value.encode_to_vec();
-            assert_eq!(bytes, value.to_le_bytes());
-            assert_eq!(u64::decode_exact(&bytes).expect("round trip"), value);
-        }
-        let wide = u128::from(0xDEAD_BEEF_u32);
-        assert_eq!(wide.encode_to_vec().len(), 16);
-        assert_eq!(
-            u128::decode_exact(&wide.encode_to_vec()).expect("u128"),
-            wide
+        check!(u16, 0x0102, [0x02, 0x01]);
+        check!(u32, 0x0102_0304, [0x04, 0x03, 0x02, 0x01]);
+        check!(u64, 0x0102_0304_0506_0708, [8, 7, 6, 5, 4, 3, 2, 1]);
+        check!(u64, u64::MAX, [0xFF; 8]);
+        check!(
+            u128,
+            0xDEAD_BEEF,
+            [0xEF, 0xBE, 0xAD, 0xDE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
         );
-        assert_eq!(
-            u16::decode_exact(&0x0102u16.to_le_bytes()).expect("u16"),
-            0x0102
-        );
-        assert_eq!(
-            u32::decode_exact(&0x0102_0304u32.to_le_bytes()).expect("u32"),
-            0x0102_0304
+        // Signed values are two's complement, so `-1i64` is all ones on the
+        // wire and a pre-epoch stamp is distinguishable from zero.
+        check!(i64, -1, [0xFF; 8]);
+        check!(i64, i64::MIN, [0, 0, 0, 0, 0, 0, 0, 0x80]);
+        check!(
+            i64,
+            i64::MAX,
+            [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F]
         );
     }
 
+    /// Malformed-input handling is the security boundary: a bool, a length
+    /// prefix, or a trailing byte that decodes to *something* rather than
+    /// failing is a silent corruption.
     #[test]
-    fn bool_accepts_only_zero_and_one() {
+    fn malformed_input_is_rejected_rather_than_decoded() {
         assert!(!bool::decode_exact(&[0]).expect("false"));
         assert!(bool::decode_exact(&[1]).expect("true"));
         assert_eq!(
             bool::decode(&[2]),
             Err(CodecError::InvalidBoolEncoding { byte: 2 })
         );
-    }
-
-    #[test]
-    fn truncation_reports_expected_and_available() {
         assert_eq!(
             u64::decode(&[1, 2, 3]),
             Err(CodecError::Truncated {
@@ -337,29 +346,15 @@ mod tests {
                 total: 9
             })
         );
-    }
-
-    #[test]
-    fn blobs_round_trip_with_length_prefix() {
-        let payload = vec![7u8; 1024];
-        let mut out = Vec::new();
-        encode_bytes(&mut out, &payload);
-        assert_eq!(out.len(), 4 + 1024);
-        let (slice, consumed) = decode_byte_slice(&out).expect("slice");
-        assert_eq!(slice, payload.as_slice());
-        assert_eq!(consumed, out.len());
-        let (owned, _) = decode_byte_vec(&out).expect("vec");
-        assert_eq!(owned, payload);
-    }
-
-    #[test]
-    fn blob_decode_rejects_lies_about_length() {
-        let mut bad = 10_000u32.to_le_bytes().to_vec();
-        bad.extend_from_slice(&[0u8; 8]);
+        // A length prefix that lies about how many bytes follow must not
+        // allocate on the claim.
+        let mut short = 10_000u32.to_le_bytes().to_vec();
+        short.extend_from_slice(&[0u8; 8]);
         assert!(matches!(
-            decode_byte_slice(&bad),
+            decode_byte_slice(&short),
             Err(CodecError::Truncated { .. })
         ));
+        // A length prefix above the admission bound is refused before slicing.
         let huge = u32::try_from(MAX_FRAME_BYTES + 1).expect("bound fits in u32");
         assert!(matches!(
             decode_byte_slice(&huge.to_le_bytes()),
@@ -367,6 +362,8 @@ mod tests {
         ));
     }
 
+    /// A blob that cannot be framed is a programming error at the call site,
+    /// not a value to encode and discover later.
     #[test]
     #[should_panic(expected = "exceeds maximum")]
     fn blob_encode_panics_over_bound() {

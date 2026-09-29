@@ -4,12 +4,12 @@
 //! graceful shutdown (the honest crash), restart it on the same `--data-dir`
 //! with fresh ports, and prove acknowledged writes come back.
 //! The lost-response half of exactly-once is covered deterministically:
-//! the same `(session, seq)` identity replayed — even after a kill and
-//! restart, even on a fresh connection — returns the original outcome
+//! the same `(session, seq)` identity replayed - even after a kill and
+//! restart, even on a fresh connection - returns the original outcome
 //! without re-executing.
 
 use std::collections::HashSet;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::TcpStream;
 use std::sync::{
     Arc,
@@ -19,32 +19,9 @@ use std::time::{Duration, Instant};
 
 use kivi_client::{ClientConfig, NativeClient};
 use kivi_lab::process::Server;
+use kivi_lab::testkit::{NS, read_frame};
 use kivi_state::Key;
-use kivi_types::{NamespaceId, RequestIdentity, RequestSeq, SessionId};
-
-const NS: NamespaceId = NamespaceId::from_u64(1);
-
-fn read_frame(
-    socket: &mut TcpStream,
-    reader: &mut kivi_protocol::FrameReader,
-) -> std::io::Result<kivi_protocol::Frame> {
-    let mut chunk = vec![0u8; 4096];
-    loop {
-        let count = socket.read(&mut chunk)?;
-        if count == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "closed",
-            ));
-        }
-        let frames = reader.push(&chunk[..count]).map_err(|error| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
-        })?;
-        if let Some(frame) = frames.into_iter().next() {
-            return Ok(frame);
-        }
-    }
-}
+use kivi_types::{RequestIdentity, RequestSeq, SessionId};
 
 /// Raw socket with the durable-dedup capability negotiated.
 struct RawDurable {
@@ -277,7 +254,7 @@ fn streamed_upload_replay_after_kill_returns_original_without_reexecuting() {
     assert_eq!(stored_version(&replay), version, "live replay dedups");
     drop(raw);
     server.kill();
-    // After the crash the dedup memory is gone — but the WAL remembers
+    // After the crash the dedup memory is gone - but the WAL remembers
     // the small root, so the replay still dedups instead of storing anew.
     let server = Server::spawn_auto(scratch.path(), &[]).expect("server spawns");
     let mut raw = RawDurable::connect(&server.endpoint());
@@ -303,7 +280,7 @@ fn kill_mid_upload_leaves_no_root_and_recovers_cleanly() {
     let endpoint = server.endpoint();
     let session = SessionId::from_u128(0x00DE_C0DE);
     let mut raw = RawDurable::connect(&endpoint);
-    // Begin plus two data frames, then the honest crash — no commit, so
+    // Begin plus two data frames, then the honest crash - no commit, so
     // nothing may become visible, and staged-but-uncommitted packs must
     // not wedge recovery.
     let max_data = raw_upload_begin(&mut raw, 50, session, 1, "half", Some(1_500_000));
@@ -330,7 +307,7 @@ fn kill_mid_upload_leaves_no_root_and_recovers_cleanly() {
 /// with a fresh source. Retries are commit-safe: a stalled first attempt
 /// either never committed (plain retry) or did (same bytes → identical
 /// root either way, so the retry converges rather than corrupts). Only
-/// terminal errors fail the test — the point here is atomicity under
+/// terminal errors fail the test - the point here is atomicity under
 /// concurrency, not liveness under parallel-suite fsync storms.
 fn put_stream_sturdy(
     client: &NativeClient,
@@ -396,7 +373,7 @@ fn concurrent_same_key_uploads_never_tear() {
         errors.lock().expect("errors lock")
     );
     // Last-writer-wins, never torn: the stored value is exactly one of
-    // the two uploads — full length, full bytes, no interleave.
+    // the two uploads - full length, full bytes, no interleave.
     let client = server.client();
     let stored = client
         .get(&Key::from("race"))
@@ -445,7 +422,7 @@ fn replay_after_kill_returns_original_without_reexecuting() {
     let scratch = tempfile::tempdir().expect("scratch");
     let server = Server::spawn_auto(scratch.path(), &[]).expect("server spawns");
     let endpoint = server.endpoint();
-    // Fixed identity: this is the "lost response" — the client sent
+    // Fixed identity: this is the "lost response" - the client sent
     // (session, seq=1), the reply never arrived, and the retry carries
     // the same bytes.
     let session = SessionId::from_u128(0xC0_FFEE);
@@ -458,7 +435,7 @@ fn replay_after_kill_returns_original_without_reexecuting() {
     assert_eq!(counter_value(&replay), 1);
     drop(raw);
     server.kill();
-    // After the crash the dedup memory is gone — but the WAL remembers.
+    // After the crash the dedup memory is gone - but the WAL remembers.
     let server = Server::spawn_auto(scratch.path(), &[]).expect("server spawns");
     let mut raw = RawDurable::connect(&server.endpoint());
     let after_crash = raw.counter_add(3, session, 1, 0, "exact");
@@ -668,7 +645,7 @@ fn group_commit_batches_hot_writes_with_one_barrier() {
     assert!(batches < logical, "batches {batches} < mutations {logical}");
     assert_eq!(barriers, batches, "one barrier per batch today");
     // Admin counters are exact u64; the ratio is a human-readable test
-    // assertion (values here are in the thousands — nowhere near 2^53).
+    // assertion (values here are in the thousands - nowhere near 2^53).
     #[allow(clippy::cast_precision_loss)]
     let per_fsync = logical as f64 / barriers as f64;
     // Immediate mode pins this at exactly 1.0 (one barrier per mutation
@@ -992,7 +969,7 @@ fn band_occupancy(server: &Server) -> Vec<(u16, Vec<Key>)> {
 /// One pre-kill mutation attempt with its explicit identity: everything
 /// needed to retry it verbatim after a crash. Each attempt owns a
 /// single-use session (one client per mutation below), so no session
-/// floor can advance past it before the kill — a retry is always a
+/// floor can advance past it before the kill - a retry is always a
 /// dedup hit (applied before the kill) or a first execution (never
 /// sent), never an expiry.
 enum Ambiguous {
@@ -1024,8 +1001,8 @@ fn resume_client(endpoint: &str, session: SessionId) -> NativeClient {
 /// Retries every ambiguous identity verbatim (fresh resume client per
 /// attempt: completing an attempt advances that client's floor, so a
 /// second attempt on the same object would self-expire). Each identity
-/// applies exactly once across kill + resume — hit when the first
-/// attempt applied, first execution otherwise — and a repeat retry must
+/// applies exactly once across kill + resume - hit when the first
+/// attempt applied, first execution otherwise - and a repeat retry must
 /// return the identical outcome, proving the record is stable rather
 /// than re-executed.
 fn retry_ambiguous(endpoint: &str, ambiguous: &[Ambiguous]) {
@@ -1157,7 +1134,7 @@ fn concurrent_checkpoint_workload_survives_kill_exactly() {
     // Four threads hammering: distinct SET keys plus one shared hot
     // counter. Every mutation carries its own session and explicit
     // sequence 1, so every unacknowledged attempt is retryable verbatim
-    // after the kill — no identity is ever inferred or reused across
+    // after the kill - no identity is ever inferred or reused across
     // attempts. Workload dials fail fast (short connect budget): once
     // the server is dead there is nothing to learn from redialing it.
     eprintln!("AM: spawning clients");
@@ -1223,7 +1200,7 @@ fn concurrent_checkpoint_workload_survives_kill_exactly() {
     // The kill window is honest ambiguity, not loss or duplication: an
     // ambiguous attempt may have applied (durable, reply lost in the
     // kill) or never been sent. The recovered counter must lie within
-    // exactly that window — anything outside is loss or double-apply.
+    // exactly that window - anything outside is loss or double-apply.
     let recovered = u64::try_from(
         client
             .counter_get(&Key::from("am-hot"))
@@ -1306,7 +1283,7 @@ fn deleted_current_recovers_from_wal_replay() {
 fn missing_current_manifest_falls_back_to_previous() {
     // Two checkpoints install current + previous. Destroying the current
     // manifest must fall back loudly to the retained previous (WAL tail
-    // covers the gap) — never partial state, never silent loss.
+    // covers the gap) - never partial state, never silent loss.
     let scratch = tempfile::tempdir().expect("scratch");
     let server = Server::spawn_auto(scratch.path(), &["--checkpoint-mutations", "5"])
         .expect("server spawns");
@@ -1369,7 +1346,7 @@ fn extract_manifest(body: &str, which: &str) -> String {
 fn corrupt_band_is_detected_loudly() {
     // Corrupting a current-only band (rewritten by the second checkpoint,
     // so the previous chain references different files) must fail loudly
-    // or fall back — never serve partial state.
+    // or fall back - never serve partial state.
     let scratch = tempfile::tempdir().expect("scratch");
     let server = Server::spawn_auto(scratch.path(), &["--checkpoint-mutations", "5"])
         .expect("server spawns");
@@ -1416,7 +1393,7 @@ fn corrupt_band_is_detected_loudly() {
     bytes[flip] ^= 0xFF;
     std::fs::write(&band_path, &bytes).expect("band corrupted");
     // Restart: either loud failure or previous-fallback with full state.
-    // A corrupt FIRST band (likely an empty reused band — identical file
+    // A corrupt FIRST band (likely an empty reused band - identical file
     // in both chains) breaks both chains and must fail loudly.
     // Fresh ephemeral ports: recovery reads the data directory, so the
     // probe address is irrelevant and cannot collide with anything.

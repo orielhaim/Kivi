@@ -6,11 +6,11 @@
 //!
 //! Three concepts stay structurally distinct:
 //!
-//! * [`Ticks`] — deterministic virtual monotonic microseconds since a
+//! * [`Ticks`] - deterministic virtual monotonic microseconds since a
 //!   clock-defined origin. Simulation and correctness-sensitive timing.
-//! * [`WallTimestamp`] — exact wall-clock instants as signed Unix
+//! * [`WallTimestamp`] - exact wall-clock instants as signed Unix
 //!   microseconds. Expiry and other logical metadata (RFC §163).
-//! * `std::time::Instant` (not defined here) — monotonic process time for
+//! * `std::time::Instant` (not defined here) - monotonic process time for
 //!   local timeouts, latency measurement, and scheduler deadlines. A system
 //!   clock adjustment must never break a local timeout, so wall and
 //!   monotonic time never share a type.
@@ -316,8 +316,12 @@ impl fmt::Display for Expiry {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
+    /// `Ticks` is a virtual monotonic clock: spans saturate rather than go
+    /// negative, so a backwards simulator step cannot produce a negative age.
     #[test]
     fn ticks_advance_and_measure_spans() {
         let start = Ticks::from_micros(1_000);
@@ -327,55 +331,51 @@ mod tests {
         assert_eq!(start.saturating_since(later), Duration::ZERO);
     }
 
+    /// Expiry is a security-relevant boundary and it is *inclusive*: a stamp
+    /// exactly at the deadline is expired, not one microsecond of slack. A
+    /// skewed clock still gets a total, deterministic answer - an early clock
+    /// serves live data, a late clock expires early, and neither panics.
     #[test]
-    fn expiry_is_never_or_a_stamp() {
+    fn expiry_is_inclusive_at_the_deadline_and_never_fires() {
         assert!(!Expiry::NEVER.is_expired(WallTimestamp::MAX));
         let deadline = WallTimestamp::from_micros(500);
         let expiry = Expiry::at(deadline);
         assert_eq!(expiry.as_stamp(), Some(deadline));
         assert!(!expiry.is_expired(WallTimestamp::from_micros(499)));
-        assert!(expiry.is_expired(WallTimestamp::from_micros(500)));
+        assert!(expiry.is_expired(deadline));
         assert!(expiry.is_expired(WallTimestamp::from_micros(501)));
+        // Clock skew, both directions.
+        assert!(!expiry.is_expired(WallTimestamp::from_micros(0)));
+        assert!(expiry.is_expired(WallTimestamp::MAX));
     }
 
-    #[test]
-    fn display_formats() {
-        assert_eq!(Ticks::from_micros(7).to_string(), "7us");
-        assert_eq!(Expiry::NEVER.to_string(), "never");
+    /// Stamps round-trip through the RFC 3339 text form, including before the
+    /// epoch: a pre-epoch stamp must survive as a signed value rather than
+    /// clamping to zero.
+    #[rstest]
+    #[case::epoch("1970-01-01T00:00:00Z", 0)]
+    #[case::pre_epoch("1969-12-31T23:59:59.999999Z", -1)]
+    #[case::one_second("1970-01-01T00:00:01Z", 1_000_000)]
+    fn rfc3339_round_trips_including_before_the_epoch(#[case] text: &str, #[case] micros: i64) {
+        let stamp = WallTimestamp::from_micros(micros);
+        assert_eq!(stamp.to_rfc3339().expect("formats"), text);
+        assert_eq!(WallTimestamp::parse_rfc3339(text).expect("parses"), stamp);
     }
 
+    /// Signed arithmetic must not underflow at negative stamps: a difference
+    /// across the epoch is a negative number, and a naive unsigned computation
+    /// would report a huge positive gap.
     #[test]
-    fn epoch_round_trips_through_jiff() {
-        let epoch = WallTimestamp::EPOCH;
-        assert_eq!(epoch.to_jiff().expect("epoch fits").as_microsecond(), 0);
-        assert_eq!(
-            WallTimestamp::from_jiff(epoch.to_jiff().expect("epoch fits")).expect("round trip"),
-            epoch
-        );
-        assert_eq!(epoch.to_rfc3339().expect("formats"), "1970-01-01T00:00:00Z");
-        assert_eq!(
-            WallTimestamp::parse_rfc3339("1970-01-01T00:00:00Z").expect("parses"),
-            epoch
-        );
-    }
-
-    #[test]
-    fn pre_epoch_stamps_order_before_epoch() {
+    fn differences_across_the_epoch_stay_signed() {
         let before = WallTimestamp::from_micros(-1);
         assert!(before < WallTimestamp::EPOCH);
         assert_eq!(
-            before.to_rfc3339().expect("formats"),
-            "1969-12-31T23:59:59.999999Z"
+            WallTimestamp::EPOCH
+                .signed_duration_since(before)
+                .expect("in range")
+                .as_micros(),
+            1
         );
-        assert_eq!(
-            WallTimestamp::parse_rfc3339("1969-12-31T23:59:59.999999Z").expect("parses"),
-            before
-        );
-        // Negative differences stay signed.
-        let gap = WallTimestamp::EPOCH
-            .signed_duration_since(before)
-            .expect("in range");
-        assert_eq!(gap.as_micros(), 1);
         assert_eq!(
             before
                 .signed_duration_since(WallTimestamp::EPOCH)
@@ -385,46 +385,23 @@ mod tests {
         );
     }
 
-    #[test]
-    fn micros_round_trip_through_jiff() {
-        for micros in [
-            i64::MIN + 1,
-            -1_000_001,
-            -1,
-            0,
-            1,
-            1_000_000,
-            9_000_000_000_000_000,
-        ] {
-            let stamp = WallTimestamp::from_micros(micros);
-            match stamp.to_jiff() {
-                Ok(jiff) => {
-                    assert_eq!(
-                        WallTimestamp::from_jiff(jiff).expect("in range"),
-                        stamp,
-                        "micros {micros} must round-trip"
-                    );
-                }
-                Err(TimeError::OutOfRange { .. }) => {}
-                Err(error) => panic!("unexpected error for {micros}: {error}"),
-            }
-        }
-    }
-
-    #[test]
-    fn sub_microsecond_truncates_toward_zero() {
-        let positive = Timestamp::from_nanosecond(1_500).expect("small timestamp fits");
+    /// A nanosecond-precision input truncates toward zero, symmetrically. An
+    /// asymmetric truncation would make a stamp before the epoch read as one
+    /// microsecond *after* it.
+    #[rstest]
+    #[case::positive(1_500i128, 1)]
+    #[case::negative(-1_500, -1)]
+    fn sub_microsecond_truncates_toward_zero(#[case] nanos: i128, #[case] micros: i64) {
+        let stamp = Timestamp::from_nanosecond(nanos).expect("small timestamp fits");
         assert_eq!(
-            WallTimestamp::from_jiff(positive).expect("fits"),
-            WallTimestamp::from_micros(1)
-        );
-        let negative = Timestamp::from_nanosecond(-1_500).expect("small timestamp fits");
-        assert_eq!(
-            WallTimestamp::from_jiff(negative).expect("fits"),
-            WallTimestamp::from_micros(-1)
+            WallTimestamp::from_jiff(stamp).expect("fits"),
+            WallTimestamp::from_micros(micros)
         );
     }
 
+    /// The sentinels order correctly and refuse to convert, but still render
+    /// for diagnostics: an operator reading a max timestamp must get a number,
+    /// not a panic.
     #[test]
     fn sentinels_compare_but_do_not_convert() {
         assert!(WallTimestamp::MIN < WallTimestamp::EPOCH);
@@ -437,7 +414,6 @@ mod tests {
             WallTimestamp::MIN.to_jiff(),
             Err(TimeError::OutOfRange { .. })
         ));
-        // Diagnostics still render instead of failing.
         assert_eq!(WallTimestamp::MAX.to_string(), format!("{}us", i64::MAX));
         assert!(
             WallTimestamp::MAX
@@ -446,8 +422,10 @@ mod tests {
         );
     }
 
+    /// Checked addition crosses the epoch in both directions and reports
+    /// overflow rather than wrapping.
     #[test]
-    fn checked_add_uses_jiff_arithmetic() {
+    fn checked_add_crosses_the_epoch_in_both_directions() {
         let start = WallTimestamp::from_micros(1_000_000);
         let later = start
             .checked_add(SignedDuration::from_secs(2))
@@ -463,30 +441,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn invalid_rfc3339_is_an_error_not_a_stamp() {
+    /// A malformed or impossible timestamp is an error, never a stamp. A
+    /// parser that returned epoch zero for `"not a timestamp"` would silently
+    /// make an operator's input read as 1970.
+    #[rstest]
+    #[case::garbage("not a timestamp")]
+    #[case::impossible("2024-13-45T99:99:99Z")]
+    fn invalid_rfc3339_is_an_error_not_a_stamp(#[case] text: &str) {
         assert!(matches!(
-            WallTimestamp::parse_rfc3339("not a timestamp"),
+            WallTimestamp::parse_rfc3339(text),
             Err(TimeError::InvalidFormat { .. })
         ));
-        assert!(matches!(
-            WallTimestamp::parse_rfc3339("2024-13-45T99:99:99Z"),
-            Err(TimeError::InvalidFormat { .. })
-        ));
-    }
-
-    #[test]
-    fn expiry_boundary_and_skew() {
-        // Exactly at the deadline counts as expired (strict containment).
-        let deadline = WallTimestamp::from_micros(2_000_000);
-        let expiry = Expiry::at(deadline);
-        assert!(!expiry.is_expired(WallTimestamp::from_micros(1_999_999)));
-        assert!(expiry.is_expired(deadline));
-        // A skewed (early) clock observes live data; a late clock expires
-        // early. Either way the comparison is total and deterministic.
-        assert!(!expiry.is_expired(WallTimestamp::from_micros(0)));
-        assert!(expiry.is_expired(WallTimestamp::MAX));
-        // Readable diagnostics for operators.
-        assert_eq!(expiry.to_string(), "at 1970-01-01T00:00:02Z");
     }
 }

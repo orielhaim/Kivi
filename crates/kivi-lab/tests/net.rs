@@ -2,7 +2,7 @@
 //!
 //! Engines start in-process on ephemeral ports (no binaries involved), and
 //! every test shuts its engine down. These prove the wire, routing,
-//! redirect, lifecycle, and isolation behavior — not the simulator.
+//! redirect, lifecycle, and isolation behavior - not the simulator.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -11,18 +11,13 @@ use std::thread;
 use std::time::Duration;
 
 use bytes::Bytes;
-use kivi_client::{ClientConfig, NativeClient};
-use kivi_engine::{
-    ConnLimits, DurabilityMode, EngineConfig, EngineNetwork, LocalEngine, Placement, TurnBudget,
-};
+use kivi_engine::{DurabilityMode, EngineConfig, EngineNetwork, LocalEngine, Placement};
+use kivi_lab::testkit::{NS, client_for, network, read_frame};
 use kivi_state::Key;
 use kivi_tablet::{DirectorySnapshot, HashPrefix, PartitionRange};
 use kivi_types::{
-    ClusterId, NamespaceId, NodeId, NodeIncarnation, RequestSeq, TabletEpoch, TabletId,
-    WallTimestamp, WorkerId, WriteGuardGeneration,
+    RequestSeq, TabletEpoch, TabletId, WallTimestamp, WorkerId, WriteGuardGeneration,
 };
-
-const NS: NamespaceId = NamespaceId::from_u64(1);
 const EPOCH: TabletEpoch = TabletEpoch::INITIAL;
 const GUARD: WriteGuardGeneration = WriteGuardGeneration::INITIAL;
 
@@ -56,24 +51,6 @@ fn split_snapshot() -> DirectorySnapshot {
         kivi_tablet::Redirect::new(vec![TabletId::from_u64(2), TabletId::from_u64(3)]),
     )
     .expect("retire")
-}
-
-fn network() -> EngineNetwork {
-    EngineNetwork {
-        base_port: 0,
-        ports: Vec::new(),
-        bind_ip: [127, 0, 0, 1].into(),
-        max_frame: kivi_protocol::DEFAULT_MAX_FRAME,
-        placement: kivi_engine::ThreadPlacement::unbound(),
-        node_id: NodeId::from_u64(1),
-        cluster_id: ClusterId::from_u128(1),
-        incarnation: NodeIncarnation::INITIAL,
-        conn: ConnLimits::default(),
-        turn: TurnBudget::default(),
-        // The RESP edge is served by the engine's own workers;
-        // these harnesses exercise the native protocol only.
-        resp: None,
-    }
 }
 
 /// Restarts an engine on the exact ports of a previous one (TIME_WAIT-safe
@@ -114,16 +91,6 @@ fn start_split() -> LocalEngine {
         durability: DurabilityMode::Ephemeral,
     })
     .expect("networked engine starts")
-}
-
-fn client_for(engine: &LocalEngine) -> NativeClient {
-    let seed = engine.worker_addrs()[0].to_string();
-    NativeClient::new(ClientConfig {
-        seeds: vec![seed],
-        namespace: NS,
-        ..ClientConfig::default()
-    })
-    .expect("client builds")
 }
 
 /// Finds keys routed to each of the two tablets (deterministic probing).
@@ -387,28 +354,6 @@ fn pipelined_raw_socket_round_trips_in_order() {
     engine.shutdown().expect("clean shutdown");
 }
 
-fn read_frame(
-    socket: &mut TcpStream,
-    reader: &mut kivi_protocol::FrameReader,
-) -> std::io::Result<kivi_protocol::Frame> {
-    let mut chunk = vec![0u8; 4096];
-    loop {
-        let count = socket.read(&mut chunk)?;
-        if count == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "closed",
-            ));
-        }
-        let frames = reader.push(&chunk[..count]).map_err(|error| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
-        })?;
-        if let Some(frame) = frames.into_iter().next() {
-            return Ok(frame);
-        }
-    }
-}
-
 #[test]
 fn direct_path_bypasses_the_channel() {
     let engine = start_split();
@@ -455,7 +400,7 @@ fn large_single_frame_round_trips() {
     engine.shutdown().expect("clean shutdown");
 }
 
-/// Concurrent 4 MiB bulk sets from independent connections all succeed —
+/// Concurrent 4 MiB bulk sets from independent connections all succeed -
 /// one connection's in-progress frame never trips another's bound, and
 /// pipelined small frames alongside bulk traffic stay healthy.
 #[test]

@@ -7,7 +7,7 @@
 //! events, and policy must produce an equal trace.
 //!
 //! Traces are plain data (`PartialEq`, `Clone`, `Debug`) with no I/O, clocks,
-//! or maps involved — equality across repeated runs is the replay check.
+//! or maps involved - equality across repeated runs is the replay check.
 
 use core::fmt;
 
@@ -63,28 +63,10 @@ pub struct TraceEntry<E> {
 }
 
 impl<E> TraceEntry<E> {
-    /// Returns the event identifier.
-    #[must_use]
-    pub const fn id(&self) -> EventId {
-        self.id
-    }
-
-    /// Returns the virtual tick the event ran (or would have run) at.
-    #[must_use]
-    pub const fn at(&self) -> Ticks {
-        self.at
-    }
-
     /// Returns the recorded fault decision.
     #[must_use]
     pub const fn decision(&self) -> RecordedDecision {
         self.decision
-    }
-
-    /// Returns the event payload.
-    #[must_use]
-    pub fn event(&self) -> &E {
-        &self.event
     }
 }
 
@@ -131,27 +113,9 @@ impl<E> Trace<E> {
         });
     }
 
-    /// Returns all entries in run order.
-    #[must_use]
-    pub fn entries(&self) -> &[TraceEntry<E>] {
-        &self.entries
-    }
-
     /// Iterates over entries in run order.
     pub fn iter(&self) -> core::slice::Iter<'_, TraceEntry<E>> {
         self.entries.iter()
-    }
-
-    /// Returns the number of recorded entries.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// Whether nothing has been recorded yet.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
     }
 }
 
@@ -169,39 +133,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn trace_records_identity_tick_decision_and_payload() {
-        let mut trace = Trace::new(42);
-        assert!(trace.is_empty());
-        assert_eq!(trace.seed(), 42);
-        trace.record(
-            EventId::from_u64(3),
-            Ticks::from_micros(90),
-            RecordedDecision::Dropped,
-            "packet",
-        );
-        assert_eq!(trace.len(), 1);
-        let entry = &trace.entries()[0];
-        assert_eq!(entry.id(), EventId::from_u64(3));
-        assert_eq!(entry.decision(), RecordedDecision::Dropped);
-        assert_eq!(entry.event(), &"packet");
-        assert_eq!(trace.iter().count(), 1);
-    }
-
-    #[test]
-    fn decisions_map_from_policy_answers() {
+    fn policy_answers_map_onto_recorded_decisions() {
+        use RecordedDecision as R;
+        assert_eq!(R::from(FaultDecision::Allow), R::Ran);
+        assert_eq!(R::from(FaultDecision::Drop), R::Dropped);
+        assert_eq!(R::from(FaultDecision::Duplicate), R::Duplicated);
         assert_eq!(
-            RecordedDecision::from(FaultDecision::Allow),
-            RecordedDecision::Ran
-        );
-        assert_eq!(
-            RecordedDecision::from(FaultDecision::Drop),
-            RecordedDecision::Dropped
-        );
-        assert_eq!(
-            RecordedDecision::from(FaultDecision::Defer {
+            R::from(FaultDecision::Defer {
                 until: Ticks::from_micros(7)
             }),
-            RecordedDecision::Deferred {
+            R::Deferred {
                 until: Ticks::from_micros(7)
             }
         );

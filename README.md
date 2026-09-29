@@ -27,9 +27,31 @@ The architecture focuses on:
 This is not "Redis but rewritten in Rust" There are already enough projects
 whose architectural roadmap is essentially that sentence
 
+## Performance
+
+On this project's own host and instrument, Kivi currently measures faster than
+Redis: at pipeline depth 256, a resident 16-byte `GET` costs 201 ns/op against
+Redis 8.10.1's 295, or 32% less. That is a scoped result, not a general one. It
+is one read-only shape at one depth, and at depth 1 the round trip dominates all
+three servers and Kivi is not the fastest of them. The shape, the method, the
+control row that isolates Kivi's own cost, and the host's measurement limits are
+in [`docs/perf-program.md`](docs/perf-program.md)
+
 Kivi is still a research-oriented project and is under active development
 
 The full architecture lives in [`docs/rfc.md`](docs/rfc.md).
+
+## Documentation
+
+| document | what it is |
+| --- | --- |
+| [`docs/rfc.md`](docs/rfc.md) | the architecture specification |
+| [`docs/perf-program.md`](docs/perf-program.md) | how to benchmark Kivi, and what it currently costs |
+| [`docs/microscope.md`](docs/microscope.md) | the measurement instruments and what this host can measure |
+| [`docs/hardware.md`](docs/hardware.md) | measured hardware capabilities and what was unavailable |
+| [`docs/cluster.md`](docs/cluster.md) | running a multi-tablet replicated cluster |
+| [`docs/resp-compat.md`](docs/resp-compat.md) | the RESP compatibility profile |
+| [`docs/fabric.md`](docs/fabric.md) | Memory Fabric ownership and execution guarantees |
 
 ## Status
 

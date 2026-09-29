@@ -16,11 +16,7 @@
 use std::time::Duration;
 
 use kivi_lab::cluster::Cluster;
-use kivi_state::Key;
-
-fn key(name: &str) -> Key {
-    Key::from(name)
-}
+use kivi_lab::testkit::{NS, key};
 
 /// Minority fencing over real processes: isolate the leader, prove the
 /// minority cannot acknowledge while the majority continues, heal, and
@@ -31,7 +27,6 @@ fn key(name: &str) -> Key {
 #[test]
 fn minority_partition_fences_old_leader() {
     use kivi_client::{ClientConfig, NativeClient};
-    use kivi_types::NamespaceId;
 
     let cluster = Cluster::spawn().expect("cluster spawns");
     let leader = cluster.wait_leader();
@@ -47,7 +42,7 @@ fn minority_partition_fences_old_leader() {
     // airtight for the fencing verdict below).
     cluster.partition(leader);
     // The majority elects without the isolated node (the isolate itself
-    // may still report `leader` on its stale term — that is the fenced
+    // may still report `leader` on its stale term - that is the fenced
     // minority, not the majority).
     let majority = cluster.wait_leader_except(leader);
     assert_ne!(majority, leader, "majority elects without the isolate");
@@ -59,10 +54,10 @@ fn minority_partition_fences_old_leader() {
     // without quorum its commit can never complete. Pin a short-timeout
     // client on the isolate alone so no majority redirect can rescue it.
     // Still-leader, still-pending, or prompt routing failure all count as
-    // fenced — only an `Ok` acknowledgement fails the test.
+    // fenced - only an `Ok` acknowledgement fails the test.
     let isolate_client = NativeClient::new(ClientConfig {
         seeds: vec![cluster.native_endpoint(leader)],
-        namespace: NamespaceId::from_u64(1),
+        namespace: NS,
         request_timeout: Duration::from_secs(6),
         ..ClientConfig::default()
     })
@@ -80,7 +75,7 @@ fn minority_partition_fences_old_leader() {
         .expect("majority writes during partition");
 
     // Heal: the isolated uncommitted suffix truncates and every replica
-    // converges on the majority history — no dual acknowledged histories.
+    // converges on the majority history - no dual acknowledged histories.
     cluster.heal(leader);
     cluster.wait_converged();
     let value = cluster
@@ -128,7 +123,7 @@ fn stale_leader_hint_recovers_with_same_identity() {
     // Retry a NEW identity through the stale-hint client: bounded
     // condition-driven retries must land on the new leader (identity
     // preserved exactly once). Election-in-flight answers (`Overloaded`,
-    // timeouts) are retryable here — only a terminal acknowledgement or
+    // timeouts) are retryable here - only a terminal acknowledgement or
     // the deadline decides.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let retry = loop {
@@ -170,7 +165,7 @@ fn stale_leader_hint_recovers_with_same_identity() {
 }
 
 /// Snapshot catch-up: purge history on the leader while a follower is
-/// down, then restart it behind the purge point — it must install the
+/// down, then restart it behind the purge point - it must install the
 /// checkpoint snapshot and resume replication.
 #[test]
 fn lagging_follower_recovers_via_snapshot_after_purge() {

@@ -10,7 +10,7 @@
 use bytes::Bytes;
 use jiff::SignedDuration;
 use kivi_state::{ExpiryPolicy, Operation, OperationResult, SetCondition};
-use kivi_types::WallTimestamp;
+use kivi_types::{TabletRoute, WallTimestamp};
 
 use crate::error::{KiviErrorKind, RespError};
 
@@ -114,7 +114,7 @@ impl ExecuteError {
 ///
 /// Deliberately **not** `Send + Sync`. A connection may be served on the same
 /// thread that owns the data it addresses, and then the cheapest correct
-/// executor is a handle to that owner's state — no lock, no channel, no second
+/// executor is a handle to that owner's state - no lock, no channel, no second
 /// wakeup. Demanding `Send + Sync` here would forbid exactly the executor
 /// worth having and force a rendezvous per request to satisfy a bound no
 /// caller needs.
@@ -136,21 +136,67 @@ pub trait Executor {
     /// would still pay one engine rendezvous per command, so deepening a
     /// pipeline would cost more rather than less. An executor that can hold
     /// several operations in flight should override this, and its answers
-    /// must line up with `ops` positionally — RESP replies are positional.
+    /// must line up with `ops` positionally - RESP replies are positional.
     fn execute_batch(&self, ops: &[Operation]) -> Vec<Result<OperationResult, ExecuteError>> {
         ops.iter().map(|op| self.execute(op)).collect()
     }
 
     /// Current wall time (relative expiry computation only; never
-    /// persisted as a decision — the materialized stamp is).
+    /// persisted as a decision - the materialized stamp is).
     fn now(&self) -> WallTimestamp;
+
+    /// Resolves the route for a drain, once, or `None` if this turn has no direct
+    /// route.
+    ///
+    /// # Why this is a separate call
+    ///
+    /// The route is the same for every command in a pipeline, so asking for it per
+    /// command asks the same question two hundred and fifty-six times. On the
+    /// worker that question is two `arc-swap` loads and a version compare, and the
+    /// profile charged it 95 instructions per command - enough that removing 142
+    /// instructions of `TabletId` hashing only bought 47. Precomputation is only
+    /// worth anything if it is hoisted; leaving it in the loop is the same work with
+    /// a comment.
+    ///
+    /// The value is [`Copy`] and sixteen bytes, so passing it per command costs two
+    /// moves and no allocation, no lifetime, and no borrow of the publication.
+    ///
+    /// Defaulted to `None` so every executor - including `Box<dyn Executor>` and
+    /// the trait's own test doubles - keeps working unchanged. `None` is always
+    /// safe: it means "use the general path", and the general path is the authority.
+    #[must_use]
+    fn direct_route(&self) -> Option<TabletRoute> {
+        None
+    }
+
+    /// Answers a [`FastKind`](crate::fast::FastKind) for a borrowed key without
+    /// suspending, or `None` to use the general path.
+    ///
+    /// `route` is the [`Self::direct_route`] resolved for this drain. It is passed
+    /// in rather than looked up so that the per-command path is an index and
+    /// nothing else; an executor that ignored it and re-derived the tablet from
+    /// `key` would be doing the work this type exists to have already done.
+    ///
+    /// Implementing it is worth roughly 2,500 instructions per command. See
+    /// [`crate::fast`] for the cost map that says what it removes, and for why a
+    /// `GET` needs none of the machinery the general path builds.
+    fn fast_read(
+        &self,
+        route: TabletRoute,
+        kind: crate::fast::FastKind,
+        key: &[u8],
+        now: WallTimestamp,
+    ) -> Option<Reply> {
+        let _ = (route, kind, key, now);
+        None
+    }
 
     /// Executes a batch, allowed to suspend.
     ///
     /// Only an executor whose answer depends on another thread needs this: a
     /// durability proof, or a payload that lives in a chunk lane. Such an
     /// answer cannot be collected by a blocking call from a reactor, because
-    /// the call would park the thread that has to produce it — so it is awaited
+    /// the call would park the thread that has to produce it - so it is awaited
     /// instead.
     ///
     /// A boxed future rather than `async fn` so this trait stays object-safe
@@ -770,7 +816,13 @@ pub fn map_parse_error(error: &RespError) -> Reply {
 /// Remaining TTL in seconds: `-2` missing, `-1` immortal, else the
 /// ceiling of remaining milliseconds divided by 1000 (Redis rounds up
 /// partial seconds; a 1 ms remainder reports `1`, never `0`).
-fn ttl_seconds(expiry: Option<kivi_types::Expiry>, now: WallTimestamp) -> i64 {
+/// Whole seconds of TTL remaining: `-2` missing, `-1` immortal.
+///
+/// Public because the direct read path in [`crate::fast`] must produce the same
+/// number, and the alternative - a second implementation of Redis's TTL rounding -
+/// is a second thing to get wrong. One authority, two callers.
+#[must_use]
+pub fn ttl_seconds(expiry: Option<kivi_types::Expiry>, now: WallTimestamp) -> i64 {
     match expiry {
         None => -2,
         Some(value) => match value.as_stamp() {
@@ -791,7 +843,11 @@ fn ttl_seconds(expiry: Option<kivi_types::Expiry>, now: WallTimestamp) -> i64 {
 }
 
 /// Remaining TTL in milliseconds: `-2` missing, `-1` immortal.
-fn ttl_millis(expiry: Option<kivi_types::Expiry>, now: WallTimestamp) -> i64 {
+/// Milliseconds of TTL remaining: `-2` missing, `-1` immortal.
+///
+/// Public for the same reason as [`ttl_seconds`].
+#[must_use]
+pub fn ttl_millis(expiry: Option<kivi_types::Expiry>, now: WallTimestamp) -> i64 {
     match expiry {
         None => -2,
         Some(value) => match value.as_stamp() {
@@ -948,7 +1004,7 @@ mod tests {
         };
         // PXAT is unix *milliseconds*: 5000 ms anchors 5_000_000 µs, never
         // the raw millisecond count (which would land in 1970 and expire
-        // immediately — caught by differential testing against Redis).
+        // immediately - caught by differential testing against Redis).
         assert_eq!(
             expiry,
             ExpiryPolicy::ExpireAt(WallTimestamp::from_micros(5_000_000))

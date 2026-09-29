@@ -52,23 +52,6 @@ impl PlannerConfig {
     }
 }
 
-/// Why planning failed.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
-pub enum PlannerError {
-    /// No eligible active nodes exist.
-    #[error("no eligible active nodes for placement")]
-    NoEligibleNodes,
-    /// Replication factor exceeds eligible nodes (degraded placement).
-    #[error("replication factor {wanted} exceeds {eligible} eligible nodes")]
-    UnderReplicated {
-        /// Requested factor.
-        wanted: usize,
-        /// Eligible nodes.
-        eligible: usize,
-    },
-}
-
 /// One intended move: replace `from` with `to` on `tablet`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MigrationIntent {
@@ -116,9 +99,9 @@ pub fn plan_rebalance(state: &ControlState, config: &PlannerConfig) -> Vec<Migra
         // Desired size honors both policy and eligibility: degrade
         // gracefully instead of refusing the whole cluster when the
         // requested spread is impossible. Size changes themselves (grow
-        // or shrink below/above the factor) are out of scope —
+        // or shrink below/above the factor) are out of scope -
         // replication factor is fixed and genesis always forms full
-        // sets — so only balanced-size swaps move here.
+        // sets - so only balanced-size swaps move here.
         let want = config.replication_factor.min(eligible.len());
         if current.len() != want {
             continue;
@@ -126,15 +109,9 @@ pub fn plan_rebalance(state: &ControlState, config: &PlannerConfig) -> Vec<Migra
         // Move only when materially imbalanced (the most loaded holder
         // exceeds the least loaded eligible outsider by 2+) and the
         // outsider is not already a voter.
-        if let Some((from, to)) = pick_balance_move(
-            &current,
-            &eligible,
-            &load,
-            &planned_touch,
-            config,
-            state,
-            tablet,
-        ) {
+        if let Some((from, to)) =
+            pick_balance_move(&current, &eligible, &load, &planned_touch, config, state)
+        {
             let mut voters: Vec<NodeId> =
                 current.into_iter().filter(|node| *node != from).collect();
             voters.push(to);
@@ -194,15 +171,9 @@ pub fn plan_drain(
         if outsiders.is_empty() {
             continue;
         }
-        if let Some(target) = pick_add_target(
-            &current,
-            &outsiders,
-            state,
-            tablet,
-            &load,
-            &planned_touch,
-            config,
-        ) {
+        if let Some(target) =
+            pick_add_target(&current, &outsiders, state, &load, &planned_touch, config)
+        {
             let mut voters: Vec<NodeId> = current
                 .into_iter()
                 .filter(|node| *node != draining)
@@ -233,7 +204,7 @@ pub fn plan_drain(
 /// tablet-id order (deterministic). Each intent replaces one failed
 /// source with the healthiest eligible target through the SAME
 /// [`crate::migration::MigrationPlan`] path as manual moves (add learner, catch up,
-/// `change_membership`, retire — never delete-first).
+/// `change_membership`, retire - never delete-first).
 ///
 /// Bounds: global `max_repairs_per_round` plus per-source/per-target caps
 /// so a rack/node loss cannot stampede the cluster. When no eligible
@@ -297,9 +268,8 @@ pub fn plan_repair(state: &ControlState, config: &PlannerConfig) -> Vec<Migratio
         }
         candidates.push((health, usable, tablet, source));
     }
-    // Safety first: Unavailable (usable 0 sorts first via health order
-    // Unavailable < UnderReplicated? ensure explicit rank), then lowest
-    // usable count, then tablet id.
+    // Safety first (Unavailable before UnderReplicated), then lowest usable
+    // count, then tablet id.
     candidates.sort_by(|a, b| {
         fn rank(health: TabletHealth) -> u8 {
             match health {
@@ -350,15 +320,9 @@ pub fn plan_repair(state: &ControlState, config: &PlannerConfig) -> Vec<Migratio
         if outsiders.is_empty() {
             continue;
         }
-        if let Some(target) = pick_add_target(
-            &current,
-            &outsiders,
-            state,
-            tablet,
-            &load,
-            &planned_touch,
-            config,
-        ) {
+        if let Some(target) =
+            pick_add_target(&current, &outsiders, state, &load, &planned_touch, config)
+        {
             if per_target.get(&target.as_u64()).copied().unwrap_or(0)
                 >= config.max_repairs_per_target
             {
@@ -411,15 +375,12 @@ fn replica_load(state: &ControlState) -> BTreeMap<u64, usize> {
 /// failure domain the tablet does not yet cover.
 ///
 /// Capacity-aware: load is weighted by node `weight` (effective load
-/// `load / weight`), so a weight-2 node holds ~2x the tablets of a
-/// weight-1 node instead of equal counts. Tablet-count is the current
-/// capacity signal; estimated logical bytes will refine the score once
-/// per-tablet size estimates flow through the control plane.
+/// `load / weight`), so a weight-8 node holds ~8x the tablets of a weight-1
+/// node instead of equal counts.
 fn pick_add_target(
     current: &[NodeId],
     candidates: &[NodeId],
     state: &ControlState,
-    tablet: TabletId,
     load: &BTreeMap<u64, usize>,
     touched: &BTreeMap<u64, usize>,
     config: &PlannerConfig,
@@ -429,8 +390,7 @@ fn pick_add_target(
         .filter_map(|node| state.node(*node))
         .map(|record| record.failure_domain.clone())
         .collect();
-    // (fresh_domain desc, effective load asc, id asc, node).
-    let mut ranked: Vec<(bool, u64, u64, u64, NodeId)> = Vec::new();
+    let mut ranked: Vec<(bool, u64, u64, NodeId)> = Vec::new();
     for candidate in candidates {
         if current.contains(candidate) {
             continue;
@@ -441,7 +401,6 @@ fn pick_add_target(
         let fresh_domain = state.node(*candidate).is_some_and(|record| {
             !record.failure_domain.is_empty() && !covered.contains(&record.failure_domain)
         });
-        let _ = tablet;
         let weight = u64::from(
             state
                 .node(*candidate)
@@ -451,15 +410,15 @@ fn pick_add_target(
         // Effective load scaled to permille for integer ordering:
         // `raw * 1000 / weight`. Deterministic, no float.
         let effective = raw.saturating_mul(1000).saturating_add(weight - 1) / weight.max(1);
-        ranked.push((fresh_domain, effective, raw, candidate.as_u64(), *candidate));
+        ranked.push((fresh_domain, effective, raw, *candidate));
     }
     ranked.sort_by(|a, b| {
         b.0.cmp(&a.0)
             .then(a.1.cmp(&b.1))
             .then(a.2.cmp(&b.2))
-            .then(a.3.cmp(&b.3))
+            .then(a.3.as_u64().cmp(&b.3.as_u64()))
     });
-    ranked.into_iter().map(|(_, _, _, _, node)| node).next()
+    ranked.into_iter().map(|(_, _, _, node)| node).next()
 }
 
 /// Picks the most-loaded current holder to shed (deterministic by load
@@ -489,11 +448,10 @@ fn pick_balance_move(
     touched: &BTreeMap<u64, usize>,
     config: &PlannerConfig,
     state: &ControlState,
-    tablet: TabletId,
 ) -> Option<(NodeId, NodeId)> {
     let from = pick_shed_victim(current, load)?;
     let from_load = load.get(&from.as_u64()).copied().unwrap_or(0);
-    let to = pick_add_target(current, eligible, state, tablet, load, touched, config)?;
+    let to = pick_add_target(current, eligible, state, load, touched, config)?;
     let to_load = load.get(&to.as_u64()).copied().unwrap_or(0);
     if from_load.saturating_sub(to_load) >= 2 {
         Some((from, to))

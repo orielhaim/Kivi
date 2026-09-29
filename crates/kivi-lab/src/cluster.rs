@@ -353,7 +353,7 @@ impl Cluster {
     }
 
     /// Spawns like [`Cluster::spawn`] with a RESP edge per member. Fails
-    /// loudly when the binary was built without `redis-compat` — never a
+    /// loudly when the binary was built without the RESP edge - never a
     /// silent native-only cluster.
     ///
     /// # Errors
@@ -397,7 +397,7 @@ impl Cluster {
     /// # Errors
     ///
     /// Returns [`SpawnError`] like [`Cluster::spawn`].
-    pub fn spawn_with_layout(
+    fn spawn_with_layout(
         tablet_count: usize,
         worker_count: usize,
         layout: &str,
@@ -410,23 +410,6 @@ impl Cluster {
             READY_TIMEOUT,
             layout,
         )
-    }
-
-    /// Spawns like [`Cluster::spawn_with_tablets`] with an explicit
-    /// readiness window per member (large formations open hundreds of
-    /// groups per process; the default 20 s window suits small ones).
-    /// The window persists on the cluster for later restarts.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SpawnError`] like [`Cluster::spawn`].
-    pub fn spawn_with_tablets_timeout(
-        tablet_count: usize,
-        worker_count: usize,
-        want_resp: bool,
-        ready_timeout: Duration,
-    ) -> Result<Self, SpawnError> {
-        Self::spawn_full_timeout(tablet_count, worker_count, want_resp, &[], ready_timeout)
     }
 
     /// Spawns like [`Cluster::spawn_with_tablets`] with extra environment
@@ -443,45 +426,24 @@ impl Cluster {
         want_resp: bool,
         extra_env: &[(&str, &str)],
     ) -> Result<Self, SpawnError> {
-        Self::spawn_full_timeout(
-            tablet_count,
-            worker_count,
-            want_resp,
-            extra_env,
-            READY_TIMEOUT,
-        )
-    }
-
-    /// Spawns like [`Cluster::spawn_full`] with an explicit readiness
-    /// window per member (persisted for later restarts).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SpawnError`] like [`Cluster::spawn`].
-    pub fn spawn_full_timeout(
-        tablet_count: usize,
-        worker_count: usize,
-        want_resp: bool,
-        extra_env: &[(&str, &str)],
-        ready_timeout: Duration,
-    ) -> Result<Self, SpawnError> {
         Self::spawn_full_timeout_layout(
             tablet_count,
             worker_count,
             want_resp,
             extra_env,
-            ready_timeout,
+            READY_TIMEOUT,
             "hash",
         )
     }
 
-    /// Spawns like [`Cluster::spawn_full_timeout`] with an explicit
+    /// Spawns like [`Cluster::spawn_full`] with an explicit readiness
+    /// window per member (persisted for later restarts) and an explicit
     /// namespace layout.
     ///
     /// # Errors
     ///
     /// Returns [`SpawnError`] like [`Cluster::spawn`].
-    pub fn spawn_full_timeout_layout(
+    fn spawn_full_timeout_layout(
         tablet_count: usize,
         worker_count: usize,
         want_resp: bool,
@@ -497,8 +459,6 @@ impl Cluster {
             ready_timeout,
             layout,
         )?;
-        // Single-tablet clusters keep the legacy single-leader wait;
-        // multi-tablet formations wait for every tablet to elect.
         if cluster.tablet_count == 1 {
             let _ = cluster.wait_leader();
         } else {
@@ -507,38 +467,13 @@ impl Cluster {
         Ok(cluster)
     }
 
-    /// Spawns a fresh 3-node cluster WITHOUT waiting for elections:
-    /// members are up (ready) but groups may still be campaigning. Density
-    /// probes use this with their own generous convergence loops; every
-    /// other spawn helper waits for stable leadership before returning.
+    /// Spawns a fresh 3-node cluster without waiting for elections: members
+    /// are up (ready) but groups may still be campaigning.
     ///
     /// # Errors
     ///
     /// Returns [`SpawnError`] like [`Cluster::spawn`].
-    pub fn spawn_bare(
-        tablet_count: usize,
-        worker_count: usize,
-        want_resp: bool,
-        extra_env: &[(&str, &str)],
-        ready_timeout: Duration,
-    ) -> Result<Self, SpawnError> {
-        Self::spawn_bare_layout(
-            tablet_count,
-            worker_count,
-            want_resp,
-            extra_env,
-            ready_timeout,
-            "hash",
-        )
-    }
-
-    /// Spawns like [`Cluster::spawn_bare`] with an explicit namespace
-    /// layout.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SpawnError`] like [`Cluster::spawn`].
-    pub fn spawn_bare_layout(
+    fn spawn_bare_layout(
         tablet_count: usize,
         worker_count: usize,
         want_resp: bool,
@@ -903,7 +838,7 @@ impl Cluster {
     }
 
     /// Parsed `/ready` for one member (readiness reflects replica health,
-    /// transport, membership, and leader knowledge — never just the TCP
+    /// transport, membership, and leader knowledge - never just the TCP
     /// listener).
     ///
     /// # Panics
@@ -1576,7 +1511,6 @@ impl Cluster {
         &self,
         per_tablet: usize,
     ) -> std::collections::BTreeMap<u64, Vec<String>> {
-        use kivi_state::PartitionHasher;
         let namespace = NamespaceId::from_u64(1);
         let ranges: Vec<(u64, u128, u8)> = self
             .tablets_status(self.live_index())
@@ -1609,10 +1543,7 @@ impl Cluster {
                 break;
             }
             let candidate = format!("mt-key-{i:06}");
-            let hash = PartitionHasher::V1
-                .hash(namespace, candidate.as_bytes())
-                .expect("supported")
-                .as_u128();
+            let hash = kivi_state::route_hash(namespace, candidate.as_bytes()).as_u128();
             if let Some(group) = route(hash)
                 && out[&group].len() < per_tablet
             {
@@ -1751,7 +1682,7 @@ impl Cluster {
 
     /// Coherent serving-ready predicate for a restarted member: the new
     /// process incarnation must advance past `incarnation_before` (same
-    /// `NodeId`, new process — stale process-local state keyed only by
+    /// `NodeId`, new process - stale process-local state keyed only by
     /// `NodeId` is fenced), every tablet must elect one stable leader,
     /// per-tablet applied indexes must converge across live members, every
     /// live member must agree on the exact active ordered tiling at
@@ -1829,8 +1760,8 @@ impl Cluster {
     }
 
     /// Waits until every live member reports the same exact ordered tiling
-    /// at `width` — first range starts empty, last is unbounded, adjacent
-    /// boundaries match — stable across consecutive polls. `deadline` is
+    /// at `width` - first range starts empty, last is unbounded, adjacent
+    /// boundaries match - stable across consecutive polls. `deadline` is
     /// absolute (callers with their own budget pass theirs through).
     ///
     /// # Panics
@@ -2238,7 +2169,7 @@ impl Cluster {
 
     /// Retunes the live reconciler policy on every live member (e.g.,
     /// enable auto-split). Broadcast (not leader-only): the policy is a
-    /// local live control, and leadership may move — every member holds
+    /// local live control, and leadership may move - every member holds
     /// the same tuning so whoever leads acts on it.
     ///
     /// # Panics
@@ -2604,7 +2535,7 @@ impl Cluster {
 
     /// Replaces the control voter set through joint consensus on the
     /// control leader (control-plane membership itself, §31), waiting
-    /// for the uniform successor — not just the joint commit. New
+    /// for the uniform successor - not just the joint commit. New
     /// voters must already be control learners (the reconciler admits
     /// `Active` data nodes automatically).
     ///
@@ -2763,10 +2694,15 @@ fn spawn_member(
     for (key, value) in extra_env {
         command.env(key, value);
     }
+    // The log is appended across restarts so a failure story survives, which
+    // means it already holds a previous incarnation's `KIVI_READY`. Scan from
+    // the end: readiness must be read from the bytes *this* process writes, not
+    // from the ports its predecessor used.
+    let stdout_start = std::fs::metadata(&stdout_log).map_or(0, |meta| meta.len());
     let mut child = command
         .spawn()
         .map_err(|error| SpawnError::Io(error.to_string()))?;
-    match wait_ready_file(&mut child, &stdout_log, ready_timeout) {
+    match wait_ready_file(&mut child, &stdout_log, stdout_start, ready_timeout) {
         WaitOutcome::Ready(native, admin, resp) => Ok((
             child,
             native.into_iter().next().unwrap_or_default(),
@@ -2810,13 +2746,18 @@ enum WaitOutcome {
 /// only appended bytes per quantum (the clock owns the deadline, file
 /// growth never blocks the harness). A silent stall can never hang past
 /// the deadline; early exit reports immediately.
+///
+/// `start` is the log length from before the process was spawned: everything
+/// before it belongs to a previous incarnation and must not be read as this
+/// one's readiness.
 fn wait_ready_file(
     child: &mut Child,
     stdout_log: &std::path::Path,
+    start: u64,
     timeout: Duration,
 ) -> WaitOutcome {
     use std::io::{Read as _, Seek as _};
-    let mut offset = 0u64;
+    let mut offset = start;
     let mut pending = String::new();
     let deadline = Instant::now() + timeout;
     loop {
@@ -2859,6 +2800,7 @@ fn wait_ready_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
     use serde_json::json;
 
     fn tablet_status(role: &str, applied: u64, voters: &[u64]) -> TabletStatus {
@@ -2869,121 +2811,128 @@ mod tests {
         }
     }
 
-    #[test]
-    fn tablet_statuses_reject_malformed_rows() {
-        let valid = json!([
-            {"group": 1, "role": "leader", "applied": 7, "voters": [1, 2, 3]}
-        ]);
-        assert!(parse_tablet_statuses(&valid).is_some());
-        for malformed in [
-            json!(null),
-            json!([{"group": 1, "role": "leader", "voters": [1]}]),
-            json!([{"group": 1, "role": "leader", "applied": "7", "voters": [1]}]),
-            json!([{"group": 1, "role": "unknown", "applied": 7, "voters": [1]}]),
-            json!([{"group": 1, "role": "leader", "applied": 7, "voters": [1, 1]}]),
-            json!([
-                {"group": 1, "role": "leader", "applied": 7, "voters": [1]},
-                {"group": 1, "role": "follower", "applied": 7, "voters": [1]}
-            ]),
-        ] {
-            assert!(parse_tablet_statuses(&malformed).is_none());
-        }
-    }
-
-    #[test]
-    fn single_tablet_rejects_missing_or_malformed_fields() {
+    /// The admin plane is a wire boundary the harness parses to make
+    /// convergence decisions. A row that slips through malformed is a
+    /// silently-wrong wait predicate, so every shape below must be rejected.
+    #[rstest]
+    #[case::not_a_list(
+        json!(null),
+        None
+    )]
+    #[case::missing_applied(
+        json!([{"group": 1, "role": "leader", "voters": [1]}]),
+        None
+    )]
+    #[case::applied_as_string(
+        json!([{"group": 1, "role": "leader", "applied": "7", "voters": [1]}]),
+        None
+    )]
+    #[case::unknown_role(
+        json!([{"group": 1, "role": "unknown", "applied": 7, "voters": [1]}]),
+        None
+    )]
+    #[case::repeated_voter(
+        json!([{"group": 1, "role": "leader", "applied": 7, "voters": [1, 1]}]),
+        None
+    )]
+    #[case::same_group_listed_twice(
+        json!([
+            {"group": 1, "role": "leader", "applied": 7, "voters": [1]},
+            {"group": 1, "role": "follower", "applied": 7, "voters": [1]}
+        ]),
+        None
+    )]
+    #[case::one_valid_row(
+        json!([{"group": 1, "role": "leader", "applied": 7, "voters": [1, 2, 3]}]),
+        Some(1)
+    )]
+    fn tablet_status_rows_are_all_or_nothing(
+        #[case] body: serde_json::Value,
+        #[case] groups: Option<usize>,
+    ) {
         assert_eq!(
-            parse_single_tablet(&json!({"group": 1, "role": "leader", "applied": 7})),
-            Some(("leader".to_owned(), 7))
+            parse_tablet_statuses(&body).map(|statuses| statuses.len()),
+            groups
         );
-        for malformed in [
-            json!({"role": "leader", "applied": 7}),
-            json!({"group": 1, "applied": 7}),
-            json!({"group": 1, "role": "leader"}),
-            json!({"group": 1, "role": "unknown", "applied": 7}),
-            json!({"group": 1, "role": "leader", "applied": "7"}),
-        ] {
-            assert!(parse_single_tablet(&malformed).is_none());
-        }
     }
 
-    #[test]
-    fn active_tablets_reject_malformed_directories() {
-        let valid = json!({
+    #[rstest]
+    #[case::missing_group(json!({"role": "leader", "applied": 7}), None)]
+    #[case::missing_role(json!({"group": 1, "applied": 7}), None)]
+    #[case::missing_applied(json!({"group": 1, "role": "leader"}), None)]
+    #[case::unknown_role(json!({"group": 1, "role": "unknown", "applied": 7}), None)]
+    #[case::applied_as_string(json!({"group": 1, "role": "leader", "applied": "7"}), None)]
+    #[case::complete(
+        json!({"group": 1, "role": "leader", "applied": 7}),
+        Some(("leader".to_owned(), 7))
+    )]
+    fn single_tablet_rows_are_all_or_nothing(
+        #[case] body: serde_json::Value,
+        #[case] expected: Option<(String, u64)>,
+    ) {
+        assert_eq!(parse_single_tablet(&body), expected);
+    }
+
+    #[rstest]
+    #[case::missing_version(
+        json!({"tablets": [{"tablet": 1, "state": "Active"}]}),
+        None
+    )]
+    #[case::missing_state(
+        json!({"version": 3, "tablets": [{"tablet": 1}]}),
+        None
+    )]
+    #[case::tablet_listed_twice(
+        json!({
+            "version": 3,
+            "tablets": [
+                {"tablet": 1, "state": "Active"},
+                {"tablet": 1, "state": "Tombstone"}
+            ]
+        }),
+        None
+    )]
+    #[case::active_and_tombstoned(
+        json!({
             "version": 3,
             "tablets": [
                 {"tablet": 1, "state": "Active"},
                 {"tablet": 2, "state": "Tombstone"}
             ]
-        });
-        assert_eq!(parse_active_tablets(&valid), Some(BTreeSet::from([1])));
-        for malformed in [
-            json!({"tablets": [{"tablet": 1, "state": "Active"}]}),
-            json!({"version": 3, "tablets": [{"tablet": 1}]}),
-            json!({
-                "version": 3,
-                "tablets": [
-                    {"tablet": 1, "state": "Active"},
-                    {"tablet": 1, "state": "Tombstone"}
-                ]
-            }),
-        ] {
-            assert!(parse_active_tablets(&malformed).is_none());
-        }
+        }),
+        Some(BTreeSet::from([1]))
+    )]
+    fn active_tablet_directories_are_all_or_nothing(
+        #[case] body: serde_json::Value,
+        #[case] expected: Option<BTreeSet<u64>>,
+    ) {
+        assert_eq!(parse_active_tablets(&body), expected);
     }
 
+    /// Quorum convergence: an incomplete view must never yield leaders, and
+    /// a complete one must resolve the quorum owner plus the agreed apply
+    /// position.
     #[test]
-    fn wait_rounds_reject_missing_tablets() {
+    fn wait_rounds_need_a_complete_view_then_resolve_quorum() {
         let live_nodes = vec![(0, 1), (1, 2)];
-        let active = BTreeSet::from([1, 2]);
         let mut first = TabletStatuses::new();
         first.insert(1, tablet_status("leader", 7, &[1, 2]));
         let mut second = TabletStatuses::new();
         second.insert(1, tablet_status("follower", 7, &[1, 2]));
-        let views = vec![(0, first), (1, second)];
-        assert!(leaders_from_views(&views, &live_nodes, &active).is_none());
-        assert!(converged_applied(&views, &live_nodes, &active).is_none());
-    }
 
-    #[test]
-    fn wait_rounds_accept_complete_matching_views() {
-        let live_nodes = vec![(0, 1), (1, 2)];
-        let active = BTreeSet::from([1]);
-        let mut first = TabletStatuses::new();
-        first.insert(1, tablet_status("leader", 7, &[1, 2]));
-        let mut second = TabletStatuses::new();
-        second.insert(1, tablet_status("follower", 7, &[1, 2]));
-        let views = vec![(0, first), (1, second)];
+        // A node that never reported cannot contribute a vote.
+        let partial = vec![(0, first.clone()), (1, TabletStatuses::new())];
+        assert!(leaders_from_views(&partial, &live_nodes, &BTreeSet::from([1])).is_none());
+        assert!(converged_applied(&partial, &live_nodes, &BTreeSet::from([1])).is_none());
+
+        let complete = vec![(0, first), (1, second)];
         assert_eq!(
-            leaders_from_views(&views, &live_nodes, &active),
+            leaders_from_views(&complete, &live_nodes, &BTreeSet::from([1])),
             Some(vec![(1, 0)])
         );
         assert_eq!(
-            converged_applied(&views, &live_nodes, &active),
+            converged_applied(&complete, &live_nodes, &BTreeSet::from([1])),
             Some(BTreeMap::from([(1, 7)]))
         );
-    }
-
-    #[cfg(windows)]
-    fn long_lived_child() -> Child {
-        Command::new("cmd")
-            .args(["/C", "ping -n 60 127.0.0.1 >NUL"])
-            .spawn()
-            .expect("spawn child")
-    }
-
-    #[cfg(not(windows))]
-    fn long_lived_child() -> Child {
-        Command::new("sh")
-            .args(["-c", "sleep 60"])
-            .spawn()
-            .expect("spawn child")
-    }
-
-    #[test]
-    fn partial_formation_child_cleanup_waits_for_exit() {
-        let mut child = long_lived_child();
-        terminate_child(&mut child);
-        assert!(child.try_wait().expect("child status").is_some());
     }
 }

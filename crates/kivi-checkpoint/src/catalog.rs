@@ -237,7 +237,7 @@ pub fn encode_wal_floor(mut floors: Vec<LaneFloor>) -> Result<Vec<u8>, Checkpoin
 }
 
 /// Decodes and verifies the WAL-floor record. Each entry must carry
-/// nonzero positions (a zero floor is not a floor — it is a missing
+/// nonzero positions (a zero floor is not a floor - it is a missing
 /// record, and recovery must replay from genesis instead of skipping).
 ///
 /// # Errors

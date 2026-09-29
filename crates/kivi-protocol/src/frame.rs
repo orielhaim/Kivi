@@ -147,7 +147,7 @@ bitflags::bitflags! {
 /// wire layout by construction (compile-time size-asserted below): field
 /// order, widths, and little-endianness are all visible in the type, and
 /// zerocopy moves bytes without hand-rolled slicing. Kivi still owns every
-/// other rule — magic, versions, tags, reserved-bit rejection, and bounds
+/// other rule - magic, versions, tags, reserved-bit rejection, and bounds
 /// all validate in [`FrameHeader::decode`], never in the layout.
 // Only `unsafe` in this crate: zerocopy's derive-generated trait impls.
 // Every use goes through zerocopy's safe API (`read_from_bytes`,
@@ -356,10 +356,10 @@ pub fn encode_frame(kind: FrameKind, request_id: u64, payload: &[u8]) -> Vec<u8>
 
 /// Incremental frame parser over arbitrary byte chunks.
 ///
-/// Codec state only — no I/O, no timers, no allocation beyond the output
+/// Codec state only - no I/O, no timers, no allocation beyond the output
 /// frames and the pending tail buffer (whose growth the connection bounds).
-/// The tail buffer grows on demand up to a declared in-progress frame —
-/// never pre-allocated — and releases one-shot bulk capacity back once the
+/// The tail buffer grows on demand up to a declared in-progress frame -
+/// never pre-allocated - and releases one-shot bulk capacity back once the
 /// frame completes (see [`FrameReader::buffer_ceiling`]).
 #[derive(Debug)]
 pub struct FrameReader {
@@ -401,8 +401,8 @@ impl FrameReader {
     /// Coherent buffering ceiling for a connection whose unparsed-junk
     /// bound is `input_cap`.
     ///
-    /// The input bound caps bytes that have no validated meaning yet —
-    /// junk, trickles, and unparseable prefixes — never a legal frame in
+    /// The input bound caps bytes that have no validated meaning yet -
+    /// junk, trickles, and unparseable prefixes - never a legal frame in
     /// flight. Once the buffered head parses as a header declaring a
     /// payload within this parser's `max_frame`, the ceiling rises to
     /// cover exactly that declared frame (`header + payload`), so a
@@ -450,7 +450,7 @@ impl FrameReader {
             // One-shot bulk frames must not park megabytes on the
             // connection forever: the tail buffer grew on demand to hold
             // the declared payload, and releases it once drained quiet.
-            // This never pre-sizes anything — growth stays demand-driven.
+            // This never pre-sizes anything - growth stays demand-driven.
             if self.buf.capacity() > BULK_CAPACITY_RELEASE && self.buf.len() < BULK_TAIL_QUIET {
                 self.buf.shrink_to_fit();
             }
@@ -538,20 +538,11 @@ mod tests {
         ));
     }
 
+    /// A frame arriving in pieces and several frames arriving in one read are
+    /// both normal on a TCP stream. Getting either wrong desynchronises the
+    /// connection, so the reader is exercised on both shapes.
     #[test]
-    fn header_round_trips() {
-        let header = FrameHeader::new(FrameKind::Request, 0x0102_0304_0506_0708, 11);
-        let bytes = header.encode();
-        assert_eq!(bytes.len(), FRAME_HEADER_LEN);
-        let back = FrameHeader::decode(&bytes).expect("parse");
-        assert_eq!(back, header);
-        assert_eq!(back.magic, PROTOCOL_MAGIC);
-        assert_eq!(back.request_id, 0x0102_0304_0506_0708);
-        assert_eq!(back.payload_len, 11);
-    }
-
-    #[test]
-    fn split_header_reassembles() {
+    fn a_frame_reassembles_across_a_split_and_frames_coalesce() {
         let bytes = encode_frame(FrameKind::Ping, 0, &[]);
         let mut reader = FrameReader::new(1024);
         assert!(reader.push(&bytes[..10]).expect("partial").is_empty());
@@ -560,10 +551,7 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].kind, FrameKind::Ping);
         assert_eq!(reader.end(), Ok(()));
-    }
 
-    #[test]
-    fn coalesced_frames_all_parse() {
         let mut blob = encode_frame(FrameKind::Ping, 1, &[]);
         blob.extend_from_slice(&encode_frame(FrameKind::Pong, 2, b"xy"));
         blob.extend_from_slice(&encode_frame(FrameKind::Ping, 3, &[]));
@@ -624,18 +612,24 @@ mod tests {
         );
     }
 
+    /// A declared length above the negotiated bound must be refused on
+    /// arrival, before its payload is buffered, rather than after waiting for
+    /// bytes that will never come. Bytes left over when the peer closes are a
+    /// truncated frame, not a clean end.
     #[test]
-    fn oversized_declared_length_fails_before_payload_arrives() {
+    fn an_oversized_declaration_fails_on_arrival_and_a_partial_tail_is_truncation() {
         let mut bytes = encode_frame(FrameKind::Request, 9, b"tiny");
         // Rewrite the length to a huge value without sending the payload.
         bytes[10..14].copy_from_slice(&(1u32 << 26).to_le_bytes());
-        // The oversized declaration must fail immediately, without waiting
-        // for 64 MiB that will never arrive.
         let mut reader = FrameReader::new(1024);
         assert!(matches!(
             reader.push(&bytes),
             Err(ProtocolError::Oversized { .. })
         ));
+
+        let mut reader = FrameReader::new(1024);
+        reader.push(&[1, 2, 3]).expect("buffered");
+        assert_eq!(reader.end(), Err(ProtocolError::Truncated));
     }
 
     #[rstest]
@@ -680,13 +674,6 @@ mod tests {
             reader.push(&bad),
             Err(ProtocolError::UnknownKind { .. })
         ));
-    }
-
-    #[test]
-    fn trailing_bytes_at_close_are_truncation() {
-        let mut reader = FrameReader::new(1024);
-        reader.push(&[1, 2, 3]).expect("buffered");
-        assert_eq!(reader.end(), Err(ProtocolError::Truncated));
     }
 
     proptest! {

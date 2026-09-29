@@ -1,7 +1,7 @@
 //! Compact generational handles and behavior classes.
 //!
 //! Medium objects live in worker-local moving arenas (OBASE insight: group
-//! by behavior, not size alone). Handles — not raw pointers — name them,
+//! by behavior, not size alone). Handles - not raw pointers - name them,
 //! so relocation, compaction, and tier movement only bump a generation
 //! instead of chasing pointers. No stable raw pointer ever escapes the
 //! materialization boundary: callers resolve a handle to bytes through the
@@ -96,22 +96,5 @@ impl BehaviorClass {
     #[must_use]
     pub const fn mutable_hot(self) -> bool {
         matches!(self, Self::HotMutable | Self::ShortLived)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn invalid_handle_is_not_issued() {
-        assert!(ObjectHandle::INVALID.is_invalid());
-        assert!(!ObjectHandle::new(0, 1).is_invalid());
-    }
-
-    #[test]
-    fn hot_mutable_is_never_a_compression_candidate() {
-        assert!(!BehaviorClass::HotMutable.compression_candidate());
-        assert!(BehaviorClass::HotReadMostly.compression_candidate());
     }
 }

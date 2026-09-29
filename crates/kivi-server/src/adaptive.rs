@@ -576,7 +576,7 @@ impl AdaptiveRuntime {
             }
             // The hardware reading carries its own provenance, so it is the one
             // sample in this loop that does not share the fabric metadata. A
-            // worker with no counters still reports — the software-only reading
+            // worker with no counters still reports - the software-only reading
             // is a fact about the machine, and a consumer must be able to tell
             // "measured nothing" from "was not asked".
             if let Some((_, reading)) = inputs.hardware.iter().find(|(id, _)| id == worker) {

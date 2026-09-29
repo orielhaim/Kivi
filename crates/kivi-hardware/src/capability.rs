@@ -276,7 +276,7 @@ pub enum PmuCounter {
     Migrations,
     /// Nanoseconds the calling thread was scheduled for.
     ///
-    /// Not a hardware counter — the kernel synthesises it — but it is the only
+    /// Not a hardware counter - the kernel synthesises it - but it is the only
     /// interval denominator a machine with no virtualised PMU has, and naming it
     /// separately is what lets a consumer tell "no denominator" from "hardware
     /// cycles".
@@ -632,33 +632,38 @@ pub fn snapshot() -> &'static Capabilities {
 mod tests {
     use super::*;
 
+    /// Detection must never fail and must see at least one processor, and two
+    /// reads of the same machine must agree - otherwise two subsystems would
+    /// disagree about the snapshot they share.
     #[test]
-    fn detection_never_fails_and_always_has_a_cpu() {
+    fn detection_never_fails_and_is_deterministic() {
         let capabilities = Capabilities::detect();
         assert!(capabilities.topology.logical_cpu_count() >= 1);
         assert!(capabilities.topology.physical_core_count() >= 1);
-    }
-
-    #[test]
-    fn detection_is_deterministic() {
-        assert_eq!(Capabilities::detect(), Capabilities::detect());
-    }
-
-    #[test]
-    fn snapshot_is_shared() {
+        assert_eq!(capabilities, Capabilities::detect());
         assert!(std::ptr::eq(snapshot(), snapshot()));
     }
 
+    /// An absent capability must carry the reason an operator can act on, not
+    /// a bare false, and a present one must expose its value.
     #[test]
-    fn unavailable_carries_a_reason() {
-        let support: Support<u8> = Support::Unavailable(Unavailable::PermissionDenied);
-        assert_eq!(support.get(), None);
-        assert_eq!(support.unavailable(), Some(&Unavailable::PermissionDenied));
-        assert!(!support.is_available());
+    fn absence_carries_a_reason_and_presence_carries_a_value() {
+        let present: Support<u8> = Support::Available(7);
+        assert!(present.is_available());
+        assert_eq!(present.get(), Some(&7));
+        assert_eq!(present.unavailable(), None);
+
+        let absent: Support<u8> = Support::Unavailable(Unavailable::PermissionDenied);
+        assert!(!absent.is_available());
+        assert_eq!(absent.get(), None);
+        assert_eq!(absent.unavailable(), Some(&Unavailable::PermissionDenied));
     }
 
+    /// Every mechanism is named exactly once. An enumerated device reports by
+    /// presence only: enumeration proves the hardware exists, not that a Kivi
+    /// backend opened it, so it must never read as usable when nothing is.
     #[test]
-    fn every_mechanism_is_reported_exactly_once() {
+    fn mechanisms_are_named_once_and_enumeration_is_not_a_backend() {
         let capabilities = Capabilities::detect();
         let mechanisms = capabilities.mechanisms();
         let mut names: Vec<&str> = mechanisms.iter().map(|m| m.name).collect();
@@ -666,14 +671,7 @@ mod tests {
         names.dedup();
         assert_eq!(names.len(), mechanisms.len());
         assert!(names.contains(&"pmu"));
-    }
-
-    #[test]
-    fn an_enumerated_device_is_not_a_backend() {
-        // Enumeration proves hardware exists. It does not prove a Kivi backend
-        // opened it, so these are reported by presence, not as usable.
-        let capabilities = Capabilities::detect();
-        for mechanism in capabilities.mechanisms() {
+        for mechanism in &mechanisms {
             if matches!(mechanism.name, "cxl-memory" | "rdma" | "dsa") {
                 assert_eq!(
                     mechanism.support.unavailable(),

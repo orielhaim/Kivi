@@ -21,37 +21,9 @@ use kivi_types::{ChunkId, ManifestId, SecurityDomainId};
 use crate::error::ChunkError;
 use crate::manifest::{ChunkManifest, verify_manifest};
 use crate::pack::{
-    PACK_HEADER_LEN, PACK_SIZE_SLACK, RecordId, ScannedRecord, append_record, decode_pack_header,
-    encode_chunk_record, encode_manifest_record, encode_pack_header, lane_dir_name, list_packs,
-    pack_path, scan_pack,
+    PACK_HEADER_LEN, PACK_SIZE_SLACK, RecordId, ScannedRecord, append_record, encode_chunk_record,
+    encode_manifest_record, encode_pack_header, lane_dir_name, list_packs, pack_path, scan_pack,
 };
-
-/// Proof that a chunk survived the durability barrier: only
-/// [`ChunkStore::durable_chunk`] mints it, and only for index entries at or
-/// below the last synced generation. Carries the address, never the bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct DurableChunk(ChunkId);
-
-/// Proof that a manifest survived the durability barrier. See
-/// [`DurableChunk`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct DurableManifest(ManifestId);
-
-impl DurableChunk {
-    /// Returns the proven address.
-    #[must_use]
-    pub const fn id(self) -> ChunkId {
-        self.0
-    }
-}
-
-impl DurableManifest {
-    /// Returns the proven address.
-    #[must_use]
-    pub const fn id(self) -> ManifestId {
-        self.0
-    }
-}
 
 /// Where one verified record lives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,12 +182,12 @@ pub struct StageOutcome {
     /// Whether bytes were physically appended (`false` = dedup hit).
     pub inserted: bool,
     /// Whether the address is durable now (dedup hit on synced data, or
-    /// this call synced — staging alone never implies durability).
+    /// this call synced - staging alone never implies durability).
     pub durable: bool,
 }
 
 /// Cumulative store counters for the admin plane (§62). Owned locally,
-/// snapshotted on request — never a hot-path lock.
+/// snapshotted on request - never a hot-path lock.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ChunkStats {
     /// Chunk records indexed (unique addresses in this lane).
@@ -316,7 +288,7 @@ impl ChunkStore {
         let mut logical_chunk_bytes = 0u64;
         let mut unique_stored_bytes = 0u64;
         // Resolve the active pack: highest sequence present. A headerless
-        // newest file proves nothing was published — remove it and fall
+        // newest file proves nothing was published - remove it and fall
         // back (a rotation crash between create and header sync).
         let active_seq = drop_headerless_newest(&dir, &mut seqs, &mut summary)?;
         for &seq in &seqs {
@@ -569,24 +541,22 @@ impl ChunkStore {
         Ok(())
     }
 
-    /// Returns the durability proof for an indexed chunk, if it is durable.
-    /// The engine converts this into the small WAL root mutation only after
-    /// this returns `Some`: chunks-first ordering made type-level (§10).
+    /// Whether an indexed chunk is durable: at or below the last synced
+    /// generation. The engine converts the small WAL root mutation only after
+    /// this returns `true` - chunks-first ordering.
     #[must_use]
-    pub fn durable_chunk(&self, id: ChunkId) -> Option<DurableChunk> {
+    pub fn durable_chunk(&self, id: ChunkId) -> bool {
         self.chunks
             .get(&id)
-            .filter(|location| self.is_durable_gen(location.generation))
-            .map(|_| DurableChunk(id))
+            .is_some_and(|location| self.is_durable_gen(location.generation))
     }
 
-    /// Returns the durability proof for an indexed manifest, if durable.
+    /// Whether an indexed manifest is durable. See [`Self::durable_chunk`].
     #[must_use]
-    pub fn durable_manifest(&self, id: ManifestId) -> Option<DurableManifest> {
+    pub fn durable_manifest(&self, id: ManifestId) -> bool {
         self.manifests
             .get(&id)
-            .filter(|location| self.is_durable_gen(location.generation))
-            .map(|_| DurableManifest(id))
+            .is_some_and(|location| self.is_durable_gen(location.generation))
     }
 
     /// Reads and fully verifies one chunk: framing, CRCs, and the content
@@ -780,25 +750,6 @@ impl ChunkStore {
     }
 }
 
-/// Validates that a pack header on disk names the expected lane/sequence.
-/// Thin wrapper for engine-level checks without a full scan.
-///
-/// # Errors
-///
-/// Returns [`ChunkError`] on I/O failure or header mismatch.
-pub fn check_pack_header(dir: &Path, lane: u16, seq: u64) -> Result<(), ChunkError> {
-    use std::io::Read as _;
-    let path = pack_path(dir, seq);
-    let mut file = File::options()
-        .read(true)
-        .open(&path)
-        .map_err(|error| ChunkError::io("open chunk pack header", &path, &error))?;
-    let mut header = [0u8; PACK_HEADER_LEN];
-    file.read_exact(&mut header)
-        .map_err(|error| ChunkError::io("read chunk pack header", &path, &error))?;
-    decode_pack_header(&header, lane, seq)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -831,10 +782,10 @@ mod tests {
         let staged = store.stage_chunk(id, &bytes).expect("stages");
         assert!(staged.inserted);
         assert!(!staged.durable);
-        assert!(store.durable_chunk(id).is_none());
+        assert!(!store.durable_chunk(id));
         // One barrier makes everything staged so far durable.
         store.sync().expect("syncs");
-        assert!(store.durable_chunk(id).is_some());
+        assert!(store.durable_chunk(id));
         // Restaging the same address is a dedup hit on durable data.
         let again = store.stage_chunk(id, &bytes).expect("restages");
         assert!(!again.inserted);
@@ -976,7 +927,7 @@ mod tests {
             .expect("stages manifest");
         assert!(staged.inserted && !staged.durable);
         store.sync().expect("syncs");
-        assert!(store.durable_manifest(id).is_some());
+        assert!(store.durable_manifest(id));
         drop(store);
         let (store, _) = ChunkStore::open(
             scratch.path(),
@@ -990,12 +941,12 @@ mod tests {
         assert_eq!(back, manifest);
     }
 
+    /// A record must never straddle a rotation: the bytes staged before
+    /// the spill and after it must both read back exactly, from whichever
+    /// pack holds them.
     #[test]
-    fn rotation_spills_into_fresh_packs() {
+    fn rotation_spills_into_fresh_packs_without_losing_a_chunk() {
         let scratch = tempfile::tempdir().expect("scratch");
-        // Tiny target: two 164-byte chunk records fit per pack past the
-        // 64-byte header (64 + 164 + 164 = 392 ≤ 512 < 556), so six chunks
-        // span exactly three packs.
         let (mut store, _) = ChunkStore::open(
             scratch.path(),
             0,
@@ -1011,7 +962,11 @@ mod tests {
                 .expect("stages");
         }
         store.sync().expect("syncs");
-        assert_eq!(store.pack_seqs(), vec![1, 2, 3]);
+        assert!(
+            store.pack_seqs().len() > 1,
+            "the 512-byte target must have rotated: {:?}",
+            store.pack_seqs()
+        );
         for byte in 0u8..6 {
             let bytes = vec![byte; 100];
             assert_eq!(

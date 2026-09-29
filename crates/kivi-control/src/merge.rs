@@ -32,6 +32,11 @@ pub enum MergePhase {
     BaseSeeded,
     /// Both parents fenced; final tails installed.
     Fenced,
+    /// Proven: the merged group holds the planned voters, has a live leader,
+    /// and is not measurably behind. The only phase from which routing may be
+    /// published - see [`SplitPhase`](crate::split::SplitPhase), whose argument
+    /// applies identically here.
+    TargetReady,
     /// Directory cutover published (parents retired with redirect,
     /// merged active).
     CutoverCommitted,
@@ -50,6 +55,30 @@ impl MergePhase {
         matches!(self, Self::Completed | Self::Failed)
     }
 
+    /// Whether readiness gating is reported for this phase. See
+    /// [](crate::split::SplitPhase::needs_children_ready):
+    /// the same three phases, for the same reasons, against the merge target.
+    #[must_use]
+    pub const fn needs_target_ready(self) -> bool {
+        matches!(
+            self,
+            Self::BaseSeeded | Self::Fenced | Self::CutoverCommitted
+        )
+    }
+
+    /// Every phase, for exhaustive checks over the lifecycle.
+    pub const ALL: [Self; 9] = [
+        Self::Planned,
+        Self::TargetAllocated,
+        Self::BaseSeeded,
+        Self::Fenced,
+        Self::TargetReady,
+        Self::CutoverCommitted,
+        Self::ParentsRetiring,
+        Self::Completed,
+        Self::Failed,
+    ];
+
     pub(crate) fn can_advance_to(self, next: Self) -> bool {
         self == next
             || matches!(
@@ -59,8 +88,9 @@ impl MergePhase {
                     | (Self::BaseSeeded, Self::Fenced | Self::Failed)
                     | (
                         Self::Fenced,
-                        Self::BaseSeeded | Self::CutoverCommitted | Self::Failed
+                        Self::BaseSeeded | Self::TargetReady | Self::Failed
                     )
+                    | (Self::TargetReady, Self::CutoverCommitted | Self::Failed)
                     | (Self::CutoverCommitted, Self::ParentsRetiring | Self::Failed)
                     | (Self::ParentsRetiring, Self::Completed | Self::Failed)
             )
@@ -74,10 +104,11 @@ impl MergePhase {
             Self::TargetAllocated => 1,
             Self::BaseSeeded => 2,
             Self::Fenced => 3,
+            Self::TargetReady => 6,
             Self::CutoverCommitted => 4,
             Self::ParentsRetiring => 5,
-            Self::Completed => 6,
-            Self::Failed => 7,
+            Self::Completed => 7,
+            Self::Failed => 8,
         }
     }
 
@@ -94,8 +125,9 @@ impl MergePhase {
             3 => Ok(Self::Fenced),
             4 => Ok(Self::CutoverCommitted),
             5 => Ok(Self::ParentsRetiring),
-            6 => Ok(Self::Completed),
-            7 => Ok(Self::Failed),
+            6 => Ok(Self::TargetReady),
+            7 => Ok(Self::Completed),
+            8 => Ok(Self::Failed),
             _ => Err(MergeError::BadPhase { found: byte }),
         }
     }
@@ -103,7 +135,6 @@ impl MergePhase {
 
 /// Why a merge plan was rejected.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
 pub enum MergeError {
     /// Unknown phase discriminant.
     #[error("unknown merge phase discriminant {found}")]
@@ -299,6 +330,87 @@ mod tests {
                 PlacementVersion::INITIAL,
             ),
             Err(MergeError::BadIdentities)
+        ));
+    }
+
+    /// Every phase that can follow `from`, per the transition table.
+    fn successors(from: MergePhase) -> Vec<MergePhase> {
+        MergePhase::ALL
+            .into_iter()
+            .filter(|to| from.can_advance_to(*to))
+            .collect()
+    }
+
+    /// Publishing routing to the merge target requires a readiness proof.
+    ///
+    /// The merge-side statement of the split's invariant. A merge retires *two*
+    /// parents once the cutover lands, so a target that cannot serve is not a
+    /// degraded range - it is two lost ones.
+    #[test]
+    fn publishing_routing_requires_a_readiness_proof() {
+        assert_eq!(
+            successors(MergePhase::Fenced),
+            vec![
+                MergePhase::BaseSeeded,
+                MergePhase::Fenced,
+                MergePhase::TargetReady,
+                MergePhase::Failed,
+            ],
+            "Fenced reaches TargetReady; it must not reach CutoverCommitted directly"
+        );
+        assert_eq!(
+            successors(MergePhase::TargetReady),
+            vec![
+                MergePhase::TargetReady,
+                MergePhase::CutoverCommitted,
+                MergePhase::Failed,
+            ]
+        );
+        for from in MergePhase::ALL {
+            if matches!(from, MergePhase::TargetReady | MergePhase::CutoverCommitted) {
+                continue;
+            }
+            assert!(
+                !from.can_advance_to(MergePhase::CutoverCommitted),
+                "{from:?} must not publish routing without TargetReady"
+            );
+        }
+    }
+
+    /// A plan cannot walk back to a phase that has not published routing.
+    #[test]
+    fn a_plan_cannot_regress_past_the_cutover() {
+        let past = |phase: MergePhase| {
+            matches!(
+                phase,
+                MergePhase::CutoverCommitted | MergePhase::ParentsRetiring | MergePhase::Completed
+            )
+        };
+        for from in MergePhase::ALL {
+            for to in successors(from) {
+                if past(from) && !to.is_terminal() {
+                    assert!(
+                        past(to),
+                        "{from:?} -> {to:?} walks back to a phase that has not published \
+                         routing; both parents are already tombstones with redirects"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every phase round-trips through a discriminant of its own.
+    #[test]
+    fn every_phase_round_trips_through_its_discriminant() {
+        let mut seen = std::collections::BTreeSet::new();
+        for phase in MergePhase::ALL {
+            let byte = phase.encode_byte();
+            assert!(seen.insert(byte), "{phase:?} reuses discriminant {byte}");
+            assert_eq!(MergePhase::decode_byte(byte), Ok(phase));
+        }
+        assert!(matches!(
+            MergePhase::decode_byte(9),
+            Err(MergeError::BadPhase { found: 9 })
         ));
     }
 }

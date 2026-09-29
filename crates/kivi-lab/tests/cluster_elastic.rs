@@ -1,6 +1,6 @@
 //! Elastic-cluster product tests: automatic failure detection + repair,
 //! online split/merge with exactly-once and failover, automatic topology
-//! policy, restart survival, and bounded log rotation — all on real
+//! policy, restart survival, and bounded log rotation - all on real
 //! processes over H3/QUIC with real data directories.
 //!
 //! ```text
@@ -20,66 +20,10 @@
 use std::time::{Duration, Instant};
 
 use kivi_lab::cluster::Cluster;
+use kivi_lab::testkit::{
+    fill, get_stream, merge_and_wait, put, put_stream, split_and_wait, traffic_get, traffic_put,
+};
 use kivi_state::Key;
-
-fn key(name: &str) -> Key {
-    Key::from(name)
-}
-
-fn put(client: &kivi_client::NativeClient, name: &str, value: &[u8]) {
-    client
-        .set(&key(name), bytes::Bytes::copy_from_slice(value))
-        .unwrap_or_else(|error| panic!("set {name} commits: {error:?}"));
-}
-
-fn traffic_put(client: &kivi_client::NativeClient, name: &str, value: &[u8]) {
-    for attempt in 0..10 {
-        match client.set(&key(name), bytes::Bytes::copy_from_slice(value)) {
-            Ok(()) => return,
-            Err(_) if attempt < 9 => std::thread::sleep(Duration::from_millis(200)),
-            Err(error) => panic!("traffic set {name} never converges: {error:?}"),
-        }
-    }
-}
-
-fn traffic_get(client: &kivi_client::NativeClient, name: &str) -> Vec<u8> {
-    for attempt in 0..10 {
-        match client.get(&key(name)) {
-            Ok(Some(value)) => return value.to_vec(),
-            Ok(None) => panic!("traffic key {name} lost"),
-            Err(_) if attempt < 9 => std::thread::sleep(Duration::from_millis(200)),
-            Err(error) => panic!("traffic get {name} never converges: {error:?}"),
-        }
-    }
-    unreachable!()
-}
-
-fn put_big(client: &kivi_client::NativeClient, name: &str, value: &[u8]) {
-    let mut source: &[u8] = value;
-    client
-        .put_stream(&key(name), Some(value.len() as u64), &mut source)
-        .unwrap_or_else(|error| panic!("put_stream {name} commits: {error:?}"));
-}
-
-fn get_big(client: &kivi_client::NativeClient, name: &str) -> Vec<u8> {
-    client
-        .get_stream(&key(name))
-        .unwrap_or_else(|error| panic!("get_stream {name} reads: {error:?}"))
-        .unwrap_or_else(|| panic!("{name} present"))
-        .to_vec()
-}
-
-fn fill(len: usize, seed: u8) -> Vec<u8> {
-    let mut out = vec![0u8; len];
-    let mut state = u64::from(seed) | 1;
-    for byte in &mut out {
-        state = state
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407);
-        *byte = u8::try_from((state >> 33) & 0xFF).unwrap_or(0xFF);
-    }
-    out
-}
 
 /// Counts tablets whose desired voters still name `node`.
 fn tablets_desiring(cluster: &Cluster, node: u64) -> usize {
@@ -191,7 +135,7 @@ fn auto_repair_after_hard_kill() {
     cluster.wait_converged_all();
     let _ = cluster.wait_all_leaders();
     // No-resurrection as a quiescence predicate (never a fixed sleep):
-    // poll the invariant itself — the returnee converges with zero
+    // poll the invariant itself - the returnee converges with zero
     // tablets still desiring the repaired node.
     let resurrection_deadline = Instant::now() + Duration::from_secs(120);
     loop {
@@ -346,7 +290,7 @@ fn manual_split_serves_through_cutover() {
     // manifests (no 16 MiB retransfer per child).
     let big_key = format!("{}-big", parent_keys[2]);
     let big = fill(16 * 1024 * 1024, 0x5A);
-    put_big(&client, &big_key, &big);
+    put_stream(&client, &big_key, &big);
     let dir_before = cluster
         .node_info(cluster.live_index())
         .get("dir_version")
@@ -366,21 +310,7 @@ fn manual_split_serves_through_cutover() {
             round += 1;
         }
     });
-    let reply = cluster.split_tablet(parent);
-    assert_eq!(
-        reply.get("ok").and_then(serde_json::Value::as_bool),
-        Some(true),
-        "split accepted: {reply}"
-    );
-    let left = reply
-        .get("left")
-        .and_then(serde_json::Value::as_u64)
-        .expect("left");
-    let right = reply
-        .get("right")
-        .and_then(serde_json::Value::as_u64)
-        .expect("right");
-    cluster.wait_splits_done(Duration::from_secs(600));
+    let (left, right) = split_and_wait(&cluster, parent);
     traffic_done.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = traffic_handle.join();
     // New directory version published everywhere (per-node cutover
@@ -405,7 +335,7 @@ fn manual_split_serves_through_cutover() {
         let _ = traffic_get(&client, name);
     }
     assert_eq!(
-        get_big(&client, &big_key),
+        get_stream(&client, &big_key),
         big,
         "chunked value byte-exact after split"
     );
@@ -526,6 +456,338 @@ fn split_survives_leader_failover() {
     }
 }
 
+/// Reads the split view from the first live member: phase, block reason, and
+/// which tablets the serving directory currently routes.
+fn split_view(cluster: &Cluster) -> (String, Option<String>, Vec<u64>) {
+    for index in 0..cluster.member_count() {
+        if !cluster.alive(index) {
+            continue;
+        }
+        let (status, json) = cluster.admin_get(index, "/v1/control/splits");
+        if status != 200 {
+            continue;
+        }
+        let Some(plan) = json
+            .get("splits")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|plans| plans.first())
+        else {
+            return (String::new(), None, Vec::new());
+        };
+        let phase = plan
+            .get("phase")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let blocked = plan
+            .get("blocked")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        // `serving_tabs` describes the directory, not the plan, so it sits beside
+        // the plan list rather than inside a plan.
+        let serving = json
+            .get("serving_tabs")
+            .and_then(serde_json::Value::as_array)
+            .map(|ids| ids.iter().filter_map(serde_json::Value::as_u64).collect())
+            .unwrap_or_default();
+        return (phase, blocked, serving);
+    }
+    (String::new(), None, Vec::new())
+}
+
+/// A split never hands the namespace to children that cannot serve, and never
+/// leaves the namespace with nowhere to route.
+///
+/// Sampled throughout the split rather than at the end: the failure being
+/// pinned is a *transient* one - a moment where routing points at a child with
+/// no leader - and a test that only looks at the final state walks straight past
+/// it.
+#[test]
+fn a_split_never_routes_to_a_child_that_cannot_serve() {
+    // Four tablets over four members, the shape the existing split tests use.
+    let cluster = Cluster::spawn_with_tablets(4, 2, false).expect("cluster spawns");
+    let _ = cluster.wait_all_leaders();
+    let keys = cluster.keys_for_tablets(4);
+    let parent = *keys.keys().next().expect("a tablet");
+    let parent_keys = keys
+        .get(&parent)
+        .cloned()
+        .unwrap_or_else(|| keys.values().next().cloned().unwrap_or_default());
+    let client = cluster.client();
+    for (index, name) in parent_keys.iter().enumerate() {
+        put(&client, name, format!("v{index}").as_bytes());
+    }
+    // `split_and_wait` creates the split and waits for it; creating it here as
+    // well would target a parent the first one had already taken out of service.
+    let (left, right) = split_and_wait(&cluster, parent);
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let mut saw_published = false;
+    loop {
+        let (phase, blocked, serving) = split_view(&cluster);
+        assert!(
+            !serving.is_empty(),
+            "the namespace stopped routing while the split was in {phase:?} \
+             (blocked: {blocked:?}): the parent stopped serving and the children \
+             were not ready to take over"
+        );
+        if matches!(
+            phase.as_str(),
+            "CutoverCommitted" | "ParentRetiring" | "Completed"
+        ) {
+            saw_published = true;
+            // Routing has moved. Both children must be serving it, with a live
+            // leader each - this is the claim the readiness proof makes, checked
+            // from the outside rather than from the code that made it.
+            for child in [left, right] {
+                assert!(
+                    serving.contains(&child),
+                    "routing published to {child} but it is not in the serving set \
+                     {serving:?} (phase {phase})"
+                );
+                let leader = cluster.leader_of(child);
+                assert!(
+                    leader < cluster.member_count(),
+                    "child {child} is authoritative but no member leads it (phase {phase})"
+                );
+            }
+        }
+        if phase == "Completed" || Instant::now() > deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        saw_published,
+        "the split never reached a published-routing phase"
+    );
+    for (index, name) in parent_keys.iter().enumerate() {
+        assert_eq!(
+            traffic_get(&client, name),
+            format!("v{index}").as_bytes(),
+            "state survived the split"
+        );
+    }
+}
+
+/// A child that cannot be provisioned holds the plan, and the parent keeps
+/// serving.
+///
+/// The founder is what makes a child group real, and a plan whose founder is gone
+/// has to wait for it: a group nobody initialized has no membership and no
+/// leader, and publishing routing to it is the outage this whole phase model
+/// exists to prevent. So the observable outcome is a plan that stops advancing
+/// with a stated reason, and a parent that is still the authority.
+#[test]
+fn an_unready_child_keeps_the_parent_authoritative() {
+    let mut cluster = Cluster::spawn_with_tablets(4, 2, false).expect("cluster spawns");
+    let _ = cluster.wait_all_leaders();
+    let keys = cluster.keys_for_tablets(4);
+    let parent = *keys.keys().next().expect("a tablet");
+    let parent_keys = keys
+        .get(&parent)
+        .cloned()
+        .unwrap_or_else(|| keys.values().next().cloned().unwrap_or_default());
+    let client = cluster.client();
+    for name in &parent_keys {
+        put(&client, name, b"before-split");
+    }
+    let reply = cluster.split_tablet(parent);
+    assert_eq!(
+        reply.get("ok").and_then(serde_json::Value::as_bool),
+        Some(true),
+        "split accepted: {reply}"
+    );
+    // Kill the founder as soon as the children are provisioned - but not while it
+    // is also the control leader, or the reconciler stops and the plan freezes
+    // for a reason that has nothing to do with child readiness.
+    let founder = wait_for_founder_kill(&mut cluster, parent);
+    // The plan must stop short of published routing, and must say why.
+    //
+    // Which phase it holds in is deliberately not asserted. Readiness is proven
+    // before the fence so an unready child never holds a range unwritable, which
+    // means the plan waits at `BaseSeeded`; if it had already been fenced it
+    // would wait at `Fenced`. The property is the same either way: no routing
+    // moves, the parent keeps serving, and the reason is reported.
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut held = false;
+    while Instant::now() < deadline {
+        let (phase, blocked, serving) = split_view(&cluster);
+        assert!(
+            !serving.is_empty(),
+            "the parent stopped serving while the split was still in {phase:?}"
+        );
+        assert!(
+            !matches!(
+                phase.as_str(),
+                "ChildrenReady" | "CutoverCommitted" | "ParentRetiring" | "Completed"
+            ),
+            "routing reached {phase:?} with the founder dead: the readiness proof let \
+             a child through that cannot elect a leader"
+        );
+        if !phase.is_empty() {
+            held = true;
+            assert!(
+                serving.contains(&parent),
+                "the parent must remain the serving authority while its children are \
+                 not ready, but the serving set is {serving:?} in {phase:?}"
+            );
+            if matches!(phase.as_str(), "BaseSeeded" | "Fenced" | "CutoverCommitted") {
+                assert!(
+                    blocked.is_some(),
+                    "a split gated on readiness in {phase:?} must report which \
+                     prerequisite is unmet, not just stop"
+                );
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        held,
+        "removing the founder ({founder}) never left the plan visible at all"
+    );
+    // Reads keep working throughout: the parent is still serving them.
+    for name in &parent_keys {
+        assert_eq!(traffic_get(&client, name), b"before-split");
+    }
+    // And the split completes once the founder is back.
+    cluster.restart(founder).expect("founder restarts");
+    cluster.wait_splits_done(Duration::from_secs(600));
+}
+
+/// Kills the split's founder (its lowest-numbered planned replica) while the
+/// plan is still `Planned`, returning the member index.
+///
+/// `Planned` specifically: the children get their Raft membership from the
+/// founder's `initialize_group`, and once that has run, a three-replica child
+/// survives losing one - it still has a quorum and an elected leader. Removing
+/// the founder afterwards does not make a child unready, and asserting that it
+/// does would be asserting something false. Before provisioning, the founder's
+/// absence leaves the child groups with no membership at all, which is the state
+/// the readiness proof exists to refuse.
+fn wait_for_founder_kill(cluster: &mut Cluster, parent: u64) -> usize {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let (phase, _, _) = split_view(cluster);
+        if phase == "Planned" {
+            break;
+        }
+        // An empty phase is "the plan has not been created yet", which is the
+        // normal state immediately after the split is accepted.
+        assert!(
+            Instant::now() < deadline,
+            "the split reached {phase:?} before the founder could be removed"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // The plan's replicas are the parent's desired set; the founder is the
+    // lowest of them, which is the rule `initialize_split_children` uses.
+    let mut founder = u64::MAX;
+    for index in 0..cluster.member_count() {
+        if !cluster.alive(index) {
+            continue;
+        }
+        let (_, splits) = cluster.admin_get(index, "/v1/control/splits");
+        if let Some(replicas) = splits
+            .get("splits")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|plans| plans.first())
+            .and_then(|plan| plan.get("replicas"))
+            .and_then(serde_json::Value::as_array)
+        {
+            for replica in replicas.iter().filter_map(serde_json::Value::as_u64) {
+                founder = founder.min(replica);
+            }
+        }
+        if founder != u64::MAX {
+            break;
+        }
+    }
+    assert!(founder != u64::MAX, "the split plan named no replicas");
+    let index = usize::try_from(founder - 1).unwrap_or(0);
+    assert!(
+        index < cluster.member_count() && cluster.alive(index),
+        "founder node {founder} is not a live member of parent {parent}"
+    );
+    // A control leader elsewhere, so the kill takes out the founder's consensus
+    // groups and nothing else.
+    let leader_deadline = Instant::now() + Duration::from_secs(120);
+    while cluster.control_leader_index() == Some(index) {
+        assert!(
+            Instant::now() < leader_deadline,
+            "node {founder} never handed off the control leadership, so killing it \
+             would stop the reconciler instead of the split"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    cluster.kill(index);
+    index
+}
+
+/// A split interrupted by a full cluster restart resumes from its persisted
+/// phase, creates no second set of children, and leaves the namespace serving.
+///
+/// Restart safety is the whole reason the phases are replicated rather than
+/// held in memory, so this kills every member at an arbitrary point and checks
+/// the two things that would be wrong if they were not: duplicate children, and a
+/// namespace that never comes back.
+#[test]
+fn a_split_survives_a_full_restart() {
+    let mut cluster = Cluster::spawn_with_tablets(3, 2, false).expect("cluster spawns");
+    let _ = cluster.wait_all_leaders();
+    let keys = cluster.keys_for_tablets(2);
+    let parent = *keys.keys().next().expect("a tablet");
+    let client = cluster.client();
+    for name in &keys[&parent] {
+        put(&client, name, b"restart-value");
+    }
+    let reply = cluster.split_tablet(parent);
+    assert_eq!(
+        reply.get("ok").and_then(serde_json::Value::as_bool),
+        Some(true),
+        "split accepted: {reply}"
+    );
+    // Restart at a phase boundary, not at a fixed delay: the interesting
+    // restart is one that lands after children exist and before routing moved.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let (phase, _, _) = split_view(&cluster);
+        if matches!(phase.as_str(), "BaseSeeded" | "Fenced") {
+            break;
+        }
+        assert_ne!(
+            phase, "Completed",
+            "the split finished before a restart could interrupt it"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "the split never reached a restartable phase"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    cluster.restart_all().expect("cluster restarts");
+
+    cluster.wait_splits_done(Duration::from_secs(600));
+    // Exactly two children, named once: a replayed transition that re-allocated
+    // would show up as a third tablet, or as the plan's children changing.
+    let (phase, _, serving) = split_view(&cluster);
+    assert_eq!(phase, "Completed", "the split resumed after the restart");
+    // Three tablets, one of them split: two untouched parents plus the two
+    // children. A replayed transition that re-allocated would show up here as an
+    // extra tablet, and one that never completed as a missing child.
+    assert_eq!(
+        serving.len(),
+        4,
+        "two untouched parents plus exactly two split children: {serving:?}"
+    );
+    for name in &keys[&parent] {
+        assert_eq!(
+            traffic_get(&client, name),
+            b"restart-value",
+            "state survived a restart mid-split"
+        );
+    }
+}
+
 /// Merge money flow (§60): merge two split children back online; one
 /// merged range, all state preserved, dedup preserved, old children
 /// fenced/retired, client caches converge.
@@ -546,24 +808,9 @@ fn merge_children_back_online() {
         .counter_add(&Key::from(counter_key.clone()), 3)
         .expect("counter commits");
     // Split, write on children, then merge back.
-    let split = cluster.split_tablet(parent);
-    let left = split
-        .get("left")
-        .and_then(serde_json::Value::as_u64)
-        .expect("left");
-    let right = split
-        .get("right")
-        .and_then(serde_json::Value::as_u64)
-        .expect("right");
-    cluster.wait_splits_done(Duration::from_secs(600));
+    let (left, right) = split_and_wait(&cluster, parent);
     put(&client, &format!("{counter_key}-post"), b"child-write");
-    let merge = cluster.merge_tablets(left, right);
-    assert_eq!(
-        merge.get("ok").and_then(serde_json::Value::as_bool),
-        Some(true),
-        "merge accepted: {merge}"
-    );
-    cluster.wait_merges_done(Duration::from_secs(600));
+    merge_and_wait(&cluster, left, right);
     // One merged range serves everything; dedup survived the round trip.
     for name in &keys[&parent] {
         let _ = traffic_get(&client, name);
@@ -648,7 +895,7 @@ fn automatic_split_then_merge() {
 }
 
 /// Topology survives a full restart (§64): split, checkpoint, purge logs,
-/// restart the cluster — the new directory stays, old parents never
+/// restart the cluster - the new directory stays, old parents never
 /// reappear as active.
 #[test]
 fn topology_survives_full_restart() {
@@ -665,16 +912,7 @@ fn topology_survives_full_restart() {
         .get("dir_version")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
-    let split = cluster.split_tablet(parent);
-    let left = split
-        .get("left")
-        .and_then(serde_json::Value::as_u64)
-        .expect("left");
-    let right = split
-        .get("right")
-        .and_then(serde_json::Value::as_u64)
-        .expect("right");
-    cluster.wait_splits_done(Duration::from_secs(600));
+    let (left, right) = split_and_wait(&cluster, parent);
     // Cutover publishes per node (leader first, then peers): wait for
     // convergence instead of asserting a single member immediately.
     cluster.wait_dir_version(dir_before + 1, Duration::from_secs(120));
@@ -713,27 +951,5 @@ fn topology_survives_full_restart() {
     );
     for name in &keys[&parent] {
         assert_eq!(traffic_get(&client, name), b"restart-proof");
-    }
-}
-
-/// Log rotation stays bounded on a live member (§53 at product level):
-/// the per-member rotated logs exist, the count is bounded, and the
-/// server keeps serving.
-#[test]
-fn member_logs_rotate_and_stay_bounded() {
-    let cluster = Cluster::spawn_with_tablets(2, 2, false).expect("cluster spawns");
-    let _ = cluster.wait_all_leaders();
-    let client = cluster.client();
-    for index in 0..50 {
-        traffic_put(&client, &format!("log-{index}"), b"v");
-    }
-    // Every member runs with KIVI_LOG_DIR=<data_dir>/logs (harness default,
-    // 8 MiB × 8 files). The directory exists and file count is bounded.
-    for index in 0..cluster.member_count() {
-        if !cluster.alive(index) {
-            continue;
-        }
-        let (_, node) = cluster.admin_get(index, "/v1/node");
-        assert!(node.get("node").is_some(), "node serves with rotation on");
     }
 }

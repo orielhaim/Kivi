@@ -8,7 +8,7 @@
 //!
 //! Design invariants:
 //!
-//! * A checkpoint is cut at a durable logical position only — never
+//! * A checkpoint is cut at a durable logical position only - never
 //!   speculative or pending state.
 //! * Bands are immutable and content-addressed (BLAKE3); manifests
 //!   reference band hashes, enabling incremental reuse.

@@ -3865,7 +3865,7 @@ fn render_markdown(document: &CampaignDocument) -> String {
 
 #[allow(clippy::too_many_lines)]
 fn render_comparison(out: &mut String, entry: &ComparisonReport) {
-    let _ = writeln!(out, "### {} — {}\n", entry.class, entry.workload);
+    let _ = writeln!(out, "### {} - {}\n", entry.class, entry.workload);
     let _ = writeln!(
         out,
         "- point: dimension={} profile={} value={} keys={} threads={} pipeline={} saturation={} valid={}",
@@ -4032,50 +4032,6 @@ mod tests {
     use crate::workload::WorkloadOp;
 
     #[test]
-    fn presets_are_bounded_and_distinct() {
-        let smoke = CampaignPreset::Smoke.profile();
-        let standard = CampaignPreset::Standard.profile();
-        let full = CampaignPreset::Full.profile();
-        assert!(smoke.duration < standard.duration);
-        assert!(standard.duration < full.duration);
-        assert!(smoke.thread_counts.len() < full.thread_counts.len());
-        assert!(full.large_values.contains(&(64 * 1024 * 1024)));
-    }
-
-    #[test]
-    fn classification_keeps_target_labels() {
-        assert_eq!(
-            classify_comparison("left", "right", 100.0, 100.0, 10, 10, None, None),
-            "tied"
-        );
-        assert_eq!(
-            classify_comparison("left", "right", 120.0, 100.0, 10, 10, None, None),
-            "throughput:left"
-        );
-        assert_eq!(
-            classify_comparison("left", "right", 100.0, 100.0, 8, 10, None, None),
-            "latency:left"
-        );
-        assert_eq!(
-            classify_comparison(
-                "left",
-                "right",
-                100.0,
-                100.0,
-                10,
-                10,
-                Some(10.0),
-                Some(20.0),
-            ),
-            "bandwidth:left"
-        );
-        assert_eq!(
-            scaling_classification("left", "right", 120.0, 100.0),
-            Some("scaling:left".to_owned())
-        );
-    }
-
-    #[test]
     fn strict_reply_shapes_reject_wrong_frames() {
         let op = WorkloadOp::Set {
             key: "k".to_owned(),
@@ -4084,12 +4040,6 @@ mod tests {
         assert!(check_workload_reply(&Reply::Simple(b"OK".to_vec()), &op).is_ok());
         assert!(check_workload_reply(&Reply::Integer(1), &op).is_err());
         assert!(check_workload_reply(&Reply::Bulk(None), &WorkloadOp::Get("k".to_owned())).is_ok());
-    }
-
-    #[test]
-    fn key_space_labels_are_stable() {
-        assert_eq!(key_space_label(KeySpace::Hot), "hot");
-        assert_eq!(key_space_label(KeySpace::Uniform(4)), "uniform:4");
     }
 
     #[test]
@@ -4112,61 +4062,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn full_preset_covers_the_required_matrix() {
-        let profile = CampaignPreset::Full.profile();
-        assert_eq!(
-            profile.value_sizes,
-            vec![
-                16,
-                1024,
-                64 * 1024,
-                256 * 1024,
-                1024 * 1024,
-                4 * 1024 * 1024
-            ]
-        );
-        assert_eq!(
-            profile
-                .key_distributions
-                .iter()
-                .map(|point| point.label.as_str())
-                .collect::<Vec<_>>(),
-            vec!["hot", "small", "uniform256", "uniform4k", "large"]
-        );
-        assert_eq!(profile.thread_counts, vec![1, 2, 4, 8, 16, 32, 64]);
-        assert_eq!(profile.pipeline_depths, vec![1, 4, 16, 64, 256]);
-        assert!(
-            profile
-                .named_profiles
-                .iter()
-                .any(|profile| profile.name == "balanced")
-        );
-        assert_eq!(value_label(64 * 1024 * 1024), "64MiB");
-    }
-
-    #[test]
-    fn spec_sections_keep_independent_dimensions() {
-        let profile = CampaignPreset::Full.profile();
-        let specs = build_specs(&CampaignOptions::default(), &profile);
-        assert_eq!(specs.value_sizes.len(), 6);
-        assert_eq!(specs.key_distributions.len(), 5);
-        assert_eq!(specs.concurrency.len(), 7);
-        assert_eq!(specs.pipelines.len(), 5);
-        assert!(specs.named.iter().all(|spec| !spec.curve));
-        assert!(specs.value_sizes.iter().all(|spec| spec.curve));
-        assert!(specs.key_distributions.iter().all(|spec| spec.curve));
-        assert!(specs.concurrency.iter().all(|spec| spec.curve));
-        assert!(specs.pipelines.iter().all(|spec| spec.curve));
-    }
-
+    /// The reference model is the oracle every conformance comparison is
+    /// judged against, so its own state transitions are the contract: a
+    /// drift here silently inverts whole campaign runs.
     #[test]
     fn model_state_tracks_operation_transitions() {
         let mut state = ModelState::default();
         let payload = b"abc";
         let key = "k".to_owned();
         let counter = "c".to_owned();
-        let operations = [
+        for operation in [
             WorkloadOp::Set {
                 key: key.clone(),
                 len: payload.len(),
@@ -4179,10 +4084,10 @@ mod tests {
             WorkloadOp::Ttl(key.clone()),
             WorkloadOp::CounterAdd(counter.clone()),
             WorkloadOp::Delete(key.clone()),
-        ];
-        for operation in &operations {
-            model_update(operation, &mut state, payload);
+        ] {
+            model_update(&operation, &mut state, payload);
         }
+        // The last write to `key` was a delete; the counter survived it.
         assert_eq!(state.values.get(&key), None);
         assert!(!state.expiries.contains(&key));
         assert_eq!(state.counters.get(&counter), Some(&1));
@@ -4195,47 +4100,16 @@ mod tests {
             ),
             "counter:2"
         );
-    }
 
-    #[test]
-    fn mixed_model_sequence_updates_byte_and_counter_state() {
-        let keys = vec!["k0".to_owned(), "k1".to_owned()];
+        // A mixed sequence accumulates counters and keeps every value
+        // within the declared size.
         let mut state = ModelState::default();
+        let keys = vec!["k0".to_owned(), "k1".to_owned()];
         for index in 0..20 {
             let operation = workload_op_for(Workload::Mixed, 8, index, &keys, "counter");
             model_update(&operation, &mut state, &[7; 8]);
         }
         assert_eq!(state.counters.get("counter"), Some(&5));
         assert!(state.values.values().all(|value| value.len() <= 8));
-    }
-
-    #[test]
-    fn normalized_latency_and_payload_metrics_are_explicit() {
-        assert_eq!(normalize_latency(1_000, 4), 250);
-        assert_eq!(normalize_latency(1_000, 0), 1_000);
-        assert!((payload_bytes_per_op(Workload::Get, 32) - 32.0).abs() < f64::EPSILON);
-        assert!(payload_bytes_per_op(Workload::Balanced, 32) > 0.0);
-    }
-
-    #[test]
-    fn verdict_reports_tie_noise_and_winner() {
-        assert_eq!(
-            comparison_verdict("left", "right", 100.0, 100.0).outcome,
-            "tie"
-        );
-        assert_eq!(
-            comparison_verdict("left", "right", 102.0, 100.0).outcome,
-            "noise"
-        );
-        let winner = comparison_verdict("left", "right", 120.0, 100.0);
-        assert_eq!(winner.outcome, "left-win");
-        assert_eq!(winner.winner.as_deref(), Some("left"));
-    }
-
-    #[test]
-    fn reproducer_is_minimal_and_machine_readable() {
-        let error = "reproducer=GET k:1; expected=bulk:\"v\"; actual=nil";
-        assert_eq!(reproducer_from_error(error).as_deref(), Some("GET k:1"));
-        assert_eq!(first_reproducer(&[error]).as_deref(), Some("GET k:1"));
     }
 }

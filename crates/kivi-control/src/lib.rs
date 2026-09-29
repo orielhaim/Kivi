@@ -33,37 +33,27 @@ pub mod state;
 pub mod topology;
 
 pub use adaptive::{
-    Action, ActionCost, ActionId, ActionKind, ActionObservation, ActionOutcome, ActionRecord,
-    ActionResult, ActionScope, ActionState, ActionTarget, ActuationError, Actuator,
-    ActuatorReceipt, AdaptiveConfig, AdaptiveController, AdaptiveDecision, AdaptiveMode,
-    BaselineConfig, BaselineController, BaselineProposal, ControllerFrame, ControllerSimulation,
-    ControllerSource, ControllerStats, DecisionTrace, ErasureCodingLayout, ExpectedBenefit,
-    LearnedConfig, LearnedController, LearnedDecision, LearnedModel, MaterializationIntent,
-    MemoryBudget, MigrationFence, MigrationRecommendation, ModelDecodeError, ModelDisableReason,
-    ModelLoadReport, ModelLoadStatus, ObjectiveBreakdown, ObjectiveScales, ObjectiveVector,
-    ObjectiveWeights, Ppm, RedundancyPreference, RepairBudget, SafetyContext, SafetyEnvelope,
-    SafetyValidator, SafetyViolation, ScrubBudget, SimulationInput, SimulationReport,
-    SimulationWorkload, TabletMergePolicy, TabletSet, TabletSplitPolicy, TopologyViolation,
-    TraceStatus,
+    Action, ActionCost, ActionId, ActionOutcome, ActionRecord, ActionResult, ActionScope,
+    ActionState, ActionTarget, ActuationError, Actuator, ActuatorReceipt, AdaptiveConfig,
+    AdaptiveController, AdaptiveDecision, AdaptiveMode, BaselineConfig, BaselineController,
+    ControllerFrame, ControllerSimulation, ControllerSource, ControllerStats, DecisionTrace,
+    ExpectedBenefit, LearnedController, MaterializationIntent, MemoryBudget, MigrationFence,
+    MigrationRecommendation, Ppm, RedundancyPreference, RepairBudget, SafetyContext,
+    SafetyValidator, ScrubBudget, SimulationInput, SimulationReport, SimulationWorkload,
+    TabletMergePolicy, TabletSet, TabletSplitPolicy,
 };
-
 pub use catalog::{
-    CatalogError, CatalogIndexKind, CatalogIndexState, CatalogLayout, IndexRecord, NamespaceRecord,
+    CatalogIndexKind, CatalogIndexState, CatalogLayout, IndexRecord, NamespaceRecord,
 };
 pub use failure::{FailureDetector, FailureDetectorConfig, TabletHealth, classify_tablet};
-pub use layouts::{LayoutError, LayoutKey, LayoutRecord};
-pub use merge::{MergeError, MergePhase, MergePlan};
-pub use migration::{MigrationError, MigrationPhase, MigrationPlan};
-pub use mutation::{CONTROL_MUTATION_VERSION, ControlMutation, ControlMutationError};
-pub use node::{NodeError, NodeRecord, NodeState};
-pub use placement::{DesiredReplicaSet, PlacementError, PlacementVersion};
-pub use planner::{
-    MigrationIntent, PlannerConfig, PlannerError, plan_drain, plan_rebalance, plan_repair,
-};
-pub use redundancy::{
-    control_generation_of, descriptors_from_registry, drain_plan, health_of, layout_key,
-    published_layout,
-};
-pub use split::{SplitError, SplitPhase, SplitPlan};
-pub use state::{ClusterGeneration, ControlApplyError, ControlSnapshotError, ControlState};
+pub use layouts::{LayoutKey, LayoutRecord};
+pub use merge::{MergePhase, MergePlan};
+pub use migration::{MigrationPhase, MigrationPlan};
+pub use mutation::{ControlMutation, ControlMutationError};
+pub use node::{NodeRecord, NodeState};
+pub use placement::{DesiredReplicaSet, PlacementVersion};
+pub use planner::{MigrationIntent, PlannerConfig, plan_drain, plan_rebalance, plan_repair};
+pub use redundancy::{descriptors_from_registry, layout_key, published_layout};
+pub use split::{SplitPhase, SplitPlan};
+pub use state::{ControlApplyError, ControlState};
 pub use topology::{PlanId, PlanKind, PlanPriority, PlanSchedulerConfig, tablet_sets_conflict};

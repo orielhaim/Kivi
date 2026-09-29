@@ -10,12 +10,12 @@
 
   Correspondence to crates/kivi-state/src/{txn,store}.rs (rule by rule):
     escrow width ................ Widths[p] (durable per-tablet share)
-    local spend ................. Spend (guard share >= n; debit now —
+    local spend ................. Spend (guard share >= n; debit now -
                                   previewed by predict_cost, settled by
                                   apply BoundedAdd with EscrowShare)
     paired transfer ............. Narrow (debit source, escrow to the
                                   transit slot) + DeliverCredit (credit
-                                  the destination, clear the slot) —
+                                  the destination, clear the slot) -
                                   plan_escrow_transfer / transfer_escrow
     idempotent replay ........... ResendNotice / DeliverNotice (credit
                                   guarded on the live slot; replays of a

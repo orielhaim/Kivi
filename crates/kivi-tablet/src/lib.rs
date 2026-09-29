@@ -3,7 +3,7 @@
 //! This crate owns the ownership truth: which tablet is the single writable
 //! authority for every routable point, and how that authority moves. It is
 //! deliberately free of runtime, networking, storage, consensus, clocks, and
-//! hardware concerns — those systems will consume this model, never redefine
+//! hardware concerns - those systems will consume this model, never redefine
 //! it.
 //!
 //! Core rules:

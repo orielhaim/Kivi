@@ -4,8 +4,8 @@
 //! [`SimCluster`] owns a [`Scheduler`] of [`ClusterEvent`]s plus the three
 //! domain simulators ([`NetSim`], per-node [`VirtualDisk`]s, [`NodeTable`])
 //! and deterministic fault policies. Drivers build scenarios from explicit
-//! actions — add nodes, connect links, send messages, partition/heal, crash,
-//! restart, submit storage work, advance time — and run them with explicit
+//! actions - add nodes, connect links, send messages, partition/heal, crash,
+//! restart, submit storage work, advance time - and run them with explicit
 //! bounds (`run_until_idle(max_events)`, never an unbounded loop).
 //!
 //! Application logic plugs in through [`AppHandler`]: scheduled app events
@@ -72,7 +72,7 @@ pub enum ClusterEvent<E> {
 }
 
 /// Machine-readable history of one cluster happening. Categories name what
-/// the kernel did — never free-form human logging.
+/// the kernel did - never free-form human logging.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClusterTrace<E> {
     /// An event entered the scheduler.
@@ -270,7 +270,7 @@ pub enum ClusterAction<E> {
 /// arrive separately as bytes so each scenario owns its wire decoding
 /// explicitly. `S` is volatile per-node state, discarded on crash. Both
 /// handler methods receive the shared simulation RNG for deterministic
-/// choices (peer selection, jitter) — never ambient randomness.
+/// choices (peer selection, jitter) - never ambient randomness.
 pub trait AppHandler<E, S> {
     /// Handles a scheduled app event on `node` with its volatile `state`.
     fn handle_app(
@@ -335,7 +335,7 @@ impl InvariantFailure {
 }
 
 /// Cluster driver failure: misuse, exhaustion, or a broken invariant.
-/// Reachability and operation outcomes are traced, never errors — only
+/// Reachability and operation outcomes are traced, never errors - only
 /// scenario misuse, checked-arithmetic exhaustion, and invariant violations
 /// fail a run.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

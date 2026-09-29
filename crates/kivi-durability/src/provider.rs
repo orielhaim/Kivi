@@ -1,16 +1,14 @@
 //! Durability provider concepts: what the rest of Kivi depends on.
 //!
 //! Tablets and workers talk about [`PersistIntent`] (what must survive),
-//! [`CommitProof`] (what did survive), and [`RecoveryRecord`] (what came
-//! back) through the [`DurabilityProvider`] trait. No `File`, `rustix`,
-//! `io_uring`, or platform type crosses this boundary: future providers
-//! (`QuorumLog`, `PersistentMemory`, `CXL`) implement the same trait.
+//! [`CommitProof`] (what did survive), and [`StorageHealth`] through the
+//! [`DurabilityProvider`] trait. No `File`, `rustix`, `io_uring`, or platform
+//! type crosses this boundary.
 
 use crate::wal::WalRecord;
 
 /// How strongly one append must be barriered before the caller replies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
 pub enum DurabilityLevel {
     /// The batch is file-synced before acknowledgement: a later crash
     /// still replays it. The only level implemented here.
@@ -35,15 +33,6 @@ pub struct CommitProof {
     pub bytes_durable: u64,
     /// Sync operations issued for this append (one in the baseline).
     pub fsyncs: u64,
-}
-
-/// One recovered WAL record with its physical position.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RecoveryRecord {
-    /// Per-lane batch sequence the record arrived in.
-    pub batch_seq: u64,
-    /// The logical record.
-    pub record: WalRecord,
 }
 
 /// Coarse provider state for operators (see the storage-health model).

@@ -16,7 +16,7 @@
 //! bincode, or rkyv anywhere near durable bytes). Differences from the WAL
 //! are deliberate: files are self-describing (lane/sequence live in the
 //! header, so GC-created gaps need no contiguity repair), and only the
-//! *active* (highest-sequence) pack may end mid-record — a torn tail there
+//! *active* (highest-sequence) pack may end mid-record - a torn tail there
 //! truncates to the last complete boundary, while any damage in a sealed
 //! pack fails loudly.
 //!
@@ -53,30 +53,30 @@ use crate::codec::ChunkCodecId;
 use crate::error::ChunkError;
 
 /// Magic word: ASCII `"KVCP"` read as a little-endian `u32`.
-pub const PACK_MAGIC: u32 = 0x5043_564B;
+pub(crate) const PACK_MAGIC: u32 = 0x5043_564B;
 /// Magic word: ASCII `"KVCC"` read as a little-endian `u32`.
-pub const CHUNK_RECORD_MAGIC: u32 = 0x4343_564B;
+pub(crate) const CHUNK_RECORD_MAGIC: u32 = 0x4343_564B;
 /// Magic word: ASCII `"KVMP"` read as a little-endian `u32`.
-pub const MANIFEST_RECORD_MAGIC: u32 = 0x504D_564B;
+pub(crate) const MANIFEST_RECORD_MAGIC: u32 = 0x504D_564B;
 /// Pack major version.
-pub const PACK_MAJOR: u16 = 1;
+pub(crate) const PACK_MAJOR: u16 = 1;
 /// Pack minor version.
-pub const PACK_MINOR: u16 = 0;
-/// Record format version minted in this stage.
-pub const RECORD_VERSION: u16 = 1;
+pub(crate) const PACK_MINOR: u16 = 0;
+/// Record format version.
+pub(crate) const RECORD_VERSION: u16 = 1;
 /// Encoded pack header length in bytes.
-pub const PACK_HEADER_LEN: usize = 64;
+pub(crate) const PACK_HEADER_LEN: usize = 64;
 /// Encoded chunk record header length in bytes.
-pub const CHUNK_HEADER_LEN: usize = 60;
+pub(crate) const CHUNK_HEADER_LEN: usize = 60;
 /// Encoded manifest record header length in bytes.
-pub const MANIFEST_HEADER_LEN: usize = 52;
+pub(crate) const MANIFEST_HEADER_LEN: usize = 52;
 /// Body CRC length in bytes.
-pub const BODY_CRC_LEN: usize = 4;
+pub(crate) const BODY_CRC_LEN: usize = 4;
 
 /// Slack a pack file may exceed its rotation target by: one maximum record
 /// plus framing. Larger files are a rotation bug, reported before reading
 /// them wholesale.
-pub const PACK_SIZE_SLACK: u64 = 16 * 1024 * 1024;
+pub(crate) const PACK_SIZE_SLACK: u64 = 16 * 1024 * 1024;
 
 /// Formats a lane directory name (`lane-0007`).
 #[must_use]
@@ -86,48 +86,37 @@ pub fn lane_dir_name(lane: u16) -> String {
 
 /// Formats a pack file name (`00000000000000000007.pack`).
 #[must_use]
-pub fn pack_file_name(seq: u64) -> String {
+pub(crate) fn pack_file_name(seq: u64) -> String {
     format!("{seq:020}.pack")
 }
 
 /// Parses a pack file name back to its sequence, if well-formed.
 #[must_use]
-pub fn parse_pack_name(name: &str) -> Option<u64> {
+pub(crate) fn parse_pack_name(name: &str) -> Option<u64> {
     name.strip_suffix(".pack")?.parse::<u64>().ok()
 }
 
 /// Which immutable record a pack slot holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum RecordKind {
-    /// Logical chunk bytes addressed by [`ChunkId`].
+enum RecordKind {
+    /// Logical chunk bytes addressed by `ChunkId`.
     Chunk,
-    /// Canonical manifest bytes addressed by [`ManifestId`].
+    /// Canonical manifest bytes addressed by `ManifestId`.
     Manifest,
 }
 
 /// Content address of one pack record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum RecordId {
-    /// Chunk address.
+pub(crate) enum RecordId {
+    /// Logical chunk bytes addressed by `ChunkId`.
     Chunk(ChunkId),
-    /// Manifest address.
+    /// Canonical manifest bytes addressed by `ManifestId`.
     Manifest(ManifestId),
-}
-
-impl RecordId {
-    /// Which record holds this address.
-    #[must_use]
-    pub const fn kind(self) -> RecordKind {
-        match self {
-            Self::Chunk(_) => RecordKind::Chunk,
-            Self::Manifest(_) => RecordKind::Manifest,
-        }
-    }
 }
 
 /// One verified pack record: identity, lengths, and physical position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ScannedRecord {
+pub(crate) struct ScannedRecord {
     /// Content address.
     pub id: RecordId,
     /// Chunk logical bytes (0 for manifests).
@@ -154,7 +143,7 @@ struct RecordHeader {
 /// Encodes one chunk record: framed header, body, trailing CRC.
 /// With `NONE` the body is the logical bytes verbatim.
 #[must_use]
-pub fn encode_chunk_record(id: ChunkId, logical_len: u64, body: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_chunk_record(id: ChunkId, logical_len: u64, body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(CHUNK_HEADER_LEN + body.len() + BODY_CRC_LEN);
     let mut header = [0u8; CHUNK_HEADER_LEN];
     header[0..4].copy_from_slice(&CHUNK_RECORD_MAGIC.to_le_bytes());
@@ -175,7 +164,7 @@ pub fn encode_chunk_record(id: ChunkId, logical_len: u64, body: &[u8]) -> Vec<u8
 
 /// Encodes one manifest record around canonical manifest bytes.
 #[must_use]
-pub fn encode_manifest_record(id: ManifestId, body: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_manifest_record(id: ManifestId, body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(MANIFEST_HEADER_LEN + body.len() + BODY_CRC_LEN);
     let mut header = [0u8; MANIFEST_HEADER_LEN];
     header[0..4].copy_from_slice(&MANIFEST_RECORD_MAGIC.to_le_bytes());
@@ -197,7 +186,7 @@ pub fn encode_manifest_record(id: ManifestId, body: &[u8]) -> Vec<u8> {
 /// project-owned signed Unix micros (same 8 bytes as before; values that
 /// fit `i64` encode identically).
 #[must_use]
-pub fn encode_pack_header(
+pub(crate) fn encode_pack_header(
     lane: u16,
     seq: u64,
     created_at: kivi_types::WallTimestamp,
@@ -434,7 +423,7 @@ fn read_verify_record(
 
 /// One scanned pack: verified records plus torn-tail accounting.
 #[derive(Debug)]
-pub struct PackScan {
+pub(crate) struct PackScan {
     /// Verified records in file order.
     pub records: Vec<ScannedRecord>,
     /// Bytes to keep (`file_len` when clean).
@@ -458,7 +447,7 @@ pub struct PackScan {
 /// # Panics
 ///
 /// Never panics on pack bytes: every length is gated before slicing.
-pub fn scan_pack(
+pub(crate) fn scan_pack(
     path: &Path,
     lane: u16,
     seq: u64,
@@ -498,7 +487,7 @@ pub fn scan_pack(
         let mut magic = [0u8; 8];
         read_at(file, path, pos, &mut magic)?;
         // Unparseable tail bytes are a torn write when the pack is still
-        // active (a torn sector leaves garbage, not a clean prefix — see
+        // active (a torn sector leaves garbage, not a clean prefix - see
         // the module docs) and damage otherwise. Truncating a genuinely
         // corrupt (rather than torn) last record still fails loudly later:
         // the WAL-tail and checkpoint dependency gates prove every
@@ -575,7 +564,7 @@ fn torn_or_corrupt(
 ///
 /// Returns [`ChunkError`] when the write fails; the file position past a
 /// partial write is the caller's torn tail to repair, never trusted.
-pub fn append_record(file: &mut File, path: &Path, record: &[u8]) -> Result<(), ChunkError> {
+pub(crate) fn append_record(file: &mut File, path: &Path, record: &[u8]) -> Result<(), ChunkError> {
     file.write_all(record)
         .map_err(|error| ChunkError::io("append pack record", path, &error))
 }
@@ -586,7 +575,7 @@ pub fn append_record(file: &mut File, path: &Path, record: &[u8]) -> Result<(), 
 /// # Errors
 ///
 /// Returns [`ChunkError`] when the directory itself is unreadable.
-pub fn list_packs(dir: &Path) -> Result<Vec<u64>, ChunkError> {
+pub(crate) fn list_packs(dir: &Path) -> Result<Vec<u64>, ChunkError> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -618,7 +607,7 @@ pub fn list_packs(dir: &Path) -> Result<Vec<u64>, ChunkError> {
 /// # Panics
 ///
 /// Never panics on pack bytes: lengths are gated before slicing.
-pub fn verify_record_at(
+pub(crate) fn verify_record_at(
     file: &mut File,
     path: &Path,
     location: &ScannedRecord,
@@ -641,17 +630,9 @@ pub fn verify_record_at(
     Ok(body)
 }
 
-impl ScannedRecord {
-    /// Byte range of the full record within its file.
-    #[must_use]
-    pub const fn file_range(self) -> (u64, u64) {
-        (self.offset, self.offset + self.total_len)
-    }
-}
-
 /// Opens a pack file path for a lane directory and sequence.
 #[must_use]
-pub fn pack_path(dir: &Path, seq: u64) -> PathBuf {
+pub(crate) fn pack_path(dir: &Path, seq: u64) -> PathBuf {
     dir.join(pack_file_name(seq))
 }
 

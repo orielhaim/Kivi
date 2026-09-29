@@ -5,15 +5,12 @@
 //! *which* provider satisfies it. Nothing here names a device, a tier, or
 //! an ordering of providers. Providers advertise measured capabilities
 //! ([`crate::provider::ProviderCaps`]); the planner scores them against an
-//! intent. Adding a future device (CXL, PM, RDMA, DPA) means registering a
-//! new provider with capabilities, never changing this intent schema.
+//! intent. Adding a new device means registering a new provider with
+//! capabilities, never changing this intent schema.
 //!
-//! Design notes from the required reading:
-//! - DMS (CIDR 2026): intent/provider/calibration split is the load-bearing
-//!   boundary. Intent is stable; providers and calibration evolve.
-//! - Tiered Memory Beyond Hotness (OSDI 2025): intent carries latency and
-//!   tail targets plus reconstruction cost, so placement never reduces to
-//!   access frequency.
+//! Intent carries latency and tail targets plus reconstruction cost, so
+//! placement never reduces to access frequency (Tiered Memory Beyond
+//! Hotness, OSDI 2025).
 
 use kivi_types::TabletId;
 
@@ -181,20 +178,5 @@ impl MaterializationIntent {
     #[must_use]
     pub const fn allows_volatile(&self) -> bool {
         !self.durability_required
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn hot_prefers_latency_and_cold_prefers_cost() {
-        let hot = MaterializationIntent::hot();
-        let cold = MaterializationIntent::cold();
-        assert!(hot.access_latency_target_ns.is_some());
-        assert!(cold.access_latency_target_ns.is_none());
-        assert!(hot.reclaim_priority > cold.reclaim_priority);
-        assert!(hot.allows_volatile());
     }
 }

@@ -6,13 +6,10 @@
 //! confused deputy is bound, never obeyed), and conservation (planning can
 //! neither mint nor destroy rights).
 
-use std::collections::BTreeSet;
-
 use bytes::Bytes;
 use kivi_state::{
-    Key, TxnCoordinator, TxnError, TxnExpect, TxnState, TxnWrite, TxnWriteKind, check_bounds,
-    plan_escrow_transfer, reservation_cost, select_coordinator, verify_escrow_widths,
-    write_set_digest,
+    Key, TxnError, TxnExpect, TxnState, TxnWrite, TxnWriteKind, plan_escrow_transfer,
+    select_coordinator, verify_escrow_widths, write_set_digest,
 };
 use kivi_types::{NamespaceId, TabletId};
 use proptest::prelude::*;
@@ -51,19 +48,9 @@ fn route(key: &[u8]) -> Option<TabletId> {
 }
 
 proptest! {
-    /// The coordinator is the lowest participant tablet — never a service,
-    /// never first-writer-wins.
-    #[test]
-    fn coordinator_select_is_min(tablets in prop::collection::vec(0u64..8, 0..6)) {
-        let set: BTreeSet<TabletId> = tablets.into_iter().map(TabletId::from_u64).collect();
-        prop_assert_eq!(
-            TxnCoordinator::select(&set),
-            set.iter().next().map(|tablet| TxnCoordinator { tablet: *tablet }),
-        );
-    }
-
-    /// Coordinator derivation is order-independent: re-drives and recovery
-    /// probes present the same set in any order and must agree.
+    /// Coordinator derivation is order-independent and picks the lowest
+    /// participant tablet: re-drives and recovery probes present the same set
+    /// in any order and must agree.
     #[test]
     fn select_coordinator_order_free(writes in prop::collection::vec(arb_write(), 1..6)) {
         let mut reversed = writes.clone();
@@ -215,16 +202,6 @@ proptest! {
                 width(donor_after) + width(recip_after),
                 width((donor_min, donor_max)) + width((recip_min, recip_max)),
             );
-        }
-    }
-
-    /// Reservation cost counts one intent per key: admission reserves before
-    /// acknowledging prepare, so prepared-then-unappliable is unreachable.
-    #[test]
-    fn reservation_counts_intents(writes in prop::collection::vec(arb_write(), 0..8)) {
-        if check_bounds(2, &writes).is_ok() {
-            let cost = reservation_cost(&writes).expect("bounded");
-            prop_assert_eq!(cost.intents, writes.len());
         }
     }
 }

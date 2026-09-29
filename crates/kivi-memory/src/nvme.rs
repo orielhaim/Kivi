@@ -273,8 +273,8 @@ fn read_exact_at(
 
 /// The volume's logical sector size, which bounds every unbuffered transfer.
 ///
-/// Read from the device, not assumed. A wrong value does not fall back — it
-/// fails the transfer — so a provider that cannot learn the answer stays
+/// Read from the device, not assumed. A wrong value does not fall back - it
+/// fails the transfer - so a provider that cannot learn the answer stays
 /// buffered rather than guessing.
 fn sector_size(path: &Path) -> Option<u32> {
     kivi_hardware::io::logical_block_size(path)
@@ -441,7 +441,7 @@ impl NvmeProvider {
         // The volume's logical sector size bounds every unbuffered transfer.
         // It is read from the device rather than assumed, because it differs
         // between NVMe, SATA and network-backed volumes and a wrong value does
-        // not fall back — it fails.
+        // not fall back - it fails.
         //
         // The data file may not exist yet on a fresh provider, and a directory
         // has no block size to report. Creating it up front is not a
@@ -456,8 +456,8 @@ impl NvmeProvider {
         let known = sector_size(&data);
         let alignment = known.unwrap_or(4096);
         // The mode is resolved once, from the policy and the volume's own
-        // alignment. The per-record read path stays buffered regardless — see
-        // [`NvmeProvider::read_at`] — and the mode resolved here is the one the
+        // alignment. The per-record read path stays buffered regardless - see
+        // [`NvmeProvider::read_at`] - and the mode resolved here is the one the
         // bulk scan uses.
         let direct = match known {
             Some(align) => options.direct.mode_for(SCAN_CHUNK, align),
@@ -568,7 +568,7 @@ impl NvmeProvider {
         // caching needed interior mutability behind a `&self` method, and that
         // cost the provider its `Sync`, which is worth more than the open it
         // saved. The *append* handle is cached, because it is free of the
-        // problem — it sits behind `&mut self` on the single-writer path that
+        // problem - it sits behind `&mut self` on the single-writer path that
         // owns every device append.
         let mut file =
             std::fs::File::open(&data).map_err(|error| Self::read_error(&data, &error))?;
@@ -810,12 +810,7 @@ pub async fn promote_async(
 ) -> Result<Vec<u8>, MemoryError> {
     let data = dir.join("materializations.dat");
     // Two positioned reads sized from the record's own header, matching the
-    // synchronous path. The previous form read the entire demotion store to
-    // answer one record, which made a promotion cost a copy of the whole store:
-    // the fifth promotion of a 1 KiB object copied as much as the first
-    // promotion of a 1 GiB one. The provider-level fix did not reach this
-    // function, which is the path the Compio off-core lane actually uses, so
-    // the production promotion path was still O(store).
+    // synchronous path: a promotion costs one record, not a copy of the store.
     let file = compio::fs::OpenOptions::new()
         .read(true)
         .open(&data)
@@ -956,10 +951,6 @@ mod tests {
 
     #[test]
     fn the_direct_policy_is_answered_from_the_device_not_a_constant() {
-        // `sector_size` used to return `None` unconditionally, which made the
-        // policy resolve to buffered for every configuration. It now reads the
-        // device, and `Always` produces a genuinely unbuffered provider on a
-        // volume that accepts it.
         let dir = tempfile::tempdir().expect("tempdir");
         let options = NvmeOptions {
             direct: DirectIoPolicy::Always,

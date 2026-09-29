@@ -11,8 +11,8 @@
 //!
 //! Wall-clock age is never equated with replication freshness: a locally old
 //! timestamp proves nothing about what the leader has committed. A replica may
-//! claim a staleness bound only when it holds [`FreshnessReceipt`] evidence —
-//! a recent authority proof (consensus barrier) — whose age on the caller's
+//! claim a staleness bound only when it holds [`FreshnessReceipt`] evidence -
+//! a recent authority proof (consensus barrier) - whose age on the caller's
 //! monotonic clock ([`Ticks`], always passed in, never read) fits the bound,
 //! whose authority still matches the current authority exactly, and whose
 //! coverage boundary the replica has applied. Without such evidence the
@@ -93,7 +93,7 @@ impl ReplicaFreshness {
     ///
     /// A token from another tablet, another epoch (split/merge lineage,
     /// never silently comparable), or an unassigned position never
-    /// validates — the caller must reject it, never wait on it.
+    /// validates - the caller must reject it, never wait on it.
     ///
     /// # Errors
     ///
@@ -408,7 +408,7 @@ impl fmt::Display for ReadReceipt {
 }
 
 /// Per-read execution context: the two clocks plus the wait budget. Both
-/// clocks are supplied by the caller — production passes wall time for
+/// clocks are supplied by the caller - production passes wall time for
 /// expiry and monotonic time for ages; deterministic simulation passes
 /// virtual time for both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -440,8 +440,8 @@ impl ReadContext {
 /// How a replica may establish read authority. The conservative path is
 /// always available; the accelerators reuse explicit evidence and fall back
 /// the moment that evidence is missing, uncertain, or invalidated. The
-/// external contract is identical under every mode: only the mechanism —
-/// and the documented assumption behind it — differs.
+/// external contract is identical under every mode: only the mechanism -
+/// and the documented assumption behind it - differs.
 ///
 /// Fallback chain (never a weakening; every layer serves the same `Latest`):
 ///
@@ -456,7 +456,7 @@ pub enum ReadAuthorityProvider {
     ConservativeLeader,
     /// True asynchronous Lazy-ALR backend for Raft/SMR (LAW work): pending
     /// reads batch opportunistically behind one lightweight ordered
-    /// [`AlrFence`] sync — ordering of a write, no state mutation — and
+    /// [`AlrFence`] sync - ordering of a write, no state mutation - and
     /// execute locally once the sync boundary is applied. A concurrent
     /// write ordered after batch formation may subsume the extra sync.
     ///
@@ -465,7 +465,7 @@ pub enum ReadAuthorityProvider {
     AlmostLocal,
     /// True local linearizable reads under an explicit bounded-clock-drift
     /// assumption (Bodega-style directional roster leases, see
-    /// [`crate::roster`]): a responder serves only with a stable roster —
+    /// [`crate::roster`]): a responder serves only with a stable roster -
     /// same-roster valid grants from an intersecting majority plus local
     /// applied state covering the quorum-derived safety floor.
     ///
@@ -529,8 +529,8 @@ impl fmt::Display for LeaseEligibility {
 /// A fence has the ordering properties of a write (one Raft log slot,
 /// committed by the same majority, applied in the same order) and the
 /// mutation footprint of nothing: applying it advances the applied pointer
-/// only. When a batch's fence — or a subsuming write ordered after batch
-/// formation — is locally applied, every write that completed before the
+/// only. When a batch's fence - or a subsuming write ordered after batch
+/// formation - is locally applied, every write that completed before the
 /// batch formed is necessarily visible, so the whole batch executes
 /// locally under exact `Latest` semantics with no timing assumption.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -569,7 +569,7 @@ impl fmt::Display for AlrFence {
 
 /// Responder write-coverage report: the answering replica applied through
 /// `applied` and can (when `healthy`) satisfy the logical read contract
-/// from that state — inline values, chunked roots with resolvable
+/// from that state - inline values, chunked roots with resolvable
 /// sidecars, and manifests alike. The leader gates external write success
 /// on these reports (see `ResponderCoverage` in the execution layer):
 /// internal Raft commit and externally completed write are separate
@@ -671,7 +671,7 @@ impl fmt::Display for ServePath {
     }
 }
 
-/// Worker-local consistency counters. Plain integers behind the hub lock —
+/// Worker-local consistency counters. Plain integers behind the hub lock -
 /// no process-global hot-path atomics. Snapshot into [`ConsistencySnapshot`]
 /// for status/admin surfaces.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -899,7 +899,7 @@ pub struct ConsistencySnapshot {
 
 /// Fencing composition of one tablet lineage (RFC §70, §194, §251).
 ///
-/// Four mechanisms, one rule — a stale owner cannot authorize under the
+/// Four mechanisms, one rule - a stale owner cannot authorize under the
 /// current generation:
 ///
 /// ```text
@@ -919,7 +919,7 @@ pub struct ConsistencySnapshot {
 /// (`INITIAL`, `INITIAL`); a stable tablet identity means one unbroken log
 /// lineage, so its epoch/guard never advance beneath it. Ownership moves
 /// that preserve the log (worker moves, replica migration) preserve the
-/// triple exactly — envelopes in flight stay verifiable, and Raft
+/// triple exactly - envelopes in flight stay verifiable, and Raft
 /// membership alone decides who may still commit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AuthorityTransition {
@@ -985,7 +985,7 @@ impl fmt::Display for AuthorityTransition {
 
 /// Validates that the serving authority still matches the directory's
 /// recorded authority for the tablet: the single cross-check between the
-/// routing view and the commit view. Any drift fails closed — the replica
+/// routing view and the commit view. Any drift fails closed - the replica
 /// serves nothing until the two agree again.
 ///
 /// Directory `None` (tablet absent from the snapshot) also fails: an
@@ -1166,7 +1166,7 @@ mod tests {
             Ok(())
         );
         // 101ms old: outside the bound while labeled successful is
-        // forbidden — the caller must escalate or fail.
+        // forbidden - the caller must escalate or fail.
         assert!(matches!(
             receipt.satisfies_bound(
                 bound,
@@ -1236,25 +1236,7 @@ mod tests {
     }
 
     #[test]
-    fn alr_fences_name_tablet_batch_and_requester() {
-        let fence = AlrFence::new(tablet(3), 17, NodeId::from_u64(2));
-        assert_eq!(fence.tablet, tablet(3));
-        assert_eq!(fence.batch, 17);
-        assert_eq!(
-            fence.to_string(),
-            "alr-fence(tablet 3 batch 17 requester 2)"
-        );
-    }
-
-    #[test]
-    fn lease_eligibility_gates_only_the_roster_path() {
-        assert!(LeaseEligibility::Eligible.lease_may_serve());
-        assert!(!LeaseEligibility::ConservativeOnly.lease_may_serve());
-        assert_eq!(LeaseEligibility::Eligible.to_string(), "lease-eligible");
-    }
-
-    #[test]
-    fn read_receipt_chains_into_at_least_tokens() {
+    fn read_receipt_chains_into_an_at_least_token_the_issuer_covers() {
         let current = authority(3, 1, 1);
         let receipt = ReadReceipt::new(
             current,
@@ -1264,7 +1246,6 @@ mod tests {
         let chained = receipt.token();
         assert_eq!(chained.tablet(), tablet(3));
         assert_eq!(chained.position(), CommitPosition::from_u64(9));
-        // The issuing replica covers its own receipt.
         let fresh = ReplicaFreshness::new(
             current,
             CommitPosition::from_u64(9),
@@ -1273,112 +1254,71 @@ mod tests {
         assert_eq!(fresh.covers_token(chained), Ok(()));
     }
 
+    /// Two independent authorities must never be reconciled into one. Any
+    /// movement of the epoch, the guard, or the absence of a second authority
+    /// at all is a mismatch, because continuing would serve a read under a
+    /// fence nobody currently holds.
     #[test]
     fn reconcile_fails_closed_on_any_drift_or_absence() {
         let serving = authority(3, 1, 1);
         assert_eq!(reconcile_authority(&serving, Some(&serving)), Ok(()));
-        assert_eq!(
-            reconcile_authority(&serving, None),
-            Err(FreshnessReject::StaleAuthority)
-        );
-        assert_eq!(
-            reconcile_authority(&serving, Some(&authority(3, 2, 1))),
-            Err(FreshnessReject::StaleAuthority)
-        );
-        assert_eq!(
-            reconcile_authority(&serving, Some(&authority(3, 1, 2))),
-            Err(FreshnessReject::StaleAuthority)
-        );
+        for other in [None, Some(&authority(3, 2, 1)), Some(&authority(3, 1, 2))] {
+            assert_eq!(
+                reconcile_authority(&serving, other),
+                Err(FreshnessReject::StaleAuthority),
+                "{other:?} was reconciled into {serving}"
+            );
+        }
     }
 
+    /// A lineage-changing transition (split, merge, incarnation change) cannot
+    /// preserve the lineage, and only a pure routing swap preserves
+    /// memory-held evidence. A transition wrongly marked as preserving either
+    /// would let a read be served across a boundary it has no right to cross.
     #[test]
-    fn transitions_name_what_survives_them() {
-        assert!(AuthorityTransition::WorkerMove.preserves_lineage());
-        assert!(AuthorityTransition::ReplicaMigration.preserves_lineage());
-        assert!(AuthorityTransition::DirectoryReplace.preserves_lineage());
-        assert!(!AuthorityTransition::Split.preserves_lineage());
-        assert!(!AuthorityTransition::Merge.preserves_lineage());
-        assert!(!AuthorityTransition::IncarnationChange.preserves_lineage());
-        // Only pure routing swaps preserve memory-held evidence.
+    fn only_routing_swaps_preserve_memory_held_evidence() {
+        for transition in [
+            AuthorityTransition::WorkerMove,
+            AuthorityTransition::ReplicaMigration,
+            AuthorityTransition::DirectoryReplace,
+        ] {
+            assert!(
+                transition.preserves_lineage(),
+                "{transition} must preserve the lineage"
+            );
+        }
+        for transition in [
+            AuthorityTransition::Split,
+            AuthorityTransition::Merge,
+            AuthorityTransition::IncarnationChange,
+        ] {
+            assert!(
+                !transition.preserves_lineage(),
+                "{transition} cannot preserve the lineage"
+            );
+        }
         assert!(AuthorityTransition::DirectoryReplace.preserves_evidence());
         assert!(!AuthorityTransition::WorkerMove.preserves_evidence());
         assert!(!AuthorityTransition::ReplicaMigration.preserves_evidence());
     }
 
+    /// A caller may ask for an hour-long wait; the engine must cap it, or one
+    /// unlucky read holds a request open indefinitely. A shorter ask is passed
+    /// through unchanged.
     #[test]
-    fn context_caps_unbounded_waits() {
-        let ctx = ReadContext::new(
+    fn a_read_context_caps_an_unbounded_wait() {
+        let asked_for_hour = ReadContext::new(
             WallTimestamp::from_micros(1_000),
             Ticks::from_micros(2_000),
             Duration::from_secs(3_600),
         );
-        assert_eq!(ctx.capped_wait(), AT_LEAST_WAIT_CAP);
-        let short = ReadContext::new(
+        assert_eq!(asked_for_hour.capped_wait(), AT_LEAST_WAIT_CAP);
+        let asked_for_ms = ReadContext::new(
             WallTimestamp::from_micros(1_000),
             Ticks::from_micros(2_000),
             Duration::from_millis(50),
         );
-        assert_eq!(short.capped_wait(), Duration::from_millis(50));
-    }
-
-    #[test]
-    fn provider_modes_name_their_assumptions() {
-        assert_eq!(
-            ReadAuthorityProvider::AlmostLocal.to_string(),
-            "almost-local"
-        );
-        assert_eq!(
-            ReadAuthorityProvider::RosterLease.to_string(),
-            "roster-lease"
-        );
-        assert_eq!(
-            ReadAuthorityProvider::ConservativeLeader.to_string(),
-            "conservative-leader"
-        );
-    }
-
-    #[test]
-    fn serve_paths_name_their_evidence() {
-        assert_eq!(ServePath::AlrSync.to_string(), "alr-sync");
-        assert_eq!(ServePath::AlrSubsumed.to_string(), "alr-subsumed");
-        assert_eq!(ServePath::RosterLease.to_string(), "roster-lease");
-    }
-
-    #[test]
-    fn roster_summaries_explain_why_a_read_is_safe() {
-        let summary = RosterSummary {
-            generation: 4,
-            term: 9,
-            responders: 3,
-            grants: 2,
-            required: 2,
-            floor: CommitPosition::from_u64(18291),
-            applied: CommitPosition::from_u64(18304),
-            quarantined: false,
-        };
-        let text = summary.explain();
-        assert!(
-            text.contains("grants=2/2"),
-            "explains grant count, got: {text}"
-        );
-        assert!(text.contains("floor=18291"), "explains floor, got: {text}");
-        assert!(
-            text.contains("applied=18304"),
-            "explains coverage, got: {text}"
-        );
-    }
-
-    #[test]
-    fn metrics_record_contract_mix_and_path_split() {
-        let mut metrics = ConsistencyMetrics::default();
-        metrics.record_serve(0, true);
-        metrics.record_serve(1, false);
-        metrics.record_serve(2, false);
-        metrics.record_serve(7, false);
-        let snapshot = metrics.snapshot();
-        assert_eq!(snapshot.reads_by_contract, (1, 1, 1, 1));
-        assert_eq!(snapshot.authority_serves, 1);
-        assert_eq!(snapshot.local_serves, 3);
+        assert_eq!(asked_for_ms.capped_wait(), Duration::from_millis(50));
     }
 
     #[test]

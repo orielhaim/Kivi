@@ -1,6 +1,6 @@
 //! Live fourth-node admission on an ordered cluster: one long-lived client
 //! keeps serving traffic straight through admission, directory catch-up,
-//! lineage churn, and rebalance — no client recreation, no rebalance
+//! lineage churn, and rebalance - no client recreation, no rebalance
 //! warmup, no `TooManyRedirects`, no routing black holes.
 //!
 //! Lifecycle model under test:
@@ -33,22 +33,8 @@ use kivi_client::ordered::{
     ScanProjection,
 };
 use kivi_lab::cluster::Cluster;
+use kivi_lab::testkit::{NS, hex_key, merge_and_wait, spread_key, tablet_state_dump};
 use kivi_state::Key;
-use kivi_types::NamespaceId;
-
-const NS: NamespaceId = NamespaceId::from_u64(1);
-
-fn spread_key(slot: usize, index: usize) -> Vec<u8> {
-    let prefix = match slot % 4 {
-        0 => 0x10u8,
-        1 => b'A',
-        2 => 0x90u8,
-        _ => 0xF0u8,
-    };
-    let mut key = vec![prefix];
-    key.extend_from_slice(format!("{index:06}").as_bytes());
-    key
-}
 
 /// One traffic burst: point writes + spot reads + a cross-tablet batch +
 /// a covering scan. Every op must succeed on the long-lived client; the
@@ -96,7 +82,7 @@ fn traffic_burst(
     // the known-decision recovery path under churn. A stale cached route
     // may probe a retired tablet while the server serves on its live
     // successor; the driver keeps served-elsewhere prepares in the abort
-    // set, evicts the proven-stale routes, and converges on re-probe —
+    // set, evicts the proven-stale routes, and converges on re-probe -
     // no intent is ever orphaned without a record or an owner.
     // (`txn_abort.rs` holds the deterministic abort regression.)
     let batch: Vec<BatchWriteSpec> = [0usize, 1, 3]
@@ -274,54 +260,6 @@ fn liveness(cluster: &Cluster, client: &kivi_client::NativeClient) -> String {
     )
 }
 
-/// Short hex for failure messages (first bytes only).
-fn hex_key(key: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::new();
-    for byte in key.iter().take(8) {
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
-}
-
-/// Per-member Raft state for one tablet group: role/term/leader plus
-/// log positions — distinguishes "no leader yet" from "divergent logs"
-/// when a key goes missing after migration.
-fn tablet_state_dump(cluster: &Cluster, tablet: u64) -> String {
-    let mut parts = Vec::new();
-    for index in 0..cluster.member_count() {
-        if !cluster.alive(index) {
-            parts.push(format!("m{index}:down"));
-            continue;
-        }
-        let row = cluster.tablets_status_opt(index).and_then(|status| {
-            status
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .find(|entry| {
-                    entry.get("group").and_then(serde_json::Value::as_u64) == Some(tablet)
-                })
-        });
-        match row {
-            Some(entry) => parts.push(format!(
-                "m{index}:role={} leader={} term={} last_log={} committed={} applied={}",
-                entry["role"].as_str().unwrap_or("?"),
-                entry["leader"]
-                    .as_u64()
-                    .map_or("none".to_owned(), |l| l.to_string()),
-                entry["term"].as_u64().unwrap_or(0),
-                entry["last_log"].as_u64().unwrap_or(0),
-                entry["committed"].as_u64().unwrap_or(0),
-                entry["applied"].as_u64().unwrap_or(0),
-            )),
-            None => parts.push(format!("m{index}:no-group")),
-        }
-    }
-    parts.join(" ")
-}
-
 /// Active tablet set + directory version of one member's serving
 /// directory (data-empty joiners report a version too: convergence is
 /// defined over directories, not hosted groups).
@@ -346,7 +284,7 @@ fn directory_view(cluster: &Cluster, index: usize) -> (u64, Vec<u64>) {
 
 /// Waits until every live member serves the same directory: equal
 /// versions and equal active tablet sets, stable across polls. This is
-/// the admission convergence predicate — it holds for data-empty members
+/// the admission convergence predicate - it holds for data-empty members
 /// (genesis + replayed cutovers) as well as tablet hosts.
 fn wait_directory_agreed(cluster: &Cluster, timeout: Duration) {
     let deadline = Instant::now() + timeout;
@@ -441,13 +379,7 @@ fn live_fourth_node_admission_without_traffic_loss() {
         .expect("split right child");
     cluster.wait_splits_done(Duration::from_secs(600));
     traffic_burst(&cluster, &client, &mut model, 30_000, "split");
-    let merge = cluster.merge_tablets(left, right);
-    assert_eq!(
-        merge.get("ok").and_then(serde_json::Value::as_bool),
-        Some(true),
-        "merge accepted: {merge}"
-    );
-    cluster.wait_merges_done(Duration::from_secs(600));
+    merge_and_wait(&cluster, left, right);
     wait_directory_agreed(&cluster, Duration::from_secs(300));
     traffic_burst(&cluster, &client, &mut model, 40_000, "merged");
 

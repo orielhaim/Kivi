@@ -18,7 +18,7 @@
 //! in-process voters per group through ONE shared [`SharedRegistry`]
 //! implementing the real [`openraft_multi::GroupRouter`] (group ids route
 //! to the right instance), so leaders hold real replication streams and
-//! followers receive real heartbeats — the honest proxy for mostly-idle
+//! followers receive real heartbeats - the honest proxy for mostly-idle
 //! Multi-Raft tablet groups, with production-faithful shared routing
 //! (never a connection object per group).
 //!
@@ -38,9 +38,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use kivi_consensus::config::{KiviTypeConfig, spike_config};
+use kivi_consensus::router::GroupNetworkFactory;
 use kivi_consensus::spike::{MemLogStore, MemStateMachine, StubNetworkFactory};
-use kivi_consensus::types::ConsensusGroupId;
+use kivi_consensus::{ConsensusGroupId, config::KiviTypeConfig, config::spike_config};
 use kivi_types::TabletId;
 use openraft::Raft;
 use openraft::type_config::async_runtime::watch::WatchReceiver as _;
@@ -234,7 +234,7 @@ async fn spawn_lone_voter(config: &Arc<openraft::Config>, node_id: u64) -> Densi
 
 /// Spawns one 3-voter group on the shared registry. All three
 /// initialize; a `NotAllowed` from a late voter is safe to ignore per
-/// `OpenRaft`'s contract — it means a peer already won an election and
+/// `OpenRaft`'s contract - it means a peer already won an election and
 /// replicated to this node, i.e. the cluster is up. The agreement wait
 /// proves convergence either way.
 async fn spawn_voter_group(
@@ -258,7 +258,7 @@ async fn spawn_voter_group(
         let raft = Raft::new(
             node_id,
             Arc::clone(config),
-            kivi_consensus::router::GroupNetworkFactory::new(registry.clone(), group_id),
+            GroupNetworkFactory::new(registry.clone(), group_id),
             MemLogStore::new(),
             MemStateMachine::default(),
         )
@@ -343,7 +343,7 @@ async fn run(groups: usize, voters: usize, hold_secs: u64) {
     // happens after the sleep and both RSS and CPU are read from it.
     // (An extra refresh between sleep-end and the CPU read would shrink
     // the window to milliseconds and sample heartbeat bursts instead of
-    // the average — a methodology bug the old spike shared.)
+    // the average - a methodology bug the old spike shared.)
     sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
     compio::time::sleep(Duration::from_secs(5)).await;
     let (rss_idle_mib, idle_cpu_pct) = idle_sample(&mut sys);
@@ -369,7 +369,7 @@ async fn run(groups: usize, voters: usize, hold_secs: u64) {
 /// This process's CPU load as percent of one core over the window since
 /// the caller's previous refresh, plus current RSS. The caller sleeps
 /// between its baseline refresh and this call, so the CPU result is the
-/// true average over the window — not an instantaneous sample.
+/// true average over the window - not an instantaneous sample.
 fn idle_sample(sys: &mut sysinfo::System) -> (f64, f64) {
     use sysinfo::{Pid, ProcessesToUpdate};
     sys.refresh_processes(ProcessesToUpdate::All, true);

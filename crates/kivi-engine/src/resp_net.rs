@@ -21,15 +21,15 @@
 //!   thread. Those requests are recognised from the request and the stored
 //!   representation *before* execution, so nothing is executed twice.
 //!
-//! Everything else — the overwhelming majority of traffic, and every point-read
-//! profile — executes inline. What does not goes to the owning worker through
+//! Everything else - the overwhelming majority of traffic, and every point-read
+//! profile - executes inline. What does not goes to the owning worker through
 //! the engine queue: correctness never depends on which worker holds the
 //! connection.
 //!
 //! # Which worker accepts
 //!
 //! The worker owning the most tablets takes the listener, so a single-tablet
-//! engine — the common deployment — forwards nothing. The choice is made once,
+//! engine - the common deployment - forwards nothing. The choice is made once,
 //! at spawn, and reported so the admin plane can name the bound endpoint.
 
 use std::net::SocketAddr;
@@ -137,7 +137,7 @@ pub(crate) async fn serve_resp(shared: Rc<WorkerNet>, config: RespNetConfig) {
 
     // Requests this worker does not own need an engine client, which cannot
     // exist before the workers it routes to. Clients that connect during
-    // startup sit in the accept backlog until this resolves — a bounded wait,
+    // startup sit in the accept backlog until this resolves - a bounded wait,
     // not a race, and never a connection answered with a false error.
     let forward = loop {
         if shared.shutdown.get() {
@@ -146,13 +146,12 @@ pub(crate) async fn serve_resp(shared: Rc<WorkerNet>, config: RespNetConfig) {
         if let Some(client) = config.forward.get() {
             break client.clone();
         }
-        YieldOnce(false).await;
+        crate::net::YieldNow::default().await;
     };
-    let forward = Arc::new(forward);
-    // One pool per worker, shared by every connection it serves. Requests that
-    // need another thread are the only ones that reach it, so it stays idle —
-    // and out of the way — on a workload the worker can answer itself.
-    let helpers = Helpers::spawn(&forward, HELPER_THREADS);
+    let forward = Arc::new(forward); // One pool per worker, shared by every connection it serves. Requests that
+    // need another thread are the only ones that reach it, so it stays idle -
+    // and out of the way - on a workload the worker can answer itself.
+    let helpers = spawn_helpers(&forward, HELPER_THREADS);
 
     // No accept timeout: cancelling a pending accept leaks the listener on this
     // compio version, which breaks same-port restart. Shutdown observes the
@@ -171,7 +170,6 @@ pub(crate) async fn serve_resp(shared: Rc<WorkerNet>, config: RespNetConfig) {
                 let id = next_id;
                 next_id = next_id.wrapping_add(1);
                 let stats = Arc::clone(&config.stats);
-                let namespace = config.namespace;
                 let conn = config.conn;
                 let worker = Rc::clone(&shared);
                 let forward = Arc::clone(&forward);
@@ -182,7 +180,6 @@ pub(crate) async fn serve_resp(shared: Rc<WorkerNet>, config: RespNetConfig) {
                         peer,
                         id,
                         shared: worker,
-                        namespace,
                         conn_config: conn,
                         stats,
                         forward,
@@ -200,26 +197,6 @@ pub(crate) async fn serve_resp(shared: Rc<WorkerNet>, config: RespNetConfig) {
     }
 }
 
-/// One cooperative yield: `Pending` once, after re-arming the waker.
-struct YieldOnce(bool);
-
-impl core::future::Future for YieldOnce {
-    type Output = ();
-
-    fn poll(
-        mut self: core::pin::Pin<&mut Self>,
-        cx: &mut core::task::Context<'_>,
-    ) -> core::task::Poll<()> {
-        if self.0 {
-            core::task::Poll::Ready(())
-        } else {
-            self.0 = true;
-            cx.waker().wake_by_ref();
-            core::task::Poll::Pending
-        }
-    }
-}
-
 /// Everything one accepted connection needs, so the serving function takes a
 /// bundle rather than eight positional arguments that are easy to transpose.
 struct RespConnLaunch {
@@ -227,11 +204,10 @@ struct RespConnLaunch {
     peer: SocketAddr,
     id: u64,
     shared: Rc<WorkerNet>,
-    namespace: NamespaceId,
     conn_config: ConnConfig,
     stats: Arc<RespStats>,
     forward: Arc<LocalClient>,
-    helpers: Arc<Helpers>,
+    helpers: Arc<async_channel::Sender<DeferredJob>>,
 }
 
 /// Serves one RESP connection on the worker's reactor.
@@ -246,7 +222,6 @@ async fn serve_resp_conn(launch: RespConnLaunch) {
         peer,
         id,
         shared,
-        namespace,
         conn_config,
         stats,
         forward,
@@ -260,7 +235,6 @@ async fn serve_resp_conn(launch: RespConnLaunch) {
     let (respond, receive) = crossbeam_channel::bounded(1);
     let executor = WorkerExecutor {
         shared,
-        namespace,
         forward,
         helpers,
         respond,
@@ -292,7 +266,7 @@ async fn serve_resp_conn(launch: RespConnLaunch) {
         }
         // Every turn this read produced, then ONE write. A pipeline deeper
         // than the per-turn budget spans several turns, and writing after each
-        // one costs a syscall per turn — a 256-deep pipeline paid four writes
+        // one costs a syscall per turn - a 256-deep pipeline paid four writes
         // where the client sent one read. Coalescing makes the write count per
         // read rather than per turn, which is the only ratio that matches what
         // a pipelining client actually sends.
@@ -366,71 +340,67 @@ struct DeferredJob {
     reply: async_channel::Sender<Result<OperationResult, ExecuteError>>,
 }
 
-/// Threads allowed to block, for requests the reactor cannot answer.
+/// Starts `threads` helper threads sharing `client`, returning the bounded
+/// queue they drain.
 ///
-/// A reactor thread must never park: the tasks that would answer it — the
+/// A reactor thread must never park: the tasks that would answer it - the
 /// bridge that drains the worker queue, the commit coordinator, the chunk lane
-/// — all run on that same thread or are only reachable through it. Blocking
-/// there is a deadlock, not a slow path. These threads have no such
-/// constraint: they are ordinary threads that go through the same engine queue
-/// an embedded caller uses, and the reactor waits on them without parking.
+/// - all run on that same thread or are only reachable through it. Blocking
+/// there is a deadlock, not a slow path. Helpers have no such constraint: they
+/// are ordinary threads that go through the same engine queue an embedded
+/// caller uses, and the reactor waits on them without parking.
 ///
 /// Sized small on purpose. Only requests that need another thread arrive here,
 /// so a busy helper means the workload is dominated by large values or
-/// durability — the cases where the engine is waiting on a device or a lane
+/// durability - the cases where the engine is waiting on a device or a lane
 /// anyway, and where a longer queue buys nothing.
-struct Helpers {
-    jobs: async_channel::Sender<DeferredJob>,
+fn spawn_helpers(client: &LocalClient, threads: usize) -> Arc<async_channel::Sender<DeferredJob>> {
+    let (jobs, incoming) = async_channel::bounded::<DeferredJob>(DEFERRED_BACKLOG);
+    for index in 0..threads.max(1) {
+        let client = client.clone();
+        let incoming = incoming.clone();
+        // A helper that cannot start is fatal to the edge: without it every
+        // deferred request would have nowhere to go. Failing loudly here,
+        // inside the accept loop, is better than answering clients with an
+        // error nobody can act on.
+        let spawned = std::thread::Builder::new()
+            .name(format!("kivi-resp-helper-{index}"))
+            .spawn(move || {
+                while let Ok(job) = incoming.recv_blocking() {
+                    let outcome = client.execute_op(job.op).map_err(map_engine_error);
+                    // The receiver is waiting; a failure here means the
+                    // connection went away mid-flight, and the answer has
+                    // nowhere to go.
+                    let _ = job.reply.try_send(outcome);
+                }
+            });
+        if let Err(error) = spawned {
+            tracing::error!(%error, "RESP helper thread spawn failed");
+        }
+    }
+    Arc::new(jobs)
 }
 
-impl Helpers {
-    /// Starts `threads` helpers sharing `client`.
-    #[must_use]
-    fn spawn(client: &LocalClient, threads: usize) -> Arc<Self> {
-        let (jobs, incoming) = async_channel::bounded::<DeferredJob>(DEFERRED_BACKLOG);
-        for index in 0..threads.max(1) {
-            let client = client.clone();
-            let incoming = incoming.clone();
-            // A helper that cannot start is fatal to the edge: without it every
-            // deferred request would have nowhere to go. Failing loudly here,
-            // inside the accept loop, is better than answering clients with an
-            // error nobody can act on.
-            let spawned = std::thread::Builder::new()
-                .name(format!("kivi-resp-helper-{index}"))
-                .spawn(move || {
-                    while let Ok(job) = incoming.recv_blocking() {
-                        let outcome = client.execute_op(job.op).map_err(map_engine_error);
-                        // The receiver is waiting; a failure here means the
-                        // connection went away mid-flight, and the answer has
-                        // nowhere to go.
-                        let _ = job.reply.try_send(outcome);
-                    }
-                });
-            if let Err(error) = spawned {
-                tracing::error!(%error, "RESP helper thread spawn failed");
-            }
-        }
-        Arc::new(Self { jobs })
-    }
-
-    /// Runs one request on a helper and waits for its answer.
-    ///
-    /// Waited on rather than fired and collected, because a RESP turn is
-    /// sequential: the command after this one may read what this one wrote, so
-    /// two helpers must never apply the same turn's commands concurrently.
-    ///
-    /// A full backlog is refused rather than queued: the alternative is
-    /// unbounded memory for requests whose answers are device-bound anyway.
-    async fn run(&self, op: Operation) -> Result<OperationResult, ExecuteError> {
-        let (reply, receiver) = async_channel::bounded(1);
-        self.jobs
-            .try_send(DeferredJob { op, reply })
-            .map_err(|_| ExecuteError::Overloaded)?;
-        receiver
-            .recv()
-            .await
-            .unwrap_or(Err(ExecuteError::Overloaded))
-    }
+/// Runs one request on a helper and waits for its answer.
+///
+/// Waited on rather than fired and collected, because a RESP turn is
+/// sequential: the command after this one may read what this one wrote, so
+/// two helpers must never apply the same turn's commands concurrently.
+///
+/// A full backlog is refused rather than queued: the alternative is
+/// unbounded memory for requests whose answers are device-bound anyway.
+async fn run_deferred(
+    helpers: &async_channel::Sender<DeferredJob>,
+    op: Operation,
+) -> Result<OperationResult, ExecuteError> {
+    let (reply, receiver) = async_channel::bounded(1);
+    helpers
+        .try_send(DeferredJob { op, reply })
+        .map_err(|_| ExecuteError::Overloaded)?;
+    receiver
+        .recv()
+        .await
+        .unwrap_or(Err(ExecuteError::Overloaded))
 }
 
 /// Helper threads per worker.
@@ -456,8 +426,8 @@ struct InlineFacts {
 /// Whether one request can be executed inline without ever waiting on anything
 /// other than the thread executing it.
 ///
-/// Each exclusion is a wait the reactor cannot serve — a durability proof, or
-/// the chunk lane's separate thread — and every one is decided *before*
+/// Each exclusion is a wait the reactor cannot serve - a durability proof, or
+/// the chunk lane's separate thread - and every one is decided *before*
 /// execution, so nothing is executed twice and nothing is left half-done.
 ///
 /// A pure function of the operation and three facts, so the decision can be
@@ -491,17 +461,16 @@ fn inline_eligible(op: &Operation, facts: InlineFacts) -> bool {
 ///
 /// **A reactor-served connection must use the async turn.** The synchronous
 /// `Executor` methods hand anything they cannot answer to a helper and *block*
-/// on it, which is correct on an ordinary thread and a deadlock on this one —
+/// on it, which is correct on an ordinary thread and a deadlock on this one -
 /// the helper's answer arrives via the worker queue, and the queue is drained
 /// by the task this call is blocking. [`RespConnection::drain_async`] takes the
 /// path that awaits instead.
 struct WorkerExecutor {
     shared: Rc<WorkerNet>,
-    namespace: NamespaceId,
     /// Engine client for requests this worker cannot answer itself.
     forward: Arc<LocalClient>,
     /// Threads allowed to block, for those requests.
-    helpers: Arc<Helpers>,
+    helpers: Arc<async_channel::Sender<DeferredJob>>,
     /// Reused for the connection's life. A same-thread rendezvous never
     /// blocks, so this costs one channel send and one `try_recv` with no
     /// wakeup on either side; a fresh channel per request would allocate more
@@ -514,11 +483,7 @@ impl WorkerExecutor {
     /// Routes the operation's key, reporting whether this worker owns the
     /// tablet it landed on.
     fn route(&self, routing: &crate::routing::RoutingSnapshot, op: &Operation) -> Option<TabletId> {
-        let tablet = crate::compound::route_point_key(
-            routing.directory(),
-            self.namespace,
-            op.key().as_bytes(),
-        )?;
+        let tablet = crate::compound::route_point_key(routing, op.key().as_bytes())?;
         (routing.placement().worker_of(tablet) == Some(self.shared.id)).then_some(tablet)
     }
 
@@ -533,7 +498,7 @@ impl WorkerExecutor {
             .shared
             .tablets
             .borrow()
-            .get(&tablet)
+            .get(tablet)
             .and_then(|live| live.store().get(op.key(), now))
             .is_some_and(kivi_state::StoredObject::is_chunked);
         inline_eligible(
@@ -555,7 +520,7 @@ impl WorkerExecutor {
     ) -> Result<OperationResult, ExecuteError> {
         // The reply channel is reused for the connection's life, so it is
         // emptied first. `handle_request` sends at most one answer and one is
-        // always taken below, so this should find nothing — but a path that
+        // always taken below, so this should find nothing - but a path that
         // answered twice would otherwise hand this request its neighbour's
         // reply, and a wrong answer in the right slot is the one failure a
         // RESP client cannot detect.
@@ -594,32 +559,10 @@ impl WorkerExecutor {
         snapshot.direct_ops += 1;
         self.shared.metrics.set(snapshot);
         // No slicing here: the store applies a range read's own window, and
-        // applying it twice returns the wrong bytes. A chunked root — the one
-        // case where the store names a manifest instead of a value — never
+        // applying it twice returns the wrong bytes. A chunked root - the one
+        // case where the store names a manifest instead of a value - never
         // reaches this path, because `inline_eligible` forwards it.
         response.map_err(map_worker_error)
-    }
-
-    /// Hands the operation to the worker that owns its tablet.
-    fn execute_forwarded(&self, op: &Operation) -> Result<OperationResult, ExecuteError> {
-        self.forward
-            .execute_op(op.clone())
-            .map_err(map_engine_error)
-    }
-
-    /// Executes one operation, choosing the path that can answer it.
-    fn run(
-        &self,
-        op: &Operation,
-        routing: &crate::routing::RoutingSnapshot,
-    ) -> Result<OperationResult, ExecuteError> {
-        let now = kivi_core::wall_now_or_max(&kivi_core::SystemClock);
-        match self.route(routing, op) {
-            Some(tablet) if self.inline_eligible(op, tablet) => {
-                self.execute_inline(op, tablet, now)
-            }
-            _ => self.execute_forwarded(op),
-        }
     }
 
     /// Executes a turn, keeping its commands in order across the path split.
@@ -630,7 +573,7 @@ impl WorkerExecutor {
     ///
     /// The switch is one-way on purpose. A RESP client pipelines commands it
     /// expects applied in order, and the engine expands one client command into
-    /// more than one operation — `SETRANGE` becomes a write plus a length read,
+    /// more than one operation - `SETRANGE` becomes a write plus a length read,
     /// and that read must observe the write. Answering the length inline while
     /// the write is still on a helper is exactly how that breaks: the read wins
     /// the race and reports 0 for a 7-byte value.
@@ -652,16 +595,26 @@ impl WorkerExecutor {
                 }
                 sequential = true;
             }
-            results.push(self.helpers.run(op.clone()).await);
+            results.push(run_deferred(&self.helpers, op.clone()).await);
         }
         results
     }
 }
 
 impl Executor for WorkerExecutor {
+    /// Hands the operation to the worker that owns its tablet.
     fn execute(&self, op: &Operation) -> Result<OperationResult, ExecuteError> {
         let routing = self.shared.routing.load();
-        self.run(op, &routing)
+        let now = kivi_core::wall_now_or_max(&kivi_core::SystemClock);
+        match self.route(&routing, op) {
+            Some(tablet) if self.inline_eligible(op, tablet) => {
+                self.execute_inline(op, tablet, now)
+            }
+            _ => self
+                .forward
+                .execute_op(op.clone())
+                .map_err(map_engine_error),
+        }
     }
 
     /// The synchronous turn. A request this worker cannot answer itself is
@@ -676,13 +629,81 @@ impl Executor for WorkerExecutor {
                 Some(tablet) if self.inline_eligible(op, tablet) => {
                     self.execute_inline(op, tablet, now)
                 }
-                _ => self.execute_forwarded(op),
+                _ => self
+                    .forward
+                    .execute_op(op.clone())
+                    .map_err(map_engine_error),
             })
             .collect()
     }
 
     fn now(&self) -> WallTimestamp {
         kivi_core::wall_now_or_max(&kivi_core::SystemClock)
+    }
+
+    /// The single-tablet route this worker owns, asked once per drain rather
+    /// than once per command: a pipeline shares one answer, and asking per
+    /// command is two `arc-swap` loads and a version compare multiplied by the
+    /// pipeline depth. `None` means the general path routes it.
+    fn direct_route(&self) -> Option<kivi_types::TabletRoute> {
+        self.shared.local_routes().single()
+    }
+
+    /// Answers a common read directly from the tablet a compiled route names.
+    ///
+    /// No semantics are reimplemented: the value, length, existence answer and
+    /// TTL all come from the store's own accessors, so there is no second
+    /// authority for what `GET` means. Every `None` is a correctness-preserving
+    /// fallback - a key this worker does not own, a chunked or fabric-backed
+    /// value whose resolution suspends, or a slot vacated mid-pipeline - and the
+    /// general path routes against the new publication.
+    fn fast_read(
+        &self,
+        route: kivi_types::TabletRoute,
+        kind: kivi_resp::fast::FastKind,
+        key: &[u8],
+        now: kivi_types::WallTimestamp,
+    ) -> Option<kivi_resp::Reply> {
+        // The route arrived already resolved against this worker's slots, so
+        // reaching the tablet is a bounds check. The borrow guard is bound to a
+        // name rather than dropped at the end of a chain: `self.shared.tablets`
+        // is a `RefCell`, so the `borrow()` has to outlive the `&ObjectStore` it
+        // hands out.
+        let tablets = self.shared.tablets.borrow();
+        let live = tablets.by_slot(route.slot())?.store();
+        let stored = live.get_borrowed(key, now);
+        Some(match (kind, stored) {
+            // A value that is not inline bytes cannot be answered without
+            // resolving it, which is the fallback's job.
+            (kivi_resp::fast::FastKind::Get, Some(object)) => {
+                let kivi_state::LogicalValue::Bytes(bytes) = object.value() else {
+                    return None;
+                };
+                kivi_resp::Reply::Bulk(bytes.clone())
+            }
+            (kivi_resp::fast::FastKind::Get, None) => kivi_resp::Reply::Nil,
+            (kivi_resp::fast::FastKind::Exists, found) => {
+                kivi_resp::Reply::Int(i64::from(found.is_some()))
+            }
+            (kivi_resp::fast::FastKind::StrLen, Some(object)) => {
+                let kivi_state::LogicalValue::Bytes(bytes) = object.value() else {
+                    return None;
+                };
+                // The same saturation the general path's `Length` mapping uses,
+                // so the two agree on a value longer than `i64::MAX`.
+                kivi_resp::Reply::Int(i64::try_from(bytes.len()).unwrap_or(i64::MAX))
+            }
+            (kivi_resp::fast::FastKind::StrLen, None) => kivi_resp::Reply::Int(0),
+            // The TTL rounding is `kivi-resp`'s, not a second copy: Redis's
+            // round-up-to-seconds and the one-second grace for an expired but
+            // unreclaimed value are properties of the command.
+            (kivi_resp::fast::FastKind::Ttl, found) => kivi_resp::Reply::Int(
+                kivi_resp::translate::ttl_seconds(found.map(kivi_state::StoredObject::expiry), now),
+            ),
+            (kivi_resp::fast::FastKind::Pttl, found) => kivi_resp::Reply::Int(
+                kivi_resp::translate::ttl_millis(found.map(kivi_state::StoredObject::expiry), now),
+            ),
+        })
     }
 
     fn execute_batch_async<'a>(

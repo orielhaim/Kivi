@@ -13,7 +13,6 @@ use std::path::PathBuf;
 /// here (they never touch the provider); mutating requests fail instead of
 /// recording memory-only writes.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
 pub enum DurabilityError {
     /// Another process holds the data-directory lock.
     #[error("data directory locked (held by another process): {path:?}")]
@@ -78,7 +77,6 @@ impl DurabilityError {
 /// committed history and never converts corruption into acknowledged data
 /// loss: anything outside a torn final tail fails here, loudly.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
 pub enum RecoveryError {
     /// A lane directory contains an unparsable file name.
     #[error("lane {lane:04} holds an unexpected file: {name:?}")]

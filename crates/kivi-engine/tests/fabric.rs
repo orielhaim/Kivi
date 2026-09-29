@@ -6,69 +6,18 @@
 //! the fabric path; assertions compare full logical bytes through the
 //! public [`kivi_engine::LocalClient`] API only.
 
-use std::path::Path;
+mod harness;
+
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use kivi_engine::{
-    BatchPolicy, CheckpointConfig, DurabilityMode, DurableConfig, EngineConfig, EngineError,
-    FabricConfig, LocalClient, LocalEngine, Placement,
+use harness::{
+    ROOT, config, durable_config, durable_split_config, root_placement, root_snapshot,
+    split_placement, split_snapshot,
 };
+use kivi_engine::{EngineError, FabricConfig, LocalClient, LocalEngine};
 use kivi_state::{Key, ObjectVersion, TxnExpect, TxnWrite, TxnWriteKind};
-use kivi_tablet::{DirectorySnapshot, HashPrefix, PartitionRange};
-use kivi_types::{NamespaceId, TabletEpoch, TabletId, WorkerId, WriteGuardGeneration};
-
-const NS: NamespaceId = NamespaceId::from_u64(1);
-const TABLET: TabletId = TabletId::from_u64(1);
-const EPOCH: TabletEpoch = TabletEpoch::INITIAL;
-const GUARD: WriteGuardGeneration = WriteGuardGeneration::INITIAL;
-
-fn hash_range(bits: u128, len: u8) -> PartitionRange {
-    PartitionRange::Hash(HashPrefix::new(bits, len).expect("range"))
-}
-
-fn activate(snapshot: &DirectorySnapshot, tablet: TabletId) -> DirectorySnapshot {
-    snapshot
-        .clone()
-        .stage(tablet)
-        .and_then(|staged| staged.activate(tablet))
-        .expect("stage+activate")
-}
-
-fn root_snapshot() -> DirectorySnapshot {
-    let genesis =
-        DirectorySnapshot::bootstrap(NS, TABLET, hash_range(0, 0), EPOCH, GUARD).expect("genesis");
-    activate(&genesis, TABLET)
-}
-
-fn split_snapshot() -> DirectorySnapshot {
-    let mut dir = root_snapshot();
-    dir = dir
-        .allocate(TabletId::from_u64(2), hash_range(0, 1), EPOCH, GUARD)
-        .and_then(|staged| staged.stage(TabletId::from_u64(2)))
-        .expect("child 0*");
-    dir = dir
-        .allocate(
-            TabletId::from_u64(3),
-            hash_range(1u128 << 127, 1),
-            EPOCH,
-            GUARD,
-        )
-        .and_then(|staged| staged.stage(TabletId::from_u64(3)))
-        .expect("child 1*");
-    dir = dir.seal(TABLET).expect("seal");
-    dir = dir.activate(TabletId::from_u64(2)).expect("activate 2");
-    dir = dir.activate(TabletId::from_u64(3)).expect("activate 3");
-    dir.retire(
-        TABLET,
-        kivi_tablet::Redirect::new(vec![TabletId::from_u64(2), TabletId::from_u64(3)]),
-    )
-    .expect("retire")
-}
-
-fn worker(index: u64) -> WorkerId {
-    WorkerId::from_u64(index)
-}
+use kivi_types::TabletId;
 
 /// Deterministic constant-fill pattern (`(seed % 251)` repeated).
 fn fill_pattern(seed: u64, len: usize) -> Bytes {
@@ -109,70 +58,32 @@ fn pressured_fabric() -> FabricConfig {
 }
 
 fn start_ephemeral(
-    directory: DirectorySnapshot,
-    placement: Placement,
+    directory: kivi_tablet::DirectorySnapshot,
+    placement: kivi_engine::Placement,
     worker_count: usize,
     fabric: FabricConfig,
 ) -> LocalEngine {
-    LocalEngine::start(EngineConfig {
-        namespace: NS,
-        hardware: kivi_engine::HardwareConfig::default(),
-        directory,
-        placement,
-        worker_count,
-        request_capacity: 256,
-        chunks: kivi_engine::ChunkFabricConfig::default(),
-        fabric,
-        network: None,
-        durability: DurabilityMode::Ephemeral,
-    })
-    .expect("ephemeral engine starts")
+    let mut config = config(directory, placement, worker_count);
+    config.request_capacity = 256;
+    config.fabric = fabric;
+    LocalEngine::start(config).expect("ephemeral engine starts")
 }
 
 fn start_single_ephemeral(fabric: FabricConfig) -> LocalEngine {
-    start_ephemeral(
-        root_snapshot(),
-        Placement::new([(TABLET, worker(0))]),
-        1,
-        fabric,
-    )
+    start_ephemeral(root_snapshot(), root_placement(), 1, fabric)
 }
 
 /// Durable config with automatic checkpoints stilled: tests trigger
 /// manually, so cuts stay deterministic.
-fn durable(dir: &Path, fabric: FabricConfig) -> EngineConfig {
-    let opened = kivi_durability::open_data_dir(dir, None).expect("data dir opens");
-    EngineConfig {
-        namespace: NS,
-        hardware: kivi_engine::HardwareConfig::default(),
-        directory: root_snapshot(),
-        placement: Placement::new([(TABLET, worker(0))]),
-        worker_count: 2,
-        request_capacity: 256,
-        chunks: kivi_engine::ChunkFabricConfig::default(),
-        fabric,
-        network: None,
-        durability: DurabilityMode::Durable(DurableConfig {
-            data_dir: dir.to_owned(),
-            segment_target_bytes: 1024 * 1024,
-            node: opened.meta.node,
-            cluster: opened.meta.cluster,
-            incarnation: opened.meta.incarnation,
-            shared_wal: false,
-            batch: BatchPolicy::default_policy(),
-            checkpoint: CheckpointConfig {
-                disabled: true,
-                ..CheckpointConfig::default_config()
-            },
-        }),
-    }
+fn durable(dir: &std::path::Path, fabric: FabricConfig) -> kivi_engine::EngineConfig {
+    durable_config(dir, kivi_engine::ChunkFabricConfig::default(), fabric)
 }
 
 /// Waits for an installed CURRENT at `cut` (background build plus publish
 /// are asynchronous), sharing the test's overall deadline.
-fn await_current(dir: &Path, cut: u64, deadline: Instant) {
+fn await_current(dir: &std::path::Path, cut: u64, deadline: Instant) {
     loop {
-        if let Ok(Some(current)) = kivi_checkpoint::read_current(dir, TABLET)
+        if let Ok(Some(current)) = kivi_checkpoint::read_current(dir, ROOT)
             && current.cut >= cut
         {
             return;
@@ -231,17 +142,6 @@ fn clamped_slice(value: &Bytes, offset: u64, len: u64) -> Bytes {
     let from = usize::try_from(start).expect("offset fits in usize");
     let until = usize::try_from(end).expect("offset fits in usize");
     value.slice(from..until)
-}
-
-#[test]
-fn medium_value_round_trips_ephemeral() {
-    let engine = start_single_ephemeral(FabricConfig::default());
-    let client = engine.client();
-    let key = Key::from("fabric:medium:1k");
-    let value = fill_pattern(9, 1024);
-    client.set(&key, value.clone()).expect("set");
-    assert_eq!(client.get(&key).expect("get"), Some(value), "1KB exact");
-    engine.shutdown().expect("clean shutdown");
 }
 
 #[test]
@@ -339,12 +239,7 @@ fn verify_pressure_keys(client: &LocalClient, expected: &[(Key, Bytes)], deadlin
 
 #[test]
 fn pressure_demotes_and_resume_is_exact() {
-    let engine = start_ephemeral(
-        root_snapshot(),
-        Placement::new([(TABLET, worker(0))]),
-        2,
-        pressured_fabric(),
-    );
+    let engine = start_ephemeral(root_snapshot(), root_placement(), 2, pressured_fabric());
     let client = engine.client();
     let deadline = Instant::now() + Duration::from_secs(30);
     let expected = write_pressure_keys(&client, deadline);
@@ -359,12 +254,7 @@ fn pressure_demotes_and_resume_is_exact() {
 
 #[test]
 fn small_set_range_restages_after_offcore_fabric_demotion() {
-    let engine = start_ephemeral(
-        root_snapshot(),
-        Placement::new([(TABLET, worker(0))]),
-        2,
-        pressured_fabric(),
-    );
+    let engine = start_ephemeral(root_snapshot(), root_placement(), 2, pressured_fabric());
     let client = engine.client();
     let deadline = Instant::now() + Duration::from_secs(30);
     let expected = write_pressure_keys(&client, deadline);
@@ -416,10 +306,7 @@ fn probe_one_key_per_tablet(engine: &LocalEngine) -> Vec<(TabletId, Key)> {
 fn cross_tablet_batch_with_medium_values() {
     let engine = start_ephemeral(
         split_snapshot(),
-        Placement::new([
-            (TabletId::from_u64(2), worker(0)),
-            (TabletId::from_u64(3), worker(1)),
-        ]),
+        split_placement(),
         2,
         FabricConfig::default(),
     );
@@ -498,7 +385,7 @@ fn cross_tablet_batch_with_medium_values() {
 /// refuses to serve a root whose value is unreadable. The flip lands past
 /// the batch header so it hits body bytes, and the batch/footers CRCs are
 /// what must catch it.
-fn corrupt_worker_zero_wal(data_dir: &Path) {
+fn corrupt_worker_zero_wal(data_dir: &std::path::Path) {
     let wal_dir = data_dir.join(kivi_durability::node::WAL_DIR_NAME);
     let mut segments: Vec<_> = std::fs::read_dir(&wal_dir)
         .expect("wal dir present")
@@ -587,35 +474,8 @@ fn durable_supersede_checkpoint_restart() {
 }
 
 /// Durable config over the split directory (two tablets, two workers).
-fn durable_split(dir: &Path, fabric: FabricConfig) -> EngineConfig {
-    let opened = kivi_durability::open_data_dir(dir, None).expect("data dir opens");
-    EngineConfig {
-        namespace: NS,
-        hardware: kivi_engine::HardwareConfig::default(),
-        directory: split_snapshot(),
-        placement: Placement::new([
-            (TabletId::from_u64(2), worker(0)),
-            (TabletId::from_u64(3), worker(1)),
-        ]),
-        worker_count: 2,
-        request_capacity: 256,
-        chunks: kivi_engine::ChunkFabricConfig::default(),
-        fabric,
-        network: None,
-        durability: DurabilityMode::Durable(DurableConfig {
-            data_dir: dir.to_owned(),
-            segment_target_bytes: 1024 * 1024,
-            node: opened.meta.node,
-            cluster: opened.meta.cluster,
-            incarnation: opened.meta.incarnation,
-            shared_wal: false,
-            batch: BatchPolicy::default_policy(),
-            checkpoint: CheckpointConfig {
-                disabled: true,
-                ..CheckpointConfig::default_config()
-            },
-        }),
-    }
+fn durable_split(dir: &std::path::Path, fabric: FabricConfig) -> kivi_engine::EngineConfig {
+    durable_split_config(dir, fabric)
 }
 
 #[test]

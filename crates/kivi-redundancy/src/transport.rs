@@ -5,7 +5,7 @@
 //! network: production transports live above (control/consensus networking),
 //! while [`LoopbackTransport`] routes to separate in-process stores for
 //! deterministic tests. Real-network coverage lives in the `kivi-consensus`
-//! and `kivi-lab` suites — loopback proves the plane logic, not the wire.
+//! and `kivi-lab` suites - loopback proves the plane logic, not the wire.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -139,13 +139,6 @@ impl LoopbackTransport {
     pub fn add_node(&self, node: NodeId, store: Arc<Mutex<crate::store::LocalFragmentStore>>) {
         if let Ok(mut guard) = self.stores.lock() {
             guard.insert(node, store);
-        }
-    }
-
-    /// Removes a node's store (simulates a dead holder: calls fail closed).
-    pub fn remove_node(&self, node: NodeId) {
-        if let Ok(mut guard) = self.stores.lock() {
-            guard.remove(&node);
         }
     }
 }

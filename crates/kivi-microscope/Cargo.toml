@@ -1,0 +1,36 @@
+[package]
+name = "kivi-microscope"
+version = "0.1.0"
+description = "Measurement instruments for Kivi's performance program: calibrated TSC, exact allocation and byte-movement accounting, per-phase request decomposition"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+# The microscope is a measurement instrument, not library code on any product
+# path. No product crate depends on it; only benches and the control servers do.
+[dependencies]
+
+# Lints are spelled out rather than inherited. Cargo forbids overriding a
+# inherited lint table, and this crate needs exactly one deliberate difference
+# from the workspace: it is the workspace's designated `unsafe` island.
+#
+# Three things require `unsafe` here and nowhere else:
+#
+#   * `rdtsc` / `rdtscp` for calibrated timekeeping (no safe intrinsic)
+#   * the `GlobalAlloc` forwarding impl for the counting allocator
+#   * a thread-local raw pointer, so instrumented code can record without a
+#     `&mut` borrow and stay `Copy` and two words wide
+#
+# Everything else is byte-identical to the workspace table, and every product
+# crate keeps `unsafe_code = "deny"`. This is the containment boundary the
+# program requires custom tables and io_uring to have, applied to the measuring
+# instruments themselves, so an unsafe change is a diff in one small crate
+# rather than a diff in the workspace policy.
+[lints.rust]
+unsafe_code = "allow"
+missing_docs = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = "deny"
+pedantic = "deny"

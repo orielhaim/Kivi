@@ -5,9 +5,9 @@
 //! scheduler, seeded RNG, fault policy, and trace below are only a
 //! deterministic *driver* for it. If production semantics ever depended on
 //! ambient time, randomness, or hash order, these replay assertions would
-//! catch it — no `SimTablet` fork exists or may be introduced.
+//! catch it - no `SimTablet` fork exists or may be introduced.
 
-use kivi_core::{EventView, FaultDecision, FaultPolicy, RandomSource};
+use kivi_core::{FaultDecision, FaultPolicy, RandomSource};
 use kivi_sim::{AllowAll, DropEveryNth, Scheduler, SimRng, Trace};
 use kivi_state::{Key, Mutation, ObjectStore};
 use kivi_types::WallTimestamp;
@@ -53,9 +53,9 @@ fn script(seed: u64, count: u64) -> Vec<Mutation> {
 /// Drives one run: each mutation executes at its scheduled tick with the
 /// tick as logical time, under `policy`. The policy is consulted exactly
 /// once per event. Returns the final snapshot plus the trace.
-fn drive<P: FaultPolicy>(
+fn drive(
     seed: u64,
-    mut policy: P,
+    policy: &mut dyn FaultPolicy,
 ) -> (Vec<(Key, kivi_state::StoredObject)>, Trace<Mutation>) {
     use kivi_sim::RecordedDecision;
 
@@ -72,8 +72,9 @@ fn drive<P: FaultPolicy>(
     while let Some(scheduled) = scheduler.pop_next() {
         let id = scheduled.id();
         let at = scheduled.at();
+        let view = scheduled.view();
         let mutation = scheduled.into_event();
-        let decision = policy.decide(&EventView::new(id, at), &(), &mut rng);
+        let decision = policy.decide(&view, &(), &mut rng);
         match decision {
             FaultDecision::Allow | FaultDecision::Duplicate => {
                 // Duplicates re-run the identical deterministic apply and
@@ -102,24 +103,39 @@ fn drive<P: FaultPolicy>(
     (store.snapshot_sorted(), trace)
 }
 
-#[rstest]
-#[case(11)]
-#[case(22)]
-fn production_mutations_replay_identically(#[case] seed: u64) {
-    let (first_state, first_trace) = drive(seed, AllowAll);
-    let (second_state, second_trace) = drive(seed, AllowAll);
-    assert_eq!(first_state, second_state);
-    assert_eq!(first_trace, second_trace);
-    assert!(!first_state.is_empty(), "script must touch state");
+/// One scripted policy family, re-constructible so the same scenario can be
+/// driven twice from scratch. A policy is stateful (it counts decisions), so
+/// the two runs must each get their own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fault {
+    None,
+    EverySeventh,
 }
 
+impl Fault {
+    fn build(self) -> Box<dyn FaultPolicy> {
+        match self {
+            Self::None => Box::new(AllowAll),
+            Self::EverySeventh => Box::new(DropEveryNth::new(NonZeroU64::new(7).expect("nonzero"))),
+        }
+    }
+}
+
+/// Replay equivalence over the *production* state logic: no `SimTablet`
+/// fork exists, so this is the only proof that `kivi_state` reads nothing
+/// ambient (wall clock, unseeded randomness, hash order) that would make a
+/// simulated run irreproducible.
 #[rstest]
-#[case(11)]
-#[case(22)]
-fn faulted_mutation_runs_replay_identically(#[case] seed: u64) {
-    let every = NonZeroU64::new(7).expect("nonzero");
-    let (first_state, first_trace) = drive(seed, DropEveryNth::new(every));
-    let (second_state, second_trace) = drive(seed, DropEveryNth::new(every));
-    assert_eq!(first_state, second_state);
-    assert_eq!(first_trace, second_trace);
+#[case(11, Fault::None)]
+#[case(22, Fault::None)]
+#[case(11, Fault::EverySeventh)]
+#[case(22, Fault::EverySeventh)]
+fn production_mutations_replay_identically(#[case] seed: u64, #[case] fault: Fault) {
+    let (first_state, first_trace) = drive(seed, &mut *fault.build());
+    assert!(!first_state.is_empty(), "script must touch state");
+    assert_eq!(
+        drive(seed, &mut *fault.build()),
+        (first_state, first_trace),
+        "seed {seed} under {fault:?} must replay exactly"
+    );
 }

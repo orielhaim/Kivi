@@ -412,8 +412,6 @@ pub struct FragmentCensus {
     pub by_node: HashMap<NodeId, u64>,
     /// Fragments per independence key (failure-domain view).
     pub by_domain: HashMap<String, u64>,
-    /// Stored fragment bytes per node id (bounded by cluster size).
-    pub by_node_bytes: HashMap<NodeId, u64>,
 }
 
 impl FragmentCensus {
@@ -427,10 +425,5 @@ impl FragmentCensus {
     pub fn record(&mut self, node: NodeId, domain_key: String) {
         *self.by_node.entry(node).or_insert(0) += 1;
         *self.by_domain.entry(domain_key).or_insert(0) += 1;
-    }
-
-    /// Records one fragment's stored bytes against its holder.
-    pub fn record_bytes(&mut self, node: NodeId, bytes: u64) {
-        *self.by_node_bytes.entry(node).or_insert(0) += bytes;
     }
 }

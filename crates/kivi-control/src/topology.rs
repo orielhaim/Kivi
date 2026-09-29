@@ -109,7 +109,7 @@ impl PlanSchedulerConfig {
 /// Whether two tablet sets conflict (share any tablet): a tablet never
 /// executes two incompatible topology plans at once (e.g., migrating
 /// `A→D` while splitting the same tablet serializes; repair wins over
-/// split — see planner eligibility).
+/// split - see planner eligibility).
 #[must_use]
 pub fn tablet_sets_conflict(first: &[TabletId], second: &[TabletId]) -> bool {
     first.iter().any(|tablet| second.contains(tablet))

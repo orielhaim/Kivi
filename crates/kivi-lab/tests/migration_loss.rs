@@ -19,33 +19,10 @@ use std::time::Duration;
 use bytes::Bytes;
 use kivi_client::{ClientConfig, NativeClient};
 use kivi_lab::cluster::Cluster;
+use kivi_lab::testkit::{NS, hex_key, spread_key, tablet_state_dump};
 use kivi_state::Key;
-use kivi_types::NamespaceId;
-
-const NS: NamespaceId = NamespaceId::from_u64(1);
 const ITERATIONS: usize = 50;
 const KEYS_PER_ITER: usize = 10;
-
-fn spread_key(slot: usize, index: usize) -> Vec<u8> {
-    let prefix = match slot % 4 {
-        0 => 0x10u8,
-        1 => b'A',
-        2 => 0x90u8,
-        _ => 0xF0u8,
-    };
-    let mut key = vec![prefix];
-    key.extend_from_slice(format!("{index:06}").as_bytes());
-    key
-}
-
-fn hex_key(key: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::new();
-    for byte in key.iter().take(8) {
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
-}
 
 /// Client pinned to one member's native endpoint: `get_any` serves from
 /// that member's local applied state when it hosts the tablet (no
@@ -74,42 +51,6 @@ fn presence(cluster: &Cluster, key: &[u8]) -> Vec<(usize, Option<Vec<u8>>)> {
         out.push((index, value));
     }
     out
-}
-
-/// Per-member Raft state for one tablet group.
-fn tablet_state_dump(cluster: &Cluster, tablet: u64) -> String {
-    let mut parts = Vec::new();
-    for index in 0..cluster.member_count() {
-        if !cluster.alive(index) {
-            parts.push(format!("m{index}:down"));
-            continue;
-        }
-        let row = cluster.tablets_status_opt(index).and_then(|status| {
-            status
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .find(|entry| {
-                    entry.get("group").and_then(serde_json::Value::as_u64) == Some(tablet)
-                })
-        });
-        match row {
-            Some(entry) => parts.push(format!(
-                "m{index}:role={} leader={} term={} last_log={} committed={} applied={}",
-                entry["role"].as_str().unwrap_or("?"),
-                entry["leader"]
-                    .as_u64()
-                    .map_or("none".to_owned(), |l| l.to_string()),
-                entry["term"].as_u64().unwrap_or(0),
-                entry["last_log"].as_u64().unwrap_or(0),
-                entry["committed"].as_u64().unwrap_or(0),
-                entry["applied"].as_u64().unwrap_or(0),
-            )),
-            None => parts.push(format!("m{index}:no-group")),
-        }
-    }
-    parts.join(" ")
 }
 
 fn directory_versions(cluster: &Cluster) -> String {

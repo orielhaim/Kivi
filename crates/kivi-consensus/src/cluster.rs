@@ -27,13 +27,12 @@
 //! Startup config conflicting with durable identity fails loudly.
 //!
 //! [`classify_bootstrap`] decides fresh vs. existing from durable state
-//! (vote, log, snapshot base — all three empty means fresh). Every node
+//! (vote, log, snapshot base - all three empty means fresh). Every node
 //! in a fresh static cluster calls `initialize` on its own `Raft`
 //! instance with the joint membership; `OpenRaft`'s contract makes a
 //! repeated local `initialize` with identical membership benign
-//! (already-initialized), which is the race the density spike met:
-//! concurrent local initialization attempts converge instead of forking
-//! groups.
+//! (already-initialized), so concurrent local initialization attempts
+//! converge instead of forking groups.
 //!
 //! [`verify_against_durable`] enforces restart discipline: cluster and
 //! node identity must match the data directory, and the tablet must
@@ -295,7 +294,7 @@ pub enum BootstrapError {
 /// to the local node. The configured voter set is deliberately NOT
 /// compared: once the replicated control plane owns placement, startup
 /// flags go stale (new members join without restarts), and restarts
-/// must recover durable membership — never refuse it, never
+/// must recover durable membership - never refuse it, never
 /// re-initialize over it. Removed-while-down replicas are fenced
 /// earlier at open (tombstoned through the control-plane desired
 /// oracle), so this check stays permissive by design. Endpoint
@@ -387,18 +386,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn first_deployment_shape_validates() {
-        let topology = topology();
-        topology.validate().expect("1x3 validates");
-        let (voters, nodes) = topology
-            .membership_for(TabletId::from_u64(9))
-            .expect("membership builds");
-        assert_eq!(voters, BTreeSet::from([1, 2, 3]));
-        assert_eq!(nodes.len(), 3);
-        assert_eq!(nodes[&1], "127.0.0.1:9101");
-    }
-
+    /// Every structural incoherence refuses at validate. A tablet naming
+    /// an unknown node is also the shape `membership_for` reports, so both
+    /// the pre-check and the builder are covered by the same case.
     #[test]
     fn incoherent_topologies_fail_loudly() {
         let mut bad = topology();
@@ -419,18 +409,31 @@ mod tests {
             bad.validate(),
             Err(TopologyError::UnknownNode { .. })
         ));
+        assert!(matches!(
+            bad.membership_for(TabletId::from_u64(9)),
+            Err(TopologyError::UnknownNode { .. })
+        ));
         let mut bad = topology();
         bad.tablets.clear();
         assert!(matches!(bad.validate(), Err(TopologyError::NoTablets)));
     }
 
+    /// Any single durable trace - including a lone vote with no entries -
+    /// means existing; only a totally empty group may initialize.
     #[test]
-    fn bootstrap_classification_needs_no_signals_for_fresh() {
+    fn any_durable_trace_means_existing() {
+        for (vote, log, snapshot) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            assert_eq!(
+                classify_bootstrap(vote, log, snapshot),
+                Bootstrap::Existing,
+                "vote={vote} log={log} snapshot={snapshot}"
+            );
+        }
         assert_eq!(classify_bootstrap(false, false, false), Bootstrap::Fresh);
-        // Any single durable trace means existing — including a lone vote.
-        assert_eq!(classify_bootstrap(true, false, false), Bootstrap::Existing);
-        assert_eq!(classify_bootstrap(false, true, false), Bootstrap::Existing);
-        assert_eq!(classify_bootstrap(false, false, true), Bootstrap::Existing);
     }
 
     #[test]

@@ -4,18 +4,15 @@
 //! for this asset?* The control plane owns that answer (propose + state
 //! read); the redundancy plane only consumes it through [`LayoutCatalog`]
 //! and advances it through [`CatalogPublish`]. [`AssetId`] stays independent
-//! of layouts — no layout field ever enters the identity — so assets keep
+//! of layouts - no layout field ever enters the identity - so assets keep
 //! their names across generations, schemes, and repairs.
 //!
 //! [`MemCatalog`] is the in-process authority for tests (max-generation
 //! fencing, stale rejection); the server implements both traits over the
-//! control-plane propose path with a blocking wait. [`merge_discovery`]
-//! classifies holder probes against authority for observability only.
+//! control-plane propose path with a blocking wait.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-
-use kivi_codec::integrity::blake3_256;
 
 use crate::{AssetId, RedundancyError};
 
@@ -34,13 +31,9 @@ pub trait LayoutCatalog: Send + Sync + std::fmt::Debug {
     /// Returns the current published layout, if any.
     fn get(&self, asset: &AssetId) -> Option<PublishedLayout>;
 
-    /// Returns the current published layouts known to this catalog.
-    ///
-    /// Incremental maintenance callers use this as a bounded refresh source;
-    /// the default keeps small custom catalogs source-compatible.
-    fn list(&self) -> Vec<PublishedLayout> {
-        Vec::new()
-    }
+    /// Returns every current published layout, asset-ordered. Incremental
+    /// maintenance uses this as a bounded refresh source.
+    fn list(&self) -> Vec<PublishedLayout>;
 }
 
 /// Publish side of the catalog: advance or drop the current layout.
@@ -148,57 +141,6 @@ impl CatalogPublish for MemCatalog {
     }
 }
 
-/// What holder probes say about control authority (observability only:
-/// discovery never overrides the catalog).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Discovery {
-    /// Probed holders agree with the control-plane layout (or nothing
-    /// contradicts it).
-    Current {
-        /// Agreed generation.
-        generation: u64,
-    },
-    /// No control record and no observations.
-    Unknown,
-    /// Observations contradict authority — or data exists with no
-    /// authority at all. Holds a human-readable cause.
-    Divergent {
-        /// Human-readable cause.
-        detail: String,
-    },
-}
-
-/// Classifies holder probes (`generation`, layout-bytes hash) against the
-/// control-plane record: agreement is [`Discovery::Current`], silence on
-/// both sides is [`Discovery::Unknown`], and any contradiction — including
-/// data with no authority — is [`Discovery::Divergent`].
-#[must_use]
-pub fn merge_discovery(control: Option<&PublishedLayout>, probed: &[(u64, [u8; 32])]) -> Discovery {
-    let Some(current) = control else {
-        if probed.is_empty() {
-            return Discovery::Unknown;
-        }
-        return Discovery::Divergent {
-            detail: format!("{} holder reports without control authority", probed.len()),
-        };
-    };
-    let expect_hash = blake3_256(&current.layout.encode());
-    let expect = (current.layout.generation, expect_hash);
-    for (generation, hash) in probed {
-        if (*generation, *hash) != expect {
-            return Discovery::Divergent {
-                detail: format!(
-                    "holder reports generation {generation} against control {}",
-                    current.layout.generation
-                ),
-            };
-        }
-    }
-    Discovery::Current {
-        generation: current.layout.generation,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,31 +192,5 @@ mod tests {
         catalog.drop_asset(&asset()).expect("drops");
         assert!(catalog.get(&asset()).is_none());
         catalog.drop_asset(&asset()).expect("idempotent");
-    }
-
-    #[test]
-    fn discovery_classifies_current_unknown_divergent() {
-        assert_eq!(merge_discovery(None, &[]), Discovery::Unknown);
-        assert!(matches!(
-            merge_discovery(None, &[(1, [2; 32])]),
-            Discovery::Divergent { .. }
-        ));
-        let current = PublishedLayout {
-            control_generation: 4,
-            layout: layout(2),
-        };
-        let hash = blake3_256(&current.layout.encode());
-        assert_eq!(
-            merge_discovery(Some(&current), &[(2, hash)]),
-            Discovery::Current { generation: 2 }
-        );
-        assert_eq!(
-            merge_discovery(Some(&current), &[]),
-            Discovery::Current { generation: 2 }
-        );
-        assert!(matches!(
-            merge_discovery(Some(&current), &[(2, [9; 32])]),
-            Discovery::Divergent { .. }
-        ));
     }
 }

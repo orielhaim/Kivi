@@ -65,22 +65,6 @@ pub fn read_via_fabric(
     fabric.read(asset)
 }
 
-/// Reads canonical manifest bytes back through the fabric.
-///
-/// # Errors
-///
-/// Returns [`RedundancyError`] when no layout exists, reconstruction fails,
-/// or the bytes do not verify.
-pub fn read_manifest_via_fabric(
-    fabric: &mut RedundancyFabric,
-    domain: SecurityDomainId,
-    id: ManifestId,
-    len: u64,
-) -> Result<Vec<u8>, RedundancyError> {
-    let asset = kivi_redundancy::integration::manifest_asset(id, domain, len);
-    fabric.read(asset)
-}
-
 #[cfg(test)]
 mod tests {
     use kivi_redundancy::{FabricConfig, NodeDescriptor};
@@ -138,8 +122,8 @@ mod tests {
             .stage_manifest(manifest_id, &canonical)
             .expect("stages manifest");
         store.sync().expect("syncs");
-        assert!(store.durable_chunk(id).is_some());
-        assert!(store.durable_manifest(manifest_id).is_some());
+        assert!(store.durable_chunk(id));
+        assert!(store.durable_manifest(manifest_id));
 
         let (mut fabric, _) = RedundancyFabric::open(
             &fabric_root.path().join("redundancy"),
@@ -167,9 +151,5 @@ mod tests {
 
         let back = read_via_fabric(&mut fabric, DOMAIN, id, bytes.len() as u64).expect("recovers");
         assert_eq!(back, bytes);
-        let back_manifest =
-            read_manifest_via_fabric(&mut fabric, DOMAIN, manifest_id, canonical.len() as u64)
-                .expect("recovers manifest");
-        assert_eq!(back_manifest, canonical);
     }
 }

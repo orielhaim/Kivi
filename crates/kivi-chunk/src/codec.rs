@@ -1,15 +1,14 @@
-//! Chunk body codec identifiers.
+//! Chunk codec identifiers.
 //!
-//! `ChunkId` always names canonical *logical* bytes (§2): the address is
-//! computed before any physical encoding, so a future compressed
-//! representation of the same logical chunk keeps the same identity and
-//! existing manifests keep resolving. The record carries both the logical
-//! and stored lengths plus this codec so decoders know how to recover the
-//! logical bytes the id names.
+//! `ChunkId` always names canonical *logical* bytes: the address is computed
+//! before any physical encoding, so a future compressed representation of
+//! the same logical chunk keeps the same identity and existing manifests
+//! keep resolving. The record carries both the logical and stored lengths
+//! plus this codec so decoders know how to recover the logical bytes the id
+//! names.
 //!
-//! `NONE` is the only codec wired here. `LZ4` keeps its reserved assignment so a
-//! future experiment cannot silently collide, but builds and loads reject
-//! it explicitly until measured.
+//! `NONE` is the only codec wired here. Every other assignment fails
+//! verification: this build never guesses past a format it does not own.
 
 /// Opaque chunk-body codec assignment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -19,9 +18,6 @@ impl ChunkCodecId {
     /// Stored bytes are the logical bytes verbatim. The only codec this
     /// mints or reads.
     pub const NONE: Self = Self(0);
-    /// Reserved assignment for a future LZ4 experiment. Rejected by
-    /// [`is_supported`](Self::is_supported) until then.
-    pub const LZ4: Self = Self(1);
 
     /// Wraps a raw assignment, including unknown future values.
     #[must_use]
@@ -46,7 +42,6 @@ impl core::fmt::Display for ChunkCodecId {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self.0 {
             0 => write!(f, "none"),
-            1 => write!(f, "lz4(reserved)"),
             other => write!(f, "unknown-codec({other})"),
         }
     }
@@ -57,9 +52,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_none_is_supported_this_stage() {
+    fn only_zero_is_supported() {
         assert!(ChunkCodecId::NONE.is_supported());
-        assert!(!ChunkCodecId::LZ4.is_supported());
+        assert!(!ChunkCodecId::from_u8(1).is_supported());
         assert!(!ChunkCodecId::from_u8(0x7F).is_supported());
         assert_eq!(ChunkCodecId::NONE.as_u8(), 0);
     }

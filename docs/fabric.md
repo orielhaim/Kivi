@@ -1,4 +1,4 @@
-# Phase 9 Memory Fabric integration: logical-vs-physical ownership, execution paths, and operating guarantees
+# Memory Fabric: logical versus physical ownership, execution paths, and operating guarantees
 
 The architectural claim: Kivi owns exact logical state; physical
 representations may move, compress, disappear, reappear, or coexist

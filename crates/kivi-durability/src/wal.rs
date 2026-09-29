@@ -2,7 +2,7 @@
 //!
 //! One logical lane per worker; no global WAL mutex. A record carries its
 //! full tablet identity (tablet, epoch, guard) plus its tablet commit
-//! position, so recovery never assumes a tablet always lived in one lane —
+//! position, so recovery never assumes a tablet always lived in one lane -
 //! future tablet movement across workers keeps old lanes recoverable.
 //!
 //! ## Segment file layout (`wal/lane-XXXX/<seq:020>.wal`)
@@ -76,10 +76,10 @@
 //!   continue. A complete-but-wrong final batch is corruption, not a tear.
 //! * Corruption anywhere else (middle segments, complete bad batches,
 //!   duplicate/skipped batch sequences, segment gaps, unknown record
-//!   kinds/versions, oversize declarations) fails recovery loudly —
+//!   kinds/versions, oversize declarations) fails recovery loudly -
 //!   history is never silently truncated.
 //! * Segments rotate at the configured target size; old segments are never
-//!   deleted in this stage (compaction belongs to the checkpoint fabric).
+//!   deleted here; compaction belongs to the checkpoint fabric.
 
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -124,7 +124,7 @@ pub const BATCH_FOOTER_LEN: usize = 20;
 /// allocating). Individual values are already bounded by the protocol
 /// frame ceiling; this guards the framing arithmetic itself.
 pub const WAL_MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
-/// Allocation guard for records per batch (baseline batches hold few).
+/// Allocation guard for records per batch.
 pub const WAL_MAX_RECORDS_PER_BATCH: usize = 4096;
 /// Production segment rotation target (RFC starting point).
 pub const DEFAULT_SEGMENT_TARGET_BYTES: u64 = 256 * 1024 * 1024;
@@ -134,7 +134,7 @@ pub const RECORD_KIND_MUTATION: u16 = 1;
 pub const RECORD_KIND_OUTCOME: u16 = 2;
 /// Bulk-value record kind (see [`WalRecord::Material`]).
 pub const RECORD_KIND_MATERIAL: u16 = 3;
-/// Record format version for every kind minted in this stage.
+/// Record format version for every kind.
 pub const RECORD_VERSION_1: u16 = 1;
 
 // Only `unsafe` in this module: zerocopy's derive-generated trait impls.
@@ -259,8 +259,8 @@ pub struct OutcomeRecord {
 /// whole point: with the bytes in a second file, a correct
 /// durable-before-reference ordering needs a *second* platform flush per
 /// batch, and a flush costs orders of magnitude more than the bytes do. A
-/// single ordered log makes the ordering structural — a replayed batch
-/// always has its material — instead of something three files have to
+/// single ordered log makes the ordering structural - a replayed batch
+/// always has its material - instead of something three files have to
 /// agree on.
 ///
 /// `commit` is the position of the mutation that installs the reference, so
@@ -306,7 +306,7 @@ pub enum WalRecord {
 ///
 /// The tablet record rides boxed: a full mutation record dwarfs consensus
 /// metadata by an order of magnitude, and entries already live behind
-/// heap batch buffers — the box keeps the enum (and every batch `Vec`)
+/// heap batch buffers - the box keeps the enum (and every batch `Vec`)
 /// small instead of padding every consensus entry to mutation size.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WalEntry {
@@ -590,7 +590,7 @@ fn encode_batch_body(records: &[WalRecord]) -> Result<Vec<u8>, DurabilityError> 
 ///
 /// Returns [`DurabilityError`] when the batch is empty, oversized, or a
 /// blob exceeds the `u32` length bound.
-pub fn encode_raft_batch(records: &[crate::raft::RaftRecord]) -> Result<Vec<u8>, DurabilityError> {
+fn encode_raft_batch(records: &[crate::raft::RaftRecord]) -> Result<Vec<u8>, DurabilityError> {
     let mut body = Vec::new();
     for record in records {
         let kind = record.kind();
@@ -946,10 +946,7 @@ pub struct WorkerLaneStats {
 ///
 /// All file operations are synchronous `std::fs` calls made from the owning
 /// worker thread with no `.await` in between, so concurrent connection
-/// tasks on the same thread cannot interleave a batch. Blocking an
-/// executor thread on `fsync` is the honest baseline cost this stage
-/// measures (see the durability benchmarks); an `io_uring` backend can
-/// replace the mechanism later behind [`DurabilityProvider`].
+/// tasks on the same thread cannot interleave a batch.
 #[derive(Debug)]
 pub struct LocalWalLane {
     dir: PathBuf,
@@ -1086,7 +1083,7 @@ impl LocalWalLane {
 
     /// Recovers starting at a reclamation floor: segments below
     /// `floor.first_segment` are ignored entirely (reclaim leftovers or
-    /// reappeared deletions — harmless by checkpoint-cut semantics),
+    /// reappeared deletions - harmless by checkpoint-cut semantics),
     /// retained segments must be contiguous from the floor, and the first
     /// batch must carry `floor.first_batch` (validating the floor record
     /// itself). Post-restart numbering continues past every sequence ever
@@ -1095,7 +1092,7 @@ impl LocalWalLane {
     /// # Errors
     ///
     /// Returns [`RecoveryError`] when a retained segment is missing or any
-    /// retained content fails validation — same loud rules as [`recover`](Self::recover).
+    /// retained content fails validation - same loud rules as [`recover`](Self::recover).
     #[allow(clippy::too_many_lines)]
     pub fn recover_from(&mut self, floor: LaneFloor) -> Result<LaneRecovery, RecoveryError> {
         if floor.lane != self.lane {
@@ -1241,7 +1238,7 @@ impl LocalWalLane {
 
     /// Scans one sealed segment strictly and summarizes it for the
     /// reclamation planner. No torn-tail repair happens here: sealed files
-    /// end at batch boundaries, so any truncation is corruption — the
+    /// end at batch boundaries, so any truncation is corruption - the
     /// planner keeps the segment (and everything after it) on any error.
     ///
     /// # Errors
@@ -1361,7 +1358,7 @@ impl LocalWalLane {
     /// # Errors
     ///
     /// Returns [`DurabilityError`] on encode failure, a failed lane, or a
-    /// failed barrier — same contract as `append_records`.
+    /// failed barrier - same contract as `append_records`.
     pub fn append_raft_records(
         &mut self,
         records: &[crate::raft::RaftRecord],
@@ -1441,7 +1438,7 @@ impl LocalWalLane {
         // (`write_all` is the only primitive that guarantees a full
         // write), and because a single append makes the flush's writeback
         // cover one contiguous range instead of three. The copy is one
-        // pass over a body the encoder just produced — nanoseconds next to
+        // pass over a body the encoder just produced - nanoseconds next to
         // the barrier it precedes.
         let mut frame = Vec::with_capacity(BATCH_HEADER_LEN + body.len() + BATCH_FOOTER_LEN);
         frame.extend_from_slice(&header_bytes);
@@ -1459,7 +1456,7 @@ impl LocalWalLane {
             // Health follows the failure kind: full disks go read-only
             // (explicit, recoverable), anything else fails the lane
             // terminally. Either way the typed error below carries the
-            // real OS failure — never a placeholder.
+            // real OS failure - never a placeholder.
             if error.kind() == io::ErrorKind::StorageFull {
                 self.health = StorageHealth::ReadOnly;
                 tracing::warn!(lane = self.lane, path = %path.display(), "WAL lane read-only: storage full");
@@ -1528,7 +1525,7 @@ impl LocalWalLane {
         self.file = Some(file);
         self.segment_seq = seq;
         self.segment_bytes = SEGMENT_HEADER_LEN as u64;
-        // The new segment's first batch is whatever sequence issues next —
+        // The new segment's first batch is whatever sequence issues next -
         // fixed now, whatever appends first.
         self.active_first_batch = self.next_batch_seq;
         self.segments += 1;
@@ -1638,7 +1635,7 @@ impl LocalWalLane {
             let batch = BatchHeaderWire::read_from_bytes(&bytes[offset..offset + BATCH_HEADER_LEN])
                 .map_err(|_| fail("unreadable batch header"))?;
             if batch.magic.get() != WAL_MAGIC_BATCH {
-                // Complete bytes, wrong magic: corruption, never a tear —
+                // Complete bytes, wrong magic: corruption, never a tear -
                 // even on the last segment.
                 return Err(fail("bad batch magic"));
             }
@@ -1990,7 +1987,6 @@ mod tests {
                 WalEntry::Consensus(_) => panic!("tablet-only lane holds no consensus entries"),
             }
         }
-        // Old segments are never deleted in this stage.
         assert!(lane.segment_count() >= 3);
     }
 
@@ -2199,7 +2195,7 @@ mod tests {
         let path = dir.join(segment_file_name(1));
         let full = fs::read(&path).expect("segment bytes");
         // Splice a copy of batch 1 right after itself: complete bytes,
-        // duplicate sequence — corruption, not a tear.
+        // duplicate sequence - corruption, not a tear.
         let first_len = batch_end(&full, 1) - SEGMENT_HEADER_LEN;
         let mut doubled = Vec::new();
         doubled.extend_from_slice(&full[..batch_end(&full, 1)]);

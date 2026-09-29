@@ -9,7 +9,7 @@
 //!
 //! Replacement ordering is enforced by construction, mirroring RFC §190:
 //! a successor can activate only once the current owner no longer covers its
-//! range as active (the parent must be sealed first — activating against an
+//! range as active (the parent must be sealed first - activating against an
 //! overlapping active tablet is rejected), and a tablet retires only after
 //! its redirect successors are active. There is no path from two writable
 //! authorities to one range, and no path back from fenced or tombstoned to
@@ -26,7 +26,7 @@ use crate::tablet::{Redirect, TabletDescriptor, TabletState};
 ///
 /// Genesis is [`INITIAL`](Self::INITIAL); every transition advances by
 /// exactly one via [`next`](Self::next), which fails explicitly at `u64::MAX`
-/// rather than wrapping — versions only advance, never recycle.
+/// rather than wrapping - versions only advance, never recycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DirectoryVersion(u64);
 
@@ -445,7 +445,7 @@ impl DirectorySnapshot {
             let (parent, prefix) = leaves[split];
             if prefix.prefix_len() == 128 {
                 // Single-address piece: unsplittable (unreachable for any
-                // realistic count — the address space holds 2^128 points).
+                // realistic count - the address space holds 2^128 points).
                 return Err(DirectoryError::InvalidTabletCount { count });
             }
             let len = prefix.prefix_len() + 1;
@@ -551,7 +551,7 @@ impl DirectorySnapshot {
     /// names one. Topology churn chains tombstones (split children later
     /// merged, merged tablets later split): a recorded successor may itself
     /// be retired, so resolution follows the tombstone chain to currently
-    /// active tablets. Entries with no live resolution are omitted — the
+    /// active tablets. Entries with no live resolution are omitted - the
     /// caller re-resolves through a newer snapshot instead of guessing.
     /// Cycles are impossible by construction (retirement requires active
     /// successors, so edges always point forward in lineage time), but a
@@ -601,7 +601,7 @@ impl DirectorySnapshot {
         // Key-aware pick first: split children partition the parent range,
         // so exactly one live successor covers the key. Fall back to the
         // first live successor only when no range covers (hash layouts
-        // route by hash, not key bytes — the caller handles that case).
+        // route by hash, not key bytes - the caller handles that case).
         let successors = self.successor_ranges(tablet);
         successors
             .iter()
@@ -1417,7 +1417,7 @@ mod tests {
         dir = activate_all(&dir, TabletId::from_u64(1));
         assert_eq!(dir.lookup_by_key(b"b"), Some(TabletId::from_u64(1)));
         assert_eq!(dir.lookup_by_key(b"g"), None);
-        // Gap: nothing owns "z" yet — representable transiently, never misrouted.
+        // Gap: nothing owns "z" yet - representable transiently, never misrouted.
         assert_eq!(dir.lookup_by_key(b"z"), None);
         dir = dir
             .allocate(

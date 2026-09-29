@@ -39,11 +39,12 @@ pub const MAX_CHUNKS_PER_MANIFEST: usize = 65_535;
 /// is corruption, rejected before allocation.
 pub const MAX_STORED_BODY: u64 = 8 * 1024 * 1024;
 
-/// Largest value the legacy (non-streaming) `GET` resolves inline: 64 MiB,
-/// matching the protocol frame ceiling philosophy. Larger chunked values
-/// require the streaming read path, which never builds one giant response
-/// frame — or giant resident allocation — for anyone.
-pub const MAX_LEGACY_VALUE_BYTES: u64 = 64 * 1024 * 1024;
+/// Largest value a non-streaming read will resolve into one response frame.
+///
+/// A larger value must be fetched through the streaming read path, which never
+/// builds one giant response frame - or one giant resident allocation - for
+/// anyone. 64 MiB matches the protocol frame ceiling.
+pub const MAX_INLINE_VALUE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Versioned chunking parameters. Stored in every manifest, so old data
 /// stays readable when the defaults evolve: the policy that *wrote* a
@@ -92,7 +93,7 @@ impl Chunking {
     ///
     /// Returns [`ChunkError::TooLarge`] when the piece count exceeds the
     /// address space (only reachable for absurd lengths on narrow
-    /// targets — staged values always fit memory first).
+    /// targets - staged values always fit memory first).
     pub fn split_lengths(self, total_len: u64) -> Result<Vec<u64>, ChunkError> {
         let size = self.chunk_size as u64;
         if size == 0 || total_len == 0 {

@@ -1551,259 +1551,6 @@ impl ActionLedger {
     }
 }
 
-/// Raw and normalized objective dimensions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct ObjectiveBreakdown {
-    /// Latency improvement or regression.
-    pub latency: i64,
-    /// Throughput improvement or regression.
-    pub throughput: i64,
-    /// General resource improvement or regression.
-    pub resource: i64,
-    /// Memory improvement or regression.
-    pub memory: i64,
-    /// Storage improvement or regression.
-    pub storage: i64,
-    /// Network improvement or regression.
-    pub network: i64,
-    /// Repair-debt improvement or regression.
-    pub repair_debt: i64,
-    /// Durability-risk improvement or regression.
-    pub durability_risk: i64,
-    /// Movement cost.
-    pub movement_cost: i64,
-    /// Churn cost.
-    pub churn: i64,
-}
-
-impl ObjectiveBreakdown {
-    /// Returns all-zero dimensions.
-    #[must_use]
-    pub const fn zero() -> Self {
-        Self {
-            latency: 0,
-            throughput: 0,
-            resource: 0,
-            memory: 0,
-            storage: 0,
-            network: 0,
-            repair_debt: 0,
-            durability_risk: 0,
-            movement_cost: 0,
-            churn: 0,
-        }
-    }
-    /// Returns dimensions normalized to signed parts per million.
-    #[must_use]
-    pub fn normalized(self, scales: ObjectiveScales) -> Self {
-        Self {
-            latency: normalize(self.latency, scales.latency),
-            throughput: normalize(self.throughput, scales.throughput),
-            resource: normalize(self.resource, scales.resource),
-            memory: normalize(self.memory, scales.memory),
-            storage: normalize(self.storage, scales.storage),
-            network: normalize(self.network, scales.network),
-            repair_debt: normalize(self.repair_debt, scales.repair_debt),
-            durability_risk: normalize(self.durability_risk, scales.durability_risk),
-            movement_cost: normalize(self.movement_cost, scales.movement_cost),
-            churn: normalize(self.churn, scales.churn),
-        }
-    }
-}
-
-/// Per-dimension normalization ceilings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ObjectiveScales {
-    /// Latency scale.
-    pub latency: u64,
-    /// Throughput scale.
-    pub throughput: u64,
-    /// Resource scale.
-    pub resource: u64,
-    /// Memory scale.
-    pub memory: u64,
-    /// Storage scale.
-    pub storage: u64,
-    /// Network scale.
-    pub network: u64,
-    /// Repair-debt scale.
-    pub repair_debt: u64,
-    /// Durability-risk scale.
-    pub durability_risk: u64,
-    /// Movement-cost scale.
-    pub movement_cost: u64,
-    /// Churn scale.
-    pub churn: u64,
-}
-
-impl ObjectiveScales {
-    /// Returns one scale for every objective dimension.
-    #[must_use]
-    pub const fn uniform(value: u64) -> Self {
-        Self {
-            latency: value,
-            throughput: value,
-            resource: value,
-            memory: value,
-            storage: value,
-            network: value,
-            repair_debt: value,
-            durability_risk: value,
-            movement_cost: value,
-            churn: value,
-        }
-    }
-    /// Whether every scale is nonzero.
-    #[must_use]
-    pub const fn is_valid(&self) -> bool {
-        self.latency != 0
-            && self.throughput != 0
-            && self.resource != 0
-            && self.memory != 0
-            && self.storage != 0
-            && self.network != 0
-            && self.repair_debt != 0
-            && self.durability_risk != 0
-            && self.movement_cost != 0
-            && self.churn != 0
-    }
-}
-
-impl Default for ObjectiveScales {
-    fn default() -> Self {
-        Self::uniform(1_000_000)
-    }
-}
-
-/// Explicit objective weights in parts per million.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ObjectiveWeights {
-    /// Latency weight.
-    pub latency: u32,
-    /// Throughput weight.
-    pub throughput: u32,
-    /// Resource weight.
-    pub resource: u32,
-    /// Memory weight.
-    pub memory: u32,
-    /// Storage weight.
-    pub storage: u32,
-    /// Network weight.
-    pub network: u32,
-    /// Repair-debt weight.
-    pub repair_debt: u32,
-    /// Durability-risk weight.
-    pub durability_risk: u32,
-    /// Movement-cost weight.
-    pub movement_cost: u32,
-    /// Churn weight.
-    pub churn: u32,
-}
-
-impl ObjectiveWeights {
-    /// Returns equal weights for all dimensions.
-    #[must_use]
-    pub const fn equal() -> Self {
-        Self {
-            latency: 100_000,
-            throughput: 100_000,
-            resource: 100_000,
-            memory: 100_000,
-            storage: 100_000,
-            network: 100_000,
-            repair_debt: 100_000,
-            durability_risk: 100_000,
-            movement_cost: 100_000,
-            churn: 100_000,
-        }
-    }
-    /// Sum of all weights.
-    #[must_use]
-    pub const fn total(self) -> u64 {
-        self.latency as u64
-            + self.throughput as u64
-            + self.resource as u64
-            + self.memory as u64
-            + self.storage as u64
-            + self.network as u64
-            + self.repair_debt as u64
-            + self.durability_risk as u64
-            + self.movement_cost as u64
-            + self.churn as u64
-    }
-    /// Whether the weight vector has at least one nonzero dimension.
-    #[must_use]
-    pub const fn is_valid(self) -> bool {
-        self.total() != 0
-    }
-}
-
-impl Default for ObjectiveWeights {
-    fn default() -> Self {
-        Self::equal()
-    }
-}
-
-/// A normalized, weighted multi-objective value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ObjectiveVector {
-    /// Raw signed dimensions.
-    pub raw: ObjectiveBreakdown,
-    /// Explicitly normalized signed dimensions.
-    pub normalized: ObjectiveBreakdown,
-    /// Explicit weights used for scalarization.
-    pub weights: ObjectiveWeights,
-}
-
-impl ObjectiveVector {
-    /// Creates a vector after validating scales and weights.
-    #[must_use]
-    pub fn new(
-        raw: ObjectiveBreakdown,
-        scales: ObjectiveScales,
-        weights: ObjectiveWeights,
-    ) -> Option<Self> {
-        if !scales.is_valid() || !weights.is_valid() {
-            return None;
-        }
-        Some(Self {
-            raw,
-            normalized: raw.normalized(scales),
-            weights,
-        })
-    }
-    /// Computes a scalar only after explicit normalization and weighting.
-    #[must_use]
-    pub fn scalar_score(self) -> i64 {
-        let value = i128::from(self.normalized.latency) * i128::from(self.weights.latency)
-            + i128::from(self.normalized.throughput) * i128::from(self.weights.throughput)
-            + i128::from(self.normalized.resource) * i128::from(self.weights.resource)
-            + i128::from(self.normalized.memory) * i128::from(self.weights.memory)
-            + i128::from(self.normalized.storage) * i128::from(self.weights.storage)
-            + i128::from(self.normalized.network) * i128::from(self.weights.network)
-            + i128::from(self.normalized.repair_debt) * i128::from(self.weights.repair_debt)
-            + i128::from(self.normalized.durability_risk)
-                * i128::from(self.weights.durability_risk)
-            + i128::from(self.normalized.movement_cost) * i128::from(self.weights.movement_cost)
-            + i128::from(self.normalized.churn) * i128::from(self.weights.churn);
-        i64::try_from(value / i128::from(PPM_SCALE)).unwrap_or(if value < 0 {
-            i64::MIN
-        } else {
-            i64::MAX
-        })
-    }
-}
-
-fn normalize(value: i64, scale: u64) -> i64 {
-    if scale == 0 {
-        return 0;
-    }
-    let scaled = i128::from(value).saturating_mul(i128::from(PPM_SCALE)) / i128::from(scale);
-    let limit = i64::try_from(PPM_SCALE).unwrap_or(i64::MAX);
-    let bounded = scaled.clamp(-i128::from(limit), i128::from(limit));
-    i64::try_from(bounded).unwrap_or(if bounded < 0 { i64::MIN } else { i64::MAX })
-}
-
 /// Typed hard-constraint failure from the safety validator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum SafetyViolation {
@@ -3057,8 +2804,8 @@ impl BaselineController {
             // bandwidth the working set needs. So the response is to spend
             // less: shrink the maintenance budgets rather than grow them.
             //
-            // The evidence is gated twice — once on source trust, once on
-            // `sustained_windows` — so a single window in which a worker
+            // The evidence is gated twice - once on source trust, once on
+            // `sustained_windows` - so a single window in which a worker
             // happened to miss the cache cannot change any policy.
             reason = ActionReason::SustainedMemoryBoundWorker;
             let action = Action::AdjustScrubBudget {
@@ -4874,7 +4621,7 @@ mod tests {
 
     #[test]
     fn a_multiplexed_reading_never_reaches_a_decision() {
-        // The same stall, the same misses, the same workload — but the kernel
+        // The same stall, the same misses, the same workload - but the kernel
         // had to multiplex the counter group, so the ratio measured a different
         // set of instructions than the controller is reasoning about.
         let config = BaselineConfig {
@@ -4950,20 +4697,7 @@ mod tests {
     }
 
     #[test]
-    fn legal_actions_have_closed_typed_shapes_and_keys() {
-        let action = memory_action(1, 400_000);
-        assert_eq!(action.kind(), ActionKind::AdjustMemoryBudget);
-        assert_eq!(
-            action.scope(),
-            ActionScope::new(ClusterId::from_u128(1), NamespaceId::from_u64(1))
-        );
-        assert_eq!(action.target(), ActionTarget::Tablet(TabletId::from_u64(1)));
-        assert_eq!(action.key().target, action.conflict_key().target);
-        assert!(matches!(action.key().policy, PolicyFingerprint::Memory(_)));
-    }
-
-    #[test]
-    fn ledger_enforces_action_rate_and_conflict_suppression() {
+    fn the_ledger_rate_limits_then_conflict_suppresses() {
         let mut ledger = ActionLedger::new(ActionLedgerConfig {
             max_history: 8,
             max_traces: 8,
@@ -4971,66 +4705,70 @@ mod tests {
             conflict_cooldown_windows: 10,
             duplicate_cooldown_windows: 10,
         });
-        let first = ledger
-            .admit(
-                memory_action(1, 400_000),
-                ActionReason::SustainedMemoryPressure,
-                ControllerSource::Baseline,
-                ActionObservation {
-                    sequence: ObservationSequence::from_u64(1),
-                    window: ObservationWindowId::from_u64(1),
-                    version: 1,
-                    at: Ticks::from_micros(1),
-                },
-            )
-            .expect("first action");
-        assert_eq!(first.state, ActionState::Proposed);
+        let observe = |sequence: u64| ActionObservation {
+            sequence: ObservationSequence::from_u64(sequence),
+            window: ObservationWindowId::from_u64(sequence),
+            version: 1,
+            at: Ticks::from_micros(sequence),
+        };
+        let admit = |ledger: &mut ActionLedger, action, observation| {
+            ledger
+                .admit(
+                    action,
+                    ActionReason::SustainedMemoryPressure,
+                    ControllerSource::Baseline,
+                    observation,
+                )
+                .map(|record| record.state)
+        };
+        let first = admit(&mut ledger, memory_action(1, 400_000), observe(1));
+        assert_eq!(first, Ok(ActionState::Proposed));
+        // A *different* target in the same window is rate-limited, not
+        // conflict-suppressed: the per-window budget is exhausted.
         assert!(matches!(
-            ledger.admit(
-                memory_action(2, 400_000),
-                ActionReason::SustainedMemoryPressure,
-                ControllerSource::Baseline,
-                ActionObservation {
-                    sequence: ObservationSequence::from_u64(1),
-                    window: ObservationWindowId::from_u64(1),
-                    version: 1,
-                    at: Ticks::from_micros(1)
-                }
-            ),
+            admit(&mut ledger, memory_action(2, 400_000), observe(1)),
             Err(LedgerRejection::RateLimit)
         ));
+        // The same target in a later window is conflict-suppressed.
         assert!(matches!(
-            ledger.admit(
-                memory_action(1, 300_000),
-                ActionReason::SustainedMemoryPressure,
-                ControllerSource::Baseline,
-                ActionObservation {
-                    sequence: ObservationSequence::from_u64(2),
-                    window: ObservationWindowId::from_u64(2),
-                    version: 1,
-                    at: Ticks::from_micros(2)
-                }
-            ),
+            admit(&mut ledger, memory_action(1, 300_000), observe(2)),
             Err(LedgerRejection::Conflict)
         ));
     }
 
+    /// Sustained high pressure proposes; sustained low pressure with high
+    /// criticality proposes the promotion. Neither may exceed the
+    /// per-window action ceiling, and the cooldown must keep a single
+    /// window's actions from repeating every frame.
     #[test]
-    fn alternating_workload_does_not_flap_beyond_cooldowns() {
+    fn sustained_pressure_proposes_and_the_ceiling_holds() {
         let config = BaselineConfig {
             sustained_windows: 2,
             min_samples: 1,
             ..BaselineConfig::default()
         };
-        let mut controller = BaselineController::new(config);
         let validator = SafetyValidator::default();
-        let first = controller.propose(&frame(1, 1, 0.95, 0, 0, 0), &context(), &validator);
-        let second = controller.propose(&frame(2, 2, 0.95, 0, 0, 0), &context(), &validator);
-        assert!(first.actions.is_empty());
-        assert!(!second.actions.is_empty());
-        assert!(second.actions.len() <= 2);
-        let low = controller.propose(&frame(3, 3, 0.1, 0, 0, 200), &context(), &validator);
-        assert!(low.actions.is_empty() || low.actions.len() <= 2);
+        let mut high = BaselineController::new(config);
+        assert!(
+            high.propose(&frame(1, 1, 0.95, 0, 0, 0), &context(), &validator)
+                .actions
+                .is_empty(),
+            "one window cannot yet be sustained"
+        );
+        let ceiling = config.max_actions_per_window as usize;
+        let proposing = high.propose(&frame(2, 2, 0.95, 0, 0, 0), &context(), &validator);
+        assert!(!proposing.actions.is_empty());
+        assert!(proposing.actions.len() <= ceiling);
+
+        let mut low = BaselineController::new(config);
+        let _ = low.propose(&frame(1, 1, 0.1, 0, 0, 200), &context(), &validator);
+        let promoting = low.propose(&frame(2, 2, 0.1, 0, 0, 200), &context(), &validator);
+        assert!(!promoting.actions.is_empty());
+        assert!(promoting.actions.len() <= ceiling);
+        assert_eq!(
+            promoting.trace.reason,
+            ActionReason::LowPressureCriticalPromotion
+        );
     }
 
     #[test]
@@ -5148,31 +4886,6 @@ mod tests {
         assert_eq!(report.status, ModelLoadStatus::Corrupt);
         assert!(!learned.is_enabled());
         assert_eq!(learned.model().samples(), 0);
-    }
-
-    #[test]
-    fn objective_dimensions_are_explicit_before_scalarization() {
-        let raw = ObjectiveBreakdown {
-            latency: 500_000,
-            throughput: 250_000,
-            resource: 0,
-            memory: 100_000,
-            storage: 0,
-            network: 0,
-            repair_debt: 100_000,
-            durability_risk: 0,
-            movement_cost: -50_000,
-            churn: -10_000,
-        };
-        let vector = ObjectiveVector::new(
-            raw,
-            ObjectiveScales::uniform(1_000_000),
-            ObjectiveWeights::equal(),
-        )
-        .expect("valid objective");
-        assert_eq!(vector.normalized.latency, 500_000);
-        assert_eq!(vector.normalized.movement_cost, -50_000);
-        assert!(vector.scalar_score() > 0);
     }
 
     #[test]

@@ -5,8 +5,8 @@
 //! an end-to-end number cannot: how much of a request is the frontend, and
 //! how much of that is allocation.
 //!
-//! The executor here is a hash map and nothing else — no thread, no channel,
-//! no rendezvous — so every nanosecond below is parse, dispatch, key
+//! The executor here is a hash map and nothing else - no thread, no channel,
+//! no rendezvous - so every nanosecond below is parse, dispatch, key
 //! handling, reply construction, and the write that would carry them. The gap
 //! between this and the server's end-to-end number is the part that is *not*
 //! the frontend.

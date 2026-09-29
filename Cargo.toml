@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/kivi-microscope",
+    "crates/kivi-wirelab",
     "crates/kivi-types",
     "crates/kivi-codec",
     "crates/kivi-core",
@@ -30,6 +32,7 @@ edition = "2024"
 rust-version = "1.98"
 
 [workspace.dependencies]
+kivi-microscope = { path = "crates/kivi-microscope", version = "0.1.0" }
 kivi-lab = { path = "crates/kivi-lab", version = "0.1.0" }
 kivi-resp = { path = "crates/kivi-resp", version = "0.1.0" }
 kivi-types = { path = "crates/kivi-types", version = "0.1.0" }
@@ -57,6 +60,12 @@ jiff = { version = "0.2", default-features = false, features = [
     "alloc",
 ] }
 blake3 = "1.8"
+# The V2 partition hash's construction: a frozen, public, portable 128-bit hash with
+# a published seed, so a client can compute it and a directory snapshot written on
+# one architecture is readable on another.
+twox-hash = { version = "2", default-features = false, features = [
+    "xxhash3_128",
+] }
 crc32c = "0.6"
 # Checkpoint band compression experiment (RFC §217: lz4_flex for hot/warm).
 lz4_flex = "0.14"

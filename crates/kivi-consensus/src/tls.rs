@@ -23,7 +23,7 @@
 //! and fresh data directories per run, so static pins are impractical there.
 //!
 //! Kivi identity beyond TLS (cluster, node, incarnation, capabilities)
-//! rides authenticated H3 request headers validated per request — TLS
+//! rides authenticated H3 request headers validated per request - TLS
 //! proves *which certificate*, headers prove *which Kivi peer*. Socket
 //! tuples are never identity (§33).
 
@@ -38,7 +38,7 @@ use kivi_types::NodeId;
 /// trust cannot stay purely static. Static pins (startup flags) seed
 /// verification; this registry extends it as the control plane commits
 /// admissions. Consulted on every dial and for every incoming
-/// connection — no restart, no flag edits.
+/// connection - no restart, no flag edits.
 pub type TrustRegistry = Arc<RwLock<HashMap<NodeId, Vec<u8>>>>;
 
 /// Fingerprint of a peer certificate: `BLAKE3(cert DER)`.
@@ -73,14 +73,6 @@ pub enum TlsError {
     Io {
         /// What was attempted.
         op: &'static str,
-        /// Human-readable cause.
-        detail: String,
-    },
-    /// A configured fingerprint is malformed.
-    #[error("bad peer fingerprint for node {node}: {detail}")]
-    BadFingerprint {
-        /// Node the pin names.
-        node: u64,
         /// Human-readable cause.
         detail: String,
     },
@@ -146,7 +138,7 @@ impl NodeCert {
         })?;
         // Best-effort atomicity: temp + rename per file; a crash leaves the
         // previous complete pair or none (regeneration is idempotent only
-        // before first use — after peers pin us, operator repair applies).
+        // before first use - after peers pin us, operator repair applies).
         for (path, bytes) in [(&cert_path, &cert_der), (&key_path, &key_der)] {
             let tmp = path.with_extension("tmp");
             std::fs::write(&tmp, bytes).map_err(|error| TlsError::Io {
@@ -178,7 +170,7 @@ pub fn server_name_for(peer: NodeId) -> String {
 /// Builds a rustls client config trusting exactly the given peer
 /// certificates as anchors (self-signed; each peer's cert is its own
 /// root). Standard `WebPKI` verification then enforces signatures and the
-/// `kivi-n{id}` SAN honestly — no custom signature logic, no impersonation
+/// `kivi-n{id}` SAN honestly - no custom signature logic, no impersonation
 /// hole. Which peer the certificate belongs to is established by the
 /// authenticated Kivi headers per request and cross-checked against the
 /// dialed peer.

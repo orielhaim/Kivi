@@ -9,7 +9,7 @@
 //! Format principles (shared with the storage codec family, independently
 //! versioned): explicit little-endian integers, length-prefixed blobs,
 //! versioned tags, magic-gated frames, CRC-free (TCP checksums plus
-//! application-level integrity later — frames fail closed on shape, not
+//! application-level integrity later - frames fail closed on shape, not
 //! content hashes). No serde, bincode, rkyv, or JSON anywhere near this
 //! wire.
 

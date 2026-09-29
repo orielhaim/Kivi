@@ -12,7 +12,7 @@
 //! driver --RecordRead--> coordinator (recovery; never guesses)
 //! ```
 //!
-//! ## What this models — and what it does not
+//! ## What this models - and what it does not
 //!
 //! Modeled faithfully: prepare validation (OCC versions incl. absence,
 //! foreign-intent conflicts, digest binding), durable intents, the single
@@ -23,7 +23,7 @@
 //! Abstracted: transaction ids are `u64` (production: BLAKE3-derived
 //! 128-bit ids); durability is handler-retained maps standing in for the
 //! checkpoint/WAL (a crash discards only routing of messages to the down
-//! node — deliveries to non-running instances drop — while every durable
+//! node - deliveries to non-running instances drop - while every durable
 //! step survives, exactly the property under test); versions are plain
 //! counters; ordering uses a logical sequence (virtual ticks order events
 //! but handler logic must not read clocks). Disk-torn-write faults belong
@@ -145,7 +145,7 @@ pub enum TxnMsg {
         /// Transaction.
         txn: TxnSimId,
         /// Whether the decision is now durable (either by this send or a
-        /// racing one — the driver re-reads to learn which).
+        /// racing one - the driver re-reads to learn which).
         stored: bool,
     },
     /// Resolve one key's intent.
@@ -359,7 +359,7 @@ fn encode_msg_record_reply(
     }
 }
 
-/// Decodes one message (`None` on truncation or unknown tags — never a
+/// Decodes one message (`None` on truncation or unknown tags - never a
 /// guess, mirroring production wire discipline).
 #[must_use]
 pub fn decode_msg(input: &[u8]) -> Option<TxnMsg> {
@@ -532,13 +532,13 @@ pub struct AppliedWrite {
 
 /// Deterministic 2PC fabric: durable intents, durable decisions, and
 /// committed state, plus the driver-side collection buffers that make
-/// re-drives deterministic. All maps live in the handler (durable —
+/// re-drives deterministic. All maps live in the handler (durable -
 /// surviving the crash of any node); per-node volatile state is `()`.
 /// Ordering uses a logical sequence bumped on every durable step (never a
 /// clock): the `NoGuess` invariant compares sequences, not ticks.
 #[derive(Debug, Default)]
 pub struct TxnSim {
-    /// Which node hosts which key (scenario routing; fixed within a run —
+    /// Which node hosts which key (scenario routing; fixed within a run -
     /// Prepared writes are never remapped into another lineage).
     pub key_home: BTreeMap<TxnKey, NodeId>,
     /// Durable participant intents: `(host, key) -> intent`.
@@ -659,7 +659,7 @@ impl TxnSim {
     /// Handles one driver recovery probe: records the write set (the
     /// client knows what it sent) and reads the coordinator record. The
     /// reply decides the next step: a Commit decision finalizes, anything
-    /// else re-prepares (idempotent replays for already-reserved keys —
+    /// else re-prepares (idempotent replays for already-reserved keys -
     /// never a blind fresh attempt, which would fork reservations).
     fn driver_recover(
         &mut self,
@@ -676,7 +676,7 @@ impl TxnSim {
     }
 
     /// Handles one prepare on a participant: OCC validation plus digest
-    /// binding, then a durable intent — or a deterministic conflict.
+    /// binding, then a durable intent - or a deterministic conflict.
     fn on_prepare(
         &mut self,
         ctx: StepCtx<'_>,
@@ -921,7 +921,7 @@ impl TxnSim {
     }
 
     /// Handles driver-side replies, attributed exactly by request
-    /// correlation id (unknown ids — duplicates after collection close —
+    /// correlation id (unknown ids - duplicates after collection close -
     /// drop silently; the decided flag already converged the attempt).
     fn on_driver_msg(
         &mut self,
@@ -994,7 +994,7 @@ impl TxnSim {
 
     /// Follows a recovery reply for one attempt: a Commit decision for
     /// this attempt's digest finalizes its write set (apply); an Abort
-    /// for it finalizes too (discard — missing intents are idempotent
+    /// for it finalizes too (discard - missing intents are idempotent
     /// no-ops); anything else re-prepares the attempt (idempotent replays
     /// converge already-reserved keys). A decision for a different digest
     /// governs another attempt: this one cannot proceed and waits (its
@@ -1146,7 +1146,7 @@ impl AppHandler<TxnDriverEv, ()> for TxnSim {
 /// Asserts no partial commit while running: condemns applies that
 /// contradict a durable Abort for the same digest, and applied writes
 /// spanning digests within one transaction. Mid-flight partial
-/// application (finalizes still traveling) is legal — terminal atomicity
+/// application (finalizes still traveling) is legal - terminal atomicity
 /// is asserted at idle with [`assert_quiesced_atomic`].
 ///
 /// # Errors
@@ -1222,7 +1222,7 @@ pub fn assert_quiesced_atomic(
 }
 
 /// Asserts no split decision: all durable decisions for one transaction
-/// agree on both outcome and digest — across coordinators too. A second
+/// agree on both outcome and digest - across coordinators too. A second
 /// decision for one txn with a different digest (conflicting drivers
 /// reusing an id, or a lineage split) is corruption, never a tie to
 /// break. Honest flows decide once (first-writer-wins per record key, one

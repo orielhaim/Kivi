@@ -37,7 +37,7 @@ one shared WAL writer (cross-group fsync batching, all groups)
 
 Tablet `T` lives on worker `(T-1) % workers` (deterministic local
 striping; not distributed placement). Thread count scales with workers
-plus fixed services — never with tablet count. Every tablet has its own
+plus fixed services - never with tablet count. Every tablet has its own
 independent Raft leadership: different tablets routinely have different
 leaders; there is no global current leader.
 
@@ -75,11 +75,11 @@ KIVI_READY native=127.0.0.1:9201 peer=127.0.0.1:9101 admin=127.0.0.1:9301 node=1
 First startup tiles the hash space into `--cluster-tablets` tablets,
 forms every group exactly once (initial membership from the static
 topology, persisted), and persists the tablet-set identity. Tablet ids
-derive from the tiling — they are not operator-chosen — so changing
+derive from the tiling - they are not operator-chosen - so changing
 `--cluster-tablets` (or voters, or identities) on an existing data
 directory fails loudly instead of silently forming a different cluster.
 Restarts recover every replica and every Raft group (never re-bootstrap)
-and fail loudly on any such disagreement — never a silent partial
+and fail loudly on any such disagreement - never a silent partial
 cluster.
 
 ## Normal client use (any node, any tablet)
@@ -122,11 +122,11 @@ cargo run -p kivi-server --bin kivi-cli -- --server 127.0.0.1:9202 atomic-batch 
 Single-tablet batches commit server-side in one roundtrip. Batches
 spanning tablets run client-driven OCC + 2PC with bounded retries: the
 coordinator is always the lowest participant tablet (derived, never
-configured — recovery re-drives agree with no control-plane
+configured - recovery re-drives agree with no control-plane
 involvement), prepares carry a write-set digest binding the exact
 transaction (a conflicting digest under one id is rejected, never
 mixed in), and conflicts surface as `TxnConflict` after retries. Range
-and predicate transactions are rejected loudly — point writes only.
+and predicate transactions are rejected loudly - point writes only.
 
 Beyond bytes and strict counters, keys can hold typed values (client
 methods, same routing and contracts as point ops):
@@ -135,7 +135,7 @@ methods, same routing and contracts as point ops):
 commutative counter   order-free adds, no ordinals exposed
                       (commutative_add / commutative_get)
 bounded counter       capacity + escrow shares; adds stay inside owned
-                      rights, rights move by paired transfer — narrowing
+                      rights, rights move by paired transfer - narrowing
                       is unilateral, widening pairs in one atomic batch
                       (bounded_create / bounded_add / bounded_get)
 semaphore             capacity permits, idempotent acquire by client-
@@ -174,14 +174,14 @@ Scans surface typed values as descriptors, never inlined bulk.
 ```
 
 Lost-response exactly-once: retry the same session/sequence after the
-kill — the new leader returns the original outcome, the counter advances
+kill - the new leader returns the original outcome, the counter advances
 once. See `crates/kivi-lab/tests/cluster_replication.rs` (single tablet)
 and `cluster_multitablet.rs` (non-default tablet).
 
 ## Read contracts
 
 Every native point read names its freshness contract on the wire
-(`Latest` when absent — pre-contract clients only knew linearizable
+(`Latest` when absent - pre-contract clients only knew linearizable
 reads, and `Latest` is the strongest contract, so the default never
 weakens). Contract retries preserve it across redirects and redials.
 
@@ -194,7 +194,7 @@ Latest
   paths reuse explicit evidence and fall back to the barrier.
 
 AtLeast(CommitToken)
-  Serves from any replica whose applied state covers the token — no
+  Serves from any replica whose applied state covers the token - no
   leader contact when already covered. A replica behind the token waits
   bounded (deadline-aware, default 5s server-side, hard-capped 10s).
   Tokens are lineage-bound (tablet + epoch): a token from another
@@ -206,7 +206,7 @@ BoundedStale(max_staleness)
   Serves only from a FreshnessReceipt proving the bound (a recent
   authority proof on the server's monotonic clock, same authority,
   coverage applied). Without satisfying evidence the read escalates to
-  a fresh barrier — which satisfies any bound — instead of serving weak
+  a fresh barrier - which satisfies any bound - instead of serving weak
   data. If the authority path is unreachable the read fails retriable
   (Overloaded/StaleRoute), never out-of-bound data labeled success.
   Single-node servers are definitionally fresh and serve directly.
@@ -279,7 +279,7 @@ reads also log their path, authority, and position at debug level.
 
 `/ready` is usable-only and multi-tablet aware: `ready` requires every
 configured tablet healthy (with `tablets_total` / `tablets_healthy` /
-`leaders_known` counts) — partial failure is reported openly, never
+`leaders_known` counts) - partial failure is reported openly, never
 hidden behind one boolean.
 
 ## Full restart
@@ -298,7 +298,7 @@ heartbeats, appends, snapshot fragments, preflight acks) and bulk
 (manifests, chunks). The Raft log carries only tiny roots; large values
 pre-distribute sidecars over bulk *before* the root proposes (preflight
 to a write quorum), so small same-tablet writes stay responsive while
-bulk moves. Followers still gate every append on sidecar durability —
+bulk moves. Followers still gate every append on sidecar durability -
 preflight is only an optimization, never a correctness dependency
 (`KIVI_DISABLE_PREFLIGHT=1` forces the old append-gate path; lab only).
 

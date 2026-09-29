@@ -19,8 +19,6 @@ pub enum OffcoreKind {
     Demote,
     /// Reads a representation back from `NVMe` (promotion).
     Promote,
-    /// Deletes an `NVMe` record after its representation retired.
-    Delete,
 }
 
 /// Lifecycle of one off-core operation.
@@ -30,12 +28,6 @@ pub enum OffcoreState {
     Queued,
     /// Submitted to the device, awaiting completion.
     Submitted,
-    /// Completed successfully.
-    Completed,
-    /// Failed; the fabric falls back to another representation.
-    Failed,
-    /// Cancelled before submission (mutation, migration, or load shed).
-    Cancelled,
 }
 
 /// One explicit `NVMe` operation.
@@ -157,20 +149,6 @@ impl OffcoreQueue {
         self.enqueue(object, version, OffcoreKind::Promote, Vec::new())
     }
 
-    /// Enqueues a deletion.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`crate::error::MemoryError::Overloaded`] when bounds are
-    /// exhausted.
-    pub fn enqueue_delete(
-        &mut self,
-        object: u64,
-        version: u64,
-    ) -> Result<OffcoreOpId, crate::error::MemoryError> {
-        self.enqueue(object, version, OffcoreKind::Delete, Vec::new())
-    }
-
     fn enqueue(
         &mut self,
         object: u64,
@@ -249,12 +227,6 @@ impl OffcoreQueue {
     #[must_use]
     pub const fn submitted_len(&self) -> usize {
         self.submitted.len()
-    }
-
-    /// Queued payload bytes.
-    #[must_use]
-    pub const fn queued_bytes(&self) -> u64 {
-        self.queued_bytes
     }
 }
 

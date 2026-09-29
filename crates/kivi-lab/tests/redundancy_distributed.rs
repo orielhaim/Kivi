@@ -26,129 +26,14 @@
 use std::time::{Duration, Instant};
 
 use kivi_lab::cluster::Cluster;
-use serde_json::{Value, json};
-
-/// Generous deadlines: spawning three real processes plus elections,
-/// fragment transfer, and Raft commits dominates wall time.
-const DEADLINE: Duration = Duration::from_secs(180);
-const POLL: Duration = Duration::from_millis(250);
+use kivi_lab::testkit::redundancy::{
+    asset_hex, await_health, await_until, fragments_root, health, payload, protect, read, repair,
+    transition, unb64,
+};
+use serde_json::json;
 
 /// Asset family discriminant for generic immutable bytes (BLAKE3 identity).
 const KIND_GENERIC: u8 = 5;
-
-/// Deterministic pseudo-random payload (splitmix64): incompressible enough
-/// to be representative, fully reproducible.
-fn payload(len: usize, seed: u64) -> Vec<u8> {
-    let mut state = seed;
-    let mut out = Vec::with_capacity(len);
-    while out.len() < len {
-        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^= z >> 31;
-        out.extend_from_slice(&z.to_le_bytes());
-    }
-    out.truncate(len);
-    out
-}
-
-/// Standard padded base64 (the admin plane's image encoding).
-fn b64(bytes: &[u8]) -> String {
-    use base64::Engine as _;
-    base64::engine::general_purpose::STANDARD.encode(bytes)
-}
-
-/// Decodes standard padded base64.
-fn unb64(text: &str) -> Option<Vec<u8>> {
-    use base64::Engine as _;
-    base64::engine::general_purpose::STANDARD.decode(text).ok()
-}
-
-/// Lowercase hex identity of a generic immutable asset.
-fn asset_hex(bytes: &[u8]) -> String {
-    use core::fmt::Write as _;
-    let digest = kivi_codec::integrity::blake3_256(bytes);
-    let mut out = String::with_capacity(64);
-    for byte in digest {
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
-}
-
-/// Fragment store root of one live cluster member.
-fn fragments_root(cluster: &Cluster, index: usize) -> std::path::PathBuf {
-    cluster.data_dir(index).join("redundancy").join("fragments")
-}
-
-/// Protects bytes through the admin plane, failing loudly with the body.
-fn protect(cluster: &Cluster, index: usize, bytes: &[u8], tolerance: u8) -> (u16, Value) {
-    let body = json!({
-        "kind": KIND_GENERIC,
-        "domain": 0,
-        "bytes_b64": b64(bytes),
-        "tolerance": tolerance,
-    });
-    cluster.admin_post(index, "/v1/redundancy/protect", &body)
-}
-
-/// Reads an asset back through the admin plane.
-fn read(cluster: &Cluster, index: usize, hash: &str) -> (u16, Value) {
-    cluster.admin_get(
-        index,
-        &format!("/v1/redundancy/read?kind={KIND_GENERIC}&domain=0&hash_hex={hash}"),
-    )
-}
-
-/// Reads one asset's health.
-fn health(cluster: &Cluster, index: usize, hash: &str) -> (u16, Value) {
-    cluster.admin_get(
-        index,
-        &format!("/v1/redundancy/health?kind={KIND_GENERIC}&domain=0&hash_hex={hash}"),
-    )
-}
-
-/// Repairs one asset.
-fn repair(cluster: &Cluster, index: usize, hash: &str) -> (u16, Value) {
-    cluster.admin_post(
-        index,
-        "/v1/redundancy/repair",
-        &json!({ "kind": KIND_GENERIC, "domain": 0, "hash_hex": hash }),
-    )
-}
-
-/// Transitions one asset to an explicit scheme.
-fn transition(cluster: &Cluster, index: usize, hash: &str, scheme: &Value) -> (u16, Value) {
-    cluster.admin_post(
-        index,
-        "/v1/redundancy/transition",
-        &json!({ "kind": KIND_GENERIC, "domain": 0, "hash_hex": hash, "scheme": scheme }),
-    )
-}
-
-/// Polls until `check` returns true or the deadline passes, then panics with
-/// the last observed body.
-fn await_until<T>(label: &str, mut check: impl FnMut() -> Option<T>) -> T {
-    let deadline = Instant::now() + DEADLINE;
-    loop {
-        if let Some(value) = check() {
-            return value;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out after {DEADLINE:?} waiting for {label}"
-        );
-        std::thread::sleep(POLL);
-    }
-}
-
-/// Waits until an asset reports `wanted` health on a node.
-fn await_health(cluster: &Cluster, index: usize, hash: &str, wanted: &str) -> Value {
-    await_until(&format!("health {wanted} on node {index}"), || {
-        let (status, body) = health(cluster, index, hash);
-        (status == 200 && body["health"].as_str() == Some(wanted)).then_some(body)
-    })
-}
 
 /// Replication across real nodes: protect, wipe a holder's physical store
 /// while it is down, restart it, read REMOTELY (it holds no fragment), then
@@ -268,7 +153,7 @@ fn reed_solomon_cross_process_reconstruction() {
 
     let (status, body) = repair(&cluster, 0, &hash);
     assert_eq!(status, 200, "repair: {body}");
-    await_health(&cluster, 0, &hash, "healthy");
+    let _health = await_health(&cluster, 0, &hash, "healthy");
 
     // Beyond tolerance: two dead holders with parity 1 fails closed and
     // never returns wrong bytes.
@@ -312,7 +197,7 @@ fn restart_recovers_catalog_and_fragments() {
 
     // Catalog recovered through control replay: every node answers health.
     for index in 0..3usize {
-        await_health(&cluster, index, &hash, "healthy");
+        let _health = await_health(&cluster, index, &hash, "healthy");
     }
     let (status, body) = read(&cluster, 0, &hash);
     assert_eq!(status, 200, "read after restart: {body}");
@@ -610,7 +495,7 @@ fn duplicate_repair_is_idempotent() {
     cluster.kill(2);
     std::fs::remove_dir_all(fragments_root(&cluster, 2)).expect("fragments wiped");
     cluster.restart(2).expect("node 2 restarts");
-    await_health(&cluster, 0, &hash, "degraded");
+    let _health = await_health(&cluster, 0, &hash, "degraded");
 
     // Two coordinators repair concurrently: both may report work, the end
     // state is one healthy layout with exactly three verified pieces.

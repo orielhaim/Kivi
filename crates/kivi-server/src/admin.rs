@@ -2,7 +2,7 @@
 //!
 //! Architectural boundary: this module is the ONLY place Tokio, Axum,
 //! Tower, or Serde exist. The Compio native data plane (`kivi-engine`,
-//! `LiveTablet`, `DataWorker` execution) never sees them — Axum interacts
+//! `LiveTablet`, `DataWorker` execution) never sees them - Axum interacts
 //! with the engine exclusively through [`kivi_engine::AdminHandle`]
 //! (immutable snapshots plus the bounded control channel), and Serde/JSON
 //! exist only for these admin DTOs, never for the Mutation IR, the native
@@ -41,7 +41,7 @@ const MAX_ADMIN_BODY_BYTES: usize = 64 * 1024;
 const ADMIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Shared admin state: node identity (operator-configured in ephemeral
-/// mode, data-directory-persisted in durable mode — always the same values
+/// mode, data-directory-persisted in durable mode - always the same values
 /// the engine serves in native handshakes) plus the engine query handle.
 #[derive(Debug, Clone)]
 pub struct AdminState {
@@ -1077,7 +1077,7 @@ async fn adaptive(State(state): State<AdminState>) -> Json<serde_json::Value> {
     let snapshot = runtime.snapshot();
     // The hardware summaries are reported whole rather than as a boolean,
     // because the interesting question is not "is it on" but "what did the
-    // machine say" — and a summary with `measured: false` and every counter at
+    // machine say" - and a summary with `measured: false` and every counter at
     // zero is a real answer about a real machine.
     let hardware: Vec<serde_json::Value> = snapshot
         .hardware

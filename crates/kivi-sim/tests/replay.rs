@@ -2,8 +2,8 @@
 //! events: the replay-equivalence proof for the simulation kernel.
 //!
 //! The driver loop below is the exact shape future virtual network/storage
-//! simulators will use — pop, consult the fault policy, run or skip, record
-//! to the trace — over their own event payloads.
+//! simulators will use - pop, consult the fault policy, run or skip, record
+//! to the trace - over their own event payloads.
 
 use core::num::NonZeroU64;
 use core::time::Duration;
@@ -13,6 +13,7 @@ use kivi_sim::{
     AllowAll, DropEveryNth, DropWithProbability, RecordedDecision, Scheduler, SimRng, Trace,
 };
 use kivi_types::Ticks;
+use rstest::rstest;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MachineEvent {
@@ -20,7 +21,7 @@ enum MachineEvent {
     Spawn { count: u64, delay_ms: u64 },
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Machine {
     total: i64,
     applied: u64,
@@ -47,7 +48,7 @@ impl FaultPolicy for DeferOnce {
 
 /// Drives one full run: 1,200 initial events (a fifth of them spawners),
 /// faulted per `policy`, traced throughout.
-fn drive<P: FaultPolicy>(seed: u64, mut policy: P) -> (Machine, Trace<MachineEvent>) {
+fn drive(seed: u64, mut policy: Box<dyn FaultPolicy>) -> (Machine, Trace<MachineEvent>) {
     let mut rng = SimRng::seed_from_u64(seed);
     let mut scheduler = Scheduler::new(Ticks::from_micros(0));
     for i in 0..1200u64 {
@@ -116,68 +117,82 @@ fn drive<P: FaultPolicy>(seed: u64, mut policy: P) -> (Machine, Trace<MachineEve
     (machine, trace)
 }
 
-#[test]
-fn allow_all_baseline_has_exact_counts() {
-    let (machine, trace) = drive(9, AllowAll);
-    // 960 initial adds + 240 spawners x 3 children each, nothing dropped.
-    assert_eq!(
-        machine,
-        Machine {
-            total: 1680,
-            applied: 1680,
-            spawned: 240,
+/// One scripted policy family, re-constructible so the same scenario can be
+/// driven twice from scratch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fault {
+    None,
+    Lossy,
+    EveryFourth,
+    DeferOnce,
+}
+
+impl Fault {
+    fn build(self) -> Box<dyn FaultPolicy> {
+        match self {
+            Self::None => Box::new(AllowAll),
+            Self::Lossy => Box::new(DropWithProbability::new(200_000)),
+            Self::EveryFourth => Box::new(DropEveryNth::new(NonZeroU64::new(4).expect("nonzero"))),
+            Self::DeferOnce => Box::new(DeferOnce { done: false }),
         }
-    );
-    assert_eq!(trace.len(), 1920);
-    assert!(trace.iter().all(|e| e.decision() == RecordedDecision::Ran));
+    }
 }
 
-#[test]
-fn replay_is_identical_with_lossy_policy() {
-    let (first_state, first_trace) = drive(42, DropWithProbability::new(200_000));
-    let (second_state, second_trace) = drive(42, DropWithProbability::new(200_000));
-    assert_eq!(first_state, second_state);
-    assert_eq!(first_trace, second_trace);
-    // Faults were actually injected (not a vacuous replay of all-Allow).
-    assert!(
-        first_trace
+/// The replay-equivalence proof: the whole kernel - scheduler order, event
+/// identities, fault decisions, and the driven machine - is a pure function
+/// of (seed, policy). A hash-map iteration order, a wall clock, or a
+/// consumed-counter leak anywhere in the loop breaks these.
+#[rstest]
+#[case(Fault::None, 1920, 0, 0)]
+#[case(Fault::Lossy, 0, 0, 0)]
+#[case(Fault::EveryFourth, 0, 0, 0)]
+#[case(Fault::DeferOnce, 0, 0, 1)]
+fn kernel_replays_exactly(
+    #[case] fault: Fault,
+    #[case] all_ran: usize,
+    #[case] all_dropped: usize,
+    #[case] deferred: usize,
+) {
+    let (machine, trace) = drive(42, fault.build());
+    assert_eq!(drive(42, fault.build()), (machine.clone(), trace.clone()));
+    let count = |wanted: RecordedDecision| {
+        trace
             .iter()
-            .any(|e| e.decision() == RecordedDecision::Dropped)
-    );
-    assert!(
-        first_trace
-            .iter()
-            .any(|e| e.decision() == RecordedDecision::Ran)
-    );
-}
-
-#[test]
-fn replay_is_identical_with_periodic_drops() {
-    let every = NonZeroU64::new(4).expect("nonzero");
-    let (first_state, first_trace) = drive(7, DropEveryNth::new(every));
-    let (second_state, second_trace) = drive(7, DropEveryNth::new(every));
-    assert_eq!(first_state, second_state);
-    assert_eq!(first_trace, second_trace);
-}
-
-#[test]
-fn different_seeds_diverge() {
-    let (_, trace_42) = drive(42, DropWithProbability::new(200_000));
-    let (_, trace_43) = drive(43, DropWithProbability::new(200_000));
-    assert_ne!(trace_42, trace_43);
-}
-
-#[test]
-fn defer_once_still_replays_exactly() {
-    let (first_state, first_trace) = drive(5, DeferOnce { done: false });
-    let (second_state, second_trace) = drive(5, DeferOnce { done: false });
-    assert_eq!(first_state, second_state);
-    assert_eq!(first_trace, second_trace);
+            .filter(|entry| entry.decision() == wanted)
+            .count()
+    };
+    if all_ran > 0 {
+        assert_eq!(count(RecordedDecision::Ran), all_ran);
+        assert_eq!(count(RecordedDecision::Dropped), all_dropped);
+    } else {
+        // Not a vacuous all-allow replay: the scripted fault actually bit.
+        assert!(count(RecordedDecision::Ran) > 0, "the run did work");
+        assert!(
+            count(RecordedDecision::Dropped) + deferred > 0,
+            "fault {fault:?} injected nothing"
+        );
+    }
     assert_eq!(
-        first_trace
+        trace
             .iter()
-            .filter(|e| matches!(e.decision(), RecordedDecision::Deferred { .. }))
+            .filter(|entry| matches!(entry.decision(), RecordedDecision::Deferred { .. }))
             .count(),
-        1
+        deferred,
+        "fault {fault:?} deferred the wrong number of events"
     );
+    // Every `Add(1)` that ran contributed exactly once, so the running total
+    // matches the apply count: a double-apply or a lost add breaks it.
+    assert_eq!(machine.total, i64::try_from(machine.applied).expect("fits"));
+    if all_ran > 0 {
+        // Unfaulted: the whole 1,200-event script drains, spawns included.
+        assert_eq!(machine.spawned, 240);
+        assert_eq!(machine.applied, 1680);
+    }
+}
+
+#[test]
+fn the_seed_is_load_bearing() {
+    let (_, first) = drive(42, Fault::Lossy.build());
+    let (_, second) = drive(43, Fault::Lossy.build());
+    assert_ne!(first, second, "an ignored seed makes every replay vacuous");
 }

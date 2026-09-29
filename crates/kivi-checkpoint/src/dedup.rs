@@ -7,7 +7,7 @@
 //! deterministic sorted order; then prepared intents in key order. It is a
 //! separate immutable artifact (not mixed into object bands) because dedup
 //! and intent state have different growth and lifecycle characteristics
-//! than objects — and they must scale without disturbing band reuse.
+//! than objects - and they must scale without disturbing band reuse.
 //!
 //! ```text
 //! header (32 bytes, fixed):
@@ -40,8 +40,8 @@
 //!
 //! Format v1 (sessions only, no intents) and v2 (intents without
 //! write-set digests) are rejected: breaking prototype formats is
-//! allowed, and silently dropping intents — or their confused-deputy
-//! binding — would violate the durability contract.
+//! allowed, and silently dropping intents - or their confused-deputy
+//! binding - would violate the durability contract.
 
 use kivi_codec::integrity::crc32c_checksum;
 use kivi_codec::{Decode as _, Encode as _};
@@ -207,7 +207,7 @@ pub fn build_dedup(
 }
 
 /// Encodes the intent section: count plus key-ordered intents (duplicate
-/// keys rejected — one intent per key by construction).
+/// keys rejected - one intent per key by construction).
 fn encode_intents(
     body: &mut Vec<u8>,
     intents: &mut [kivi_state::TxnIntent],

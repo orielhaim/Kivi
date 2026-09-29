@@ -186,12 +186,6 @@ impl FailureDetector {
             {
                 Some(NodeState::Unavailable)
             }
-            // Direct Active -> Unavailable when grace already effectively
-            // expired (e.g., a node missed many polls while the leader
-            // was down and the new leader's first observations arrive in
-            // bulk): never flap, always pass through Suspect first in the
-            // replicated log — the caller issues one transition per pass,
-            // so this arm is unreachable in practice but documents intent.
             _ => None,
         }
     }
@@ -226,7 +220,7 @@ impl TabletHealth {
 }
 
 /// Classifies one tablet's health from desired voters, usable voters
-/// (desired voters in `Active`/`Suspect`/`Draining` states — i.e., not
+/// (desired voters in `Active`/`Suspect`/`Draining` states - i.e., not
 /// `Unavailable`/`Removed`), and whether a live plan already covers it.
 #[must_use]
 pub fn classify_tablet(
@@ -290,21 +284,17 @@ mod tests {
     #[test]
     fn grace_expires_to_unavailable() {
         let mut detector = FailureDetector::new(FailureDetectorConfig::lab());
-        // 3 (suspicion) + 5 (grace) = 8 misses to unavailable.
+        // Lab config: suspect after 3 misses, unavailable after 5 more.
+        // The caller applies each transition to the replicated state
+        // before the next poll, so the walk starts Active and moves to
+        // Suspect on the third miss.
+        let mut current = NodeState::Active;
         let mut transition = None;
-        for index in 0..8 {
-            let current = transition.unwrap_or(if index < 3 {
-                NodeState::Active
-            } else {
-                NodeState::Suspect
-            });
-            // After the 3rd miss the replicated state is Suspect.
-            let current = if index >= 3 {
-                NodeState::Suspect
-            } else {
-                current
-            };
+        for _ in 0..8 {
             transition = detector.observe(node(3), false, current);
+            if let Some(next) = transition {
+                current = next;
+            }
         }
         assert_eq!(transition, Some(NodeState::Unavailable));
     }

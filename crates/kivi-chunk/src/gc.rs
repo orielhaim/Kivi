@@ -27,7 +27,7 @@
 //!    uncommitted data is never fully dead.
 //!
 //! A pack is therefore proposed only when it was sealed before the plan
-//! began *and* nothing reachable — live, retained, or in flight — names
+//! began *and* nothing reachable - live, retained, or in flight - names
 //! any record in it. Deleting it cannot strand a future commit.
 //!
 //! ## Reclamation scope (§38, §39)
@@ -80,7 +80,7 @@ pub struct GcReport {
 /// block). A *live* manifest with no representation is corruption and
 /// fails the whole plan; a merely *pinned* one may simply not be staged
 /// yet and is skipped (its bytes live in packs this plan can never
-/// propose — see the module docs).
+/// propose - see the module docs).
 ///
 /// # Errors
 ///
@@ -89,7 +89,7 @@ pub fn plan(store: &ChunkStore, inputs: &GcInputs) -> Result<GcReport, ChunkErro
     let active_seq = store.active_seq();
     // Pins join the mark set directly: pinned chunks are staged (or about
     // to be) and pinned manifests name them, so no manifest read is needed
-    // — or even possible — for not-yet-staged pins.
+    // - or even possible - for not-yet-staged pins.
     let mut live_chunks: HashSet<ChunkId> = inputs.pinned_chunks.clone();
     let mut live_manifests: HashSet<ManifestId> = inputs.pinned_manifests.clone();
     live_manifests.extend(inputs.live_manifests.iter().copied());

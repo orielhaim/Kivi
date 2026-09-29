@@ -8,7 +8,6 @@ use crate::handle::ObjectHandle;
 
 /// Every way the Memory Fabric can refuse an optimization step.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
 pub enum MemoryError {
     /// A stale generational handle was used after relocation, compaction,
     /// or reclamation. The caller must re-resolve the object root; the

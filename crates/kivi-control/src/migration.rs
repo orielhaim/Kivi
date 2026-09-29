@@ -98,7 +98,6 @@ impl MigrationPhase {
 
 /// Why a migration plan was rejected.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
 pub enum MigrationError {
     /// Unknown phase discriminant in canonical bytes.
     #[error("unknown migration phase discriminant {found}")]

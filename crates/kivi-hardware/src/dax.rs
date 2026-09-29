@@ -4,9 +4,9 @@
 //! Linux surfaces CXL capacity in two shapes, and Kivi treats them
 //! differently:
 //!
-//! * **Device DAX** — `/dev/daxN.Y`, a character device that can be mapped
+//! * **Device DAX** - `/dev/daxN.Y`, a character device that can be mapped
 //!   directly. Detected in [`discover_regions`] and used by [`DaxRegion`].
-//! * **kmem hotplug** — the same capacity hotplugged into the system, appearing
+//! * **kmem hotplug** - the same capacity hotplugged into the system, appearing
 //!   as an ordinary NUMA node whose tier is `Cxl` or `Pmem`. Nothing here maps
 //!   it: the memory fabric sees it as a memory node and treats it as any other
 //!   node, which is correct because it is one.
@@ -154,7 +154,7 @@ impl DaxRegion {
     /// can be exercised on a machine with no CXL hardware.
     ///
     /// This is how Kivi tests that a provider can disappear, that alignment is
-    /// enforced, and that the allocator refuses to overcommit — without ever
+    /// enforced, and that the allocator refuses to overcommit - without ever
     /// claiming the numbers describe CXL. A benchmark against an emulated
     /// region is reported as emulated.
     ///

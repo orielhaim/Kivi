@@ -1,6 +1,6 @@
 //! Kivi peer message vocabulary over QUIC/H3.
 //!
-//! Peer traffic runs on the QUIC/H3 mesh ([`crate::transport`]) — never the
+//! Peer traffic runs on the QUIC/H3 mesh ([`crate::transport`]) - never the
 //! native client protocol, RESP, or admin HTTP. HTTP/3 provides
 //! multiplexing, framing, flow control, and stream lifecycle; this module
 //! owns only Kivi semantics:
@@ -9,7 +9,7 @@
 //!   in authenticated H3 headers and validated per request (wrong cluster,
 //!   stale incarnation, and missing capabilities refuse loudly);
 //! * Raft RPC payloads as Kivi-owned binary structs (never `OpenRaft`
-//!   memory layout — [`crate::router`] owns translation both ways, so
+//!   memory layout - [`crate::router`] owns translation both ways, so
 //!   `OpenRaft` upgrades cannot change these bytes);
 //! * immutable sidecar identities (`ChunkId`/`ManifestId` over content,
 //!   never pack offsets).
@@ -47,10 +47,6 @@ pub const CAP_CONSENSUS_V2: u64 = 1 << 0;
 pub const CAP_SIDECAR_V1: u64 = 1 << 1;
 /// All capabilities this binary requires of its peers.
 pub const REQUIRED_CAPABILITIES: u64 = CAP_CONSENSUS_V2 | CAP_SIDECAR_V1;
-/// Maximum bulk payload bytes per frame (chunk + framing, well under the
-/// 16 MiB peer ceiling; chunk bodies never exceed 8 MiB by construction).
-pub const MAX_BULK_FRAME_BYTES: usize = 8 * 1024 * 1024;
-
 /// Stable peer identity: who is speaking, in which cluster, in which
 /// process generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -66,7 +62,7 @@ pub struct PeerIdentity {
 /// Why a peer request was refused at the authentication layer (wrong
 /// cluster, stale incarnation, missing capability, suspended link).
 /// Refusals fail only the request (mapped to retry-safe transport
-/// errors), never the connection — H3 streams are cheap.
+/// errors), never the connection - H3 streams are cheap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum AuthReject {
@@ -265,7 +261,7 @@ pub struct PeerSnapshotRequest {
     /// Transfer-session id: one attempt to move this checkpoint,
     /// generated fresh per `full_snapshot` call. The receiver compares it
     /// against the in-flight stream to tell a new transfer from a
-    /// continuation — never part of durable snapshot identity.
+    /// continuation - never part of durable snapshot identity.
     pub transfer: u64,
     /// Byte offset of this fragment.
     pub offset: u64,
@@ -943,8 +939,8 @@ pub const fn h3_media_type(request: &PeerRequest) -> &'static str {
 
 /// HTTP method for a request family (transport metadata only, never
 /// durable state). Identity-in-path bulk fetches are empty-body GETs;
-/// every other family — Raft RPCs and the sidecar-preflight POST, which
-/// carries its manifest identity plus logical length as a small body — is
+/// every other family - Raft RPCs and the sidecar-preflight POST, which
+/// carries its manifest identity plus logical length as a small body - is
 /// a POST. A GET with a body is never emitted: intermediaries may drop
 /// the body, which would corrupt preflight into an undecodable request.
 #[must_use]
@@ -1407,7 +1403,7 @@ fn decode_lease_batch(reader: &mut Reader<'_>) -> Result<PeerLeaseBatch, PeerCod
 
 /// Encodes one lease-protocol message: tag `u8` plus fixed `u64` fields
 /// (roster content carries a count-prefixed responder vec, capped on
-/// decode). Structural only — attempt identity, incarnation binding, and
+/// decode). Structural only - attempt identity, incarnation binding, and
 /// roster ordering are engine checks, never codec checks.
 pub fn encode_lease_message(out: &mut Vec<u8>, message: &kivi_types::LeaseMessage) {
     use kivi_types::LeaseMessage as M;
@@ -1484,7 +1480,7 @@ pub fn encode_lease_message(out: &mut Vec<u8>, message: &kivi_types::LeaseMessag
 ///
 /// Returns [`PeerCodecError`] on truncation, unknown tags, oversize
 /// responder sets, or trailing structure. Unknown roster identities are
-/// accepted structurally — the engine (which owns authority, term, and
+/// accepted structurally - the engine (which owns authority, term, and
 /// generation validity) refuses what it must.
 pub(crate) fn decode_lease_message(
     reader: &mut Reader<'_>,
@@ -1638,7 +1634,7 @@ impl IncarnationTable {
     }
 
     /// Returns the newest observed incarnation as a raw value (`0` when
-    /// nothing was observed — handshake diagnostics only).
+    /// nothing was observed - handshake diagnostics only).
     #[must_use]
     pub fn newest(&self, node: NodeId) -> u64 {
         self.observed
@@ -1664,72 +1660,57 @@ mod tests {
         (0x0C10_57E2, 2, 3, REQUIRED_CAPABILITIES)
     }
 
+    /// Handshake gate: a current peer in the right cluster with every
+    /// capability is admitted, and each rejection class (wrong cluster,
+    /// missing capability, strictly older generation) refuses loudly while
+    /// the same live generation reconnects freely.
     #[test]
-    fn headers_accept_current_peers() {
-        let table = IncarnationTable::new();
+    fn headers_admit_current_peers_and_refuse_the_rest() {
+        let mut table = IncarnationTable::new();
         let (cluster, node, incarnation, caps) = headers();
         let validated =
             validate_peer_headers(cluster, node, incarnation, caps, &identity(), &table)
                 .expect("accepts");
         assert_eq!(validated.node, NodeId::from_u64(2));
         assert_eq!(validated.incarnation, NodeIncarnation::from_u64(3));
-        // Rejections carry their exact reasons.
-        for (cluster, node, incarnation, caps) in [
-            (
-                0xDEAD_BEEF_CAFE_F00D_DEAD_BEEF_CAFE_F00D,
-                2,
-                3,
-                REQUIRED_CAPABILITIES,
-            ),
-            (0x0C10_57E2, 2, 3, 0),
-        ] {
-            assert!(
-                validate_peer_headers(cluster, node, incarnation, caps, &identity(), &table)
-                    .is_err()
-            );
-        }
-    }
 
-    #[test]
-    fn headers_reject_wrong_cluster_stale_and_weak_peers() {
-        let mut table = IncarnationTable::new();
-        let (cluster, node, incarnation, caps) = headers();
-        // Wrong cluster.
         assert!(matches!(
             validate_peer_headers(0xDEAD, node, incarnation, caps, &identity(), &table),
             Err(AuthReject::WrongCluster { .. })
         ));
-        // Missing capability.
         assert!(matches!(
             validate_peer_headers(cluster, node, incarnation, 0, &identity(), &table),
             Err(AuthReject::MissingCapability { .. })
         ));
-        // Stale incarnation after observing a newer generation.
-        assert!(table.observe(NodeId::from_u64(2), NodeIncarnation::from_u64(8)));
+        assert!(matches!(
+            validate_peer_headers(
+                cluster,
+                node,
+                NodeIncarnation::INVALID.as_u64(),
+                caps,
+                &identity(),
+                &table
+            ),
+            Err(AuthReject::StaleIncarnation { .. })
+        ));
+
+        // The table only ever advances: an older or repeated generation is
+        // not observed, so it can never revalidate afterwards.
+        let peer = NodeId::from_u64(node);
+        assert!(table.observe(peer, NodeIncarnation::from_u64(7)));
+        assert!(!table.observe(peer, NodeIncarnation::from_u64(7)));
+        assert!(!table.observe(peer, NodeIncarnation::from_u64(6)));
+        assert!(!table.observe(peer, NodeIncarnation::INVALID));
+        assert!(table.observe(peer, NodeIncarnation::from_u64(8)));
+        assert_eq!(table.newest(peer), 8);
         assert!(matches!(
             validate_peer_headers(cluster, node, incarnation, caps, &identity(), &table),
             Err(AuthReject::StaleIncarnation { .. })
         ));
-        // Equal incarnations reconnect freely: the same live generation
-        // revalidates (transient healing depends on this; only strictly
-        // older generations are stale).
         assert!(
             validate_peer_headers(cluster, node, 8, caps, &identity(), &table).is_ok(),
-            "equal incarnation must revalidate"
+            "equal incarnation is the same live generation and must revalidate"
         );
-        // Invalid incarnations are never current.
-        assert!(!table.observe(NodeId::from_u64(9), NodeIncarnation::INVALID));
-    }
-
-    #[test]
-    fn incarnation_table_advances_monotonically() {
-        let mut table = IncarnationTable::new();
-        let node = NodeId::from_u64(2);
-        assert!(table.observe(node, NodeIncarnation::from_u64(7)));
-        assert!(!table.observe(node, NodeIncarnation::from_u64(7)));
-        assert!(!table.observe(node, NodeIncarnation::from_u64(6)));
-        assert!(table.observe(node, NodeIncarnation::from_u64(8)));
-        assert_eq!(table.newest(node), 8);
     }
 
     #[test]

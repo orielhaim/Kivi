@@ -1,12 +1,9 @@
 //! Production durability for Kivi: data directory, segmented WAL, recovery.
 //!
 //! This crate owns crash semantics; the rest of Kivi depends on its
-//! concepts ([`PersistIntent`], [`CommitProof`], [`RecoveryRecord`],
-//! [`DurabilityProvider`]), never on filesystem handles. Tablet and state
-//! code stay free of files, `rustix`, `io_uring`, and platform calls, so
-//! future providers (`QuorumLog`, `PersistentMemory`, `CXL`) slot in
-//! without rewriting tablet semantics. Only the local WAL provider ships
-//! in this stage.
+//! concepts ([`PersistIntent`], [`CommitProof`], [`DurabilityProvider`]),
+//! never on filesystem handles. Tablet and state code stay free of files,
+//! `rustix`, `io_uring`, and platform calls.
 //!
 //! Data-directory layout:
 //!
@@ -34,19 +31,16 @@ pub mod raft;
 pub mod wal;
 
 pub use error::{DurabilityError, RecoveryError};
-pub use node::{NodeMeta, NodeSeed, OpenDir, open_data_dir};
+pub use node::{NodeSeed, OpenDir, open_data_dir};
 pub use provider::{
     BarrierCost, CommitProof, DurabilityLevel, DurabilityProvider, LaneStats, PersistIntent,
-    RecoveryRecord, StorageHealth,
+    StorageHealth,
 };
 pub use raft::{
-    RAFT_PAYLOAD_BLANK, RAFT_PAYLOAD_MEMBERSHIP, RAFT_PAYLOAD_NORMAL, RECORD_KIND_RAFT_COMMITTED,
-    RECORD_KIND_RAFT_ENTRY, RECORD_KIND_RAFT_PURGE, RECORD_KIND_RAFT_TRUNCATE,
-    RECORD_KIND_RAFT_VOTE, RaftCommitted, RaftEntry, RaftEntryPayload, RaftMembership, RaftPurge,
-    RaftRecord, RaftTruncate, RaftVote,
+    RaftCommitted, RaftEntry, RaftEntryPayload, RaftMembership, RaftPurge, RaftRecord,
+    RaftTruncate, RaftVote,
 };
 pub use wal::{
-    DEFAULT_SEGMENT_TARGET_BYTES, LaneFloor, LaneIdentity, LaneRecovery, LocalWalLane,
-    MutationRecord, OutcomeRecord, RecoveredRecord, RecoverySummary, SealedSegmentSummary,
-    WAL_MAJOR, WAL_MAX_BODY_BYTES, WalEntry, WalRecord, WorkerLaneStats,
+    DEFAULT_SEGMENT_TARGET_BYTES, LaneFloor, LaneIdentity, LocalWalLane, MutationRecord,
+    OutcomeRecord, RecoverySummary, SealedSegmentSummary, WalEntry, WalRecord, WorkerLaneStats,
 };

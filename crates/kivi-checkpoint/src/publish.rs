@@ -23,7 +23,7 @@
 //! An interrupted publication is invisible: CURRENT still points at the
 //! previous checkpoint, and orphaned content-addressed files are either
 //! reused (identical bytes) or swept by the next publish. Reused bands
-//! are never rewritten — but a referenced-yet-missing band fails loudly
+//! are never rewritten - but a referenced-yet-missing band fails loudly
 //! (rebuilding it at a new cut would fork its identity).
 
 use std::collections::HashSet;
@@ -45,7 +45,7 @@ pub struct PublishStats {
     pub bands_skipped_present: usize,
     /// Dedup component written (`false` when already present).
     pub dedup_written: bool,
-    /// Manifest written (`false` when already present — identical rebuild).
+    /// Manifest written (`false` when already present - identical rebuild).
     pub manifest_written: bool,
     /// Artifact files removed by retention GC.
     pub garbage_collected: usize,
@@ -239,7 +239,7 @@ pub fn write_wal_floor(
     Ok(())
 }
 
-/// Reads the durable WAL-floor record (`None` when never published —
+/// Reads the durable WAL-floor record (`None` when never published -
 /// recovery replays from genesis).
 ///
 /// # Errors
@@ -263,7 +263,7 @@ fn file_matches(path: &Path, len: u64) -> bool {
 }
 
 /// Writes `bytes` to `path` through temp + sync + atomic rename (without
-/// the final directory sync — the publisher batches one sync per
+/// the final directory sync - the publisher batches one sync per
 /// directory after all renames).
 fn write_file_sync(path: &Path, bytes: &[u8]) -> Result<(), CheckpointError> {
     use kivi_durability::fs::sync_file;

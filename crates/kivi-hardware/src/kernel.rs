@@ -145,8 +145,13 @@ mod tests {
         (0..=300_usize).chain([1024, 4096, 65_537]).collect()
     }
 
+    /// These are dispatched vector paths with a scalar oracle. A kernel that
+    /// only inspected whole vectors would pass every aligned case and then
+    /// corrupt a value in the tail, so the oracle is compared at every length
+    /// and - for the zero scan - with a single non-zero byte placed at every
+    /// offset, including the last.
     #[test]
-    fn zero_detection_matches_the_oracle_at_every_length() {
+    fn the_vector_paths_match_the_scalar_oracle_at_every_length() {
         for len in lengths() {
             assert!(is_all_zero(&vec![0_u8; len]), "len {len}");
             let mut bytes = vec![0_u8; len];
@@ -163,13 +168,10 @@ mod tests {
                 );
                 bytes[offset] = 0;
             }
-        }
-    }
 
-    #[test]
-    fn position_matches_the_oracle_at_every_length() {
-        for len in lengths() {
-            let bytes: Vec<u8> = (0..len).map(|i| u8::try_from(i % 251).unwrap()).collect();
+            let bytes: Vec<u8> = (0..len)
+                .map(|i| u8::try_from(i % 251).expect("under 251"))
+                .collect();
             for needle in [0_u8, 1, 7, 128, 250] {
                 assert_eq!(
                     position_of(&bytes, needle),
@@ -178,20 +180,6 @@ mod tests {
                 );
             }
             assert_eq!(position_of(&bytes, 255), None, "len {len}");
-        }
-    }
-
-    #[test]
-    fn a_non_zero_byte_anywhere_is_found() {
-        // The single most important property of the dispatched scan: a kernel
-        // that only inspected whole vectors would pass every aligned test above
-        // and corrupt a value in the tail.
-        for len in 0..300_usize {
-            let mut bytes = vec![0_u8; len];
-            if let Some(last) = bytes.last_mut() {
-                *last = 1;
-                assert!(!is_all_zero(&bytes), "len {len}");
-            }
         }
     }
 }

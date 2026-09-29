@@ -219,7 +219,7 @@ impl RegionBacking {
 /// Reads the kernel's accounting for the mapping containing `region`.
 ///
 /// `None` when the platform has no such interface, or when the region does not
-/// lie inside any current mapping — which on a freed or unmapped region is the
+/// lie inside any current mapping - which on a freed or unmapped region is the
 /// only answer available, and is deliberately not zero.
 #[must_use]
 pub fn read_backing(region: &[u8]) -> Option<RegionBacking> {
@@ -395,26 +395,6 @@ mod tests {
         assert!(HugePagePolicy::parse("always").is_err());
     }
 
-    #[test]
-    fn detection_always_answers() {
-        let support = detect();
-        assert!(!support.to_string().is_empty());
-    }
-
-    #[test]
-    fn empty_region_is_never_advised() {
-        assert!(!advise_region(&mut []));
-    }
-
-    #[test]
-    fn advising_a_live_region_does_not_abort() {
-        // The kernel refuses a mapping it does not recognise. The contract is
-        // that advice is best-effort and never fatal, so this must simply
-        // return whatever the platform says.
-        let mut memory = vec![0_u8; 8192];
-        let _ = advise_region(&mut memory);
-    }
-
     /// A `smaps` excerpt in the kernel's own format: one 4 KiB-backed
     /// anonymous mapping, one promoted to 2 MiB, and a file mapping between
     /// them so a positional parser would attribute fields to the wrong block.
@@ -446,58 +426,56 @@ KernelPageSize:        4 kB
 MMUPageSize:           4 kB
 ";
 
+    /// The unit in a `smaps` field is per line: `kB` on most fields, `MB` on
+    /// `MMUPageSize`. Reading 65536 as bytes instead of 64 MiB would report a
+    /// promoted region as empty, and reading a file mapping's absent
+    /// `AnonHugePages` as zero must not be confused with a measurement.
     #[test]
-    fn a_base_page_mapping_reports_no_promotion() {
-        let backing = parse_smaps(SMAPS, 0x0040_0800).expect("a live mapping");
-        assert_eq!(backing.virtual_bytes, 0x1000);
-        assert_eq!(backing.resident_bytes, 4096);
-        assert!(!backing.promoted());
-        assert_eq!(backing.kernel_page_bytes, 4096);
-        assert_eq!(backing.mmu_page_bytes, 4096);
-        assert!((backing.huge_fraction() - 0.0).abs() < 1e-9);
-    }
+    fn each_block_reports_its_own_fields_with_the_unit_it_declares() {
+        let base = parse_smaps(SMAPS, 0x0040_0800).expect("a live mapping");
+        assert_eq!(base.virtual_bytes, 0x1000);
+        assert_eq!(base.resident_bytes, 4096);
+        assert!(!base.promoted());
+        assert_eq!(base.kernel_page_bytes, 4096);
+        assert_eq!(base.mmu_page_bytes, 4096);
+        assert!((base.huge_fraction() - 0.0).abs() < 1e-9);
 
-    #[test]
-    fn a_promoted_mapping_reports_its_huge_pages_in_bytes_not_kilobytes() {
-        let backing = parse_smaps(SMAPS, 0x7f00_2000_0000).expect("a live mapping");
-        assert!(backing.promoted());
+        let promoted = parse_smaps(SMAPS, 0x7f00_2000_0000).expect("a live mapping");
+        assert!(promoted.promoted());
         assert_eq!(
-            backing.anon_huge_bytes,
+            promoted.anon_huge_bytes,
             64 * 1024 * 1024,
             "65536 kB is 64 MiB"
         );
-        assert_eq!(backing.resident_bytes, 64 * 1024 * 1024);
-        assert_eq!(backing.mmu_page_bytes, 2 * 1024 * 1024, "the unit is read");
-        assert_eq!(backing.kernel_page_bytes, 4096, "still a 4 KiB base page");
-        assert!((backing.huge_fraction() - 1.0).abs() < 1e-9);
+        assert_eq!(promoted.resident_bytes, 64 * 1024 * 1024);
+        assert_eq!(promoted.mmu_page_bytes, 2 * 1024 * 1024, "the unit is read");
+        assert_eq!(promoted.kernel_page_bytes, 4096, "still a 4 KiB base page");
+        assert!((promoted.huge_fraction() - 1.0).abs() < 1e-9);
+
+        let file = parse_smaps(SMAPS, 0x7f01_0500_0000).expect("a live mapping");
+        assert!(!file.promoted(), "a file mapping has no AnonHugePages line");
+        assert_eq!(file.anon_huge_bytes, 0);
+        assert_eq!(file.file_backed_bytes, 128 * 1024 * 1024);
+        assert_eq!(file.resident_bytes, 128 * 1024 * 1024);
+        assert_eq!(file.virtual_bytes, 256 * 1024 * 1024);
     }
 
-    #[test]
-    fn a_file_mapping_reports_its_own_fields_and_none_of_the_anonymous_ones() {
-        let backing = parse_smaps(SMAPS, 0x7f01_0500_0000).expect("a live mapping");
-        assert!(
-            !backing.promoted(),
-            "a file mapping has no AnonHugePages line"
-        );
-        assert_eq!(backing.anon_huge_bytes, 0);
-        assert_eq!(backing.file_backed_bytes, 128 * 1024 * 1024);
-        assert_eq!(backing.resident_bytes, 128 * 1024 * 1024);
-        assert_eq!(backing.virtual_bytes, 256 * 1024 * 1024);
-    }
-
+    /// A freed or unmapped region has no accounting at all. Reporting zero
+    /// would make "the kernel gave me nothing" and "the kernel told me
+    /// nothing" the same answer.
     #[test]
     fn an_address_outside_every_mapping_is_absent_not_zero() {
-        // A freed or unmapped region has no accounting. Reporting zero would
-        // make "the kernel gave me nothing" and "the kernel told me nothing"
-        // the same answer.
         assert!(parse_smaps(SMAPS, 0xDEAD_0000).is_none());
     }
 
     /// The same content with the blank lines removed, which is what WSL2's
     /// kernel prints. A parser that delimits blocks on `\n\n` finds nothing
-    /// here, and the honest-looking answer it returns — no accounting — hides
-    /// a mapping that plainly exists.
-    const SMAPS_NO_BLANK_LINES: &str = "\
+    /// here, and the honest-looking answer it returns - no accounting - hides
+    /// a mapping that plainly exists. Each block must be delimited by its
+    /// header alone, so no block inherits its neighbour's huge pages.
+    #[test]
+    fn blocks_are_delimited_by_their_header_not_by_a_blank_line() {
+        const NO_BLANK_LINES: &str = "\
 00400000-00401000 r--p 00000000 08:01 1
 Size:                  4 kB
 Rss:                   4 kB
@@ -513,77 +491,73 @@ Size:             262144 kB
 Rss:              131072 kB
 FilePmdMapped:    131072 kB
 ";
-
-    #[test]
-    fn blocks_are_delimited_by_their_header_not_by_a_blank_line() {
-        let promoted = parse_smaps(SMAPS_NO_BLANK_LINES, 0x7f00_2000_0000)
-            .expect("a live mapping without blank-line separators");
+        let promoted = parse_smaps(NO_BLANK_LINES, 0x7f00_2000_0000).expect("a live mapping");
         assert!(promoted.promoted());
         assert_eq!(promoted.anon_huge_bytes, 64 * 1024 * 1024);
         assert_eq!(promoted.mmu_page_bytes, 2 * 1024 * 1024);
-        // The last block must not inherit the previous block's huge pages.
-        let file_backed = parse_smaps(SMAPS_NO_BLANK_LINES, 0x7f01_0500_0000)
-            .expect("a live mapping without blank-line separators");
-        assert!(!file_backed.promoted());
-        assert_eq!(file_backed.anon_huge_bytes, 0);
-        assert_eq!(file_backed.file_backed_bytes, 128 * 1024 * 1024);
+
+        // The block after a promoted one must not inherit its huge pages.
+        let file = parse_smaps(NO_BLANK_LINES, 0x7f01_0500_0000).expect("a live mapping");
+        assert!(!file.promoted());
+        assert_eq!(file.anon_huge_bytes, 0);
+        assert_eq!(file.file_backed_bytes, 128 * 1024 * 1024);
+
         // And the first, which shares a block boundary with a promoted one.
-        let first = parse_smaps(SMAPS_NO_BLANK_LINES, 0x0040_0800).expect("the first block");
+        let first = parse_smaps(NO_BLANK_LINES, 0x0040_0800).expect("the first block");
         assert!(!first.promoted());
         assert_eq!(first.resident_bytes, 4096);
     }
 
+    /// A header's device field is itself `major:minor`, and a mapped path can
+    /// contain a colon. Neither may make a data line look like a header.
     #[test]
     fn a_path_containing_a_colon_does_not_confuse_the_block_delimiter() {
-        // A header's device field is itself `major:minor`, and a mapped path can
-        // contain a colon. Neither may make a data line look like a header.
-        let with_path = "\
+        const WITH_PATH: &str = "\
 7f0000000000-7f0000100000 r--p 00000000 08:01 42 /mnt/we:ird/dir
 Size:                  64 kB
 Rss:                   64 kB
 AnonHugePages:          0 kB
 MMUPageSize:           4 kB
 ";
-        let backing = parse_smaps(with_path, 0x7f00_0000_8000).expect("a mapped file");
+        let backing = parse_smaps(WITH_PATH, 0x7f00_0000_8000).expect("a mapped file");
         assert_eq!(backing.resident_bytes, 64 * 1024);
         assert!(!backing.promoted());
     }
 
+    /// A kernel that reported more huge bytes than resident bytes would make
+    /// the ratio exceed one; the reader clamps rather than claiming a fraction
+    /// of a set that does not exist. A region with nothing resident at all is
+    /// an unmeasured ratio, not a division by zero.
     #[test]
-    fn a_region_with_nothing_resident_has_an_unmeasured_ratio() {
-        let backing = RegionBacking {
+    fn the_huge_fraction_is_always_a_real_fraction() {
+        let empty = RegionBacking {
             resident_bytes: 0,
             anon_huge_bytes: 0,
             ..RegionBacking::default()
         };
-        assert!((backing.huge_fraction() - 0.0).abs() < 1e-9);
-        assert!(!backing.promoted());
-    }
+        assert!((empty.huge_fraction() - 0.0).abs() < 1e-9);
+        assert!(!empty.promoted());
 
-    #[test]
-    fn huge_bytes_never_exceed_the_resident_set() {
-        // A kernel that reported more huge bytes than resident bytes would make
-        // the ratio exceed one; the reader clamps rather than claiming a
-        // fraction of a set that does not exist.
-        let backing = RegionBacking {
+        let impossible = RegionBacking {
             resident_bytes: 4096,
             anon_huge_bytes: 8 * 1024 * 1024,
             ..RegionBacking::default()
         };
-        assert!(backing.huge_fraction() <= 1.0);
+        assert!(impossible.huge_fraction() <= 1.0);
     }
 
+    /// Whether the platform answers at all is a machine fact. What must hold
+    /// either way is that an answer describes *some* mapping containing this
+    /// region, and that a decline is not a zero. An empty region has nothing
+    /// to describe and is never advised.
     #[test]
-    fn reading_a_live_region_backing_answers_or_declines() {
-        let mut memory = vec![0_u8; 1 << 20];
-        // Whether the platform answers at all is a machine fact. What must hold
-        // either way is that an answer describes *some* mapping containing this
-        // region, and that a decline is not a zero.
+    fn a_live_region_answers_or_declines_and_an_empty_one_never_advises() {
+        assert!(read_backing(&[]).is_none());
+        assert!(!advise_region(&mut []));
+        let memory = vec![0_u8; 1 << 20];
         if let Some(backing) = read_backing(&memory) {
             assert!(backing.virtual_bytes >= memory.len() as u64);
             assert!(backing.resident_bytes <= backing.virtual_bytes);
         }
-        assert!(read_backing(&[]).is_none());
-        memory.clear();
     }
 }

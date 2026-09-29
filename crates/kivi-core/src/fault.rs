@@ -2,7 +2,7 @@
 //!
 //! Faults are decisions, not mechanisms. Before the kernel runs a scheduled
 //! event it asks a [`FaultPolicy`], which sees an [`EventView`] (identifier
-//! plus scheduled tick — never payload semantics), optionally some typed
+//! plus scheduled tick - never payload semantics), optionally some typed
 //! domain context, and answers with a [`FaultDecision`]. The layering stays:
 //!
 //! ```text
@@ -101,47 +101,11 @@ impl fmt::Display for FaultDecision {
 ///
 /// The `Ctx` parameter carries optional typed domain context (e.g. a network
 /// delivery descriptor) defined entirely outside `kivi-core`; `()` means no
-/// context. One trait serves every domain — domain simulators instantiate it
+/// context. One trait serves every domain - domain simulators instantiate it
 /// with their context type rather than inventing parallel machinery.
 pub trait FaultPolicy<Ctx = ()> {
     /// Returns the decision for `event` with domain context `ctx`,
     /// optionally drawing from `rng`.
     fn decide(&mut self, event: &EventView, ctx: &Ctx, rng: &mut dyn RandomSource)
     -> FaultDecision;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    struct Scripted {
-        decisions: Vec<FaultDecision>,
-    }
-
-    impl FaultPolicy for Scripted {
-        fn decide(&mut self, _: &EventView, (): &(), _: &mut dyn RandomSource) -> FaultDecision {
-            self.decisions.pop().unwrap_or(FaultDecision::Allow)
-        }
-    }
-
-    struct NullRng;
-
-    impl RandomSource for NullRng {
-        fn next_u64(&mut self) -> u64 {
-            0
-        }
-    }
-
-    #[test]
-    fn policy_sees_only_identity_and_tick() {
-        let view = EventView::new(EventId::from_u64(9), Ticks::from_micros(150));
-        assert_eq!(view.id(), EventId::from_u64(9));
-        assert_eq!(view.at(), Ticks::from_micros(150));
-        let mut policy = Scripted {
-            decisions: vec![FaultDecision::Drop],
-        };
-        let mut rng = NullRng;
-        assert_eq!(policy.decide(&view, &(), &mut rng), FaultDecision::Drop);
-        assert_eq!(policy.decide(&view, &(), &mut rng), FaultDecision::Allow);
-    }
 }

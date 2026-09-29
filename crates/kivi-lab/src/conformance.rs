@@ -1,7 +1,7 @@
 //! Differential-testing helpers: Kivi RESP vs reference Redis.
 //!
 //! Every run works under a unique key prefix (`kivi-lab:<run-id>:`) and
-//! cleans only keys it owns — never `FLUSHALL`/`FLUSHDB` on an externally
+//! cleans only keys it owns - never `FLUSHALL`/`FLUSHDB` on an externally
 //! supplied instance. Comparisons normalize only representation differences
 //! with identical semantics (RESP2 vs RESP3 null forms); genuine semantic
 //! differences must surface, never hide in the harness.
@@ -32,7 +32,7 @@ static RUN_IDS: AtomicU64 = AtomicU64::new(0);
 #[must_use]
 pub fn run_scope() -> String {
     // pid + counter: unique across parallel test binaries too. No wall
-    // clock — an atomic process identity is sufficient for uniqueness.
+    // clock - an atomic process identity is sufficient for uniqueness.
     let id = RUN_IDS.fetch_add(1, Ordering::Relaxed);
     format!("kivi-lab:{}-{id}:", std::process::id())
 }
@@ -215,7 +215,7 @@ fn command_string(client: &mut RespClient, argv: &[&[u8]]) -> Result<String, Cli
 }
 
 /// Every key name the matrix and [`setup_edge_keys`] touch (unprefixed).
-/// Cleanup deletes exactly these under the run prefix — no `SCAN` (outside
+/// Cleanup deletes exactly these under the run prefix - no `SCAN` (outside
 /// the profile), no multi-key `DEL` (rejected, never faked), and especially
 /// no `FLUSHALL`/`FLUSHDB` on an externally supplied instance.
 #[must_use]
@@ -337,7 +337,7 @@ pub enum Observable {
     Status(String),
     /// Bulk bytes (empty and nil stay distinct from each other).
     Bulk(Vec<u8>),
-    /// Null (nil bulk or RESP3 null — identical semantics).
+    /// Null (nil bulk or RESP3 null - identical semantics).
     Nil,
     /// Empty string (distinct from nil by construction of the profile).
     Empty,

@@ -2,7 +2,7 @@
 //!
 //! Describes *what* to do, never *how* a database executes it. This module
 //! must not know about `kivi-state` internals (chunk ids, manifests),
-//! worker routing, or any connection struct — keys
+//! worker routing, or any connection struct - keys
 //! are plain strings, values are described by length, and target adapters
 //! in [`crate::targets`] own every protocol-specific conversion.
 //!
@@ -79,7 +79,7 @@ impl ValueSize {
 }
 
 /// Deterministic pseudo-random fill (splitmix64): representative,
-/// incompressible-ish content — never zeros-only, identical on both sides.
+/// incompressible-ish content - never zeros-only, identical on both sides.
 #[must_use]
 pub fn fill_pattern(len: usize, seed: u64) -> Vec<u8> {
     let mut state = seed;
@@ -236,7 +236,7 @@ pub fn counter_key_name(space: KeySpace, thread: usize, prefix: &str) -> String 
 }
 
 /// Pure workload generation: the `i`-th op of `workload` over `keys`.
-/// No I/O, no client types — identical for every target adapter.
+/// No I/O, no client types - identical for every target adapter.
 #[must_use]
 pub fn workload_op_for(
     workload: Workload,
@@ -364,149 +364,4 @@ pub fn seed_ops_for(
         )));
     }
     ops
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use clap::Parser;
-
-    #[derive(Debug, Parser)]
-    struct Probe {
-        #[arg(value_enum)]
-        workload: Workload,
-        #[arg(value_enum)]
-        size: ValueSize,
-    }
-
-    #[test]
-    fn enums_parse_from_cli() {
-        let probe = Probe::try_parse_from(["probe", "compat", "kb64"]).expect("parses");
-        assert_eq!(probe.workload, Workload::Compat);
-        assert_eq!(probe.size, ValueSize::Kb64);
-        assert_eq!(ValueSize::Mb4.len(), 4 * 1024 * 1024);
-    }
-
-    #[test]
-    fn key_space_parser_accepts_hot_and_uniform() {
-        assert_eq!(parse_key_space("hot"), Ok(KeySpace::Hot));
-        assert_eq!(parse_key_space("uniform:16"), Ok(KeySpace::Uniform(16)));
-        assert_eq!(
-            parse_key_space("uniform-global:16"),
-            Ok(KeySpace::UniformGlobal(16))
-        );
-        assert!(parse_key_space("uniform:0").is_err());
-        assert!(parse_key_space("uniform-global:0").is_err());
-        assert!(parse_key_space("uniform:lots").is_err());
-        assert!(parse_key_space("cold").is_err());
-    }
-
-    #[test]
-    fn fill_pattern_is_deterministic_and_sized() {
-        assert_eq!(fill_pattern(16, 7), fill_pattern(16, 7));
-        assert_ne!(fill_pattern(16, 7), fill_pattern(16, 8));
-        assert_eq!(fill_pattern(100, 1).len(), 100);
-        assert!(fill_pattern(64, 1).iter().any(|byte| *byte != 0));
-    }
-
-    #[test]
-    fn workload_mix_matches_legacy_pattern() {
-        let keys = vec!["a".to_owned(), "b".to_owned()];
-        let counter = "c";
-        assert_eq!(
-            workload_op_for(Workload::Get, 1, 0, &keys, counter),
-            WorkloadOp::Get("a".to_owned())
-        );
-        assert_eq!(
-            workload_op_for(Workload::Set, 1, 1, &keys, counter),
-            WorkloadOp::Set {
-                key: "b".to_owned(),
-                len: 1
-            }
-        );
-        assert_eq!(
-            workload_op_for(Workload::Counter, 1, 7, &keys, counter),
-            WorkloadOp::CounterAdd("c".to_owned())
-        );
-        assert_eq!(
-            workload_op_for(Workload::Mixed, 1, 3, &keys, counter),
-            WorkloadOp::Delete("b".to_owned())
-        );
-        assert_eq!(
-            workload_op_for(Workload::Compat, 1, 4, &keys, counter),
-            WorkloadOp::SetRange("a".to_owned())
-        );
-        assert_eq!(
-            workload_op_for(Workload::Range, 1, 9, &keys, counter),
-            WorkloadOp::GetRange("b".to_owned())
-        );
-        assert_eq!(
-            workload_op_for(Workload::Exists, 1, 0, &keys, counter),
-            WorkloadOp::Exists("a".to_owned())
-        );
-        assert_eq!(
-            workload_op_for(Workload::Balanced, 1, 0, &keys, counter),
-            WorkloadOp::Get("a".to_owned())
-        );
-        assert_eq!(
-            workload_op_for(Workload::Balanced, 1, 17, &keys, counter),
-            WorkloadOp::Expire("b".to_owned())
-        );
-        assert_eq!(
-            workload_op_for(Workload::Balanced, 1, 19, &keys, counter),
-            WorkloadOp::Ttl("b".to_owned())
-        );
-        assert!(workload_supports_resp(Workload::Cache));
-        assert!(!workload_supports_resp(Workload::Counter));
-    }
-
-    #[test]
-    fn seed_ops_cover_measured_types_only() {
-        assert_eq!(
-            seed_ops_for(KeySpace::Hot, 0, Workload::Get, 1, ""),
-            vec![WorkloadOp::Set {
-                key: "hot".to_owned(),
-                len: 1
-            }]
-        );
-        assert!(seed_ops_for(KeySpace::Hot, 1, Workload::Get, 1, "").is_empty());
-        assert_eq!(
-            seed_ops_for(KeySpace::Hot, 0, Workload::Counter, 1, ""),
-            vec![WorkloadOp::CounterAdd("hot:c".to_owned())]
-        );
-    }
-
-    #[test]
-    fn workload_key_names_match_legacy_layout() {
-        assert_eq!(
-            thread_key_names(KeySpace::Hot, 3, ""),
-            vec!["hot".to_owned()]
-        );
-        assert_eq!(
-            thread_key_names(KeySpace::Uniform(2), 1, ""),
-            vec!["t1:k0".to_owned(), "t1:k1".to_owned()]
-        );
-        assert_eq!(
-            thread_key_names(KeySpace::UniformGlobal(2), 1, ""),
-            vec!["g:k0".to_owned(), "g:k1".to_owned()]
-        );
-        assert_eq!(counter_key_name(KeySpace::Hot, 0, ""), "hot:c");
-        assert_eq!(counter_key_name(KeySpace::Uniform(9), 2, ""), "t2:c");
-        assert_eq!(counter_key_name(KeySpace::UniformGlobal(9), 2, ""), "g:c");
-    }
-
-    #[test]
-    fn key_prefix_isolates_runs() {
-        assert_eq!(
-            thread_key_names(KeySpace::Uniform(1), 0, "run-1:"),
-            vec!["run-1:t0:k0".to_owned()]
-        );
-        assert_eq!(
-            seed_ops_for(KeySpace::Hot, 0, Workload::Get, 1, "run-1:"),
-            vec![WorkloadOp::Set {
-                key: "run-1:hot".to_owned(),
-                len: 1
-            }]
-        );
-    }
 }

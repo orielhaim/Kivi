@@ -10,12 +10,8 @@
 use std::time::Duration;
 
 use kivi_lab::cluster::Cluster;
-use kivi_state::Key;
+use kivi_lab::testkit::key;
 use kivi_types::{CommitPosition, CommitToken, TabletEpoch, TabletId};
-
-fn key(name: &str) -> Key {
-    Key::from(name)
-}
 
 /// All four contracts serve their semantics, proofs chain, and the chain
 /// survives leader failover and restart without weakening.

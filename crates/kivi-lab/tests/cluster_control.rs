@@ -1,7 +1,7 @@
 //! Replicated control-plane product tests: dynamic node admission,
 //! learner catch-up through the existing snapshot/sidecar path, joint
 //! membership replacement, leadership handoff, drain, safe removal, and
-//! crash recovery — all on real processes over H3/QUIC with real data
+//! crash recovery - all on real processes over H3/QUIC with real data
 //! directories.
 //!
 //! ```text
@@ -14,53 +14,7 @@
 use std::time::{Duration, Instant};
 
 use kivi_lab::cluster::Cluster;
-use kivi_state::Key;
-
-fn key(name: &str) -> Key {
-    Key::from(name)
-}
-
-fn put(client: &kivi_client::NativeClient, name: &str, value: &[u8]) {
-    client
-        .set(&key(name), bytes::Bytes::copy_from_slice(value))
-        .unwrap_or_else(|error| panic!("set {name} commits: {error:?}"));
-}
-
-fn get(client: &kivi_client::NativeClient, name: &str) -> Vec<u8> {
-    client
-        .get(&key(name))
-        .unwrap_or_else(|error| panic!("get {name} reads: {error:?}"))
-        .unwrap_or_else(|| panic!("{name} present"))
-        .to_vec()
-}
-
-fn put_big(client: &kivi_client::NativeClient, name: &str, value: &[u8]) {
-    let mut source: &[u8] = value;
-    client
-        .put_stream(&key(name), Some(value.len() as u64), &mut source)
-        .unwrap_or_else(|error| panic!("put_stream {name} commits: {error:?}"));
-}
-
-fn get_big(client: &kivi_client::NativeClient, name: &str) -> Vec<u8> {
-    client
-        .get_stream(&key(name))
-        .unwrap_or_else(|error| panic!("get_stream {name} reads: {error:?}"))
-        .unwrap_or_else(|| panic!("{name} present"))
-        .to_vec()
-}
-
-fn fill(len: usize, seed: u8) -> Vec<u8> {
-    // Deterministic pseudo-random bytes (cheap LCG, no extra deps).
-    let mut out = vec![0u8; len];
-    let mut state = u64::from(seed) | 1;
-    for byte in &mut out {
-        state = state
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407);
-        *byte = u8::try_from((state >> 33) & 0xFF).unwrap_or(0xFF);
-    }
-    out
-}
+use kivi_lab::testkit::{fill, get, get_stream, key, put, put_stream, traffic_get, traffic_put};
 
 /// Streaming upload with bounded whole-call retries (the source is
 /// re-readable memory; pre-commit failures are definitely
@@ -92,15 +46,6 @@ fn traffic_get_big(client: &kivi_client::NativeClient, name: &str) -> Vec<u8> {
         }
     }
     unreachable!()
-}
-
-/// Traffic op with bounded retries (redirects converge during
-/// migration; a bounded retry is the designed client flow, not a
-/// masked failure).
-fn traffic_put(client: &kivi_client::NativeClient, name: &str, value: &[u8]) {
-    if let Err(error) = traffic_put_result(client, name, value) {
-        panic!("traffic set {name} never converges: {error:?}");
-    }
 }
 
 /// Traffic op with bounded retries, returning the terminal error
@@ -178,20 +123,6 @@ fn dump_cluster_state(cluster: &Cluster, failed_key: &str, error: &kivi_client::
     }
 }
 
-fn traffic_get(client: &kivi_client::NativeClient, name: &str) -> Vec<u8> {
-    for attempt in 0..10 {
-        match client.get(&key(name)) {
-            Ok(Some(value)) => return value.to_vec(),
-            Ok(None) => panic!("traffic key {name} lost"),
-            Err(_) if attempt < 9 => {
-                std::thread::sleep(Duration::from_millis(200));
-            }
-            Err(error) => panic!("traffic get {name} never converges: {error:?}"),
-        }
-    }
-    unreachable!()
-}
-
 /// Manual move replaces exactly one voter through learner catch-up and
 /// joint consensus, with reads/writes online throughout and byte-exact
 /// data afterwards.
@@ -238,7 +169,7 @@ fn manual_move_replaces_one_voter() {
 }
 
 /// A learner far behind (log purged past it) catches up through
-/// checkpoint snapshot + differential immutable sidecars — no full
+/// checkpoint snapshot + differential immutable sidecars - no full
 /// directory copy, no pack-file copy.
 #[test]
 fn learner_snapshot_catch_up_after_purge() {
@@ -254,7 +185,7 @@ fn learner_snapshot_catch_up_after_purge() {
     let tablet = *keys.keys().next().expect("a tablet");
     let big = fill(8 * 1024 * 1024, 0xA1);
     let big_key = keys[&tablet][0].clone();
-    put_big(&client, &big_key, &big);
+    put_stream(&client, &big_key, &big);
     // Snapshot + purge every member's tablet log, then advance past it.
     for index in 0..3 {
         let _ = cluster.snapshot_tablet(index, tablet);
@@ -272,7 +203,7 @@ fn learner_snapshot_catch_up_after_purge() {
     // (the big key aliases one small-key slot, so it is skipped in the
     // small-value sweep).
     let client = cluster.client();
-    assert_eq!(get_big(&client, &big_key), big);
+    assert_eq!(get_stream(&client, &big_key), big);
     for name in &keys[&tablet] {
         if *name == big_key {
             continue;
@@ -373,7 +304,7 @@ fn drain_transition_remove_small() {
 
 /// Drain survives a bystander crash mid-flight: the money test's chaos
 /// element (kill a non-draining member after drain starts, restart it)
-/// at small scale with a tight bounded cap. Drain must complete —
+/// at small scale with a tight bounded cap. Drain must complete -
 /// replica migration, leadership transfer, and retirement never wait
 /// on the crashed member.
 #[test]
@@ -430,7 +361,7 @@ fn drain_survives_bystander_crash_small() {
 }
 
 /// Full-cluster restart mid-migration (§39 crash points, §61): killing
-/// every process while plans are in flight loses nothing — control
+/// every process while plans are in flight loses nothing - control
 /// leaders, sources, and targets all recover from persisted plans and
 /// durable Raft state with no manual cleanup.
 #[test]
@@ -452,7 +383,7 @@ fn cluster_restart_during_migration() {
     let _ = cluster.move_tablet(first, 1, 4);
     let _ = cluster.move_tablet(second, 2, 4);
     // Crash everything mid-flight (covers: after plan commit, while
-    // learner catches up, during joint membership — whichever phase
+    // learner catches up, during joint membership - whichever phase
     // each plan happens to be in).
     cluster.kill_all();
     cluster.restart_all().expect("cluster revives");
@@ -485,7 +416,6 @@ fn cluster_restart_during_migration() {
 /// `MOVED`/`ASK`/slots. Writes to a migrating tablet answer retryable
 /// `BUSY` off-leader and `OK` on the leader; reads keep serving.
 /// Retrying across members converges without exposing placement.
-#[cfg(feature = "redis-compat")]
 #[test]
 fn resp_serves_during_migration() {
     use kivi_lab::resp_client::{Reply, RespClient};
@@ -565,13 +495,13 @@ fn resp_serves_during_migration() {
 
 /// Full product money test (§62): 100 tablets RF=3, real workload with
 /// large values, dynamic 4th node, online rebalance with failures
-/// injected mid-flight, drain, safe removal, and full restart — reads
+/// injected mid-flight, drain, safe removal, and full restart - reads
 /// and writes throughout, zero unavailable tablets by design.
 ///
 /// STRESS PROFILE (not default CI): this test saturates disk/loopback
 /// with ~100 MB bulk plus chaos kills, so its fixed wall-clock budgets
 /// (600 s drain cap, 4-attempt streaming retries) only hold on an
-/// otherwise idle box — under parallel load it fails slow, never
+/// otherwise idle box - under parallel load it fails slow, never
 /// wrong (no assertion has ever fired on state, only budgets on time).
 /// Run explicitly on an idle machine:
 /// `cargo nextest run -p kivi-lab --test cluster_control --run-ignored all -E 'test(four_node_rebalance_drain_money)'`.
@@ -603,8 +533,8 @@ fn four_node_rebalance_drain_money() {
     let second_big_key = keys[&second_tablet][0].clone();
     let first_big = fill(64 * 1024 * 1024, 0x10);
     let second_big = fill(64 * 1024 * 1024, 0x20);
-    put_big(&client, &first_big_key, &first_big);
-    put_big(&client, &second_big_key, &second_big);
+    put_stream(&client, &first_big_key, &first_big);
+    put_stream(&client, &second_big_key, &second_big);
     // Add the fourth node without restarting A/B/C.
     let _ = cluster.add_node();
     cluster.wait_control_nodes(4, Duration::from_secs(90));
@@ -645,7 +575,7 @@ fn four_node_rebalance_drain_money() {
     // the end shows migration did not degrade ordinary SET latency.
     let mut latencies: Vec<Duration> = Vec::new();
     // Every committed key name, in order (the post-run sample draws
-    // from committed keys only — never regenerated phantoms).
+    // from committed keys only - never regenerated phantoms).
     let mut written: Vec<String> = Vec::new();
     loop {
         // Interleaved workload: every tablet stays writable while its
@@ -796,8 +726,8 @@ fn four_node_rebalance_drain_money() {
     // Byte-exact data after migration, including large values that
     // moved through sidecar reuse (no full copies).
     let client = cluster.client();
-    assert_eq!(get_big(&client, &first_big_key), first_big);
-    assert_eq!(get_big(&client, &second_big_key), second_big);
+    assert_eq!(get_stream(&client, &first_big_key), first_big);
+    assert_eq!(get_stream(&client, &second_big_key), second_big);
     // Sample the interleaved workload (first, middle, last): every
     // sampled op committed during migration, so the sample proves the
     // flow.
@@ -844,7 +774,7 @@ fn four_node_rebalance_drain_money() {
     // and tablet membership recover; service resumes.
     cluster.restart_all().expect("remaining cluster restarts");
     let client = cluster.client();
-    assert_eq!(get_big(&client, &first_big_key), first_big);
+    assert_eq!(get_stream(&client, &first_big_key), first_big);
     traffic_put(&client, "post-restart", b"ok");
     assert_eq!(traffic_get(&client, "post-restart"), b"ok");
     let counts = cluster.replica_counts();

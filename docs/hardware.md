@@ -81,8 +81,8 @@ offset 4095 len 2 -> 2 bytes, first=[79] last=Some(80)
 offset 8192 len 8192 -> 8192 bytes, first=[160] last=Some(68)
 ```
 
-`unbuffered = true` is read back from the open handle, and the four windows —
-including two deliberately unaligned — return the right bytes. The sector size
+`unbuffered = true` is read back from the open handle, and the four windows -
+including two deliberately unaligned - return the right bytes. The sector size
 comes from `statx(STATX_DIOALIGN)`, with a sysfs
 `queue/logical_block_size` fallback (walking partition to parent device), and
 `IOCTL_DISK_GET_DRIVE_GEOMETRY` on Windows.
@@ -122,14 +122,14 @@ group returns `EACCES` on WSL2's kernel, while the same events opened
 standalone succeed. That is the fallback's reason to exist, and it is a property
 of the machine rather than a mode anyone chose.
 
-**The fallback must not discard the denominator.** The first version reported
+**The fallback must not discard the denominator.** Reporting
 `CycleSource::None` and dropped the task clock it had just opened, so every
-sample read as `comparable: false`, `cycles: 0`, `trust: 0` — identical to "this
+sample read as `comparable: false`, `cycles: 0`, `trust: 0` - identical to "this
 machine has no PMU", which is a different fault with a different fix. The
 fallback now opens the task clock as its own denominator and reports
 `TaskClockNanoseconds`, and `PmuCounter::TaskClock` is a distinct variant so a
 consumer can tell "the kernel gave me hardware cycles" from "the kernel gave me
-the task clock" — the first supports ratios the second does not.
+the task clock" - the first supports ratios the second does not.
 
 **Commutability is decided per sample, not from the counter set's shape.**
 Independently opened counters are commensurable whenever the kernel scheduled
@@ -187,7 +187,7 @@ The benchmark refuses to report a timing at all unless the region was actually
 promoted, so the two rows cannot silently become a comparison of one region
 with itself.
 
-Two things were wrong in the first version of that benchmark and are fixed:
+Two properties of that benchmark matter:
 the unadvised row's stores were dead by the end of the closure and the compiler
 elided them (27 ns for 8 MiB of faulting), and the `smaps` parser split blocks
 on `\n\n`, which WSL2's kernel does not emit, so it found no mapping at all.
@@ -197,7 +197,7 @@ Both are covered by tests now.
 
 `kivi_hardware::numa::Arena` mmaps, binds with `mbind` **before the first
 touch**, and advises `MADV_HUGEPAGE`. Placement is then verified by parsing
-`/proc/self/numa_maps` for the mapping's per-node page counts — 11 tests on
+`/proc/self/numa_maps` for the mapping's per-node page counts - 11 tests on
 Linux, including `the_census_agrees_with_where_the_pages_went` and
 `a_real_node_binds_or_reports_why_not`. On this single-node host every outcome
 resolves to node 0, which the code reports as the node rather than as a
@@ -218,13 +218,13 @@ This was the open question in RFC §26, and the measurement settles it.
 | `crc32c_1mib_batch_body` | 44.99 µs | **23.3 GB/s** |
 | `crc32c_oracle_1mib` (bitwise scalar) | 4.311 ms | 0.24 GB/s |
 | `crc32c_4mib_chunk` | 181.7 µs | 23.1 GB/s |
-| `crc32c_20_byte_header` | 6.49 ns | — |
+| `crc32c_20_byte_header` | 6.49 ns | - |
 
 **96x over the scalar oracle.** The `crc32c` crate is dispatching the SSE4.2
 `CRC32` instruction; 23 GB/s is roughly memory bandwidth on this machine, which
 is the ceiling. A different crate advertising SIMD would be advertising the same
 instruction. `reed-solomon-simd` and `blake3` are left alone for the same
-reason — BLAKE3 measures 7.5 GB/s at 1 MiB, already multi-threaded and
+reason - BLAKE3 measures 7.5 GB/s at 1 MiB, already multi-threaded and
 dispatching AVX2.
 
 ### SIMD kernels: two kept, one deleted
@@ -236,7 +236,7 @@ oracle that is the definition of correctness.
 | --- | --- | --- | --- |
 | `is_all_zero` | 90.14 µs | 251.7 µs | **2.8x** |
 | `position_of` | 36.49 µs | 66.69 µs | **1.8x** |
-| ~~`xor_fold`~~ | 95 µs | 89 µs | none — **deleted** |
+| ~~`xor_fold`~~ | 95 µs | 89 µs | none - **deleted** |
 
 The XOR fold was implemented, measured, and removed. The compiler already
 vectorises that shape, so the dispatch bought nothing and the code was pure
@@ -254,7 +254,7 @@ fails the test rather than shipping.
 | `cpu_pinned_to_current_core` | 78.29 µs |
 
 Pinning to a physical core and not pinning are indistinguishable (0.1%), and
-both beat "the core the thread happened to start on" — which is a measurement of
+both beat "the core the thread happened to start on" - which is a measurement of
 which core you landed on, not of affinity. The honest conclusion is that **on
 this machine, for this workload, affinity buys nothing on a single thread**. The
 case for pinning is contention between threads, and this machine has no SMT
@@ -279,12 +279,12 @@ machine like this one the answer is "none".
 Every row is dominated by the same `Capabilities::detect()` call, so the
 marginal cost of resolving a plan is at or below the measurement floor. The four
 strategies differ in *which* processor a thread gets, not in how long deciding
-costs — which is what makes it safe to default to a real strategy and to change
+costs - which is what makes it safe to default to a real strategy and to change
 that default when a measurement says so.
 
 ### The NVMe demotion-store read: the one large win
 
-`NvmeProvider::read_at` used to open the whole demotion store and copy all of
+`NvmeProvider::read_at` opens the whole demotion store and copies all of
 it to answer one record. A promotion was therefore O(store), not O(record). It
 now reads the 20-byte record header at the record's own offset, then the
 payload, which is O(record).
@@ -305,7 +305,7 @@ Per promotion, which is the number that matters:
 | 2048 | 20.5 µs | 722 µs |
 | 8192 | 20.8 µs | **2664 µs** |
 
-The positioned cost is flat — 21.7, 20.5, 20.8 µs — because it does not depend
+The positioned cost is flat - 21.7, 20.5, 20.8 µs - because it does not depend
 on the store. The old cost grows 50x across the same range. There is no store
 size at which the old path is preferable.
 
@@ -341,7 +341,7 @@ inferring it from an end-to-end number.
 
 ## Hardware telemetry reaches the controller
 
-A `PmuSample` used to stop at `kivi-hardware::telemetry`, so no controller could
+A `PmuSample` stops at `kivi-hardware::telemetry`, so no controller can
 tell a software estimate from a hardware measurement. The chain now runs:
 
 ```text
@@ -363,16 +363,16 @@ bill of health.
 The summary folds by extremes, not by mean, and that is the whole point:
 
 * worst stall fraction, worst cache-miss ratio, worst branch-miss ratio,
-  worst cost multiplier — a controller asking "did this worker ever stall badly"
+  worst cost multiplier - a controller asking "did this worker ever stall badly"
   needs the worst window;
-* best IPC — a controller deciding whether a worker is CPU bound needs to know
+* best IPC - a controller deciding whether a worker is CPU bound needs to know
   whether it ever reached full issue;
-* minimum trust — one multiplexed window in three must not be averaged away by
+* minimum trust - one multiplexed window in three must not be averaged away by
   two exact ones;
-* page faults, context switches, migrations — additive, because a page fault is
+* page faults, context switches, migrations - additive, because a page fault is
   a page fault whether or not a stall counter was readable.
 
-Two new Phase 12 branches act on it, and both *reduce* work rather than adding
+Two branches act on it, and both *reduce* work rather than adding
 it, because a memory-bound or migrating worker is already paying for bandwidth:
 
 | Branch | Condition | Action |
@@ -383,7 +383,7 @@ it, because a memory-bound or migrating worker is already paying for bandwidth:
 `BaselineConfig::hardware_min_trust_ppm` (default 900 000) gates both, so a
 multiplexed reading can never reach a decision on its own. A machine with no
 counters produces exactly the decision the software-only path produced before
-this existed — asserted by `a_machine_without_counters_is_unaffected`, which
+this existed - asserted by `a_machine_without_counters_is_unaffected`, which
 compares the two proposals rather than trusting the intent.
 
 ### Proven on a live server
@@ -403,7 +403,7 @@ two-worker `--pmu` server on WSL2, after two control intervals:
 Two real page faults counted by worker 0's own counter group, carried through the
 sampler, the closed signal, the fabric fold, and out through the admin plane. The
 ratios are zero because this machine has no instruction, cycle, or cache
-counter — which is the correct answer, not a missing one.
+counter - which is the correct answer, not a missing one.
 
 ## Classification of every track
 
@@ -426,10 +426,10 @@ counter — which is the correct answer, not a missing one.
 | DAMON | sysfs adapter | **Implemented, not present here, parser tested against the documented format.** Reports `NotPresent`; no claim about a machine without it. |
 | io_uring | `io_uring_setup` probe | **Implemented.** Reads `io_uring_params.features`. |
 | CXL / DAX | in-tree mapping + `CxlProvider` in `kivi-memory` | **Adopted as a provider.** Registers uncalibrated and `healthy: false` until measured; never claims persistence; anonymous emulation is a distinct kind tag. No CXL hardware here. |
-| SPDK | — | **Evaluated, not adopted.** No NVMe-oF requirement exists. |
+| SPDK | - | **Evaluated, not adopted.** No NVMe-oF requirement exists. |
 | RDMA | discovery only | **Not adopted.** No fabric requirement; the control and data paths are loopback and TCP. |
 | DSA | discovery only | **Not adopted.** No measured compaction bottleneck. |
-| DPDK | — | **Not adopted.** No measured packet-processing bottleneck. |
+| DPDK | - | **Not adopted.** No measured packet-processing bottleneck. |
 
 ## What is not done
 
@@ -498,13 +498,13 @@ on `HEAD` pass here, and one appears the other way round.
 
 That one, `migration_preserves_acked_writes_across_handoff`, is load-sensitive
 rather than broken. It also failed in the clean Windows run and passes alone there
-(234.5 s, against 228.5 s inside the full run) — a 230-second multi-process
+(234.5 s, against 228.5 s inside the full run) - a 230-second multi-process
 handoff test with a wall-clock deadline, which is exactly the shape that fails on
 a busy machine and passes on an idle one. The other 23, and the 31 on the
 baseline, are one cluster family whose root cause is a harness gap rather than a
 product defect: the 4th member is spawned into a fresh directory with no
 `--control-seeds` and no `add_learner`, so it waits for a control group that a
-founding voter already created — `node 4 has to be a member ... membership:
+founding voter already created - `node 4 has to be a member ... membership:
 configs [{1,2,3}]`. Fixing that is a change to `kivi-lab`'s cluster fixture,
 which is outside this phase.
 

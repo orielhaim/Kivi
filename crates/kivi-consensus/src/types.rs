@@ -2,7 +2,7 @@
 //!
 //! These types are the only consensus vocabulary the rest of the workspace
 //! may use. They are defined in terms of Kivi identities
-//! ([`kivi_types`]) and plain data — never in terms of `OpenRaft` types, so
+//! ([`kivi_types`]) and plain data - never in terms of `OpenRaft` types, so
 //! an `OpenRaft` upgrade (or replacement) cannot ripple past this crate.
 
 use core::fmt;
@@ -210,7 +210,7 @@ pub struct ReadBarrier {
     pub boundary: ConsensusLogIndex,
 }
 
-/// Kivi-owned consensus failures. These — never `OpenRaft` error types —
+/// Kivi-owned consensus failures. These - never `OpenRaft` error types -
 /// cross the crate boundary and travel to clients over the native protocol.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]

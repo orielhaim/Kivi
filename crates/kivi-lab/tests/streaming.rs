@@ -4,68 +4,13 @@
 //! paths (never the embedded channel short-circuit).
 
 use bytes::Bytes;
-use kivi_client::{ClientConfig, ClientError, NativeClient};
+use kivi_client::ClientError;
 use kivi_engine::{
-    BatchPolicy, CheckpointConfig, ChunkFabricConfig, ConnLimits, DurabilityMode, DurableConfig,
-    EngineConfig, EngineNetwork, FabricConfig, LocalEngine, Placement, TurnBudget,
+    BatchPolicy, CheckpointConfig, ChunkFabricConfig, DurabilityMode, DurableConfig, EngineConfig,
+    FabricConfig, LocalEngine,
 };
+use kivi_lab::testkit::{NS, client_for, directory, network, placement, start_ephemeral};
 use kivi_state::Key;
-use kivi_tablet::{DirectorySnapshot, HashPrefix, PartitionRange};
-use kivi_types::{ClusterId, NamespaceId, NodeId, NodeIncarnation, WorkerId};
-
-const NS: NamespaceId = NamespaceId::from_u64(1);
-
-fn directory() -> DirectorySnapshot {
-    DirectorySnapshot::bootstrap(
-        NS,
-        TabletId::from_u64(1),
-        PartitionRange::Hash(HashPrefix::new(0, 0).expect("root")),
-        kivi_types::TabletEpoch::INITIAL,
-        kivi_types::WriteGuardGeneration::INITIAL,
-    )
-    .expect("genesis")
-    .stage(TabletId::from_u64(1))
-    .and_then(|snapshot| snapshot.activate(TabletId::from_u64(1)))
-    .expect("active root")
-}
-
-fn placement() -> Placement {
-    Placement::new([(TabletId::from_u64(1), WorkerId::from_u64(0))])
-}
-
-fn network() -> EngineNetwork {
-    EngineNetwork {
-        base_port: 0,
-        ports: Vec::new(),
-        bind_ip: [127, 0, 0, 1].into(),
-        max_frame: kivi_protocol::DEFAULT_MAX_FRAME,
-        placement: kivi_engine::ThreadPlacement::unbound(),
-        node_id: NodeId::from_u64(1),
-        cluster_id: ClusterId::from_u128(1),
-        incarnation: NodeIncarnation::INITIAL,
-        conn: ConnLimits::default(),
-        turn: TurnBudget::default(),
-        // The RESP edge is served by the engine's own workers;
-        // these harnesses exercise the native protocol only.
-        resp: None,
-    }
-}
-
-fn start_ephemeral(chunks: ChunkFabricConfig) -> LocalEngine {
-    LocalEngine::start(EngineConfig {
-        namespace: NS,
-        hardware: kivi_engine::HardwareConfig::default(),
-        directory: directory(),
-        placement: placement(),
-        worker_count: 2,
-        request_capacity: 128,
-        chunks,
-        fabric: FabricConfig::default(),
-        network: Some(network()),
-        durability: DurabilityMode::Ephemeral,
-    })
-    .expect("networked engine starts")
-}
 
 fn start_durable(dir: &std::path::Path) -> LocalEngine {
     let opened = kivi_durability::open_data_dir(dir, None).expect("data dir opens");
@@ -93,18 +38,8 @@ fn start_durable(dir: &std::path::Path) -> LocalEngine {
     .expect("durable networked engine starts")
 }
 
-fn client_for(engine: &LocalEngine) -> NativeClient {
-    let seed = engine.worker_addrs()[0].to_string();
-    NativeClient::new(ClientConfig {
-        seeds: vec![seed],
-        namespace: NS,
-        ..ClientConfig::default()
-    })
-    .expect("client builds")
-}
-
 /// Deterministic pseudo-random bytes (splitmix64): representative,
-/// incompressible-ish content — never zeros-only.
+/// incompressible-ish content - never zeros-only.
 fn pattern_bytes(len: usize, seed: u64) -> Bytes {
     let mut state = seed;
     let mut out = Vec::with_capacity(len);
@@ -119,8 +54,6 @@ fn pattern_bytes(len: usize, seed: u64) -> Bytes {
     out.truncate(len);
     Bytes::from(out)
 }
-
-use kivi_types::TabletId;
 
 #[test]
 fn upload_download_round_trip_over_the_wire() {

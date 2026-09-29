@@ -14,14 +14,14 @@
 //! ## Windows
 //!
 //! * File data is durable after [`sync_file`] (`FlushFileBuffers`; Windows
-//!   has no data-only flush — full flush every time).
+//!   has no data-only flush - full flush every time).
 //! * `rename` (`MoveFile`) is atomic via NTFS journaling.
 //! * **There is no directory-sync API on Windows.** Namespace operations
 //!   cannot be force-flushed by userspace; their durability timing is
 //!   OS/journal policy. [`sync_dir`] therefore reports
 //!   [`DirSync::UnsupportedPlatform`] instead of pretending. Atomicity of
 //!   the rename itself still holds (journaled), so crash recovery sees
-//!   either the old or the new name — never a half rename.
+//!   either the old or the new name - never a half rename.
 //!
 //! Consequence for the WAL: file content durability is strict on both
 //! platforms (every batch is file-synced before acknowledgement); only the
@@ -36,7 +36,7 @@ use std::io::{self, Write};
 use std::path::Path;
 
 /// Outcome of syncing a directory: actually flushed, or unsupported by the
-/// platform (Windows). Callers must not ignore the difference silently —
+/// platform (Windows). Callers must not ignore the difference silently -
 /// this type is `#[must_use]` and both arms are logged at the call sites
 /// that matter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +47,21 @@ pub enum DirSync {
     /// The platform has no directory-sync API; namespace durability timing
     /// is OS policy (see module docs). Atomicity still holds.
     UnsupportedPlatform,
+}
+
+impl DirSync {
+    /// The arm this platform's [`sync_dir`] reports. The two differ only in
+    /// whether a directory-entry flush is issued at all.
+    pub const fn synced_for_this_platform() -> Self {
+        #[cfg(unix)]
+        {
+            Self::Synced
+        }
+        #[cfg(not(unix))]
+        {
+            Self::UnsupportedPlatform
+        }
+    }
 }
 
 /// Flushes one file's content (and, where the OS requires it, metadata) to
@@ -109,7 +124,7 @@ pub fn create_dir_all_sync(path: &Path) -> io::Result<DirSync> {
 
 /// Crash-safe file publication: write a sibling temporary file, sync it,
 /// atomically rename over the target, then sync the containing directory
-/// where supported. A crash leaves either the old or the new content —
+/// where supported. A crash leaves either the old or the new content -
 /// never a half file. Stale temporary files from a previous crash are
 /// removed first (their content was never published).
 ///
@@ -167,9 +182,6 @@ mod tests {
     fn dir_sync_reports_honestly() {
         let scratch = tempfile::tempdir().expect("scratch dir");
         let outcome = sync_dir(scratch.path()).expect("sync_dir works on existing dir");
-        #[cfg(unix)]
-        assert_eq!(outcome, DirSync::Synced);
-        #[cfg(windows)]
-        assert_eq!(outcome, DirSync::UnsupportedPlatform);
+        assert_eq!(outcome, DirSync::synced_for_this_platform());
     }
 }

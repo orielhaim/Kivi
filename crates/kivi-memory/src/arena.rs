@@ -9,7 +9,7 @@
 //! generation so stale handles fail loudly instead of reading freed bytes.
 //!
 //! OBASE contributes the grouping insight (behavior, not size); Kivi's
-//! single-owner model drops OBASE's lock-free concurrency complexity —
+//! single-owner model drops OBASE's lock-free concurrency complexity -
 //! there are no concurrent mutators to coordinate with.
 //!
 //! Handles never escape as raw pointers: resolution clones the resident
@@ -417,48 +417,21 @@ impl ClassArena {
 mod tests {
     use super::*;
 
+    /// The generational handle is the arena's only defence against reading a
+    /// freed slot as live data: reuse must land on the same slot with a
+    /// different generation, and the old handle must resolve to nothing.
     #[test]
-    fn alloc_get_update_free_roundtrip() {
-        let mut arenas = WorkerArenas::new(1 << 20);
-        let handle = arenas
-            .alloc(BehaviorClass::HotMutable, Bytes::from_static(b"hello"))
-            .expect("alloc");
-        assert_eq!(
-            arenas
-                .get(BehaviorClass::HotMutable, handle)
-                .expect("get")
-                .as_ref(),
-            b"hello"
-        );
-        arenas
-            .update(
-                BehaviorClass::HotMutable,
-                handle,
-                Bytes::from_static(b"world!"),
-            )
-            .expect("update");
-        assert_eq!(
-            arenas
-                .get(BehaviorClass::HotMutable, handle)
-                .expect("get")
-                .as_ref(),
-            b"world!"
-        );
-        let bytes = arenas
-            .free(BehaviorClass::HotMutable, handle)
-            .expect("free");
-        assert_eq!(bytes.as_ref(), b"world!");
-        let stale = arenas.get(BehaviorClass::HotMutable, handle);
-        assert!(matches!(stale, Err(MemoryError::StaleHandle { .. })));
-    }
-
-    #[test]
-    fn freed_slots_are_reused_with_new_generations() {
+    fn a_freed_slot_is_reused_only_under_a_new_generation() {
         let mut arenas = WorkerArenas::new(1 << 20);
         let first = arenas
             .alloc(BehaviorClass::Warm, Bytes::from_static(b"a"))
             .expect("alloc");
-        arenas.free(BehaviorClass::Warm, first).expect("free");
+        assert_eq!(
+            arenas.get(BehaviorClass::Warm, first).expect("get"),
+            Bytes::from_static(b"a")
+        );
+        let freed = arenas.free(BehaviorClass::Warm, first).expect("free");
+        assert_eq!(freed, Bytes::from_static(b"a"));
         let second = arenas
             .alloc(BehaviorClass::Warm, Bytes::from_static(b"b"))
             .expect("alloc");

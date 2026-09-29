@@ -1,75 +1,35 @@
 //! Durable engine tests: embedded write → shutdown → reopen → read back.
 //!
-//! No processes or sockets here — these prove the engine/durability
+//! No processes or sockets here - these prove the engine/durability
 //! contract (WAL persist, recovery replay, identity continuity) through
 //! the public `LocalEngine` API. Real crash/kill coverage lives in
-//! `kivi-server/tests/durability.rs`.
+//! `kivi-lab/tests/durability.rs`.
 
-use kivi_engine::{DurabilityMode, DurableConfig, EngineConfig, LocalEngine, Placement};
+mod harness;
+
+use harness::{ROOT, durable_config, root_snapshot};
+use kivi_engine::{DurabilityMode, EngineConfig, LocalEngine};
 use kivi_state::Key;
-use kivi_tablet::{DirectorySnapshot, HashPrefix, PartitionRange};
-use kivi_types::{
-    ClusterId, NamespaceId, NodeId, NodeIncarnation, TabletEpoch, TabletId, WorkerId,
-    WriteGuardGeneration,
-};
+use kivi_types::NodeIncarnation;
 
-const NS: NamespaceId = NamespaceId::from_u64(1);
-
-fn directory() -> DirectorySnapshot {
-    let genesis = DirectorySnapshot::bootstrap(
-        NS,
-        TabletId::from_u64(1),
-        PartitionRange::Hash(HashPrefix::new(0, 0).expect("root")),
-        TabletEpoch::INITIAL,
-        WriteGuardGeneration::INITIAL,
-    )
-    .expect("genesis");
-    genesis
-        .stage(TabletId::from_u64(1))
-        .and_then(|snapshot| snapshot.activate(TabletId::from_u64(1)))
-        .expect("active root")
-}
-
-fn placement() -> Placement {
-    Placement::new([(TabletId::from_u64(1), WorkerId::from_u64(0))])
-}
-
-fn durable_config(dir: &std::path::Path) -> (DurabilityMode, NodeId, ClusterId, NodeIncarnation) {
-    let opened = kivi_durability::open_data_dir(dir, None).expect("data dir opens");
-    let mode = DurabilityMode::Durable(DurableConfig {
-        data_dir: dir.to_owned(),
-        segment_target_bytes: 1024 * 1024,
-        node: opened.meta.node,
-        cluster: opened.meta.cluster,
-        incarnation: opened.meta.incarnation,
-        shared_wal: false,
-        batch: kivi_engine::BatchPolicy::default_policy(),
-        checkpoint: kivi_engine::CheckpointConfig::default_config(),
-    });
-    (
-        mode,
-        opened.meta.node,
-        opened.meta.cluster,
-        opened.meta.incarnation,
+fn durable(dir: &std::path::Path) -> EngineConfig {
+    durable_config(
+        dir,
+        kivi_engine::ChunkFabricConfig::default(),
+        kivi_engine::FabricConfig::default(),
     )
 }
 
 fn start(dir: &std::path::Path) -> (LocalEngine, NodeIncarnation) {
-    let (durability, _, _, incarnation) = durable_config(dir);
-    let engine = LocalEngine::start(EngineConfig {
-        namespace: NS,
-        hardware: kivi_engine::HardwareConfig::default(),
-        directory: directory(),
-        placement: placement(),
-        worker_count: 2,
-        request_capacity: 64,
-        chunks: kivi_engine::ChunkFabricConfig::default(),
-        fabric: kivi_engine::FabricConfig::default(),
-        network: None,
-        durability,
-    })
-    .expect("durable engine starts");
-    (engine, incarnation)
+    let config = durable(dir);
+    let incarnation = match &config.durability {
+        DurabilityMode::Durable(cfg) => cfg.incarnation,
+        DurabilityMode::Ephemeral => unreachable!("durable config is durable"),
+    };
+    (
+        LocalEngine::start(config).expect("durable engine starts"),
+        incarnation,
+    )
 }
 
 #[test]
@@ -114,22 +74,11 @@ fn recovery_rejects_forgotten_tablet() {
     // Reopen with tablet 1 sealed (Active->Fenced, unwritable): its WAL
     // history has nowhere to replay, so startup must fail rather than
     // discard it.
-    let sealed = directory().seal(TabletId::from_u64(1)).expect("seal");
-    let (durability, _, _, _) = durable_config(scratch.path());
-    let err = LocalEngine::start(EngineConfig {
-        namespace: NS,
-        hardware: kivi_engine::HardwareConfig::default(),
-        directory: sealed,
-        placement: placement(),
-        worker_count: 2,
-        request_capacity: 64,
-        chunks: kivi_engine::ChunkFabricConfig::default(),
-        fabric: kivi_engine::FabricConfig::default(),
-        network: None,
-        durability,
-    })
-    .expect_err("forgotten tablet fails startup");
-    let message = format!("{err:?}");
+    let sealed = root_snapshot().seal(ROOT).expect("seal");
+    let mut config = durable(scratch.path());
+    config.directory = sealed;
+    let error = LocalEngine::start(config).expect_err("forgotten tablet fails startup");
+    let message = format!("{error:?}");
     assert!(
         message.contains("UnknownTablet") || message.contains("unknown tablet"),
         "clear error, got {message}"

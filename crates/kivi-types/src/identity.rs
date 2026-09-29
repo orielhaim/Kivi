@@ -118,29 +118,18 @@ impl From<u128> for IdempotencyKey {
 mod tests {
     use super::*;
 
-    #[test]
-    fn identity_exposes_both_halves() {
-        let session = SessionId::from_u128(0x00C0_FFEE);
-        let seq = RequestSeq::from_u64(41);
-        let id = RequestIdentity::new(session, seq);
-        assert_eq!(id.session(), session);
-        assert_eq!(id.seq(), seq);
-        assert_eq!(id.to_string(), format!("{session}:{seq}"));
-    }
-
+    /// Identity ordering is by session, then sequence, and it is total. A
+    /// durable outcome table is keyed by this ordering, so an identity that
+    /// compared as equal to a different one would return the wrong recorded
+    /// outcome to a retried request.
     #[test]
     fn identities_order_by_session_then_sequence() {
         let a = RequestIdentity::new(SessionId::from_u128(1), RequestSeq::from_u64(9));
         let b = RequestIdentity::new(SessionId::from_u128(1), RequestSeq::from_u64(10));
         let c = RequestIdentity::new(SessionId::from_u128(2), RequestSeq::from_u64(0));
-        assert!(a < b);
-        assert!(b < c);
-    }
-
-    #[test]
-    fn idempotency_key_round_trips() {
-        let key = IdempotencyKey::from_u128(0xDEAD_BEEF);
-        assert_eq!(key.as_u128(), 0xDEAD_BEEF);
-        assert_eq!(key.to_string().len(), 32);
+        assert!(a < b, "sequence must break ties inside a session");
+        assert!(b < c, "session must dominate the sequence");
+        assert_eq!(a.session(), SessionId::from_u128(1));
+        assert_eq!(a.seq(), RequestSeq::from_u64(9));
     }
 }

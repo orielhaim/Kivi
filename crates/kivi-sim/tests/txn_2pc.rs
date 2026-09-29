@@ -1,6 +1,6 @@
 //! Deterministic 2PC failure scenarios: message loss and
 //! duplication, one-way partitions, coordinator and participant crashes,
-//! full-cluster restart, and conflicting drivers — all on virtual time
+//! full-cluster restart, and conflicting drivers - all on virtual time
 //! with per-event invariant checks (no real sleeps, no wall clocks).
 //!
 //! Every scenario ends at idle and asserts terminal atomicity; the
@@ -45,7 +45,7 @@ fn cluster() -> (SimCluster<TxnDriverEv, ()>, TxnSim) {
         cluster.connect(node(a), node(b), link()).expect("mesh");
     }
     // Volatile state is unit (every 2PC step is durable); restarts take it
-    // directly, so no factory is needed — but the driver requires one to
+    // directly, so no factory is needed - but the driver requires one to
     // be registered before any restart completes.
     cluster.set_restart_factory(|_| ());
     let mut sim = TxnSim::new();
@@ -78,6 +78,13 @@ fn finish(sim: &TxnSim) {
     invariant_no_guess(sim).expect("NoGuess at idle");
 }
 
+/// Schedules one driver step at `at_micros` on the coordinator.
+fn schedule(cluster: &mut SimCluster<TxnDriverEv, ()>, event: TxnDriverEv, at_micros: u64) {
+    cluster
+        .schedule_app(Ticks::from_micros(at_micros), node(0), event)
+        .expect("driver step schedules");
+}
+
 fn begin_at(
     cluster: &mut SimCluster<TxnDriverEv, ()>,
     txn: TxnSimId,
@@ -85,17 +92,15 @@ fn begin_at(
     digest: TxnDigest,
     at_micros: u64,
 ) {
-    cluster
-        .schedule_app(
-            Ticks::from_micros(at_micros),
-            node(0),
-            TxnDriverEv::Begin {
-                txn,
-                writes: writes(pairs),
-                digest,
-            },
-        )
-        .expect("schedule begin");
+    schedule(
+        cluster,
+        TxnDriverEv::Begin {
+            txn,
+            writes: writes(pairs),
+            digest,
+        },
+        at_micros,
+    );
 }
 
 fn recover_at(
@@ -105,17 +110,15 @@ fn recover_at(
     digest: TxnDigest,
     at_micros: u64,
 ) {
-    cluster
-        .schedule_app(
-            Ticks::from_micros(at_micros),
-            node(0),
-            TxnDriverEv::Recover {
-                txn,
-                writes: writes(pairs),
-                digest,
-            },
-        )
-        .expect("schedule recover");
+    schedule(
+        cluster,
+        TxnDriverEv::Recover {
+            txn,
+            writes: writes(pairs),
+            digest,
+        },
+        at_micros,
+    );
 }
 
 #[test]
@@ -138,7 +141,7 @@ fn clean_commit_applies_everywhere() {
 fn conflicting_prepare_aborts_without_partial_state() {
     let (mut cluster, mut sim) = cluster();
     let mut rng = SimRng::seed_from_u64(12);
-    // Txn 1 reserves key 10 (absent). Txn 2 expects absence too — but by
+    // Txn 1 reserves key 10 (absent). Txn 2 expects absence too - but by
     // the time it prepares, txn 1's intent blocks the key. Exactly one
     // may commit; the loser must leave nothing behind.
     begin_at(&mut cluster, 1, &[(10, 100), (20, 200)], 0xB1, 0);
@@ -308,7 +311,7 @@ fn conflicting_digest_under_one_id_is_rejected() {
 fn cross_coordinator_split_decision_is_condemned() {
     // Negative model: one transaction id committed under two digests on
     // disjoint keys (client identity bug / lineage split). Both halves
-    // proceed (no key conflicts), but the outcome is corruption — the
+    // proceed (no key conflicts), but the outcome is corruption - the
     // invariant must condemn it, never silently accept it.
     let (mut cluster, mut sim) = cluster();
     let mut rng = SimRng::seed_from_u64(19);

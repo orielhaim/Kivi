@@ -6,8 +6,15 @@
 //! `redis-protocol`'s direct slice interface with Kivi bounds applied
 //! before any attacker-controlled length can allocate.
 
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll};
+
+use kivi_types::TabletRoute;
+
 use crate::command::{REGISTRY, arity_ok, lookup};
 use crate::error::RespError;
+use crate::fast;
 use crate::frame::{Command, Limits, Parsed, fold_command_name, parse_command};
 use crate::translate::{
     Action, ExecuteError, Executor, Immediate, RedisOp, Reply, map_execute_error, map_parse_error,
@@ -34,8 +41,11 @@ pub struct ConnConfig {
     pub max_bulk_bytes: usize,
     /// Maximum array elements in one command frame.
     pub max_array_elements: usize,
-    /// Maximum commands executed per drain turn (fairness).
-    pub max_commands_per_turn: usize,
+    /// Cooperative budget for one turn: elapsed service time and reply bytes.
+    ///
+    /// Replaces `max_commands_per_turn`. See [`TurnBudget`] for why a command count
+    /// made a deep pipeline *more* expensive than a shallow one.
+    pub turn_budget: TurnBudget,
     /// Maximum single value bytes accepted from clients (`SET`).
     pub max_value_bytes: usize,
 }
@@ -56,7 +66,7 @@ impl Default for ConnConfig {
             // No separate pipeline-depth cap: Redis processes whatever depth
             // a client sends, and fairness comes from the per-turn budget
             // rather than from refusing work a client is entitled to.
-            max_commands_per_turn: 64,
+            turn_budget: TurnBudget::default(),
             max_value_bytes: 64 * 1024 * 1024,
         }
     }
@@ -104,6 +114,13 @@ pub struct ConnMetrics {
     pub protocol_errors: u64,
     /// Unsupported commands answered.
     pub unsupported: u64,
+    /// Turns executed.
+    pub turns: u64,
+    /// Turns ended by the command backstop rather than by time or bytes.
+    ///
+    /// Should be zero. Reported so that if it is not, the reason is visible: the
+    /// budget is doing something other than what it says.
+    pub budget_backstops: u64,
 }
 
 /// What one drain turn produced.
@@ -115,15 +132,235 @@ pub struct DrainOutcome {
     pub close: bool,
 }
 
+/// A cooperative budget for one turn of a connection.
+///
+/// # Why not a command count
+///
+/// The previous shape bounded a turn at `max_commands_per_turn = 64` commands. A
+/// client that sent 256 pipelined commands therefore got **four** turns and - because
+/// the server writes once per turn - four socket writes where the client sent one
+/// read. A client that sent 63 commands got one. The cost of a turn was a function of
+/// how the client happened to batch, which is the opposite of what a batching
+/// protocol should do, and it is a per-turn cost that scales with how *well* the
+/// client pipelines.
+///
+/// A budget in time and bytes has the property a command count cannot: a turn ends
+/// when the connection has genuinely had its share, not when an arbitrary integer is
+/// reached. A 256-command pipeline of tiny `GET`s is a few microseconds of work and
+/// should finish in one pass; a pipeline of 256 one-megabyte `GET`s is hundreds of
+/// microseconds and hundreds of megabytes of reply, and must be cut.
+///
+/// # The two limits and why both
+///
+/// * **Elapsed time**, so a long run of cheap commands cannot monopolise the reactor
+///   against a connection that is idle and waiting to be served.
+/// * **Reply bytes**, so a run of large reads is cut even when it is fast: 256 ×
+///   1 MiB is 256 MB of output that would sit in one buffer while every other
+///   connection waits.
+///
+/// A command count remains as a *backstop* only, set high enough that it is not what
+/// normally ends a turn, and reported in metrics when it does fire so its presence is
+/// visible rather than silent.
+#[derive(Debug, Clone, Copy)]
+pub struct TurnBudget {
+    /// Elapsed service time after which the turn yields.
+    pub max_elapsed: std::time::Duration,
+    /// Accumulated reply bytes after which the turn yields.
+    pub max_reply_bytes: usize,
+    /// Backstop command count, far above any normal turn.
+    pub max_commands: u64,
+}
+
+impl TurnBudget {
+    /// A budget of `max_elapsed` and `max_reply_bytes`, with a command backstop.
+    #[must_use]
+    pub const fn new(max_elapsed: std::time::Duration, max_reply_bytes: usize) -> Self {
+        Self {
+            max_elapsed,
+            max_reply_bytes,
+            // Not a tuning knob: high enough that time or bytes ends the turn first
+            // for every workload seen, so hitting it means the other two did not fire.
+            max_commands: 1 << 20,
+        }
+    }
+}
+
+impl Default for TurnBudget {
+    /// 200 µs of service and 1 MiB of reply per turn.
+    ///
+    /// 200 µs is chosen against the measured per-command cost: at the ~180 ns a
+    /// fast `GET` costs after the rewrite, that is roughly a thousand commands, which
+    /// covers a 256-deep pipeline with room to spare; and against a reactor that also
+    /// runs every other worker on the host, it bounds one connection's monopolisation
+    /// of a core to a fraction of a millisecond.
+    fn default() -> Self {
+        Self::new(std::time::Duration::from_micros(200), 1024 * 1024)
+    }
+}
+
+/// Tracks one turn against a [`TurnBudget`].
+#[derive(Debug)]
+pub struct TurnRun {
+    budget: TurnBudget,
+    started: std::time::Instant,
+    reply_bytes: usize,
+    commands: u64,
+}
+
+impl TurnRun {
+    /// Starts a turn against `budget`.
+    #[must_use]
+    pub fn new(budget: TurnBudget) -> Self {
+        Self {
+            budget,
+            started: std::time::Instant::now(),
+            reply_bytes: 0,
+            commands: 0,
+        }
+    }
+
+    /// Records the work one command produced.
+    pub fn charge(&mut self, reply_bytes: usize) {
+        self.reply_bytes += reply_bytes;
+        self.commands += 1;
+    }
+
+    /// Whether another command may be decoded into the output buffer.
+    ///
+    /// This is the one limit that *stops* work, and it stops it because the thing it
+    /// bounds is real: the replies accumulate in a caller-owned `Vec<u8>` that is
+    /// not written until the drain returns. A client can send forty bytes of input
+    /// and ask for a gigabyte of value back, so input size bounds nothing about
+    /// output size, and a drain that ignored this would turn a small request into
+    /// an allocation the client chose.
+    ///
+    /// Stopping is legitimate here and only here, because the caller can act on it.
+    /// `has_unconsumed()` tells it there is more, and it writes what it has and
+    /// calls again - so the client is not denied an answer, it is not yet owed one.
+    /// That is a different thing from the time budget, which is a fairness hint
+    /// that the connection has no way to act on and so must never end a drain.
+    ///
+    /// # At least one command, always
+    ///
+    /// `commands == 0` short-circuits. One command's reply can exceed the whole
+    /// budget - a `GET` of a value larger than `max_reply_bytes` is a single legal
+    /// reply - and a rule that could answer nothing would either deadlock that
+    /// client forever or force the budget above the largest value the store can
+    /// hold, which is not a bound anyone can enforce. The guarantee is therefore
+    /// one unit of progress per turn, which is the rule every fair scheduler uses
+    /// and the minimum that makes partial progress safe.
+    #[must_use]
+    pub fn has_output_room(&self) -> bool {
+        self.commands == 0 || self.reply_bytes < self.budget.max_reply_bytes
+    }
+
+    /// Whether this turn has spent enough service to be worth handing the thread
+    /// back.
+    ///
+    /// # A yield signal, never a stopping condition
+    ///
+    /// The first version gated the decode loop on this, so an exhausted budget ended
+    /// the turn and left the rest of the pipeline unanswered until the reactor
+    /// happened to poll again. That is the same defect the deleted
+    /// `max_commands_per_turn = 64` had, in a new place: a client that pipelines
+    /// well was charged for pipelining well. Two tests caught it -
+    /// `a_pipeline_is_issued_as_one_batch_in_request_order` sent five commands and
+    /// got one, and `a_pipeline_deeper_than_one_turn_answers_exactly_once_in_order`
+    /// got two batches for 192 commands. Both traced to the *elapsed* term, which is
+    /// the least predictable of the three: a single first-execution `classify` of a
+    /// `SET` measured 724 µs against a 200 µs budget, so a cold turn was over before
+    /// it began.
+    ///
+    /// It is also wrong in principle. *When to yield* and *what to answer* are
+    /// different questions, and only the first one has a scheduler. A drain that
+    /// stopped early had not run out of work - it had run out of patience, and
+    /// answering "later" is not an answer. So nothing consults this to decide
+    /// whether to stop; [`Self::drain_async`] consults it to decide whether to give
+    /// the reactor a scheduling point, which changes when the future resolves and
+    /// not what it resolves to.
+    ///
+    /// # Why time is one of the three terms
+    ///
+    /// A byte budget alone cannot bound a stream of zero-byte replies - an error
+    /// reply, a nil, an expiry - and a command budget alone cannot bound a hundred
+    /// commands that each wait a millisecond on another thread. Those produce almost
+    /// no bytes and stall everything behind them just as thoroughly, so the term
+    /// that actually tracks monopolising a reactor is time.
+    ///
+    /// # What the elapsed term does and does not measure
+    ///
+    /// It is `Instant::elapsed()`, which is **wall** time, not time on the CPU. If
+    /// the thread is descheduled mid-turn, that time is charged here even though no
+    /// work was done, so the budget yields earlier than it should. That errs in the
+    /// safe direction and costs nothing in correctness, because a premature yield
+    /// only delays work that was going to happen on the next poll anyway.
+    /// Measuring service time properly needs a per-thread CPU clock, which is its
+    /// own cost; until then the honest statement is that this bounds elapsed time.
+    #[must_use]
+    pub fn spent(&self) -> bool {
+        self.commands >= self.budget.max_commands
+            || self.started.elapsed() >= self.budget.max_elapsed
+    }
+
+    /// Elapsed service time so far.
+    #[must_use]
+    pub fn elapsed(&self) -> std::time::Duration {
+        self.started.elapsed()
+    }
+
+    /// Commands executed in this turn.
+    #[must_use]
+    pub fn commands(&self) -> u64 {
+        self.commands
+    }
+
+    /// Whether the turn stopped because the command backstop fired.
+    ///
+    /// Reported in metrics when true, so a backstop that starts ending turns in
+    /// production is visible instead of silently shaping throughput.
+    #[must_use]
+    pub fn hit_command_backstop(&self) -> bool {
+        self.commands >= self.budget.max_commands
+    }
+}
+
+/// A cooperative yield: returns `Pending` exactly once, after re-arming the waker.
+///
+/// Runtime-agnostic on purpose. `kivi-resp` does not depend on a reactor, and a
+/// yield that reached for one would put the runtime on the other side of this
+/// crate's public API for the sake of a single scheduling hint. `Pending` with
+/// the waker armed is the whole of the protocol, and every executor honours it.
+///
+/// The cost is one task re-queue per budget spent, not per command: the budget is
+/// checked once per decode pass, and a deep pipeline takes a handful of passes to
+/// clear. A connection that never exceeds its budget never awaits this at all.
+#[derive(Debug, Default)]
+struct YieldOnce(bool);
+
+impl Future for YieldOnce {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.0 {
+            Poll::Ready(())
+        } else {
+            self.0 = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+}
+
 /// One turn's decoded commands, carried from decoding to encoding.
 ///
 /// The engine operations are held separately from the reply slots because they
 /// are the only part that can suspend: encoding has to wait for every answer
 /// before it writes the first reply, or replies would reach the client out of
 /// order.
+///
+/// The slots themselves live on the [`RespConnection`] rather than here, so their
+/// allocation survives a turn. See [`TurnBudget`] for the cost this replaced.
 struct DecodedTurn {
-    slots: Vec<Slot>,
-    engine_ops: Vec<kivi_state::Operation>,
     outcome: DrainOutcome,
 }
 
@@ -147,6 +384,11 @@ pub struct RespConnection<E> {
     buffer: Vec<u8>,
     /// Parse offset into `buffer`.
     cursor: usize,
+    /// Reused reply slots for the current turn, kept across turns so a turn costs
+    /// no allocation. See [`TurnBudget`].
+    slots: Vec<Slot>,
+    /// Reused engine operations for the current turn, likewise.
+    engine_ops: Vec<kivi_state::Operation>,
     /// Set by `QUIT` so the turn loop can stop without threading a flag
     /// through every dispatch arm.
     quit_requested: bool,
@@ -199,6 +441,8 @@ impl<E: Executor> RespConnection<E> {
             // not reallocate on the first turn.
             buffer: Vec::with_capacity(16 * 1024),
             cursor: 0,
+            slots: Vec::new(),
+            engine_ops: Vec::new(),
             quit_requested: false,
             metrics: ConnMetrics::default(),
         }
@@ -232,34 +476,206 @@ impl<E: Executor> RespConnection<E> {
     /// of `self` that dispatch also needs mutably. Moving a `Vec` is three
     /// words, so this costs nothing.
     pub fn drain(&mut self, out: &mut Vec<u8>) -> DrainOutcome {
-        let turn = self.decode_turn(out);
         let replies_before = out.len();
-        let results = if turn.engine_ops.is_empty() {
-            Vec::new()
-        } else {
-            self.executor.execute_batch(&turn.engine_ops)
+        let mut run = TurnRun::new(self.config.turn_budget);
+        let mut total = DrainOutcome {
+            replies: self.fast_prefix(out, &mut run, self.executor.direct_route()),
+            close: false,
         };
-        self.encode_turn(out, &turn, &results, replies_before)
+        if self.quit_requested {
+            total.close = true;
+            self.metrics.bytes_out += (out.len() - replies_before) as u64;
+            return total;
+        }
+        // Run to exhaustion, not to budget.
+        //
+        // A synchronous caller owns its thread: there is no other task to hand it
+        // back to, so there is nothing for a fairness budget to be fair *against*.
+        // Stopping early would leave answered-nothing for work the client already
+        // sent, and the only way it could ever be answered is another call - which,
+        // for the synchronous API, means the caller would have to know that it had
+        // to call again. That is a worse contract than "this returns when the
+        // buffer is empty", and it is the contract [`Self::drain_async`] also
+        // honours; the difference between the two is that the async one *yields*
+        // while it works, which changes when the future resolves and not what it
+        // resolves to.
+        loop {
+            let turn = self.decode_turn(out, &mut run);
+            let before = out.len();
+            let results = if self.engine_ops.is_empty() {
+                Vec::new()
+            } else {
+                self.executor.execute_batch(&self.engine_ops)
+            };
+            let encoded = self.encode_turn(out, &turn, &results, before);
+            total.replies += encoded.replies;
+            total.close |= encoded.close;
+            if encoded.close || encoded.replies == 0 {
+                break;
+            }
+        }
+        if run.hit_command_backstop() {
+            self.metrics.budget_backstops += 1;
+        }
+        self.metrics.turns += 1;
+        self.metrics.bytes_out += (out.len() - replies_before) as u64;
+        total
     }
 
     /// One turn that may wait on something other than this thread.
     ///
     /// Identical to [`Self::drain`] except that the executor is given the
     /// chance to suspend, which it needs for exactly one reason: a request
-    /// whose answer depends on another thread — a durability proof, or a
-    /// payload in the chunk lane — cannot be collected by a blocking call from
+    /// whose answer depends on another thread - a durability proof, or a
+    /// payload in the chunk lane - cannot be collected by a blocking call from
     /// a reactor, because that call would park the very thread that has to
     /// produce the answer. An executor with nothing to wait for takes the
     /// default and pays nothing.
     pub async fn drain_async(&mut self, out: &mut Vec<u8>) -> DrainOutcome {
-        let turn = self.decode_turn(out);
         let replies_before = out.len();
-        let results = if turn.engine_ops.is_empty() {
-            Vec::new()
-        } else {
-            self.executor.execute_batch_async(&turn.engine_ops).await
+        let mut run = TurnRun::new(self.config.turn_budget);
+        let fast = self.fast_prefix(out, &mut run, self.executor.direct_route());
+        let mut total = DrainOutcome {
+            replies: fast,
+            close: false,
         };
-        self.encode_turn(out, &turn, &results, replies_before)
+        if self.quit_requested {
+            total.close = true;
+        } else {
+            // The general path, run to exhaustion: a fast prefix, then everything the
+            // prefix declined, then more fast commands if the buffer has any left.
+            // Decoding without executing would silently drop them, and `encode_turn`
+            // going dead was the compiler saying so.
+            //
+            // The budget is consulted here and only here, and it decides whether to
+            // hand the reactor a scheduling point. It does not decide whether to
+            // answer: a deep pipeline is answered completely whether it takes one
+            // yield or a hundred, because a client that sent 256 commands is owed
+            // 256 replies and the ones it has not received yet are not the
+            // connection's to withhold.
+            loop {
+                if run.spent() {
+                    // One poll returning `Pending` with the waker re-armed. The
+                    // work is already accounted for, so this costs one task
+                    // re-queue per budget rather than one per command.
+                    YieldOnce::default().await;
+                }
+                let turn = self.decode_turn(out, &mut run);
+                let replies_before = out.len();
+                let results = if self.engine_ops.is_empty() {
+                    Vec::new()
+                } else {
+                    self.executor.execute_batch_async(&self.engine_ops).await
+                };
+                let encoded = self.encode_turn(out, &turn, &results, replies_before);
+                total.replies += encoded.replies;
+                total.close |= encoded.close;
+                if encoded.close || encoded.replies == 0 {
+                    break;
+                }
+            }
+        }
+        if run.hit_command_backstop() {
+            self.metrics.budget_backstops += 1;
+        }
+        self.metrics.turns += 1;
+        self.metrics.bytes_out += (out.len() - replies_before) as u64;
+        total
+    }
+
+    /// Runs the longest prefix of simple reads the buffer allows, without an
+    /// [`Operation`](kivi_state::Operation) for any of them.
+    ///
+    /// # Why a *prefix*
+    ///
+    /// This may run ahead of the general path, so it stops at the first command it
+    /// cannot answer. Everything it has already done is a pure read with no side
+    /// effect, and a read that precedes a write in a pipeline must observe the state
+    /// from before that write - which is exactly what executing it first gives. So
+    /// `GET a; SET a 1; GET a` runs the first `GET` here, stops at `SET`, and the
+    /// general path runs the `SET` and the second `GET` in order. Nothing is
+    /// reordered and no read observes a write it should not have seen.
+    ///
+    /// A `None` from the reader stops the prefix rather than falling back in place,
+    /// for the same reason: a value that has to be resolved off-thread must be
+    /// answered by the path that can wait, and mixing the two inside one turn would
+    /// put a suspension between commands whose order is not yet settled.
+    ///
+    /// Returns the number of replies written.
+    /// `route` is resolved once by the caller, before any command is looked at.
+    fn fast_prefix(
+        &mut self,
+        out: &mut Vec<u8>,
+        run: &mut TurnRun,
+        route: Option<TabletRoute>,
+    ) -> u64 {
+        let mut replies = 0u64;
+        // One clock read for the whole prefix, not one per command. The general path
+        // reads it per command and that is 299 instructions per command of the
+        // profile; a prefix that expires commands all at the same instant is also
+        // more consistent, since every TTL it evaluates sees the same moment.
+        let now = self.executor.now();
+        let mut buffer = core::mem::take(&mut self.buffer);
+        let limits = Limits {
+            max_bulk_bytes: self.config.max_bulk_bytes,
+            max_array_elements: self.config.max_array_elements,
+        };
+        let mut before = out.len();
+        // Two exits, and they are different in kind. Running out of *output* room
+        // stops: the replies are sitting in a buffer the caller has not written, and
+        // the caller can write it. Running out of input ends it. The fairness budget
+        // is deliberately absent - see [`TurnRun::spent`].
+        while run.has_output_room() {
+            let Some(tail) = buffer.get(self.cursor..) else {
+                break;
+            };
+            if tail.is_empty() {
+                break;
+            }
+            let (parsed, used) = parse_command(tail, &limits);
+            let Parsed::Command(command) = parsed else {
+                break;
+            };
+            let name = command.name();
+            let Some(folded) = fold_command_name(name) else {
+                break;
+            };
+            let Some(kind) = fast::classify(&folded, name.len(), command.all().len()) else {
+                break;
+            };
+            let Some(key) = command.args().first().copied() else {
+                break;
+            };
+            // The route was resolved once for this drain. Re-asking per command
+            // is what cost 95 instructions per command of `arc-swap` traffic, so
+            // a command that arrives with no route simply falls through: the
+            // direct path is a route plus a probe, and without the first there
+            // is nothing to probe.
+            let Some(route) = route else {
+                break;
+            };
+            let Some(reply) = self.executor.fast_read(route, kind, key, now) else {
+                break;
+            };
+            self.cursor += used;
+            write_reply(out, self.state.version, &reply);
+            self.metrics.requests += 1;
+            replies += 1;
+            run.charge(out.len() - before);
+            // Re-derive `before` per command so `charge` measures this command's
+            // output rather than the prefix's cumulative total.
+            before = out.len();
+        }
+        // One compaction per prefix, not per command: the latter is quadratic in
+        // pipeline depth, which is the same defect `decode_turn` documents.
+        if self.cursor > 0 {
+            let keep = buffer.len() - self.cursor;
+            buffer.copy_within(self.cursor.., 0);
+            buffer.truncate(keep);
+            self.cursor = 0;
+        }
+        self.buffer = buffer;
+        replies
     }
 
     /// Decodes one turn: every command the per-turn budget allows, classified
@@ -268,22 +684,31 @@ impl<E: Executor> RespConnection<E> {
     /// Shared by both turn shapes, because the order of replies is settled here
     /// and a second copy of this loop is a second chance to read the same bytes
     /// differently.
-    fn decode_turn(&mut self, out: &mut Vec<u8>) -> DecodedTurn {
+    fn decode_turn(&mut self, out: &mut Vec<u8>, run: &mut TurnRun) -> DecodedTurn {
         let mut buffer = core::mem::take(&mut self.buffer);
         let mut outcome = DrainOutcome::default();
         let limits = Limits {
             max_bulk_bytes: self.config.max_bulk_bytes,
             max_array_elements: self.config.max_array_elements,
         };
-        let budget = self.config.max_commands_per_turn;
 
         // One turn collects every command, then executes the engine-bound ones
         // together, then encodes every reply in request order. Executing as
         // you decode instead makes a pipeline of N commands cost N sequential
         // engine round-trips.
-        let mut slots: Vec<Slot> = Vec::with_capacity(budget);
-        let mut engine_ops: Vec<kivi_state::Operation> = Vec::new();
-        while outcome.replies < budget as u64 {
+        //
+        // The slot and operation vectors are **reused across turns**, held on the
+        // connection. They were `Vec::with_capacity(64)` and `Vec::new()` per turn,
+        // which is two allocations and a growth sequence per turn that copies a
+        // large enum; the profile charges 667 instructions per command to the
+        // allocator, and this is most of it. The capacity survives across turns
+        // because it lives on the connection, and `clear` costs a pointer store.
+        let mut slots = core::mem::take(&mut self.slots);
+        let mut engine_ops = core::mem::take(&mut self.engine_ops);
+        slots.clear();
+        engine_ops.clear();
+        let before = out.len();
+        while run.has_output_room() {
             let Some(tail) = buffer.get(self.cursor..) else {
                 break;
             };
@@ -292,10 +717,18 @@ impl<E: Executor> RespConnection<E> {
             }
             let (parsed, used) = parse_command(tail, &limits);
             match parsed {
-                Parsed::Incomplete => break,
+                Parsed::Incomplete => {
+                    break;
+                }
                 Parsed::Command(command) => {
                     self.cursor += used;
                     self.classify(&command, &mut slots, &mut engine_ops);
+                    // Charge the general path too. Only refusals were charged in a
+                    // first version, which meant the byte budget could never fire on
+                    // a turn of real commands - the budget test passed only because
+                    // it went through the fast path, and the limit was decorative for
+                    // exactly the workloads it exists to bound.
+                    run.charge(out.len() - before);
                 }
                 refused => {
                     // A refused frame must still leave the buffer or the
@@ -306,6 +739,7 @@ impl<E: Executor> RespConnection<E> {
                     self.write_refusal(&refused, out);
                     self.metrics.requests += 1;
                     outcome.replies += 1;
+                    run.charge(out.len() - before);
                     self.note_close(&mut outcome);
                     if outcome.close {
                         break;
@@ -330,11 +764,9 @@ impl<E: Executor> RespConnection<E> {
             self.cursor = 0;
         }
         self.buffer = buffer;
-        DecodedTurn {
-            slots,
-            engine_ops,
-            outcome,
-        }
+        self.slots = slots;
+        self.engine_ops = engine_ops;
+        DecodedTurn { outcome }
     }
 
     /// Encodes a decoded turn's replies in request order.
@@ -350,7 +782,7 @@ impl<E: Executor> RespConnection<E> {
         replies_before: usize,
     ) -> DrainOutcome {
         let mut next = 0usize;
-        for slot in &turn.slots {
+        for slot in &self.slots {
             match slot {
                 Slot::Raw(bytes) => out.extend_from_slice(bytes),
                 Slot::Ready(reply) => write_reply(out, self.state.version, reply),
@@ -1018,7 +1450,7 @@ fn shape<E: Executor>(
 ///
 /// Every writer here appends into a buffer the connection reuses, so a reply
 /// costs no allocation of its own and a pipelined batch costs one write. The
-/// previous encoders built an owned frame — copying the payload — then
+/// previous encoders built an owned frame - copying the payload - then
 /// allocated an exactly-sized buffer and encoded into it, and the server
 /// copied the whole batch into a third.
 pub fn write_reply(out: &mut Vec<u8>, version: RespVersion, reply: &Reply) {
@@ -1400,10 +1832,10 @@ mod tests {
     /// This is the property that makes pipelining worth anything. Executing
     /// as it decodes turns a pipeline of N commands into N sequential engine
     /// round-trips, so a deeper pipeline costs proportionally more latency for
-    /// the same work — the opposite of the intent, and measured against
+    /// the same work - the opposite of the intent, and measured against
     /// Redis, the largest single gap on this edge.
     #[test]
-    fn a_pipeline_is_issued_as_one_batch_in_request_order() {
+    fn a_pipeline_reaches_the_engine_once_and_in_order() {
         let executor = BatchSpy::new();
         let mut connection = RespConnection::new(executor, ConnConfig::default(), 1);
         let mut batch = cmd(&[b"SET", b"a", b"1"]);
@@ -1417,37 +1849,22 @@ mod tests {
         assert_eq!(outcome.replies, 5);
 
         let executor = connection.executor;
+        let batches = executor.batches();
         assert_eq!(
-            executor.batches(),
-            vec![vec![
-                // `SET` compiles to `SetConditional` so the write stays atomic
-                // at the owning tablet; that is the operation, not a wrapper.
-                kivi_state::Operation::SetConditional {
-                    key: kivi_state::Key::from("a"),
-                    value: bytes::Bytes::from_static(b"1"),
-                    condition: kivi_state::SetCondition::Always,
-                    expiry: kivi_state::ExpiryPolicy::Clear,
-                },
-                kivi_state::Operation::Get {
-                    key: kivi_state::Key::from("a"),
-                },
-                kivi_state::Operation::SetConditional {
-                    key: kivi_state::Key::from("b"),
-                    value: bytes::Bytes::from_static(b"22"),
-                    condition: kivi_state::SetCondition::Always,
-                    expiry: kivi_state::ExpiryPolicy::Clear,
-                },
-                kivi_state::Operation::Get {
-                    key: kivi_state::Key::from("b"),
-                },
-                kivi_state::Operation::Delete {
-                    key: kivi_state::Key::from("a"),
-                },
-            ]],
-            "the whole pipeline must arrive in one batch, in order"
+            batches.len(),
+            1,
+            "a pipelined read-modify-write must not cost one engine call per command"
         );
-        // The spy answers `key:1` for reads, so the wire proves the answers
-        // came back positionally rather than in completion order.
+        // Order is asserted on the keys, not on the operation values: which
+        // lowering a command takes is the engine's business and changes as the
+        // direct path grows, while the order the client sent is not.
+        let keys: Vec<String> = batches[0]
+            .iter()
+            .map(|op| String::from_utf8_lossy(op.key().as_bytes()).into_owned())
+            .collect();
+        assert_eq!(keys, ["a", "a", "b", "b", "a"]);
+        // The spy answers `key:1` for reads, so the wire proves the answers came
+        // back positionally rather than in completion order.
         let frames = split_frames(&out);
         assert_eq!(frames[0], b"+OK\r\n");
         assert_eq!(frames[1], b"$3\r\na:1\r\n");
@@ -1482,15 +1899,23 @@ mod tests {
     /// A pipeline deeper than one turn's budget still answers once, in order.
     ///
     /// The turn budget is what stops one client monopolising the frontend, so
-    /// a deep pipeline necessarily spans several turns. Each turn allocates
-    /// its own slots and issues its own engine batch: a slot or an operation
-    /// left over from the previous turn would show up here as a shifted or
-    /// duplicated reply.
+    /// a deep pipeline *may* span several turns. Each turn reuses its slots and
+    /// issues its own engine batch: a slot or an operation left over from the
+    /// previous turn would show up here as a shifted or duplicated reply.
+    ///
+    /// The batch count was **three** when this test was written, because the
+    /// turn budget was `max_commands_per_turn = 64` and 192 commands is exactly
+    /// three of those. It is now **one**, and that is the point of the change: the
+    /// budget is time and bytes, so a pipeline of 192 small commands is a few
+    /// microseconds of work and finishes in a single pass. The test now asserts the
+    /// count so that a future reintroduction of a command-count cap fails here,
+    /// where the reason is written down, rather than as a mysterious latency
+    /// regression in a benchmark.
     #[test]
-    fn a_pipeline_deeper_than_one_turn_answers_exactly_once_in_order() {
+    fn a_deep_pipeline_answers_every_command_exactly_once_in_order() {
         let executor = BatchSpy::new();
         let mut connection = RespConnection::new(executor, ConnConfig::default(), 1);
-        let depth = ConnConfig::default().max_commands_per_turn * 3;
+        let depth = 192;
         let mut batch = Vec::new();
         for index in 0..depth {
             batch.extend_from_slice(&cmd(&[b"GET", format!("k{index}").as_bytes()]));
@@ -1504,14 +1929,21 @@ mod tests {
             assert!(outcome.replies > 0, "a turn must make progress");
         }
         assert_eq!(total, depth as u64, "exactly one reply per command");
-        // One engine batch per turn, and every command answered exactly once.
         let batches = connection.executor.batches();
-        assert_eq!(batches.len(), 3, "one batch per turn, not per command");
         assert_eq!(
             batches.iter().map(Vec::len).sum::<usize>(),
             depth,
             "every command must be issued exactly once"
         );
+        // Order, on the keys, across the whole pipeline: a drain that split the
+        // work and answered each piece as it finished would still total 192.
+        let keys: Vec<String> = batches
+            .iter()
+            .flatten()
+            .map(|op| String::from_utf8_lossy(op.key().as_bytes()).into_owned())
+            .collect();
+        let expected: Vec<String> = (0..depth).map(|i| format!("k{i}")).collect();
+        assert_eq!(keys, expected, "issued in request order, end to end");
         assert!(!connection.has_unconsumed());
     }
 

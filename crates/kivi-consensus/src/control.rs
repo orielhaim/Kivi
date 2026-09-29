@@ -57,28 +57,7 @@ pub struct ObservedMembership {
 }
 
 impl ObservedMembership {
-    /// Builds an observation for tests and diagnostics.
-    #[must_use]
-    pub fn new(
-        group: ConsensusGroupId,
-        voters: BTreeSet<u64>,
-        learners: BTreeSet<u64>,
-        leader: Option<ReplicaId>,
-        term: ConsensusTerm,
-        is_joint: bool,
-    ) -> Self {
-        Self {
-            group,
-            voters,
-            learners,
-            leader,
-            term,
-            is_joint,
-            lag: std::collections::BTreeMap::new(),
-        }
-    }
-
-    /// Builds an observation with replication lag (production path).
+    /// Builds one observation of a tablet group's actual Raft state.
     #[must_use]
     pub fn with_lag(
         group: ConsensusGroupId,
@@ -178,7 +157,7 @@ pub fn select_authoritative(
 
 /// Whether `target` is sufficiently caught up to promote: present as a
 /// learner (or already a voter) with replication lag within
-/// [`CATCH_UP_LAG_THRESHOLD`]. Unknown lag never promotes — promoting a
+/// [`CATCH_UP_LAG_THRESHOLD`]. Unknown lag never promotes - promoting a
 /// lagging node can stall quorum progress.
 #[must_use]
 pub fn caught_up(observed: &ObservedMembership, target: NodeId) -> bool {
@@ -257,32 +236,18 @@ pub enum ReconcileStep {
     Done,
 }
 
-/// Derives the next step for `plan` from `observed`.
-///
-/// Pure function of (persisted phase, observed membership): the
-/// reconciler calls it every pass and executes the returned step, so a
-/// retried or reordered pass converges instead of duplicating harmful
-/// work. Leadership transfer is requested both after convergence (the
-/// departing source still leads) and before reconfiguring out from
-/// under a leading source (graceful handoff via [`handoff_successor`]).
-///
-/// The length is the phase dispatch table itself (one arm per phase);
-/// splitting it would scatter the state machine across helpers for no
-/// readability gain.
-#[allow(clippy::too_many_lines)]
-#[must_use]
 /// Graceful-handoff target when the migration source still leads: the
 /// most caught-up retained desired voter that already votes (desired
 /// order breaks lag ties).
 ///
 /// Rationale: changing membership out from under a leading source
-/// removes the only leader — the uniform commit steps the source down
+/// removes the only leader - the uniform commit steps the source down
 /// and the group goes leaderless until a fresh election completes,
 /// burning client redirect budgets with `Overloaded` the whole window.
 /// Handing off first keeps a live leader across the reconfiguration, so
 /// migration is hitless. Returns `None` when no established voter can
 /// take over yet (all lagged/unknown): the caller then proceeds with the
-/// membership change rather than stalling migration behind a transfer —
+/// membership change rather than stalling migration behind a transfer -
 /// a brief election window beats a stuck plan. The newcomer target is
 /// never chosen: it only becomes a voter through the change itself.
 /// Single-voter moves have no candidate by construction (the outage is
@@ -309,10 +274,18 @@ fn desired_position(desired: &[NodeId], node: NodeId) -> usize {
         .unwrap_or(usize::MAX)
 }
 
-/// Derives the next step for `plan` from `observed` (phase dispatch
-/// table; see the function body for the per-phase rules, including the
-/// graceful leadership handoff before reconfiguring out from under a
-/// leading migration source).
+/// Derives the next step for `plan` from `observed`.
+///
+/// Pure function of (persisted phase, observed membership): the
+/// reconciler calls it every pass and executes the returned step, so a
+/// retried or reordered pass converges instead of duplicating harmful
+/// work. Leadership transfer is requested both after convergence (the
+/// departing source still leads) and before reconfiguring out from under
+/// a leading source (graceful handoff via [`handoff_successor`]).
+///
+/// The body is the phase dispatch table itself (one arm per phase);
+/// splitting it would scatter the state machine across helpers for no
+/// readability gain.
 #[allow(clippy::too_many_lines)]
 #[must_use]
 pub fn next_step(
@@ -409,7 +382,7 @@ pub fn next_step(
         Phase::MembershipChanging => {
             // Strict convergence only: the source must be gone AND the
             // target a voter. A uniform set that still names the source
-            // (or names extra voters) is NOT done — declaring Committed
+            // (or names extra voters) is NOT done - declaring Committed
             // early strands the plan in SourceRetiring forever, because
             // retiring the local replica never changes membership.
             if converged {
@@ -495,15 +468,17 @@ pub fn next_step(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use kivi_control::topology::PlanId;
     use kivi_control::{MigrationPhase, MigrationPlan, PlacementVersion};
     use kivi_types::{NodeId, TabletId};
+    use rstest::rstest;
 
     use super::*;
     use crate::types::{ConsensusTerm, ReplicaId};
 
+    /// Plan moving tablet 17 from node 1 to node 4, desired set 2/3/4.
     fn plan_at(phase: MigrationPhase) -> MigrationPlan {
         let mut plan = MigrationPlan::new(
             PlanId::from_u64(1),
@@ -523,40 +498,7 @@ mod tests {
     }
 
     fn observed(voters: &[u64], learners: &[u64], leader: Option<u64>) -> ObservedMembership {
-        ObservedMembership::new(
-            ConsensusGroupId::of_tablet(TabletId::from_u64(17)),
-            voters.iter().copied().collect::<BTreeSet<_>>(),
-            learners.iter().copied().collect::<BTreeSet<_>>(),
-            leader.map(|node| ReplicaId::of_node(NodeId::from_u64(node))),
-            ConsensusTerm::new(3),
-            false,
-        )
-    }
-
-    #[test]
-    fn planned_creates_target_first() {
-        let step = next_step(
-            &plan_at(MigrationPhase::Planned),
-            &observed(&[1, 2, 3], &[], Some(1)),
-        );
-        assert!(matches!(step, ReconcileStep::EnsureTargetReplica { .. }));
-    }
-
-    #[test]
-    fn learner_flow_waits_then_promotes() {
-        // Learner present but not voter: wait, never promote early.
-        let step = next_step(
-            &plan_at(MigrationPhase::LearnerAdded),
-            &observed(&[1, 2, 3], &[4], Some(1)),
-        );
-        assert!(matches!(step, ReconcileStep::WaitCatchUp { .. }));
-        // Ready with a caught-up learner and a non-source leader: change
-        // membership (no handoff needed).
-        let step = next_step(
-            &plan_at(MigrationPhase::Ready),
-            &observed(&[1, 2, 3], &[4], Some(2)),
-        );
-        assert!(matches!(step, ReconcileStep::ChangeMembership { .. }));
+        observed_with_lag(voters, learners, leader, &[])
     }
 
     fn observed_with_lag(
@@ -576,165 +518,187 @@ mod tests {
         )
     }
 
-    #[test]
-    fn ready_hands_off_before_removing_a_leading_source() {
-        // Source still leads with caught-up retained voters: hand off to
-        // the first retained desired voter (2) instead of reconfiguring
-        // out from under the only leader.
+    /// The phase dispatch table. `case` names one row so a failure reads as
+    /// a matrix cell; every row asserts the exact step, not merely its
+    /// kind.
+    #[rstest]
+    #[case::planned_creates_target(
+        MigrationPhase::Planned, &[1, 2, 3], &[], Some(1), &[],
+        ReconcileStep::EnsureTargetReplica { tablet: TabletId::from_u64(17), target: NodeId::from_u64(4) },
+    )]
+    #[case::target_starting_adds_learner(
+        MigrationPhase::TargetStarting, &[1, 2, 3], &[], Some(1), &[],
+        ReconcileStep::AddLearner { tablet: TabletId::from_u64(17), target: NodeId::from_u64(4) },
+    )]
+    #[case::target_starting_advances_when_joined(
+        MigrationPhase::TargetStarting, &[1, 2, 3], &[4], Some(1), &[],
+        ReconcileStep::AdvancePlan { plan: PlanId::from_u64(1), phase: MigrationPhase::LearnerAdded },
+    )]
+    #[case::learner_added_waits_for_catchup(
+        MigrationPhase::LearnerAdded, &[1, 2, 3], &[4], Some(1), &[],
+        ReconcileStep::WaitCatchUp { tablet: TabletId::from_u64(17), target: NodeId::from_u64(4) },
+    )]
+    #[case::learner_added_re_adds_when_absent(
+        MigrationPhase::LearnerAdded, &[1, 2, 3], &[], Some(1), &[],
+        ReconcileStep::AddLearner { tablet: TabletId::from_u64(17), target: NodeId::from_u64(4) },
+    )]
+    #[case::ready_advances_when_promoted(
+        MigrationPhase::Ready, &[1, 2, 3, 4], &[], Some(1), &[],
+        ReconcileStep::AdvancePlan { plan: PlanId::from_u64(1), phase: MigrationPhase::Committed },
+    )]
+    #[case::ready_hands_off_from_leading_source(
+        // Equal lag: desired order breaks the tie, so node 2 wins.
+        MigrationPhase::Ready, &[1, 2, 3], &[4], Some(1), &[(1, 0), (2, 0), (3, 0)],
+        ReconcileStep::TransferLeadership { tablet: TabletId::from_u64(17), to: NodeId::from_u64(2) },
+    )]
+    #[case::ready_hands_off_to_least_lagged(
+        MigrationPhase::Ready, &[1, 2, 3], &[4], Some(1), &[(1, 0), (2, 5), (3, 2)],
+        ReconcileStep::TransferLeadership { tablet: TabletId::from_u64(17), to: NodeId::from_u64(3) },
+    )]
+    #[case::ready_changes_when_no_caught_up_successor(
+        // Unknown lag for every voter: proceed rather than stall.
+        MigrationPhase::Ready, &[1, 2, 3], &[4], Some(1), &[],
+        ReconcileStep::ChangeMembership {
+            tablet: TabletId::from_u64(17),
+            desired: vec![NodeId::from_u64(2), NodeId::from_u64(3), NodeId::from_u64(4)],
+        },
+    )]
+    #[case::ready_changes_under_non_source_leader(
+        MigrationPhase::Ready, &[1, 2, 3], &[4], Some(2), &[(1, 0), (2, 0), (3, 0)],
+        ReconcileStep::ChangeMembership {
+            tablet: TabletId::from_u64(17),
+            desired: vec![NodeId::from_u64(2), NodeId::from_u64(3), NodeId::from_u64(4)],
+        },
+    )]
+    #[case::membership_changing_hands_off_on_redrive(
+        MigrationPhase::MembershipChanging, &[1, 2, 3], &[4], Some(1), &[(1, 0), (2, 0), (3, 0)],
+        ReconcileStep::TransferLeadership { tablet: TabletId::from_u64(17), to: NodeId::from_u64(2) },
+    )]
+    #[case::membership_changing_repairs_residue(
+        // Uniform set still naming the source is NOT converged.
+        MigrationPhase::MembershipChanging, &[1, 2, 3], &[4], Some(2), &[],
+        ReconcileStep::ChangeMembership {
+            tablet: TabletId::from_u64(17),
+            desired: vec![NodeId::from_u64(2), NodeId::from_u64(3), NodeId::from_u64(4)],
+        },
+    )]
+    #[case::committed_hands_off_while_source_leads(
+        MigrationPhase::Committed, &[1, 2, 3, 4], &[], Some(1), &[],
+        ReconcileStep::TransferLeadership { tablet: TabletId::from_u64(17), to: NodeId::from_u64(2) },
+    )]
+    #[case::committed_retires_non_voter_source(
+        MigrationPhase::Committed, &[2, 3, 4], &[], Some(1), &[],
+        ReconcileStep::RetireSource { tablet: TabletId::from_u64(17), source: NodeId::from_u64(1) },
+    )]
+    #[case::committed_repairs_residue_set(
+        MigrationPhase::Committed, &[1, 2, 3, 4], &[], Some(2), &[],
+        ReconcileStep::ChangeMembership {
+            tablet: TabletId::from_u64(17),
+            desired: vec![NodeId::from_u64(2), NodeId::from_u64(3), NodeId::from_u64(4)],
+        },
+    )]
+    #[case::source_retiring_repairs_residue(
+        MigrationPhase::SourceRetiring, &[1, 2, 3, 4], &[], Some(2), &[],
+        ReconcileStep::ChangeMembership {
+            tablet: TabletId::from_u64(17),
+            desired: vec![NodeId::from_u64(2), NodeId::from_u64(3), NodeId::from_u64(4)],
+        },
+    )]
+    #[case::source_retiring_retires_when_converged(
+        MigrationPhase::SourceRetiring, &[2, 3, 4], &[], Some(2), &[],
+        ReconcileStep::RetireSource { tablet: TabletId::from_u64(17), source: NodeId::from_u64(1) },
+    )]
+    #[case::completed_rests(
+        MigrationPhase::Completed, &[2, 3, 4], &[], Some(2), &[],
+        ReconcileStep::Done,
+    )]
+    fn phase_table(
+        #[case] phase: MigrationPhase,
+        #[case] voters: &[u64],
+        #[case] learners: &[u64],
+        #[case] leader: Option<u64>,
+        #[case] lag: &[(u64, u64)],
+        #[case] expected: ReconcileStep,
+    ) {
         let step = next_step(
-            &plan_at(MigrationPhase::Ready),
-            &observed_with_lag(&[1, 2, 3], &[4], Some(1), &[(1, 0), (2, 0), (3, 0)]),
+            &plan_at(phase),
+            &observed_with_lag(voters, learners, leader, lag),
         );
-        assert!(matches!(
-            step,
-            ReconcileStep::TransferLeadership { to, .. } if to == NodeId::from_u64(2)
-        ));
-        // Same handoff on membership re-drives while the source leads.
-        let step = next_step(
-            &plan_at(MigrationPhase::MembershipChanging),
-            &observed_with_lag(&[1, 2, 3], &[4], Some(1), &[(1, 0), (2, 5), (3, 0)]),
-        );
-        assert!(matches!(
-            step,
-            ReconcileStep::TransferLeadership { to, .. } if to == NodeId::from_u64(3)
-        ));
-        // No caught-up established voter (lags unknown): proceed with the
-        // membership change rather than stalling behind a transfer.
-        let step = next_step(
-            &plan_at(MigrationPhase::Ready),
-            &observed(&[1, 2, 3], &[4], Some(1)),
-        );
-        assert!(matches!(step, ReconcileStep::ChangeMembership { .. }));
-        // Non-source leader: no handoff, straight to membership change.
-        let step = next_step(
-            &plan_at(MigrationPhase::Ready),
-            &observed_with_lag(&[1, 2, 3], &[4], Some(2), &[(1, 0), (2, 0), (3, 0)]),
-        );
-        assert!(matches!(step, ReconcileStep::ChangeMembership { .. }));
+        assert_eq!(step, expected);
     }
 
+    /// A joint membership in flight always waits: proposing a competing
+    /// change before `OpenRaft` flattens the joint config would fork the
+    /// transition.
     #[test]
     fn joint_membership_waits() {
         let mut obs = observed(&[1, 2, 3], &[4], Some(2));
         obs.is_joint = true;
-        let step = next_step(&plan_at(MigrationPhase::MembershipChanging), &obs);
-        assert!(matches!(step, ReconcileStep::WaitJoint { .. }));
+        assert_eq!(
+            next_step(&plan_at(MigrationPhase::MembershipChanging), &obs),
+            ReconcileStep::WaitJoint {
+                tablet: TabletId::from_u64(17)
+            }
+        );
     }
 
-    #[test]
-    fn leader_source_transfers_before_retire() {
-        // Source still votes and leads: graceful handoff first.
-        let step = next_step(
-            &plan_at(MigrationPhase::Committed),
-            &observed(&[1, 2, 3, 4], &[], Some(1)),
-        );
-        assert!(matches!(step, ReconcileStep::TransferLeadership { .. }));
-        // Removed source that somehow still leads (stale): retire, not
-        // transfer — it is already out of the voter set.
-        let step = next_step(
-            &plan_at(MigrationPhase::Committed),
-            &observed(&[2, 3, 4], &[], Some(1)),
-        );
-        assert!(matches!(step, ReconcileStep::RetireSource { .. }));
-        // Source gone from voters: straight to retire.
-        let step = next_step(
-            &plan_at(MigrationPhase::Committed),
-            &observed(&[2, 3, 4], &[], Some(2)),
-        );
-        assert!(matches!(step, ReconcileStep::RetireSource { .. }));
-    }
-
-    #[test]
-    fn residue_membership_repairs_instead_of_stalling() {
-        // Uniform residue still naming the source is NOT committed:
-        // re-drive convergence (both phases heal the same way).
-        let step = next_step(
-            &plan_at(MigrationPhase::Committed),
-            &observed(&[1, 2, 3, 4], &[], Some(2)),
-        );
-        assert!(matches!(step, ReconcileStep::ChangeMembership { .. }));
-        let step = next_step(
-            &plan_at(MigrationPhase::SourceRetiring),
-            &observed(&[1, 2, 3, 4], &[], Some(2)),
-        );
-        assert!(matches!(step, ReconcileStep::ChangeMembership { .. }));
-        // Converged source-retiring retires locally.
-        let step = next_step(
-            &plan_at(MigrationPhase::SourceRetiring),
-            &observed(&[2, 3, 4], &[], Some(2)),
-        );
-        assert!(matches!(step, ReconcileStep::RetireSource { .. }));
-    }
-
-    #[test]
-    fn terminal_plans_rest() {
-        let step = next_step(
-            &plan_at(MigrationPhase::Completed),
-            &observed(&[1, 2, 3], &[], Some(1)),
-        );
-        assert_eq!(step, ReconcileStep::Done);
-    }
-
+    /// An embryonic local Raft group (created by `ensure_group` before
+    /// `add_learner`: empty membership, no leader, local node neither
+    /// voter nor learner) must never shadow an authoritative view from
+    /// actual members. A local process existing is not evidence that its
+    /// group view is authoritative.
     #[test]
     fn embryonic_local_never_shadows_member() {
-        // Regression for the drain stall: the control leader is also the
-        // migration target, `ensure_group` created an embryonic local
-        // group (empty membership, no leader, not voter/learner), while
-        // the real group still lives on members. The embryonic view must
-        // lose to the member view.
-        let embryonic = ObservedMembership::new(
+        let embryonic = ObservedMembership::with_lag(
             ConsensusGroupId::of_tablet(TabletId::from_u64(17)),
             BTreeSet::new(),
             BTreeSet::new(),
             None,
             ConsensusTerm::new(0),
             false,
+            BTreeMap::new(),
         );
         let member = observed(&[1, 2, 3], &[], Some(1));
-        // Embryonic local is a non-member fallback, not authoritative.
+        let target = NodeId::from_u64(4);
         assert_eq!(
-            observation_authority(Some(&embryonic), NodeId::from_u64(4)),
+            observation_authority(Some(&embryonic), target),
             Some(ObservationAuthority::NonMemberFallback)
         );
-        // Member local is authoritative.
         assert_eq!(
             observation_authority(Some(&member), NodeId::from_u64(1)),
             Some(ObservationAuthority::Member)
         );
-        // Selection prefers the remote member over the embryonic local.
-        let picked = select_authoritative(
-            Some(embryonic.clone()),
-            NodeId::from_u64(4),
-            Some(member.clone()),
-        );
-        assert_eq!(picked, Some(member.clone()));
-        // Without any remote, the embryonic fallback is returned (caller
-        // defers on leaderless), never mistaken for authority.
-        let fallback = select_authoritative(Some(embryonic), NodeId::from_u64(4), None);
-        assert!(fallback.is_some());
+        assert_eq!(observation_authority(None, target), None);
+
         assert_eq!(
-            observation_authority(fallback.as_ref(), NodeId::from_u64(4)),
+            select_authoritative(Some(embryonic.clone()), target, Some(member.clone())),
+            Some(member.clone())
+        );
+        // Without any remote, the embryonic fallback is returned (the
+        // caller defers on leaderless), never mistaken for authority.
+        let fallback = select_authoritative(Some(embryonic), target, None).expect("fallback");
+        assert_eq!(
+            observation_authority(Some(&fallback), target),
             Some(ObservationAuthority::NonMemberFallback)
         );
-        // Missing local yields the remote member directly.
-        let picked = select_authoritative(None, NodeId::from_u64(4), Some(member.clone()));
-        assert_eq!(picked, Some(member));
-    }
-
-    #[test]
-    fn learner_local_is_authoritative() {
-        // A learner (catching-up target) observes authoritatively: it is a
-        // real group participant, unlike an embryonic placeholder.
+        // A missing local yields the remote member directly.
+        assert_eq!(
+            select_authoritative(None, target, Some(member.clone())),
+            Some(member)
+        );
+        // A learner is a real participant: its view outranks a remote one.
         let learner = observed(&[1, 2, 3], &[4], Some(1));
         assert_eq!(
-            observation_authority(Some(&learner), NodeId::from_u64(4)),
+            observation_authority(Some(&learner), target),
             Some(ObservationAuthority::Member)
         );
-        let picked = select_authoritative(
-            Some(learner.clone()),
-            NodeId::from_u64(4),
-            Some(observed(&[1, 2, 3], &[], Some(2))),
+        assert_eq!(
+            select_authoritative(
+                Some(learner.clone()),
+                target,
+                Some(observed(&[1, 2, 3], &[], Some(2)))
+            ),
+            Some(learner)
         );
-        assert_eq!(picked, Some(learner));
     }
 }

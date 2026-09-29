@@ -8,7 +8,7 @@
 //!
 //! Current provider: the local filesystem under `<data-dir>/checkpoints`.
 //! Future providers (`NVMe` packs, object store, peer sources, coded
-//! storage) implement this same identity — hence the seam stays tiny:
+//! storage) implement this same identity - hence the seam stays tiny:
 //! hashes, kinds, and paths, never a storage framework.
 //!
 //! ```text
@@ -39,7 +39,7 @@ impl ArtifactHash {
     /// Hashes pre-image chunks incrementally (header identity plus body
     /// without concatenating them). Checkpoint content identities always
     /// cover the artifact's identity header (minus its CRC field) plus
-    /// the stored body — bodies alone do not identify an artifact (empty
+    /// the stored body - bodies alone do not identify an artifact (empty
     /// bands of different ids share an empty body).
     #[must_use]
     pub fn of_chunks(chunks: &[&[u8]]) -> Self {

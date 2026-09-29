@@ -2,7 +2,7 @@
 //!
 //! Committed entries flow through the existing deterministic state path: a
 //! `ReplicatedMutation` decodes to a `MutationEnvelope`, then to the shared
-//! `Mutation` IR, then through `ObjectStore::apply` — no second database
+//! `Mutation` IR, then through `ObjectStore::apply` - no second database
 //! implementation exists.
 //!
 //! ## `CommitPosition`
@@ -60,7 +60,7 @@
 //!
 //! Every applied command recomputes its outcome and compares it against the
 //! proposal's `expected`. A mismatch is state-machine divergence or
-//! corruption — never an ordinary client error — and surfaces as a storage
+//! corruption - never an ordinary client error - and surfaces as a storage
 //! `IO` error (which halts the `OpenRaft` node) plus a latched unhealthy
 //! flag the admin plane reports. The same holds for authority/namespace
 //! mismatches, expired identities at apply time (the leader's pre-proposal
@@ -70,7 +70,7 @@
 //! ## Snapshot substrate
 //!
 //! The snapshot is the Kivi checkpoint state in canonical bytes: objects,
-//! sessions, applied pointer, and membership — the same logical concepts
+//! sessions, applied pointer, and membership - the same logical concepts
 //! `LiveTablet` checkpoints, encoded here
 //! because this crate must not depend on the engine. Chunked roots snapshot
 //! as manifest references; bulk bytes stay in chunk packs.
@@ -125,7 +125,7 @@ pub const SESSION_OUTCOME_CAP: usize = 1024;
 /// Reserved identity for requests without a retry contract (embedded
 /// callers sharing fate with the process): session `0`, sequence `0`.
 /// Anonymous commands apply, verify, and advance `applied` exactly like
-/// identified ones but install no dedup entry — and every later anonymous
+/// identified ones but install no dedup entry - and every later anonymous
 /// command applies fresh rather than colliding on a shared fake identity.
 /// Client adapters must never issue session `0`.
 pub const ANONYMOUS_SESSION: u128 = 0;
@@ -138,8 +138,8 @@ const CONTROL_SNAPSHOT_MAGIC: u32 = 0x4353_564B;
 const CONTROL_SNAPSHOT_VERSION: u16 = 1;
 /// Applied-file framing magic (`KVSA`: Kivi state-machine applied).
 const APPLIED_MAGIC: u32 = 0x4153_564B;
-/// Snapshot framing version (v2 binds prepared intents to their write-set
-/// digests; v1 images are rejected loudly, never migrated).
+/// Snapshot framing version (prepared intents are bound to their write-set
+/// digests; any other version is rejected loudly).
 const SNAPSHOT_VERSION: u16 = 2;
 /// Applied-file framing version.
 const APPLIED_VERSION: u16 = 1;
@@ -330,7 +330,7 @@ pub enum ProposalGate {
 }
 
 /// Why state-machine application failed. Every variant is divergence,
-/// corruption, or I/O — never an ordinary client error.
+/// corruption, or I/O - never an ordinary client error.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum StateMachineFault {
@@ -437,7 +437,7 @@ pub enum StateMachineFault {
     /// A control-plane mutation was rejected at apply time (illegal
     /// lifecycle transition, unknown node/plan, or stale fenced
     /// generation). Stale generations are safe rejections, never
-    /// corruption — but they still fail the entry loudly so the
+    /// corruption - but they still fail the entry loudly so the
     /// divergence cannot commit silently.
     #[error("control mutation rejected at index {index}: {detail}")]
     ControlRejected {
@@ -516,12 +516,6 @@ impl ReplicatedTablet {
         self.tablet
     }
 
-    /// Returns the current authority triple.
-    #[must_use]
-    pub const fn authority(&self) -> TabletAuthority {
-        self.authority
-    }
-
     /// Returns the last applied pointer (`None` before the first apply).
     #[must_use]
     pub const fn applied(&self) -> Option<AppliedPointer> {
@@ -565,7 +559,7 @@ impl ReplicatedTablet {
 
     /// Approximate median split key of this replica. The ordered index is
     /// rebuilt first when disabled (same lazy rule as [`scan_local`](Self::scan_local)),
-    /// so a median is available whenever the tablet holds enough keys —
+    /// so a median is available whenever the tablet holds enough keys -
     /// split planning never observes a permanently unindexed tablet.
     #[must_use]
     pub fn median_split_key(&mut self) -> Option<kivi_state::Key> {
@@ -595,14 +589,8 @@ impl ReplicatedTablet {
         self.store.scan_range(spec, now)
     }
 
-    /// Prepared transaction intents currently reserving keys, in key order
-    /// (split/merge fencing and the resolver consult this).
-    #[must_use]
-    pub fn pending_intents(&self) -> Vec<kivi_state::TxnIntent> {
-        self.store.snapshot_intents()
-    }
-
     /// Number of prepared intents on this replica.
+    #[cfg(test)]
     #[must_use]
     pub fn pending_intent_count(&self) -> usize {
         self.store.pending_intent_count()
@@ -618,24 +606,13 @@ impl ReplicatedTablet {
         intents
     }
 
-    /// Installs one migrated intent verbatim (cutover path only).
-    pub fn restore_intent(&mut self, intent: kivi_state::TxnIntent) {
-        self.store.restore_intent(intent);
-    }
-
-    /// Returns one session's dedup state, if this replica has seen it.
-    #[must_use]
-    pub fn session(&self, session: SessionId) -> Option<&SessionState> {
-        self.sessions.get(&session)
-    }
-
     /// Exports a full copy of live objects plus all dedup sessions for
     /// topology copy (split/merge base). Objects are cheap clones
     /// (`Bytes` refcounts; chunked roots reference the same immutable
-    /// `ManifestId` — never a chunk copy). Callers partition objects by
-    /// [`PartitionHasher`](kivi_state::PartitionHasher); sessions copy
-    /// wholesale to every child (bounded, and required for exactly-once
-    /// retries across the cutover).
+    /// `ManifestId` - never a chunk copy). Callers partition objects by
+    /// [`route_hash`](kivi_state::route_hash), the same function every router
+    /// uses; sessions copy wholesale to every child (bounded, and required for
+    /// exactly-once retries across the cutover).
     #[must_use]
     pub fn export_topology_copy(&self) -> TopologyCopy {
         let objects = self.store.snapshot_entries();
@@ -787,7 +764,7 @@ impl ReplicatedTablet {
     /// # Errors
     ///
     /// Returns [`StateMachineFault`] on divergence, misrouting, expiry,
-    /// control rejection, or apply failure — all fail-loudly classes,
+    /// control rejection, or apply failure - all fail-loudly classes,
     /// never client errors.
     pub fn apply_entry(
         &mut self,
@@ -861,7 +838,7 @@ impl ReplicatedTablet {
             ConsensusCommand::ReadSync(sync) => {
                 // Lazy-ALR fence: ordering without mutation. The applied
                 // pointer advances (the caller in `apply_entry` records it),
-                // which is the entire effect — and exactly the effect the
+                // which is the entire effect - and exactly the effect the
                 // waiting batch needs. No objects, sessions, floors, or
                 // outcomes change, so there is nothing to verify and no
                 // dedup to install; a fence replays identically.
@@ -914,7 +891,7 @@ impl ReplicatedTablet {
         let session = identity.session();
         let seq = identity.seq();
         // Anonymous commands (reserved session/sequence zero: no retry
-        // contract) skip dedup entirely — lookup and install alike — so
+        // contract) skip dedup entirely - lookup and install alike - so
         // unrelated anonymous writes never alias one fake identity.
         if session.as_u128() == ANONYMOUS_SESSION && seq.as_u64() == 0 {
             return self.apply_fresh(index, command, envelope);
@@ -1337,8 +1314,8 @@ fn decode_membership(
         nodes.insert(id, BasicNode::new(addr.to_owned()));
     }
     let voter_set: BTreeSet<u64> = voters.into_iter().collect();
-    // The default (empty) membership is a real state — a fresh replica
-    // that never installed one — and must round-trip exactly. Strict
+    // The default (empty) membership is a real state - a fresh replica
+    // that never installed one - and must round-trip exactly. Strict
     // validation applies to non-empty memberships only.
     if voter_set.is_empty() && nodes.is_empty() {
         return Ok((openraft::StoredMembership::default(), at));
@@ -1490,8 +1467,8 @@ impl ReplicatedTablet {
     /// Encodes the framed snapshot image (transport + file bytes).
     ///
     /// The control group encodes replicated control state under its own
-    /// magic; tablet groups encode objects/sessions as before. The branch
-    /// is by group kind, so neither format ever aliases the other.
+    /// magic; tablet groups encode objects and sessions. The branch is by
+    /// group kind, so neither format ever aliases the other.
     #[must_use]
     pub fn encode_snapshot(&self) -> Vec<u8> {
         if self.is_control() {
@@ -1919,7 +1896,7 @@ fn encode_applied_body(
 /// ([`kivi_durability::fs::write_atomic_sync`]: sibling temp file, file
 /// sync, atomic rename, directory sync where the platform allows). A crash
 /// leaves the old complete image or the new complete image, never a torn
-/// one — so recovery treats any structural fault as corruption (loud),
+/// one - so recovery treats any structural fault as corruption (loud),
 /// never as a tail to repair. No second crash protocol is invented here.
 fn write_crash_safe(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     kivi_durability::fs::write_atomic_sync(path, bytes)
@@ -2083,7 +2060,7 @@ impl ReplicatedStateMachine {
         // The applied file additionally grounds membership when no
         // snapshot exists yet (fresh replica that applied entries but
         // never snapshotted): adopt its membership, never its objects
-        // (there are none durable outside snapshots — the log replays).
+        // (there are none durable outside snapshots - the log replays).
         if current_snapshot.is_none()
             && let Some(bytes) = applied_bytes
         {
@@ -2263,8 +2240,8 @@ impl ReplicatedStateMachine {
     }
 
     /// Returns a clone of the replicated control image (meaningful on
-    /// the control group; empty elsewhere). Read-only observers —
-    /// routing, admin, reconciler — use this; only committed control
+    /// the control group; empty elsewhere). Read-only observers -
+    /// routing, admin, reconciler - use this; only committed control
     /// entries mutate it.
     pub async fn tablet_control(&self) -> kivi_control::ControlState {
         self.shared.lock().await.tablet.control().clone()
@@ -2343,10 +2320,10 @@ impl ReplicatedStateMachine {
         inner.tablet.read_local(op, now)
     }
 
-    /// Arms fault injection for snapshot/install persistence (a
-    /// storage-health path): the next snapshot build or install fails its
-    /// durability barrier, latches unhealthy, and blocks purge. Test and
-    /// chaos hooks only; never armed in normal serving.
+    /// Arms fault injection for snapshot/install persistence: the next
+    /// snapshot build or install fails its durability barrier, latches
+    /// unhealthy, and blocks purge.
+    #[cfg(test)]
     pub async fn set_snapshot_write_failure(&self, fail: bool) {
         self.shared.lock().await.inject_snapshot_write_failure = fail;
     }
@@ -2371,8 +2348,6 @@ impl ReplicatedStateMachine {
             .collect()
     }
 
-    /// Marks the replica unhealthy with a latched detail (startup
-    /// verification found applied roots referencing missing sidecars).
     /// Reads fail closed; a later repair (sidecar fetch + re-verify, or a
     /// snapshot install carrying the missing bulk) heals via the snapshot
     /// path, which resets health on validated install. Never blocks
@@ -2461,7 +2436,7 @@ fn plan_seal(
 }
 
 /// Executes a seal plan on the calling thread: image file, then the
-/// applied file naming it, then the CURRENT switch — each crash-safe
+/// applied file naming it, then the CURRENT switch - each crash-safe
 /// (sibling temp file, file sync, atomic rename). A crash leaves the old
 /// complete image or the new complete image, never a torn one.
 fn execute_seal(plan: &SealPlan) -> Result<(), StateMachineFault> {
@@ -2528,14 +2503,7 @@ pub struct SealedSnapshotBuilder {
     data: Vec<u8>,
 }
 
-impl SealedSnapshotBuilder {
-    /// Returns the sealed snapshot metadata (base log id, membership,
-    /// checkpoint identity).
-    #[must_use]
-    pub const fn meta(&self) -> &SnapshotMetaOf<KiviTypeConfig> {
-        &self.meta
-    }
-}
+impl SealedSnapshotBuilder {}
 
 impl RaftSnapshotBuilder<KiviTypeConfig> for SealedSnapshotBuilder {
     type SnapshotData = Cursor<Vec<u8>>;
@@ -2583,7 +2551,7 @@ impl RaftStateMachine<KiviTypeConfig> for ReplicatedStateMachine {
         // The whole batch applies under one lock acquisition: apply is
         // pure in-memory work (no awaits inside), so the reactor never
         // stalls here. Each entry's response streams back through its
-        // `ApplyResponder` immediately — no `Vec` buffering — and
+        // `ApplyResponder` immediately - no `Vec` buffering - and
         // `client_write` on the leader resolves entry by entry.
         let mut inner = self.shared.lock().await;
         if !inner.healthy {
@@ -2843,15 +2811,12 @@ mod tests {
         TabletId, WallTimestamp, WriteGuardGeneration,
     };
     use openraft::storage::RaftStateMachine;
+    use std::future::Future;
 
-    use super::{
-        ReplicatedStateMachine, ReplicatedTablet, StateMachineFault, commit_of_index,
-        index_of_commit,
-    };
+    use super::{ReplicatedStateMachine, ReplicatedTablet, StateMachineFault, commit_of_index};
     use crate::config::KiviTypeConfig;
     use crate::mutation::{ReplicatedMutation, ReplicatedOutcome};
     use openraft::vote::RaftLeaderId as _;
-    use std::future::Future;
 
     const NS: NamespaceId = NamespaceId::from_u64(1);
     const TABLET: TabletId = TabletId::from_u64(9);
@@ -2885,6 +2850,36 @@ mod tests {
         ))
     }
 
+    /// A command carrying an explicit ack floor, so the entry advances the
+    /// replicated floor by a chosen amount.
+    fn command_with_floor(
+        session: u128,
+        seq: u64,
+        ack_floor: u64,
+        mutation: Mutation,
+        expected: OperationResult,
+    ) -> crate::command::ConsensusCommand {
+        let inner = crate::command::ConsensusCommand::Tablet(ReplicatedMutation::new(
+            MutationEnvelope::new(
+                NS,
+                authority(),
+                RequestIdentity::new(SessionId::from_u128(session), RequestSeq::from_u64(seq)),
+                None,
+                mutation,
+            ),
+            expected,
+            NOW,
+            RequestSeq::from_u64(0),
+        ));
+        let tablet = inner.as_tablet().expect("tablet command").clone();
+        crate::command::ConsensusCommand::Tablet(ReplicatedMutation::new(
+            tablet.envelope().clone(),
+            tablet.expected().clone(),
+            tablet.now(),
+            RequestSeq::from_u64(ack_floor),
+        ))
+    }
+
     fn log_id(index: u64) -> openraft::type_config::alias::LogIdOf<crate::config::KiviTypeConfig> {
         use openraft::impls::leader_id_adv::LeaderId;
         openraft::LogId::new(LeaderId::new(1, 1), index)
@@ -2899,25 +2894,6 @@ mod tests {
             .block_on(future)
     }
 
-    #[test]
-    fn commit_position_is_the_raft_index_plus_one() {
-        // Index 0 is a real entry; the +1 preserves UNASSIGNED.
-        assert_eq!(commit_of_index(0), kivi_types::CommitPosition::FIRST);
-        assert_eq!(
-            commit_of_index(41),
-            kivi_types::CommitPosition::from_u64(42)
-        );
-        assert_eq!(index_of_commit(kivi_types::CommitPosition::FIRST), Some(0));
-        assert_eq!(
-            index_of_commit(kivi_types::CommitPosition::from_u64(42)),
-            Some(41)
-        );
-        assert_eq!(
-            index_of_commit(kivi_types::CommitPosition::UNASSIGNED),
-            None
-        );
-    }
-
     /// Applies one command at `index`, panicking on divergence (test
     /// shorthand: every case below commits known-good history).
     fn apply(
@@ -2930,30 +2906,37 @@ mod tests {
             .expect("test history applies")
     }
 
+    fn delete(existed: bool) -> OperationResult {
+        OperationResult::Deleted { existed }
+    }
+
+    /// Transactional prepare/finalize: prepare reserves the key without
+    /// touching user state, a racing mutation against the reserved key is
+    /// refused, and finalize applies the write and releases the intent.
     #[test]
     fn apply_serves_transaction_prepare_and_finalize() {
         use kivi_state::{TxnExpect, TxnId, TxnWriteKind};
         let mut tablet = tablet();
         let txn = TxnId::derive(7, 1, 0);
-        // Prepare reserves without touching user state.
-        let prepare = Mutation::TxnPrepare {
-            txn,
-            coordinator: TABLET.as_u64(),
-            key: Key::from("k"),
-            expect: TxnExpect::Absent,
-            write: TxnWriteKind::Put(bytes::Bytes::from_static(b"v")),
-            digest: [0xD1; 32],
-        };
-        let outcome = apply(
+        apply(
             &mut tablet,
             0,
-            command(1, 1, prepare, OperationResult::TxnPrepared),
+            command(
+                1,
+                1,
+                Mutation::TxnPrepare {
+                    txn,
+                    coordinator: TABLET.as_u64(),
+                    key: Key::from("k"),
+                    expect: TxnExpect::Absent,
+                    write: TxnWriteKind::Put(bytes::Bytes::from_static(b"v")),
+                    digest: [0xD1; 32],
+                },
+                OperationResult::TxnPrepared,
+            ),
         );
-        let _ = outcome;
         assert_eq!(tablet.pending_intent_count(), 1);
         assert!(tablet.store().get(&Key::from("k"), NOW).is_none());
-        // A normal mutation against the reserved key diverges loudly at
-        // apply (prepare blocks it first on every honest path).
         assert!(
             tablet
                 .store
@@ -2964,22 +2947,26 @@ mod tests {
                     },
                     NOW,
                 )
-                .is_err()
+                .is_err(),
+            "a reserved key refuses a racing mutation"
         );
-        // Finalize-commit applies the prepared write.
-        let finalize = Mutation::TxnFinalize {
-            txn,
-            key: Key::from("k"),
-            commit: true,
-            digest: [0xD1; 32],
-        };
         apply(
             &mut tablet,
             1,
             command(
                 1,
                 2,
-                finalize,
+                Mutation::TxnFinalize {
+                    txn,
+                    key: Key::from("k"),
+                    commit: true,
+                    write: kivi_state::TxnWrite {
+                        key: Key::from("k"),
+                        kind: kivi_state::TxnWriteKind::CounterAdd(1),
+                        expect: kivi_state::TxnExpect::Absent,
+                    },
+                    digest: [0xD1; 32],
+                },
                 OperationResult::TxnFinalized {
                     applied: true,
                     version: Some(ObjectVersion::FIRST),
@@ -2990,6 +2977,9 @@ mod tests {
         assert!(tablet.store().get(&Key::from("k"), NOW).is_some());
     }
 
+    /// The snapshot is a persisted contract: prepared intents, the
+    /// ordered-index flag, and their re-encoded bytes all survive the
+    /// round trip, and a restore rebuilds the index exactly.
     #[test]
     fn snapshot_round_trips_intents_and_ordered_flag() {
         use kivi_state::{TxnExpect, TxnId, TxnWriteKind};
@@ -3018,311 +3008,64 @@ mod tests {
         assert!(decoded.ordered_index);
         assert_eq!(decoded.intents.len(), 1);
         assert_eq!(decoded.intents[0].id, txn);
-        // Install restores intents verbatim and rebuilds the index.
         let mut rebuilt = ReplicatedTablet::new(NS, TABLET, authority());
         rebuilt.install_decoded(decoded);
         assert!(rebuilt.ordered_index_enabled());
         assert_eq!(rebuilt.pending_intent_count(), 1);
         assert!(rebuilt.store.verify_ordered_index());
+        // Sorted, deterministic: re-encoding installed state is identical.
+        assert_eq!(rebuilt.encode_snapshot(), image);
     }
 
-    #[test]
-    fn scan_serves_ordered_pages_locally() {
-        use kivi_state::{ScanDirection, ScanProjection, ScanSpec};
-        let mut tablet = tablet();
-        apply(
-            &mut tablet,
-            0,
-            command(
-                1,
-                1,
-                Mutation::PutBytes {
-                    key: Key::from("b"),
-                    value: bytes::Bytes::from_static(b"2"),
-                },
-                OperationResult::Stored {
-                    version: ObjectVersion::FIRST,
-                },
-            ),
-        );
-        apply(
-            &mut tablet,
-            1,
-            command(
-                1,
-                2,
-                Mutation::PutBytes {
-                    key: Key::from("a"),
-                    value: bytes::Bytes::from_static(b"1"),
-                },
-                OperationResult::Stored {
-                    version: ObjectVersion::FIRST,
-                },
-            ),
-        );
-        let spec = ScanSpec::new(
-            None,
-            None,
-            ScanDirection::Forward,
-            100,
-            1 << 20,
-            ScanProjection::KeysOnly,
-        )
-        .expect("spec");
-        let page = tablet.scan_local(&spec, NOW).expect("scan");
-        assert!(page.exhausted);
-        assert_eq!(page.entries.len(), 2);
-        assert_eq!(page.entries[0].key, Key::from("a"));
-        assert!(tablet.store.verify_ordered_index());
-    }
-
-    #[test]
-    fn apply_serves_set_delete_and_reads() {
-        let mut tablet = tablet();
-        let outcome = apply(
-            &mut tablet,
-            0,
-            command(
-                1,
-                1,
-                Mutation::PutBytes {
-                    key: Key::from("k"),
-                    value: bytes::Bytes::from_static(b"v"),
-                },
-                OperationResult::Stored {
-                    version: ObjectVersion::FIRST,
-                },
-            ),
-        );
-        assert_eq!(
-            outcome,
-            ReplicatedOutcome::new(OperationResult::Stored {
-                version: ObjectVersion::FIRST,
-            })
-        );
-        assert_eq!(tablet.applied_commit(), commit_of_index(0));
-        let exists = tablet
-            .read_local(
-                &kivi_state::Operation::Exists {
-                    key: Key::from("k"),
-                },
-                NOW,
-            )
-            .expect("exists reads");
-        assert_eq!(exists, OperationResult::Exists(true));
-        let get = tablet
-            .read_local(
-                &kivi_state::Operation::Get {
-                    key: Key::from("k"),
-                },
-                NOW,
-            )
-            .expect("get reads");
-        assert_eq!(
-            get,
-            OperationResult::Value(Some(bytes::Bytes::from_static(b"v")))
-        );
-        let outcome = apply(
-            &mut tablet,
-            1,
-            command(
-                1,
-                2,
-                Mutation::Delete {
-                    key: Key::from("k"),
-                },
-                OperationResult::Deleted { existed: true },
-            ),
-        );
-        assert_eq!(
-            outcome,
-            ReplicatedOutcome::new(OperationResult::Deleted { existed: true })
-        );
-        assert_eq!(tablet.applied_commit(), commit_of_index(1));
-    }
-
-    #[test]
-    fn apply_serves_counter_expiry_and_conditional() {
-        let mut tablet = tablet();
-        apply(
-            &mut tablet,
-            0,
-            command(
-                7,
-                1,
-                Mutation::CounterAdd {
-                    key: Key::from("n"),
-                    delta: 41,
-                },
-                OperationResult::CounterUpdated {
-                    value: 41,
-                    version: ObjectVersion::FIRST,
-                },
-            ),
-        );
-        apply(
-            &mut tablet,
-            1,
-            command(
-                7,
-                2,
-                Mutation::SetExpiry {
-                    key: Key::from("n"),
-                    expiry: kivi_types::Expiry::at(WallTimestamp::from_micros(2_000_000)),
-                },
-                OperationResult::ExpirySet { applied: true },
-            ),
-        );
-        apply(
-            &mut tablet,
-            2,
-            command(
-                7,
-                3,
-                Mutation::SetExpiry {
-                    key: Key::from("n"),
-                    expiry: kivi_types::Expiry::NEVER,
-                },
-                OperationResult::ExpiryPersisted { removed: true },
-            ),
-        );
-        // Conditional SET arrives materialized (resolved expiry stamp).
-        apply(
-            &mut tablet,
-            3,
-            command(
-                8,
-                1,
-                Mutation::PutBytesWithExpiry {
-                    key: Key::from("c"),
-                    value: bytes::Bytes::from_static(b"v"),
-                    expiry: kivi_types::Expiry::NEVER,
-                },
-                OperationResult::ConditionalSet {
-                    applied: true,
-                    version: Some(ObjectVersion::FIRST),
-                },
-            ),
-        );
-        assert_eq!(tablet.applied_commit(), commit_of_index(3));
-    }
-
-    #[test]
-    fn apply_serves_splice_preserving_surroundings() {
-        let mut tablet = tablet();
-        apply(
-            &mut tablet,
-            0,
-            command(
-                8,
-                1,
-                Mutation::PutBytes {
-                    key: Key::from("s"),
-                    value: bytes::Bytes::from_static(b" offen"),
-                },
-                OperationResult::Stored {
-                    version: ObjectVersion::FIRST,
-                },
-            ),
-        );
-        // SETRANGE splice preserves bytes around the patch.
-        apply(
-            &mut tablet,
-            1,
-            command(
-                8,
-                2,
-                Mutation::SpliceBytes {
-                    key: Key::from("s"),
-                    offset: 0,
-                    patch: bytes::Bytes::from_static(b"c"),
-                },
-                OperationResult::Stored {
-                    version: ObjectVersion::from_u64(2),
-                },
-            ),
-        );
-        let get = tablet
-            .read_local(
-                &kivi_state::Operation::Get {
-                    key: Key::from("s"),
-                },
-                NOW,
-            )
-            .expect("reads spliced");
-        assert_eq!(
-            get,
-            OperationResult::Value(Some(bytes::Bytes::from_static(b"coffen")))
-        );
-        assert_eq!(tablet.applied_commit(), commit_of_index(1));
-    }
-
+    /// Same identity applied twice (the lost-response retry path) returns
+    /// the original outcome without executing twice, and the applied
+    /// cursor still advances over the dedup hit.
     #[test]
     fn same_identity_retry_returns_the_original_without_reexecuting() {
         let mut tablet = tablet();
-        let first = command(
-            0x5E55,
-            1,
-            Mutation::CounterAdd {
-                key: Key::from("n"),
-                delta: 1,
-            },
-            OperationResult::CounterUpdated {
-                value: 1,
-                version: ObjectVersion::FIRST,
-            },
-        );
-        let outcome = tablet
-            .apply_entry(log_id(0), &openraft::EntryPayload::Normal(first))
-            .expect("first applies");
-        assert_eq!(
-            outcome,
-            ReplicatedOutcome::new(OperationResult::CounterUpdated {
-                value: 1,
-                version: ObjectVersion::FIRST,
-            })
-        );
-        // Lost-response retry: the identical command commits again (new
-        // leader, new index) and must NOT execute twice.
-        let retry = command(
-            0x5E55,
-            1,
-            Mutation::CounterAdd {
-                key: Key::from("n"),
-                delta: 1,
-            },
-            OperationResult::CounterUpdated {
-                value: 1,
-                version: ObjectVersion::FIRST,
-            },
-        );
-        let outcome = tablet
-            .apply_entry(log_id(1), &openraft::EntryPayload::Normal(retry))
-            .expect("retry hits dedup");
-        assert_eq!(
-            outcome,
-            ReplicatedOutcome::new(OperationResult::CounterUpdated {
-                value: 1,
-                version: ObjectVersion::FIRST,
-            }),
-            "retry returns the original outcome"
-        );
-        // Counter proves single execution.
-        let get = tablet
-            .read_local(
-                &kivi_state::Operation::CounterGet {
+        let expected = OperationResult::CounterUpdated {
+            value: 1,
+            version: ObjectVersion::FIRST,
+        };
+        let add = || {
+            command(
+                0x5E55,
+                1,
+                Mutation::CounterAdd {
                     key: Key::from("n"),
+                    delta: 1,
                 },
-                NOW,
+                expected.clone(),
             )
-            .expect("reads");
-        assert_eq!(get, OperationResult::Counter(Some(1)));
-        // The applied cursor still advances over the dedup hit.
+        };
+        for index in 0..2 {
+            assert_eq!(
+                tablet
+                    .apply_entry(log_id(index), &openraft::EntryPayload::Normal(add()))
+                    .expect("retry hits dedup"),
+                ReplicatedOutcome::new(expected.clone())
+            );
+        }
+        // Counter proves single execution.
+        assert_eq!(
+            tablet
+                .read_local(
+                    &kivi_state::Operation::CounterGet {
+                        key: Key::from("n"),
+                    },
+                    NOW,
+                )
+                .expect("reads"),
+            OperationResult::Counter(Some(1))
+        );
         assert_eq!(tablet.applied_commit(), commit_of_index(1));
     }
 
+    /// A commit whose `expected` disagrees with deterministic apply, and
+    /// one whose identity sits at or below the replicated floor, are both
+    /// divergence: they halt the replica instead of committing silently.
     #[test]
-    fn verification_mismatch_fails_loudly() {
+    fn divergence_and_expired_identity_fail_loudly() {
         let mut tablet = tablet();
         let lying = command(
             1,
@@ -3343,62 +3086,48 @@ mod tests {
             matches!(fault, StateMachineFault::Divergence { .. }),
             "loud divergence, got {fault:?}"
         );
-    }
 
-    #[test]
-    fn expired_identity_at_apply_is_divergence() {
-        let mut tablet = tablet();
-        // Unknown sessions always admit (mirroring the single-node
-        // engine): the floor only constrains sessions the replica has
-        // actually seen.
-        let fresh = command(
-            1,
-            1,
-            Mutation::Delete {
-                key: Key::from("k"),
-            },
-            OperationResult::Deleted { existed: false },
+        // A second replica walks the floor: an unknown session admits
+        // (the floor only constrains sessions the replica has seen), an
+        // ack advances it, and a later entry below the floor is divergence
+        // (the leader's pre-proposal check would have rejected it).
+        let mut other = ReplicatedTablet::new(NS, TABLET, authority());
+        apply(
+            &mut other,
+            0,
+            command_with_floor(
+                1,
+                1,
+                1,
+                Mutation::Delete {
+                    key: Key::from("k"),
+                },
+                delete(false),
+            ),
         );
-        let fresh_inner = fresh.as_tablet().expect("tablet command").clone();
-        let fresh = crate::command::ConsensusCommand::Tablet(ReplicatedMutation::new(
-            fresh_inner.envelope().clone(),
-            fresh_inner.expected().clone(),
-            fresh_inner.now(),
-            RequestSeq::from_u64(1),
-        ));
-        tablet
-            .apply_entry(log_id(0), &openraft::EntryPayload::Normal(fresh))
-            .expect("unknown session admits");
-        // Advance the session floor past sequence 3 with an ack: a later
-        // committed entry for sequence 3 means floor divergence (the
-        // leader's pre-proposal check would have rejected it).
-        let advance = command(
+        apply(
+            &mut other,
             1,
-            5,
-            Mutation::Delete {
-                key: Key::from("k"),
-            },
-            OperationResult::Deleted { existed: false },
+            command_with_floor(
+                1,
+                5,
+                4,
+                Mutation::Delete {
+                    key: Key::from("k"),
+                },
+                delete(false),
+            ),
         );
-        let advance_inner = advance.as_tablet().expect("tablet command").clone();
-        let advance = crate::command::ConsensusCommand::Tablet(ReplicatedMutation::new(
-            advance_inner.envelope().clone(),
-            advance_inner.expected().clone(),
-            advance_inner.now(),
-            RequestSeq::from_u64(4),
-        ));
-        tablet
-            .apply_entry(log_id(1), &openraft::EntryPayload::Normal(advance))
-            .expect("floor advances");
-        let stale = command(
+        let stale = command_with_floor(
             1,
             3,
+            0,
             Mutation::Delete {
                 key: Key::from("k"),
             },
-            OperationResult::Deleted { existed: false },
+            delete(false),
         );
-        let fault = tablet
+        let fault = other
             .apply_entry(log_id(2), &openraft::EntryPayload::Normal(stale))
             .expect_err("expired identity fails");
         assert!(
@@ -3407,26 +3136,26 @@ mod tests {
         );
     }
 
+    /// A committed envelope naming a foreign tablet or a superseded epoch
+    /// never cross-installs: both fail loudly.
     #[test]
     fn misrouted_and_stale_envelopes_fail() {
         let mut tablet = tablet();
-        // Foreign tablet.
-        let foreign_authority = TabletAuthority::new(
-            TabletId::from_u64(10),
-            TabletEpoch::INITIAL,
-            WriteGuardGeneration::INITIAL,
-        );
         let foreign = crate::command::ConsensusCommand::Tablet(ReplicatedMutation::new(
             MutationEnvelope::new(
                 NS,
-                foreign_authority,
+                TabletAuthority::new(
+                    TabletId::from_u64(10),
+                    TabletEpoch::INITIAL,
+                    WriteGuardGeneration::INITIAL,
+                ),
                 RequestIdentity::new(SessionId::from_u128(1), RequestSeq::from_u64(1)),
                 None,
                 Mutation::Delete {
                     key: Key::from("k"),
                 },
             ),
-            OperationResult::Deleted { existed: false },
+            delete(false),
             NOW,
             RequestSeq::from_u64(0),
         ));
@@ -3434,23 +3163,21 @@ mod tests {
             tablet.apply_entry(log_id(0), &openraft::EntryPayload::Normal(foreign)),
             Err(StateMachineFault::Misrouted { .. })
         ));
-        // Stale epoch on the right tablet.
-        let stale_authority = TabletAuthority::new(
-            TABLET,
-            TabletEpoch::from_u64(999),
-            WriteGuardGeneration::INITIAL,
-        );
         let stale = crate::command::ConsensusCommand::Tablet(ReplicatedMutation::new(
             MutationEnvelope::new(
                 NS,
-                stale_authority,
+                TabletAuthority::new(
+                    TABLET,
+                    TabletEpoch::from_u64(999),
+                    WriteGuardGeneration::INITIAL,
+                ),
                 RequestIdentity::new(SessionId::from_u128(1), RequestSeq::from_u64(2)),
                 None,
                 Mutation::Delete {
                     key: Key::from("k"),
                 },
             ),
-            OperationResult::Deleted { existed: false },
+            delete(false),
             NOW,
             RequestSeq::from_u64(0),
         ));
@@ -3460,13 +3187,17 @@ mod tests {
         ));
     }
 
+    /// Blank and membership entries carry no client outcome but still
+    /// advance the applied pointer and install membership.
     #[test]
-    fn blank_and_membership_entries_advance_applied_without_outcomes() {
+    fn non_command_entries_advance_applied_without_outcomes() {
         let mut tablet = tablet();
-        let blank = tablet
-            .apply_entry(log_id(0), &openraft::EntryPayload::Blank)
-            .expect("blank applies");
-        assert_eq!(blank, ReplicatedOutcome::none());
+        assert_eq!(
+            tablet
+                .apply_entry(log_id(0), &openraft::EntryPayload::Blank)
+                .expect("blank applies"),
+            ReplicatedOutcome::none()
+        );
         let membership = openraft::Membership::new(
             vec![BTreeSet::from([1u64, 2, 3])],
             BTreeMap::from([
@@ -3476,13 +3207,19 @@ mod tests {
             ]),
         )
         .expect("test membership validates");
-        let installed = tablet
-            .apply_entry(log_id(1), &openraft::EntryPayload::Membership(membership))
-            .expect("membership installs");
-        assert_eq!(installed, ReplicatedOutcome::none());
+        assert_eq!(
+            tablet
+                .apply_entry(log_id(1), &openraft::EntryPayload::Membership(membership))
+                .expect("membership installs"),
+            ReplicatedOutcome::none()
+        );
         assert_eq!(tablet.applied_commit(), commit_of_index(1));
+        assert!(tablet.membership_voters().contains(&1));
     }
 
+    /// The persisted snapshot contract end to end: applied pointer,
+    /// dedup sessions, and membership round-trip, re-encode byte for
+    /// byte, and a foreign identity or a damaged byte refuses to install.
     #[test]
     fn snapshot_images_round_trip_with_dedup_and_membership() {
         let mut tablet = tablet();
@@ -3501,36 +3238,33 @@ mod tests {
         tablet
             .apply_entry(log_id(1), &openraft::EntryPayload::Membership(membership))
             .expect("membership");
-        let set = command(
-            1,
-            1,
-            Mutation::PutBytes {
-                key: Key::from("k"),
-                value: bytes::Bytes::from_static(b"v"),
-            },
-            OperationResult::Stored {
-                version: ObjectVersion::FIRST,
-            },
+        apply(
+            &mut tablet,
+            2,
+            command(
+                1,
+                1,
+                Mutation::PutBytes {
+                    key: Key::from("k"),
+                    value: bytes::Bytes::from_static(b"v"),
+                },
+                OperationResult::Stored {
+                    version: ObjectVersion::FIRST,
+                },
+            ),
         );
-        tablet
-            .apply_entry(log_id(2), &openraft::EntryPayload::Normal(set))
-            .expect("set");
         let image = tablet.encode_snapshot();
         let decoded = ReplicatedTablet::decode_snapshot(&image, NS, TABLET).expect("decodes");
         assert_eq!(decoded.applied.map(|pointer| pointer.index), Some(2));
         assert_eq!(decoded.objects.len(), 1);
         assert_eq!(decoded.sessions.len(), 1);
-        // Re-encoding the installed state is byte-identical (sorted,
-        // deterministic).
         let mut rebuilt = ReplicatedTablet::new(NS, TABLET, authority());
         rebuilt.install_decoded(decoded);
         assert_eq!(rebuilt.encode_snapshot(), image);
-        // Foreign identity fails loudly, never cross-installs.
         assert!(matches!(
             ReplicatedTablet::decode_snapshot(&image, NS, TabletId::from_u64(10)),
             Err(StateMachineFault::Misrouted { .. })
         ));
-        // Corrupt bytes fail loudly.
         let mut damaged = image.clone();
         damaged[10] ^= 0xFF;
         assert!(
@@ -3604,22 +3338,24 @@ mod tests {
             counter_entry(3, 2, 20, 30, 2),
         ];
         apply_all(&mut sm, writes).await;
-        let get = sm
-            .read_local(
+        assert_eq!(
+            sm.read_local(
                 &kivi_state::Operation::CounterGet {
                     key: Key::from("n"),
                 },
                 NOW,
             )
             .await
-            .expect("seeded state reads");
-        assert_eq!(get, OperationResult::Counter(Some(30)));
+            .expect("seeded state reads"),
+            OperationResult::Counter(Some(30))
+        );
         sm
     }
 
-    /// Applies through the trait surface and seals a snapshot base.
+    /// Sealing reports the applied base, and reopen replays the retained
+    /// tail exactly once on top of it.
     #[test]
-    fn state_machine_applies_and_seals_snapshot() {
+    fn state_machine_recovers_through_snapshot_plus_replay() {
         block_on(async {
             let dir = tempfile::tempdir().expect("scratch");
             let mut sm = seeded_counter_sm(&dir).await;
@@ -3629,17 +3365,6 @@ mod tests {
             let builder = sm.get_snapshot_builder().await;
             assert_eq!(builder.meta.last_log_id.map(|id| id.index), Some(3));
             assert_eq!(sm.snapshotted_index().await, Some(3));
-        });
-    }
-
-    /// Reopen reports the snapshot base; the retained tail replays exactly
-    /// once and replicas converge.
-    #[test]
-    fn state_machine_recovers_through_snapshot_plus_replay() {
-        block_on(async {
-            let dir = tempfile::tempdir().expect("scratch");
-            let mut sm = seeded_counter_sm(&dir).await;
-            let _sealed = sm.get_snapshot_builder().await;
             apply_all(&mut sm, vec![counter_entry(4, 3, 5, 35, 3)]).await;
             drop(sm);
             // Reopen: base 3 durable, tail (4) replays from the log.
@@ -3649,16 +3374,18 @@ mod tests {
             assert_eq!(applied.map(|id| id.index), Some(3));
             assert!(membership.membership().voter_ids().any(|id| id == 1));
             apply_all(&mut reopened, vec![counter_entry(4, 3, 5, 35, 3)]).await;
-            let get = reopened
-                .read_local(
-                    &kivi_state::Operation::CounterGet {
-                        key: Key::from("n"),
-                    },
-                    NOW,
-                )
-                .await
-                .expect("converged");
-            assert_eq!(get, OperationResult::Counter(Some(35)));
+            assert_eq!(
+                reopened
+                    .read_local(
+                        &kivi_state::Operation::CounterGet {
+                            key: Key::from("n"),
+                        },
+                        NOW,
+                    )
+                    .await
+                    .expect("converged"),
+                OperationResult::Counter(Some(35))
+            );
         });
     }
 
@@ -3706,29 +3433,34 @@ mod tests {
             .expect("removes CURRENT");
             let mut reopened =
                 ReplicatedStateMachine::open(dir.path(), NS, TABLET, authority()).expect("reopens");
-            let (applied, _) = reopened.applied_state().await.expect("applied");
-            assert_eq!(applied.map(|id| id.index), Some(0));
-            let get = reopened
-                .read_local(
-                    &kivi_state::Operation::Get {
-                        key: Key::from("k"),
-                    },
-                    NOW,
-                )
-                .await
-                .expect("adopted image serves");
             assert_eq!(
-                get,
+                reopened
+                    .applied_state()
+                    .await
+                    .expect("applied")
+                    .0
+                    .map(|id| id.index),
+                Some(0)
+            );
+            assert_eq!(
+                reopened
+                    .read_local(
+                        &kivi_state::Operation::Get {
+                            key: Key::from("k"),
+                        },
+                        NOW,
+                    )
+                    .await
+                    .expect("adopted image serves"),
                 OperationResult::Value(Some(bytes::Bytes::from_static(b"v")))
             );
         });
     }
 
-    /// Fault injection: a failed snapshot barrier latches unhealthy with
-    /// its detail; reads fail closed; a validated install heals the
-    /// machine.
+    /// A failed snapshot barrier latches unhealthy and fails reads closed;
+    /// a validated install heals the machine.
     #[test]
-    fn snapshot_failure_poisions_and_install_heals() {
+    fn snapshot_failure_poisons_and_install_heals() {
         use openraft::Entry;
         use openraft::impls::leader_id_adv::LeaderId;
 

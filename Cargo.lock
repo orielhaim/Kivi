@@ -18,6 +18,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "ahash"
+version = "0.8.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
+dependencies = [
+ "cfg-if",
+ "getrandom 0.3.4",
+ "once_cell",
+ "version_check",
+ "zerocopy",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1833,6 +1846,7 @@ dependencies = [
  "openraft-multi",
  "openraft-rt-compio",
  "rcgen",
+ "rstest",
  "rustls",
  "sysinfo",
  "tempfile",
@@ -1948,6 +1962,7 @@ dependencies = [
  "kivi-tablet",
  "kivi-types",
  "redis",
+ "rstest",
  "serde",
  "serde_json",
  "tempfile",
@@ -1968,9 +1983,14 @@ dependencies = [
  "kivi-types",
  "lz4_flex",
  "proptest",
+ "rstest",
  "tempfile",
  "thiserror",
 ]
+
+[[package]]
+name = "kivi-microscope"
+version = "0.1.0"
 
 [[package]]
 name = "kivi-observation"
@@ -2005,7 +2025,6 @@ dependencies = [
  "divan",
  "futures",
  "kivi-codec",
- "kivi-observation",
  "kivi-types",
  "proptest",
  "reed-solomon-simd",
@@ -2027,6 +2046,7 @@ dependencies = [
  "kivi-types",
  "proptest",
  "redis-protocol",
+ "rstest",
  "thiserror",
 ]
 
@@ -2089,6 +2109,7 @@ dependencies = [
 name = "kivi-state"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "bitflags 2.13.2",
  "blake3",
  "bytes",
@@ -2097,7 +2118,9 @@ dependencies = [
  "kivi-codec",
  "kivi-types",
  "proptest",
+ "rstest",
  "thiserror",
+ "twox-hash",
 ]
 
 [[package]]
@@ -2113,7 +2136,20 @@ name = "kivi-types"
 version = "0.1.0"
 dependencies = [
  "jiff",
+ "rstest",
  "thiserror",
+]
+
+[[package]]
+name = "kivi-wirelab"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "compio",
+ "kivi-core",
+ "kivi-resp",
+ "kivi-state",
+ "kivi-types",
 ]
 
 [[package]]
@@ -4225,9 +4261,9 @@ dependencies = [
 
 [[package]]
 name = "xxhash-rust"
-version = "0.8.18"
+version = "0.8.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aee1b19627c7c60102ab80d3a9cbe18de90bfe03bfa6c3715447681f0e8c8af6"
+checksum = "550a2b930b62486a393c52d5c3b84bff264b28aa437ed64694d31e93b1757af7"
 
 [[package]]
 name = "yasna"

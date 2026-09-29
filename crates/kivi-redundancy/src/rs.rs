@@ -1,36 +1,18 @@
 //! Reed-Solomon provider: production coding mechanism, Kivi-owned semantics.
 //!
-//! # Ecosystem selection and benchmarks
+//! The kernel is `reed-solomon-simd` (pure Rust, runtime SIMD selection,
+//! no C toolchain). Its types do not leak outside this module: Kivi owns
+//! everything around them - [`RsParams`] validation, shard padding and
+//! truncation, fragment identity and hashes, durable metadata, placement,
+//! verification, and repair scheduling.
 //!
-//! Inspected September 2026:
+//! # A successful decode is never sufficient
 //!
-//! * `reed-solomon-erasure` v6.0.0 — classic Klaus-Post port, 5.9M downloads,
-//!   MIT, `galois_8`/`galois_16` backends, optional `simd-accel` via bundled
-//!   C kernels tuned for Haswell+ (`RUST_REED_SOLOMON_ERASURE_ARCH`). Last
-//!   release 2022 (stale), C toolchain dependency, published ~1.1 GiB/s
-//!   encode on Sia's 10+20/4 MiB bench vs 22–28 GiB/s for modern SIMD ports.
-//! * `reed-solomon-simd` v3.1.0 — Leopard-RS port, pure Rust, runtime SIMD
-//!   selection (SSSE3/AVX2/NEON + scalar fallback), `O(n log n)`, 2M
-//!   downloads, maintained (2025, MSRV 1.82), MIT+BSD. Published 4.8–10 GiB/s
-//!   encode and fastest decode in its `quick-comparison` vs
-//!   `reed-solomon-16`, `reed-solomon-erasure`, `novelpoly`, `leopard-codec`.
-//! * `sia_reed_solomon` (Aug 2026) — new Klaus-Post SIMD port, WASM-SIMD,
-//!   wire-compatible, 6–25x faster than `reed-solomon-erasure`, but weeks old
-//!   and browser-focused: too new for a durability baseline.
-//!
-//! Selected: `reed-solomon-simd`. Pure Rust (no C), actively maintained,
-//! fastest maintained option, huge width support (we bound it down), even
-//! shard sizes with 64-byte-multiple cross-version compatibility — which is
-//! exactly what [`crate::RsParams`] (`V1`, 64-byte-aligned shards) encodes.
-//! Local `benches/redundancy.rs` re-measures encode/decode on this machine
-//! for representative Kivi asset sizes.
-//!
-//! Kivi owns everything around the kernels: [`RsParams`] validation, shard
-//! padding/truncation, fragment identity/hashes, durable metadata, placement,
-//! verification (a successful decode is never sufficient — bytes are
-//! content-hash verified against [`crate::InformationAsset`] before
-//! publication), and repair scheduling. No `reed-solomon-simd` type leaks
-//! outside this module.
+//! Decoding proves the shards are consistent, not that they are the right
+//! bytes. Every reconstruction is content-hash verified against
+//! [`crate::InformationAsset`] before publication, so a shard set from a
+//! different generation or a corrupted-but-consistent set fails loudly
+//! instead of installing wrong data.
 
 use crate::{RedundancyError, RsParams};
 
@@ -110,7 +92,7 @@ pub fn encode(bytes: &[u8], params: RsParams) -> Result<Vec<Vec<u8>>, Redundancy
 /// `present` maps shard index → shard bytes (each `fragment_len`); at least
 /// `data` entries must be present. Returns the truncated logical bytes
 /// (`logical_len`); the caller must content-verify them against the asset id
-/// before publication — a successful decode alone proves nothing.
+/// before publication - a successful decode alone proves nothing.
 ///
 /// # Errors
 ///
@@ -150,11 +132,6 @@ pub fn decode(
     // Partition into original vs recovery by index.
     let mut original: Vec<(usize, &[u8])> = Vec::new();
     let mut recovery: Vec<(usize, &[u8])> = Vec::new();
-    for (index, bytes) in present.iter().take(usize::from(params.data)) {
-        // `take(data)` is enough: the decoder needs any `data` shards, and
-        // the first `data` present suffice (MDS threshold, exact).
-        let _ = (index, bytes);
-    }
     for (index, bytes) in present {
         let idx = *index as usize;
         if idx < params.data as usize {
@@ -163,7 +140,7 @@ pub fn decode(
             recovery.push((idx - params.data as usize, bytes.as_slice()));
         }
     }
-    // Fast path: all data shards present — concatenate, no decode.
+    // Fast path: all data shards present - concatenate, no decode.
     if original.len() == params.data as usize {
         let mut by_index = original;
         by_index.sort_by_key(|(i, _)| *i);

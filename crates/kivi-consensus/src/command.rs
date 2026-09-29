@@ -177,18 +177,6 @@ pub enum ConsensusCommandError {
 }
 
 impl ConsensusCommand {
-    /// Wraps a tablet command.
-    #[must_use]
-    pub const fn tablet(command: ReplicatedMutation) -> Self {
-        Self::Tablet(command)
-    }
-
-    /// Wraps a control mutation.
-    #[must_use]
-    pub const fn control(mutation: kivi_control::ControlMutation) -> Self {
-        Self::Control(mutation)
-    }
-
     /// Returns the tablet command, if this is one.
     #[must_use]
     pub const fn as_tablet(&self) -> Option<&ReplicatedMutation> {
@@ -205,24 +193,6 @@ impl ConsensusCommand {
             Self::Tablet(_) | Self::ReadSync(_) => None,
             Self::Control(mutation) => Some(mutation),
         }
-    }
-
-    /// Whether this is a tablet command.
-    #[must_use]
-    pub const fn is_tablet(&self) -> bool {
-        matches!(self, Self::Tablet(_))
-    }
-
-    /// Whether this is a control mutation.
-    #[must_use]
-    pub const fn is_control(&self) -> bool {
-        matches!(self, Self::Control(_))
-    }
-
-    /// Whether this is a Lazy-ALR read fence.
-    #[must_use]
-    pub const fn is_read_sync(&self) -> bool {
-        matches!(self, Self::ReadSync(_))
     }
 
     /// Returns the read fence, if this is one.
@@ -362,30 +332,53 @@ mod tests {
         ))
     }
 
+    /// Both families survive the envelope: the inner body is
+    /// self-framed, the tag selects its decoder, and a fence is never
+    /// mistaken for a write (distinct tag, exact body).
     #[test]
-    fn tablet_command_round_trips_through_envelope() {
-        let command = tablet_command();
-        let back = ConsensusCommand::decode_exact(&command.encode_to_vec()).expect("decodes");
-        assert_eq!(back, command);
-        assert!(back.is_tablet());
-        assert!(back.as_tablet().is_some());
+    fn commands_round_trip_through_the_envelope() {
+        for command in [tablet_command(), fence_command()] {
+            let back = ConsensusCommand::decode_exact(&command.encode_to_vec()).expect("decodes");
+            assert_eq!(back, command);
+        }
+        let fence = fence_command();
+        assert!(fence.as_read_sync().is_some());
+        assert!(fence.as_tablet().is_none());
+        assert!(fence.as_control().is_none());
     }
 
+    /// A truncated body, an unknown outer version, an unknown tag, and a
+    /// version-skewed fence body all refuse loudly instead of misreading
+    /// positions.
     #[test]
-    fn corrupt_envelope_fails() {
-        let good = tablet_command().encode_to_vec();
-        assert!(ConsensusCommand::decode_exact(&good[..2]).is_err());
-        let mut versioned = good.clone();
+    fn corrupt_envelopes_fail_loudly() {
+        let tablet = tablet_command().encode_to_vec();
+        assert!(ConsensusCommand::decode_exact(&tablet[..2]).is_err());
+        let mut versioned = tablet.clone();
         versioned[0] = versioned[0].wrapping_add(1);
         assert!(matches!(
             ConsensusCommand::decode_exact(&versioned),
             Err(ConsensusCommandError::UnsupportedVersion { .. })
         ));
-        let mut tagged = good;
+        let mut tagged = tablet;
         tagged[2] = 0x7F;
         assert!(matches!(
             ConsensusCommand::decode_exact(&tagged),
             Err(ConsensusCommandError::BadTag { .. })
+        ));
+
+        let fence = fence_command().encode_to_vec();
+        assert!(ConsensusCommand::decode_exact(&fence[..10]).is_err());
+        // Inner fence version bump: the outer tag decodes, the body
+        // refuses rather than misreading positions.
+        let mut skewed = fence.clone();
+        skewed[3] = skewed[3].wrapping_add(1);
+        assert!(ConsensusCommand::decode_exact(&skewed).is_err());
+        let mut trailing = fence;
+        trailing.push(0x00);
+        assert!(matches!(
+            ConsensusCommand::decode_exact(&trailing),
+            Err(ConsensusCommandError::BadSync { .. })
         ));
     }
 
@@ -395,39 +388,5 @@ mod tests {
             AlrFence::new(TabletId::from_u64(9), 17, NodeId::from_u64(2)),
             CommitPosition::from_u64(41),
         ))
-    }
-
-    #[test]
-    fn fence_round_trips_and_names_its_kind() {
-        let command = fence_command();
-        assert!(command.is_read_sync());
-        assert!(!command.is_tablet());
-        assert!(!command.is_control());
-        assert_eq!(
-            command.as_read_sync().expect("fence").formation_applied,
-            kivi_types::CommitPosition::from_u64(41)
-        );
-        let back = ConsensusCommand::decode_exact(&command.encode_to_vec()).expect("decodes");
-        assert_eq!(back, command);
-        // A fence is never mistaken for a write by an old or partial
-        // decoder: distinct tag, exact body.
-        assert!(back.as_tablet().is_none());
-    }
-
-    #[test]
-    fn fence_rejects_short_and_versioned_bodies() {
-        let good = fence_command().encode_to_vec();
-        assert!(ConsensusCommand::decode_exact(&good[..10]).is_err());
-        let mut versioned = good.clone();
-        // Inner fence version bump: the outer tag decodes, the body
-        // refuses loudly instead of misreading positions.
-        versioned[3] = versioned[3].wrapping_add(1);
-        assert!(ConsensusCommand::decode_exact(&versioned).is_err());
-        let mut trailing = good;
-        trailing.push(0x00);
-        assert!(matches!(
-            ConsensusCommand::decode_exact(&trailing),
-            Err(ConsensusCommandError::BadSync { .. })
-        ));
     }
 }

@@ -1,7 +1,7 @@
 //! Native message semantics: opcodes, handshake, requests, responses.
 //!
 //! Every type here has a fixed wire encoding (little-endian integers,
-//! length-prefixed blobs, versioned tags) implemented by hand — never
+//! length-prefixed blobs, versioned tags) implemented by hand - never
 //! derived struct layout, never enum discriminants. Decoding translates
 //! immediately into project-owned domain types ([`Operation`],
 //! [`PartitionRange`], tablet identities); this crate never redefines what
@@ -349,7 +349,7 @@ pub enum Status {
     StaleToken = 21,
     /// A strong write committed internally but responder coverage could
     /// not be established, so it was not acknowledged as complete: the
-    /// outcome is uncertain — it may have applied. Never transparently
+    /// outcome is uncertain - it may have applied. Never transparently
     /// retried (that would double-apply anonymous non-idempotent writes);
     /// identified writes may re-drive under the same identity, everyone
     /// else must read-verify before retrying.
@@ -504,7 +504,7 @@ impl core::fmt::Display for RequestId {
 }
 
 /// Optional client route hint: where the client believes the authority is.
-/// The server revalidates against its immutable snapshot on every request —
+/// The server revalidates against its immutable snapshot on every request -
 /// hints accelerate, never authorize.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RouteHint {
@@ -816,9 +816,15 @@ pub struct Request {
     pub batch_writes: Vec<BatchWrite>,
     /// Coordinator tablet for one prepare (`TxnPrepare` only).
     pub txn_coordinator: u64,
-    /// Whether to apply (`true`) or discard (`false`) the intent
+    /// Whether to apply (`true`) or discard (`false`) the write
     /// (`TxnFinalize` only).
     pub txn_commit: bool,
+    /// The write this finalize resolves, as a one-entry tail exactly as
+    /// `TxnPrepare` carries its own.
+    ///
+    /// Required rather than optional: a finalize that does not name its write
+    /// cannot become a self-contained log entry, so a request omitting it is
+    /// refused rather than completed with a guess.
     /// Digest over the full transaction write set (`TxnPrepare` /
     /// `TxnFinalize`): binds the step to the exact transaction, so a
     /// conflicting driver under one `TxnId` is rejected, never mixed in.
@@ -919,69 +925,31 @@ impl Request {
             }
             Opcode::Scan | Opcode::AtomicBatch => return None,
             Opcode::TxnPrepare => {
-                if self.batch_writes.len() != 1 {
-                    return None;
-                }
-                let write = &self.batch_writes[0];
-                let kind = match write.kind {
-                    BATCH_PUT => {
-                        kivi_state::TxnWriteKind::Put(bytes::Bytes::from(write.value.clone()))
-                    }
-                    BATCH_DELETE => kivi_state::TxnWriteKind::Delete,
-                    BATCH_COUNTER_ADD => kivi_state::TxnWriteKind::CounterAdd(write.delta),
-                    BATCH_PUT_CHUNKED => {
-                        if write.value.len() != 40 {
-                            return None;
-                        }
-                        let mut manifest = [0u8; 32];
-                        manifest.copy_from_slice(&write.value[..32]);
-                        let mut len = [0u8; 8];
-                        len.copy_from_slice(&write.value[32..]);
-                        kivi_state::TxnWriteKind::PutChunked {
-                            manifest: kivi_types::ManifestId::from_bytes(manifest),
-                            logical_len: u64::from_le_bytes(len),
-                        }
-                    }
-                    BATCH_COMMUTATIVE_ADD => kivi_state::TxnWriteKind::CommutativeAdd(write.delta),
-                    BATCH_BOUNDED_ADD => kivi_state::TxnWriteKind::BoundedAdd(write.delta),
-                    BATCH_ESCROW_SHARE => {
-                        if write.value.len() != 16 {
-                            return None;
-                        }
-                        let mut min = [0u8; 8];
-                        let mut max = [0u8; 8];
-                        min.copy_from_slice(&write.value[..8]);
-                        max.copy_from_slice(&write.value[8..]);
-                        kivi_state::TxnWriteKind::EscrowSetShare {
-                            min: i64::from_le_bytes(min),
-                            max: i64::from_le_bytes(max),
-                        }
-                    }
-                    _ => return None,
-                };
-                let expect = match write.expect {
-                    BATCH_EXPECT_ABSENT => kivi_state::TxnExpect::Absent,
-                    BATCH_EXPECT_VERSION => kivi_state::TxnExpect::Version(
-                        kivi_state::ObjectVersion::from_u64(write.expect_version),
-                    ),
-                    _ => kivi_state::TxnExpect::Any,
-                };
+                let write = single_batch_write(&self.batch_writes)?;
+                let kind = batch_write_kind(write)?;
                 return Some(Operation::TxnPrepare {
                     txn: kivi_state::TxnId::from_bytes(self.batch_txn),
                     coordinator: TabletId::from_u64(self.txn_coordinator),
                     write: kivi_state::TxnWrite {
                         key: Key::from(write.key.clone()),
                         kind,
-                        expect,
+                        expect: batch_write_expect(write),
                     },
                     digest: self.txn_digest,
                 });
             }
             Opcode::TxnFinalize => {
+                let write = single_batch_write(&self.batch_writes)?;
+                let kind = batch_write_kind(write)?;
                 return Some(Operation::TxnFinalize {
                     txn: kivi_state::TxnId::from_bytes(self.batch_txn),
                     key,
                     commit: self.txn_commit,
+                    write: kivi_state::TxnWrite {
+                        key: Key::from(write.key.clone()),
+                        kind,
+                        expect: batch_write_expect(write),
+                    },
                     digest: self.txn_digest,
                 });
             }
@@ -1265,7 +1233,7 @@ pub enum ResponseBody {
         tablet: u64,
     },
     /// Commutative addition applied (pairs with `CommutativeAdd`): no
-    /// ordinal, by design — permutations are indistinguishable.
+    /// ordinal, by design - permutations are indistinguishable.
     CommutativeApplied,
     /// Commutative counter sum (pairs with `CommutativeGet`).
     CommutativeValue(i64),
@@ -1813,6 +1781,22 @@ impl Request {
                 out.extend_from_slice(&self.batch_txn);
                 push_u8(&mut out, u8::from(self.txn_commit));
                 out.extend_from_slice(&self.txn_digest);
+                // The resolved write, in the one-entry tail `TxnPrepare` uses.
+                // The log entry has to be self-contained, so the request that
+                // becomes that entry has to carry the write; the coordinator has
+                // no other source for it and must not invent one.
+                push_u16(
+                    &mut out,
+                    u16::try_from(self.batch_writes.len()).unwrap_or(u16::MAX),
+                );
+                for write in &self.batch_writes {
+                    push_blob(&mut out, &write.key);
+                    push_u8(&mut out, write.kind);
+                    push_blob(&mut out, &write.value);
+                    push_i64(&mut out, write.delta);
+                    push_u8(&mut out, write.expect);
+                    push_u64(&mut out, write.expect_version);
+                }
             }
             Opcode::BoundedCounterCreate => {
                 push_u64(&mut out, self.capacity);
@@ -1869,8 +1853,8 @@ impl Request {
             | Opcode::LeaseInspect
             | Opcode::BytesLength => {}
         }
-        // Retry identity rides last so pre-identity decoders fail cleanly on
-        // length: flag 0 means "no identity, end of request".
+        // Retry identity rides last so a decoder can tell "no identity, end of
+        // request" from a truncated one.
         match self.identity {
             None => push_u8(&mut out, 0),
             Some(identity) => {
@@ -1880,15 +1864,12 @@ impl Request {
                 push_u64(&mut out, self.ack_floor.as_u64());
             }
         }
-        // Read-contract trailer: `Latest` writes nothing (byte-identical
-        // to pre-contract encodings — old servers keep serving it as the
-        // only contract they know). Any other contract appends its tag,
-        // which old servers reject loudly as trailing bytes instead of
-        // silently serving stronger-or-weaker semantics. Tags mirror
-        // `kivi-codec`'s canonical `ReadContract` tags (0 is accepted on
-        // decode as `Latest` but never written).
+        // Read-contract trailer: the tag is always written, including `Latest`
+        // as tag 0. Omitting it for `Latest` would make the wire shape depend on
+        // which contract a request happened to carry, so a decoder could not
+        // tell "no contract" from "the strongest contract".
         match self.contract {
-            ReadContract::Latest => {}
+            ReadContract::Latest => push_u8(&mut out, 0),
             ReadContract::AtLeast(token) => {
                 push_u8(&mut out, 1);
                 push_u64(&mut out, token.tablet().as_u64());
@@ -1913,7 +1894,7 @@ impl Request {
     /// # Errors
     ///
     /// Returns [`ProtocolError`] on unknown opcodes, truncation, trailing
-    /// bytes, or non-UTF-8 where strings are required (none here — keys
+    /// bytes, or non-UTF-8 where strings are required (none here - keys
     /// stay byte-exact).
     #[allow(clippy::too_many_lines)]
     pub fn decode(input: &[u8]) -> Result<Self, ProtocolError> {
@@ -2080,6 +2061,15 @@ impl Request {
                 request.txn_digest = digest
                     .try_into()
                     .map_err(|_| ProtocolError::Malformed { context: CONTEXT })?;
+                // The resolved write, in the same one-entry tail a prepare
+                // carries. Required: the log entry this becomes has to be able to
+                // apply the write without reading state the log does not hold, and
+                // this frame is the only place that write exists.
+                let writes = decode_batch_writes(&mut cursor, 1)?;
+                if writes.len() != 1 {
+                    return Err(ProtocolError::Malformed { context: CONTEXT });
+                }
+                request.batch_writes = writes;
             }
             Opcode::BoundedCounterCreate => {
                 request.capacity = cursor.u64(CONTEXT)?;
@@ -2147,43 +2137,40 @@ impl Request {
             | Opcode::LeaseInspect
             | Opcode::BytesLength => {}
         }
-        // Identity suffix: absent on pre-identity encodings (exact end),
-        // otherwise flag 1 plus session/seq/ack. Anything else is malformed.
-        if cursor.remaining() > 0 {
-            match cursor.u8(CONTEXT)? {
-                0 => {}
-                1 => {
-                    let session = kivi_types::SessionId::from_u128(cursor.u128(CONTEXT)?);
-                    let seq = RequestSeq::from_u64(cursor.u64(CONTEXT)?);
-                    let ack_floor = RequestSeq::from_u64(cursor.u64(CONTEXT)?);
-                    request.identity = Some(RequestIdentity::new(session, seq));
-                    request.ack_floor = ack_floor;
-                }
-                _ => return Err(ProtocolError::Malformed { context: CONTEXT }),
+        // Identity suffix: flag 1 plus session/seq/ack, or flag 0 for a read.
+        // The flag is always present; a request that ends before it is
+        // truncated, not an identity-less request.
+        match cursor.u8(CONTEXT)? {
+            0 => {}
+            1 => {
+                let session = kivi_types::SessionId::from_u128(cursor.u128(CONTEXT)?);
+                let seq = RequestSeq::from_u64(cursor.u64(CONTEXT)?);
+                let ack_floor = RequestSeq::from_u64(cursor.u64(CONTEXT)?);
+                request.identity = Some(RequestIdentity::new(session, seq));
+                request.ack_floor = ack_floor;
             }
+            _ => return Err(ProtocolError::Malformed { context: CONTEXT }),
         }
-        // Contract trailer: absent means `Latest` (pre-contract clients
-        // only knew linearizable reads). Present trailers decode by tag;
-        // unknown tags are malformed, never guessed.
-        if cursor.remaining() > 0 {
-            request.contract = match cursor.u8(CONTEXT)? {
-                0 => ReadContract::Latest,
-                1 => {
-                    let tablet = TabletId::from_u64(cursor.u64(CONTEXT)?);
-                    let epoch = TabletEpoch::from_u64(cursor.u64(CONTEXT)?);
-                    let position = CommitPosition::from_u64(cursor.u64(CONTEXT)?);
-                    ReadContract::AtLeast(CommitToken::new(tablet, epoch, position))
+        // Contract trailer: always present, decoded by tag. An unknown tag is
+        // malformed, never guessed: silently reading a strong contract as weak
+        // would serve stale data under a promise of freshness.
+        request.contract = match cursor.u8(CONTEXT)? {
+            0 => ReadContract::Latest,
+            1 => {
+                let tablet = TabletId::from_u64(cursor.u64(CONTEXT)?);
+                let epoch = TabletEpoch::from_u64(cursor.u64(CONTEXT)?);
+                let position = CommitPosition::from_u64(cursor.u64(CONTEXT)?);
+                ReadContract::AtLeast(CommitToken::new(tablet, epoch, position))
+            }
+            2 => {
+                let micros = cursor.u64(CONTEXT)?;
+                ReadContract::BoundedStale {
+                    max_staleness: core::time::Duration::from_micros(micros),
                 }
-                2 => {
-                    let micros = cursor.u64(CONTEXT)?;
-                    ReadContract::BoundedStale {
-                        max_staleness: core::time::Duration::from_micros(micros),
-                    }
-                }
-                3 => ReadContract::Any,
-                _ => return Err(ProtocolError::Malformed { context: CONTEXT }),
-            };
-        }
+            }
+            3 => ReadContract::Any,
+            _ => return Err(ProtocolError::Malformed { context: CONTEXT }),
+        };
         cursor.end(CONTEXT)?;
         Ok(request)
     }
@@ -2454,7 +2441,7 @@ impl Response {
                 // A stream read never completes as a single `Response`
                 // frame: bytes arrive as `ValueStream*` frames under the
                 // request id. An `Ok` shaped like a response is a peer
-                // bug — fail closed, never guess a shape.
+                // bug - fail closed, never guess a shape.
                 Opcode::GetStream => {
                     return Err(ProtocolError::Malformed { context: CONTEXT });
                 }
@@ -2719,6 +2706,68 @@ fn flag(cursor: &mut Cursor<'_>) -> Result<bool, ProtocolError> {
 /// `(key, kind, value, delta, expect, expect_version)`. The count is capped
 /// at `max` (framing-level allocation bound; servers enforce the tighter
 /// transaction bound), so decoders never allocate blindly.
+/// The one write a `TxnPrepare` or `TxnFinalize` carries.
+///
+/// Both carry exactly one write in the batch tail. A finalize without one cannot
+/// become a self-contained log entry, so the count is a refusal rather than a
+/// default: inventing a write would commit something nobody asked for.
+fn single_batch_write(writes: &[BatchWrite]) -> Option<&BatchWrite> {
+    match writes {
+        [write] => Some(write),
+        _ => None,
+    }
+}
+
+/// The write kind a batch entry encodes, or `None` for a tag this build cannot
+/// produce - never a guess with the wrong construction.
+fn batch_write_kind(write: &BatchWrite) -> Option<kivi_state::TxnWriteKind> {
+    Some(match write.kind {
+        BATCH_PUT => kivi_state::TxnWriteKind::Put(bytes::Bytes::from(write.value.clone())),
+        BATCH_DELETE => kivi_state::TxnWriteKind::Delete,
+        BATCH_COUNTER_ADD => kivi_state::TxnWriteKind::CounterAdd(write.delta),
+        BATCH_PUT_CHUNKED => {
+            if write.value.len() != 40 {
+                return None;
+            }
+            let mut manifest = [0u8; 32];
+            manifest.copy_from_slice(&write.value[..32]);
+            let mut len = [0u8; 8];
+            len.copy_from_slice(&write.value[32..]);
+            kivi_state::TxnWriteKind::PutChunked {
+                manifest: kivi_types::ManifestId::from_bytes(manifest),
+                logical_len: u64::from_le_bytes(len),
+            }
+        }
+        BATCH_COMMUTATIVE_ADD => kivi_state::TxnWriteKind::CommutativeAdd(write.delta),
+        BATCH_BOUNDED_ADD => kivi_state::TxnWriteKind::BoundedAdd(write.delta),
+        BATCH_ESCROW_SHARE => {
+            if write.value.len() != 16 {
+                return None;
+            }
+            let mut min = [0u8; 8];
+            let mut max = [0u8; 8];
+            min.copy_from_slice(&write.value[..8]);
+            max.copy_from_slice(&write.value[8..]);
+            kivi_state::TxnWriteKind::EscrowSetShare {
+                min: i64::from_le_bytes(min),
+                max: i64::from_le_bytes(max),
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// The OCC expectation a batch entry encodes.
+fn batch_write_expect(write: &BatchWrite) -> kivi_state::TxnExpect {
+    match write.expect {
+        BATCH_EXPECT_ABSENT => kivi_state::TxnExpect::Absent,
+        BATCH_EXPECT_VERSION => kivi_state::TxnExpect::Version(
+            kivi_state::ObjectVersion::from_u64(write.expect_version),
+        ),
+        _ => kivi_state::TxnExpect::Any,
+    }
+}
+
 fn decode_batch_writes(
     cursor: &mut Cursor<'_>,
     max: usize,
@@ -2768,7 +2817,7 @@ fn decode_batch_writes(
 
 /// V1 streaming-upload bound: 1 GiB per stream (1024 chunks at the
 /// default 1 MiB grid). Peers agree here so both sides enforce the same
-/// ceiling — the server aborts past it, the client never opens past it.
+/// ceiling - the server aborts past it, the client never opens past it.
 /// Bulk beyond this is a future multi-stream or resumption story, never
 /// silent truncation today.
 pub const MAX_STREAM_UPLOAD_BYTES: u64 = 1024 * 1024 * 1024;
@@ -2939,7 +2988,7 @@ impl StreamAbort {
 /// payload under the originating request id. `total_len` data bytes
 /// follow across `ValueStreamData` frames, then one empty
 /// `ValueStreamEnd`. Raw `Data` payloads are verbatim bytes (no
-/// envelope); `Commit`-side framing does not exist for reads — the
+/// envelope); `Commit`-side framing does not exist for reads - the
 /// stream simply ends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ValueStreamBegin {
@@ -3073,13 +3122,35 @@ mod tests {
             expect_version: 0,
         });
         assert!(Request::decode(&multi.encode()).is_err());
-        // Finalize carries key + commit flag.
+        // A finalize carries key, commit flag, and the write it resolves.
+        //
+        // The write is not optional and not advisory. The entry this request
+        // becomes has to apply without reading state the log does not carry, so
+        // the write travels with it; and a finalize that does not name its write
+        // has no self-contained meaning, so the count rule applies here exactly as
+        // it does to a prepare.
         let mut finalize = request(Opcode::TxnFinalize);
         finalize.txn_commit = true;
         let decoded = Request::decode(&finalize.encode()).expect("round trip");
         assert!(decoded.txn_commit);
         let op = decoded.into_operation().expect("translatable");
-        assert!(matches!(op, Operation::TxnFinalize { commit: true, .. }));
+        let Operation::TxnFinalize { commit, write, .. } = op else {
+            panic!("finalize translates to a finalize");
+        };
+        assert!(commit);
+        let expected_key = finalize.batch_writes[0].key.clone();
+        assert_eq!(
+            write.key.as_bytes(),
+            expected_key.as_slice(),
+            "the write survives the wire"
+        );
+        let mut finalize_without_write = request(Opcode::TxnFinalize);
+        finalize_without_write.batch_writes.clear();
+        assert!(
+            Request::decode(&finalize_without_write.encode()).is_err(),
+            "a finalize with no write cannot become a log entry, so it is refused \
+             rather than completed with a guess"
+        );
         // Txn responses shape as their own opcodes.
         for (opcode, body) in [
             (
@@ -3285,74 +3356,80 @@ mod tests {
     }
 
     #[rstest]
-    #[case(Status::Ok)]
-    #[case(Status::InvalidRequest)]
-    #[case(Status::Unsupported)]
-    #[case(Status::WrongType)]
-    #[case(Status::NotFound)]
-    #[case(Status::CounterOverflow)]
-    #[case(Status::VersionExhausted)]
-    #[case(Status::StaleRoute)]
-    #[case(Status::NotLocal)]
-    #[case(Status::Overloaded)]
-    #[case(Status::ResourceExhausted)]
-    #[case(Status::ValueTooLarge)]
-    #[case(Status::Internal)]
-    #[case(Status::DedupExpired)]
-    #[case(Status::SessionOverloaded)]
-    #[case(Status::TxnConflict)]
-    #[case(Status::TxnAborted)]
-    #[case(Status::TxnTooLarge)]
-    #[case(Status::TxnCoordinatorUnavailable)]
-    #[case(Status::UniqueViolation)]
-    #[case(Status::ScanCursorStale)]
-    #[case(Status::StaleToken)]
-    #[case(Status::CoverageUncertain)]
-    fn every_status_round_trips(#[case] status: Status) {
+    #[case(Status::Ok, false)]
+    #[case(Status::InvalidRequest, false)]
+    #[case(Status::Unsupported, false)]
+    #[case(Status::WrongType, false)]
+    #[case(Status::NotFound, false)]
+    #[case(Status::CounterOverflow, false)]
+    #[case(Status::VersionExhausted, false)]
+    #[case(Status::StaleRoute, true)]
+    #[case(Status::NotLocal, true)]
+    #[case(Status::Overloaded, true)]
+    #[case(Status::ResourceExhausted, false)]
+    #[case(Status::ValueTooLarge, false)]
+    #[case(Status::Internal, false)]
+    #[case(Status::DedupExpired, false)]
+    #[case(Status::SessionOverloaded, false)]
+    #[case(Status::TxnConflict, false)]
+    #[case(Status::TxnAborted, false)]
+    #[case(Status::TxnTooLarge, false)]
+    #[case(Status::TxnCoordinatorUnavailable, true)]
+    #[case(Status::UniqueViolation, false)]
+    #[case(Status::ScanCursorStale, true)]
+    #[case(Status::StaleToken, false)]
+    #[case(Status::CoverageUncertain, false)]
+    #[case(Status::BoundedExceeded, false)]
+    #[case(Status::SemaphoreExhausted, false)]
+    #[case(Status::LeaseConflict, false)]
+    #[case(Status::StaleFencing, false)]
+    #[case(Status::StreamFull, false)]
+    #[case(Status::TxnDecisionConflict, false)]
+    #[case(Status::TxnCrossTablet, false)]
+    fn every_status_round_trips_with_its_retriability(
+        #[case] status: Status,
+        #[case] retriable: bool,
+    ) {
         assert_eq!(Status::from_u16(status.as_u16()), Some(status));
-        assert_eq!(
-            status.is_retriable(),
-            matches!(
-                status,
-                Status::StaleRoute
-                    | Status::NotLocal
-                    | Status::Overloaded
-                    | Status::TxnCoordinatorUnavailable
-                    | Status::ScanCursorStale
-            )
-        );
+        assert_eq!(status.is_retriable(), retriable, "{status}");
     }
 
+    /// Only a redirect, an overload, an unreachable coordinator, and a stale
+    /// scan cursor are transport retries. Everything else is either a
+    /// terminal rejection or - the ones that matter here - a status whose
+    /// retry would be actively harmful:
+    ///
+    /// * `StaleToken` never heals under the same token.
+    /// * `CoverageUncertain` means the write may have committed, so blind
+    ///   redelivery could double-apply an anonymous non-idempotent write.
+    /// * `StaleFencing` names a superseded lease, so retrying it releases or
+    ///   renews the wrong grant.
     #[test]
-    fn stale_token_is_terminal() {
-        // A stale token never heals under the same token: retrying is
-        // pointless (refresh the token instead), so it is not retriable.
-        assert!(!Status::StaleToken.is_retriable());
+    fn only_transport_retries_are_marked_retriable() {
+        for retriable in [
+            Status::StaleRoute,
+            Status::NotLocal,
+            Status::Overloaded,
+            Status::TxnCoordinatorUnavailable,
+            Status::ScanCursorStale,
+        ] {
+            assert!(retriable.is_retriable(), "{retriable} should be retriable");
+        }
+        for terminal in [
+            Status::StaleToken,
+            Status::CoverageUncertain,
+            Status::StaleFencing,
+            Status::TxnDecisionConflict,
+            Status::DedupExpired,
+            Status::SessionOverloaded,
+        ] {
+            assert!(!terminal.is_retriable(), "{terminal} must not be retried");
+        }
+        // The wire codes are a contract; they are checked, not assumed.
         assert_eq!(Status::from_u16(21), Some(Status::StaleToken));
-        assert_eq!(Status::StaleToken.to_string(), "stale-token");
-    }
-
-    #[test]
-    fn coverage_uncertain_is_terminal_and_ambiguous() {
-        // A coverage refusal is not a transport retry: the write may have
-        // committed, so blind redelivery could double-apply anonymous
-        // non-idempotent writes. Callers read-verify (or re-drive under
-        // the same identity) instead.
-        assert!(!Status::CoverageUncertain.is_retriable());
         assert_eq!(Status::from_u16(22), Some(Status::CoverageUncertain));
-        assert_eq!(Status::CoverageUncertain.to_string(), "coverage-uncertain");
-    }
-
-    #[test]
-    fn dedup_statuses_are_terminal() {
-        // Dedup outcomes are deterministic for the same state: retrying is
-        // harmless but pointless, so they are not marked retriable.
-        assert!(!Status::DedupExpired.is_retriable());
-        assert!(!Status::SessionOverloaded.is_retriable());
         assert_eq!(Status::from_u16(13), Some(Status::DedupExpired));
         assert_eq!(Status::from_u16(14), Some(Status::SessionOverloaded));
-        assert_eq!(Status::DedupExpired.to_string(), "dedup-expired");
-        assert_eq!(Status::SessionOverloaded.to_string(), "session-overloaded");
     }
 
     #[test]
@@ -3386,17 +3463,6 @@ mod tests {
         let mut bad = request(Opcode::Get).encode();
         bad.push(0x7F);
         assert!(Request::decode(&bad).is_err());
-        // A pre-contract encoding (no trailer at all) still decodes as
-        // Latest: the strongest contract, never a silent weakening.
-        // (Only the contract is compared: opcode tails never round-trip
-        // across shapes, as `every_operation_round_trips` pins.)
-        let truncated = request(Opcode::Get).encode();
-        assert_eq!(
-            Request::decode(&truncated)
-                .expect("pre-contract decodes")
-                .contract,
-            ReadContract::Latest
-        );
     }
 
     #[test]
@@ -3421,8 +3487,7 @@ mod tests {
             decoded.proof.expect("proof").token().position(),
             CommitPosition::from_u64(41)
         );
-        // Proof-less responses are byte-identical to pre-proof encodings
-        // and decode to `None` (no evidence, never freshness).
+        // Proof-less responses decode to `None` (no evidence, never freshness).
         let bare = Response {
             status: Status::Ok,
             body: ResponseBody::Exists(true),
@@ -3436,10 +3501,12 @@ mod tests {
         assert!(Response::decode(&bad).is_err());
     }
 
+    /// Golden wire layout for the identity suffix: flag 1, then session, seq and
+    /// ack little-endian. A retry that changes the session or the sequence
+    /// would execute the mutation twice, so these bytes are pinned rather than
+    /// derived.
     #[test]
     fn identity_wire_layout_is_stable() {
-        // Golden suffix: flag 1, session LE, seq LE, ack LE. The base layout
-        // is pinned by the pre-identity tests; this pins the suffix.
         let mut bare = request(Opcode::Get);
         bare.identity = None;
         let mut identified = bare.clone();
@@ -3450,15 +3517,23 @@ mod tests {
         identified.ack_floor = RequestSeq::from_u64(0x2122_2324_2526_2728);
         let bare_bytes = bare.encode();
         let full_bytes = identified.encode();
-        // Bare ends with flag 0 (1 byte); identified ends with flag 1 plus
+        // Both encodings end with the identity flag followed by the contract
+        // tag. Bare's flag is 0 (1 byte); identified's is flag 1 plus
         // session/seq/ack (33 bytes): the difference is exactly 32.
         assert_eq!(full_bytes.len(), bare_bytes.len() + 32);
         assert_eq!(
-            &full_bytes[..bare_bytes.len() - 1],
-            &bare_bytes[..bare_bytes.len() - 1]
+            &full_bytes[..bare_bytes.len() - 2],
+            &bare_bytes[..bare_bytes.len() - 2]
         );
-        assert_eq!(bare_bytes[bare_bytes.len() - 1], 0);
-        let suffix = &full_bytes[bare_bytes.len() - 1..];
+        assert_eq!(
+            bare_bytes[bare_bytes.len() - 2],
+            0,
+            "flag 0 means no identity"
+        );
+        // The identity suffix is the 33 bytes starting at the flag, which
+        // sits in the same position in both encodings; the contract tag
+        // follows it.
+        let suffix = &full_bytes[bare_bytes.len() - 2..][..33];
         assert_eq!(suffix.len(), 33);
         assert_eq!(suffix[0], 1);
         assert_eq!(
@@ -3468,33 +3543,42 @@ mod tests {
         assert_eq!(&suffix[17..25], &0x1112_1314_1516_1718u64.to_le_bytes());
         assert_eq!(&suffix[25..33], &0x2122_2324_2526_2728u64.to_le_bytes());
         let back = Request::decode(&full_bytes).expect("identity round trip");
-        // Opcode tails are not preserved for Get (same as pre-identity
-        // behavior); the identity suffix is what this pins.
         assert_eq!(back.identity, identified.identity);
         assert_eq!(back.ack_floor, identified.ack_floor);
         assert_eq!(back.key, identified.key);
         assert_eq!(back.hint, identified.hint);
     }
 
+    /// The identity flag and the contract tag are both always present, so a
+    /// request that ends before them is truncated rather than identity-less or
+    /// contract-less, and an undefined byte is malformed rather than silently
+    /// skipped. Accepting either would let a corrupted or foreign encoding
+    /// decode as a read with no retry identity and the strongest contract.
     #[test]
-    fn pre_identity_requests_still_decode() {
-        // A request encoded by a pre-identity client (no suffix at all, not
-        // even the flag) decodes with no identity rather than failing: the
-        // server decides policy, not the parser.
+    fn a_truncated_or_undefined_trailer_byte_is_malformed() {
         let mut bare = request(Opcode::Set);
         bare.identity = None;
         let bytes = bare.encode();
-        assert_eq!(bytes[bytes.len() - 1], 0, "flag 0 terminates");
-        let old_style = &bytes[..bytes.len() - 1];
-        let back = Request::decode(old_style).expect("suffix-less decodes");
-        assert_eq!(back.identity, None);
-        assert_eq!(back.ack_floor, RequestSeq::from_u64(0));
-        // A garbage flag is malformed, not silently skipped.
-        let mut bad = bytes.clone();
-        let last = bad.len() - 1;
-        bad[last] = 0x7F;
+        assert_eq!(bytes[bytes.len() - 2], 0, "flag 0 means no identity");
+        // Cut off the identity flag and the contract tag behind it.
         assert!(matches!(
-            Request::decode(&bad),
+            Request::decode(&bytes[..bytes.len() - 2]),
+            Err(ProtocolError::Truncated | ProtocolError::Malformed { .. })
+        ));
+        // An undefined identity flag.
+        let mut bad_flag = bytes.clone();
+        let flag_at = bad_flag.len() - 2;
+        bad_flag[flag_at] = 0x7F;
+        assert!(matches!(
+            Request::decode(&bad_flag),
+            Err(ProtocolError::Malformed { .. })
+        ));
+        // An undefined contract tag.
+        let mut bad_tag = bytes.clone();
+        let last = bad_tag.len() - 1;
+        bad_tag[last] = 0x7F;
+        assert!(matches!(
+            Request::decode(&bad_tag),
             Err(ProtocolError::Malformed { .. })
         ));
     }

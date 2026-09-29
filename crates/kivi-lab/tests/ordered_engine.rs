@@ -4,38 +4,17 @@
 
 use bytes::Bytes;
 use kivi_client::{
-    ClientConfig, NativeClient,
+    NativeClient,
     ordered::{
         AtomicBatchResult, BatchExpect, BatchWriteKind, BatchWriteSpec, ClientScanValue,
         IndexTermSet, ScanConsistency, ScanDirection, ScanOptions, ScanProjection,
     },
 };
-use kivi_engine::{
-    ConnLimits, DurabilityMode, EngineConfig, EngineNetwork, LocalEngine, Placement, TurnBudget,
-};
+use kivi_engine::{DurabilityMode, EngineConfig, LocalEngine, Placement};
+use kivi_lab::testkit::{NS, client_for, network};
 use kivi_state::{IndexId, IndexKind, Key};
 use kivi_tablet::DirectorySnapshot;
-use kivi_types::{ClusterId, NamespaceId, NodeId, NodeIncarnation, TabletId, WorkerId};
-
-const NS: NamespaceId = NamespaceId::from_u64(1);
-
-fn network() -> EngineNetwork {
-    EngineNetwork {
-        base_port: 0,
-        ports: Vec::new(),
-        bind_ip: [127, 0, 0, 1].into(),
-        max_frame: kivi_protocol::DEFAULT_MAX_FRAME,
-        placement: kivi_engine::ThreadPlacement::unbound(),
-        node_id: NodeId::from_u64(1),
-        cluster_id: ClusterId::from_u128(1),
-        incarnation: NodeIncarnation::INITIAL,
-        conn: ConnLimits::default(),
-        turn: TurnBudget::default(),
-        // The RESP edge is served by the engine's own workers;
-        // these harnesses exercise the native protocol only.
-        resp: None,
-    }
-}
+use kivi_types::{TabletId, WorkerId};
 
 fn start_ordered() -> LocalEngine {
     start_ordered_with_boundaries(&[b"m".to_vec(), b"t".to_vec()])
@@ -60,16 +39,6 @@ fn start_ordered_with_boundaries(boundaries: &[Vec<u8>]) -> LocalEngine {
         durability: DurabilityMode::Ephemeral,
     })
     .expect("ordered engine starts")
-}
-
-fn client_for(engine: &LocalEngine) -> NativeClient {
-    let seed = engine.worker_addrs()[0].to_string();
-    NativeClient::new(ClientConfig {
-        seeds: vec![seed],
-        namespace: NS,
-        ..ClientConfig::default()
-    })
-    .expect("client builds")
 }
 
 fn put(client: &NativeClient, key: &str, value: &str) {

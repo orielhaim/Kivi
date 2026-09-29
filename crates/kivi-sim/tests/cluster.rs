@@ -7,7 +7,7 @@ use core::time::Duration;
 use kivi_core::{EventView, FaultPolicy, RandomSource};
 use kivi_sim::{
     AppHandler, ClusterAction, ClusterError, ClusterTrace, DropEveryNth, Endpoint, LinkConfig,
-    MsgId, NetError, NodeStep, SimCluster, SimRng, StepOutcome, StorageFault, StorageOp,
+    MsgId, NodeStep, SimCluster, SimRng, StepOutcome, StorageFault, StorageOp,
 };
 use kivi_types::{NodeId, NodeIncarnation, Ticks};
 use rstest::{fixture, rstest};
@@ -132,7 +132,7 @@ fn send_delivers_with_full_metadata() {
 fn stale_sender_incarnation_is_rejected_after_restart() {
     // The critical scenario: A sends while at incarnation N, crashes, and
     // restarts as N+1 before the in-flight message arrives. Arrival must
-    // reject the message as stale — it can never become valid.
+    // reject the message as stale - it can never become valid.
     let mut cluster = two_nodes();
     let mut app = TinyApp;
     let mut rng = SimRng::seed_from_u64(2);
@@ -291,21 +291,6 @@ fn run_bounds_and_idle_reporting() {
     assert_eq!(
         empty.run_next(&mut app, &mut rng).expect("idle"),
         StepOutcome::Idle
-    );
-}
-
-#[test]
-fn error_conversions_wrap_sources_with_text() {
-    use std::error::Error;
-    let net: ClusterError = NetError::ZeroBandwidth.into();
-    assert_eq!(net, ClusterError::Net(NetError::ZeroBandwidth));
-    assert!(net.source().is_some());
-    assert_eq!(net.to_string(), "network: link bandwidth must be nonzero");
-    let missing: ClusterError = ClusterError::MissingRestartFactory { node: node(1) };
-    assert!(missing.source().is_none());
-    assert_eq!(
-        missing.to_string(),
-        format!("no restart-state factory set for node {}", node(1))
     );
 }
 

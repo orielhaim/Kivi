@@ -1,9 +1,6 @@
 //! Shared physical consensus durability: one WAL writer batching many groups.
 //!
-//! [`DurableRaftStore`](crate::store::DurableRaftStore)
-//! its own lane-writer thread (`kivi-consensus-lane`): one OS thread per Raft
-//! group. Multi-Raft replaces that with one node-wide physical writer
-//! serving every local group:
+//! One node-wide physical writer serves every local group:
 //!
 //! ```text
 //! Group A submissions ─┐
@@ -24,12 +21,11 @@
 //!
 //! ## Format
 //!
-//! No format change was needed: [`RaftRecord`]
-//! already carries its consensus group ([`TabletId`])
-//! plus namespace on every record kind (10–15 v1), and the WAL framing
-//! (`kind u16, version u16, length u32`) multiplexes families already. One
-//! physical WAL scan at open dispatches records by group and rebuilds each
-//! group's logical state in a single recovery pass.
+//! [`RaftRecord`] carries its consensus group ([`TabletId`]) plus namespace
+//! on every record kind, and the WAL framing (`kind u16, version u16,
+//! length u32`) multiplexes families. One physical WAL scan at open
+//! dispatches records by group and rebuilds each group's logical state in a
+//! single recovery pass.
 //!
 //! ## Backpressure
 //!
@@ -47,7 +43,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -366,13 +362,6 @@ impl SharedRaftDurability {
     pub fn metrics(&self) -> SharedDurabilityMetrics {
         self.inner.stats.snapshot()
     }
-
-    /// Data directory path backing the shared lane (operator introspection).
-    #[must_use]
-    pub fn data_dir_hint(&self) -> PathBuf {
-        PathBuf::from(kivi_durability::node::WAL_DIR_NAME)
-            .join(kivi_durability::wal::lane_dir_name(CONSENSUS_LANE))
-    }
 }
 
 /// Writer thread: batches cross-group submissions into single physical
@@ -392,7 +381,7 @@ fn writer_main(
         let mut byte_count = jobs[0].bytes;
         // Opportunistic cross-group batching: drain everything already
         // queued (concurrent groups pile up while a barrier is in flight),
-        // then — only when a single group is active — park for one linger
+        // then - only when a single group is active - park for one linger
         // so a near-simultaneous arrival from another group still joins
         // the same physical batch. Bounded by record/byte caps; the first
         // job guarantees progress even under no concurrency.
@@ -739,7 +728,7 @@ impl std::fmt::Debug for GroupLogReader {
 impl GroupRaftStore {
     /// Builds one group's logical view from its recovered records. The
     /// caller dispatches the shared lane's recovery output by group and
-    /// folds each group in one pass — the physical log is never replayed
+    /// folds each group in one pass - the physical log is never replayed
     /// once per group.
     ///
     /// # Errors
@@ -788,14 +777,8 @@ impl GroupRaftStore {
         self.gate = Some(gate);
     }
 
-    /// Returns the installed gate, if any.
-    #[must_use]
-    pub fn gate(&self) -> Option<&crate::gate::SidecarGate> {
-        self.gate.as_ref()
-    }
-
     /// Returns the newest committed-membership voter set visible in the
-    /// retained log (newest-first scan). Empty when none survives — the
+    /// retained log (newest-first scan). Empty when none survives - the
     /// caller falls back to the state machine's snapshot membership.
     pub async fn membership_voters(&self) -> BTreeSet<u64> {
         let inner = self.shared_cache.lock().await;
@@ -805,11 +788,6 @@ impl GroupRaftStore {
             }
         }
         BTreeSet::new()
-    }
-
-    /// Returns the group served.
-    pub async fn group(&self) -> ConsensusGroupId {
-        ConsensusGroupId::of_tablet(self.shared_cache.lock().await.group)
     }
 
     /// Persists raw records through the shared barrier without folding
@@ -877,15 +855,7 @@ impl GroupRaftStore {
 
 impl crate::store::ConsensusLogStore for GroupRaftStore {
     fn set_gate(&mut self, gate: crate::gate::SidecarGate) {
-        GroupRaftStore::set_gate(self, gate);
-    }
-
-    fn gate(&self) -> Option<&crate::gate::SidecarGate> {
-        GroupRaftStore::gate(self)
-    }
-
-    async fn membership_voters(&self) -> BTreeSet<u64> {
-        GroupRaftStore::membership_voters(self).await
+        self.gate = Some(gate);
     }
 }
 
@@ -1297,7 +1267,7 @@ mod tests {
             store_b.save_vote(&vote).await.expect("B vote");
             // A purges through index 5 and records its commit pointer;
             // B's markers must stay absent (logical isolation over the
-            // shared physical history — purge is never segment deletion).
+            // shared physical history - purge is never segment deletion).
             let purged = openraft::LogId::new(LeaderId::new(1, 1), 5);
             store_a.purge(purged).await.expect("A purge");
             store_a

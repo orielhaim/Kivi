@@ -16,13 +16,13 @@
                                 -> no-op; a stale release never frees a
                                 successor's lease)
     release ................... Release (live holder + current token ->
-                                free; token NOT reset — successors still
+                                free; token NOT reset - successors still
                                 fence predecessors)
     expiry .................... Tick (clock advances past expiry; the
                                 next acquire observes the lapse)
     crash ..................... CrashHolder (holder state is durable in
                                 the store; the crash matters only in that
-                                the holder stops renewing — modeled by
+                                the holder stops renewing - modeled by
                                 enabling Tick past expiry)
 
   Deliberate abstractions (documented, not hidden):

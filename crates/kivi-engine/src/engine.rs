@@ -159,7 +159,7 @@ pub struct EngineConfig {
 }
 
 /// Durability mode: in-memory speed or crash-recoverable persistence.
-/// There is no silent default — callers choose explicitly so a supposed
+/// There is no silent default - callers choose explicitly so a supposed
 /// durable deployment can never run on the memory provider.
 #[derive(Debug, Clone)]
 pub enum DurabilityMode {
@@ -174,7 +174,7 @@ pub enum DurabilityMode {
 #[derive(Debug, Clone)]
 pub struct ChunkFabricConfig {
     /// Values strictly larger stage as chunked roots; the rest stay
-    /// inline. Physical only — logical `Bytes` semantics never change.
+    /// inline. Physical only - logical `Bytes` semantics never change.
     pub inline_threshold: u64,
     /// Chunk pack rotation target in bytes per lane.
     pub pack_target_bytes: u64,
@@ -354,7 +354,7 @@ pub enum EngineError {
     #[error("session outcome window exhausted")]
     SessionOverloaded,
     /// The request is not admittable (absurd range, oversize patch):
-    /// caller bug, state untouched — fix and retry.
+    /// caller bug, state untouched - fix and retry.
     #[error("invalid request: {detail}")]
     InvalidRequest {
         /// Human-readable reason (returned verbatim).
@@ -440,7 +440,7 @@ pub struct LocalEngine {
 ///
 /// Clonable and `Send + Sync`: the Tokio admin plane holds this while worker
 /// threads own everything mutable. Reads go through the immutable routing
-/// publication or the bounded control channel — never locks, never the data
+/// publication or the bounded control channel - never locks, never the data
 /// path, never Tokio inside the engine.
 #[derive(Debug, Clone)]
 pub struct AdminHandle {
@@ -680,26 +680,13 @@ impl AdminHandle {
     }
 
     /// Snapshots the redundancy fabric for the admin plane (`None` in
-    /// ephemeral mode, which holds no fabric). Additive: existing admin
-    /// DTOs are untouched; a future `kivi-server` `/v1/redundancy`
-    /// endpoint consumes this directly.
+    /// ephemeral mode, which holds no fabric). Carries the fabric counters,
+    /// the background lane's job counters, and the fragment census.
     #[must_use]
     pub fn redundancy_snapshot(&self) -> Option<crate::redundancy::RedundancyAdminSnapshot> {
         self.redundancy
             .as_ref()
             .map(crate::redundancy::EngineRedundancy::admin_snapshot)
-    }
-
-    /// Snapshots the redundancy background-lane counters for the admin
-    /// plane (`None` in ephemeral mode, which holds no fabric). Best-effort
-    /// protects report here: `submitted`/`completed` track accepted jobs,
-    /// `rejected_overload` tracks submits the bounded lane refused (each
-    /// one also warn-logged at submit time).
-    #[must_use]
-    pub fn redundancy_lane_stats(&self) -> Option<kivi_redundancy::LaneStats> {
-        self.redundancy
-            .as_ref()
-            .map(crate::redundancy::EngineRedundancy::lane_stats)
     }
 }
 
@@ -708,14 +695,13 @@ impl LocalEngine {
     /// per active directory tablet on its placed worker, spawns worker
     /// threads, and publishes the initial routing snapshot.
     ///
-    /// Fresh tablets start at initial fencing generations (there is no
-    /// persisted fencing state to recover; future phases will carry fencing
-    /// generations in directory metadata instead of defaulting them here).
+    /// Fresh tablets start at initial fencing generations, which is what the
+    /// directory descriptor names.
     ///
     /// # Errors
     ///
     /// Returns [`EngineError`] for invalid configuration, incoherent
-    /// routing, or tablet construction failures — always before serving.
+    /// routing, or tablet construction failures - always before serving.
     // One linear bring-up (validate → tablets → durability → workers →
     // listeners → checkpoint); the order is the correctness argument and
     // splitting it would scatter the startup sequence.
@@ -907,8 +893,8 @@ impl LocalEngine {
         // WAL tail replays after the cuts. A corrupt database never serves
         // partial state, and replayed tablets are simply the workers'
         // initial state. (Chunked-root dependency validation runs after
-        // this match over final live state — see the dependency gate
-        // below — covering restore and replay uniformly.)
+        // this match over final live state - see the dependency gate
+        // below - covering restore and replay uniformly.)
         let (lanes, durability, checkpoint_spawn): (
             Vec<Option<WorkerDurability>>,
             Option<EngineDurability>,
@@ -986,8 +972,8 @@ impl LocalEngine {
             }
         };
         // Dependency gate (§30, §31), extended to fabric roots: every
-        // live chunked root — restored from checkpoints, replayed from
-        // the WAL tail, or fresh — proves its manifest and chunks in its
+        // live chunked root - restored from checkpoints, replayed from
+        // the WAL tail, or fresh - proves its manifest and chunks in its
         // owner's lane before serving. Every live fabric root proves a
         // resolvable materialization in its owner's fabric (journal
         // import above plus seals below cover the live set). A committed
@@ -1277,7 +1263,7 @@ impl LocalEngine {
             };
             // Fencing: the checkpoint's authority must match the startup
             // directory. A stale checkpoint (old epoch/guard) is skipped
-            // here — the WAL tail then fails loudly on the same fencing
+            // here - the WAL tail then fails loudly on the same fencing
             // mismatch instead of serving cross-authority state.
             let descriptor = routing.directory().get(tablet).ok_or_else(|| {
                 kivi_durability::RecoveryError::UnknownTablet {
@@ -1374,7 +1360,7 @@ impl LocalEngine {
     }
 
     /// Reads the durable WAL floors (absent file means genesis everywhere
-    /// — pre-checkpoint databases replay fully).
+    /// - pre-checkpoint databases replay fully).
     fn read_wal_floors(
         cfg: &DurableConfig,
     ) -> Result<std::collections::HashMap<u16, kivi_durability::LaneFloor>, EngineError> {
@@ -1459,7 +1445,7 @@ impl LocalEngine {
     }
 
     /// Validates merged records against the startup directory, skips
-    /// checkpoint-covered records (commit at or below the tablet's cut —
+    /// checkpoint-covered records (commit at or below the tablet's cut -
     /// counted as obsolete, never replayed), and replays the tail in
     /// commit order.
     #[allow(clippy::too_many_lines)]
@@ -1522,7 +1508,7 @@ impl LocalEngine {
                 // their own: they are published by the mutation beside them
                 // in the same batch, and that mutation carries the fencing
                 // context these checks exist to validate. Skipping them here
-                // is not a hole — the mutation with the identical commit
+                // is not a hole - the mutation with the identical commit
                 // position is checked immediately below.
                 let is_material = matches!(record, WalRecord::Material(_));
                 if !is_material && record.namespace() != namespace {
@@ -1556,7 +1542,7 @@ impl LocalEngine {
                 // nothing behind it. Reclamation never lets a segment
                 // holding a live value's bytes fall below the floor, so the
                 // record carrying them is still present. Importing twice is
-                // harmless — the id is already resident.
+                // harmless - the id is already resident.
                 let is_material = matches!(record, WalRecord::Material(_));
                 if record.commit().as_u64() <= cut && !is_material {
                     obsolete_skipped += 1;
@@ -1662,25 +1648,21 @@ impl LocalEngine {
                 fabric,
                 placement.clone(),
             );
-            senders.push(handle_sender(&handle));
+            senders.push(handle.sender());
             workers.push(handle);
         }
         (workers, senders)
     }
 
-    /// Spawns networked workers, collecting bound addresses into the shared
-    /// endpoint registry once every worker reports ready.
-    /// Spawns one networked worker per placement slot.
+    /// Spawns one networked worker per placement slot, collecting bound
+    /// addresses into the shared endpoint registry once every worker reports
+    /// ready.
     ///
     /// Returns the handles, the per-worker request senders, each worker's bound
     /// native address, the slot the RESP accept loops wait on for an engine
     /// client to forward through (published by the caller once the engine
     /// exists, the only moment a client can route to a live worker), and the
     /// RESP endpoint when that edge is configured.
-    ///
-    /// Nine parameters is the shape the surrounding call sites dictate; they
-    /// are grouped by the `WorkerSpawn` bundle rather than left as a list that
-    /// a reader has to decode positionally.
     #[allow(
         clippy::too_many_arguments,
         clippy::type_complexity,
@@ -1711,7 +1693,7 @@ impl LocalEngine {
         let mut bound: Vec<(WorkerId, String)> = Vec::with_capacity(worker_count);
         let mut addrs: Vec<std::net::SocketAddr> = Vec::with_capacity(worker_count);
         // The RESP edge binds on the worker that owns the most tablets, so a
-        // single-tablet engine — the common shape — forwards nothing. Decided
+        // single-tablet engine - the common shape - forwards nothing. Decided
         // once, here, from the same distribution the placement already
         // produced; a tie goes to the lower index for determinism.
         let resp_owner = by_worker
@@ -1816,7 +1798,7 @@ impl LocalEngine {
             .map_err(EngineError::NetStart)?;
             bound.push((id, format!("{}:{}", advertise_ip, addr.port())));
             addrs.push(addr);
-            senders.push(handle_sender(&handle));
+            senders.push(handle.sender());
             workers.push(handle);
         }
         endpoints.store(Arc::new(bound.into_iter().collect()));
@@ -1856,93 +1838,10 @@ impl LocalEngine {
         }
     }
 
-    /// Returns cumulative transaction-resolver counters
-    /// `(passes, commit-finalized, abort-finalized)`.
-    #[must_use]
-    pub fn resolver_metrics(&self) -> (u64, u64, u64) {
-        use std::sync::atomic::Ordering;
-        (
-            self.shared.recovery_runs.load(Ordering::Relaxed),
-            self.shared.resolved_commits.load(Ordering::Relaxed),
-            self.shared.resolved_aborts.load(Ordering::Relaxed),
-        )
-    }
-
-    /// Inspects one transaction across every local tablet: who coordinates,
-    /// who participates, who prepared what, which decision is durably
-    /// known, and how old the oldest prepared intent is. Everything an
-    /// operator needs to answer "what is blocking resolution": a prepared
-    /// intent with no known decision waits (correctly) for the coordinator
-    /// record; run [`resolve_transactions`](Self::resolve_transactions) to
-    /// converge it.
-    #[must_use]
-    pub fn transaction_status(&self, txn: TxnId) -> TxnStatusReport {
-        use std::collections::{BTreeMap, BTreeSet};
-        let mut prepared: BTreeMap<TabletId, Vec<Vec<u8>>> = BTreeMap::new();
-        let mut coordinators: BTreeSet<TabletId> = BTreeSet::new();
-        let mut oldest: Option<kivi_types::WallTimestamp> = None;
-        for worker in &self.workers {
-            let (respond, receive) = crossbeam_channel::bounded(1);
-            if worker
-                .control_sender()
-                .try_send(crate::worker::WorkerControl::ListIntents { respond })
-                .is_err()
-            {
-                continue;
-            }
-            let Ok(listed) = receive.recv() else {
-                continue;
-            };
-            for (tablet, intent) in listed {
-                if intent.id != txn {
-                    continue;
-                }
-                coordinators.insert(intent.coordinator);
-                prepared
-                    .entry(tablet)
-                    .or_default()
-                    .push(intent.key.as_bytes().to_vec());
-                oldest = Some(
-                    oldest.map_or(intent.prepared_at, |oldest| oldest.min(intent.prepared_at)),
-                );
-            }
-        }
-        let now = kivi_core::wall_now_or_max(&SystemClock);
-        let coordinator = coordinators.iter().next().copied();
-        let (decision, digest) = coordinator
-            .and_then(|coordinator| {
-                self.client()
-                    .get(&kivi_state::txn_record_key(coordinator, txn))
-                    .ok()
-                    .flatten()
-                    .and_then(|bytes| kivi_state::TxnRecord::decode(&bytes).ok())
-            })
-            .map_or((None, None), |record| {
-                (Some(record.state), Some(record.digest))
-            });
-        TxnStatusReport {
-            txn,
-            coordinator,
-            coordinator_disagree: coordinators.len() > 1,
-            participants: prepared.keys().copied().collect(),
-            prepared,
-            decision,
-            digest,
-            oldest_prepared_age_micros: oldest.map(|prepared_at| {
-                u64::try_from(
-                    now.as_micros()
-                        .saturating_sub(prepared_at.as_micros())
-                        .max(0),
-                )
-                .unwrap_or(u64::MAX)
-            }),
-        }
-    }
-
     /// Resolves abandoned cross-tablet transaction intents on every local
     /// tablet: decided transactions finalize per their coordinator record;
     /// expired undecided transactions CAS-abort through the record (never
-    /// unilaterally — the CAS proves no commit won the race); live intents
+    /// unilaterally - the CAS proves no commit won the race); live intents
     /// wait. Mirrors the cluster reconciler's rules (grace windows,
     /// decision-first, fence-before-discard) for the embedded topology.
     /// Returns `(finalized_commits, finalized_aborts)`.
@@ -1955,8 +1854,47 @@ impl LocalEngine {
     ///
     /// Returns [`EngineError`] on routing/transport failure; per-intent
     /// failures are skipped (the next pass retries), never fatal.
+    /// Resolves one expired intent by finalizing it, unless its driver may still be
+    /// live.
+    ///
+    /// The grace period is the whole policy: an intent younger than it is assumed
+    /// to have a driver that is about to decide, and taking the decision away from
+    /// it would turn a slow client into a lost transaction. Past it, the decision
+    /// already exists in the record and the finalize only has to be delivered.
+    ///
+    /// Failure is a retry, not an error: the next pass tries again, and a member
+    /// that is merely unreachable must not stop the ones after it.
+    fn resolve_one(
+        client: &LocalClient,
+        intent: &kivi_state::TxnIntent,
+        age: u64,
+        commit: bool,
+        digest: [u8; 32],
+    ) -> bool {
+        if age < kivi_state::RESOLVE_GRACE_MICROS {
+            return false;
+        }
+        // The intent's own write. The finalize entry is self-contained, so this is
+        // the same write the prepare reserved rather than something rediscovered
+        // from the reservation at apply time.
+        client
+            .txn_finalize(&intent.key, intent.write.clone(), intent.id, commit, digest)
+            .is_ok()
+    }
+
+    /// Resolves every expired transaction intent on this node, returning how many
+    /// committed and how many aborted.
+    ///
+    /// A pass never fails on a per-intent problem: an unreachable member or an
+    /// unresolvable record is retried on the next pass, and must not stop the
+    /// intents queued after it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError`] when the worker set cannot be enumerated at all,
+    /// which is a wiring failure rather than a per-transaction one.
     pub fn resolve_transactions(&self) -> Result<(usize, usize), EngineError> {
-        use kivi_state::{MAX_TXN_LIFETIME_MICROS, RESOLVE_GRACE_MICROS, TxnRecord, TxnState};
+        use kivi_state::{MAX_TXN_LIFETIME_MICROS, TxnRecord, TxnState};
         use std::sync::atomic::Ordering;
         self.shared.recovery_runs.fetch_add(1, Ordering::Relaxed);
         let client = self.client();
@@ -1998,32 +1936,20 @@ impl LocalEngine {
             .unwrap_or(u64::MAX);
             match record {
                 Some(record) if record.state == TxnState::Committed => {
-                    if age < RESOLVE_GRACE_MICROS {
-                        continue;
-                    }
-                    if client
-                        .txn_finalize(&intent.key, intent.id, true, record.digest)
-                        .is_ok()
-                    {
+                    if Self::resolve_one(&client, intent, age, true, record.digest) {
                         committed += 1;
                         self.shared.resolved_commits.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 Some(record) if record.state == TxnState::Aborted => {
-                    if age < RESOLVE_GRACE_MICROS {
-                        continue;
-                    }
-                    if client
-                        .txn_finalize(&intent.key, intent.id, false, record.digest)
-                        .is_ok()
-                    {
+                    if Self::resolve_one(&client, intent, age, false, record.digest) {
                         aborted += 1;
                         self.shared.resolved_aborts.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 _ => {
                     // Undecided (or record-less): only an expired lease may
-                    // resolve, and only through a fenced CAS-abort — never
+                    // resolve, and only through a fenced CAS-abort - never
                     // by discarding the intent directly.
                     if age < MAX_TXN_LIFETIME_MICROS {
                         continue;
@@ -2048,7 +1974,13 @@ impl LocalEngine {
                     // (commit 0 / abort 1): distinct intents, genuine OCC.
                     if client.decide_record_raw(intent.coordinator, intent.id, &aborted_record, 2)
                         && client
-                            .txn_finalize(&intent.key, intent.id, false, aborted_record.digest)
+                            .txn_finalize(
+                                &intent.key,
+                                intent.write.clone(),
+                                intent.id,
+                                false,
+                                aborted_record.digest,
+                            )
                             .is_ok()
                     {
                         aborted += 1;
@@ -2104,18 +2036,10 @@ impl LocalEngine {
         self.admin_handle().redundancy_snapshot()
     }
 
-    /// Snapshots the redundancy background-lane counters (`None` in
-    /// ephemeral mode). See [`AdminHandle::redundancy_lane_stats`] for the
-    /// admin-plane twin.
-    #[must_use]
-    pub fn redundancy_lane_stats(&self) -> Option<kivi_redundancy::LaneStats> {
-        self.admin_handle().redundancy_lane_stats()
-    }
-
     /// Returns a clonable read-only handle for the admin/control plane.
     ///
-    /// The handle carries no worker threads or queues — only the shared
-    /// routing publication, bound endpoints, and control senders — so it is
+    /// The handle carries no worker threads or queues - only the shared
+    /// routing publication, bound endpoints, and control senders - so it is
     /// `Send + Sync` and safe to hold across Tokio tasks. Metric queries
     /// block on a rendezvous: serve them from `spawn_blocking`, never from
     /// async handlers directly.
@@ -2158,7 +2082,7 @@ impl LocalEngine {
 
     /// Routes one key to its `(tablet, owner worker)` under the current
     /// publication. Exposed for debugging, placement verification, and the
-    /// future `EXPLAIN KEY` surface — normal operations route internally.
+    /// future `EXPLAIN KEY` surface - normal operations route internally.
     ///
     /// # Errors
     ///
@@ -2166,23 +2090,13 @@ impl LocalEngine {
     /// tablet covers the key.
     pub fn route_key(&self, key: &Key) -> Result<(TabletId, WorkerId), EngineError> {
         let routing = self.shared.routing.load();
-        let tablet = crate::compound::route_point_key(
-            routing.directory(),
-            self.shared.namespace,
-            key.as_bytes(),
-        )
-        .ok_or(EngineError::NoRoute)?;
+        let tablet = crate::compound::route_point_key(&routing, key.as_bytes())
+            .ok_or(EngineError::NoRoute)?;
         let worker = routing
             .placement()
             .worker_of(tablet)
             .ok_or(EngineError::NoRoute)?;
         Ok((tablet, worker))
-    }
-
-    /// Returns the directory version of the current routing publication.
-    #[must_use]
-    pub fn routing_version(&self) -> kivi_tablet::DirectoryVersion {
-        self.shared.routing.load().version()
     }
 
     /// Shuts every worker down and joins all threads, surfacing the first
@@ -2200,7 +2114,9 @@ impl LocalEngine {
             checkpoint.shutdown();
         }
         for worker in &self.workers {
-            let _ = worker.try_control(crate::worker::WorkerControl::Shutdown);
+            let _ = worker
+                .control_sender()
+                .try_send(crate::worker::WorkerControl::Shutdown);
         }
         // Wakeup for accept loops: they park in `accept()` uncancellable
         // (cancelling AcceptEx leaks the listener), so each bound worker
@@ -2268,13 +2184,6 @@ pub struct ShutdownReport {
     pub workers_joined: usize,
 }
 
-/// Extracts the current request ingress out of a fresh handle. Handle
-/// ingress bundles are not otherwise exposed; the engine keeps exactly one
-/// per worker.
-fn handle_sender(handle: &WorkerHandle) -> RequestIngress {
-    handle.sender()
-}
-
 /// Best-effort readable panic message from a thread payload.
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> Option<String> {
     if let Some(text) = payload.downcast_ref::<String>() {
@@ -2313,32 +2222,6 @@ enum BatchAttempt {
     Conflict,
     /// Terminal driver failure.
     Fatal(EngineError),
-}
-
-/// Operator inspection of one transaction's distributed state.
-#[derive(Debug, Clone)]
-pub struct TxnStatusReport {
-    /// Transaction inspected.
-    pub txn: TxnId,
-    /// Coordinator tablet (from prepared intents; `None` when nothing is
-    /// prepared anywhere — no decision can exist without intents... or the
-    /// record alone remains after full resolution).
-    pub coordinator: Option<TabletId>,
-    /// Whether prepared intents disagree on the coordinator (conflicting
-    /// drivers under one id — resolve by digest, never by guessing).
-    pub coordinator_disagree: bool,
-    /// Participant tablets holding prepared intents.
-    pub participants: Vec<TabletId>,
-    /// Prepared keys per participant tablet.
-    pub prepared: std::collections::BTreeMap<TabletId, Vec<Vec<u8>>>,
-    /// Durably known decision (`None` = unresolved: correct behavior is to
-    /// WAIT, never to guess).
-    pub decision: Option<kivi_state::TxnState>,
-    /// Digest of the known decision record, when known.
-    pub digest: Option<[u8; 32]>,
-    /// Age of the oldest prepared intent in micros (`None` when nothing
-    /// is prepared).
-    pub oldest_prepared_age_micros: Option<u64>,
 }
 
 /// Which decision the coordinator record converged to after the guarded
@@ -2381,7 +2264,7 @@ impl LocalClient {
             op,
             now: kivi_core::wall_now_or_max(&SystemClock),
             // Embedded callers share fate with the process: no retry
-            // identity, so no dedup — durable mode still WALs the write.
+            // identity, so no dedup - durable mode still WALs the write.
             identity: None,
             respond,
         };
@@ -2431,7 +2314,7 @@ impl LocalClient {
     }
 
     /// Executes one typed operation against its owning tablet. Chunked reads
-    /// resolve here on the caller thread (blocking lane call — this is
+    /// resolve here on the caller thread (blocking lane call - this is
     /// application-thread context, never the reactor), so every typed
     /// method below keeps its plain-bytes contract whatever the physical
     /// representation is.
@@ -2453,133 +2336,9 @@ impl LocalClient {
         // caller's window (a future lane range-read will fetch only the
         // required chunks instead of the full payload).
         let routing = self.shared.routing.load();
-        let tablet = crate::compound::route_point_key(
-            routing.directory(),
-            self.shared.namespace,
-            key.as_bytes(),
-        )
-        .ok_or(EngineError::NoRoute)?;
+        let tablet = crate::compound::route_point_key(&routing, key.as_bytes())
+            .ok_or(EngineError::NoRoute)?;
         self.execute_on(tablet, op, range)
-    }
-
-    /// Executes many operations, issuing **every** request before waiting for
-    /// any answer. Results come back in request order.
-    ///
-    /// The serial path costs one thread rendezvous per operation, so a client
-    /// that pipelines N commands into one buffer still pays N round-trips.
-    /// Issuing them all first lets the owning worker drain its queue in a
-    /// single turn, which is what pipelining is supposed to buy. Measured
-    /// against Redis — which already answers a whole pipeline in one event
-    /// loop pass — the serial path was the largest single gap on this edge.
-    ///
-    /// Per-operation routing and send failures are recorded against that
-    /// operation and do not abort the batch: one unroutable key must not
-    /// discard the work already accepted for its neighbours, and must not
-    /// shift anybody else's answer out of position.
-    #[must_use]
-    pub fn execute_many(&self, ops: Vec<Operation>) -> Vec<Result<OperationResult, EngineError>> {
-        /// One operation's place in the batch.
-        enum Slot<'lane> {
-            /// Queued, with the rendezvous to collect it.
-            Queued {
-                receive: crossbeam_channel::Receiver<crate::worker::WorkerResponse>,
-                lane: &'lane crate::chunk_lane::ChunkLaneHandle,
-                range: Option<(u64, u64)>,
-            },
-            /// Already decided; the answer does not need collecting.
-            Settled(Result<OperationResult, EngineError>),
-        }
-
-        // One routing snapshot for the whole batch: the directory cannot
-        // change under a caller that has not been told it may change.
-        let routing = self.shared.routing.load();
-        let now = kivi_core::wall_now_or_max(&SystemClock);
-        let mut slots: Vec<Slot<'_>> = Vec::with_capacity(ops.len());
-
-        for op in ops {
-            // A range read over a chunked root is sliced on this side, so the
-            // window has to travel with the request (same as `execute`).
-            let range = match &op {
-                Operation::GetRange { offset, len, .. } => Some((*offset, *len)),
-                _ => None,
-            };
-            let Some(tablet) = crate::compound::route_point_key(
-                routing.directory(),
-                self.shared.namespace,
-                op.key().as_bytes(),
-            ) else {
-                slots.push(Slot::Settled(Err(EngineError::NoRoute)));
-                continue;
-            };
-            let Some(worker) = routing.placement().worker_of(tablet) else {
-                slots.push(Slot::Settled(Err(EngineError::UnknownTablet { tablet })));
-                continue;
-            };
-            let Ok(index) = usize::try_from(worker.as_u64()) else {
-                slots.push(Slot::Settled(Err(EngineError::UnknownWorker { worker })));
-                continue;
-            };
-            let (Some(sender), Some(lane)) = (
-                self.shared.senders.get(index),
-                self.shared.chunk_lanes.get(index),
-            ) else {
-                slots.push(Slot::Settled(Err(EngineError::UnknownWorker { worker })));
-                continue;
-            };
-            let (respond, receive) = bounded(RESPONSE_CAPACITY);
-            let request = TabletRequest {
-                tablet,
-                op,
-                now,
-                // Embedded callers share fate with the process: no retry
-                // identity, so no dedup — durable mode still WALs the write.
-                identity: None,
-                respond,
-            };
-            match sender.try_send(request) {
-                Ok(()) => slots.push(Slot::Queued {
-                    receive,
-                    lane,
-                    range,
-                }),
-                Err(error) => slots.push(Slot::Settled(Err(map_send_error(&error, worker)))),
-            }
-        }
-
-        // Collect pass: every request is already queued, so waiting for the
-        // first answer overlaps with the worker executing the rest.
-        slots
-            .into_iter()
-            .map(|slot| match slot {
-                Slot::Settled(result) => result,
-                Slot::Queued {
-                    receive,
-                    lane,
-                    range,
-                } => receive
-                    .recv()
-                    .map_err(|_| EngineError::WorkerDown {
-                        worker: kivi_types::WorkerId::from_u64(0),
-                    })
-                    .and_then(|response| response.map_err(EngineError::from))
-                    .and_then(|outcome| {
-                        let OperationResult::ChunkedValue {
-                            manifest,
-                            logical_len,
-                        } = outcome
-                        else {
-                            return Ok(outcome);
-                        };
-                        let bytes = lane.read_value_blocking(manifest, logical_len)?;
-                        Ok(match range {
-                            None => OperationResult::Value(Some(bytes)),
-                            Some((offset, len)) => OperationResult::Value(Some(
-                                kivi_state::slice_range(&bytes, offset, len),
-                            )),
-                        })
-                    }),
-            })
-            .collect()
     }
 
     /// Fetches bytes (`None` when absent, expired, or never written).
@@ -2629,7 +2388,7 @@ impl LocalClient {
     /// fail with wrong-type. The live expiry survives (unlike
     /// [`set`](Self::set)): partial writes touch bytes, never the TTL.
     /// Large results and chunked bases restage through the chunk lane (also
-    /// preserving expiry), so the patch itself stays small — bulk rewrites
+    /// preserving expiry), so the patch itself stays small - bulk rewrites
     /// belong on the streaming upload path instead.
     ///
     /// # Errors
@@ -2811,6 +2570,7 @@ impl LocalClient {
     pub fn txn_finalize(
         &self,
         key: &Key,
+        write: kivi_state::TxnWrite,
         txn: TxnId,
         commit: bool,
         digest: [u8; 32],
@@ -2821,6 +2581,7 @@ impl LocalClient {
                 txn,
                 key: key.clone(),
                 commit,
+                write,
                 digest,
             },
         )? {
@@ -2886,7 +2647,7 @@ impl LocalClient {
         let routing = self.shared.routing.load();
         let namespace = self.shared.namespace;
         let directory = routing.directory();
-        let route = |key: &[u8]| crate::compound::route_point_key(directory, namespace, key);
+        let route = |key: &[u8]| crate::compound::route_point_key(&routing, key);
         let plan = plan_transaction(
             txn,
             writes.to_vec(),
@@ -2986,7 +2747,7 @@ impl LocalClient {
     /// One single-tablet batch attempt: the whole write set commits as one
     /// atomic record. OCC conflicts (including foreign intent reservations)
     /// retry with a fresh attempt; every other rejection is terminal for
-    /// this attempt (nothing was applied — validation precedes all writes).
+    /// this attempt (nothing was applied - validation precedes all writes).
     fn batch_attempt_local(
         &self,
         plan: &kivi_state::TxnDriverPlan,
@@ -3017,7 +2778,7 @@ impl LocalClient {
     }
 
     /// Persists one terminal decision through an absence-guarded
-    /// prepare + commit-finalize on the record key (CAS — never a blind
+    /// prepare + commit-finalize on the record key (CAS - never a blind
     /// overwrite). `decide_salt` separates the commit decide-transaction
     /// from the abort one so the two never share intent identity.
     fn decide_record(
@@ -3065,6 +2826,15 @@ impl LocalClient {
             txn: decide_txn,
             key: record_key,
             commit: true,
+            // The decision record's own write. The single-participant path
+            // already knows it, so naming it costs nothing - and the finalize
+            // entry is self-contained without it having to be rediscovered from
+            // the reservation at apply time.
+            write: kivi_state::TxnWrite {
+                key: Key::from(""),
+                kind: kivi_state::TxnWriteKind::Delete,
+                expect: kivi_state::TxnExpect::Absent,
+            },
             digest: [0u8; 32],
         };
         matches!(
@@ -3085,7 +2855,9 @@ impl LocalClient {
     ) -> Result<Vec<Option<ObjectVersion>>, EngineError> {
         let mut versions: Vec<Option<ObjectVersion>> = vec![None; plan.writes.len()];
         for (order, write) in plan.writes.iter().enumerate() {
-            if let Some(version) = self.txn_finalize(&write.key, plan.txn, commit, digest)? {
+            if let Some(version) =
+                self.txn_finalize(&write.key, write.clone(), plan.txn, commit, digest)?
+            {
                 versions[order] = Some(version);
             }
         }
@@ -3120,53 +2892,13 @@ impl LocalClient {
         for index in prepared {
             let _ = self.txn_finalize(
                 &plan.writes[*index].key,
+                plan.writes[*index].clone(),
                 plan.txn,
                 false,
                 plan.record.digest,
             );
         }
         AbortOutcome::Aborted
-    }
-
-    /// Resolves one transaction's intents over `keys`: reads its
-    /// coordinator record and finalizes accordingly (commit applies,
-    /// abort discards; missing intents are idempotent no-ops).
-    /// Undecided records resolve nothing (the driver is still live or the
-    /// lease path owns them — see the cluster reconciler).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EngineError`] on routing/transport failure.
-    pub fn resolve_transaction(
-        &self,
-        coordinator: TabletId,
-        txn: TxnId,
-        keys: &[Key],
-    ) -> Result<(usize, usize), EngineError> {
-        let record_key = txn_record_key(coordinator, txn);
-        let record = self
-            .get(&record_key)?
-            .map(|bytes| TxnRecord::decode(&bytes))
-            .transpose()
-            .map_err(|_| EngineError::InvalidRequest {
-                detail: "undecodable transaction record".to_owned(),
-            })?;
-        let commit = match record {
-            Some(record) if record.state == TxnState::Committed => (true, record.digest),
-            Some(record) if record.state == TxnState::Aborted => (false, record.digest),
-            _ => return Ok((0, 0)),
-        };
-        let (commit, digest) = commit;
-        let mut done = 0usize;
-        for key in keys {
-            // Missing intents (already resolved) count as converged.
-            // Finalizes carry the record digest they follow, so a
-            // conflicting reservation is never resolved by mistake.
-            if self.txn_finalize(key, txn, commit, digest).is_ok() {
-                done += 1;
-            }
-        }
-        if commit { Ok((done, 0)) } else { Ok((0, done)) }
     }
 
     /// Attaches an absolute expiry; `false` when the key is absent.

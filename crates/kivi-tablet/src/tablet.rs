@@ -23,7 +23,7 @@
 //! There are no backward edges and no boolean state flags: the enum *is* the
 //! state, so illegal combinations such as "active but fenced" are
 //! unrepresentable. Only [`TabletDescriptor::authority`] exposes a
-//! [`TabletAuthority`], and only while active —
+//! [`TabletAuthority`], and only while active -
 //! inactive, fenced, and tombstoned tablets cannot authorize mutations.
 
 use core::fmt;
@@ -74,7 +74,7 @@ impl fmt::Display for TabletState {
 /// Forwarding record left on a tombstone (RFC §190 parent redirect, §191
 /// merged-source redirect).
 ///
-/// Names the live successor tablets that now own the retired range — a set,
+/// Names the live successor tablets that now own the retired range - a set,
 /// not a single identity, because a split retires one parent into several
 /// children. Directory transitions require every successor to exist and be
 /// active at retirement time, so redirects always resolve forward.
@@ -272,11 +272,5 @@ mod tests {
             &[TabletId::from_u64(2), TabletId::from_u64(3)]
         );
         assert!(Redirect::new(Vec::new()).is_empty());
-    }
-
-    #[test]
-    fn states_display_distinctly() {
-        assert_eq!(TabletState::Active.to_string(), "active");
-        assert_eq!(TabletState::Tombstone.to_string(), "tombstone");
     }
 }

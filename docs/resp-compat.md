@@ -73,7 +73,7 @@ Bootstrap commands: `PING`, `ECHO`, `HELLO`, `CLIENT SETINFO/SETNAME/GETNAME`,
 `Exact` = verified against official Redis docs. `ProfileDeviation` = works
 with a documented difference. `Unsupported` = recognized, clear error, never
 faked. This table is generated from `kivi-resp`'s `REGISTRY`, which also
-drives dispatch validation and `COMMAND` output — claims cannot drift.
+drives dispatch validation and `COMMAND` output - claims cannot drift.
 
 | Command | Status | Notes |
 |---|---|---|
@@ -118,8 +118,8 @@ Redis integer commands operate on String contents; Kivi counters are a
 separate `StrictCounter` type (a `GET` on one is `WRONGTYPE` by design).
 Mapping `INCR` onto `StrictCounter` would silently change observable types,
 so v1 leaves the whole family unsupported with a clear error instead of an
-approximate one. A future Kivi-native numeric-bytes semantic — useful on its
-own, not just for Redis — could enable exact mappings later.
+approximate one. A future Kivi-native numeric-bytes semantic - useful on its
+own, not just for Redis - could enable exact mappings later.
 
 ### Errors
 

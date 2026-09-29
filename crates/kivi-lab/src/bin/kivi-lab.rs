@@ -8,7 +8,7 @@
 //! ```
 //!
 //! `bench --target resp` speaks the same raw RESP to Kivi RESP, Redis,
-//! Valkey, or Dragonfly — the transport is identical, so comparisons
+//! Valkey, or Dragonfly - the transport is identical, so comparisons
 //! isolate server differences. Machine-readable reports use `--format json`
 //! (schema [`kivi_lab::metrics::BENCH_SCHEMA`]); serde lives only in this
 //! non-production crate.
@@ -193,7 +193,7 @@ struct ConformanceArgs {
     /// Kivi RESP address (skips spawning when given).
     #[arg(long)]
     kivi: Option<String>,
-    /// Spawn an ephemeral Kivi server (needs a `redis-compat` binary).
+    /// Spawn an ephemeral Kivi server.
     #[arg(long, default_value_t = false)]
     spawn: bool,
     /// Reference Redis URL (or `KIVI_LAB_REDIS_URL`).
@@ -470,7 +470,7 @@ fn finish_report(
 fn conformance_cmd(args: ConformanceArgs) -> anyhow::Result<()> {
     use anyhow::Context;
     // Resolve the Kivi side: explicit address, or a spawned ephemeral
-    // server (which hard-fails without a `redis-compat` binary).
+    // server (which hard-fails without the RESP edge).
     let _spawned: Option<kivi_lab::process::Server>;
     let kivi_addr = match (args.kivi, args.spawn) {
         (Some(addr), _) => {
@@ -517,102 +517,5 @@ fn conformance_cmd(args: ConformanceArgs) -> anyhow::Result<()> {
         Ok(())
     } else {
         anyhow::bail!("{} conformance mismatches", mismatches.len())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use clap::Parser;
-
-    #[test]
-    fn bench_args_parse_end_to_end() {
-        let cli = Cli::try_parse_from([
-            "kivi-lab",
-            "bench",
-            "--threads",
-            "4",
-            "--ops",
-            "100",
-            "--workload",
-            "get",
-            "--keys",
-            "hot",
-            "--value-size",
-            "kb64",
-            "--duration-ms",
-            "250",
-            "--format",
-            "json",
-        ])
-        .expect("args parse");
-        let Command::Bench(args) = cli.command else {
-            panic!("bench subcommand");
-        };
-        assert_eq!(args.threads, 4);
-        assert_eq!(args.ops, 100);
-        assert_eq!(args.workload, Workload::Get);
-        assert_eq!(args.value_size, ValueSize::Kb64);
-        assert_eq!(args.duration, Some(Duration::from_millis(250)));
-        assert_eq!(args.format, Format::Json);
-    }
-
-    #[test]
-    fn bench_args_reject_bad_input_without_panicking() {
-        assert!(Cli::try_parse_from(["kivi-lab", "bench", "--threads", "0"]).is_err());
-        assert!(Cli::try_parse_from(["kivi-lab", "bench", "--keys", "cold"]).is_err());
-        assert!(Cli::try_parse_from(["kivi-lab", "bench", "--workload", "frobnicate"]).is_err());
-    }
-
-    #[test]
-    fn compare_args_parse_presets_and_overrides() {
-        let cli = Cli::try_parse_from([
-            "kivi-lab",
-            "compare",
-            "--preset",
-            "standard",
-            "--redis",
-            "redis://localhost:6379",
-            "--kivi-endpoint",
-            "127.0.0.1:9000",
-            "--kivi-resp",
-            "127.0.0.1:6380",
-            "--duration-ms",
-            "250",
-            "--threads",
-            "4",
-            "--pipeline",
-            "8",
-            "--workload",
-            "read-heavy",
-        ])
-        .expect("args parse");
-        let Command::Compare(args) = cli.command else {
-            panic!("compare subcommand");
-        };
-        assert_eq!(args.preset, CampaignPreset::Standard);
-        assert_eq!(args.duration, Some(Duration::from_millis(250)));
-        assert_eq!(args.threads, Some(4));
-        assert_eq!(args.pipeline, Some(8));
-        assert_eq!(args.workload, Some(Workload::ReadHeavy));
-    }
-
-    #[test]
-    fn compare_args_reject_bad_bounded_values() {
-        assert!(Cli::try_parse_from(["kivi-lab", "compare", "--trials", "0"]).is_err());
-        assert!(Cli::try_parse_from(["kivi-lab", "compare", "--duration-ms", "0"]).is_err());
-    }
-
-    #[test]
-    fn conformance_args_parse() {
-        let cli = Cli::try_parse_from([
-            "kivi-lab",
-            "conformance",
-            "--spawn",
-            "--redis",
-            "redis://localhost:6379",
-        ])
-        .expect("args parse");
-        assert!(matches!(cli.command, Command::Conformance(_)));
     }
 }

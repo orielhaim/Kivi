@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use kivi_types::{NodeId, Ticks};
 
-use crate::{AssetId, SchemeId, SchemeParams};
+use crate::{AssetId, SchemeId};
 
 const REPAIR_PRIORITY_UNRECOVERABLE: u64 = 1_000_000_000_000;
 const REPAIR_PRIORITY_NO_TOLERANCE: u64 = 800_000_000_000;
@@ -70,17 +70,6 @@ pub struct SchemeRequirements {
 }
 
 impl SchemeRequirements {
-    /// Builds requirements directly from bounded scheme parameters.
-    #[must_use]
-    pub fn from_params(params: SchemeParams) -> Self {
-        Self {
-            scheme: params.scheme(),
-            total_fragments: params.total_fragments(),
-            required_fragments: params.required_pieces(),
-            independent_tolerance: params.tolerance(),
-        }
-    }
-
     /// Builds requirements without decoding a [`SchemeParams`] value.
     #[must_use]
     pub const fn new(
@@ -337,13 +326,6 @@ impl RepairRisk {
         score = score.saturating_add(byte_priority(self.reconstruction_bytes));
         score
     }
-
-    /// Alias for [`priority`](Self::priority) for controller integrations that
-    /// name the value explicitly as a score.
-    #[must_use]
-    pub fn priority_score(&self) -> u64 {
-        self.priority()
-    }
 }
 
 fn count_nodes(nodes: &[NodeId]) -> u64 {
@@ -582,24 +564,6 @@ impl RepairDebt {
     pub fn for_node(&self, node: NodeId) -> DebtCounters {
         self.by_node.get(&node).copied().unwrap_or_default()
     }
-
-    /// Returns the debt attached to one failure-domain key, or zero.
-    #[must_use]
-    pub fn for_failure_domain(&self, failure_domain: &str) -> DebtCounters {
-        self.by_failure_domain
-            .get(failure_domain)
-            .copied()
-            .unwrap_or_default()
-    }
-
-    /// Returns the debt attached to one scheme, or zero.
-    #[must_use]
-    pub fn for_scheme(&self, scheme: SchemeId) -> DebtCounters {
-        self.by_scheme
-            .get(&SchemeKey::new(scheme))
-            .copied()
-            .unwrap_or_default()
-    }
 }
 
 fn add_map<K: Ord>(map: &mut BTreeMap<K, DebtCounters>, key: K, counters: DebtCounters) {
@@ -677,12 +641,6 @@ impl ScrubCursor {
         }
     }
 
-    /// Whether the current cycle has reached its end.
-    #[must_use]
-    pub const fn is_complete(self) -> bool {
-        self.cycle_complete
-    }
-
     /// Reconciles the cursor with the current catalog.
     ///
     /// The catalog is ordered by [`AssetId`]. A missing cursor asset resumes
@@ -723,12 +681,6 @@ impl ScrubCursor {
         }
     }
 
-    /// Alias for [`normalize`](Self::normalize) that emphasizes bounds
-    /// checking to persistence adapters.
-    pub fn clamp(&mut self, targets: &[ScrubTarget]) {
-        self.normalize(targets);
-    }
-
     /// Returns the cursor's position in the stable catalog, if active.
     #[must_use]
     pub fn position(&self, targets: &[ScrubTarget]) -> Option<usize> {
@@ -765,12 +717,6 @@ pub struct ScrubBatch {
 }
 
 impl ScrubBatch {
-    /// Number of asset ranges in the batch.
-    #[must_use]
-    pub fn asset_count(&self) -> usize {
-        self.ranges.len()
-    }
-
     /// Whether the batch contains no work.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -1064,11 +1010,6 @@ impl MaintenanceReport {
         self.reconstructions = self.reconstructions.saturating_add(1);
     }
 
-    /// Adds one completed fragment transfer.
-    pub fn record_transfer(&mut self) {
-        self.transfers = self.transfers.saturating_add(1);
-    }
-
     /// Adds one corruption observation.
     pub fn record_corruption(&mut self) {
         self.corruption_detected = self.corruption_detected.saturating_add(1);
@@ -1077,11 +1018,6 @@ impl MaintenanceReport {
     /// Adds one failed maintenance operation.
     pub fn record_failure(&mut self) {
         self.repair_failures = self.repair_failures.saturating_add(1);
-    }
-
-    /// Adds one stale completion rejected by fencing.
-    pub fn record_stale_result(&mut self) {
-        self.stale_results = self.stale_results.saturating_add(1);
     }
 
     /// Returns the non-negative duration between the report boundaries.
@@ -1143,11 +1079,6 @@ impl ControllerSnapshot {
     #[must_use]
     pub const fn cursor(&self) -> ScrubCursor {
         self.schedule.cursor
-    }
-
-    /// Replaces the most recent report.
-    pub fn set_last_report(&mut self, report: MaintenanceReport) {
-        self.last_report = Some(report);
     }
 }
 
@@ -1234,8 +1165,11 @@ mod tests {
         assert_eq!(left.total_bytes, 300);
         assert_eq!(left.total_fragments, 7);
         assert_eq!(left.for_node(NodeId::from_u64(1)).assets, 2);
-        assert_eq!(left.for_failure_domain("rack-b").assets, 3);
-        assert_eq!(left.for_scheme(SchemeId::Replication).bytes, 200);
+        assert_eq!(left.by_failure_domain["rack-b"].assets, 3);
+        assert_eq!(
+            left.by_scheme[&SchemeKey::new(SchemeId::Replication)].bytes,
+            200
+        );
 
         left.remove(&first);
         assert_eq!(left.total_assets, 3);
@@ -1286,7 +1220,7 @@ mod tests {
         let mut cursor = ScrubCursor::new(ScrubMode::Full);
         cursor.next_asset = Some(asset(2));
         cursor.byte_offset = 99;
-        cursor.clamp(&targets);
+        cursor.normalize(&targets);
         assert_eq!(cursor.byte_offset, 5);
         assert!(cursor.position(&targets).is_some());
     }

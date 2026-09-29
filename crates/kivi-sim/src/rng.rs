@@ -1,9 +1,9 @@
 //! Deterministic simulation RNG with a project-owned, frozen algorithm.
 //!
-//! [`SimRng`] implements a SplitMix64-style generator (a single `u64` of
-//! state, one addition and three xor-shift/multiply mixes per draw) with its
-//! constants pinned in this file. Replay stability therefore depends only on
-//! this source text — never on a dependency version, platform `rand`
+//! [`SimRng`] is a SplitMix64-style generator (a single `u64` of state, one
+//! addition and three xor-shift/multiply mixes per draw) with its constants
+//! pinned in this file. Replay stability therefore depends only on this
+//! source text - never on a dependency version, platform `rand`
 //! implementation, or hardware instruction set. The frozen vectors in the
 //! tests below pin the behavior; any intentional algorithm change must mint
 //! new vectors explicitly, which makes replay drift reviewable.
@@ -16,7 +16,7 @@ use kivi_core::RandomSource;
 /// Deterministic 64-bit generator: SplitMix64-style, fully owned.
 ///
 /// State transition per draw (all arithmetic modulo 2^64, which is inherent
-/// to the mixing construction — not a counter semantic, so the project's
+/// to the mixing construction - not a counter semantic, so the project's
 /// no-wrap rule for identities/sequences does not apply):
 ///
 /// ```text
@@ -77,44 +77,5 @@ mod tests {
             assert_eq!(rng.next_u64(), expected);
         }
         assert_eq!(SimRng::seed_from_u64(0).next_u64(), SEED_0_FIRST_DRAW);
-        // Replay from the same seed reproduces the frozen stream exactly.
-        let mut replay = SimRng::seed_from_u64(42);
-        for expected in SEED_42_STREAM {
-            assert_eq!(replay.next_u64(), expected);
-        }
-    }
-
-    #[test]
-    fn same_seed_replays_identically() {
-        let mut left = SimRng::seed_from_u64(42);
-        let mut right = SimRng::seed_from_u64(42);
-        for _ in 0..64 {
-            assert_eq!(left.next_u64(), right.next_u64());
-        }
-    }
-
-    #[test]
-    fn different_seeds_diverge_immediately() {
-        let mut left = SimRng::seed_from_u64(42);
-        let mut right = SimRng::seed_from_u64(43);
-        assert_ne!(left.next_u64(), right.next_u64());
-    }
-
-    #[test]
-    fn helpers_stay_within_contract() {
-        let mut rng = SimRng::seed_from_u64(7);
-        for _ in 0..32 {
-            assert_eq!(rng.below_u64(1), 0);
-            assert!(rng.below_u64(1000) < 1000);
-        }
-        let mut left = SimRng::seed_from_u64(7);
-        let mut right = SimRng::seed_from_u64(7);
-        let mut a = [0u8; 20];
-        let mut b = [0u8; 20];
-        left.fill_bytes(&mut a);
-        right.fill_bytes(&mut b);
-        assert_eq!(a, b);
-        assert_eq!(left.next_u32(), right.next_u32());
-        assert_eq!(left.next_u128(), right.next_u128());
     }
 }

@@ -171,7 +171,6 @@ impl LayoutRecord {
 
 /// Why a layout key or record was rejected.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
 pub enum LayoutError {
     /// Truncated input where framing promised bytes.
     #[error("truncated layout record")]

@@ -42,8 +42,6 @@
 //! key beside the primary (see [`projection_key`]) so updates/deletes can
 //! remove stale entries without client memory.
 
-use kivi_types::NamespaceId;
-
 use crate::object::{Key, ObjectVersion};
 
 /// Pinned index-key format tag (9 bytes).
@@ -82,33 +80,6 @@ pub enum IndexKind {
     NonUnique,
     /// One primary per term; concurrent claims conflict.
     Unique,
-}
-
-/// Lifecycle of an index definition (control-plane owned).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum IndexState {
-    /// Accepting maintenance writes, invisible to queries (backfill window).
-    Building,
-    /// Maintained and queryable.
-    Ready,
-    /// Maintenance stopped, entries being removed.
-    Dropping,
-}
-
-/// Index definition: which primary namespace feeds which ordered index
-/// namespace, and how.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IndexDefinition {
-    /// Index identity.
-    pub id: IndexId,
-    /// Namespace holding primary objects.
-    pub primary: NamespaceId,
-    /// Ordered namespace holding index entries.
-    pub index_ns: NamespaceId,
-    /// Uniqueness contract.
-    pub kind: IndexKind,
-    /// Lifecycle state.
-    pub state: IndexState,
 }
 
 /// Index key-codec failure (structural only).
@@ -253,27 +224,6 @@ pub fn decode_non_unique_key(input: &[u8]) -> Result<(IndexId, Vec<u8>, Vec<u8>)
     Ok((index, term, primary))
 }
 
-/// Decodes a unique entry key into `(index, term)`.
-///
-/// # Errors
-///
-/// Returns [`IndexCodecError`] when the input is not a well-formed unique
-/// entry key.
-pub fn decode_unique_key(input: &[u8]) -> Result<(IndexId, Vec<u8>), IndexCodecError> {
-    use IndexCodecError as Fault;
-    if input.len() < 18 || &input[..9] != INDEX_FORMAT_TAG || input[17] != 0x00 {
-        return Err(Fault::NotAnIndexKey);
-    }
-    let index = IndexId::from_u64(u64::from_be_bytes(
-        input[9..17].try_into().map_err(|_| Fault::NotAnIndexKey)?,
-    ));
-    let (term, end) = take_escaped(input, 18)?;
-    if end != input.len() {
-        return Err(Fault::NotAnIndexKey);
-    }
-    Ok((index, term))
-}
-
 /// Encodes a non-unique entry value: the referenced primary version.
 #[must_use]
 pub fn encode_non_unique_value(version: ObjectVersion) -> Vec<u8> {
@@ -323,7 +273,7 @@ pub fn projection_key(primary: &[u8]) -> Key {
 }
 
 /// Projection-key prefix after the system byte: `kivi/proj/`.
-pub const PROJECTION_PREFIX: &[u8; 10] = b"kivi/proj/";
+const PROJECTION_PREFIX: &[u8; 10] = b"kivi/proj/";
 
 /// Strips a projection key to its primary (`None` for ordinary keys).
 /// Routers use this to co-locate projections with their primaries.
@@ -485,11 +435,6 @@ mod tests {
                 b"k\x00".as_slice()
             )
         );
-        let (uindex, uterm) = decode_unique_key(&unique).expect("round trip");
-        assert_eq!(
-            (uindex, uterm.as_slice()),
-            (IndexId::from_u64(7), b"alice@example.com".as_slice())
-        );
     }
 
     #[test]
@@ -543,10 +488,6 @@ mod tests {
     fn malformed_keys_rejected() {
         assert_eq!(
             decode_non_unique_key(b"garbage"),
-            Err(IndexCodecError::NotAnIndexKey)
-        );
-        assert_eq!(
-            decode_unique_key(&encode_non_unique_key(IndexId::from_u64(1), b"t", b"p")),
             Err(IndexCodecError::NotAnIndexKey)
         );
     }

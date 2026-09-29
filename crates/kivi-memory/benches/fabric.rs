@@ -1,13 +1,12 @@
-//! Phase-9 Memory Fabric costs against the all-DRAM baseline: inline
-//! and arena point reads, mixed insert/read throughput, the background
-//! compression/demotion path, and the cold promotion path. Repeatable
-//! locally with `cargo bench -p kivi-memory`.
+//! Memory Fabric costs against the all-DRAM baseline: inline and arena
+//! point reads, mixed insert/read throughput, the background
+//! compression/demotion path, and the cold promotion path.
 //!
 //! Reporting follows one style everywhere: an `ItemsCount` throughput
-//! counter plus divan 0.1's built-in timing distribution
-//! (mean/median/min/max). Divan 0.1.21 reports no p99-style latency
-//! percentiles, so p50/p99/p99.9 stay in `tests/measure.rs`, which
-//! computes them by hand.
+//! counter plus divan's built-in timing distribution
+//! (mean/median/min/max). Divan reports no p99-style latency percentiles,
+//! so p50/p99/p99.9 stay in `tests/measure.rs`, which computes them by
+//! hand.
 
 use divan::{Bencher, black_box, counter::ItemsCount};
 

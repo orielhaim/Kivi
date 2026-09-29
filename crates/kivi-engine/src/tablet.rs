@@ -4,7 +4,7 @@
 //! with its mutable [`ObjectStore`]. It is deliberately distinct from
 //! [`TabletDescriptor`]: descriptors are
 //! shared routing facts, live tablets are single-owner execution state.
-//! There is no lock anywhere in this path — the owning worker thread is the
+//! There is no lock anywhere in this path - the owning worker thread is the
 //! only mutator, and execution is plain synchronous Rust once a request
 //! arrives.
 //!
@@ -29,7 +29,7 @@ use kivi_types::{
     TabletId, WallTimestamp,
 };
 
-/// Local per-tablet counters. Plain integers behind the owner thread —
+/// Local per-tablet counters. Plain integers behind the owner thread -
 /// aggregation across workers happens outside the hot path.
 ///
 /// Transaction and semantic counters record replicated apply truth (what
@@ -95,7 +95,7 @@ pub struct TabletMetrics {
 impl TabletMetrics {
     /// Records one applied mutation by category. Exhaustive over
     /// variants (no wildcard): a new mutation must be counted explicitly.
-    pub fn note_applied(&mut self, mutation: &kivi_state::Mutation) {
+    pub(crate) fn note_applied(&mut self, mutation: &kivi_state::Mutation) {
         use kivi_state::Mutation as M;
         match mutation {
             M::TxnCommitLocal { .. } => self.txn_local_commits += 1,
@@ -128,7 +128,7 @@ impl TabletMetrics {
 
     /// Records one applied transaction outcome that carries no mutation
     /// of its own (prepare conflicts, finalize conflicts).
-    pub fn note_txn_outcome(&mut self, outcome: &kivi_state::ApplyOutcome) {
+    pub(crate) fn note_txn_outcome(&mut self, outcome: &kivi_state::ApplyOutcome) {
         use kivi_state::ApplyOutcome as O;
         if outcome == &O::TxnConflict {
             self.txn_prepare_conflicts += 1;
@@ -136,7 +136,7 @@ impl TabletMetrics {
     }
 
     /// Records one terminal rejection by error category.
-    pub fn note_rejection(&mut self, error: &kivi_state::OpError) {
+    pub(crate) fn note_rejection(&mut self, error: &kivi_state::OpError) {
         use kivi_state::OpError as E;
         match error {
             E::TxnConflict => self.rejected_conflicts += 1,
@@ -204,7 +204,7 @@ pub struct DedupEntry {
 /// One session's dedup state on one tablet: the durable floor plus the
 /// retained outcomes above it. The floor survives with an empty outcome
 /// map (a compact floor record); sessions are never garbage-collected in
-/// this stage — correctness over reclamation, and the eventual
+/// this stage - correctness over reclamation, and the eventual
 /// session-retention design must preserve the "never execute again" rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionDedup {
@@ -342,7 +342,7 @@ pub(crate) type RestoredSession = (SessionId, RequestSeq, Vec<(RequestSeq, Dedup
 
 /// One mutable tablet replica. `Send` (it moves between threads only at
 /// construction/migration boundaries) but used from exactly one thread at a
-/// time — the owner enforces that, not the type system.
+/// time - the owner enforces that, not the type system.
 pub struct LiveTablet {
     id: TabletId,
     authority: TabletAuthority,
@@ -364,7 +364,7 @@ pub struct LiveTablet {
     /// history for chunk GC: the checkpoint worker prunes entries at or
     /// below the older retained cut (then checkpoint bands plus the WAL
     /// tail cover them), keeping everything newer as GC roots. One push
-    /// per chunked commit only — inline traffic never touches it.
+    /// per chunked commit only - inline traffic never touches it.
     chunked_commits: std::collections::VecDeque<(u64, kivi_types::ManifestId)>,
 }
 
@@ -425,7 +425,7 @@ impl LiveTablet {
     }
 
     /// Marks the physical checkpoint band holding `key` dirty. No-op when
-    /// tracking is disabled. An unmappable key (unsupported layout — only
+    /// tracking is disabled. An unmappable key (unsupported layout - only
     /// reachable if formats evolve past this build) fails closed: callers
     /// surface it rather than silently losing dirt.
     fn note_key_dirty(&mut self, key: &Key) {
@@ -584,7 +584,7 @@ impl LiveTablet {
             // Unreachable for well-formed clients (the floor only
             // passes consecutively completed sequences, and a live
             // identity is never completed beneath itself), but a
-            // violated invariant must fail closed — never re-execute.
+            // violated invariant must fail closed - never re-execute.
             return IdentityGate::Expired;
         }
         if let Some(entry) = session.get(seq) {
@@ -609,7 +609,7 @@ impl LiveTablet {
 
     /// Prepares one operation for the durable pipeline: dedup lookup and
     /// floor advance first, then store preparation. Never persists, never
-    /// mutates logical state — the caller persists exactly what this
+    /// mutates logical state - the caller persists exactly what this
     /// returns before replying.
     ///
     /// Identity `None` (embedded callers, which share fate with the
@@ -688,7 +688,7 @@ impl LiveTablet {
     }
 
     /// Advances the applied cursor after a verified apply. The caller must
-    /// have applied exactly `applied.next()` — contiguity is checked by
+    /// have applied exactly `applied.next()` - contiguity is checked by
     /// the commit paths, not here.
     fn set_applied(&mut self, commit: CommitPosition) {
         self.applied_commit = commit;
@@ -716,14 +716,14 @@ impl LiveTablet {
     /// On restart, replay applies the same durable mutation.
     ///
     /// Application must arrive in assignment order: the applied cursor
-    /// advances contiguously, so a batch applies 1,2,3 — never 1,3,2.
+    /// advances contiguously, so a batch applies 1,2,3 - never 1,3,2.
     /// Out-of-order or repeated application is process-fatal for the same
     /// reason as a value mismatch.
     ///
     /// # Errors
     ///
     /// Returns [`TabletError::Apply`] when application itself fails (only
-    /// reachable on divergent state — same log on same state never
+    /// reachable on divergent state - same log on same state never
     /// produces it, which is exactly what the verification below guards).
     ///
     /// # Panics
@@ -793,8 +793,8 @@ impl LiveTablet {
     /// local-commit sets) journal exactly like direct ones, and deletions
     /// journal nothing. Prepared intents journal their referenced manifests
     /// directly (no post-state root exists yet): the entry lingers past an
-    /// abort until the prune bound passes — retention-longer, never
-    /// shorter — so payload a later Commit needs can never be collected
+    /// abort until the prune bound passes - retention-longer, never
+    /// shorter - so payload a later Commit needs can never be collected
     /// first. GC always sees staged data as either pinned or journaled,
     /// never neither.
     fn note_chunked_commit(&mut self, commit: CommitPosition, mutation: &Mutation) {
@@ -1030,7 +1030,7 @@ impl LiveTablet {
     /// Open batches are definitionally excluded: only applied positions
     /// are durable truth, so capture never waits and never sees
     /// speculation. Serialization happens off the hot worker from this
-    /// view — the first step of the future COW/MVCC checkpoint model.
+    /// view - the first step of the future COW/MVCC checkpoint model.
     pub fn capture_view(&mut self, namespace: NamespaceId) -> kivi_checkpoint::TabletSnapshot {
         use kivi_checkpoint::{OutcomeCheckpoint, SessionCheckpoint};
         let mut sessions: Vec<SessionCheckpoint> = self
@@ -1108,16 +1108,12 @@ impl LiveTablet {
     /// mutations, returning each reclaimed key with its outcome. Bounded by
     /// `limit` so reclamation never starves foreground work; the driver
     /// repeats sweeps until `collect_expired` comes back empty.
-    pub fn sweep_expired(&mut self, now: WallTimestamp, limit: usize) -> Vec<(Key, ApplyOutcome)> {
-        self.sweep_expired_except(now, limit, None)
-    }
-
-    /// Reclaims expired objects like [`sweep_expired`](Self::sweep_expired)
-    /// but never touches keys in `skip`. The commit pipeline passes its
-    /// staged keys so a sweep cannot delete a key whose prediction is
-    /// already batched (which would diverge post-durability verification).
-    /// Skipped keys simply wait for the next sweep.
-    pub fn sweep_expired_except(
+    ///
+    /// Keys in `skip` are never touched. The commit pipeline passes its staged
+    /// keys so a sweep cannot delete a key whose prediction is already
+    /// batched (which would diverge post-durability verification). Skipped
+    /// keys simply wait for the next sweep.
+    pub fn sweep_expired(
         &mut self,
         now: WallTimestamp,
         limit: usize,
@@ -1325,9 +1321,9 @@ mod tests {
             )
             .expect("persist");
         let later = WallTimestamp::from_micros(20_000_000);
-        let reclaimed = tablet.sweep_expired(later, 1);
+        let reclaimed = tablet.sweep_expired(later, 1, None);
         assert_eq!(reclaimed.len(), 1, "sweep honors its bound");
-        let reclaimed = tablet.sweep_expired(later, 100);
+        let reclaimed = tablet.sweep_expired(later, 100, None);
         assert_eq!(reclaimed.len(), 1);
         assert_eq!(tablet.metrics().expired_reclaimed, 2);
         assert_eq!(tablet.store().live_count(later), 1);

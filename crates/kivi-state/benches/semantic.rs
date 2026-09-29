@@ -205,6 +205,11 @@ fn prepare_finalize_two_keys(bencher: Bencher) {
                     txn,
                     key: key(name),
                     commit: true,
+                    write: kivi_state::txn::TxnWrite {
+                        key: key(name),
+                        kind: kivi_state::txn::TxnWriteKind::Put(bytes::Bytes::from_static(b"v")),
+                        expect: kivi_state::txn::TxnExpect::Absent,
+                    },
                     digest,
                 },
             ));

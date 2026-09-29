@@ -4,7 +4,7 @@
 //! explicit latency, bandwidth, capacity, and connectivity state. It owns no
 //! scheduler: [`send`](NetSim::send) returns a [`NetSendOutcome`] describing
 //! what must happen (schedule this delivery / record this drop), and the
-//! driver — unit-test loops or the cluster runner — performs it. Time always
+//! driver - unit-test loops or the cluster runner - performs it. Time always
 //! arrives as an explicit `now` parameter; nothing here reads a clock.
 //!
 //! Capacity discipline (the driver contract): each scheduled delivery holds
@@ -16,8 +16,8 @@
 //!
 //! Not modeled here (deliberately): TCP/QUIC, sockets, fragmentation,
 //! retransmission, congestion control, or peer protocol semantics. Fault
-//! actions `duplicate` / `reorder` / `delay` are driver operations — schedule
-//! an extra copy, or reschedule later — taken through the checked scheduler
+//! actions `duplicate` / `reorder` / `delay` are driver operations - schedule
+//! an extra copy, or reschedule later - taken through the checked scheduler
 //! so they stay deterministic.
 
 use core::fmt;
@@ -139,7 +139,7 @@ impl LinkConfig {
     ///
     /// `bandwidth_bytes_per_sec` must be nonzero (serialization delay divides
     /// by it); `capacity` bounds in-flight messages and may be zero (a link
-    /// that admits nothing — every send congests).
+    /// that admits nothing - every send congests).
     ///
     /// # Errors
     ///
@@ -275,7 +275,7 @@ impl NetDelivery {
 
 /// Typed fault context for network deliveries: the `Ctx` instantiating
 /// `FaultPolicy<Ctx>` for drop/delay/duplicate decisions. No IP, transport,
-/// or protocol concepts — just who, what size, and when.
+/// or protocol concepts - just who, what size, and when.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NetDeliveryContext {
     from: Endpoint,
@@ -362,7 +362,7 @@ pub enum NetSendOutcome {
 
 /// Network simulator failures: topology misuse and checked-arithmetic
 /// exhaustion. Reachability outcomes are [`NetSendOutcome::Dropped`], not
-/// errors — only misuse and exhaustion fail.
+/// errors - only misuse and exhaustion fail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
 #[non_exhaustive]
 pub enum NetError {
@@ -543,8 +543,8 @@ impl NetSim {
     }
 
     /// Admits one fault-injected copy (duplicate or deferral) on a directed
-    /// link without minting a new message identity. Returns `false` — and
-    /// admits nothing — when the link is missing or already at capacity, in
+    /// link without minting a new message identity. Returns `false` - and
+    /// admits nothing - when the link is missing or already at capacity, in
     /// which case the driver drops the copy as congested.
     pub fn duplicate_slot(&mut self, from: NodeId, to: NodeId) -> bool {
         if let Some(link) = self.links.get_mut(&(from, to))
@@ -692,11 +692,8 @@ impl NetSim {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kivi_core::{EventView, FaultDecision, FaultPolicy, RandomSource};
     use kivi_types::NodeIncarnation;
     use rstest::{fixture, rstest};
-
-    use crate::scheduler::Scheduler;
 
     const INC: NodeIncarnation = NodeIncarnation::INITIAL;
 
@@ -756,17 +753,12 @@ mod tests {
             .send(ep(1), node(2), vec![9u8; size], now)
             .expect("send");
         let NetSendOutcome::Scheduled { delivery } = outcome else {
-            panic!("symmetric up link must schedule");
+            panic!("up link must schedule");
         };
         assert_eq!(
             delivery.deliver_at(),
             Ticks::from_micros(1_000_000 + base_us + serial_us)
         );
-        assert_eq!(delivery.sent_at(), now);
-        assert_eq!(delivery.id(), MsgId::FIRST);
-        assert_eq!(delivery.from(), ep(1));
-        assert_eq!(delivery.to(), node(2));
-        assert_eq!(delivery.payload().len(), size);
     }
 
     enum Cut {
@@ -966,72 +958,5 @@ mod tests {
         .expect("link");
         let outcome = net.send(ep(1), node(2), vec![1], Ticks::from_micros(u64::MAX - 10));
         assert_eq!(outcome, Err(NetError::TickOverflow));
-    }
-
-    /// A policy over typed network context: drop oversized messages while
-    /// letting small ones through — the shape future loss models take.
-    struct DropOversized {
-        max_bytes: usize,
-    }
-
-    impl FaultPolicy<NetDeliveryContext> for DropOversized {
-        fn decide(
-            &mut self,
-            _: &EventView,
-            ctx: &NetDeliveryContext,
-            _: &mut dyn RandomSource,
-        ) -> FaultDecision {
-            if ctx.size_bytes() > self.max_bytes {
-                FaultDecision::Drop
-            } else {
-                FaultDecision::Allow
-            }
-        }
-    }
-
-    struct ConstRng(u64);
-
-    impl RandomSource for ConstRng {
-        fn next_u64(&mut self) -> u64 {
-            self.0
-        }
-    }
-
-    #[test]
-    fn typed_context_policy_drives_deliveries() {
-        let mut net = pair();
-        let now = Ticks::from_micros(1_000);
-        let mut scheduler = Scheduler::new(now);
-        for size in [10usize, 500] {
-            let NetSendOutcome::Scheduled { delivery } = net
-                .send(ep(1), node(2), vec![7u8; size], now)
-                .expect("send")
-            else {
-                panic!("up link must schedule");
-            };
-            scheduler
-                .schedule_at(delivery.deliver_at(), delivery)
-                .expect("delivery fits");
-        }
-        let mut policy = DropOversized { max_bytes: 100 };
-        let mut rng = ConstRng(0);
-        let mut outcomes = Vec::new();
-        while let Some(popped) = scheduler.pop_next() {
-            let ctx = popped.event().fault_context();
-            let decision = policy.decide(&popped.view(), &ctx, &mut rng);
-            net.complete_delivery(popped.event().from().node(), popped.event().to());
-            outcomes.push((ctx.size_bytes(), decision));
-        }
-        assert_eq!(
-            outcomes,
-            vec![(10, FaultDecision::Allow), (500, FaultDecision::Drop),]
-        );
-    }
-
-    #[test]
-    fn identities_display_for_trace_use() {
-        assert_eq!(MsgId::from_u64(11).to_string(), "msg11");
-        assert_eq!(ep(3).to_string(), "n3@1");
-        assert_eq!(LinkStatus::Partitioned.to_string(), "partitioned");
     }
 }

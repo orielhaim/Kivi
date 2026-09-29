@@ -344,11 +344,21 @@ mod tests {
         }
     }
 
+    /// Every registered command admits its own minimum arity, and a name that is
+    /// not registered is not a command.
+    ///
+    /// The interesting half is the arity: a spec whose declared minimum exceeds
+    /// what `arity_ok` accepts would refuse its own documented usage, and nothing
+    /// else in the suite would notice.
     #[test]
-    fn every_spec_lookup_round_trips() {
+    fn arity_bounds_are_admissible() {
         for spec in REGISTRY {
-            assert_eq!(lookup(spec.name), Some(spec));
-            assert!(arity_ok(spec, spec.min_arity));
+            assert!(
+                arity_ok(spec, spec.min_arity),
+                "{} rejects its own minimum arity {}",
+                spec.name,
+                spec.min_arity
+            );
         }
         assert_eq!(lookup("NOPE"), None);
     }

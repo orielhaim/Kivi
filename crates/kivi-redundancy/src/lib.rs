@@ -10,10 +10,10 @@
 //! interchangeable replication and Reed-Solomon providers, deterministic
 //! failure-domain-aware placement, generation-fenced `build → verify →
 //! publish → retire` transitions, bounded repair, integrity verification,
-//! observability, and deterministic simulation hooks.
+//! observability.
 //!
 //! ```text
-//! intent (tolerance, locality, cost — never "RS(8,3)")
+//! intent (tolerance, locality, cost - never "RS(8,3)")
 //!   │
 //!   ▼
 //! planner (deterministic baseline; adaptive control fits later)
@@ -44,62 +44,39 @@ pub mod intent;
 pub mod lane;
 pub mod metrics;
 pub mod placement;
-pub mod policy;
 pub mod proto;
 pub mod repair;
 pub mod replication;
 pub mod rs;
 pub mod scheme;
-pub mod sim;
 pub mod store;
 pub mod transport;
 
 pub use asset::{AssetId, AssetKind, InformationAsset};
-pub use catalog::{
-    CatalogPublish, Discovery, LayoutCatalog, MemCatalog, PublishedLayout, merge_discovery,
-};
-pub use dist::{DistConfig, DistributedAssessment, DistributedFabric, RepairReport, SweepReport};
+pub use catalog::{CatalogPublish, LayoutCatalog, PublishedLayout};
+pub use dist::{DistConfig, DistributedFabric, RepairReport, SweepReport};
 pub use domain::{FailureDomain, FailureScope, NodeDescriptor, NodeHealth};
 pub use error::RedundancyError;
-pub use fabric::{
-    FabricConfig, ReconstructionBudgets, RecoveryReport, RedundancyFabric, TransitionState,
-};
+pub use fabric::{FabricConfig, RecoveryReport, RedundancyFabric, TransitionState};
 pub use fragment::{FragmentId, FragmentRecord, FragmentRole, RedundancyLayout};
-pub use healing::{
-    ControllerSnapshot, DebtCounters, MaintenanceBudgets, MaintenanceReport, RepairDebt,
-    RepairDebtEntry, RepairRisk, SchemeRequirements, ScrubBatch, ScrubCursor, ScrubMode,
-    ScrubRange, ScrubSchedule, ScrubTarget,
-};
+pub use healing::{ControllerSnapshot, MaintenanceBudgets, RepairDebt};
 pub use intent::{LocalityRequirement, RedundancyIntent, RepairConstraints, StorageCost};
 pub use lane::{
     FenceHook, LaneConfig, LaneJoin, LanePriority, LaneStats, LaneValue, RedundancyLane,
 };
 pub use metrics::{AssetHealth, FabricMetrics, FabricMetricsSnapshot, FragmentCensus};
 pub use placement::{
-    DegradedPlacement, ReconstructionTargets, independent_survivable, plan_placement,
-};
-pub use placement::{
-    DesiredPlacement, FragmentPlacement, HealthyPlacement, plan_placement_with_locality,
-    reconstruction_targets,
-};
-pub use policy::{
-    AssetTemperature, HOT_SMALL_MAX_BYTES, PolicyDecisionReason, PolicyDecisionTrace, PolicyError,
-    PolicyInput, PolicyObservation, PolicyOutcome, PolicyState, SchemePreference,
-    SchemePreferenceDecision, SchemePreferenceReason, SelfHealingPolicy, SelfHealingPolicyAdapter,
-    apply_maintenance_policy, apply_policy, prefer_redundancy_scheme, preferred_scheme,
-    scheme_satisfies_intent, update_maintenance_budgets,
+    DesiredPlacement, FragmentPlacement, ReconstructionTargets, independent_survivable,
+    plan_placement, plan_placement_with_locality, reconstruction_targets,
 };
 pub use proto::{
     FragmentInventoryEntry, FragmentKey, FragmentReply, FragmentRpc, MAX_FRAGMENT_WIRE_BYTES,
     MAX_INVENTORY_ENTRIES, MAX_LAYOUT_WIRE_BYTES, PROTO_MAJOR, PROTO_MINOR, RefuseReason,
 };
 pub use repair::{
-    AssetAssessment, FragmentVerdict, RepairBudgets, RepairEngine, RepairReason, RepairTask,
-    ScrubReport, assess, assess_with_min_available, scrub_report,
+    AssetAssessment, FragmentVerdict, RepairReason, ScrubReport, assess, assess_with_min_available,
+    scrub_report,
 };
-pub use scheme::{
-    ReplicationParams, RsParams, SchemeCapabilities, SchemeId, SchemeParams, plan_baseline,
-};
-pub use sim::{FaultKind, SimFragments};
+pub use scheme::{ReplicationParams, RsParams, SchemeId, SchemeParams, plan_baseline};
 pub use store::{AcceptedLayout, FragmentStore, LocalFragmentStore, StagedFragment, StoreRecovery};
-pub use transport::{FragmentTransport, LoopbackTransport, PeerTarget, TransportFailure};
+pub use transport::{FragmentTransport, PeerTarget, TransportFailure};

@@ -7,7 +7,7 @@
   roster generations per term, Guard -> Renew activation, revoke-first
   transitions, restart quarantine with incarnations, message loss /
   reordering / delay (stream transport: delivery consumes the message;
-  no application-level duplication — the scalar-counting audit in the
+  no application-level duplication - the scalar-counting audit in the
   implementation covers that separately), partitions, crash + sat-out
   restart,
   authority transitions, Raft commit vs external completion, local reads,
@@ -83,40 +83,40 @@
   Weakening switch: CONSTANT Weaken selects one structural rule to drop.
   Only "floor" and "takeover" currently exhibit counterexamples (fast,
   targeted inits below); the other four weakenings are retained as
-  documentation of the threat model but have no exhibiting config —
+  documentation of the threat model but have no exhibiting config -
   each is safety-redundant under the fail-closed deadline gates, with
   the reason recorded in the ledger. Removing a rule must either
   exhibit a fresh counterexample or extend the ledger with its
   redundancy proof.
     "none" ....... base model (must satisfy all invariants)
     "floor" ...... local reads require stability only (no floor
-                   coverage) — EXHIBITS (repair witness, WarmFloorInit)
+                   coverage) - EXHIBITS (repair witness, WarmFloorInit)
     "takeover" ... writes complete without the new-leader takeover
-                   wait — EXHIBITS (crash witness, WarmInit)
-    "quarantine" . grant/announce ignore the restart fence —
+                   wait - EXHIBITS (crash witness, WarmInit)
+    "quarantine" . grant/announce ignore the restart fence -
                    REDUNDANT (ledger: the intact fence plus
                    current-commit promo floors close every window)
-    "attempt" .... replies accepted for any attempt/sequence —
+    "attempt" .... replies accepted for any attempt/sequence -
                    REDUNDANT (ledger: floor folds max, deadlines only
                    refresh live holds, phases gate promotion)
-    "generation" . no pruning, no designated checks (old+new coexist) —
+    "generation" . no pruning, no designated checks (old+new coexist) -
                    REDUNDANT (ledger: old holds need a live old
                    grantor, which covers; promo/coverage sandwich)
     "revocation" . new Guards overwrite live exclusions; term rise sends
-                   no revokes — REDUNDANT (ledger: a departed leader's
-                   old pairing can never refresh — repair is
-                   same-term-only — so stale-term stability dies with
+                   no revokes - REDUNDANT (ledger: a departed leader's
+                   old pairing can never refresh - repair is
+                   same-term-only - so stale-term stability dies with
                    its holds)
 
   Scope flags: CONSTANT Flags selects which fault/auxiliary actions TLC
   may fire, so each negative config explores the smallest state space
-  that still admits its intended witness — faults a witness never uses
+  that still admits its intended witness - faults a witness never uses
   only multiply interleavings. CONSTANT SoupCap bounds in-flight
   messages per config. Only fast-verdict configs ship in spec/ (see
   the ledger); deeper explorations (full-composition base with all
   flags, larger bounds) are manual research: set all Flags,
   MaxTime=10, MaxSeq=4, MaxGen=2, SoupCap=20, INIT Init and run by
-  hand — expect hundreds of millions of states, not CI minutes.
+  hand - expect hundreds of millions of states, not CI minutes.
     "drop" ..... message loss (DropMsg; non-delivery is already explored
                  by simply never firing a Deliver)
     "part" ..... partitions and heals
@@ -128,7 +128,7 @@
 
   Fail-closed stall discipline (load-bearing, mirrors the
   implementation): every safety use of time-bound state revalidates the
-  deadline against now and fails closed — stability counts only live
+  deadline against now and fails closed - stability counts only live
   holds (GrantsFor), completion covers only live exclusions
   (CoveredSet), renewal receipt requires a live held pairing
   (DeliverRenew), exactly like the implementation's tick-removal
@@ -143,7 +143,7 @@
   Fast suite (spec/run_tla.ps1 default, all green 2026-09-18):
     "canonical" .... EXHAUSTIVE clean from WarmFreshInit (670K states,
                    depth 31, 10s): fresh-regime interplay with serves
-                   happening — stability, coverage chase, designation,
+                   happening - stability, coverage chase, designation,
                    leader leg. The mandatory gate. Stall-fallback is
                    covered by Rust unit tests, depth by the nightly
                    base run.
@@ -157,13 +157,13 @@
                    satisfied): uncovered completion, post-commit driver
                    repair of two pairings, serve below the ignored
                    floor (depth 13). Base-side safety on the same shape
-                   follows by trace analysis — the post-commit
+                   follows by trace analysis - the post-commit
                    promo-renew always raises the floor past applied,
                    and completing while covered chases applied past the
-                   floor — plus the Rust floor/evidence tests.
+                   floor - plus the Rust floor/evidence tests.
   Removed from the suite (no exhibiting config exists; each rule is
   safety-redundant under the fail-closed deadline gates):
-    "attempt" .... stale-accept is semantically void — floors fold max
+    "attempt" .... stale-accept is semantically void - floors fold max
                    (never lower), deadlines refresh only live holds
                    (receipt-continuity), promotion still consumes the
                    Guarding phase.
@@ -334,7 +334,7 @@ Init ==
    renewed at attempt 11 / seq 2, floors zero, soup empty. Reachable
    from Init by construction (announce; deliver every guard; answer
    every reply; promote; deliver every renew; consume every
-   renew-reply — all at now=0). Variants start here so BFS spends its
+   renew-reply - all at now=0). Variants start here so BFS spends its
    budget on the witness, not the handshake; the base config keeps the
    cold Init. *)
 WarmInit ==
@@ -394,7 +394,7 @@ WarmInit ==
    WarmInit, then six silent ticks (no lapse or delivery actions), then
    ExclLapse on all five grantor pairings at now=6: every exclusion is
    gone while every grantee hold is intact-but-expired. termStart stays
-   0, so the takeover fence is already satisfied — the witness needs
+   0, so the takeover fence is already satisfied - the witness needs
    zero ticks: uncovered completion, driver repair of two pairings,
    stale serve below the (weakened-away) floor. Reachable by
    construction. *)
@@ -452,14 +452,14 @@ WarmFloorInit ==
 (* ---- fresh targeted start for the canonical gate ----
    WarmInit, six silent ticks, lapse of all five grantor pairings, then
    driver repair of every repairable pairing ((1,2), (2,2), (1,1),
-   (3,2); (1,3) can never repair — non-designated, non-leader target)
+   (3,2); (1,3) can never repair - non-designated, non-leader target)
    plus their full handshakes, all pre-write at now=6: four pairings
    renewed-fresh with zero floors, one lapsed, everything else
    untouched. termStart stays 0 (fence satisfied), commitIdx 0.
-   Repairs land in this order — (1,2), then (1,1), then (2,2), then
-   (3,2) — so no auto-guard cascade fires and the soup stays empty.
-   From here the gate checks the fresh-regime interplay — stability,
-   coverage chase, floors, designation, leader leg — with serves
+   Repairs land in this order - (1,2), then (1,1), then (2,2), then
+   (3,2) - so no auto-guard cascade fires and the soup stays empty.
+   From here the gate checks the fresh-regime interplay - stability,
+   coverage chase, floors, designation, leader leg - with serves
    actually happening, in a tiny space: no ticks (now=MaxTime), no
    faults, every sender at its sequence cap (repairs, renewals, and
    re-guards all need gSeq < MaxSeq). Reachable by construction. What
@@ -545,7 +545,7 @@ GrantsFor(n, r) ==
         /\ hRoster[m][n] = r
         \* Fail closed on stalls: a hold counts only while its own
         \* deadline still covers now. An unprocessed-expired hold (tick
-        \* starved, long pause) authorizes nothing — the holder loses
+        \* starved, long pause) authorizes nothing - the holder loses
         \* fast-path authority instead of retaining stale authority.
         \* Bounded clock-rate drift is the only timing assumption; no
         \* scheduler/tick fairness is assumed anywhere here.
@@ -649,7 +649,7 @@ Heal(n, m) ==
 (* ---- crash: volatile pairing state is lost, incarnation rises ----
    Matches the implementation: tick lapse removes records, and a
    restart recreates the engine empty (hence owes the takeover fence
-   before completing — the hub sets takeover_until on a fresh engine).
+   before completing - the hub sets takeover_until on a fresh engine).
    Durable Raft state (accepted/applied/commit/complete) survives;
    everything else this node held or granted is forgotten. *)
 Crash(n) ==
@@ -798,7 +798,7 @@ DeliverGuard(m) ==
        IN /\ GrantGate(n)
           /\ r.auth = auth
            /\ r.term >= term[n]
-           \* Freshness is lexicographic (incarnation, sequence) — the
+           \* Freshness is lexicographic (incarnation, sequence) - the
            \* single-nat attempt preserves that order numerically, so a
            \* re-guard under the same incarnation (new generation, same
            \* lineage) is accepted iff its attempt advances.
@@ -1169,7 +1169,7 @@ LocalReadStart(n) ==
     /\ ~batchOn[n]
     \* Majority hint: a local serve needs a majority of renewed,
     \* still-valid holds (plus leader leg, designation, and known
-    \* roster at finish), so starting below that can never finish —
+    \* roster at finish), so starting below that can never finish -
     \* it only churns pending. Pruning dead starts loses no
     \* violation: every finishable read passes this gate.
     /\ Cardinality({m \in Nodes :
@@ -1256,7 +1256,7 @@ AlrFinish(n) ==
     /\ ~down[n]
     /\ pending[n] /= NONEREAD
     /\ applied[n] >= boundary[n]
-    \* A boundary was ordered for this batch — except the vacuous case
+    \* A boundary was ordered for this batch - except the vacuous case
     \* (nothing ever committed: pending is 0 and applied 0 covers it).
     /\ boundary[n] > 0 \/ commitIdx = 0
     /\ lastServed' = [lastServed EXCEPT ![n] = applied[n]]
@@ -1307,7 +1307,7 @@ NoStaleRead == \A n \in Nodes : lastServed[n] >= servedTarget[n]
    behavior: every minimal safety witness fits comfortably beneath it
    (activation bursts peak around a dozen; variants allow headroom for
    revoke/re-announce rounds), and every weakened variant below still
-   exhibits its counterexample inside the bound — the canary proving
+   exhibits its counterexample inside the bound - the canary proving
    the bound hides nothing load-bearing. *)
 SoupBound == Cardinality(msgs) <= SoupCap
 

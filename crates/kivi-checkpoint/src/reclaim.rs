@@ -2,12 +2,12 @@
 //!
 //! Safety rule (specs AD–AG, Y): a sealed segment may be reclaimed only
 //! when EVERY logical record it contains is covered by the oldest retained
-//! recovery point. The oldest promise is the PREVIOUS checkpoint's cut —
+//! recovery point. The oldest promise is the PREVIOUS checkpoint's cut -
 //! and only a verified previous counts. A tablet with a single checkpoint
 //! (or an unverifiable previous) makes no promise: its records block
 //! reclamation of every segment holding them. This keeps genesis replay
 //! viable until two checkpoints exist, so losing the sole CURRENT can
-//! never brick the database — the WAL still covers everything.
+//! never brick the database - the WAL still covers everything.
 //!
 //! ```text
 //! reclaimable(segment) ⟺ ∀ tablets T in segment:
@@ -42,7 +42,7 @@ pub struct LaneReclaim {
 ///
 /// * `summaries`: strictly scanned sealed segments per lane (oldest first;
 ///   any scan failure must have aborted the whole plan before this call).
-/// * `active`: active (still-written) segment per lane — never a
+/// * `active`: active (still-written) segment per lane - never a
 ///   candidate, but anchors the floor when everything sealed is gone.
 /// * `active_first_batch`: first batch of each active segment (or the
 ///   upcoming sequence for an empty tail).
@@ -127,7 +127,7 @@ pub fn plan_reclaim<S: std::hash::BuildHasher>(
 }
 
 /// First batch sequence of a scanned segment (the upcoming watermark when
-/// header-only — vacuously consistent, since no batch precedes it).
+/// header-only - vacuously consistent, since no batch precedes it).
 fn summary_first_batch(summary: &SealedSegmentSummary, watermark: u64) -> u64 {
     summary.first_batch_seq.unwrap_or(watermark).max(1)
 }

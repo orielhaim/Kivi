@@ -295,50 +295,58 @@ fn normalized_score(score: f64) -> f64 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn default_policy_is_valid_and_bounded() {
-        let policy = MemoryControlPolicy::default();
-        assert!(policy.validate().is_ok());
-        assert!(policy.movement_budget.max_bytes_per_tick > 0);
-        assert!(policy.planning_pressure(0.0).is_finite());
-        assert!(policy.planning_pressure(1.0).is_finite());
-    }
-
-    #[test]
-    fn invalid_fraction_and_budget_are_rejected() {
-        let budget = MovementBudget::new(1, 1, 1, 1);
-        assert!(MemoryControlPolicy::new(1.1, 0.5, 0.5, budget, 0.5, 1.0).is_none());
-        let mut invalid = budget;
-        invalid.used_ops = 2;
-        assert!(MemoryControlPolicy::new(0.5, 0.5, 0.5, invalid, 0.5, 1.0).is_none());
-    }
-
-    #[test]
-    fn policy_controls_change_decisions_without_nondeterminism() {
+    /// A policy that allows nothing (every threshold extreme) and one that
+    /// allows everything, at the same score/pressure inputs.
+    fn extremes() -> (MemoryControlPolicy, MemoryControlPolicy) {
         let budget = MovementBudget::new(10, 1, 10, 1);
         let conservative =
             MemoryControlPolicy::new(0.9, 0.0, 1.0, budget, 1.0, 0.25).expect("valid policy");
         let permissive =
             MemoryControlPolicy::new(0.1, 1.0, 0.0, budget, 0.0, 1.0).expect("valid policy");
-        assert!(!conservative.allows_compression(2.0, 0.2));
-        assert!(permissive.allows_compression(2.0, 0.2));
-        assert!(!conservative.allows_demotion(2.0, 0.8));
-        assert!(permissive.allows_demotion(2.0, 0.8));
-        assert!(!conservative.allows_promotion(2.0, 0.2));
-        assert!(permissive.allows_promotion(2.0, 0.2));
+        (conservative, permissive)
     }
 
     #[test]
-    fn policy_changes_are_deterministic() {
-        let budget = MovementBudget::new(10, 1, 10, 1);
-        let first =
-            MemoryControlPolicy::new(0.5, 0.5, 0.5, budget, 0.5, 0.5).expect("valid policy");
-        let second =
-            MemoryControlPolicy::new(0.5, 0.5, 0.5, budget, 0.5, 0.5).expect("valid policy");
-        assert_eq!(first, second);
-        assert_eq!(
-            first.planning_pressure(0.4).to_bits(),
-            second.planning_pressure(0.4).to_bits()
-        );
+    fn the_production_default_admits_background_work() {
+        let policy = MemoryControlPolicy::default();
+        assert!(policy.validate().is_ok());
+        assert!(policy.movement_budget.max_bytes_per_tick > 0);
+        assert!(policy.planning_pressure(0.5).is_finite());
+    }
+
+    #[rstest::rstest]
+    #[case::out_of_unit_residency(1.1, 0.5, 0.5)]
+    #[case::out_of_unit_compression(0.5, 1.1, 0.5)]
+    #[case::out_of_unit_demotion_pressure(0.5, 0.5, 1.1)]
+    fn an_out_of_unit_fraction_is_rejected(
+        #[case] residency: f64,
+        #[case] compress: f64,
+        #[case] demote: f64,
+    ) {
+        let budget = MovementBudget::new(1, 1, 1, 1);
+        assert!(MemoryControlPolicy::new(residency, compress, demote, budget, 0.5, 1.0).is_none());
+    }
+
+    #[test]
+    fn a_budget_already_over_its_own_limit_is_rejected() {
+        let mut budget = MovementBudget::new(1, 1, 1, 1);
+        budget.used_ops = 2;
+        assert!(MemoryControlPolicy::new(0.5, 0.5, 0.5, budget, 0.5, 1.0).is_none());
+    }
+
+    /// The three gates are the policy's whole effect on placement: a
+    /// conservative policy must refuse every move a permissive one allows.
+    #[rstest::rstest]
+    #[case::compression(2.0, 0.2)]
+    #[case::demotion(2.0, 0.8)]
+    #[case::promotion(2.0, 0.2)]
+    fn the_thresholds_are_the_whole_decision(#[case] score: f64, #[case] pressure: f64) {
+        let (conservative, permissive) = extremes();
+        assert!(!conservative.allows_compression(score, pressure));
+        assert!(permissive.allows_compression(score, pressure));
+        assert!(!conservative.allows_demotion(score, pressure));
+        assert!(permissive.allows_demotion(score, pressure));
+        assert!(!conservative.allows_promotion(score, pressure));
+        assert!(permissive.allows_promotion(score, pressure));
     }
 }

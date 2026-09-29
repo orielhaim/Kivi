@@ -34,7 +34,7 @@ use crate::nvme::{Admission, NvmeOptions, NvmeProvider};
 use crate::offcore::{OffcoreCompletion, OffcoreOpId, OffcoreQueue};
 use crate::placement::{CriticalityPlanner, PlacementInput, Planner};
 use crate::policy::MemoryControlPolicy;
-use crate::provider::{ProviderCaps, ProviderDescriptor, ProviderId, ProviderRegistry};
+use crate::provider::{ProviderCaps, ProviderId, ProviderRegistry};
 use crate::repr::{ObjectMaterialization, ReconstructionSource, Residence};
 use crate::sim::{SimFault, SimProvider};
 use crate::telemetry::SoftwareTelemetry;
@@ -45,7 +45,7 @@ use crate::transition::{Transition, TransitionTarget};
 /// Production uses [`NvmeBackend::File`] (same record format as the
 /// async Compio path); deterministic tests and simulation use
 /// [`NvmeBackend::Sim`]. Placement, transition, and movement logic never
-/// branches on this enum for correctness — only latency and fault
+/// branches on this enum for correctness - only latency and fault
 /// behavior differ.
 #[derive(Debug)]
 pub enum NvmeBackend {
@@ -149,19 +149,6 @@ impl Default for MemoryFabricConfig {
             numa_node_count: 1,
         }
     }
-}
-
-/// What the fabric's memory locality looks like, for diagnostics and the admin
-/// surface. `numa_node` is the node the owner thread's arena bytes belong to;
-/// the node counts are how many the planner can see and score.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LocalityView {
-    /// Node the owner thread's resident bytes belong to.
-    pub numa_node: Option<u32>,
-    /// Memory nodes registered with a DRAM provider.
-    pub dram_nodes: usize,
-    /// Memory nodes registered with a compressed provider.
-    pub compressed_nodes: usize,
 }
 
 /// One device operation for an external executor (single-writer
@@ -306,8 +293,6 @@ pub struct MemoryFabric {
     /// all of them so a node preference is a real choice rather than a
     /// comment.
     dram_providers: Vec<ProviderId>,
-    /// Every compressed provider, in node order.
-    compressed_providers: Vec<ProviderId>,
     nvme_provider: ProviderId,
     backend: NvmeBackend,
     objects: HashMap<u64, ObjectEntry>,
@@ -403,7 +388,6 @@ impl MemoryFabric {
             local_dram: dram_providers[usize::try_from(local).unwrap_or(0)],
             local_compressed: compressed_providers[usize::try_from(local).unwrap_or(0)],
             dram_providers,
-            compressed_providers,
             nvme_provider,
             backend,
             objects: HashMap::new(),
@@ -425,22 +409,6 @@ impl MemoryFabric {
             external_in_flight: 0,
             external_outbox: Vec::new(),
         })
-    }
-
-    /// Registers the authoritative-store reconstruction source for an
-    /// object (soft-state eviction requires it).
-    pub fn pin_authoritative(&mut self, object: u64) {
-        if let Some(entry) = self.objects.get_mut(&object)
-            && !entry
-                .materialization
-                .reconstruction
-                .contains(&ReconstructionSource::AuthoritativeStore)
-        {
-            entry
-                .materialization
-                .reconstruction
-                .push(ReconstructionSource::AuthoritativeStore);
-        }
     }
 
     /// Explicit staging admission plan: proves arena headroom for
@@ -817,38 +785,6 @@ impl MemoryFabric {
         Ok(())
     }
 
-    /// Reads an object pinned to an expected logical version: the
-    /// engine-facing resolve used for version-pinned reads. Behaves like
-    /// [`get`](Self::get) (including `Pending` promotion enqueueing) but
-    /// first proves the materialization still names `expected_version` —
-    /// a delayed promotion can never serve bytes the read was not
-    /// authorized to observe.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`MemoryError::MutatedDuringBuild`] when the object moved
-    /// past the pinned version (the caller re-prepares), plus every
-    /// [`get`](Self::get) failure mode.
-    pub fn get_pinned(
-        &mut self,
-        object: u64,
-        expected_version: u64,
-    ) -> Result<GetOutcome, MemoryError> {
-        let current = self
-            .objects
-            .get(&object)
-            .map(|entry| entry.materialization.version)
-            .ok_or(MemoryError::NoRepresentation { object })?;
-        if current != expected_version {
-            return Err(MemoryError::MutatedDuringBuild {
-                object,
-                build: expected_version,
-                current,
-            });
-        }
-        self.get(object)
-    }
-
     /// Pins an object for an outstanding operation (suspended read,
     /// in-flight checkpoint stream, parked migration). While pinned the
     /// object is never retired and its last synchronous residence is
@@ -1006,12 +942,6 @@ impl MemoryFabric {
         Ok(())
     }
 
-    /// All tracked object ids, for GC marking (live-root collection).
-    #[must_use]
-    pub fn live_ids(&self) -> Vec<u64> {
-        self.objects.keys().copied().collect()
-    }
-
     /// The materialization version of one object, if tracked.
     #[must_use]
     pub fn object_version(&self, object: u64) -> Option<u64> {
@@ -1030,12 +960,6 @@ impl MemoryFabric {
     #[must_use]
     pub fn move_depth(&self) -> usize {
         self.moves.len()
-    }
-
-    /// Current provider capability snapshot (observability).
-    #[must_use]
-    pub fn provider_caps(&self) -> Vec<ProviderDescriptor> {
-        self.registry.all().to_vec()
     }
 
     /// Tries a synchronous resolve without enqueueing work and without
@@ -1088,12 +1012,6 @@ impl MemoryFabric {
     #[must_use]
     pub fn pinned_count(&self) -> usize {
         self.pins.len()
-    }
-
-    /// Per-class arena statistics (observability).
-    #[must_use]
-    pub fn arena_stats(&self) -> [crate::arena::ArenaStats; 7] {
-        self.arenas.stats()
     }
 
     /// Advances virtual time by one tick: reevaluates placement, queues
@@ -1315,7 +1233,6 @@ impl MemoryFabric {
         match op.kind {
             crate::offcore::OffcoreKind::Demote => has_offcore,
             crate::offcore::OffcoreKind::Promote => !has_offcore,
-            crate::offcore::OffcoreKind::Delete => false,
         }
     }
 
@@ -1390,17 +1307,6 @@ impl MemoryFabric {
                 },
             },
             crate::offcore::OffcoreKind::Promote => self.execute_promote_op(op),
-            crate::offcore::OffcoreKind::Delete => OffcoreCompletion {
-                id: op.id,
-                object: op.object,
-                version: op.version,
-                bytes: Vec::new(),
-                offset: None,
-                len: None,
-                checksum: None,
-                ok: true,
-                detail: String::new(),
-            },
         }
     }
 
@@ -1486,34 +1392,6 @@ impl MemoryFabric {
     #[must_use]
     pub const fn telemetry(&self) -> &SoftwareTelemetry {
         &self.telemetry
-    }
-
-    /// Returns the telemetry object bound.
-    #[must_use]
-    pub const fn telemetry_limits(&self) -> crate::telemetry::TelemetryLimits {
-        self.telemetry.limits()
-    }
-
-    /// Returns the telemetry object capacity.
-    #[must_use]
-    pub const fn telemetry_capacity(&self) -> usize {
-        self.telemetry.capacity()
-    }
-
-    /// Replaces the telemetry bound and re-registers live objects in id order.
-    pub fn set_telemetry_capacity(&mut self, capacity: usize) {
-        self.telemetry = SoftwareTelemetry::with_capacity(capacity);
-        let mut objects: Vec<u64> = self.objects.keys().copied().collect();
-        objects.sort_unstable();
-        for object in objects {
-            if let Some(entry) = self.objects.get(&object) {
-                self.telemetry.register(
-                    object,
-                    entry.signals.mutability,
-                    entry.signals.logical_bytes,
-                );
-            }
-        }
     }
 
     /// Drains access signals for controller observation.
@@ -1744,7 +1622,7 @@ impl MemoryFabric {
     }
 
     /// Installs a demoted record produced by the external executor:
-    /// version-fenced shadow install, publish, and conditional retire —
+    /// version-fenced shadow install, publish, and conditional retire -
     /// the same verify/publish phases
     /// [`apply_completion`](Self::apply_completion) runs for internal
     /// completions.
@@ -1955,8 +1833,8 @@ impl MemoryFabric {
     ///
     /// A DRAM or compressed target always means *the owner's node*, because
     /// arena bytes are this thread's own process memory: a provider on another
-    /// node is a real entry in the registry — the planner scores it, and a
-    /// `PinnedNuma` preference can select it — but the bytes of a resident
+    /// node is a real entry in the registry - the planner scores it, and a
+    /// `PinnedNuma` preference can select it - but the bytes of a resident
     /// residence cannot be placed there by this fabric. The other nodes'
     /// providers exist so the planner can *see* the machine's memory and its
     /// relative cost instead of pretending the machine has one node.
@@ -1975,20 +1853,6 @@ impl MemoryFabric {
             Some(TransitionTarget::Nvme)
         } else {
             None
-        }
-    }
-
-    /// The memory node this fabric's arena bytes belong to, and the count of
-    /// nodes the planner can see. Diagnostics and the admin surface.
-    #[must_use]
-    pub fn locality(&self) -> LocalityView {
-        LocalityView {
-            numa_node: self
-                .registry
-                .get(self.local_dram)
-                .and_then(|caps| caps.locality.numa_node),
-            dram_nodes: self.dram_providers.len(),
-            compressed_nodes: self.compressed_providers.len(),
         }
     }
 

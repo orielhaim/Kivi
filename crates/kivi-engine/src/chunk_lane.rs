@@ -20,7 +20,7 @@
 //! The lane is also where the staging lifecycle (§10) is enforced: staging
 //! appends volatile records, [`sync`](ChunkStore::sync) flips one barrier
 //! for the whole batch (§34), and only [`durable`](kivi_chunk::ChunkStore::durable_manifest)
-//! proofs ever become WAL roots — in exactly the chunks-first order §11
+//! proofs ever become WAL roots - in exactly the chunks-first order §11
 //! mandates.
 
 use std::collections::{HashMap, VecDeque};
@@ -35,7 +35,7 @@ use kivi_types::{ChunkId, ManifestId, SecurityDomainId};
 
 /// Lane job queue depth. Uploads are rare next to point ops; 64 deep
 /// absorbs benchmark bursts while keeping worst-case queued bytes obvious
-/// (64 × frame ceiling only if every slot holds a max-size legacy stage —
+/// (64 × frame ceiling only if every slot holds a max-size legacy stage -
 /// streaming assemblers stage per-chunk instead).
 pub const CHUNK_JOB_DEPTH: usize = 64;
 
@@ -106,7 +106,7 @@ pub enum ChunkJob {
         reply: Sender<Result<StagedValue, ChunkError>>,
     },
     /// Resolve a manifest to its verified logical bytes (bounded by the
-    /// caller's cap — legacy reads pass `MAX_LEGACY_VALUE_BYTES`).
+    /// caller's cap - legacy reads pass `MAX_INLINE_VALUE_BYTES`).
     ReadValue {
         /// Manifest to resolve.
         manifest: ManifestId,
@@ -342,7 +342,7 @@ impl ChunkLaneHandle {
     ///
     /// Returns [`ChunkError::Overloaded`] when the bounded lane queue is
     /// full or the lane is gone, or the verification failure (missing or
-    /// corrupt data fails loudly — a commit must never reference it).
+    /// corrupt data fails loudly - a commit must never reference it).
     pub async fn check_root_async(
         &self,
         manifest: ManifestId,
@@ -987,10 +987,10 @@ fn read_value_job(
     manifest: ManifestId,
     logical_len: u64,
 ) -> Result<Bytes, ChunkError> {
-    if logical_len > kivi_chunk::policy::MAX_LEGACY_VALUE_BYTES {
+    if logical_len > kivi_chunk::policy::MAX_INLINE_VALUE_BYTES {
         return Err(ChunkError::TooLarge {
             len: logical_len,
-            max: kivi_chunk::policy::MAX_LEGACY_VALUE_BYTES,
+            max: kivi_chunk::policy::MAX_INLINE_VALUE_BYTES,
             context: "legacy chunked read (use streaming)",
         });
     }
@@ -1004,7 +1004,7 @@ fn read_value_job(
             ),
         });
     }
-    // Bounded above by `MAX_LEGACY_VALUE_BYTES` (64 MiB), so the
+    // Bounded above by `MAX_INLINE_VALUE_BYTES` (64 MiB), so the
     // conversion below cannot fail on any supported address space.
     let capacity = usize::try_from(logical_len).expect("capped length fits address space");
     let mut out = Vec::with_capacity(capacity);
@@ -1032,11 +1032,11 @@ fn read_value_job(
 /// even read); the span from the first affected chunk boundary streams
 /// through a fresh fixed-size grid, so changed pieces stage as new chunks
 /// while unchanged pieces dedup to their existing addresses. Peak lane
-/// residency is two chunks plus the patch plus one piece under fill —
+/// residency is two chunks plus the patch plus one piece under fill -
 /// never the value. One [`sync`](ChunkStore::sync) proves the new
 /// manifest; the reply carries only the newly staged addresses (prefix
 /// chunks stay covered by the old root until commit, then by the new
-/// one — and every staged byte lands in the GC-immune active tail, so
+/// one - and every staged byte lands in the GC-immune active tail, so
 /// the worker pinning on receipt closes the only exposure window).
 fn splice_range_job(
     store: &mut ChunkStore,
@@ -1052,7 +1052,7 @@ fn splice_range_job(
 
     let mut plan = splice_plan(store, manifest, logical_len, offset, patch.len() as u64)?;
     // Aligned no-op fast path: an empty patch on an entry edge with no
-    // gap to pad reuses every entry by reference — no chunk reads at all.
+    // gap to pad reuses every entry by reference - no chunk reads at all.
     if patch.is_empty() && offset <= logical_len && offset == plan.prefix_len {
         let mut entries = std::mem::take(&mut plan.prefix);
         entries.extend_from_slice(&plan.entries[plan.boundary..]);
@@ -1127,7 +1127,7 @@ fn splice_us(value: u64, context: &'static str) -> Result<usize, ChunkError> {
 
 /// Validated splice geometry: the base entries plus the retained prefix,
 /// the fresh-grid pieces, and the patch extent. Pure data over the
-/// manifest — no chunk I/O — so streaming agrees with planning by
+/// manifest - no chunk I/O - so streaming agrees with planning by
 /// construction.
 struct SplicePlan {
     /// Base manifest entries in logical order.
@@ -1152,7 +1152,7 @@ struct SplicePlan {
 
 /// Validates the base manifest against the root claim and computes the
 /// splice geometry: support checks, the entry-count bound, and the
-/// prefix scan. No chunk I/O — failures here touch nothing.
+/// prefix scan. No chunk I/O - failures here touch nothing.
 fn splice_plan(
     store: &mut ChunkStore,
     manifest: ManifestId,
@@ -1316,7 +1316,7 @@ impl SpliceStream {
             }
             // Past-the-end offsets stream the whole short final entry
             // (the append case); inside offsets stream the kept head
-            // *before* the patch point — the overwritten span is skipped,
+            // *before* the patch point - the overwritten span is skipped,
             // never streamed.
             head = Some(if rel >= entry.len {
                 cached
@@ -1491,7 +1491,7 @@ fn read_chunk_cached(
 /// In-flight staging pins (§40): addresses an uploader intends to stage,
 /// registered *before* the first append and removed after commit or abort.
 /// Global to the engine (every lane's GC consults the same set); held
-/// briefly and off any hot path — point ops never touch it.
+/// briefly and off any hot path - point ops never touch it.
 ///
 /// The matching RAII guard is [`PinnedUpload`]: pinning before the first
 /// append is what closes the stage-then-seal-then-commit race (an uploader
@@ -1567,7 +1567,7 @@ impl StagingPins {
 /// addresses (authoritative hashing still happens lane-side on append;
 /// this is pins only) and pins them *before* the staging job is
 /// submitted; the manifest pins once proven. Dropping releases everything,
-/// so every exit path — commit, error, timeout, abort — unpins
+/// so every exit path - commit, error, timeout, abort - unpins
 /// automatically. Carry it until the root commits (outbox entries and
 /// coordinator pendings hold one for exactly that span).
 #[derive(Debug)]
@@ -1626,9 +1626,9 @@ impl PinnedUpload {
 
     /// Wraps an already-staged proof (lane splice path): pins every new
     /// address plus the manifest at once, before admission. The window
-    /// between the lane's sync and this pin is safe by construction —
+    /// between the lane's sync and this pin is safe by construction -
     /// staged bytes land in the GC-immune active tail, and the old root
-    /// stays live until commit — but from here the guard owns the full
+    /// stays live until commit - but from here the guard owns the full
     /// address set exactly like the pre-pinned upload path.
     #[must_use]
     pub fn staged(pins: &Arc<StagingPins>, staged: &StagedValue) -> Self {
@@ -1657,7 +1657,7 @@ impl Drop for PinnedUpload {
 ///
 /// Transactional writes pass through untouched: large inline puts stay
 /// inline (bounded by the transaction byte cap), and chunked references
-/// are proven — never staged — at admission (`verify_txn_chunk_refs` on
+/// are proven - never staged - at admission (`verify_txn_chunk_refs` on
 /// the worker path, the async twin on the connection path, sidecar checks
 /// on the consensus path), so a later Commit can never meet a durable
 /// root with unavailable payload.
@@ -1875,7 +1875,7 @@ pub enum SetRangePlan {
 /// WAL as splices, results crossing the threshold restage as full
 /// values, chunked bases restage through the lane splice, and absurd
 /// ranges reject before any I/O. Pure: no lane traffic, no tablet
-/// mutation — the caller stages (blocking, async, or parked) and admits.
+/// mutation - the caller stages (blocking, async, or parked) and admits.
 pub fn plan_set_range(
     key: kivi_state::Key,
     offset: u64,
@@ -1883,7 +1883,7 @@ pub fn plan_set_range(
     base: RangeBase,
     threshold: u64,
 ) -> SetRangePlan {
-    let legacy_max = kivi_chunk::policy::MAX_LEGACY_VALUE_BYTES;
+    let legacy_max = kivi_chunk::policy::MAX_INLINE_VALUE_BYTES;
     let fence = base.fence();
     let Some(patch_end) = offset.checked_add(patch.len() as u64) else {
         return SetRangePlan::Reject {

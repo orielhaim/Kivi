@@ -1,15 +1,15 @@
 //! Deterministic event scheduler: total order over `(tick, identifier)`.
 //!
 //! Events scheduled for the same virtual tick run in schedule-call
-//! (insertion) order — the identifier minted at scheduling doubles as the
+//! (insertion) order - the identifier minted at scheduling doubles as the
 //! tie-break, so the order key never has ties and replay needs no
 //! additional disambiguation. Time only moves forward: popping an event
 //! advances the scheduler clock to its tick, scheduling into the past is
 //! rejected, and identifier/tick arithmetic is checked rather than wrapping.
 //!
 //! The scheduler stores payloads opaquely (`E` is unconstrained) and only
-//! pops them; the driver loop — pop, consult [`FaultPolicy`](kivi_core::FaultPolicy),
-//! run or skip, record to [`Trace`](crate::Trace) — lives with the future
+//! pops them; the driver loop - pop, consult [`FaultPolicy`](kivi_core::FaultPolicy),
+//! run or skip, record to [`Trace`](crate::Trace) - lives with the future
 //! network/storage/node simulators and their tests.
 
 use core::time::Duration;
@@ -60,7 +60,7 @@ impl<E> Scheduled<E> {
 /// Synchronous deterministic scheduler over opaque payloads.
 ///
 /// Backed solely by ordered maps, so iteration and popping are fully
-/// determined by contents — never by hashing, threading, or wall clocks.
+/// determined by contents - never by hashing, threading, or wall clocks.
 #[derive(Debug, Clone)]
 pub struct Scheduler<E> {
     queue: std::collections::BTreeMap<(Ticks, EventId), E>,
@@ -292,21 +292,6 @@ mod tests {
         assert_eq!(
             scheduler.schedule_at(Ticks::from_micros(2), "one too many"),
             Err(ScheduleError::EventIdExhausted(EventIdExhausted))
-        );
-    }
-
-    #[test]
-    fn scheduled_views_carry_identity_and_tick() {
-        let mut scheduler = Scheduler::new(Ticks::from_micros(5));
-        let id = scheduler
-            .schedule_at(Ticks::from_micros(9), "x")
-            .expect("schedule");
-        let peeked = scheduler.peek().expect("peek");
-        assert_eq!(peeked, (id, Ticks::from_micros(9)));
-        let popped = scheduler.pop_next().expect("pop");
-        assert_eq!(
-            popped.view(),
-            kivi_core::EventView::new(id, Ticks::from_micros(9))
         );
     }
 }

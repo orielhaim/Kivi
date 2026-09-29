@@ -8,30 +8,23 @@
 //!
 //! Layout rules (RFC §53):
 //!
-//! * Every persistent structure starts with a [`header::FrameHeader`]
-//!   carrying magic, major/minor version, feature flags, length, and CRCs.
-//! * Canonical immutable artifacts additionally carry a BLAKE3-256 content
-//!   hash (see [`integrity::chunk_id`]).
+//! * Every persistent structure carries its own magic, version, and CRC32C
+//!   header; the field order of each is the wire contract.
+//! * Immutable artifacts additionally carry a BLAKE3-256 content hash (see
+//!   [`integrity::chunk_id`]).
 //! * Integrity roles (RFC §54): CRC32C (Castagnoli) for cheap
 //!   accidental-corruption detection, BLAKE3-256 for content identity.
-//!   Algorithm IDs are stored on the wire ([`algorithm`]); no algorithm is
-//!   assumed permanent.
 //!
-//! Evolution (RFC §226, §228): a major version bump means breaking change —
-//! old decoders reject it. Old and new representations may coexist; migrations
-//! are lazy and incremental, never stop-the-world. Unknown reserved flags are
-//! rejected (fail closed) until their meaning is specified.
+//! Evolution (RFC §226, §228): a major version bump means breaking change -
+//! old decoders reject it. Unknown reserved flags are rejected (fail closed)
+//! until their meaning is specified.
 
-pub mod algorithm;
 pub mod error;
-pub mod header;
 pub mod ids;
 pub mod integrity;
 pub mod traits;
 
-pub use algorithm::{ChecksumAlgorithmId, HashAlgorithmId};
 pub use error::CodecError;
-pub use header::{CURRENT_MAJOR, CURRENT_MINOR, FrameHeader, HEADER_LEN, KIVI_MAGIC};
 pub use integrity::{blake3_256, chunk_id, crc32c_checksum};
 pub use traits::{Decode, Encode, decode_byte_slice, decode_byte_vec, encode_bytes};
 

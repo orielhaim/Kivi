@@ -27,6 +27,7 @@ pub mod names;
 pub mod position;
 pub mod reads;
 pub mod roster;
+pub mod slots;
 pub mod time;
 
 pub use authority::{AuthorityMismatch, TabletAuthority};
@@ -53,4 +54,5 @@ pub use roster::{
     RosterEngine, RosterError, RosterEvidence, RosterGeneration, RosterId, RosterTerm,
     StableRoster, majority_of,
 };
+pub use slots::{LocalTabletSlot, TabletRoute};
 pub use time::{Expiry, Ticks, TimeError, WallTimestamp};

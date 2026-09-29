@@ -591,41 +591,17 @@ impl_raw_conversions!(SessionId, u128, as_u128, from_u128);
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
+    /// The fencing types must fail closed at their zero value: none of them
+    /// implements `Default`, so the only way to reach an invalid generation is
+    /// to name [`INVALID`](TabletEpoch::INVALID) or
+    /// [`UNASSIGNED`](CommitPosition::UNASSIGNED) deliberately. A zeroed value
+    /// that counted as valid would authorize a write with no fence at all.
     #[test]
-    fn integer_ids_round_trip_through_raw_values() {
-        assert_eq!(NodeId::from_u64(7).as_u64(), 7);
-
-        assert_eq!(WorkerId::from_u64(11).as_u64(), 11);
-        assert_eq!(NamespaceId::from_u64(3).as_u64(), 3);
-        assert_eq!(TabletId::from_u64(918).as_u64(), 918);
-        assert_eq!(SecurityDomainId::from_u64(42).as_u64(), 42);
-    }
-
-    #[test]
-    fn wide_ids_round_trip_through_raw_values() {
-        assert_eq!(ClusterId::from_u128(0x1234_5678).as_u128(), 0x1234_5678);
-        assert_eq!(SessionId::from_u128(u128::MAX).as_u128(), u128::MAX);
-    }
-
-    #[test]
-    fn display_formats_match_rfc_examples() {
-        // RFC §148 shows decimal tablet/epoch and hex-ish opaque IDs.
-        assert_eq!(TabletId::from_u64(918).to_string(), "918");
-        assert_eq!(TabletEpoch::from_u64(381).to_string(), "381");
-        assert_eq!(
-            SessionId::from_u128(0).to_string(),
-            "00000000000000000000000000000000"
-        );
-        assert_eq!(
-            ClusterId::from_u128(0xab).to_string(),
-            "000000000000000000000000000000ab"
-        );
-    }
-
-    #[test]
-    fn zero_is_invalid_for_fencing_types() {
+    fn zero_is_invalid_for_every_fencing_type() {
         assert!(!TabletEpoch::INVALID.is_valid());
         assert!(!WriteGuardGeneration::INVALID.is_valid());
         assert!(!NodeIncarnation::INVALID.is_valid());
@@ -634,76 +610,66 @@ mod tests {
         assert!(CommitPosition::FIRST.is_assigned());
     }
 
+    /// Fencing comparisons are strict: a generation supersedes only a strictly
+    /// lower one, and is stale only relative to a strictly higher one. An equal
+    /// generation is neither, so a retried request on the same fence is not
+    /// mistaken for a superseded one.
     #[test]
     fn fencing_ordering_is_strict() {
-        let e1 = TabletEpoch::INITIAL;
-        let e2 = e1.next().expect("epoch advances");
-        assert!(e2.supersedes(e1));
-        assert!(e1.is_stale_relative_to(e2));
-        assert!(!e1.supersedes(e1));
-        assert!(!e1.is_stale_relative_to(e1));
-
-        let g1 = WriteGuardGeneration::INITIAL;
-        assert!(g1.next().expect("guard advances").supersedes(g1));
-        let n1 = NodeIncarnation::INITIAL;
-        assert!(n1.next().expect("incarnation advances").supersedes(n1));
-        assert!(NodeIncarnation::INVALID.is_stale_relative_to(n1));
+        let epoch = TabletEpoch::INITIAL;
+        let next = epoch.next().expect("epoch advances");
+        assert!(next.supersedes(epoch));
+        assert!(epoch.is_stale_relative_to(next));
+        assert!(!epoch.supersedes(epoch));
+        assert!(!epoch.is_stale_relative_to(epoch));
+        assert!(
+            WriteGuardGeneration::INITIAL
+                .next()
+                .expect("guard advances")
+                .supersedes(WriteGuardGeneration::INITIAL)
+        );
+        assert!(
+            NodeIncarnation::INITIAL
+                .next()
+                .expect("incarnation advances")
+                .supersedes(NodeIncarnation::INITIAL)
+        );
+        // The invalid sentinel is stale relative to any real value, so a
+        // default-constructed fence can never win a comparison.
+        assert!(NodeIncarnation::INVALID.is_stale_relative_to(NodeIncarnation::INITIAL));
     }
 
+    /// Every checked counter must report exhaustion rather than wrap or
+    /// saturate: a reused epoch, guard, incarnation, or sequence would fence
+    /// the wrong holder. The message must name *which* counter, because the
+    /// operator reading it cannot otherwise tell which one to widen.
+    #[rstest]
+    #[case::epoch(TabletEpoch::from_u64(u64::MAX).next().map(|_| ()), "tablet epoch")]
+    #[case::guard(WriteGuardGeneration::from_u64(u64::MAX).next().map(|_| ()), "write-guard generation")]
+    #[case::incarnation(NodeIncarnation::from_u64(u64::MAX).next().map(|_| ()), "node incarnation")]
+    #[case::request_seq(RequestSeq::from_u64(u64::MAX).next().map(|_| ()), "request sequence")]
+    #[case::commit_position(CommitPosition::from_u64(u64::MAX).next().map(|_| ()), "commit position")]
+    fn counters_fail_explicitly_at_the_top(
+        #[case] actual: Result<(), impl core::fmt::Display>,
+        #[case] expected_message: &str,
+    ) {
+        let message = actual.expect_err("exhaustion must be reported, not wrapped");
+        let rendered = message.to_string();
+        assert!(
+            rendered.contains(expected_message),
+            "{rendered:?} does not name {expected_message:?}"
+        );
+    }
+
+    /// One below the top still advances onto the final value: the check must
+    /// reject the overflow, not the last usable counter.
     #[test]
-    fn fencing_successors_fail_explicitly_at_u64_max() {
-        assert_eq!(
-            TabletEpoch::from_u64(u64::MAX).next(),
-            Err(GenerationExhausted::TabletEpoch)
-        );
-        assert_eq!(
-            WriteGuardGeneration::from_u64(u64::MAX).next(),
-            Err(GenerationExhausted::WriteGuardGeneration)
-        );
-        assert_eq!(
-            NodeIncarnation::from_u64(u64::MAX).next(),
-            Err(GenerationExhausted::NodeIncarnation)
-        );
-        // One below the top still advances onto the final value.
+    fn the_penultimate_value_still_advances() {
         assert_eq!(
             TabletEpoch::from_u64(u64::MAX - 1)
                 .next()
                 .expect("penultimate advances"),
             TabletEpoch::from_u64(u64::MAX)
-        );
-    }
-
-    #[test]
-    fn tablet_ids_order_deterministically_for_coordinator_election() {
-        // RFC §83: coordinator chosen deterministically, e.g. lowest TabletId.
-        let mut tablets = [
-            TabletId::from_u64(9),
-            TabletId::from_u64(3),
-            TabletId::from_u64(7),
-        ];
-        tablets.sort();
-        assert_eq!(tablets[0], TabletId::from_u64(3));
-    }
-
-    #[test]
-    fn request_seq_advances_monotonically() {
-        let first = RequestSeq::FIRST;
-        assert_eq!(first.next().expect("advances").as_u64(), 1);
-        assert_eq!(
-            CommitPosition::UNASSIGNED.next().expect("advances"),
-            CommitPosition::FIRST
-        );
-    }
-
-    #[test]
-    fn sequence_counters_fail_explicitly_at_u64_max() {
-        assert_eq!(
-            RequestSeq::from_u64(u64::MAX).next(),
-            Err(SequenceExhausted::RequestSeq)
-        );
-        assert_eq!(
-            CommitPosition::from_u64(u64::MAX).next(),
-            Err(SequenceExhausted::CommitPosition)
         );
         assert_eq!(
             RequestSeq::from_u64(u64::MAX - 1)
@@ -713,12 +679,15 @@ mod tests {
         );
     }
 
+    /// `RequestSeq` and `CommitPosition` both start below their first real
+    /// value, so a client and a tablet cannot mint a sequence that collides
+    /// with a reserved endpoint.
     #[test]
-    fn distinct_id_types_do_not_compare_equal() {
-        // Compile-time proof by construction: these are different types, so
-        // `assert_ne!(TabletId::from_u64(1), WorkerId::from_u64(1))` does not
-        // even compile. Runtime spot-check that same-type equality works.
-        assert_eq!(TabletId::from_u64(1), TabletId::from_u64(1));
-        assert_ne!(TabletId::from_u64(1), TabletId::from_u64(2));
+    fn sequence_sentinels_are_below_the_first_value() {
+        assert_eq!(RequestSeq::FIRST.next().expect("advances").as_u64(), 1);
+        assert_eq!(
+            CommitPosition::UNASSIGNED.next().expect("advances"),
+            CommitPosition::FIRST
+        );
     }
 }

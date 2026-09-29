@@ -22,7 +22,7 @@
 //! `NodeIncarnation` semantics ([`crate::transport`], [`crate::peer`]).
 //! `openraft-multi` provides only the routing adapters; all
 //! transport-level failures (unreachable, timeout, remote refusal,
-//! family mismatch) map to retry-safe errors — the safe direction
+//! family mismatch) map to retry-safe errors - the safe direction
 //! is always backoff-and-retry, never an invented verdict.
 //!
 //! Election, pre-vote, append/heartbeat, and full-snapshot delivery are
@@ -33,6 +33,10 @@
 //!
 //! `stream_append` keeps the sequential default; leadership transfer has an
 //! explicit peer RPC and preserves `OpenRaft`'s structured refusal response.
+//!
+//! The decode/encode functions below are `pub(crate)`: the owned `Peer*`
+//! structs travel inside [`crate::peer`] message bodies, and nothing outside
+//! this crate needs to translate between the two vocabularies.
 
 use std::io::Cursor;
 use std::sync::Arc;
@@ -72,7 +76,7 @@ fn snapshot_unreachable(target: u64, error: &TransportError) -> StreamingError<K
     StreamingError::Unreachable(Unreachable::new(&source))
 }
 
-/// Maps a local protocol fault (codec failure, family mismatch — our own
+/// Maps a local protocol fault (codec failure, family mismatch - our own
 /// bug or a version-skewed peer, never a remote verdict) onto the same
 /// retry-safe error.
 fn protocol_unreachable(target: u64, detail: &str) -> RPCError<KiviTypeConfig> {
@@ -93,11 +97,11 @@ fn protocol_snapshot_unreachable(target: u64, detail: &str) -> StreamingError<Ki
 
 /// Why a peer message could not cross the `OpenRaft` boundary. All
 /// variants are sender-side faults (corrupt or version-skewed peer) or
-/// local refusal — never ordinary replication outcomes (those encode as
+/// local refusal - never ordinary replication outcomes (those encode as
 /// normal responses).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
-pub enum RpcCodecError {
+pub(crate) enum RpcCodecError {
     /// A command entry's bytes do not decode as a
     /// [`ReplicatedMutation`](crate::mutation::ReplicatedMutation).
     #[error("undecodable replicated command: {detail}")]
@@ -121,7 +125,7 @@ pub enum RpcCodecError {
 /// `leader_id_adv` leader carries term plus node id directly (total
 /// order, multiple leaders per term), so the mapping is field-for-field.
 #[must_use]
-pub fn decode_wire_vote(vote: &PeerVote) -> VoteOf<KiviTypeConfig> {
+pub(crate) fn decode_wire_vote(vote: &PeerVote) -> VoteOf<KiviTypeConfig> {
     if vote.committed {
         openraft::impls::Vote::new_committed(vote.term, vote.node)
     } else {
@@ -131,7 +135,7 @@ pub fn decode_wire_vote(vote: &PeerVote) -> VoteOf<KiviTypeConfig> {
 
 /// Converts an `OpenRaft` vote into its owned wire form.
 #[must_use]
-pub fn encode_wire_vote(vote: &VoteOf<KiviTypeConfig>) -> PeerVote {
+pub(crate) fn encode_wire_vote(vote: &VoteOf<KiviTypeConfig>) -> PeerVote {
     PeerVote {
         term: vote.leader_id.term,
         node: vote.leader_id.node_id,
@@ -141,14 +145,14 @@ pub fn encode_wire_vote(vote: &VoteOf<KiviTypeConfig>) -> PeerVote {
 
 /// Converts an owned wire log id into its `OpenRaft` form.
 #[must_use]
-pub fn decode_wire_log(id: &PeerLogId) -> LogIdOf<KiviTypeConfig> {
+pub(crate) fn decode_wire_log(id: &PeerLogId) -> LogIdOf<KiviTypeConfig> {
     use openraft::impls::leader_id_adv::LeaderId;
     openraft::LogId::new(LeaderId::new(id.term, id.leader), id.index)
 }
 
 /// Converts an `OpenRaft` log id into its owned wire form.
 #[must_use]
-pub fn encode_wire_log(id: &LogIdOf<KiviTypeConfig>) -> PeerLogId {
+pub(crate) fn encode_wire_log(id: &LogIdOf<KiviTypeConfig>) -> PeerLogId {
     PeerLogId {
         term: id.leader_id.term,
         leader: id.leader_id.node_id,
@@ -168,7 +172,7 @@ fn decode_opt_log(id: Option<&PeerLogId>) -> Option<LogIdOf<KiviTypeConfig>> {
 /// are the canonical [`ConsensusCommand`](crate::command::ConsensusCommand)
 /// encoding (never `OpenRaft` memory layout).
 #[must_use]
-pub fn encode_wire_entry(entry: &EntryOf<KiviTypeConfig>) -> PeerEntry {
+pub(crate) fn encode_wire_entry(entry: &EntryOf<KiviTypeConfig>) -> PeerEntry {
     use openraft::EntryPayload;
     let payload = match &entry.payload {
         EntryPayload::Blank => PeerEntryPayload::Blank,
@@ -194,9 +198,11 @@ pub fn encode_wire_entry(entry: &EntryOf<KiviTypeConfig>) -> PeerEntry {
 /// # Errors
 ///
 /// Returns [`RpcCodecError`] when command bytes do not decode or the
-/// membership is incoherent (a corrupt or version-skewed peer — the
+/// membership is incoherent (a corrupt or version-skewed peer - the
 /// caller fails the RPC with backoff, never applies half an entry).
-pub fn decode_wire_entry(entry: &PeerEntry) -> Result<EntryOf<KiviTypeConfig>, RpcCodecError> {
+pub(crate) fn decode_wire_entry(
+    entry: &PeerEntry,
+) -> Result<EntryOf<KiviTypeConfig>, RpcCodecError> {
     use openraft::EntryPayload;
     use openraft::impls::leader_id_adv::LeaderId;
     let payload = match &entry.payload {
@@ -236,7 +242,7 @@ pub fn decode_wire_entry(entry: &PeerEntry) -> Result<EntryOf<KiviTypeConfig>, R
 
 /// Encodes an outgoing vote (or pre-vote) request for the wire.
 #[must_use]
-pub fn encode_vote_request(rpc: &VoteRequest<KiviTypeConfig>) -> PeerVoteRequest {
+pub(crate) fn encode_vote_request(rpc: &VoteRequest<KiviTypeConfig>) -> PeerVoteRequest {
     PeerVoteRequest {
         vote: encode_wire_vote(&rpc.vote),
         last_log: encode_opt_log(rpc.last_log_id.as_ref()),
@@ -246,7 +252,7 @@ pub fn encode_vote_request(rpc: &VoteRequest<KiviTypeConfig>) -> PeerVoteRequest
 
 /// Decodes an incoming vote (or pre-vote) request from the wire.
 #[must_use]
-pub fn decode_vote_request(request: &PeerVoteRequest) -> VoteRequest<KiviTypeConfig> {
+pub(crate) fn decode_vote_request(request: &PeerVoteRequest) -> VoteRequest<KiviTypeConfig> {
     VoteRequest {
         vote: decode_wire_vote(&request.vote),
         last_log_id: decode_opt_log(request.last_log.as_ref()),
@@ -256,7 +262,7 @@ pub fn decode_vote_request(request: &PeerVoteRequest) -> VoteRequest<KiviTypeCon
 
 /// Encodes an outgoing vote (or pre-vote) response for the wire.
 #[must_use]
-pub fn encode_vote_response(rpc: &VoteResponse<KiviTypeConfig>) -> PeerVoteResponse {
+pub(crate) fn encode_vote_response(rpc: &VoteResponse<KiviTypeConfig>) -> PeerVoteResponse {
     PeerVoteResponse {
         vote: encode_wire_vote(&rpc.vote),
         granted: rpc.vote_granted,
@@ -266,7 +272,7 @@ pub fn encode_vote_response(rpc: &VoteResponse<KiviTypeConfig>) -> PeerVoteRespo
 
 /// Decodes an incoming vote (or pre-vote) response from the wire.
 #[must_use]
-pub fn decode_vote_response(response: &PeerVoteResponse) -> VoteResponse<KiviTypeConfig> {
+pub(crate) fn decode_vote_response(response: &PeerVoteResponse) -> VoteResponse<KiviTypeConfig> {
     VoteResponse::new(
         decode_wire_vote(&response.vote),
         decode_opt_log(response.last_log.as_ref()),
@@ -338,7 +344,9 @@ fn decode_transfer_leader_response(
 ///
 /// This conversion is total over the request shape (entries encode
 /// infallibly).
-pub fn encode_append_request(rpc: &AppendEntriesRequest<KiviTypeConfig>) -> PeerAppendRequest {
+pub(crate) fn encode_append_request(
+    rpc: &AppendEntriesRequest<KiviTypeConfig>,
+) -> PeerAppendRequest {
     PeerAppendRequest {
         vote: encode_wire_vote(&rpc.vote),
         prev_log: encode_opt_log(rpc.prev_log_id.as_ref()),
@@ -352,7 +360,7 @@ pub fn encode_append_request(rpc: &AppendEntriesRequest<KiviTypeConfig>) -> Peer
 /// # Errors
 ///
 /// Returns [`RpcCodecError`] when any entry's command bytes do not decode.
-pub fn decode_append_request(
+pub(crate) fn decode_append_request(
     request: &PeerAppendRequest,
 ) -> Result<AppendEntriesRequest<KiviTypeConfig>, RpcCodecError> {
     let mut entries = Vec::with_capacity(request.entries.len());
@@ -369,7 +377,9 @@ pub fn decode_append_request(
 
 /// Encodes an outgoing append-entries response for the wire.
 #[must_use]
-pub fn encode_append_response(rpc: &AppendEntriesResponse<KiviTypeConfig>) -> PeerAppendResponse {
+pub(crate) fn encode_append_response(
+    rpc: &AppendEntriesResponse<KiviTypeConfig>,
+) -> PeerAppendResponse {
     match rpc {
         AppendEntriesResponse::Success => crate::peer::PeerAppendResponse::Success,
         AppendEntriesResponse::PartialSuccess(matched) => {
@@ -384,7 +394,7 @@ pub fn encode_append_response(rpc: &AppendEntriesResponse<KiviTypeConfig>) -> Pe
 
 /// Decodes an incoming append-entries response from the wire.
 #[must_use]
-pub fn decode_append_response(
+pub(crate) fn decode_append_response(
     response: &crate::peer::PeerAppendResponse,
 ) -> AppendEntriesResponse<KiviTypeConfig> {
     match response {
@@ -402,7 +412,7 @@ pub fn decode_append_response(
 /// Encodes outgoing snapshot metadata for the wire. Transfer identity
 /// rides on the fragment envelope, not in `OpenRaft`'s logical metadata.
 #[must_use]
-pub fn encode_snapshot_meta(meta: &SnapshotMetaOf<KiviTypeConfig>) -> PeerSnapshotMeta {
+pub(crate) fn encode_snapshot_meta(meta: &SnapshotMetaOf<KiviTypeConfig>) -> PeerSnapshotMeta {
     let voters: Vec<u64> = meta.last_membership.membership().voter_ids().collect();
     let nodes: Vec<(u64, String)> = meta
         .last_membership
@@ -423,9 +433,9 @@ pub fn encode_snapshot_meta(meta: &SnapshotMetaOf<KiviTypeConfig>) -> PeerSnapsh
 /// # Errors
 ///
 /// Returns [`RpcCodecError::BadMembership`] when the membership is
-/// incoherent (a corrupt or version-skewed peer — the transfer is
+/// incoherent (a corrupt or version-skewed peer - the transfer is
 /// refused, never installed).
-pub fn decode_snapshot_meta(
+pub(crate) fn decode_snapshot_meta(
     meta: &PeerSnapshotMeta,
 ) -> Result<SnapshotMetaOf<KiviTypeConfig>, RpcCodecError> {
     let voter_set: std::collections::BTreeSet<u64> = meta.voters.iter().copied().collect();
@@ -449,17 +459,21 @@ pub fn decode_snapshot_meta(
 }
 
 /// Serves one incoming peer request against the local `Raft` instance.
-/// Every RPC family is supported, including pre-vote and the election /
-/// append / snapshot flow; remote verdicts encode as normal responses
-/// while local decode faults and Raft refusals encode as
-/// [`crate::peer::PeerRpcError`]
-/// (the caller backs off — never a phantom success).
+/// Only the election, pre-vote, append, and leadership-transfer families
+/// reach Raft; every other family is served by the owner thread (sidecar
+/// fetches, preflight, snapshot reassembly, lease batches, ALR syncs,
+/// coverage polls, control forwards) and arriving here is a routing bug,
+/// refused loudly.
+///
+/// Remote verdicts encode as normal responses while local decode faults
+/// and Raft refusals encode as [`crate::peer::PeerRpcError`] (the caller
+/// backs off - never a phantom success).
 ///
 /// # Errors
 ///
 /// Returns [`crate::peer::PeerRpcError`] when the request fails to decode or the local
 /// `Raft` refuses it (shutdown, storage fault, non-member).
-pub async fn serve_peer_request<SM>(
+pub(crate) async fn serve_peer_request<SM>(
     raft: &openraft::Raft<KiviTypeConfig, SM>,
     request: crate::peer::PeerRequest,
 ) -> Result<crate::peer::PeerResponse, crate::peer::PeerRpcError>
@@ -547,23 +561,16 @@ pub struct PeerRouter {
 
 impl PeerRouter {
     /// Binds the router to the node's shared transport.
-    #[must_use]
-    pub fn new(transport: PeerTransport) -> Self {
+    pub(crate) fn new(transport: PeerTransport) -> Self {
         Self {
             transport,
             transfers: Arc::new(AtomicU64::new(1)),
         }
     }
 
-    /// Returns the shared transport (server wiring, diagnostics).
-    #[must_use]
-    pub fn transport(&self) -> &PeerTransport {
-        &self.transport
-    }
-
-    /// Issues one request/response RPC on the shared mesh and decodes the
-    /// family-matched answer. Family mismatches and remote refusals map to
-    /// the retry-safe error (never an invented verdict).
+    /// Issues one request/response RPC on the shared mesh.
+    /// Family mismatches and remote refusals map to the retry-safe error
+    /// (never an invented verdict).
     async fn call(
         &self,
         target: u64,
@@ -571,12 +578,14 @@ impl PeerRouter {
         request: PeerRequest,
         option: &RPCOption,
     ) -> Result<PeerResponse, TransportError> {
-        use kivi_types::NodeId;
-        let response = self
-            .transport
-            .call(NodeId::from_u64(target), group, request, option.hard_ttl())
-            .await?;
-        Ok(response)
+        self.transport
+            .call(
+                kivi_types::NodeId::from_u64(target),
+                group,
+                request,
+                option.hard_ttl(),
+            )
+            .await
     }
 }
 
@@ -682,7 +691,7 @@ impl GroupRouter<KiviTypeConfig, ConsensusGroupId> for PeerRouter {
     ) -> Result<SnapshotResponse<KiviTypeConfig>, StreamingError<KiviTypeConfig>> {
         // `cancel` fires when RaftCore aborts the transmission; fragment
         // sends are sequential unary RPCs, so cancellation surfaces as
-        // the next send failing or the group shutting down — either way
+        // the next send failing or the group shutting down - either way
         // the transfer stops and the receiver discards the partial
         // attempt when a fresh transfer id arrives.
         let SnapshotOf::<KiviTypeConfig, Cursor<Vec<u8>>> { meta, snapshot } = snapshot;

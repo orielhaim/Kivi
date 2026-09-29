@@ -43,7 +43,6 @@ impl ClusterGeneration {
 
 /// Why a control mutation was refused at apply time.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
 pub enum ControlApplyError {
     /// A node-state transition is not on the lifecycle path.
     #[error("illegal node transition for {node}: {detail}")]
@@ -162,7 +161,6 @@ pub enum ControlApplyError {
 
 /// Why a control snapshot image was rejected.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
 pub enum ControlSnapshotError {
     /// Truncated image where framing promised bytes.
     #[error("truncated control snapshot: {detail}")]
@@ -454,7 +452,7 @@ impl ControlState {
     }
 
     /// Whether any live topology plan (migration, split, or merge)
-    /// touches `tablet`: plan conflict rule — one tablet, one live plan.
+    /// touches `tablet`: plan conflict rule - one tablet, one live plan.
     /// Repair wins over split/merge: the planner refuses to split or merge
     /// degraded tablets (see planner eligibility).
     #[must_use]
@@ -1361,12 +1359,6 @@ fn take_blob(mut input: &[u8]) -> Result<(&[u8], &[u8]), &'static str> {
         return Err("truncated snapshot blob body");
     }
     Ok(input.split_at(len))
-}
-
-/// Returns the set of tablet ids in a desired map (test/diagnostic use).
-#[must_use]
-pub fn tablet_set(state: &ControlState) -> BTreeSet<TabletId> {
-    state.placements().map(|desired| desired.tablet).collect()
 }
 
 #[cfg(test)]

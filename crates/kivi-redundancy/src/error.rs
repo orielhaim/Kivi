@@ -90,7 +90,7 @@ pub enum RedundancyError {
     },
     /// A remote fragment holder could not be reached (transport failure,
     /// corrupt bytes on the holder, or missing representation treated as a
-    /// dead end for this attempt — the caller tries alternates).
+    /// dead end for this attempt - the caller tries alternates).
     #[error("fragment holder unreachable: {detail}")]
     Unreachable {
         /// Human-readable cause.
@@ -166,11 +166,5 @@ impl RedundancyError {
     #[must_use]
     pub const fn is_unrecoverable(&self) -> bool {
         matches!(self, Self::Unrecoverable { .. })
-    }
-
-    /// Whether the caller should retry later (bounded overload, not loss).
-    #[must_use]
-    pub const fn is_retryable(&self) -> bool {
-        matches!(self, Self::Overloaded { .. } | Self::Unreadable { .. })
     }
 }

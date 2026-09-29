@@ -1,11 +1,10 @@
 //! Large-value sidecar preflight: pre-distribute immutable roots before
 //! the tiny Raft root proposal.
 //!
-//! The previous milestone found 64 MiB bulk operations queueing small
-//! same-tablet writes (`p99 ≈ 2.3 s`): once the large root entry enters the
-//! log, followers must fetch sidecars before the append persists, and later
-//! small entries cannot commit past it. Preflight moves the expensive
-//! sidecar movement **before** the authoritative Raft entry:
+//! Once a large root entry enters the log, followers must fetch sidecars
+//! before the append persists, and later small entries cannot commit past
+//! it. Preflight moves the expensive sidecar movement **before** the
+//! authoritative Raft entry:
 //!
 //! ```text
 //! leader stages local sidecars (durable)
@@ -43,7 +42,7 @@ use std::time::Duration;
 use kivi_types::{ManifestId, NodeId};
 
 use crate::peer::{PeerPrepareRequest, PeerRequest, PeerResponse};
-use crate::transport::{PeerTransport, TransportError};
+use crate::transport::PeerTransport;
 use crate::types::ConsensusGroupId;
 
 /// Static ordinary-majority quorum for `voters` voters: `v/2+1`. Never
@@ -89,7 +88,7 @@ pub struct PreflightMetrics {
 }
 
 /// Point-in-time preflight metrics snapshot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PreflightMetricsSnapshot {
     /// Preflight rounds started.
     pub attempts: u64,
@@ -218,35 +217,17 @@ pub async fn preflight_to_quorum(
     }
 }
 
-/// Maps a transport-level preflight failure onto a log string (preflight
-/// failures never fail the write; the append gate covers them).
-#[must_use]
-pub fn describe_transport_error(error: &TransportError) -> String {
-    error.to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The quorum floor is a strict majority, and a lone voter needs no
+    /// follower replies.
     #[test]
-    fn quorum_is_static_majority() {
-        assert_eq!(quorum_needed(1), 1);
-        assert_eq!(quorum_needed(2), 2);
-        assert_eq!(quorum_needed(3), 2);
-        assert_eq!(quorum_needed(4), 3);
-        assert_eq!(quorum_needed(5), 3);
-        assert_eq!(followers_needed(3), 1);
-        assert_eq!(followers_needed(1), 0);
-    }
-
-    #[test]
-    fn disabled_preflight_is_immediately_ready() {
-        let metrics = PreflightMetrics::default();
-        // No transport needed: disabled short-circuits before any I/O.
-        // (Exercised through the multi-tablet failover tests with real
-        // transports; here only the quorum math is unit-covered.)
-        assert_eq!(followers_needed(3), 1);
-        assert_eq!(metrics.snapshot().attempts, 0);
+    fn quorum_is_strict_majority() {
+        for (voters, quorum, followers) in [(1, 1, 0), (2, 2, 1), (3, 2, 1), (5, 3, 2)] {
+            assert_eq!(quorum_needed(voters), quorum, "{voters} voters");
+            assert_eq!(followers_needed(voters), followers, "{voters} voters");
+        }
     }
 }

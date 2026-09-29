@@ -27,8 +27,8 @@
 //! | CPU-bound | service time per operation | instructions per cycle | classified, never added |
 //! | Placement stability | nothing | context switches | reported directly |
 //!
-//! Where two sources observe the *same* effect — software off-core latency and
-//! hardware stall fraction are both measuring a request waiting for memory —
+//! Where two sources observe the *same* effect - software off-core latency and
+//! hardware stall fraction are both measuring a request waiting for memory -
 //! they are combined with `max`, not with a sum. Using `max` means a
 //! measurement from either source can raise the estimate and neither can
 //! inflate it. The consequence is deliberate: hardware telemetry can make an

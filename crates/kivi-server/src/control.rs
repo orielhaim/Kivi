@@ -64,7 +64,7 @@ pub struct GenesisSeed {
 /// seed registry and placements, then returns. Idempotent: founding
 /// voters race the same batch (register is insert-if-absent, placements
 /// overwrite identically, activation is a legal self-transition), and
-/// only the control leader's proposals commit — followers and joiners
+/// only the control leader's proposals commit - followers and joiners
 /// retry until the image appears through replication.
 pub async fn genesis_loop(node: Arc<ConsensusNode>, seed: GenesisSeed) {
     loop {
@@ -237,8 +237,8 @@ impl Default for ReconcilePolicy {
 }
 
 /// Runs the reconciler until aborted: every pass syncs the peer mesh
-/// from the replicated registry (all nodes), then — only on the control
-/// leader — drives migrations, repairs, splits, and merges: reads
+/// from the replicated registry (all nodes), then - only on the control
+/// leader - drives migrations, repairs, splits, and merges: reads
 /// persisted plans, observes actual membership through
 /// [`kivi_consensus::select_authoritative`], and advances one idempotent
 /// step per live plan.
@@ -262,6 +262,9 @@ pub async fn reconcile_loop_shared(
         .lock()
         .map_or_else(|_| ReconcilePolicy::default(), |policy| policy.clone());
     let mut detector = kivi_control::FailureDetector::new(initial.failure.clone());
+    // Carries across passes so a plan blocked for a while reports its reason
+    // once, when the reason first appears and again when it changes.
+    let mut blocks = BlockReport::default();
     loop {
         let snapshot = policy
             .lock()
@@ -285,7 +288,7 @@ pub async fn reconcile_loop_shared(
         // keeps serving directories converged, while the admin cutover
         // push stays the same-pass fast path.
         super::cluster::replay_committed_topology(&node, &directory).await;
-        let _ = reconcile_once(&node, &snapshot, &mut detector, &directory).await;
+        let _ = reconcile_once(&node, &snapshot, &mut detector, &directory, &mut blocks).await;
     }
 }
 
@@ -339,6 +342,7 @@ async fn reconcile_once(
     policy: &ReconcilePolicy,
     detector: &mut kivi_control::FailureDetector,
     directory: &Arc<arc_swap::ArcSwap<kivi_tablet::DirectorySnapshot>>,
+    blocks: &mut BlockReport,
 ) -> Result<(), String> {
     // Only the control leader orchestrates.
     let status = node.status_for(ConsensusGroupId::control()).await;
@@ -355,7 +359,7 @@ async fn reconcile_once(
     // existing plans, then new automated work. New topology actions
     // (liveness transitions, drain top-ups, repairs) require control-plane
     // quorum: the leader role alone proves a quorum elected us, but a
-    // partition could have since isolated us — gate on reachable control
+    // partition could have since isolated us - gate on reachable control
     // voters so a lone leader never re-replicates the cluster alone.
     let liveness = probe_liveness(node, &state).await;
     let quorum = control_quorum(node, &state, &liveness).await;
@@ -391,16 +395,20 @@ async fn reconcile_once(
     // sequentially: at most one live split and one live merge exist
     // cluster-wide, so concurrency buys nothing and serialization keeps
     // the directory cutover easy to reason about.
+    //
+    // `blocks` is the reason each plan last reported, kept across passes so a
+    // stuck plan says why once instead of on every poll.
+    let mut reported = std::mem::take(blocks);
     {
         let splits: Vec<SplitPlan> = state
             .splits()
-            .filter(|plan| !plan.phase.is_terminal())
+            .filter(|plan| plan.phase.is_resumable())
             .cloned()
             .collect();
         for plan in splits {
             let _ = tokio::time::timeout(
                 Duration::from_secs(60),
-                drive_split(node, &state, &plan, directory),
+                drive_split(node, &state, &plan, directory, &mut reported),
             )
             .await;
         }
@@ -412,11 +420,12 @@ async fn reconcile_once(
         for plan in merges {
             let _ = tokio::time::timeout(
                 Duration::from_secs(60),
-                drive_merge(node, &state, &plan, directory),
+                drive_merge(node, &state, &plan, directory, &mut reported),
             )
             .await;
         }
     }
+    *blocks = reported;
     if quorum {
         drive_liveness(node, &state, detector, &liveness).await;
         // Re-read: liveness transitions may have changed node states that
@@ -520,9 +529,8 @@ fn route_record_tablet(
     if let Some(tablet) = snapshot.lookup_by_key(record_key.as_bytes()) {
         return Some(tablet);
     }
-    // Hash-layout fallback, shared with every other routing site.
-    let hash = kivi_state::PartitionHasher::V1.hash(namespace, record_key.as_bytes())?;
-    snapshot.lookup_by_hash(hash)
+    // Hash-layout fallback, through the one routing-hash function.
+    snapshot.lookup_by_hash(kivi_state::route_hash(namespace, record_key.as_bytes()))
 }
 
 /// Builds the participant abort-finalize for an intent (shared by the
@@ -532,6 +540,7 @@ fn abort_finalize_op(intent: &kivi_state::TxnIntent) -> kivi_state::Operation {
         txn: intent.id,
         key: intent.key.clone(),
         commit: false,
+        write: intent.write.clone(),
         digest: intent.digest,
     }
 }
@@ -613,7 +622,7 @@ async fn resolve_one_intent(
     };
     // Read the decision record (fiat-routed to the coordinator tablet).
     // Latest first (leader-precise); on any failure fall back to the
-    // local applied state (`Any`: no barrier, no redirect — served from
+    // local applied state (`Any`: no barrier, no redirect - served from
     // this replica's committed prefix when it hosts the record tablet).
     // The fallback is safe exactly because decision records are
     // write-once-terminal (`TxnState::transition_to` rejects
@@ -669,6 +678,7 @@ async fn resolve_one_intent(
                         txn: intent.id,
                         key: intent.key.clone(),
                         commit: true,
+                        write: intent.write.clone(),
                         digest: intent.digest,
                     },
                     None,
@@ -688,6 +698,7 @@ async fn resolve_one_intent(
                         txn: intent.id,
                         key: intent.key.clone(),
                         commit: false,
+                        write: intent.write.clone(),
                         digest: intent.digest,
                     },
                     None,
@@ -751,14 +762,18 @@ async fn cas_abort_absent_record(
     // (commit 0 / abort 1): distinct intents, genuine OCC on the key.
     let abort_txn = kivi_state::TxnId::derive(u128::from_le_bytes(txn.as_bytes()), 0, 2);
     let now = super::cluster::wall_now();
+    // Bound once and shared by both steps: the prepare reserves it and the
+    // finalize states it. Two spellings of one write in one function is exactly
+    // how the two can come to mean different things.
+    let aborted_write = TxnWrite {
+        key: record_key.clone(),
+        kind: TxnWriteKind::Put(bytes::Bytes::from(aborted.encode())),
+        expect: TxnExpect::Absent,
+    };
     let prepare = Operation::TxnPrepare {
         txn: abort_txn,
         coordinator,
-        write: TxnWrite {
-            key: record_key.clone(),
-            kind: TxnWriteKind::Put(bytes::Bytes::from(aborted.encode())),
-            expect: TxnExpect::Absent,
-        },
+        write: aborted_write.clone(),
         // Record-key steps bind the zero digest (no user write set).
         digest: [0u8; 32],
     };
@@ -778,6 +793,8 @@ async fn cas_abort_absent_record(
         txn: abort_txn,
         key: record_key,
         commit: true,
+        // The write `prepare` reserved. See the note in `compound.rs`.
+        write: aborted_write,
         digest: [0u8; 32],
     };
     matches!(
@@ -1057,6 +1074,264 @@ async fn blocked_parents(node: &Arc<ConsensusNode>, parents: &[TabletId]) -> Vec
     blocked
 }
 
+/// Rate-limits "this plan is blocked" reporting.
+///
+/// The reconciler runs on a fixed poll interval, forever, and a plan blocked for
+/// a transient reason - a replica restarting, a child catching up - would
+/// otherwise write the same line every pass for as long as the condition lasts.
+/// The state that matters is *why a plan is stuck*, not how many times it was
+/// observed stuck, so a reason is reported once and again only when it changes.
+#[derive(Default)]
+struct BlockReport {
+    last: BTreeMap<PlanId, String>,
+}
+
+impl BlockReport {
+    /// Records a block reason, returning whether it differs from the last one
+    /// reported for this plan.
+    fn changed(&mut self, plan: PlanId, reason: String) -> bool {
+        match self.last.get(&plan) {
+            Some(previous) if *previous == reason => false,
+            _ => {
+                self.last.insert(plan, reason);
+                true
+            }
+        }
+    }
+
+    /// Forgets a plan that finished, so its slot is not held for a plan id that
+    /// will never be reused.
+    fn forget(&mut self, plan: PlanId) {
+        self.last.remove(&plan);
+    }
+}
+
+/// Reports a split that cannot advance, and records why for `split_status`.
+///
+/// A blocked split is a normal state, not an error: the parent is still
+/// authoritative and will keep serving. What it is not is silent, which is what
+/// the old behaviour was - a plan could sit behind an unmet prerequisite with
+/// nothing but a passing log line to show for it.
+fn report_split_block(report: &mut BlockReport, plan: &SplitPlan, block: &ReadinessBlock) {
+    if report.changed(plan.id, block.to_string()) {
+        tracing::warn!(
+            plan = plan.id.as_u64(),
+            parent = plan.parent.as_u64(),
+            left = plan.left.as_u64(),
+            right = plan.right.as_u64(),
+            phase = ?plan.phase,
+            reason = %block,
+            "split blocked: parent stays authoritative"
+        );
+    }
+}
+
+/// Why a topology plan cannot advance right now.
+///
+/// The plan stays in its current phase and the parents stay authoritative; the
+/// reason is derived from observation rather than persisted, because a reason is
+/// only true until the next observation and a replicated "blocked" flag would
+/// need a state machine of its own.
+///
+/// Named for the *target* rather than for a child or a merge target because the
+/// claim is the same either way; the plan that asked is carried alongside.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReadinessBlock {
+    /// Membership has not converged on the planned voters yet.
+    NotProvisioned {
+        /// The tablet that is short.
+        target: TabletId,
+        /// The plan's intended voters.
+        want: Vec<u64>,
+        /// The voters actually in the group's Raft membership.
+        have: Vec<u64>,
+    },
+    /// Membership is mid-transition; judging now would read a half-applied
+    /// config.
+    MembershipJoint {
+        /// The tablet whose membership is in flight.
+        target: TabletId,
+    },
+    /// No leader for the group.
+    NoLeader {
+        /// The tablet with no leader.
+        target: TabletId,
+    },
+    /// A majority of the voters are not currently reachable.
+    QuorumUnreachable {
+        /// The tablet that cannot form a quorum.
+        target: TabletId,
+    },
+}
+
+impl std::fmt::Display for ReadinessBlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotProvisioned { target, want, have } => write!(
+                f,
+                "tablet {} membership is {have:?}, planned {want:?}",
+                target.as_u64()
+            ),
+            Self::MembershipJoint { target } => {
+                write!(f, "tablet {} membership is mid-transition", target.as_u64())
+            }
+            Self::NoLeader { target } => {
+                write!(f, "tablet {} has no leader", target.as_u64())
+            }
+            Self::QuorumUnreachable { target } => {
+                write!(
+                    f,
+                    "tablet {} cannot reach a voter majority",
+                    target.as_u64()
+                )
+            }
+        }
+    }
+}
+
+/// Reports a merge that cannot advance. See [`report_split_block`]: a blocked
+/// plan is a normal state in which the parents keep serving, and the reason is
+/// reported once rather than on every pass.
+fn report_merge_block(
+    report: &mut BlockReport,
+    plan: &kivi_control::MergePlan,
+    block: &ReadinessBlock,
+) {
+    if report.changed(plan.id, block.to_string()) {
+        tracing::warn!(
+            plan = plan.id.as_u64(),
+            left = plan.left.as_u64(),
+            right = plan.right.as_u64(),
+            merged = plan.merged.as_u64(),
+            phase = ?plan.phase,
+            reason = %block,
+            "merge blocked: both parents stay authoritative"
+        );
+    }
+}
+
+/// Proves that `targets` are authoritative before anything routes to them.
+///
+/// "Authoritative" is three separate claims, and the split needs all three:
+///
+/// 1. the target's Raft membership is the planned voter set - otherwise it is
+///    running on a quorum that does not include the lineage it was seeded from,
+///    and the data it holds is not a partition of anything;
+/// 2. the target has a leader - a group with voters but no leader commits
+///    nothing, so publishing routing to it is publishing routing to a stall;
+/// 3. a majority of its voters are reachable and caught up - a leader elected
+///    from a minority is a leader that cannot commit.
+///
+/// `ensure_group` returning `Ok` proves none of this. It proves a request was
+/// accepted, which is the whole gap this proof closes.
+pub(crate) async fn prove_tabsets_ready(
+    node: &Arc<ConsensusNode>,
+    state: &ControlState,
+    targets: &[TabletId],
+    planned_replicas: &[NodeId],
+    plan: PlanId,
+) -> Result<(), ReadinessBlock> {
+    let want: Vec<u64> = {
+        let mut ids = planned_replicas
+            .iter()
+            .map(|node| node.as_u64())
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
+    };
+    for target in targets {
+        prove_one_ready(node, state, *target, &want, plan).await?;
+    }
+    Ok(())
+}
+
+/// Proves one target authoritative against the planned voter set.
+///
+/// The three claims are separate on purpose: a group can satisfy two of them and
+/// still be unable to serve, and collapsing them into one boolean would make a
+/// blocked plan say "not ready" instead of saying which of the three failed.
+async fn prove_one_ready(
+    node: &Arc<ConsensusNode>,
+    state: &ControlState,
+    target: TabletId,
+    want: &[u64],
+    plan: PlanId,
+) -> Result<(), ReadinessBlock> {
+    let Some(observed) = observe_tablet(node, state, target).await else {
+        return Err(ReadinessBlock::NotProvisioned {
+            target,
+            want: want.to_vec(),
+            have: Vec::new(),
+        });
+    };
+    let have: Vec<u64> = observed.voters.iter().copied().collect();
+    if have != want {
+        return Err(ReadinessBlock::NotProvisioned {
+            target,
+            want: want.to_vec(),
+            have,
+        });
+    }
+    if observed.is_joint {
+        return Err(ReadinessBlock::MembershipJoint { target });
+    }
+    // Leader and lag are only authoritative from the leader's own view; a
+    // follower reports unknown lag, which would read as "not caught up" forever
+    // and block the plan permanently.
+    let observed = refresh_from_leader(node, state, &observed).await;
+    if observed.leader.is_none() {
+        return Err(ReadinessBlock::NoLeader { target });
+    }
+    // A lag map is only empty on a follower, so an empty one means "not measured"
+    // rather than "measured as unreachable". Reading it as the latter would stall
+    // every plan whose target leader's admin plane did not answer, on a reason
+    // that is not true. A Raft leader is itself proof of a majority - none can be
+    // elected without one - so the leader and the membership checked above carry
+    // the claim when there is no lag to read.
+    let majority_unreachable = !observed.lag.is_empty()
+        && !super::cluster::cluster_adaptive::quorum_reachable(node.node(), &observed, Some(state));
+    if majority_unreachable {
+        return Err(ReadinessBlock::QuorumUnreachable { target });
+    }
+    if observed.lag.is_empty() {
+        tracing::debug!(
+            plan = plan.as_u64(),
+            target = target.as_u64(),
+            "readiness rests on leader and membership; no replication-lag reading was \
+             available from any member"
+        );
+    }
+    Ok(())
+}
+
+/// Proves both split children ready, reporting the reason if not.
+///
+/// The two call sites (before the fence, and again under it) are the same
+/// question asked at two moments, so it is asked once here rather than spelled
+/// twice - and a spelling that drifts is how a gate stops being a gate.
+async fn split_children_ready(
+    node: &Arc<ConsensusNode>,
+    state: &ControlState,
+    plan: &SplitPlan,
+    report: &mut BlockReport,
+) -> bool {
+    match prove_tabsets_ready(
+        node,
+        state,
+        &[plan.left, plan.right],
+        &plan.replicas,
+        plan.id,
+    )
+    .await
+    {
+        Ok(()) => true,
+        Err(block) => {
+            report_split_block(report, plan, &block);
+            false
+        }
+    }
+}
+
 /// Drives one split plan a single idempotent step.
 ///
 /// Repair wins over split: a parent with a live migration plan (repair,
@@ -1066,8 +1341,10 @@ async fn drive_split(
     state: &ControlState,
     plan: &SplitPlan,
     directory: &Arc<arc_swap::ArcSwap<kivi_tablet::DirectorySnapshot>>,
+    report: &mut BlockReport,
 ) {
-    if plan.phase.is_terminal() {
+    if !plan.phase.is_resumable() {
+        report.forget(plan.id);
         return;
     }
     if !state.live_plans_for(plan.parent).is_empty() {
@@ -1082,21 +1359,32 @@ async fn drive_split(
             if ensure_split_children(node, state, plan).await
                 && initialize_split_children(node, state, plan).await
             {
-                advance_split(node, plan, SplitPhase::ChildrenAllocated).await;
+                advance_split(node, plan, SplitPhase::ChildrenProvisioning).await;
             }
         }
-        SplitPhase::ChildrenAllocated => {
+        SplitPhase::ChildrenProvisioning => {
             if seed_split_children(node, state, plan).await {
                 advance_split(node, plan, SplitPhase::BaseSeeded).await;
             }
         }
         SplitPhase::BaseSeeded => {
             // Drain before fence: unresolved intents block the seal (they
-            // never migrate — topology copies carry objects and sessions
+            // never migrate - topology copies carry objects and sessions
             // only), and finalizes flow only while unfenced. Fencing with
             // live intents would strand them: the fence blocks the very
             // finalizes that could resolve them.
             if !blocked_parents(node, &[plan.parent]).await.is_empty() {
+                return;
+            }
+            // Readiness is proven *before* the fence, not after.
+            //
+            // The children already hold their groups and membership by this
+            // phase, so this normally passes immediately. Fencing first and
+            // proving afterwards would mean a child slow to elect a leader holds
+            // the parent fenced - a range that cannot be written - for the whole
+            // wait. Proving first keeps the parent fully serving for as long as
+            // possible and makes the fence short by construction.
+            if !split_children_ready(node, state, plan, report).await {
                 return;
             }
             let fenced_at = std::time::Instant::now();
@@ -1127,15 +1415,56 @@ async fn drive_split(
                 advance_split(node, plan, SplitPhase::BaseSeeded).await;
                 return;
             }
+            // Re-prove under the fence. The pre-fence proof is what keeps this
+            // window short; this one is what makes the transition sound, because
+            // the fence is exactly the interval in which the children could have
+            // lost a leader.
+            //
+            // Nothing past here may publish routing until both children are
+            // proven to serve, and the parent is still authoritative while they
+            // are not - which is why a split that stalls here stalls with data
+            // rather than without it.
+            if let Err(block) = prove_tabsets_ready(
+                node,
+                state,
+                &[plan.left, plan.right],
+                &plan.replicas,
+                plan.id,
+            )
+            .await
+            {
+                report_split_block(report, plan, &block);
+                return;
+            }
+            advance_split(node, plan, SplitPhase::ChildrenReady).await;
+        }
+        SplitPhase::ChildrenReady => {
             if publish_split_cutover(node, state, plan, directory).await {
                 advance_split(node, plan, SplitPhase::CutoverCommitted).await;
             }
         }
         SplitPhase::CutoverCommitted => {
-            // Retirement reclaims the parent lineage: never retire under
-            // unresolved intents (a stranded intent could never resolve
-            // once its group is gone).
+            // Retirement reclaims the parent lineage, and after the cutover the
+            // parent is the last place the pre-split data exists. Never retire
+            // it while a child is not serving: that is the difference between a
+            // slow split and a lost range.
+            //
+            // Two things block: unresolved intents (a stranded intent could
+            // never resolve once its group is gone) and a child that stopped
+            // being authoritative between publication and now.
             if !blocked_parents(node, &[plan.parent]).await.is_empty() {
+                return;
+            }
+            if let Err(block) = prove_tabsets_ready(
+                node,
+                state,
+                &[plan.left, plan.right],
+                &plan.replicas,
+                plan.id,
+            )
+            .await
+            {
+                report_split_block(report, plan, &block);
                 return;
             }
             if retire_tablets(node, state, &[plan.parent], plan.generation.as_u64()).await {
@@ -1150,7 +1479,7 @@ async fn drive_split(
 }
 
 /// Defers a merge step while any parent holds unresolved intents: `true`
-/// means all clear. Drain, seal, and retire share the gate — intents never
+/// means all clear. Drain, seal, and retire share the gate - intents never
 /// migrate, so the step retries on a later pass.
 async fn merge_parents_clear(node: &Arc<ConsensusNode>, plan: &kivi_control::MergePlan) -> bool {
     blocked_parents(node, &[plan.left, plan.right])
@@ -1158,7 +1487,7 @@ async fn merge_parents_clear(node: &Arc<ConsensusNode>, plan: &kivi_control::Mer
         .is_empty()
 }
 
-/// Installs the merge final tail under fence: seed, snapshot, advance —
+/// Installs the merge final tail under fence: seed, snapshot, advance -
 /// or unfence on any failure so finalizes flow again.
 async fn merge_install_tail(
     node: &Arc<ConsensusNode>,
@@ -1187,8 +1516,10 @@ async fn drive_merge(
     state: &ControlState,
     plan: &kivi_control::MergePlan,
     directory: &Arc<arc_swap::ArcSwap<kivi_tablet::DirectorySnapshot>>,
+    report: &mut BlockReport,
 ) {
     if plan.phase.is_terminal() {
+        report.forget(plan.id);
         return;
     }
     if !state.live_plans_for(plan.left).is_empty() || !state.live_plans_for(plan.right).is_empty() {
@@ -1219,6 +1550,15 @@ async fn drive_merge(
             if !merge_parents_clear(node, plan).await {
                 return;
             }
+            // Proven before the fence, for the reason the split proves there: a
+            // target slow to elect a leader would otherwise hold *both* parents
+            // fenced - two unwritable ranges - for the whole wait.
+            if let Err(block) =
+                prove_tabsets_ready(node, state, &[plan.merged], &plan.replicas, plan.id).await
+            {
+                report_merge_block(report, plan, &block);
+                return;
+            }
             merge_install_tail(node, state, plan).await;
         }
         MergePhase::Fenced => {
@@ -1230,14 +1570,35 @@ async fn drive_merge(
                 advance_merge(node, plan, MergePhase::BaseSeeded).await;
                 return;
             }
+            // Re-prove under the fence: the same proof the split re-proves, and
+            // for the same reason - the fence is the interval in which the target
+            // could have lost a leader, and publishing routing to a target that
+            // cannot commit loses both parent ranges at once.
+            if let Err(block) =
+                prove_tabsets_ready(node, state, &[plan.merged], &plan.replicas, plan.id).await
+            {
+                report_merge_block(report, plan, &block);
+                return;
+            }
+            advance_merge(node, plan, MergePhase::TargetReady).await;
+        }
+        MergePhase::TargetReady => {
             if publish_merge_cutover(node, state, plan, directory).await {
                 advance_merge(node, plan, MergePhase::CutoverCommitted).await;
             }
         }
         MergePhase::CutoverCommitted => {
             // Retirement reclaims the parent lineages: never retire under
-            // unresolved intents.
+            // unresolved intents, and never retire while the target is not
+            // serving. After the cutover the target is the only copy of both
+            // ranges.
             if !merge_parents_clear(node, plan).await {
+                return;
+            }
+            if let Err(block) =
+                prove_tabsets_ready(node, state, &[plan.merged], &plan.replicas, plan.id).await
+            {
+                report_merge_block(report, plan, &block);
                 return;
             }
             if retire_tablets(
@@ -1514,7 +1875,7 @@ async fn seed_merge_one(
 /// Snapshots one tablet replica (local front or admin plane): seals its
 /// current state into a snapshot and purges the log through the base.
 /// Split/merge targets hold out-of-band seeded state that exists nowhere
-/// in their Raft log — without this snapshot a hard restart before the
+/// in their Raft log - without this snapshot a hard restart before the
 /// first automatic snapshot would resurrect them empty (seeded base
 /// lost; only post-seed log entries would replay).
 async fn snapshot_one(
@@ -1718,6 +2079,20 @@ async fn publish_merge_cutover(
     true
 }
 
+/// Whether a published directory has anywhere to route.
+///
+/// A directory with no active tablet is not a namespace with a cold tablet; it is
+/// a namespace where every request fails, and it is what a cutover produces if it
+/// tombstones a parent and activates children that are not there. Constructing
+/// such a snapshot is legal - a merge holds every tablet sealed between its seal
+/// and its cutover - so the check belongs at publication, not in the constructor.
+pub(crate) fn routes_somewhere(snapshot: &kivi_tablet::DirectorySnapshot) -> bool {
+    snapshot
+        .tablets()
+        .iter()
+        .any(|descriptor| descriptor.state() == kivi_tablet::TabletState::Active)
+}
+
 /// Applies a cutover body to the local directory snapshot.
 fn publish_cutover_local(
     directory: &Arc<arc_swap::ArcSwap<kivi_tablet::DirectorySnapshot>>,
@@ -1756,7 +2131,7 @@ fn publish_cutover_local(
                     })
                     .ok_or("missing split_hash")?;
                 // Ordered splits carry `split_key` as a byte array;
-                // absence means a hash split (key must be interior —
+                // absence means a hash split (key must be interior -
                 // validated by the range operation, not here).
                 let split_key: Option<Vec<u8>> = body.get("split_key").and_then(|value| {
                     value.as_array().map(|bytes| {
@@ -1801,6 +2176,16 @@ fn publish_cutover_local(
         Ok(next) => {
             if let Err(reason) = next.validate() {
                 tracing::warn!(%reason, "cutover snapshot invalid");
+                return false;
+            }
+            if !routes_somewhere(&next) {
+                // Refused rather than published: a directory that routes nowhere
+                // is indistinguishable from an outage, and it would be published
+                // over a working one.
+                tracing::error!(
+                    "refusing a cutover that leaves no active tablet: the parent would \
+                     stop serving and nothing would take over"
+                );
                 return false;
             }
             directory.store(Arc::new(next));
@@ -1870,7 +2255,7 @@ async fn drive_auto_split(
             continue;
         }
         // Tablets with unresolved intents do not split (resolve first,
-        // then cut over — see the intent migration rule).
+        // then cut over - see the intent migration rule).
         if node
             .tablet_intent_count(tablet)
             .await
@@ -1941,7 +2326,7 @@ async fn drive_auto_split(
         }) else {
             return;
         };
-        let _ = create_split_plan_at(node, tablet, split_hash, left, right).await;
+        let _ = create_split_plan(node, tablet, split_hash, None, left, right).await;
     }
     if let Some((bytes, tablet)) = best_ordered {
         // Median-key pivot from the leader-local ordered index.
@@ -1979,7 +2364,7 @@ async fn drive_auto_split(
         }) else {
             return;
         };
-        let _ = create_split_plan_full(node, tablet, 0, Some(split_key), left, right).await;
+        let _ = create_split_plan(node, tablet, 0, Some(split_key), left, right).await;
     }
 }
 
@@ -2120,25 +2505,14 @@ fn is_degraded(state: &ControlState, replicas: &[NodeId]) -> bool {
     })
 }
 
-/// Creates a split plan for `parent` at an explicit midpoint boundary
-/// with explicit children: midpoint boundary, fresh child ids from the
-/// persisted allocator, replicas inherited from the parent. One shared
-/// pathway for manual splits (admin/CLI, which reads the directory) and
-/// automatic splits (the reconciler, which owns a directory view).
-pub async fn create_split_plan_at(
-    node: &Arc<ConsensusNode>,
-    parent: TabletId,
-    split_hash: u128,
-    left: TabletId,
-    right: TabletId,
-) -> Result<PlanId, String> {
-    create_split_plan_full(node, parent, split_hash, None, left, right).await
-}
-
-/// Creates a split plan with an explicit boundary: `split_key` set for
-/// ordered parents (real-key boundary), `split_hash` for hash parents
-/// (midpoint). Exactly one boundary style applies per plan.
-pub async fn create_split_plan_full(
+/// Creates a split plan for `parent` at an explicit boundary with explicit
+/// children: replicas inherited from the parent.
+///
+/// `split_key` is set for ordered parents (real-key boundary); hash parents
+/// use the `split_hash` midpoint and pass `None`. One shared pathway for
+/// manual splits (admin/CLI, which reads the directory) and automatic splits
+/// (the reconciler, which owns a directory view).
+pub async fn create_split_plan(
     node: &Arc<ConsensusNode>,
     parent: TabletId,
     split_hash: u128,
@@ -2568,10 +2942,10 @@ async fn drive_plan(node: &Arc<ConsensusNode>, state: &ControlState, plan: &Migr
             // Retirement is durable once executed (local replica
             // unregistered plus tombstone, awaited; a remote 200
             // likewise answers only after completion), and this step
-            // only fires once membership converged — so success
+            // only fires once membership converged - so success
             // completes the plan. A repair-worthy dead source
             // (`Unavailable`/`Removed`) never answers again: skip its
-            // retirement RPC and complete — the open-time desired oracle
+            // retirement RPC and complete - the open-time desired oracle
             // tombstones its stale replica when (if) it returns, so no
             // zombie replica can resurrect.
             let source_gone = state.node(source).is_some_and(|record| {
@@ -3134,7 +3508,7 @@ pub fn repair_intents(state: &ControlState, policy: &ReconcilePolicy) -> Vec<Mig
 /// continuous: no flapping). When one node leads materially more
 /// tablets than another (beyond an eighth of the tablets), hands half
 /// the excess to the least-represented voters through graceful
-/// `transfer_leader` — never forced elections. Tablets with live
+/// `transfer_leader` - never forced elections. Tablets with live
 /// migration plans are skipped (they manage their own leadership).
 /// Returns the number of transfers issued.
 pub async fn rebalance_leadership(node: &Arc<ConsensusNode>, state: &ControlState) -> usize {
@@ -3380,6 +3754,18 @@ async fn admin_post(
     serde_json::from_slice(&reply).map_err(|error| format!("admin POST {path}: {error}"))
 }
 
+/// Performs one admin POST and reads its `ok` acknowledgement. A transport
+/// failure, a non-`ok` reply, and a missing field are all the same answer:
+/// the step did not happen, and the caller retries or gives up.
+async fn admin_post_ok(admin: SocketAddr, path: &str, body: &serde_json::Value) -> bool {
+    admin_post(admin, path, body).await.is_ok_and(|reply| {
+        reply
+            .get("ok")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    })
+}
+
 /// Minimal HTTP/1.1 round trip over a fresh connection (Content-Length
 /// framing both ways; the admin plane always replies with one).
 /// Bounded end to end (10 s): a wedged peer fails the step instead of
@@ -3457,18 +3843,12 @@ async fn admin_post_learner(
     target: NodeId,
     addr: &str,
 ) -> bool {
-    admin_post(
+    admin_post_ok(
         admin,
         &format!("/v1/tablets/{}/learners", tablet.as_u64()),
         &serde_json::json!({ "node": target.as_u64(), "addr": addr, "blocking": false }),
     )
     .await
-    .is_ok_and(|value| {
-        value
-            .get("ok")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-    })
 }
 
 /// Forwards target-replica creation to the joining node's admin plane.
@@ -3480,18 +3860,12 @@ async fn admin_post_ensure(
     generation: u64,
 ) -> bool {
     let voters: Vec<u64> = voters.iter().copied().collect();
-    admin_post(
+    admin_post_ok(
         admin,
         &format!("/v1/tablets/{}/ensure", tablet.as_u64()),
         &serde_json::json!({ "node": target.as_u64(), "voters": voters, "generation": generation }),
     )
     .await
-    .is_ok_and(|value| {
-        value
-            .get("ok")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-    })
 }
 
 /// Forwards source retirement to the leaving node's admin plane.
@@ -3502,35 +3876,23 @@ async fn admin_post_retire(
     source: NodeId,
     generation: u64,
 ) -> bool {
-    admin_post(
+    admin_post_ok(
         admin,
         &format!("/v1/tablets/{}/retire", tablet.as_u64()),
         &serde_json::json!({ "node": source.as_u64(), "generation": generation }),
     )
     .await
-    .is_ok_and(|value| {
-        value
-            .get("ok")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-    })
 }
 
 /// Forwards `change_membership` to the tablet leader's admin plane.
 async fn admin_post_members(admin: SocketAddr, tablet: TabletId, voters: &BTreeSet<u64>) -> bool {
     let voters: Vec<u64> = voters.iter().copied().collect();
-    admin_post(
+    admin_post_ok(
         admin,
         &format!("/v1/tablets/{}/members", tablet.as_u64()),
         &serde_json::json!({ "voters": voters, "retain": false }),
     )
     .await
-    .is_ok_and(|value| {
-        value
-            .get("ok")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-    })
 }
 
 /// Forwards `transfer_leader` to the tablet leader's admin plane.
@@ -3551,34 +3913,22 @@ async fn admin_post_initialize(
     peer_addrs: &BTreeMap<u64, String>,
 ) -> bool {
     let voters: Vec<u64> = voters.iter().copied().collect();
-    admin_post(
+    admin_post_ok(
         admin,
         &format!("/v1/tablets/{}/initialize", tablet.as_u64()),
         &serde_json::json!({ "voters": voters, "peer_addrs": peer_addrs }),
     )
     .await
-    .is_ok_and(|value| {
-        value
-            .get("ok")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-    })
 }
 
 /// Forwards the cutover fence to one replica's admin plane.
 async fn admin_post_fence(admin: SocketAddr, tablet: TabletId, fenced: bool) -> bool {
-    admin_post(
+    admin_post_ok(
         admin,
         &format!("/v1/tablets/{}/fence", tablet.as_u64()),
         &serde_json::json!({ "fenced": fenced }),
     )
     .await
-    .is_ok_and(|value| {
-        value
-            .get("ok")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-    })
 }
 
 /// Forwards one split-child seed to the replica's admin plane (colocated
@@ -3592,7 +3942,7 @@ async fn admin_post_seed_split(
     split_key: Option<&[u8]>,
     left: bool,
 ) -> bool {
-    admin_post(
+    admin_post_ok(
         admin,
         &format!("/v1/tablets/{}/seed-split", child.as_u64()),
         &serde_json::json!({
@@ -3603,12 +3953,6 @@ async fn admin_post_seed_split(
         }),
     )
     .await
-    .is_ok_and(|value| {
-        value
-            .get("ok")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-    })
 }
 
 /// Forwards one merge-target seed to the replica's admin plane.
@@ -3618,28 +3962,15 @@ async fn admin_post_seed_merge(
     left: TabletId,
     right: TabletId,
 ) -> bool {
-    admin_post(
+    admin_post_ok(
         admin,
         &format!("/v1/tablets/{}/seed-merge", merged.as_u64()),
         &serde_json::json!({ "left": left.as_u64(), "right": right.as_u64() }),
     )
     .await
-    .is_ok_and(|value| {
-        value
-            .get("ok")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-    })
 }
 
 /// Forwards one directory cutover to a peer's admin plane (idempotent).
 async fn admin_post_cutover(admin: SocketAddr, body: &serde_json::Value) -> bool {
-    admin_post(admin, "/v1/directory/cutover", body)
-        .await
-        .is_ok_and(|value| {
-            value
-                .get("ok")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false)
-        })
+    admin_post_ok(admin, "/v1/directory/cutover", body).await
 }

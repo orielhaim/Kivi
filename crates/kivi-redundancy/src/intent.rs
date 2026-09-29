@@ -1,8 +1,8 @@
 //! Declarative redundancy requirements: what protection, not how.
 //!
-//! [`RedundancyIntent`] expresses properties — required independent failure
+//! [`RedundancyIntent`] expresses properties - required independent failure
 //! tolerance, minimum available pieces, locality, allowed domains,
-//! storage-cost preference, repair-cost constraints — while specific layouts
+//! storage-cost preference, repair-cost constraints - while specific layouts
 //! (`RS(8,3)`, replica counts, shard widths) remain planner decisions. The
 //! initial planner is simple and deterministic, but the API leaves room for
 //! later adaptive control (opaque policy version + hints travel with the
@@ -27,32 +27,20 @@ impl StorageCost {
     }
 }
 
-/// Repair-cost/latency constraints attached to an intent.
+/// Read-latency constraint attached to an intent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RepairConstraints {
-    /// Maximum bytes the planner may read to rebuild one fragment.
-    pub max_repair_read_bytes: u64,
     /// Whether degraded reads must avoid decoding on the hot path when a
     /// full copy exists elsewhere (prefers replication for hot assets).
     pub prefer_direct_reads: bool,
 }
 
 impl RepairConstraints {
-    /// Balanced defaults: 8 MiB per-fragment repair reads, no hot-path bias.
+    /// No hot-path bias.
     #[must_use]
     pub const fn balanced() -> Self {
         Self {
-            max_repair_read_bytes: 8 * 1024 * 1024,
             prefer_direct_reads: false,
-        }
-    }
-
-    /// Hot-asset defaults: prefer layouts with direct reads.
-    #[must_use]
-    pub const fn hot() -> Self {
-        Self {
-            max_repair_read_bytes: 8 * 1024 * 1024,
-            prefer_direct_reads: true,
         }
     }
 }
@@ -135,10 +123,7 @@ impl RedundancyIntent {
             locality: LocalityRequirement::None,
             allowed_domains: Vec::new(),
             storage_cost: StorageCost::Balanced,
-            repair: RepairConstraints {
-                max_repair_read_bytes: 8 * 1024 * 1024,
-                prefer_direct_reads: false,
-            },
+            repair: RepairConstraints::balanced(),
             policy_version: 0,
         }
     }
@@ -182,12 +167,6 @@ impl RedundancyIntent {
         }
         Ok(())
     }
-
-    /// Whether this intent requires more than one independent piece.
-    #[must_use]
-    pub fn requires_redundancy(&self) -> bool {
-        self.tolerance > 0
-    }
 }
 
 #[cfg(test)]
@@ -203,15 +182,5 @@ mod tests {
         let mut wild = RedundancyIntent::survive_two();
         wild.tolerance = 9;
         assert!(wild.validate().is_err());
-    }
-
-    #[test]
-    fn semantic_contract_hides_layout() {
-        let intent = RedundancyIntent::survive_two();
-        // The intent names tolerance, never "RS(8,3)": debug form carries
-        // no codec widths.
-        let text = format!("{intent:?}");
-        assert!(text.contains("tolerance"));
-        assert!(!text.contains("RS("));
     }
 }

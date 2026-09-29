@@ -50,6 +50,28 @@
 //! insufficient by design: fragments without authority are orphans, and
 //! authority without fragments is degraded until repair.
 //!
+//! ## Two roles: resolver for replication, protector for writes
+//!
+//! The coordinator is the one place that knows how redundancy turns surviving
+//! fragments back into bytes, so it implements both seams the rest of the
+//! crate talks through rather than letting callers reach into the fabric:
+//!
+//! * [`crate::resolve::SidecarResolver`] - the Raft durability gate's fallback
+//!   when no peer holds a whole manifest or chunk. The gate's own knowledge
+//!   stops at "nobody has it"; rebuilding it is this module's job, and the
+//!   `read` path already content-verifies every piece and the whole image
+//!   before returning, so the gate's verification stays a second check rather
+//!   than the only one.
+//! * [`crate::resolve::SidecarProtector`] - the propose path's hand-off for
+//!   freshly staged roots. Fire-and-forget onto the background lane: local
+//!   durability is already proven at that point, so a protection failure costs
+//!   redundancy and never a write.
+//!
+//! Resolution failures are classified rather than collapsed (see
+//! [`crate::resolve::ResolveError`]): "no layout published yet" and "not
+//! enough fragments survive" are different facts with different responses, and
+//! the gate's bounded pending-wait is only correct if the two stay apart.
+//!
 //! ## Bounds
 //!
 //! Every remote RPC carries [`CoordinatorConfig::rpc_timeout`]; every
@@ -519,7 +541,7 @@ impl RedundancyCoordinator {
     pub async fn maintenance_tick(
         &self,
         foreground_pressure: bool,
-    ) -> Result<kivi_redundancy::MaintenanceReport, RedundancyError> {
+    ) -> Result<kivi_redundancy::healing::MaintenanceReport, RedundancyError> {
         if self.healing_stopped() {
             return self
                 .fabric
@@ -1160,6 +1182,216 @@ impl RedundancyCoordinator {
     }
 }
 
+impl RedundancyCoordinator {
+    /// Resolves one sidecar asset for the durability gate.
+    ///
+    /// The read path fetches the layout's minimum pieces from their holders,
+    /// content-verifies each, decodes, and content-verifies the image against
+    /// the asset identity - so this returns either complete correct bytes or an
+    /// error, never a partial or a plausible-looking reconstruction.
+    ///
+    /// `len` is the length the caller declares. For chunks it comes from the
+    /// manifest entry; manifests carry their own recorded length in the
+    /// published layout, so the gate does not have to know it.
+    async fn resolve_asset(
+        &self,
+        asset: &AssetId,
+        len: Option<u64>,
+        what: &str,
+    ) -> Result<Vec<u8>, crate::resolve::ResolveError> {
+        use crate::resolve::ResolveError;
+
+        let Some(layout) = self.fabric_catalog_get(asset).await else {
+            // No published layout here. The asset may never have been
+            // protected, or the protection may be in flight; both are answers
+            // the gate should wait on briefly rather than treat as a loss,
+            // because protection is asynchronous by design.
+            return Err(ResolveError::Pending {
+                detail: format!("{what} {asset} has no published layout on this replica"),
+            });
+        };
+        // A caller-declared length that disagrees with the layout is a
+        // disagreement about the *content*, not a missing copy: report it as
+        // corruption so nothing downstream treats it as a transient miss.
+        if let Some(len) = len
+            && len != layout.layout.logical_len
+        {
+            return Err(ResolveError::Corrupt {
+                detail: format!(
+                    "{what} {asset} declares {len} bytes but its layout holds {}",
+                    layout.layout.logical_len
+                ),
+            });
+        }
+        let info = InformationAsset::new(*asset, layout.layout.logical_len);
+        match self.fabric.read(info).await {
+            Ok((bytes, degraded)) => {
+                if degraded {
+                    tracing::debug!(
+                        %asset,
+                        "sidecar resolution ran degraded; a repair was queued"
+                    );
+                }
+                Ok(bytes)
+            }
+            Err(error) => Err(classify_resolve_error(&error, asset)),
+        }
+    }
+
+    /// The security domain sidecar assets are addressed under.
+    ///
+    /// Derived from the node's namespace, which is the same derivation the
+    /// durability gate uses for its own domain, so both name the same asset for
+    /// the same content. Two independent derivations would be a latent identity
+    /// split - a manifest protected under one domain and requested under the
+    /// other reads as "no layout" forever - so the derivation is written once
+    /// here and once at the gate, and the gate's own verification re-checks the
+    /// domain on every manifest it installs.
+    fn resolve_domain(&self) -> SecurityDomainId {
+        SecurityDomainId::from_u64(self.node.namespace().as_u64())
+    }
+}
+
+/// Classifies a fabric read failure into the three outcomes the gate acts on.
+///
+/// The split is load-bearing: `Pending` is the only verdict that earns the
+/// gate's bounded wait, `Unavailable` must surface immediately so an
+/// unrecoverable asset does not consume the append's budget, and `Corrupt`
+/// must never be retried at all.
+fn classify_resolve_error(
+    error: &RedundancyError,
+    asset: &AssetId,
+) -> crate::resolve::ResolveError {
+    use crate::resolve::ResolveError;
+    match error {
+        // Verification failures are content verdicts: the image or a piece did
+        // not hash to its identity. Never available, never retried.
+        RedundancyError::VerificationFailed { .. } | RedundancyError::CorruptFragment { .. } => {
+            ResolveError::Corrupt {
+                detail: format!("{asset}: {error}"),
+            }
+        }
+        // No layout, or too few surviving fragments. Both are fixed facts
+        // about the current cluster state: retrying the same asset against the
+        // same holders cannot help until a repair or a new placement changes
+        // it.
+        RedundancyError::MissingFragment { .. } | RedundancyError::Unreachable { .. } => {
+            ResolveError::Unavailable {
+                detail: format!("{asset}: {error}"),
+            }
+        }
+        // "Not enough healthy information" is the fixed fact, like a missing
+        // layout: the survivors cannot rebuild this asset.
+        RedundancyError::Unrecoverable { .. } => ResolveError::Unavailable {
+            detail: format!("{asset}: {error}"),
+        },
+        // Transport, timeout, overload, and unreadable-holder conditions are
+        // "not right now": a holder is restarting, a probe is slow, or the
+        // decode budget is momentarily full. Time can fix all of them.
+        _ => ResolveError::Pending {
+            detail: format!("{asset}: {error}"),
+        },
+    }
+}
+
+/// The redundancy plane as both content-resolution seams, over one
+/// coordinator.
+///
+/// Exists to be the single thing a node installs: the same coordinator answers
+/// the durability gate's "nobody has this" and takes custody of newly staged
+/// roots, so the two can never end up backed by different fabrics. The wrapper
+/// also gives the resolver futures something owned to capture, which `&self`
+/// methods returning `'static` futures otherwise cannot.
+#[derive(Debug, Clone)]
+pub struct SharedCoordinator(Arc<RedundancyCoordinator>, Arc<ProtectionQueue>);
+
+/// One staged root's protection, as work the drain thread can run.
+type ProtectionJob = Box<dyn FnOnce() + Send + 'static>;
+
+/// How many staged roots may await protection before new ones are dropped.
+///
+/// A dropped root costs a redundant copy, never a write, so the correct
+/// response to saturation is to shed rather than queue. Sized to absorb a burst
+/// of medium writes while the plane is healthy.
+const PROTECTION_QUEUE_DEPTH: usize = 256;
+
+/// The bounded intake the drain thread reads.
+///
+/// A channel rather than a spawn handle: the caller's runtime is not ours to
+/// use (the propose path may be on Tokio, the Raft path on a Compio reactor),
+/// so the only portable answer is a queue drained by a thread that owns its own
+/// runtime. Bounded because an unbounded queue would turn a slow redundancy
+/// plane into memory growth on the write path.
+#[derive(Debug)]
+struct ProtectionQueue {
+    sender: async_channel::Sender<ProtectionJob>,
+}
+
+impl crate::resolve::SidecarResolver for SharedCoordinator {
+    fn resolve_manifest(
+        &self,
+        manifest: kivi_types::ManifestId,
+    ) -> crate::resolve::ResolveFuture<Vec<u8>> {
+        let coordinator = Arc::clone(&self.0);
+        Box::pin(async move {
+            let domain = coordinator.resolve_domain();
+            let asset = AssetId::chunk_manifest(manifest, domain);
+            coordinator.resolve_asset(&asset, None, "manifest").await
+        })
+    }
+
+    fn resolve_chunk(&self, chunk: ChunkId, len: u64) -> crate::resolve::ResolveFuture<Vec<u8>> {
+        let coordinator = Arc::clone(&self.0);
+        Box::pin(async move {
+            let domain = coordinator.resolve_domain();
+            let asset = AssetId::chunk(chunk, domain);
+            coordinator.resolve_asset(&asset, Some(len), "chunk").await
+        })
+    }
+}
+
+impl SharedCoordinator {
+    /// Shares a coordinator as both seams, starting the background protection
+    /// thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RedundancyError::Overloaded`] if the drain thread cannot
+    /// start. Reported rather than unwinding so the caller's existing
+    /// "plane unavailable" path logs and disables the plane; a silently dead
+    /// queue would instead be discovered on the first member loss, which is
+    /// the one moment protection matters.
+    pub fn new(coordinator: Arc<RedundancyCoordinator>) -> Result<Self, RedundancyError> {
+        let (sender, receiver) = async_channel::bounded::<ProtectionJob>(PROTECTION_QUEUE_DEPTH);
+        std::thread::Builder::new()
+            .name("kivi-redundancy-protect".to_owned())
+            .spawn(move || drain_protection_jobs(&receiver))
+            .map_err(|error| RedundancyError::Overloaded {
+                detail: format!("redundancy protection thread spawn: {error}"),
+            })?;
+        Ok(Self(coordinator, Arc::new(ProtectionQueue { sender })))
+    }
+
+    /// The shared coordinator behind this handle.
+    #[must_use]
+    pub fn inner(&self) -> &Arc<RedundancyCoordinator> {
+        &self.0
+    }
+}
+
+/// Drains protection jobs until the intake closes.
+///
+/// Closing the channel is the shutdown signal: `try_send` then fails, the last
+/// queued roots are still protected, and the loop exits.
+fn drain_protection_jobs(receiver: &async_channel::Receiver<ProtectionJob>) {
+    while let Ok(job) = receiver.recv_blocking() {
+        // A panic inside a job must not end protection for the process's life:
+        // that failure would be invisible until a member is lost, and it is
+        // exactly the moment redundancy matters.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+    }
+}
+
 /// Domain accompanying an asset identity: checkpoint families bind no
 /// domain (their hash already binds provenance); every other family keeps
 /// the caller's domain.
@@ -1167,5 +1399,106 @@ fn domain_for(kind: AssetKind, domain: u64) -> u64 {
     match kind {
         AssetKind::CheckpointBand | AssetKind::CheckpointManifest | AssetKind::CheckpointDedup => 0,
         _ => domain,
+    }
+}
+
+impl crate::resolve::SidecarProtector for SharedCoordinator {
+    fn protect_root(&self, root: crate::resolve::ProtectedRoot) {
+        let coordinator = Arc::clone(&self.0);
+        // Named before the move so the saturation warning can still say which
+        // root was shed: a root-less "queue full" warning is how a whole class
+        // of protection misses stays invisible until a member is lost.
+        let manifest = root.manifest;
+        if self
+            .1
+            .sender
+            .try_send(Box::new(move || {
+                // Runs on the protection thread, which owns a Compio runtime.
+                // The staged root is already durable locally, so every failure
+                // inside costs a second copy and nothing else; the
+                // coordinator's own RPC and control-wait bounds end the job.
+                let Ok(runtime) = compio::runtime::Runtime::new() else {
+                    tracing::warn!(
+                        %manifest,
+                        "redundancy protection runtime unavailable; local copy stands"
+                    );
+                    return;
+                };
+                runtime.block_on(protect_staged_root_via(&coordinator, &root));
+            }))
+            .is_err()
+        {
+            // Full or shut down: redundancy is additive, so shedding here is
+            // the honest response. The next write of the same content
+            // re-submits it (protection is idempotent).
+            tracing::warn!(
+                %manifest,
+                "redundancy protection queue saturated; local copy stands"
+            );
+        }
+    }
+}
+
+/// Protects one staged root's chunks and then its manifest, in that order.
+///
+/// Order matters: the manifest names the content, so publishing it before the
+/// chunks would advertise a reconstruction target that cannot be met. A
+/// failure on any artifact is logged and the rest continue - protection is
+/// idempotent, so the next write of the same content re-submits it, and a
+/// partial protect still leaves a better position than none.
+async fn protect_staged_root_via(
+    coordinator: &Arc<RedundancyCoordinator>,
+    root: &crate::resolve::ProtectedRoot,
+) {
+    let canonical = match coordinator
+        .node
+        .sidecar()
+        .read_manifest(root.manifest)
+        .await
+    {
+        Ok(canonical) => canonical,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                manifest = %root.manifest,
+                "staged manifest unreadable for redundancy protection; local copy stands"
+            );
+            return;
+        }
+    };
+    let decoded = match kivi_chunk::verify_manifest(root.manifest, &canonical) {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                manifest = %root.manifest,
+                "staged manifest failed verification; not protecting"
+            );
+            return;
+        }
+    };
+    let lengths: std::collections::HashMap<kivi_types::ChunkId, u64> = decoded
+        .entries
+        .iter()
+        .map(|entry| (entry.id, entry.len))
+        .collect();
+    for chunk in &root.chunks {
+        let Some(len) = lengths.get(chunk).copied() else {
+            tracing::warn!(
+                %chunk,
+                manifest = %root.manifest,
+                "staged chunk absent from its manifest; skipping protection"
+            );
+            continue;
+        };
+        if let Err(error) = coordinator.protect_chunk(*chunk, root.domain, len, 1).await {
+            tracing::warn!(?error, %chunk, "redundancy chunk protection failed");
+        }
+    }
+    if let Err(error) = coordinator
+        .protect_manifest_auto(root.manifest, root.domain)
+        .await
+    {
+        tracing::warn!(?error, manifest = %root.manifest, "redundancy manifest protection failed");
     }
 }

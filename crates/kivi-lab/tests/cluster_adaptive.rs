@@ -3,21 +3,7 @@
 use std::time::{Duration, Instant};
 
 use kivi_lab::cluster::Cluster;
-use kivi_state::Key;
-
-fn put(client: &kivi_client::NativeClient, name: &str, value: &[u8]) {
-    client
-        .set(&Key::from(name), bytes::Bytes::copy_from_slice(value))
-        .unwrap_or_else(|error| panic!("set {name} commits: {error:?}"));
-}
-
-fn get(client: &kivi_client::NativeClient, name: &str) -> Vec<u8> {
-    client
-        .get(&Key::from(name))
-        .unwrap_or_else(|error| panic!("get {name} reads: {error:?}"))
-        .unwrap_or_else(|| panic!("{name} present"))
-        .to_vec()
-}
+use kivi_lab::testkit::{get, put};
 
 #[test]
 fn adaptive_shadow_preserves_cluster_data_and_bounds_status() {

@@ -73,12 +73,6 @@ impl ImmutableDependencies {
             domain,
         }
     }
-
-    /// Whether this names a plausible root (non-zero manifest).
-    #[must_use]
-    pub fn is_valid(self) -> bool {
-        self.manifest.is_valid()
-    }
 }
 
 /// Sidecar replication metrics (per node, atomics for lock-free reads).
@@ -96,8 +90,6 @@ pub struct SidecarMetrics {
     pub cache_hits: AtomicU64,
     /// Local store misses (transfer required).
     pub cache_misses: AtomicU64,
-    /// Bytes avoided via dedup.
-    pub deduped_bytes: AtomicU64,
     /// Bulk transfer errors.
     pub bulk_errors: AtomicU64,
     /// Content verification failures.
@@ -106,15 +98,15 @@ pub struct SidecarMetrics {
     pub pending_gated: AtomicU64,
     /// Current inflight acquisitions.
     pub inflight: AtomicU64,
+    /// Resolver consultations: acquisitions that reached the installed
+    /// resolver because no peer could serve the content.
+    pub resolutions: AtomicU64,
+    /// Acquisitions the resolver satisfied, so a lost whole copy cost a
+    /// reconstruction rather than a failed append.
+    pub resolutions_recovered: AtomicU64,
 }
 
 impl SidecarMetrics {
-    /// Creates zeroed metrics.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Snapshots counters for admin.
     #[must_use]
     pub fn snapshot(&self) -> SidecarMetricsSnapshot {
@@ -125,17 +117,18 @@ impl SidecarMetrics {
             chunk_requests: self.chunk_requests.load(Ordering::Relaxed),
             cache_hits: self.cache_hits.load(Ordering::Relaxed),
             cache_misses: self.cache_misses.load(Ordering::Relaxed),
-            deduped_bytes: self.deduped_bytes.load(Ordering::Relaxed),
             bulk_errors: self.bulk_errors.load(Ordering::Relaxed),
             verification_failures: self.verification_failures.load(Ordering::Relaxed),
             pending_gated: self.pending_gated.load(Ordering::Relaxed),
             inflight: self.inflight.load(Ordering::Relaxed),
+            resolutions: self.resolutions.load(Ordering::Relaxed),
+            resolutions_recovered: self.resolutions_recovered.load(Ordering::Relaxed),
         }
     }
 }
 
 /// Point-in-time sidecar metrics for admin.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SidecarMetricsSnapshot {
     /// Bulk bytes sent.
     pub bulk_bytes_sent: u64,
@@ -149,8 +142,6 @@ pub struct SidecarMetricsSnapshot {
     pub cache_hits: u64,
     /// Cache misses.
     pub cache_misses: u64,
-    /// Deduped bytes.
-    pub deduped_bytes: u64,
     /// Bulk errors.
     pub bulk_errors: u64,
     /// Verification failures.
@@ -159,6 +150,10 @@ pub struct SidecarMetricsSnapshot {
     pub pending_gated: u64,
     /// Inflight acquisitions.
     pub inflight: u64,
+    /// Resolver consultations (no peer could serve the content).
+    pub resolutions: u64,
+    /// Acquisitions the resolver satisfied.
+    pub resolutions_recovered: u64,
 }
 
 /// Why sidecar storage failed.
@@ -192,6 +187,25 @@ pub enum SidecarError {
     /// Shutting down.
     #[error("sidecar store shut down")]
     ShuttingDown,
+}
+
+impl SidecarError {
+    /// Whether the condition may still clear on its own.
+    ///
+    /// True only for [`SidecarError::Overloaded`], which is this crate's
+    /// "bounded resources, caller retries" signal: a decode budget that was
+    /// momentarily full, a coalesced fetch that outran its bound, a resolver
+    /// reporting that a layout is not published yet. Every other variant is a
+    /// statement about the content - missing from every source, unverifiable,
+    /// or unreadable on disk - and those do not become untrue by waiting.
+    ///
+    /// The acquisition table uses this to decide what is worth remembering: a
+    /// remembered overload would report a restarting member's sidecar as
+    /// permanently lost long after it was readable again.
+    #[must_use]
+    pub const fn is_retryable(&self) -> bool {
+        matches!(self, Self::Overloaded { .. })
+    }
 }
 
 impl From<kivi_chunk::ChunkError> for SidecarError {
@@ -235,14 +249,6 @@ enum SidecarJob {
     Sync {
         reply: futures::channel::oneshot::Sender<Result<(), SidecarError>>,
     },
-    HasChunk {
-        id: ChunkId,
-        reply: futures::channel::oneshot::Sender<bool>,
-    },
-    HasManifest {
-        id: ManifestId,
-        reply: futures::channel::oneshot::Sender<bool>,
-    },
     IsDurableChunk {
         id: ChunkId,
         reply: futures::channel::oneshot::Sender<bool>,
@@ -267,9 +273,6 @@ enum SidecarJob {
         manifest: ManifestId,
         logical_len: u64,
         reply: futures::channel::oneshot::Sender<Result<bool, SidecarError>>,
-    },
-    Stats {
-        reply: futures::channel::oneshot::Sender<kivi_chunk::ChunkStats>,
     },
 }
 
@@ -306,7 +309,7 @@ impl SidecarStore {
             detail: format!("sidecar dir {}: {error}", root.display()),
         })?;
         let (sender, receiver) = async_channel::bounded::<SidecarJob>(Self::QUEUE_DEPTH);
-        let metrics = Arc::new(SidecarMetrics::new());
+        let metrics = Arc::new(SidecarMetrics::default());
         let worker_root = root;
         let handle = std::thread::Builder::new()
             .name("kivi-sidecar".to_owned())
@@ -335,7 +338,7 @@ impl SidecarStore {
     #[must_use]
     pub fn open_ephemeral(domain: SecurityDomainId) -> (Self, JoinHandle<()>) {
         // Process identity plus an atomic salt uniquely names the scratch
-        // directory across parallel tests — no wall clock needed.
+        // directory across parallel tests - no wall clock needed.
         static SALT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "kivi-sidecar-test-{}-{}",
@@ -344,12 +347,6 @@ impl SidecarStore {
         ));
         let _ = std::fs::create_dir_all(&dir);
         Self::open(&dir, domain, 64 * 1024 * 1024).expect("ephemeral sidecar opens")
-    }
-
-    /// Returns the security domain.
-    #[must_use]
-    pub const fn domain(&self) -> SecurityDomainId {
-        self.domain
     }
 
     /// Returns shared metrics.
@@ -438,34 +435,6 @@ impl SidecarStore {
             .await
             .map_err(|_| SidecarError::ShuttingDown)?;
         rx.await.map_err(|_| SidecarError::ShuttingDown)?
-    }
-
-    /// Whether a chunk is indexed (any generation).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SidecarError::ShuttingDown`] when the worker is gone.
-    pub async fn has_chunk(&self, id: ChunkId) -> Result<bool, SidecarError> {
-        let (tx, rx) = futures::channel::oneshot::channel();
-        self.sender
-            .send(SidecarJob::HasChunk { id, reply: tx })
-            .await
-            .map_err(|_| SidecarError::ShuttingDown)?;
-        rx.await.map_err(|_| SidecarError::ShuttingDown)
-    }
-
-    /// Whether a manifest is indexed (any generation).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SidecarError::ShuttingDown`] when the worker is gone.
-    pub async fn has_manifest(&self, id: ManifestId) -> Result<bool, SidecarError> {
-        let (tx, rx) = futures::channel::oneshot::channel();
-        self.sender
-            .send(SidecarJob::HasManifest { id, reply: tx })
-            .await
-            .map_err(|_| SidecarError::ShuttingDown)?;
-        rx.await.map_err(|_| SidecarError::ShuttingDown)
     }
 
     /// Whether a chunk is durable (indexed at or below the synced gen).
@@ -634,9 +603,9 @@ impl SidecarStore {
         manifest: ManifestId,
         logical_len: u64,
     ) -> Result<Vec<u8>, SidecarError> {
-        if logical_len > kivi_chunk::policy::MAX_LEGACY_VALUE_BYTES {
+        if logical_len > kivi_chunk::policy::MAX_INLINE_VALUE_BYTES {
             return Err(SidecarError::Corrupt {
-                detail: format!("value {logical_len} exceeds legacy read cap"),
+                detail: format!("value {logical_len} exceeds the inline read cap"),
             });
         }
         let canonical = self.read_manifest(manifest).await?;
@@ -673,20 +642,6 @@ impl SidecarStore {
             });
         }
         Ok(out)
-    }
-
-    /// Current chunk-store stats (diagnostics).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SidecarError::ShuttingDown`] when the worker is gone.
-    pub async fn stats(&self) -> Result<kivi_chunk::ChunkStats, SidecarError> {
-        let (tx, rx) = futures::channel::oneshot::channel();
-        self.sender
-            .send(SidecarJob::Stats { reply: tx })
-            .await
-            .map_err(|_| SidecarError::ShuttingDown)?;
-        rx.await.map_err(|_| SidecarError::ShuttingDown)
     }
 
     #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
@@ -736,19 +691,11 @@ impl SidecarStore {
                     let out = store.sync().map_err(SidecarError::from);
                     let _ = reply.send(out);
                 }
-                SidecarJob::HasChunk { id, reply } => {
-                    let _ = reply.send(store.has_chunk(&id));
-                }
-                SidecarJob::HasManifest { id, reply } => {
-                    let _ = reply.send(store.has_manifest(&id));
-                }
                 SidecarJob::IsDurableChunk { id, reply } => {
-                    let durable = store.durable_chunk(id).is_some();
-                    let _ = reply.send(durable);
+                    let _ = reply.send(store.durable_chunk(id));
                 }
                 SidecarJob::IsDurableManifest { id, reply } => {
-                    let durable = store.durable_manifest(id).is_some();
-                    let _ = reply.send(durable);
+                    let _ = reply.send(store.durable_manifest(id));
                 }
                 SidecarJob::ReadChunk { id, reply } => {
                     let out = store
@@ -775,7 +722,7 @@ impl SidecarStore {
                             store.read_manifest(manifest).map_err(SidecarError::from)?;
                         let mut missing = Vec::new();
                         for entry in &decoded.entries {
-                            if store.durable_chunk(entry.id).is_none() {
+                            if !store.durable_chunk(entry.id) {
                                 missing.push(entry.id);
                             }
                         }
@@ -803,11 +750,11 @@ impl SidecarStore {
                         if decoded.total_len != logical_len || decoded.domain != domain {
                             return Ok(false);
                         }
-                        if store.durable_manifest(manifest).is_none() {
+                        if !store.durable_manifest(manifest) {
                             return Ok(false);
                         }
                         for entry in &decoded.entries {
-                            if store.durable_chunk(entry.id).is_none() {
+                            if !store.durable_chunk(entry.id) {
                                 return Ok(false);
                             }
                         }
@@ -819,9 +766,6 @@ impl SidecarStore {
                         other => other,
                     };
                     let _ = reply.send(out);
-                }
-                SidecarJob::Stats { reply } => {
-                    let _ = reply.send(store.stats());
                 }
             }
         }
@@ -839,67 +783,4 @@ pub struct StagedRoot {
     pub logical_len: u64,
     /// Chunk ids in order.
     pub chunks: Vec<ChunkId>,
-}
-
-/// Splits a value into deterministic chunk boundaries (pure, no I/O).
-///
-/// # Errors
-///
-/// Returns [`SidecarError`] when the chunking is invalid or oversize.
-pub fn split_value(total_len: u64) -> Result<Vec<u64>, SidecarError> {
-    kivi_chunk::Chunking::DEFAULT
-        .split_lengths(total_len)
-        .map_err(SidecarError::from)
-}
-
-/// Computes the chunk id for bytes under a domain (pure).
-#[must_use]
-pub fn chunk_id_for(domain: SecurityDomainId, bytes: &[u8]) -> ChunkId {
-    kivi_codec::integrity::chunk_id(domain, bytes)
-}
-
-/// Builds a manifest for entries (pure, verified).
-///
-/// # Errors
-///
-/// Returns [`SidecarError`] when entries are invalid.
-pub fn build_manifest_for(
-    domain: SecurityDomainId,
-    total_len: u64,
-    entries: Vec<kivi_chunk::ChunkEntry>,
-) -> Result<(ManifestId, Vec<u8>), SidecarError> {
-    let (manifest_obj, id) = kivi_chunk::build_manifest(
-        domain,
-        kivi_chunk::Chunking::DEFAULT,
-        kivi_chunk::ChunkCodecId::NONE,
-        total_len,
-        entries,
-    )?;
-    let mut canonical = Vec::new();
-    manifest_obj.encode_canonical(&mut canonical);
-    debug_assert_eq!(kivi_codec::integrity::manifest_id(domain, &canonical), id);
-    Ok((id, canonical))
-}
-
-#[allow(clippy::missing_panics_doc)]
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn dependencies_validate_manifest_nonzero() {
-        let domain = SecurityDomainId::from_u64(1);
-        let deps = ImmutableDependencies::new(ManifestId::from_bytes([7; 32]), 9, domain);
-        assert!(deps.is_valid());
-        assert!(!ImmutableDependencies::new(ManifestId::ZERO, 0, domain).is_valid());
-    }
-
-    #[test]
-    fn chunk_id_is_domain_separated_and_stable() {
-        let a = chunk_id_for(SecurityDomainId::from_u64(1), b"hello");
-        let b = chunk_id_for(SecurityDomainId::from_u64(1), b"hello");
-        let c = chunk_id_for(SecurityDomainId::from_u64(2), b"hello");
-        assert_eq!(a, b);
-        assert_ne!(a, c);
-    }
 }

@@ -8,6 +8,7 @@
 //! must produce an equal scenario result; three fixed seeds run via rstest.
 
 use core::time::Duration;
+use std::collections::BTreeMap;
 
 use kivi_core::RandomSource;
 use kivi_sim::{
@@ -165,15 +166,14 @@ impl kivi_core::FaultPolicy<kivi_sim::NetDeliveryContext> for Chaos {
     }
 }
 
-/// No delivery may reach a process that is not running.
+/// No delivery may reach a process that is not running. Node liveness is
+/// folded forward from the trace, which records every crash and restart in
+/// event order.
 fn delivered_only_to_running<E, S>(cluster: &SimCluster<E, S>) -> Result<(), String> {
-    use std::collections::BTreeMap;
+    // Every member starts running; the trace then folds each crash and
+    // restart forward. A delivery to a node the trace never marked down is
+    // legal, so the initial set has to be "all true", not "unknown".
     let mut running: BTreeMap<NodeId, bool> = BTreeMap::new();
-    for info in cluster.nodes().iter() {
-        running.insert(info.id(), info.state() == kivi_sim::NodeState::Running);
-    }
-    // Replay lifecycle from history: the check itself folds the trace.
-    running.clear();
     for info in cluster.nodes().iter() {
         running.insert(info.id(), true);
     }

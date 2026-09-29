@@ -1,5 +1,5 @@
 //! Consistency-layer read-path benchmarks: planning cost decomposition
-//! per contract and path (no I/O, no Raft — the hub plan is the
+//! per contract and path (no I/O, no Raft - the hub plan is the
 //! deterministic core; barrier/fence/coverage execution costs ride the
 //! network and are measured by the cluster benches).
 //!

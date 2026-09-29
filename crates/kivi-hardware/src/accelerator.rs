@@ -2,7 +2,7 @@
 //!
 //! Three of them were researched in full, and none of them earned a default
 //! dependency. This module records the decision, the reason, and the shape the
-//! integration would take if a deployment wanted one — so the next engineer
+//! integration would take if a deployment wanted one - so the next engineer
 //! does not repeat the evaluation, and so the capability snapshot can name
 //! them even when they are absent.
 //!
@@ -71,8 +71,6 @@
 //! round trips. Revisit only if a profile shows the kernel network stack is
 //! material, and then as a provider behind the existing peer transport, not as
 //! a second transport.
-
-use crate::capability::Unavailable;
 
 /// Intel DSA engines present on this machine.
 #[must_use]
@@ -170,20 +168,13 @@ impl AcceleratorTrack {
     }
 }
 
-/// Why an accelerator is not usable here, or the empty string when one is.
-#[must_use]
-pub fn dsa_unavailable_reason() -> Unavailable {
-    if discover_dsa().is_empty() {
-        Unavailable::NotPresent
-    } else {
-        Unavailable::NotCompiledIn
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Every track must state a decision and a classification. A track with an
+    /// empty decision is the failure mode this module exists to prevent: an
+    /// operator asks why a capability is not wired in and gets silence.
     #[test]
     fn every_track_states_a_reason_and_a_classification() {
         for track in AcceleratorTrack::ALL {
@@ -201,11 +192,5 @@ mod tests {
                 track.classification()
             );
         }
-    }
-
-    #[test]
-    fn dsa_discovery_answers_on_every_platform() {
-        let _ = discover_dsa();
-        assert!(!dsa_unavailable_reason().to_string().is_empty());
     }
 }

@@ -4,7 +4,7 @@
 //! The reference optimizes for clarity, not performance, and is written
 //! directly from the intended semantics (not by copying store internals), so
 //! agreement covers results, types, versions, expiry behavior, and final
-//! state on every step — far stronger than hand-written examples alone.
+//! state on every step - far stronger than hand-written examples alone.
 
 use std::collections::BTreeMap;
 
@@ -252,8 +252,8 @@ enum GenOp {
     Set(usize, Vec<u8>),
     /// Chunked spelling of `Set`: overwrites any type with a chunk
     /// reference naming `Vec<u8>` bytes. The reference model treats it
-    /// exactly like `Set` — representation must never leak into logical
-    /// semantics — while the Kivi side stores a chunked root the driver
+    /// exactly like `Set` - representation must never leak into logical
+    /// semantics - while the Kivi side stores a chunked root the driver
     /// resolves through the manifest registry below.
     SetChunked(usize, Vec<u8>),
     /// Fabric spelling of `Set`: overwrites any type with a fabric
@@ -603,7 +603,7 @@ proptest! {
                 fabric.insert(fake_fabric_id(key, value), value.clone());
             }
             // Engine mirror: a `SetRange` against a chunked or fabric root
-            // never reaches `prepare` as a splice — the engine resolves
+            // never reaches `prepare` as a splice - the engine resolves
             // through the registry and stores the patched bytes. Resolve
             // here through the registries and run a plain `Set` on both
             // sides instead.

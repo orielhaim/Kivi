@@ -4,7 +4,7 @@
 //! TCP connections with a sparse route cache: the first request to a range
 //! goes to the seed, learns the authority from the redirect, and routes
 //! directly afterwards. One logical request identity is preserved across
-//! route retries — redirects are transport retries, never logical replays.
+//! route retries - redirects are transport retries, never logical replays.
 //!
 //! Safe retry: every mutating call allocates one [`RequestIdentity`] (plus
 //! the acknowledgement floor) that is preserved across redirects, redials,
@@ -36,7 +36,7 @@ use kivi_protocol::{
     MAX_STREAM_UPLOAD_BYTES, ProtocolError, RequestId, Response, ResponseBody, RouteHint,
     ServerHello, Status, StreamAbort, StreamBegin, encode_frame,
 };
-use kivi_state::{Key, PartitionHasher};
+use kivi_state::Key;
 use kivi_types::{
     CommitToken, NamespaceId, ReadContract, ReadReceipt, RequestIdentity, RequestSeq, SessionId,
     WallTimestamp, WorkerId,
@@ -107,7 +107,7 @@ pub struct ClientConfig {
     /// random one. `None` (the default) mints; `Some` resumes: the client
     /// speaks as that session, so retries of its uncompleted sequences
     /// dedup-hit server-side instead of executing twice. Resuming is the
-    /// application-level exactly-once primitive — pair it with explicit
+    /// application-level exactly-once primitive - pair it with explicit
     /// sequences (`set_with_seq`, `counter_add_with_seq`) naming the
     /// sequences to resume.
     pub session: Option<SessionId>,
@@ -356,9 +356,9 @@ impl Connection {
     }
 
     /// Whether this connection's server speaks chunk-fabric streaming
-    /// (upload and streamed-read frames). Streaming calls check this
-    /// before sending anything, so a legacy server fails fast with
-    /// `Unsupported` instead of a violation.
+    /// (upload and streamed-read frames). Streaming calls check this before
+    /// sending anything, so a server without streaming support fails fast with
+    /// `Unsupported` instead of a protocol violation.
     fn streaming(&self) -> bool {
         self.server_caps.contains(Capabilities::STREAMING)
     }
@@ -579,7 +579,7 @@ impl Connection {
     }
 
     /// Best-effort stream abort (timeout hygiene: frees server-side
-    /// assembler state). Delivery failure is ignored — the connection
+    /// assembler state). Delivery failure is ignored - the connection
     /// itself is already suspect when this runs.
     fn abort_stream(conn: &Arc<Connection>, id: u64, reason: &str) {
         let _ = Connection::send_frame(
@@ -661,7 +661,7 @@ fn reader_loop(
     // each blocked `round_trip` at once (its `recv` errors immediately and
     // the `reader_alive` check below reports `Io`, i.e. redial). Without
     // this, every in-flight request on a dead connection burns its full
-    // request timeout before noticing — a ~30s stall per dead connection
+    // request timeout before noticing - a ~30s stall per dead connection
     // under load, exactly the tail this fixes. Off the hot path: runs once
     // per connection death.
     if let Ok(mut table) = pending.lock() {
@@ -703,7 +703,7 @@ fn dispatch_frame(
     match frame.kind {
         FrameKind::Response => {
             // A committed upload's final response arrives under its
-            // stream id — check the request table first (hot path),
+            // stream id - check the request table first (hot path),
             // then the stream table (id spaces never overlap).
             let Ok((response, _)) = Response::decode(&frame.payload) else {
                 return;
@@ -789,7 +789,7 @@ fn dispatch_frame(
         }
         // The server never sends these on a client connection; anything
         // else arriving here is a peer bug. Ignoring (like before) keeps
-        // one stray frame from killing healthy requests — framing
+        // one stray frame from killing healthy requests - framing
         // violations still end the connection in `reader.push`.
         _ => {}
     }
@@ -834,7 +834,7 @@ enum GetOutcome {
 /// Mutation sequence state for one client session. Sequences start at 1
 /// (0 is never issued); the acknowledgement floor only advances over
 /// consecutively completed sequences, so an in-flight sequence is never
-/// acknowledged beneath itself — even across tablets sharing the session.
+/// acknowledged beneath itself - even across tablets sharing the session.
 #[derive(Debug, Default)]
 struct SeqState {
     /// Next sequence to issue.
@@ -933,7 +933,7 @@ pub struct NativeClient {
 }
 
 impl NativeClient {
-    /// Builds a client from configuration (no connections yet — dialing is
+    /// Builds a client from configuration (no connections yet - dialing is
     /// lazy on first use, so construction never fails on network state).
     /// One client is one mutation session: every clone shares the session
     /// identity and its sequence space. Set `config.session` to resume a
@@ -1286,8 +1286,8 @@ impl NativeClient {
 
     /// Executes one request, naming the mutation sequence explicitly when
     /// `seq` is `Some` (session resumption: the identity must have been
-    /// issued under this session before — e.g., sent but unacknowledged
-    /// across a crash — so the server dedups it instead of executing
+    /// issued under this session before - e.g., sent but unacknowledged
+    /// across a crash - so the server dedups it instead of executing
     /// twice). `None` allocates a fresh sequence. Reads ignore `seq`.
     /// Only `Ok`/`NotFound` responses return `Ok`; every other application
     /// status becomes its [`ClientError`] (transaction/scan drivers use
@@ -1341,11 +1341,10 @@ impl NativeClient {
         contract: kivi_types::ReadContract,
     ) -> Result<Response, ClientError> {
         use kivi_protocol::Status;
-        let hash = PartitionHasher::V1
-            .hash(self.shared.namespace, key.as_bytes())
-            .ok_or(ClientError::Internal(
-                "partition hash unsupported".to_owned(),
-            ))?;
+        // The same construction the server routes with, so a cached route and a
+        // server-side route are the same key. See `NamespaceRouteHasher`: a client
+        // that guesses with a different hash misses its own cache on every call.
+        let hash = kivi_state::route_hash(self.shared.namespace, key.as_bytes());
         let id = self.next_id();
         let mutating = opcode.is_mutating();
         // One identity per typed call. The floor is snapshotted once;
@@ -1373,9 +1372,9 @@ impl NativeClient {
         // knowledge. A redirect is progress only if routing knowledge
         // actually improves: a newer directory version, or a never-seen
         // tablet at the current version (a sibling at the same generation).
-        // Anything else — an exact repeat, a revisited tablet at the same
+        // Anything else - an exact repeat, a revisited tablet at the same
         // or older version, or an older version for a new tablet
-        // (`A@v10 → B@v9`) — is non-progress: back off and retry WITHOUT
+        // (`A@v10 → B@v9`) - is non-progress: back off and retry WITHOUT
         // spending redirect budget (the retried hop re-reads fresh state
         // and converges when the election/topology lands). Only a long
         // streak of zero-progress hops fails over to an untried seed by
@@ -1389,10 +1388,15 @@ impl NativeClient {
         let mut max_dir_version: u64 = 0;
         let mut stale_repeats: u32 = 0;
         let mut seed_cursor = 0usize;
+        // Whether a request went out and came back unanswered. Distinct from
+        // "we transmitted something", because a refused dial after a transmission
+        // still proves nothing reached that endpoint. Only an unanswered delivery
+        // makes a mutating call's outcome ambiguous.
+        let mut delivered_unanswered = false;
         // Fresh-redirect follow: a redirect names the authority directly,
         // so the next hop goes there instead of re-resolving (re-resolution
-        // can miss at exclusive range boundaries — e.g. reverse-scan
-        // cursors — and ping-pong on the seed forever). Cleared once used;
+        // can miss at exclusive range boundaries - e.g. reverse-scan
+        // cursors - and ping-pong on the seed forever). Cleared once used;
         // never overrides dead-endpoint failover.
         let mut follow: Option<(String, kivi_protocol::RouteHint)> = None;
         self.shared.requests.fetch_add(1, Ordering::Relaxed);
@@ -1403,7 +1407,7 @@ impl NativeClient {
             }
             // Route: a fresh redirect target first (unless tried dead),
             // then cached range authority (ordered ranges by key, hash
-            // ranges by partition hash — snapshots are single-layout, so
+            // ranges by partition hash - snapshots are single-layout, so
             // exactly one lookup can hit), unless already tried dead this
             // call, else the next untried seed with no hint. The mutation
             // identity above is preserved across all hops.
@@ -1431,7 +1435,17 @@ impl NativeClient {
                         }
                         let Some(endpoint) = pick else {
                             self.shared.errors.fetch_add(1, Ordering::Relaxed);
-                            break Err(ClientError::Io("all known endpoints failed".to_owned()));
+                            // Running out of members is a transport failure -
+                            // "nothing was delivered" - unless a request went
+                            // out and came back unanswered. In that one case the
+                            // write may have applied, and a transport error would
+                            // discard the only honest answer. A refused dial is
+                            // proof of non-delivery, so it never escalates.
+                            break Err(if mutating && delivered_unanswered {
+                                ClientError::AmbiguousOutcome
+                            } else {
+                                ClientError::Io("all known endpoints failed".to_owned())
+                            });
                         };
                         (endpoint, None)
                     }
@@ -1489,12 +1503,26 @@ impl NativeClient {
                         && conn.durable_dedup()
                         && deliveries < self.shared.delivery_retries =>
                 {
-                    // Possibly transmitted, possibly not — but the identity
-                    // makes redelivery safe: a completed first attempt is a
-                    // dedup hit, otherwise it executes exactly once. Drop
-                    // the connection (its waiter is gone) and redial.
+                    // Possibly transmitted, possibly not - but the identity makes
+                    // redelivery safe: a completed first attempt is a dedup hit,
+                    // otherwise it executes exactly once.
+                    //
+                    // The redelivery must not go back to the member that just
+                    // failed to answer. A timeout means *this member is not
+                    // serving*, which after a restart is the common case: it
+                    // accepts the connection and never completes the request.
+                    // Retrying there spends the whole call budget on one suspect
+                    // target and reports an ambiguity that a different member
+                    // would have resolved - the same identity, the same
+                    // exactly-once guarantee, aimed somewhere that has not
+                    // already failed.
                     deliveries += 1;
+                    delivered_unanswered = true;
                     self.drop_connection(&endpoint);
+                    self.shared.routes.evict_endpoint(&endpoint);
+                    if !tried.contains(&endpoint) {
+                        tried.push(endpoint);
+                    }
                     backoff(self.shared.dial_backoff, deliveries.min(10));
                     continue;
                 }
@@ -1668,8 +1696,8 @@ impl NativeClient {
                 }
             }
         };
-        // Every terminal path completes the identity — including abandonment
-        // — so the acknowledgement floor can advance past it and the outcome
+        // Every terminal path completes the identity - including abandonment
+        // - so the acknowledgement floor can advance past it and the outcome
         // (if any) becomes eligible for eviction. An identity is never
         // retried after its call ends, so completing it cannot strand a
         // live retry beneath the floor.
@@ -1917,7 +1945,7 @@ impl NativeClient {
     /// the value starting at `offset`, zero-padding past-the-end gaps. The
     /// live expiry survives (unlike [`set`](Self::set)): partial writes
     /// touch bytes, never the TTL. Counters fail with wrong-type; absurd
-    /// ranges fail inadmittable. The patch travels in one request frame —
+    /// ranges fail inadmittable. The patch travels in one request frame -
     /// bulk rewrites belong on the streaming upload path instead.
     ///
     /// # Errors
@@ -1980,7 +2008,7 @@ impl NativeClient {
 
     /// Streams a value upload of any size up to the 1 GiB stream bound:
     /// frames carry slices while the server stages chunk by chunk, and one
-    /// commit barrier proves the manifest — neither side materializes the
+    /// commit barrier proves the manifest - neither side materializes the
     /// value outside chunking. Values over the inline threshold land as
     /// chunked roots and read back identically through [`get`](Self::get).
     /// Pass `total_len` when known (the server aborts on mismatch instead
@@ -1988,14 +2016,14 @@ impl NativeClient {
     ///
     /// Routing warms from the cache (probing when cold); a mid-upload
     /// range move surfaces as an error and the caller retries with a
-    /// fresh source — pass an explicit sequence (see
+    /// fresh source - pass an explicit sequence (see
     /// [`put_stream_with_seq`](Self::put_stream_with_seq)) when the retry
     /// must dedup against a possibly-committed first attempt.
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`] on transport/routing failure, a legacy
-    /// server (`Unsupported`, checked before sending anything), an
+    /// Returns [`ClientError`] on transport/routing failure, a server without
+    /// streaming support (`Unsupported`, checked before sending anything), an
     /// over-bound or inconsistent upload, or a lost commit response
     /// (`AmbiguousOutcome`: the commit may have applied).
     pub fn put_stream(
@@ -2008,7 +2036,7 @@ impl NativeClient {
     }
 
     /// Streams an upload under an explicitly named sequence of this
-    /// session (resumption: same contract as `set_with_seq` — a retried
+    /// session (resumption: same contract as `set_with_seq` - a retried
     /// upload with the same identity commits at most once, dedup-hitting
     /// when the first attempt already applied). Pair with
     /// `ClientConfig::session` to resume across restarts.
@@ -2040,21 +2068,20 @@ impl NativeClient {
     /// into `ValueStream*` frames (entry by entry for chunked values, so
     /// server memory stays flat) and the client reassembles. Returns
     /// `None` when absent. Downloads materialize client-side, bounded by
-    /// the 1 GiB stream bound — bulk processing without materializing is
+    /// the 1 GiB stream bound - bulk processing without materializing is
     /// a future reader API, not this call.
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`] on transport/routing failure, a legacy
-    /// server (`Unsupported`, checked before sending anything),
+    /// Returns [`ClientError`] on transport/routing failure, a server without
+    /// streaming support (`Unsupported`, checked before sending anything),
     /// wrong-type access, or a truncated stream (`Protocol`: the byte
     /// count, not just the end marker, must agree).
     pub fn get_stream(&self, key: &Key) -> Result<Option<Bytes>, ClientError> {
-        let hash = PartitionHasher::V1
-            .hash(self.shared.namespace, key.as_bytes())
-            .ok_or(ClientError::Internal(
-                "partition hash unsupported".to_owned(),
-            ))?;
+        // The same construction the server routes with, so a cached route and a
+        // server-side route are the same key. See `NamespaceRouteHasher`: a client
+        // that guesses with a different hash misses its own cache on every call.
+        let hash = kivi_state::route_hash(self.shared.namespace, key.as_bytes());
         let mut redirects = 0usize;
         let mut reconnects = 0usize;
         // Same dead-member failover as `execute_with_seq` (reads
@@ -2171,7 +2198,7 @@ impl NativeClient {
 
     /// Records one stream reroute: progress (newer version, or a new
     /// tablet at the current version) spends redirect budget;
-    /// non-progress (exact repeats, revisited tablets, older versions —
+    /// non-progress (exact repeats, revisited tablets, older versions -
     /// `A → B → A`, `A@v10 → B@v9`) backs off without spending it
     /// (election/topology windows), failing over only after
     /// [`MAX_STALE_REPEATS`]. Mirrors the point-path convergence guard.
@@ -2236,15 +2263,14 @@ impl NativeClient {
         source: &mut impl Read,
         identity: Option<&(RequestIdentity, RequestSeq, u64)>,
     ) -> Result<(), ClientError> {
-        let hash = PartitionHasher::V1
-            .hash(self.shared.namespace, key.as_bytes())
-            .ok_or(ClientError::Internal(
-                "partition hash unsupported".to_owned(),
-            ))?;
+        // The same construction the server routes with, so a cached route and a
+        // server-side route are the same key. See `NamespaceRouteHasher`: a client
+        // that guesses with a different hash misses its own cache on every call.
+        let hash = kivi_state::route_hash(self.shared.namespace, key.as_bytes());
         // Cold routes probe first: one cheap `Exists` warms the cache
         // through the ordinary redirect machinery, so the begin below
         // lands on the owner the first time (a move between probe and
-        // begin still aborts cleanly and surfaces — never miscommits).
+        // begin still aborts cleanly and surfaces - never miscommits).
         if self
             .shared
             .routes
@@ -2324,7 +2350,7 @@ impl NativeClient {
             });
         }
         // Ready (or an immediate abort: unknown namespace, over bound,
-        // misrouted key — all pre-commit, so all definitely uncommitted).
+        // misrouted key - all pre-commit, so all definitely uncommitted).
         let max_data = match Connection::await_stream_event(conn, &rx) {
             Ok(StreamEvent::Ready(max_data)) => max_data.max(1) as usize,
             Ok(StreamEvent::Aborted(reason)) => {
@@ -2352,7 +2378,7 @@ impl NativeClient {
         };
         self.upload_data(conn, endpoint, stream, source, total_len, max_data)?;
         // Commit: the atomic point. A lost response from here on is
-        // ambiguous (the root may have committed) — same contract as
+        // ambiguous (the root may have committed) - same contract as
         // `execute_with_seq` past delivery.
         if let Err(error) = Connection::send_frame(conn, FrameKind::StreamCommit, stream, &[]) {
             Connection::unregister_stream(conn, stream);
@@ -2389,7 +2415,7 @@ impl NativeClient {
     }
 
     /// Streams source bytes as data frames capped at the negotiated size.
-    /// Anything failing here is pre-commit, hence definitely uncommitted —
+    /// Anything failing here is pre-commit, hence definitely uncommitted -
     /// plain errors, never ambiguous. Short writer holds per frame, reads
     /// chunked to the cap.
     fn upload_data(
@@ -2445,7 +2471,7 @@ impl NativeClient {
 
     /// One download attempt: request, then collect frames to the declared
     /// total. Reads never mutate, so every failure mode either retries
-    /// (redirects, redials) or surfaces plainly — nothing is ambiguous.
+    /// (redirects, redials) or surfaces plainly - nothing is ambiguous.
     fn get_stream_attempt(
         &self,
         conn: &Arc<Connection>,
@@ -2520,7 +2546,7 @@ impl NativeClient {
     }
 
     /// Collects download frames to the declared total, then the end
-    /// marker. The count — not just the marker — must agree, or the
+    /// marker. The count - not just the marker - must agree, or the
     /// download is truncated and fails instead of returning short bytes.
     fn collect_stream_body(
         conn: &Arc<Connection>,
@@ -2589,8 +2615,8 @@ impl NativeClient {
     }
 
     /// Stores bytes under an explicitly named sequence of this session
-    /// (resumption: the identity was issued before — sent but never
-    /// acknowledged — so this either executes it for the first time or
+    /// (resumption: the identity was issued before - sent but never
+    /// acknowledged - so this either executes it for the first time or
     /// dedup-hits the stored outcome; it never executes twice). Pair with
     /// `ClientConfig::session` to resume across restarts.
     ///
@@ -2876,7 +2902,7 @@ impl NativeClient {
     }
 
     /// Adds `delta` under an explicitly named sequence of this session
-    /// (resumption: same contract as `set_with_seq` — executes at most
+    /// (resumption: same contract as `set_with_seq` - executes at most
     /// once per identity, dedup-hitting when the first attempt already
     /// applied). A dedup hit returns the originally recorded post-add
     /// value, not a re-execution.
@@ -3631,7 +3657,7 @@ impl NativeClient {
     }
 
     /// Narrows one bounded counter's escrow share to `[new_min, new_max]`
-    /// (lone operations narrow only — widening pairs inside atomic
+    /// (lone operations narrow only - widening pairs inside atomic
     /// transfers, see `OrderedClient` batch composition with
     /// [`kivi_state::plan_escrow_transfer`]).
     ///
@@ -3678,7 +3704,7 @@ impl NativeClient {
     }
 
     /// Acquires `qty` permits under `permit`: idempotent by permit id (a
-    /// retry with the same id returns success without acquiring twice —
+    /// retry with the same id returns success without acquiring twice -
     /// mint stable ids per acquisition attempt, e.g. via
     /// [`kivi_state::PermitId::derive`]).
     ///
@@ -3758,13 +3784,13 @@ impl NativeClient {
     /// Acquires (or re-acquires after expiry) the lease for `owner` with a
     /// logical TTL in micros (`0` = immortal until released). Success
     /// issues a fresh fencing token: present it on every guarded external
-    /// action, and require the resource to reject older tokens — that
+    /// action, and require the resource to reject older tokens - that
     /// rejection (not the expiry) is what retires old holders.
     ///
     /// # Errors
     ///
     /// Returns [`ClientError`] on transport/routing failure, wrong-type
-    /// access, or [`ClientError::LeaseConflict`] (live holder — renew
+    /// access, or [`ClientError::LeaseConflict`] (live holder - renew
     /// instead of re-granting).
     pub fn lease_acquire(
         &self,
@@ -4093,12 +4119,111 @@ mod tests {
 
     /// Regression for the ~30s durable tail: when the server side of a
     /// connection dies mid-request (close, violation kill, crash), the
-    /// in-flight waiter must fail at once and redial — never burn the full
+    /// in-flight waiter must fail at once and redial - never burn the full
     /// request timeout first. Deterministic stub: completes the handshake,
     /// reads exactly one request frame, then closes silently with no
     /// response. With `request_timeout` at 10s, stranded code surfaces
     /// only after ~10s; fixed code surfaces `Io` (reader ended) in
     /// milliseconds and the redial then fails fast on the closed listener.
+    /// A member that never answers must not absorb the whole redelivery budget.
+    ///
+    /// Two members: the first completes the handshake and then goes silent with
+    /// the request outstanding, which is what a restarted-but-not-yet-serving
+    /// replica looks like; the second answers. The mutation must land on the
+    /// second, and the silent member must not be asked a second time.
+    ///
+    /// Before this, the timeout arm redialled the *same* endpoint - it dropped the
+    /// connection but left the cached route in place and never marked the endpoint
+    /// tried - so with a per-call budget both redeliveries went to the silent
+    /// member and the call reported `AmbiguousOutcome` without ever contacting a
+    /// member that would have served it.
+    ///
+    /// Safe for the reason the retry is safe at all: the identity rides along, so
+    /// a completed first attempt is a dedup hit wherever it lands.
+    #[test]
+    fn a_silent_member_does_not_absorb_the_redelivery_budget() {
+        use std::io::Write as _;
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        /// A member that handshakes, reads one request, and then goes silent
+        /// instead of answering it.
+        fn silent_stub() -> (std::net::SocketAddr, std::thread::JoinHandle<u64>) {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("stub binds");
+            let addr = listener.local_addr().expect("stub addr");
+            let handle = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().expect("accept");
+                drop(listener);
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(30)))
+                    .expect("timeout");
+                let _ = stub_request(&mut socket, 1);
+                // The request is in and unanswered: hold the connection open and
+                // say nothing, which is what the client must not pin to.
+                std::thread::sleep(Duration::from_secs(2));
+                1
+            });
+            (addr, handle)
+        }
+
+        /// A member that answers.
+        fn live_stub() -> (std::net::SocketAddr, std::thread::JoinHandle<u64>) {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("stub binds");
+            let addr = listener.local_addr().expect("stub addr");
+            let handle = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().expect("accept");
+                drop(listener);
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(30)))
+                    .expect("timeout");
+                let (id, request) = stub_request(&mut socket, 2);
+                let response = Response {
+                    proof: None,
+                    status: Status::Ok,
+                    body: ResponseBody::Stored { version: 7 },
+                };
+                socket
+                    .write_all(&encode_frame(
+                        FrameKind::Response,
+                        id,
+                        &response.encode(request.opcode),
+                    ))
+                    .expect("reply");
+                1
+            });
+            (addr, handle)
+        }
+
+        let (silent, silent_handle) = silent_stub();
+        let (live, live_handle) = live_stub();
+        let client = NativeClient::new(ClientConfig {
+            seeds: vec![silent.to_string(), live.to_string()],
+            // Long enough that the live member is never what times out, short
+            // enough to keep the test quick.
+            request_timeout: Duration::from_millis(500),
+            connect_timeout: Duration::from_millis(500),
+            dial_attempts: 1,
+            ..ClientConfig::default()
+        })
+        .expect("client builds");
+        let outcome = client.set(&Key::from("k"), bytes::Bytes::from_static(b"v"));
+        assert!(
+            outcome.is_ok(),
+            "the mutation must reach a member that answers rather than exhaust the \
+             budget on one that does not: {outcome:?}"
+        );
+        assert_eq!(
+            live_handle.join().expect("live stub exits"),
+            1,
+            "the answering member served the write"
+        );
+        assert_eq!(
+            silent_handle.join().expect("silent stub exits"),
+            1,
+            "the silent member saw exactly one request: it must not be retried to"
+        );
+    }
+
     #[test]
     fn dead_connection_fails_inflight_fast() {
         use std::io::{Read, Write};
@@ -4166,7 +4291,7 @@ mod tests {
         stub.join().expect("stub exits");
         // The waiter must notice the dead connection promptly: well under
         // the 10s timeout it would otherwise burn. The redial then fails
-        // fast (refused), so the surfaced error is transport `Io` — never
+        // fast (refused), so the surfaced error is transport `Io` - never
         // a `Timeout` that pretends the server is merely slow.
         assert!(
             elapsed < Duration::from_secs(5),
@@ -4227,7 +4352,7 @@ mod tests {
     /// Leader redirect preserves the mutation identity: a
     /// follower answers `StaleRoute` with the leader's endpoint, and the
     /// retry at the leader carries the identical session, sequence, and
-    /// ack floor — bounded by the redirect budget, never an infinite
+    /// ack floor - bounded by the redirect budget, never an infinite
     /// loop, never a reallocated identity.
     #[test]
     fn redirect_retry_preserves_mutation_identity() {

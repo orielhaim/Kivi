@@ -1,84 +1,15 @@
 //! Black-box contract for Phase-8 semantics over real loopback TCP: every
 //! semantic type and the atomic-batch driver exercised through the public
-//! client API only — no engine or store internals. Typed errors must
+//! client API only - no engine or store internals. Typed errors must
 //! survive the wire; lifecycles must behave end to end.
 
 use bytes::Bytes;
-use kivi_client::{
-    AtomicBatchResult, BatchExpect, BatchWriteKind, BatchWriteSpec, ClientConfig, ClientError,
-    NativeClient,
-};
-use kivi_engine::{
-    ChunkFabricConfig, ConnLimits, DurabilityMode, EngineConfig, EngineNetwork, FabricConfig,
-    LocalEngine, Placement, TurnBudget,
-};
-use kivi_state::Key;
-use kivi_tablet::{DirectorySnapshot, HashPrefix, PartitionRange};
-use kivi_types::{ClusterId, NamespaceId, NodeId, NodeIncarnation, TabletId, WorkerId};
-
-const NS: NamespaceId = NamespaceId::from_u64(1);
-
-fn directory() -> DirectorySnapshot {
-    DirectorySnapshot::bootstrap(
-        NS,
-        TabletId::from_u64(1),
-        PartitionRange::Hash(HashPrefix::new(0, 0).expect("root")),
-        kivi_types::TabletEpoch::INITIAL,
-        kivi_types::WriteGuardGeneration::INITIAL,
-    )
-    .expect("genesis")
-    .stage(TabletId::from_u64(1))
-    .and_then(|snapshot| snapshot.activate(TabletId::from_u64(1)))
-    .expect("active root")
-}
-
-fn start_ephemeral() -> LocalEngine {
-    LocalEngine::start(EngineConfig {
-        namespace: NS,
-        hardware: kivi_engine::HardwareConfig::default(),
-        directory: directory(),
-        placement: Placement::new([(TabletId::from_u64(1), WorkerId::from_u64(0))]),
-        worker_count: 2,
-        request_capacity: 128,
-        chunks: ChunkFabricConfig::default(),
-        fabric: FabricConfig::default(),
-        network: Some(EngineNetwork {
-            base_port: 0,
-            ports: Vec::new(),
-            bind_ip: [127, 0, 0, 1].into(),
-            max_frame: kivi_protocol::DEFAULT_MAX_FRAME,
-            placement: kivi_engine::ThreadPlacement::unbound(),
-            node_id: NodeId::from_u64(1),
-            cluster_id: ClusterId::from_u128(1),
-            incarnation: NodeIncarnation::INITIAL,
-            conn: ConnLimits::default(),
-            turn: TurnBudget::default(),
-            // The RESP edge is served by the engine's own workers;
-            // these harnesses exercise the native protocol only.
-            resp: None,
-        }),
-        durability: DurabilityMode::Ephemeral,
-    })
-    .expect("networked engine starts")
-}
-
-fn client_for(engine: &LocalEngine) -> NativeClient {
-    NativeClient::new(ClientConfig {
-        seeds: vec![engine.worker_addrs()[0].to_string()],
-        namespace: NS,
-        ..ClientConfig::default()
-    })
-    .expect("client builds")
-}
-
-fn key(name: &str) -> Key {
-    Key::from(name)
-}
+use kivi_client::{AtomicBatchResult, BatchExpect, BatchWriteKind, BatchWriteSpec, ClientError};
+use kivi_lab::testkit::{NS, key, start_ephemeral_client};
 
 #[test]
 fn semaphore_lifecycle_over_wire() {
-    let engine = start_ephemeral();
-    let client = client_for(&engine);
+    let (_engine, client) = start_ephemeral_client();
     let sem = key("bb-sem");
     client.semaphore_create(&sem, 2).expect("create");
     let permit = [1; 16];
@@ -107,8 +38,7 @@ fn semaphore_lifecycle_over_wire() {
 
 #[test]
 fn lease_lifecycle_over_wire() {
-    let engine = start_ephemeral();
-    let client = client_for(&engine);
+    let (_engine, client) = start_ephemeral_client();
     let lease = key("bb-lease");
     let grant = client
         .lease_acquire(&lease, 1, 60_000_000)
@@ -150,8 +80,7 @@ fn lease_lifecycle_over_wire() {
 
 #[test]
 fn counters_over_wire() {
-    let engine = start_ephemeral();
-    let client = client_for(&engine);
+    let (_engine, client) = start_ephemeral_client();
     let free = key("bb-cc");
     client.commutative_add(&free, 5).expect("add");
     client.commutative_add(&free, -2).expect("add");
@@ -173,8 +102,7 @@ fn counters_over_wire() {
 
 #[test]
 fn stream_lifecycle_over_wire() {
-    let engine = start_ephemeral();
-    let client = client_for(&engine);
+    let (_engine, client) = start_ephemeral_client();
     let shard = key("bb-shard");
     client.stream_create(&shard, [7; 16], 0).expect("create");
     assert_eq!(
@@ -199,8 +127,7 @@ fn stream_lifecycle_over_wire() {
 
 #[test]
 fn atomic_batch_commits_and_rejects_over_wire() {
-    let engine = start_ephemeral();
-    let client = client_for(&engine);
+    let (_engine, client) = start_ephemeral_client();
     let writes = vec![
         BatchWriteSpec {
             key: b"bb-t1".to_vec(),
@@ -239,8 +166,7 @@ fn atomic_batch_commits_and_rejects_over_wire() {
 
 #[test]
 fn wrong_type_surfaces_typed_over_wire() {
-    let engine = start_ephemeral();
-    let client = client_for(&engine);
+    let (_engine, client) = start_ephemeral_client();
     let key = key("bb-bytes");
     client.set(&key, Bytes::from_static(b"plain")).expect("set");
     assert!(matches!(

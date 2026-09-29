@@ -114,7 +114,6 @@ impl NodeState {
 
 /// Why a node record was rejected.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
 pub enum NodeError {
     /// Unknown node-state discriminant in canonical bytes.
     #[error("unknown node state discriminant {found}")]
@@ -345,12 +344,21 @@ mod tests {
     }
 
     #[test]
-    fn node_record_round_trips() {
+    fn a_record_round_trips_and_a_corrupt_state_byte_fails_closed() {
         let record = sample();
         let back = NodeRecord::decode_exact(&record.encode_to_vec()).expect("decodes");
         assert_eq!(back, record);
         assert!(back.state.serves_data());
         assert!(back.state.accepts_new_replicas());
+        // The state byte is the only field where an unknown discriminant
+        // could decode into a *different*, silently wrong lifecycle state.
+        assert!(matches!(
+            NodeState::decode_byte(9),
+            Err(NodeError::BadState { .. })
+        ));
+        let mut bad = record.encode_to_vec();
+        bad[8] = 9;
+        assert!(NodeRecord::decode_exact(&bad).is_err());
     }
 
     #[test]
@@ -370,16 +378,5 @@ mod tests {
         assert!(NodeState::Unavailable.needs_repair());
         assert!(NodeState::Draining.needs_repair());
         assert!(!NodeState::Suspect.needs_repair());
-    }
-
-    #[test]
-    fn corrupt_state_byte_fails() {
-        assert!(matches!(
-            NodeState::decode_byte(9),
-            Err(NodeError::BadState { .. })
-        ));
-        let mut bad = sample().encode_to_vec();
-        bad[8] = 9;
-        assert!(NodeRecord::decode_exact(&bad).is_err());
     }
 }

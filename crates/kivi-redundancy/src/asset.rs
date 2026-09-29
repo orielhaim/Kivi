@@ -89,8 +89,8 @@ impl AssetKind {
 /// owning fabric, and the deduplication/verification domain (`u64`; the
 /// [`SecurityDomainId`] raw value for chunk families, `0` for checkpoint
 /// artifacts whose identity already binds cluster/tablet provenance).
-/// Physical facts — replica count, `(k,m)`, placement, offsets, repair
-/// state — never participate.
+/// Physical facts - replica count, `(k,m)`, placement, offsets, repair
+/// state - never participate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AssetId {
     /// Immutable family.
@@ -175,30 +175,6 @@ impl AssetId {
             Some(ChunkId::from_bytes(self.hash))
         } else {
             None
-        }
-    }
-
-    /// Returns the wrapped manifest id when this names a chunk manifest.
-    #[must_use]
-    pub fn as_manifest(self) -> Option<ManifestId> {
-        if self.kind == AssetKind::ChunkManifest {
-            Some(ManifestId::from_bytes(self.hash))
-        } else {
-            None
-        }
-    }
-
-    /// Returns the security domain when the family carries one.
-    #[must_use]
-    pub fn security_domain(self) -> Option<SecurityDomainId> {
-        match self.kind {
-            AssetKind::Chunk | AssetKind::ChunkManifest => {
-                Some(SecurityDomainId::from_u64(self.domain))
-            }
-            AssetKind::CheckpointBand
-            | AssetKind::CheckpointManifest
-            | AssetKind::CheckpointDedup
-            | AssetKind::GenericImmutable => None,
         }
     }
 

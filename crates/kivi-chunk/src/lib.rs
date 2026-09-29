@@ -57,12 +57,7 @@ pub mod store;
 pub use codec::ChunkCodecId;
 pub use error::ChunkError;
 pub use gc::{GcInputs, GcReport, plan as plan_gc};
-pub use manifest::{ChunkEntry, ChunkManifest, build_manifest, splice_entries, verify_manifest};
-pub use pack::{RecordId, ScannedRecord, pack_file_name};
+pub use manifest::{ChunkEntry, ChunkManifest, build_manifest, verify_manifest};
 pub use policy::{Chunking, DEFAULT_CHUNK_SIZE, DEFAULT_INLINE_THRESHOLD, MAX_CHUNKS_PER_MANIFEST};
-pub use redundancy::{
-    protect_manifest_staged, protect_staged, read_manifest_via_fabric, read_via_fabric,
-};
-pub use store::{
-    ChunkRecovery, ChunkStats, ChunkStore, DurableChunk, DurableManifest, StageOutcome,
-};
+pub use redundancy::{protect_manifest_staged, protect_staged, read_via_fabric};
+pub use store::{ChunkRecovery, ChunkStats, ChunkStore, StageOutcome};

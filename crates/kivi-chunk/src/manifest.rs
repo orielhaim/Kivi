@@ -16,12 +16,12 @@ use crate::error::ChunkError;
 use crate::policy::{CHUNKING_V1, Chunking, MAX_CHUNKS_PER_MANIFEST};
 
 /// Manifest format version 1. Pinned alongside the canonical layout.
-pub const MANIFEST_VERSION: u16 = 1;
+pub(crate) const MANIFEST_VERSION: u16 = 1;
 
 /// Magic word: ASCII `"KVCH"` read as a little-endian `u32`. Distinct from
 /// every WAL (`KVWL`/`KVWB`/`KVWE`), checkpoint (`KVCB`/`KVCM`), and pack
 /// (`KVCP`/`KVCC`/`KVMP`) magic by construction.
-pub const MANIFEST_MAGIC: u32 = 0x4843_564B;
+pub(crate) const MANIFEST_MAGIC: u32 = 0x4843_564B;
 
 /// Fixed canonical header length in bytes:
 ///
@@ -29,10 +29,10 @@ pub const MANIFEST_MAGIC: u32 = 0x4843_564B;
 /// magic u32, version u16, chunking_version u16, codec u8, reserved u8,
 /// domain u64, total_len u64, chunk_size u64, entry_count u32  (= 38)
 /// ```
-pub const MANIFEST_HEADER_LEN: usize = 38;
+pub(crate) const MANIFEST_HEADER_LEN: usize = 38;
 
 /// One ordered chunk reference: 32-byte id plus its logical length (40).
-pub const MANIFEST_ENTRY_LEN: usize = 40;
+pub(crate) const MANIFEST_ENTRY_LEN: usize = 40;
 
 /// One ordered chunk reference inside a manifest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -310,101 +310,6 @@ fn decode_manifest(bytes: &[u8]) -> Result<ChunkManifest, String> {
     })
 }
 
-/// Splices replacement entries over the logical range
-/// `[offset, offset + replaced_len)` of an entry list: the partial-update
-/// primitive (§27, §28).
-///
-/// Boundaries must align to existing chunk edges (the engine always
-/// replaces whole affected chunks: it loads them, patches the byte range,
-/// and re-chunks the span, so alignment holds by construction). The
-/// replacement lengths must sum to exactly `replaced_len`; the total length
-/// is unchanged. Untouched entries keep their [`ChunkId`]s byte-for-byte,
-/// so only the replacement chunks plus a new manifest become newly durable.
-///
-/// # Errors
-///
-/// Returns [`ChunkError::Invalid`] on misaligned boundaries, length
-/// mismatch, or out-of-range spans. Pure: no I/O, no hashing (the caller
-/// builds the new manifest for the returned list).
-pub fn splice_entries(
-    entries: &[ChunkEntry],
-    chunk_size: u64,
-    offset: u64,
-    replaced_len: u64,
-    replacement: &[(ChunkId, u64)],
-) -> Result<Vec<ChunkEntry>, ChunkError> {
-    let invalid = |detail: String| ChunkError::Invalid { detail };
-    if replaced_len == 0 {
-        return Err(invalid("splice range must be nonempty".to_owned()));
-    }
-    let total: u64 = entries.iter().map(|entry| entry.len).sum();
-    let end = offset
-        .checked_add(replaced_len)
-        .ok_or_else(|| invalid("splice range overflows u64".to_owned()))?;
-    if end > total {
-        return Err(invalid(format!(
-            "splice range [{offset}, {end}) exceeds total {total}"
-        )));
-    }
-    // Alignment: both edges must sit on cumulative chunk boundaries.
-    let mut cursor = 0u64;
-    let mut start_ok = offset == 0;
-    let mut end_ok = end == total;
-    for entry in entries {
-        cursor += entry.len;
-        if cursor == offset {
-            start_ok = true;
-        }
-        if cursor == end {
-            end_ok = true;
-        }
-    }
-    if !start_ok || !end_ok {
-        return Err(invalid(format!(
-            "splice range [{offset}, {end}) is not chunk-aligned (chunk size {chunk_size})"
-        )));
-    }
-    let replacement_len: u64 = replacement.iter().map(|(_, len)| len).sum();
-    if replacement_len != replaced_len {
-        return Err(invalid(format!(
-            "replacement covers {replacement_len} bytes but the range holds {replaced_len}"
-        )));
-    }
-    for (id, len) in replacement {
-        if *len == 0 || !id.is_valid() {
-            return Err(invalid(
-                "replacement holds an empty or invalid entry".to_owned(),
-            ));
-        }
-    }
-    // Single pass: keep entries outside `[offset, end)`, plant the
-    // replacement exactly at the `offset` boundary. Alignment was proven
-    // above, so the insertion point always exists; its absence is an
-    // internal error, reported instead of panicking.
-    let mut positioned = Vec::with_capacity(entries.len() + replacement.len());
-    let mut cursor = 0u64;
-    let mut inserted = false;
-    for entry in entries {
-        if !inserted && cursor == offset {
-            for (id, len) in replacement {
-                positioned.push(ChunkEntry { id: *id, len: *len });
-            }
-            inserted = true;
-        }
-        let entry_end = cursor + entry.len;
-        if entry_end <= offset || cursor >= end {
-            positioned.push(*entry);
-        }
-        cursor = entry_end;
-    }
-    if !inserted {
-        return Err(invalid(
-            "splice insertion point missing despite aligned range".to_owned(),
-        ));
-    }
-    Ok(positioned)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,7 +408,9 @@ mod tests {
         assert!(build_manifest(DOMAIN, chunking(), ChunkCodecId::NONE, 7, Vec::new()).is_err());
         assert!(build_manifest(DOMAIN, chunking(), ChunkCodecId::NONE, 0, Vec::new()).is_ok());
         // Unsupported codec and chunking fail closed.
-        assert!(build_manifest(DOMAIN, chunking(), ChunkCodecId::LZ4, 0, Vec::new()).is_err());
+        assert!(
+            build_manifest(DOMAIN, chunking(), ChunkCodecId::from_u8(1), 0, Vec::new()).is_err()
+        );
         assert!(
             build_manifest(
                 DOMAIN,
@@ -542,51 +449,5 @@ mod tests {
         assert!(verify_manifest(other, &canonical).is_err());
         // Truncation fails.
         assert!(verify_manifest(id, &canonical[..canonical.len() - 1]).is_err());
-    }
-
-    #[test]
-    fn splice_reuses_untouched_chunks() {
-        // Old: A B C D E (100 each); replace the bytes inside C only.
-        let ids = [10u8, 20, 30, 40, 50].map(|byte| chunk_id(DOMAIN, &[byte; 64]));
-        let entries: Vec<ChunkEntry> = ids
-            .iter()
-            .map(|id| ChunkEntry { id: *id, len: 100 })
-            .collect();
-        let replacement_id = chunk_id(DOMAIN, b"replacement-C");
-        let spliced =
-            splice_entries(&entries, 100, 200, 100, &[(replacement_id, 100)]).expect("splices");
-        assert_eq!(spliced.len(), 5);
-        assert_eq!(spliced[0].id, ids[0]);
-        assert_eq!(spliced[1].id, ids[1]);
-        assert_eq!(spliced[2].id, replacement_id);
-        assert_eq!(spliced[3].id, ids[3]);
-        assert_eq!(spliced[4].id, ids[4]);
-        // The new manifest shares four of five chunk addresses: only the
-        // replacement chunk plus the manifest itself are newly durable.
-        let (_, old_id) =
-            build_manifest(DOMAIN, chunking(), ChunkCodecId::NONE, 500, entries).expect("old");
-        let (_, new_id) =
-            build_manifest(DOMAIN, chunking(), ChunkCodecId::NONE, 500, spliced).expect("new");
-        assert_ne!(old_id, new_id);
-    }
-
-    #[test]
-    fn splice_rejects_misaligned_and_lying_ranges() {
-        let entries = vec![entry(1, 100), entry(2, 100)];
-        let good = (entry(9, 100).id, 100);
-        // Mid-chunk edges.
-        assert!(splice_entries(&entries, 100, 50, 100, &[good]).is_err());
-        assert!(splice_entries(&entries, 100, 0, 150, &[good]).is_err());
-        // Replacement sum mismatch.
-        assert!(splice_entries(&entries, 100, 0, 100, &[(good.0, 90)]).is_err());
-        // Past the end and empty ranges.
-        assert!(splice_entries(&entries, 100, 100, 200, &[good]).is_err());
-        assert!(splice_entries(&entries, 100, 0, 0, &[]).is_err());
-        // Multi-chunk replacement spanning two chunks keeps the outer two.
-        let chunks: Vec<ChunkEntry> = (1u8..=4).map(|byte| entry(byte, 100)).collect();
-        let spliced = splice_entries(&chunks, 100, 100, 200, &[good, good]).expect("spans");
-        assert_eq!(spliced.len(), 4);
-        assert_eq!(spliced[0], chunks[0]);
-        assert_eq!(spliced[3], chunks[3]);
     }
 }

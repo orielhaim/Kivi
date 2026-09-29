@@ -33,7 +33,7 @@
                                 / Restart
     recovery .................. RecoverFinalize (re-read the durable
                                 decision; re-drive the decided outcome;
-                                undecided resolves nothing — never guesses)
+                                undecided resolves nothing - never guesses)
     confused deputy ........... ForeignPrepare (same id, digest 3:
                                 conflicts, never overwrites)
 
@@ -76,8 +76,8 @@
 
   Invariants (NoPartialCommit is quiescence-conditioned: in-flight
   finalizes may transiently expose one key before the other lands;
-  the guarantee is that no QUIESCENT state — nothing left for the
-  transaction in the soup — is partial):
+  the guarantee is that no QUIESCENT state - nothing left for the
+  transaction in the soup - is partial):
     NoPartialCommit: every quiescent transaction has all or none of its
                      writes applied; an Abort-decided one has none.
     CommitNeedsDecision: every applied write follows a durable Commit
@@ -164,7 +164,7 @@ Finalize(t, p, c, d) ==
       re-drives) and every replay. Delivery is idempotent.
       Honest drivers only (re)send finalizes consistent with the durable
       decision (or none exist pre-decision: the decide step enqueues).
-      A contradicting finalize cannot be produced under crash faults —
+      A contradicting finalize cannot be produced under crash faults -
       the decision is single-assignment. *)
     /\ ~crashed[Coordinator]
     /\ \/ c /\ decision[t] = "commit"
@@ -190,7 +190,7 @@ DeliverFinalize(t, p, c, d) ==
 
 RecoverFinalize(t, p) ==
     (* Re-read the durable decision and re-drive the decided outcome.
-       Undecided resolves nothing — never guesses. *)
+       Undecided resolves nothing - never guesses. *)
     /\ ~crashed[Coordinator]
     /\ decision[t] = "commit"
     /\ intent[p].txn = t
@@ -199,7 +199,7 @@ RecoverFinalize(t, p) ==
 
 ForgeCommitFinalize(t, p) ==
     (* BROKEN VARIANT (AllowGuessCommit): a participant forges the commit
-       outcome for its own live intent — applying without any durable
+       outcome for its own live intent - applying without any durable
        decision. The coordinator may later abort -> applied without a
        Commit decision. *)
     /\ AllowGuessCommit
