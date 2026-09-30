@@ -211,7 +211,7 @@ table is from `cargo bench -p kivi-memory --bench nvme_read`.
 
 ### CRC32C: already hardware accelerated, do not replace it
 
-This was the open question in RFC §26, and the measurement settles it.
+This was an open question, and the measurement settles it.
 
 | Workload | Time | Throughput |
 | --- | --- | --- |

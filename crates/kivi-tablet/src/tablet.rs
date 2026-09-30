@@ -1,6 +1,6 @@
 //! Tablet lifecycle, descriptors, and redirect metadata.
 //!
-//! A tablet identity moves through exactly one chain (RFC §190–§194):
+//! A tablet identity moves through exactly one chain:
 //!
 //! ```text
 //! Allocated → Inactive → Active → Fenced → Tombstone
@@ -15,7 +15,7 @@
 //!   the authority. Never writable.
 //! * [`TabletState::Active`]: the single writable authority for its range.
 //! * [`TabletState::Fenced`]: sealed during replacement; writes stopped while
-//!   the successor finishes replay and activates (RFC §190). Never writable,
+//!   the successor finishes replay and activates. Never writable,
 //!   and never writable again.
 //! * [`TabletState::Tombstone`]: retired; carries a [`Redirect`] naming live
 //!   successors so stale routes resolve forward instead of failing.
@@ -71,8 +71,8 @@ impl fmt::Display for TabletState {
     }
 }
 
-/// Forwarding record left on a tombstone (RFC §190 parent redirect, §191
-/// merged-source redirect).
+/// Forwarding record left on a tombstone (parent redirect, merged-source
+/// redirect).
 ///
 /// Names the live successor tablets that now own the retired range - a set,
 /// not a single identity, because a split retires one parent into several

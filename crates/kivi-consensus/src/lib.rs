@@ -16,13 +16,11 @@
 //!
 //! ## `OpenRaft` selection record
 //!
-//! * Version: `openraft =0.10.0-alpha.35`, exact-pinned. Pre-1.0 alpha
-//!   APIs shift between releases, so caret drift is unacceptable. The
-//!   release adds the dedicated pre-vote RPC, which Kivi implements on the
-//!   shared peer mesh and enables for production and spike configurations.
-//! * Runtime: the official `openraft-rt-compio` `AsyncRuntime`. There is
-//!   no isolated Tokio runtime in this crate: `cargo tree -p kivi-consensus`
-//!   must show no Tokio. `OpenRaft` tasks park on Kivi's Compio reactors.
+//! * Version: an exact `=` pin to a published `0.10.0-alpha.x`. Pre-1.0
+//!   alpha APIs shift between releases, so caret drift is unacceptable.
+//! * Runtime: the official Compio `AsyncRuntime`. There is no isolated Tokio
+//!   runtime in this crate: `cargo tree -p kivi-consensus` must show no
+//!   Tokio runtime crate. `OpenRaft` tasks park on Kivi's Compio reactors.
 //! * `single-threaded` empties `OptionalSend`/`OptionalSync`, so every
 //!   `Raft` handle is `!Send`: that is the type-level enforcement of the
 //!   single-owner invariant, not a limitation to work around.

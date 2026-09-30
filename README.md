@@ -39,13 +39,10 @@ in [`docs/perf-program.md`](docs/perf-program.md)
 
 Kivi is still a research-oriented project and is under active development
 
-The full architecture lives in [`docs/rfc.md`](docs/rfc.md).
-
 ## Documentation
 
 | document | what it is |
 | --- | --- |
-| [`docs/rfc.md`](docs/rfc.md) | the architecture specification |
 | [`docs/perf-program.md`](docs/perf-program.md) | how to benchmark Kivi, and what it currently costs |
 | [`docs/microscope.md`](docs/microscope.md) | the measurement instruments and what this host can measure |
 | [`docs/hardware.md`](docs/hardware.md) | measured hardware capabilities and what was unavailable |

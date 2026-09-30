@@ -53,7 +53,7 @@ kivi-redundancy = { path = "crates/kivi-redundancy", version = "0.1.0" }
 kivi-observation = { path = "crates/kivi-observation", version = "0.1.0" }
 kivi-hardware = { path = "crates/kivi-hardware", version = "0.1.0" }
 
-# Mechanism crates borrowed per RFC §209 ("borrow mechanisms, own semantics").
+# Mechanism crates borrowed ("borrow mechanisms, own semantics").
 # The project owns all wire/durable formats; these crates never define them.
 jiff = { version = "0.2", default-features = false, features = [
     "std",
@@ -67,11 +67,8 @@ twox-hash = { version = "2", default-features = false, features = [
     "xxhash3_128",
 ] }
 crc32c = "0.6"
-# Checkpoint band compression experiment (RFC §217: lz4_flex for hot/warm).
 lz4_flex = "0.14"
 
-# Test-only framework for table-driven tests and fixtures. Never ships in
-# library code or durable formats.
 rstest = "0.27"
 
 hashbrown = "0.17"
@@ -125,7 +122,6 @@ tower-http = { version = "0.7", features = ["limit", "timeout", "trace"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
-# Test/benchmark-only mechanisms.
 proptest = "1.11"
 divan = "0.1"
 tempfile = "3.27"

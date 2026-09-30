@@ -360,7 +360,7 @@ fn drain_survives_bystander_crash_small() {
     assert_eq!(counts.len(), 3, "three nodes remain: {counts:?}");
 }
 
-/// Full-cluster restart mid-migration (§39 crash points, §61): killing
+/// Full-cluster restart mid-migration (crash points): killing
 /// every process while plans are in flight loses nothing - control
 /// leaders, sources, and targets all recover from persisted plans and
 /// durable Raft state with no manual cleanup.
@@ -412,7 +412,7 @@ fn cluster_restart_during_migration() {
     }
 }
 
-/// RESP edge during migration (§33, §61): Redis clients never see
+/// RESP edge during migration: Redis clients never see
 /// `MOVED`/`ASK`/slots. Writes to a migrating tablet answer retryable
 /// `BUSY` off-leader and `OK` on the leader; reads keep serving.
 /// Retrying across members converges without exposing placement.
@@ -493,7 +493,7 @@ fn resp_serves_during_migration() {
     assert!(seen, "migrated value serves over RESP");
 }
 
-/// Full product money test (§62): 100 tablets RF=3, real workload with
+/// Full product money test: 100 tablets RF=3, real workload with
 /// large values, dynamic 4th node, online rebalance with failures
 /// injected mid-flight, drain, safe removal, and full restart - reads
 /// and writes throughout, zero unavailable tablets by design.
@@ -512,7 +512,7 @@ fn resp_serves_during_migration() {
 #[ignore = "stress profile: needs idle box, see doc comment for explicit invocation"]
 #[test]
 fn four_node_rebalance_drain_money() {
-    // Benchmark clock (§59): phase durations print at each milestone
+    // Benchmark clock: phase durations print at each milestone
     // (migration duration, drain duration, end-to-end).
     let money_start = Instant::now();
     let mut cluster = Cluster::spawn_with_tablets(100, 4, false).expect("cluster spawns");
@@ -550,7 +550,7 @@ fn four_node_rebalance_drain_money() {
             .map_or_else(String::new, ToString::to_string)
     );
     let traffic = cluster.client();
-    // Migration bulk bytes (§59): sidecar bulk counters sampled around
+    // Migration bulk bytes: sidecar bulk counters sampled around
     // the rebalance (catch-up traffic) and around the drain.
     let bulk_bytes = |cluster: &Cluster| -> u64 {
         let mut total = 0u64;
@@ -571,7 +571,7 @@ fn four_node_rebalance_drain_money() {
     let mut rounds = 0u64;
     let mut injected = 0u8;
     let mut stable_rounds = 0u32;
-    // Client latency sampler (§58): every 50th op timed; summary at
+    // Client latency sampler: every 50th op timed; summary at
     // the end shows migration did not degrade ordinary SET latency.
     let mut latencies: Vec<Duration> = Vec::new();
     // Every committed key name, in order (the post-run sample draws
@@ -596,7 +596,7 @@ fn four_node_rebalance_drain_money() {
             rounds += 1;
             written.push(name);
         }
-        // Large streaming write concurrent with migration (§37): the
+        // Large streaming write concurrent with migration: the
         // learner converges through snapshot/log/sidecar mechanisms
         // while bulk traffic flows. Runs once; key names stay dense
         // (no skipped rounds) so the post-run sample only names
@@ -606,7 +606,7 @@ fn four_node_rebalance_drain_money() {
             traffic_put_big(&traffic, "traffic-big", &big);
             assert_eq!(traffic_get_big(&traffic, "traffic-big"), big);
         }
-        // Failure injection mid-rebalance (§50): kill the control
+        // Failure injection mid-rebalance: kill the control
         // leader once, and the target learner once; both restart and
         // migrations resume with no manual cleanup. Disabled with
         // KIVI_MONEY_CHAOS=0 to bisect chaos from migration.
@@ -741,7 +741,7 @@ fn four_node_rebalance_drain_money() {
     }
     // Drain node 1: every replica and leadership moves away. Mid-drain,
     // kill a bystander member and restart it: drain must survive source,
-    // target, and control-leader crashes alike (§42).
+    // target, and control-leader crashes alike.
     let drain_start = Instant::now();
     let _ = cluster.drain_node(1);
     let bystander = cluster.index_of(3).expect("node 3 slot");
@@ -752,7 +752,7 @@ fn four_node_rebalance_drain_money() {
     eprintln!("BENCH drain done in {:?}", drain_start.elapsed());
     // Shrink control membership 1 -> 4 first (control learner 4 was
     // admitted automatically; promote it, retire 1), then safe removal:
-    // removal refuses while the node still votes in control (§31).
+    // removal refuses while the node still votes in control.
     cluster.set_control_voters(&[2, 3, 4]);
     let _ = cluster.remove_node(1);
     let dropped = cluster.index_of(1).expect("node 1 slot");
@@ -785,7 +785,7 @@ fn four_node_rebalance_drain_money() {
             "node {node} hosts every tablet after drain: {counts:?}"
         );
     }
-    // Benchmark summary (§58-59): end-to-end duration plus ordinary
+    // Benchmark summary: end-to-end duration plus ordinary
     // SET latency sampled during migration (p50/max) and unavailable
     // tablets (zero by design throughout; any failed op would have
     // panicked above).

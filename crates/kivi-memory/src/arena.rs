@@ -2,7 +2,7 @@
 //!
 //! One [`WorkerArenas`] owns seven [`ClassArena`]s (one per
 //! [`BehaviorClass`]), each a compact generational slab over `Bytes`
-//! payloads. The owning worker is the single mutator (RFC §16): no locks,
+//! payloads. The owning worker is the single mutator: no locks,
 //! no atomics on the fast path. Relocation and compaction only rewrite
 //! slot contents and bump bookkeeping; outstanding [`ObjectHandle`]s stay
 //! valid across moves *within* a slot, and slot reuse bumps the

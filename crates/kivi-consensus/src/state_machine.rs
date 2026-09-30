@@ -1361,7 +1361,7 @@ fn take_u64_list(input: &[u8]) -> Result<(Vec<u64>, usize), ImageFault> {
 }
 
 /// Frames `body` with magic + version + CRC (project-owned framing per
-/// RFC §53: magic, version, length-capable blobs, CRC; immutable
+/// magic, version, length-capable blobs, CRC; immutable
 /// artifacts additionally carry content identity via the snapshot id).
 fn frame_image(magic: u32, version: u16, body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + 2 + body.len() + 4);

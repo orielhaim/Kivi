@@ -2,14 +2,14 @@
 //!
 //! These are inert stamps and spans: nothing here reads a clock. Callers pass
 //! timestamps in explicitly so production can supply hardware time while
-//! deterministic simulation supplies virtual time (RFC §176, §177).
+//! deterministic simulation supplies virtual time.
 //!
 //! Three concepts stay structurally distinct:
 //!
 //! * [`Ticks`] - deterministic virtual monotonic microseconds since a
 //!   clock-defined origin. Simulation and correctness-sensitive timing.
 //! * [`WallTimestamp`] - exact wall-clock instants as signed Unix
-//!   microseconds. Expiry and other logical metadata (RFC §163).
+//!   microseconds. Expiry and other logical metadata.
 //! * `std::time::Instant` (not defined here) - monotonic process time for
 //!   local timeouts, latency measurement, and scheduler deadlines. A system
 //!   clock adjustment must never break a local timeout, so wall and
@@ -272,7 +272,7 @@ pub enum TimeError {
     },
 }
 
-/// Logical expiration attached to stored data (RFC §163).
+/// Logical expiration attached to stored data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Expiry(Option<WallTimestamp>);
 

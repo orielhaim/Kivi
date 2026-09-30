@@ -2534,7 +2534,7 @@ impl Cluster {
     }
 
     /// Replaces the control voter set through joint consensus on the
-    /// control leader (control-plane membership itself, §31), waiting
+    /// control leader (control-plane membership itself), waiting
     /// for the uniform successor - not just the joint commit. New
     /// voters must already be control learners (the reconciler admits
     /// `Active` data nodes automatically).

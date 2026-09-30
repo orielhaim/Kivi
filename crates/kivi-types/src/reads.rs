@@ -1,4 +1,4 @@
-//! Explicit read contracts (RFC §66, §67).
+//! Explicit read contracts.
 //!
 //! There is no ambiguous "read replica" mode: every native read names the
 //! freshness it requires, and the engine picks the cheapest mechanism that
@@ -11,7 +11,7 @@ use crate::position::CommitToken;
 
 /// Freshness contract of one read.
 ///
-/// The four variants are the closed contract set from RFC §66. Adding a new
+/// The four variants are the closed contract set from. Adding a new
 /// contract is a consensus-layer semantic change, so this enum is
 /// deliberately exhaustive: new variants break downstream matches (including
 /// the canonical codec) at compile time, forcing an explicit wire tag
@@ -19,7 +19,7 @@ use crate::position::CommitToken;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReadContract {
     /// Linearizable read: establish a consensus read barrier, wait until local
-    /// applied state reaches it, then read (RFC §67, conservative baseline).
+    /// applied state reaches it, then read (conservative baseline).
     Latest,
     /// Wait until local applied state reaches at least `0`, then read.
     AtLeast(CommitToken),

@@ -41,7 +41,7 @@ pub enum Workload {
     Range,
 }
 
-/// Benchmark value sizes (§15 matrix). Payload bytes are deterministic
+/// Benchmark value sizes (size matrix). Payload bytes are deterministic
 /// ([`fill_pattern`]), so both sides store identical content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum ValueSize {

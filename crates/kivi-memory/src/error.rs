@@ -1,4 +1,4 @@
-//! Memory Fabric failure modes (RFC §251 hardware rule).
+//! Memory Fabric failure modes (hardware rule).
 //!
 //! A failed optimization degrades performance or cost; it never invents,
 //! loses, or corrupts logical state. These errors therefore read as *retry,

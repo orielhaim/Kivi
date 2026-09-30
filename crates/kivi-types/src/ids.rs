@@ -49,7 +49,7 @@ pub enum SequenceExhausted {
     CommitPosition,
 }
 
-/// Identity of a whole Kivi cluster (RFC §151, exact control-plane state).
+/// Identity of a whole Kivi cluster (exact control-plane state).
 ///
 /// 128-bit globally unique value assigned at cluster creation. Displayed as
 /// 32 lowercase hexadecimal digits.
@@ -76,10 +76,10 @@ impl fmt::Display for ClusterId {
     }
 }
 
-/// Identity of a single process/host member of the cluster (RFC §6, §151).
+/// Identity of a single process/host member of the cluster.
 ///
 /// Assigned by the control plane; never reused across different processes.
-/// Combined with [`NodeIncarnation`] to reject stale restarts (RFC §153).
+/// Combined with [`NodeIncarnation`] to reject stale restarts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId(u64);
 
@@ -103,10 +103,10 @@ impl fmt::Display for NodeId {
     }
 }
 
-/// Identity of a worker pinned to one CPU (RFC §15).
+/// Identity of a worker pinned to one CPU.
 ///
 /// A worker owns a set of tablet replicas; tablet state stays with its owner
-/// worker (RFC §16, §20). Distinct from the hardware's own processor identity
+/// worker. Distinct from the hardware's own processor identity
 /// (`kivi_hardware::topology::CpuId`): CPUs are hardware, workers are
 /// execution owners that can be re-pinned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -132,7 +132,7 @@ impl fmt::Display for WorkerId {
     }
 }
 
-/// Identity of a namespace, the main semantic and policy boundary (RFC §7).
+/// Identity of a namespace, the main semantic and policy boundary.
 ///
 /// The durable canonical form is this control-plane-assigned 64-bit value, not
 /// the human-readable [`crate::NamespaceName`]: names are normalized at the
@@ -161,10 +161,10 @@ impl fmt::Display for NamespaceId {
 }
 
 /// Identity of a tablet: the unit of ownership, routing, consensus, movement,
-/// replication, split, merge, and load accounting (RFC §8).
+/// replication, split, merge, and load accounting.
 ///
 /// Ordered so deterministic choices such as "lowest [`TabletId`] coordinates"
-/// (RFC §83) are well-defined.
+/// are well-defined.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TabletId(u64);
 
@@ -188,7 +188,7 @@ impl fmt::Display for TabletId {
     }
 }
 
-/// Monotonic fencing epoch of a tablet (RFC §70, §194, §251).
+/// Monotonic fencing epoch of a tablet.
 ///
 /// Every topology transition (split, merge, migration, ownership move) advances
 /// the epoch. A mutation carrying an older epoch than the current authority
@@ -259,7 +259,7 @@ impl fmt::Display for TabletEpoch {
     }
 }
 
-/// Fencing generation bound to one authoritative tablet range (RFC §70).
+/// Fencing generation bound to one authoritative tablet range.
 ///
 /// Derived from ownership state; every topology transition changes it.
 /// Stale writes carrying an older generation are rejected without extra
@@ -325,7 +325,7 @@ impl fmt::Display for WriteGuardGeneration {
     }
 }
 
-/// Durable per-process incarnation counter (RFC §153).
+/// Durable per-process incarnation counter.
 ///
 /// Incremented on every process restart and persisted before the node serves
 /// traffic. Peers reject traffic from an older incarnation so a stale
@@ -381,7 +381,7 @@ impl NodeIncarnation {
     }
 
     /// Whether `self` is stale relative to `current` and must be rejected
-    /// by peers (RFC §153).
+    /// by peers.
     #[must_use]
     pub const fn is_stale_relative_to(self, current: Self) -> bool {
         self.0 < current.0
@@ -394,7 +394,7 @@ impl fmt::Display for NodeIncarnation {
     }
 }
 
-/// Position of a mutation within one tablet's ordered log (RFC §167).
+/// Position of a mutation within one tablet's ordered log.
 ///
 /// `0` means unassigned (no log slot yet); the first committed entry is `1`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -449,11 +449,11 @@ impl fmt::Display for CommitPosition {
     }
 }
 
-/// Identity of a client session (RFC §63).
+/// Identity of a client session.
 ///
 /// 128-bit value issued at session establishment. Combined with
 /// [`RequestSeq`] it makes every mutation uniquely addressable for
-/// lost-reply deduplication (RFC §64). Displayed as 32 lowercase hex digits.
+/// lost-reply deduplication. Displayed as 32 lowercase hex digits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SessionId(u128);
 
@@ -477,11 +477,11 @@ impl fmt::Display for SessionId {
     }
 }
 
-/// Per-session monotonic sequence number (RFC §63).
+/// Per-session monotonic sequence number.
 ///
 /// Assigned by the client adapter; the core treats (`SessionId`, `RequestSeq`)
 /// as an opaque deduplication key: a retry carrying the same pair returns the
-/// recorded outcome instead of executing again (RFC §64).
+/// recorded outcome instead of executing again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RequestSeq(u64);
 
@@ -526,7 +526,7 @@ impl fmt::Display for RequestSeq {
     }
 }
 
-/// Security domain scoping content-addressed deduplication (RFC §29).
+/// Security domain scoping content-addressed deduplication.
 ///
 /// Deduplication is constrained to one domain; cross-tenant deduplication is
 /// disabled by default. There is deliberately no `DEFAULT` value: every chunk

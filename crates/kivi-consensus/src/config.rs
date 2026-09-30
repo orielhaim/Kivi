@@ -10,24 +10,21 @@
 //!
 //! ## `OpenRaft` selection record
 //!
-//! * Version: `openraft =0.10.0-alpha.35` - the latest published `0.10.0-alpha.x`
-//!   release at the time of this audit. Pinned with an exact `=` requirement:
-//!   pre-1.0 alpha APIs shift between releases, so caret drift is unacceptable.
-//!   The release adds the dedicated pre-vote RPC and keeps the pre-1.0 warning.
+//! * Version: an exact `=` pin to a published `0.10.0-alpha.x`. Pre-1.0
+//!   alpha APIs shift between releases, so caret drift is unacceptable.
 //! * Features: `default-features = false` (no Tokio runtime, no clap) plus
 //!   `single-threaded`. The latter empties `OptionalSend`/`OptionalSync`, so
 //!   every `Raft` handle and every consensus future is `!Send`: Raft tasks
 //!   are pinned to the Compio reactor thread that owns them. That is not a
 //!   limitation to work around - it is the type-level enforcement of Kivi's
-//!   single-owner invariant (RFC §16).
+//!   single-owner invariant.
 //!
 //! ## Configurable-point decisions
 //!
-//! * `AsyncRuntime = CompioRuntime` (`openraft-rt-compio`, official): Raft
-//!   tasks park on Kivi's Compio reactors - no isolated Tokio island, no
-//!   cross-runtime bridge channels. Evidence: `examples/compio_smoke.rs`
-//!   prototype (single voter elects, writes, serves a `ReadIndex` barrier on
-//!   a pure-Compio tree with zero Tokio in `cargo tree`).
+//! * `AsyncRuntime = CompioRuntime` (official): Raft tasks park on Kivi's
+//!   Compio reactors - no isolated Tokio runtime, no cross-runtime bridge
+//!   channels. Evidence: `examples/density.rs`, whose three-voter mode
+//!   elects, replicates, and reports idle CPU on a pure-Compio tree.
 //! * `Batch<T>`: official default `InlineBatch` (inline single element,
 //!   heap on spill). No custom implementation: Kivi's batching story is the
 //!   physical Multi-Raft durability batching on the WAL lane, which lives
@@ -49,6 +46,14 @@
 //! * `SnapshotData` lives on [`openraft::storage::RaftStateMachine`] (Kivi
 //!   checkpoint bytes) and on [`openraft::network::RaftNetworkV2`] (the same
 //!   bytes on the wire).
+//! * `reset_backoff_on_transfer_leader = Some(true)`: Kivi's only leadership
+//!   moves are graceful (migration handoff, rebalance), and their targets are
+//!   nodes that just joined or restarted - exactly the nodes the leader is
+//!   backing off from. A transfer is one broadcast that a target which has not
+//!   caught up refuses, so the intent is to clear that backoff first rather
+//!   than inherit a delay chosen while the target was unreachable. `None`
+//!   would behave identically; the explicit `Some(true)` records the reset as
+//!   the intent rather than an accident of the default.
 
 use std::sync::Arc;
 
@@ -90,6 +95,7 @@ pub fn cluster_config() -> Result<Arc<openraft::Config>, openraft::ConfigError> 
         election_timeout_max: 3000,
         max_in_snapshot_log_to_keep: 100,
         enable_pre_vote: Some(true),
+        reset_backoff_on_transfer_leader: Some(true),
         ..openraft::Config::default()
     }
     .validate()
@@ -111,6 +117,7 @@ pub fn spike_config() -> Result<Arc<openraft::Config>, openraft::ConfigError> {
         election_timeout_min: 1000,
         election_timeout_max: 2000,
         enable_pre_vote: Some(true),
+        reset_backoff_on_transfer_leader: Some(true),
         ..openraft::Config::default()
     }
     .validate()
@@ -130,6 +137,19 @@ mod tests {
             spike_config().expect("spike config"),
         ] {
             assert_eq!(config.enable_pre_vote, Some(true));
+        }
+    }
+
+    /// Both shapes reset a transfer target's replication backoff. A
+    /// transfer is one broadcast, so a target still inside a backoff has
+    /// not caught up and refuses it - the handoff silently never lands.
+    #[test]
+    fn leadership_transfer_resets_the_targets_backoff() {
+        for config in [
+            cluster_config().expect("cluster config"),
+            spike_config().expect("spike config"),
+        ] {
+            assert_eq!(config.reset_backoff_on_transfer_leader, Some(true));
         }
     }
 }

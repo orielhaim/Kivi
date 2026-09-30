@@ -16,7 +16,7 @@
 //! every enumeration leaving the store is either aggregated (counts) or sorted
 //! (sweeps, snapshots), so simulation replay and tests never depend on it.
 //!
-//! State changes flow through two explicit phases (RFC Mutation IR direction):
+//! State changes flow through two explicit phases (Mutation IR direction):
 //!
 //! ```text
 //! Operation → prepare() → Read(result) | Write(mutation) → apply() → outcome

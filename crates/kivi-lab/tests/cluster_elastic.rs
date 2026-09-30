@@ -54,7 +54,7 @@ fn tablets_desiring(cluster: &Cluster, node: u64) -> usize {
     usize::MAX
 }
 
-/// Failure detector product flow (§54): hard-kill C, automatic suspicion
+/// Failure detector product flow: hard-kill C, automatic suspicion
 /// → repair onto D, RF restored with traffic online, restarted C never
 /// resurrects obsolete memberships. No operator-issued tablet moves.
 #[test]
@@ -166,7 +166,7 @@ fn auto_repair_after_hard_kill() {
     );
 }
 
-/// Short outage (§55): a partition shorter than the repair grace must not
+/// Short outage: a partition shorter than the repair grace must not
 /// trigger mass re-replication; health recovers when the node returns.
 #[test]
 fn short_outage_causes_no_repair() {
@@ -199,7 +199,7 @@ fn short_outage_causes_no_repair() {
     assert_eq!(traffic_get(&client, "short-0"), b"v");
 }
 
-/// Control-leader crash during automatic repair (§56): the new leader
+/// Control-leader crash during automatic repair: the new leader
 /// recovers repair plans and continues without duplicating harmful
 /// membership actions.
 #[test]
@@ -261,7 +261,7 @@ fn control_leader_failover_during_repair() {
     assert_eq!(traffic_get(&client, "failover-0"), b"v");
 }
 
-/// Manual split money flow (§57): populated tablet with counters, expiry,
+/// Manual split money flow: populated tablet with counters, expiry,
 /// and a large chunked value splits online under continuous traffic; the
 /// new directory version publishes, children become normal tablets, the
 /// parent retires, and every value is byte-exact.
@@ -346,7 +346,7 @@ fn manual_split_serves_through_cutover() {
     );
 }
 
-/// Split exactly-once (§58): a mutation committed around cutover whose
+/// Split exactly-once: a mutation committed around cutover whose
 /// response is lost must not execute twice when retried after the
 /// directory changed (same `SessionId + RequestSeq`).
 #[test]
@@ -391,7 +391,7 @@ fn split_preserves_exactly_once() {
     assert_eq!(live, first, "counter executed exactly once across split");
 }
 
-/// Split failover (§59): kill the parent leader and the control leader
+/// Split failover: kill the parent leader and the control leader
 /// mid-split; the operation resumes safely with no orphan active ranges.
 #[test]
 fn split_survives_leader_failover() {
@@ -788,7 +788,7 @@ fn a_split_survives_a_full_restart() {
     }
 }
 
-/// Merge money flow (§60): merge two split children back online; one
+/// Merge money flow: merge two split children back online; one
 /// merged range, all state preserved, dedup preserved, old children
 /// fenced/retired, client caches converge.
 #[test]
@@ -826,7 +826,7 @@ fn merge_children_back_online() {
     );
 }
 
-/// Automatic split/merge demonstration (§61): tiny thresholds in the live
+/// Automatic split/merge demonstration: tiny thresholds in the live
 /// policy show `write → automatic split` then (after cooling) eventual
 /// merge through the real control-plane flow.
 #[test]
@@ -894,7 +894,7 @@ fn automatic_split_then_merge() {
     cluster.wait_merges_done(Duration::from_secs(600));
 }
 
-/// Topology survives a full restart (§64): split, checkpoint, purge logs,
+/// Topology survives a full restart: split, checkpoint, purge logs,
 /// restart the cluster - the new directory stays, old parents never
 /// reappear as active.
 #[test]

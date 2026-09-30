@@ -12,15 +12,15 @@
 //! ```
 //!
 //! A full queue fast-fails [`Overloaded`](kivi_chunk::ChunkError::Overloaded)
-//! like every other saturated Kivi queue (§21, §64: all queues bounded).
+//! like every other saturated Kivi queue (all queues bounded).
 //! Jobs carry their own single-slot reply channels, so completions never
 //! reorder and a dead waiter can never wedge the lane (`try_send` +
 //! disconnect-tolerant replies).
 //!
-//! The lane is also where the staging lifecycle (§10) is enforced: staging
+//! The lane is also where the staging lifecycle is enforced: staging
 //! appends volatile records, [`sync`](ChunkStore::sync) flips one barrier
-//! for the whole batch (§34), and only [`durable`](kivi_chunk::ChunkStore::durable_manifest)
-//! proofs ever become WAL roots - in exactly the chunks-first order §11
+//! for the whole batch, and only [`durable`](kivi_chunk::ChunkStore::durable_manifest)
+//! proofs ever become WAL roots - in exactly the chunks-first order
 //! mandates.
 
 use std::collections::{HashMap, VecDeque};
@@ -194,7 +194,7 @@ pub enum ChunkJob {
     },
     /// Prove one chunked root's dependencies: manifest indexed and
     /// readable, every entry's chunk indexed, lengths agreeing. Startup
-    /// and recovery gate on this (§30, §31); serving reads re-verify.
+    /// and recovery gate on this; serving reads re-verify.
     CheckRoot {
         /// Manifest to prove.
         manifest: ManifestId,
@@ -927,7 +927,7 @@ fn stage_value_job(
     let (canonical, recomputed) = manifest.canonical_with_id(domain);
     debug_assert_eq!(manifest_id, recomputed);
     store.stage_manifest(manifest_id, &canonical)?;
-    // One barrier for the whole value (§34): everything staged above
+    // One barrier for the whole value: everything staged above
     // becomes durable together, or nothing new does.
     store.sync()?;
     Ok(StagedValue {
@@ -968,7 +968,7 @@ fn finalize_stream_job(
     let (canonical, recomputed) = manifest.canonical_with_id(domain);
     debug_assert_eq!(manifest_id, recomputed);
     store.stage_manifest(manifest_id, &canonical)?;
-    // One barrier for the whole upload (§34): everything staged since
+    // One barrier for the whole upload: everything staged since
     // the last barrier becomes durable together, or nothing new does.
     store.sync()?;
     Ok(StagedValue {
@@ -1103,7 +1103,7 @@ fn splice_range_job(
     let (canonical, recomputed) = built.canonical_with_id(domain);
     debug_assert_eq!(id, recomputed);
     store.stage_manifest(id, &canonical)?;
-    // One barrier for the splice (§34): new chunks plus the new manifest
+    // One barrier for the splice: new chunks plus the new manifest
     // become durable together, or nothing new does.
     store.sync()?;
     Ok(StagedValue {
@@ -1441,9 +1441,8 @@ enum SpliceSegment {
     Zeros(u64),
 }
 
-/// Proves one chunked root's dependencies in its owner's lane (§30,
-///
-/// §31): the manifest is indexed and readable, every entry's chunk is
+/// Proves one chunked root's dependencies in its owner's lane:
+/// the manifest is indexed and readable, every entry's chunk is
 /// indexed, and the manifest total agrees with the root's claim. Index
 /// membership suffices because lane recovery verified every indexed
 /// record's bytes when it opened; serving reads re-verify anyway. A
@@ -1488,7 +1487,7 @@ fn read_chunk_cached(
     Ok(bytes)
 }
 
-/// In-flight staging pins (§40): addresses an uploader intends to stage,
+/// In-flight staging pins: addresses an uploader intends to stage,
 /// registered *before* the first append and removed after commit or abort.
 /// Global to the engine (every lane's GC consults the same set); held
 /// briefly and off any hot path - point ops never touch it.

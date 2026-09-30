@@ -1,6 +1,6 @@
 //! Integrity primitives: CRC32C checksums and BLAKE3 content identity.
 //!
-//! Thin, byte-exact wrappers over the borrowed mechanism crates (RFC §209):
+//! Thin, byte-exact wrappers over the borrowed mechanism crates:
 //! `crc32c` for cheap accidental-corruption detection, `blake3` for content
 //! identity. The project owns the constructions built on top - in particular
 //! [`chunk_id`], whose exact byte layout is part of the durable contract.
@@ -22,7 +22,7 @@ pub fn blake3_256(data: &[u8]) -> [u8; 32] {
     blake3::hash(data).into()
 }
 
-/// Derives the content address of an immutable chunk (RFC §29).
+/// Derives the content address of an immutable chunk.
 ///
 /// Byte-exact construction (durable - must never change for `V1`):
 ///

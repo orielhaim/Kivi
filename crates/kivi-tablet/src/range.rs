@@ -1,4 +1,4 @@
-//! Partition ranges for hash and ordered namespace layouts (RFC §9).
+//! Partition ranges for hash and ordered namespace layouts.
 //!
 //! A namespace uses one layout:
 //!
@@ -162,7 +162,7 @@ impl fmt::Display for HashPrefix {
 }
 
 /// One ordered-layout interval `[start, end)`: `start` inclusive, `end`
-/// exclusive, `None` meaning `+∞` (RFC §9 examples `["a", "g")`, `["p", ∞)`).
+/// exclusive, `None` meaning `+∞` (examples `["a", "g")`, `["p", ∞)`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct OrderedRange {
     start: Vec<u8>,
@@ -303,7 +303,7 @@ fn write_key(f: &mut fmt::Formatter<'_>, key: &[u8]) -> fmt::Result {
     Ok(())
 }
 
-/// Which namespace layout a range belongs to (RFC §9).
+/// Which namespace layout a range belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PartitionKind {
     /// Adaptive hash-prefix tree.
@@ -449,7 +449,7 @@ mod tests {
     /// top bits of the 128-bit hash deciding membership.
     #[test]
     fn a_hash_prefix_split_partitions_its_parent() {
-        // RFC §9: `0*` splits into `00*` and `01*`.
+        // `0*` splits into `00*` and `01*`.
         let parent = HashPrefix::new(0, 1).expect("0*");
         let left = HashPrefix::new(0, 2).expect("00*");
         let right = HashPrefix::new(0x4000_0000_0000_0000_0000_0000_0000_0000, 2).expect("01*");
@@ -577,7 +577,7 @@ mod tests {
     /// split that reported overlap one way round would drop or duplicate keys.
     #[test]
     fn ordered_overlap_is_symmetric_and_half_open() {
-        // RFC §9: `["a", "g")`, `["g", "p")`, `["p", ∞)`.
+        // `["a", "g")`, `["g", "p")`, `["p", ∞)`.
         let a = OrderedRange::new(b"a".to_vec(), Some(b"g".to_vec())).expect("[a,g)");
         let b = OrderedRange::new(b"g".to_vec(), Some(b"p".to_vec())).expect("[g,p)");
         let c = OrderedRange::new(b"p".to_vec(), None).expect("[p,inf)");

@@ -163,7 +163,7 @@ fn main() {
     // that arrives while the runtime is mid-interval waits for the interval to expire.
     // Exposed as a flag because it is the cheapest available test of "is the runtime
     // sleeping when it should be working". Measured: it makes no difference, which is
-    // itself the result - see `docs/perf-program.md` Part V §3.
+    // itself the result - see `docs/perf-program.md` Part V.
     let mut builder = compio::runtime::Runtime::builder();
     if let Some(interval) = event_interval {
         builder.event_interval(interval);

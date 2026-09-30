@@ -2,12 +2,12 @@
 //!
 //! A manifest is the small authoritative root a tablet stores for a large
 //! value: total length, chunking parameters, and the ordered chunk
-//! sequence. Bulk bytes live in chunk packs (§6); the manifest is what the
+//! sequence. Bulk bytes live in chunk packs; the manifest is what the
 //! WAL, checkpoints, and GC roots reference.
 //!
 //! Identity is computed over the canonical encoding below, so identical
 //! chunk sequences under identical parameters share one [`ManifestId`]
-//! (manifest dedup, §36) while any byte difference forks the identity.
+//! (manifest dedup) while any byte difference forks the identity.
 
 use kivi_types::{ChunkId, ManifestId, SecurityDomainId};
 

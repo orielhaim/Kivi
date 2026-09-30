@@ -1,4 +1,4 @@
-//! Project-owned partition hashing boundary (RFC §9).
+//! Project-owned partition hashing boundary.
 //!
 //! Routing needs a stable `key bytes → 128-bit hash` function that never changes
 //! under a declared algorithm version. The directory consumes

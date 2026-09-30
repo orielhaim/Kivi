@@ -13,7 +13,7 @@ thiserror.workspace = true
 tracing.workspace = true
 blake3.workspace = true
 crc32c.workspace = true
-# Coding mechanism only (RFC §209): Kivi owns fragment identity, durable
+# Coding mechanism only: Kivi owns fragment identity, durable
 # metadata, placement, lifecycle, wire/storage format, verification, and
 # repair scheduling. Selected after ecosystem review (see rs.rs docs):
 # reed-solomon-simd is the maintained pure-Rust Leopard-RS port with runtime

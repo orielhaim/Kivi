@@ -11,8 +11,8 @@
 //! * `now`: the leader's client-boundary wall time. [`ObjectStore::apply`](kivi_state::ObjectStore::apply)
 //!   takes `now` for expiry comparison, so replicas must apply at the
 //!   leader's timestamp, never their own wall clock - otherwise an object
-//!   expiring between propose and apply would fork outcomes (RFC §50:
-//!   nondeterminism is materialized by the proposer before enveloping).
+//!   expiring between propose and apply would fork outcomes, so
+//!   nondeterminism is materialized by the proposer before enveloping.
 //! * `ack_floor`: the client's acknowledgement watermark. Session floor
 //!   advances drop retained outcomes, so the advance must replicate in log
 //!   order or replicas would retain different outcome sets.

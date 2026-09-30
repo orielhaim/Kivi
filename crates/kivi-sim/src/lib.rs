@@ -1,4 +1,4 @@
-//! Deterministic simulation kernel for Kivi (RFC §176–§178).
+//! Deterministic simulation kernel for Kivi.
 //!
 //! This crate implements the interfaces from `kivi-core` (`Clock`,
 //! [`RandomSource`](kivi_core::RandomSource),

@@ -1,4 +1,4 @@
-//! Deterministic core interfaces for Kivi (RFC §176, §177, §251).
+//! Deterministic core interfaces for Kivi.
 //!
 //! Production effects drive hardware; simulation replays the same logic
 //! against virtual network, storage, randomness, scheduling, and fault

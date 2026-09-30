@@ -1,4 +1,4 @@
-//! Bodega-style directional roster leases: pure state machine (RFC §69).
+//! Bodega-style directional roster leases: pure state machine.
 //!
 //! A roster names, for one tablet lineage under one consensus term, a leader
 //! plus the replicas designated as local linearizable responders. Replicas
@@ -1277,7 +1277,7 @@ impl RosterEngine {
     /// (fast path: `RevokeReply`; failure path: exclusion timeout)
     /// before conflicting authority activates. Callers retry idempotently
     /// - [`RosterEngine::grant_for`] on every driver tick - so a skipped
-    /// Guard is deferred, never dropped.
+    ///   Guard is deferred, never dropped.
     fn open_guard(
         &mut self,
         peer: NodeId,

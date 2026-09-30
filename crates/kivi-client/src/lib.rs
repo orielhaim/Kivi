@@ -1364,7 +1364,7 @@ impl NativeClient {
         // Dead-member failover: endpoints that fail this call are
         // remembered (`tried`) and never redialed within the call, so a
         // killed or retired member fails over across untried seeds
-        // instead of stranding the request on a grave (§34). Rotation
+        // instead of stranding the request on a grave. Rotation
         // terminates: every seed is tried at most once per call, and
         // the redirect budget backstops everything else.
         // Redirect convergence guard: (tablet, endpoint, dir_version)

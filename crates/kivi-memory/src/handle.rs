@@ -43,7 +43,7 @@ impl ObjectHandle {
     }
 }
 
-/// Behavior class of a medium object (RFC §38).
+/// Behavior class of a medium object.
 ///
 /// Physical pages/extents are grouped by these classes so hot/cold,
 /// mutable/read-mostly, lifetime, and criticality classes never

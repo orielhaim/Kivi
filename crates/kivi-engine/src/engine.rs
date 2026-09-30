@@ -971,7 +971,7 @@ impl LocalEngine {
                 )
             }
         };
-        // Dependency gate (§30, §31), extended to fabric roots: every
+        // Dependency gate, extended to fabric roots: every
         // live chunked root - restored from checkpoints, replayed from
         // the WAL tail, or fresh - proves its manifest and chunks in its
         // owner's lane before serving. Every live fabric root proves a

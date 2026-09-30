@@ -506,7 +506,7 @@ fn encode_record(record: &BandRecord, out: &mut Vec<u8>) -> Result<(), Checkpoin
     match record.object.value() {
         // Chunked roots serialize as their small root (manifest id plus
         // logical length), never the bulk bytes: checkpoints hold small
-        // logical roots while chunk packs hold bulk information (§29).
+        // logical roots while chunk packs hold bulk information.
         LogicalValue::Chunked(chunked) => {
             out.push(REPR_CHUNKED);
             out.push(TYPE_BYTES);
@@ -630,7 +630,7 @@ fn decode_record(input: &[u8]) -> Result<(BandRecord, usize), CodecError> {
     let (expiry, used) = kivi_types::Expiry::decode(&input[at..])?;
     at += used;
     // Chunked roots decode to references: dependency validation proves
-    // their manifests and chunks before recovery serves them (§30).
+    // their manifests and chunks before recovery serves them.
     if repr == REPR_CHUNKED {
         if value_tag != TYPE_BYTES {
             return Err(CodecError::InvalidTag {
@@ -830,7 +830,7 @@ mod tests {
 
     #[test]
     fn chunked_roots_round_trip_as_manifest_references() {
-        // Chunked roots serialize as manifest id + length (§29): bulk
+        // Chunked roots serialize as manifest id + length: bulk
         // bytes never enter the band. The loaded root must equal the
         // stored one exactly (same manifest, same length, same version).
         let chunked = BandRecord {

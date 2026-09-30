@@ -3,7 +3,7 @@
 //! Hotness (access frequency) alone misleads tiering: a frequently
 //! accessed region with high memory-level parallelism may hide its latency
 //! while a rare serial dependency dominates request latency (AOL, OSDI
-//! 2025). [`ExecutionCriticality`] generalizes the RFC §12 heat vector
+//! 2025). [`ExecutionCriticality`] generalizes the storage heat vector
 //! into one cost-model input: frequency plus reuse distance, bytes,
 //! CPU/stall contribution, parallelism, critical-path and tail weights,
 //! mutability, and reconstruction cost.

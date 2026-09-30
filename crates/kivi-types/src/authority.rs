@@ -1,4 +1,4 @@
-//! Tablet authority and fencing checks (RFC §70, §194, §251).
+//! Tablet authority and fencing checks.
 //!
 //! Every authoritative tablet range carries a ([`TabletId`], [`TabletEpoch`],
 //! [`WriteGuardGeneration`]) triple. Writes must present the current triple;
@@ -52,7 +52,7 @@ impl TabletAuthority {
     /// Checks run in fencing hierarchy order - tablet, then epoch, then
     /// generation - so the first reported mismatch is the most significant.
     /// An old owner may still execute code, but a stale triple can never
-    /// authorize a mutation (RFC §194).
+    /// authorize a mutation.
     ///
     /// # Errors
     ///

@@ -1,4 +1,4 @@
-//! Secondary indexes as co-located ordered state (RFC §9 + index direction).
+//! Secondary indexes as co-located ordered state (with index direction).
 //!
 //! A non-unique index entry is an ordinary Kivi key that routes beside its
 //! primary: the entry key carries the primary bytes, routers strip them

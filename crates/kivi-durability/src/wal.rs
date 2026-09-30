@@ -126,7 +126,7 @@ pub const BATCH_FOOTER_LEN: usize = 20;
 pub const WAL_MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
 /// Allocation guard for records per batch.
 pub const WAL_MAX_RECORDS_PER_BATCH: usize = 4096;
-/// Production segment rotation target (RFC starting point).
+/// Production segment rotation target (starting point).
 pub const DEFAULT_SEGMENT_TARGET_BYTES: u64 = 256 * 1024 * 1024;
 /// Record kinds. Fixed forever within format version 1.
 pub const RECORD_KIND_MUTATION: u16 = 1;

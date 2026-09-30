@@ -6,7 +6,7 @@
 //! (identity, ordering, fencing comparisons); the canonical little-endian
 //! binary encoding of every type here is owned by `kivi-codec`.
 //!
-//! Design rules applied throughout (per `docs/rfc.md`):
+//! Design rules applied throughout:
 //!
 //! * Distinct concepts are distinct types: a [`TabletId`] can never be passed
 //!   where a [`WorkerId`] is expected, even though both wrap a `u64`.

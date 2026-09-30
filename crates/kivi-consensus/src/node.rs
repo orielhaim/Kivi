@@ -662,7 +662,8 @@ pub(crate) enum OwnerRequest {
         /// the owner).
         reply: Reply<()>,
     },
-    /// Resume a suspended peer link.
+    /// Resume a suspended peer link and resume replication to it (the
+    /// declared heal: the backoff chosen while it was down is dropped).
     ResumePeer {
         /// Resumed peer.
         peer: NodeId,
@@ -1350,7 +1351,8 @@ impl ReplicatedNode {
         }
     }
 
-    /// Resumes a suspended peer link.
+    /// Resumes a suspended peer link and resumes replication to it: the
+    /// declared heal drops the backoff chosen while the peer was down.
     pub async fn resume_peer(&self, peer: NodeId) {
         let (reply, rx) = futures::channel::oneshot::channel();
         if self
@@ -2766,6 +2768,7 @@ where
             }
             OwnerRequest::ResumePeer { peer, reply } => {
                 self.transport.resume_peer(peer).await;
+                self.resume_replication(peer).await;
                 let _ = reply.send(());
             }
             // Handled by the loop (breaks it); unreachable here.
@@ -2778,6 +2781,24 @@ where
     /// local replica before its reactor exits.
     pub(crate) async fn shutdown_raft(&self) {
         let _ = self.raft.shutdown().await;
+    }
+
+    /// Ends `peer`'s active replication backoff after a declared heal.
+    ///
+    /// Lifting a partition - an operator action, or a chaos nemesis - is
+    /// the one point where Kivi *knows* a previously unreachable peer is
+    /// reachable again, so replication to it resumes now instead of waiting
+    /// out a delay chosen while the peer was down. The reset is scoped to
+    /// the backoff active when it arrives, and node ids this group does not
+    /// replicate to are ignored, so one call per heal is correct.
+    pub(crate) async fn resume_replication(&self, peer: NodeId) {
+        if let Err(error) = self.raft.trigger().reset_backoff([peer.as_u64()]).await {
+            tracing::debug!(
+                peer = peer.as_u64(),
+                group = %self.group,
+                "replication backoff reset for a healed peer failed: {error}"
+            );
+        }
     }
 
     /// Quorum-commits one chunked operation with sidecar preflight. Runs

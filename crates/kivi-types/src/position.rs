@@ -1,4 +1,4 @@
-//! Commit positions and tokens (RFC §66, §167).
+//! Commit positions and tokens.
 //!
 //! Per-tablet ordering is identified by (`TabletId`, [`TabletEpoch`],
 //! [`CommitPosition`]). A [`CommitToken`] names one committed mutation and is

@@ -1,7 +1,7 @@
 //! Hash-domain types: content identity and partition routing input.
 //!
-//! [`ChunkId`] is a content address with a fixed, pinned construction (RFC
-//! §29). [`PartitionHash`] is the opposite: an opaque 128-bit routing input
+//! [`ChunkId`] is a content address with a fixed, pinned construction.
+//! [`PartitionHash`] is the opposite: an opaque 128-bit routing input
 //! whose producing algorithm is intentionally undecided. The directory routes
 //! on these values without ever choosing - or depending on - a hash function,
 //! so adopting a concrete stable partition hash later changes producers only,
@@ -22,7 +22,7 @@ pub const CHUNK_DOMAIN_TAG: &[u8] = b"KIVI-CHUNK-V1";
 /// even if their canonical bytes happened to coincide.
 pub const MANIFEST_DOMAIN_TAG: &[u8] = b"KIVI-MANIFEST-V1";
 
-/// 256-bit content address of an immutable chunk (RFC §28, §29).
+/// 256-bit content address of an immutable chunk.
 ///
 /// Construction (pinned - this formula is the durable contract):
 ///
@@ -139,7 +139,7 @@ impl fmt::Display for ManifestId {
 }
 
 /// Stable partition hash routing input: the 128-bit value a key maps to before
-/// the adaptive prefix tree routes it to a tablet (RFC §9).
+/// the adaptive prefix tree routes it to a tablet.
 ///
 /// Deliberately opaque - no algorithm is pinned here. Producers (a future
 /// key-hash layer) compute these; the directory only compares prefixes of

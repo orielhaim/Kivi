@@ -37,7 +37,7 @@ pub const PROTOCOL_MINOR: u16 = 0;
 /// Encoded frame header length in bytes.
 pub const FRAME_HEADER_LEN: usize = 24;
 
-/// Default maximum: 64 MiB per non-stream frame (RFC starting point).
+/// Default maximum: 64 MiB per non-stream frame (starting point).
 /// Servers and tests may configure a smaller bound; larger requires a
 /// protocol version bump, never a silent constant change.
 pub const DEFAULT_MAX_FRAME: usize = 64 * 1024 * 1024;

@@ -23,17 +23,17 @@ crc32c.workspace = true
 # is unacceptable. `default-features = false` drops the Tokio runtime and
 # clap; `single-threaded` removes the `Send` bounds so Raft tasks park on
 # Kivi's Compio reactors (thread-per-core ownership, enforced by types).
-openraft = { version = "=0.10.0-alpha.35", default-features = false, features = ["single-threaded"] }
+openraft = { version = "=0.10.0-alpha.36", default-features = false, features = [
+  "single-threaded",
+] }
 # Official Compio `AsyncRuntime` for OpenRaft (the `KiviTypeConfig` runtime).
-openraft-rt-compio = "=0.10.0-alpha.35"
+openraft-rt-compio = "=0.10.0-alpha.36"
 # Official Multi-Raft routing adapters (`GroupRouter` and friends).
-openraft-multi = "=0.10.0-alpha.35"
+openraft-multi = "=0.10.0-alpha.36"
 # Compio execution architecture: consensus tasks run on Compio reactors
 # (the owner thread today, `DataWorker` reactors in the future). No Tokio
 # anywhere in this crate: `cargo tree -p kivi-consensus` must show none.
 compio.workspace = true
-# Runtime-agnostic channels for the owner-thread front (`propose` futures
-# stay `Send` while the `!Send` Raft handle stays pinned to its reactor).
 futures.workspace = true
 async-channel.workspace = true
 thiserror.workspace = true
@@ -42,12 +42,9 @@ rcgen.workspace = true
 rustls.workspace = true
 
 [dev-dependencies]
-# Density-experiment measurement only (examples/density.rs). Never ships in
-# the library or the production binary.
 sysinfo = "0.39"
 tempfile.workspace = true
 divan.workspace = true
-# Behavioural matrices (reconcile phase table) as compact named cases.
 rstest.workspace = true
 
 [[bench]]

@@ -49,7 +49,7 @@ pub enum Mutation {
     /// Point `key` at a chunked value: the manifest addressing its
     /// immutable chunks plus the total logical length. The WAL carries
     /// this small root transition only - bulk bytes live in chunk packs
-    /// whose durability precedes this record (§11, §12). Overwrites any
+    /// whose durability precedes this record. Overwrites any
     /// type and clears expiry, exactly like [`PutBytes`](Self::PutBytes).
     ReplaceChunkedRoot {
         /// Target key.

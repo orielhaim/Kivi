@@ -143,7 +143,7 @@ impl RouteCache {
     /// Drops every route dialing a dead endpoint (connection refused or
     /// reset): placement moves and killed members converge through
     /// seeds and fresh redirects instead of a cached grave. Only the
-    /// affected tablets re-discover (§34); the rest of the cache stays.
+    /// affected tablets re-discover; the rest of the cache stays.
     pub fn evict_endpoint(&self, endpoint: &str) {
         let current = self.entries.load();
         if !current.iter().any(|entry| entry.endpoint == endpoint) {

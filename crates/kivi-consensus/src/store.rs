@@ -59,7 +59,7 @@
 //! cross as bounded channel jobs with oneshot acks to the node-wide
 //! shared writer thread - the reactor yields while `fsync` runs
 //! elsewhere. There is no thread per group: one writer serves every
-//! group on the node (RFC §60), batching concurrent groups' records into
+//! group on the node, batching concurrent groups' records into
 //! single physical batches.
 //!
 //! All write paths serialize through one [`futures::lock::Mutex`]: it is

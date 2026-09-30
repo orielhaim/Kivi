@@ -1,7 +1,7 @@
 //! QUIC/H3 peer TLS identity: self-signed node certificates with
 //! fingerprint pinning.
 //!
-//! Prototype PKI, deliberately minimal (§11–12): every node generates one
+//! Prototype PKI, deliberately minimal: every node generates one
 //! self-signed certificate on first open, persisted under
 //! `<data_dir>/peer-tls/` (`cert.der`, `key.der`; Kivi-owned operational
 //! files, never durable state formats). Peers authenticate by comparing the
@@ -25,7 +25,7 @@
 //! Kivi identity beyond TLS (cluster, node, incarnation, capabilities)
 //! rides authenticated H3 request headers validated per request - TLS
 //! proves *which certificate*, headers prove *which Kivi peer*. Socket
-//! tuples are never identity (§33).
+//! tuples are never identity.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

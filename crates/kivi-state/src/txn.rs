@@ -1,4 +1,4 @@
-//! Cross-tablet OCC + 2PC transaction substrate, V1 (RFC transaction fabric).
+//! Cross-tablet OCC + 2PC transaction substrate, V1 (transaction fabric).
 //!
 //! Transaction V1 provides **serializable point-key mutation sets** across
 //! tablets: OCC conflict detection via [`ObjectVersion`] validation plus

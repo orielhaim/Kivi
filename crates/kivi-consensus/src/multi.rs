@@ -1,6 +1,6 @@
 //! Multi-tablet consensus node: many tablet groups on fixed workers.
 //!
-//! The production physical Multi-Raft architecture (RFC §60):
+//! The production physical Multi-Raft architecture:
 //!
 //! ```text
 //! ConsensusNode front (Send + Sync)
@@ -2271,7 +2271,8 @@ impl ConsensusNode {
         }
     }
 
-    /// Resumes a suspended peer link (same worker-ingress discipline as
+    /// Resumes a suspended peer link and resumes replication to it from
+    /// every local replica (same worker-ingress discipline as
     /// [`suspend_peer`](Self::suspend_peer)).
     pub async fn resume_peer(&self, peer: NodeId) {
         let (reply, rx) = futures::channel::oneshot::channel();
@@ -2554,7 +2555,7 @@ fn control_forward_leader(detail: &str) -> Option<NodeId> {
 /// Validates the configured tablet set: unique, nonzero, and every
 /// tablet assigned to the local node in the static topology. Empty is
 /// valid: a joining data node starts empty and gains replicas through
-/// control-plane migration (§9, §47). Returns the sorted tablets.
+/// control-plane migration. Returns the sorted tablets.
 fn validated_tablets(config: &MultiNodeConfig) -> Result<Vec<TabletId>, NodeOpenError> {
     use NodeOpenError as Fault;
     if config.worker_count == 0 {
@@ -3256,8 +3257,17 @@ async fn worker_loop(
             }
             OwnerRequest::ResumePeer { peer, reply } => {
                 let transport = transport.clone();
+                // The heal is node-wide, so every local replica drops the
+                // backoff it accrued toward that peer. Dispatched off the
+                // ingress loop: the reset waits on RaftCore, and a
+                // partition lift must never stall peer RPCs or small
+                // writes.
+                let replicas: Vec<_> = replicas.values().cloned().collect();
                 compio::runtime::spawn(async move {
                     transport.resume_peer(peer).await;
+                    for ctx in &replicas {
+                        ctx.resume_replication(peer).await;
+                    }
                     let _ = reply.send(());
                 })
                 .detach();

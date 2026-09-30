@@ -1,11 +1,11 @@
 //! Mutation envelope: the versioned carrier binding a typed mutation to its
-//! routing, fencing, and deduplication identity (RFC §48, §49).
+//! routing, fencing, and deduplication identity.
 //!
 //! Every application mutation travels as a [`MutationEnvelope`]: namespace,
 //! tablet authority triple, client request identity, optional durable
 //! idempotency key, and one typed [`Mutation`]. Replicas replay the envelope
-//! bytes; they never re-execute proposer choices (RFC §50: nondeterminism is
-//! materialized by the proposer before enveloping).
+//! bytes; they never re-execute proposer choices, because
+//! nondeterminism is materialized by the proposer before enveloping.
 //!
 //! Framing version is 1. The pre-release opaque-bytes payload was replaced by
 //! typed Mutation IR before anything durable existed anywhere, so no
@@ -126,7 +126,7 @@ impl MutationEnvelope {
     /// Validates the envelope against the `current` tablet authority.
     ///
     /// A stale owner may still execute code, but its mutations commit nothing
-    /// (RFC §194, §251 fencing invariant).
+    /// (fencing invariant).
     ///
     /// # Errors
     ///

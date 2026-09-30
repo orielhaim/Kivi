@@ -1,4 +1,4 @@
-//! Bounded local range scans over the ordered key index (RFC §9).
+//! Bounded local range scans over the ordered key index.
 //!
 //! [`ObjectStore::scan_range`](crate::ObjectStore::scan_range) is the one
 //! canonical local scan primitive. It seeks the ordered key index and emits

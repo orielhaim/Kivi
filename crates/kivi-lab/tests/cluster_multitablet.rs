@@ -30,7 +30,7 @@ fn distinct_leaders(cluster: &Cluster, index: usize) -> Vec<u64> {
     leaders
 }
 
-/// Multi-tablet money flow (§43): many tablets, writes everywhere,
+/// Multi-tablet money flow: many tablets, writes everywhere,
 /// independent per-tablet leadership, kill with independent elections,
 /// continued traffic, restart convergence, full-cluster restart.
 #[allow(clippy::too_many_lines)]
@@ -170,7 +170,7 @@ fn multi_tablets_startup_writes_failover_restart() {
     }
 }
 
-/// Independent ordering (§44): a large write on tablet A creates no Raft
+/// Independent ordering: a large write on tablet A creates no Raft
 /// ordering dependency on tablet B - B's writes commit while A's bulk
 /// moves.
 #[test]

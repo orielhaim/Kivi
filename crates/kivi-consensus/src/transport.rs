@@ -16,7 +16,7 @@
 //! TCP head-of-line blocking *across streams*; the split removes the
 //! remaining *connection-level* coupling.
 //!
-//! H3 request/response streams are the RPC layer (§6):
+//! H3 request/response streams are the RPC layer:
 //!
 //! ```text
 //! POST /_kivi/raft/{tablet}/vote        (body: vote request codec)
@@ -784,7 +784,10 @@ impl PeerTransport {
         }
     }
 
-    /// Resumes a suspended peer link.
+    /// Resumes a suspended peer link. Callers that also want replication to
+    /// resume immediately pair this with the owner's backoff reset
+    /// ([`crate::node::OwnerCtx::resume_replication`]); the transport itself
+    /// only owns the link.
     #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn resume_peer(&self, peer: NodeId) {
         if let Some(link) = self

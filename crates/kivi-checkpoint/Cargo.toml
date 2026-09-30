@@ -16,9 +16,6 @@ blake3.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-# Checkpoint band compression experiment (RFC §217: lz4_flex for hot/warm).
-# Owns only the block codec mechanism; Kivi owns the band format, header,
-# manifest codec record, and content identity.
 lz4_flex.workspace = true
 
 [dev-dependencies]

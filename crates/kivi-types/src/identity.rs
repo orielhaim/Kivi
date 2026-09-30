@@ -1,4 +1,4 @@
-//! Request identity for safe retries (RFC §63–§65).
+//! Request identity for safe retries.
 //!
 //! Native mutations carry a ([`SessionId`], [`RequestSeq`]) pair. A client
 //! retry with the same pair after a lost reply returns the recorded outcome
@@ -68,7 +68,7 @@ impl MutationIdentity {
     }
 }
 
-/// Durable idempotency key surviving client restarts (RFC §65).
+/// Durable idempotency key surviving client restarts.
 ///
 /// The canonical durable form is a fixed 128-bit value. Human-facing clients
 /// that prefer variable-length tokens (opaque strings) map them through a

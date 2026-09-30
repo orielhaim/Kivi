@@ -1,4 +1,4 @@
-//! Exact logical tablet and directory model for Kivi (RFC §6–§9, §190–§198).
+//! Exact logical tablet and directory model for Kivi.
 //!
 //! This crate owns the ownership truth: which tablet is the single writable
 //! authority for every routable point, and how that authority moves. It is

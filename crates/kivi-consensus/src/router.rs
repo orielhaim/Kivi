@@ -31,8 +31,12 @@
 //! offset-keyed frames under a fresh transfer id; the receiver
 //! reassembles and calls `install_full_snapshot` once.
 //!
-//! `stream_append` keeps the sequential default; leadership transfer has an
-//! explicit peer RPC and preserves `OpenRaft`'s structured refusal response.
+//! `stream_append` keeps the sequential default: Kivi's appends are unary
+//! H3 requests, and the default is the honest adapter for that. Each
+//! heartbeat's response stream is drained before the worker reports
+//! progress, so the H3 stream runs its cleanup and closes cleanly.
+//! Leadership transfer has an explicit peer RPC and preserves `OpenRaft`'s
+//! structured refusal response.
 //!
 //! The decode/encode functions below are `pub(crate)`: the owned `Peer*`
 //! structs travel inside [`crate::peer`] message bodies, and nothing outside
@@ -61,38 +65,28 @@ use crate::peer::{
 use crate::transport::{PeerTransport, TransportError};
 use crate::types::ConsensusGroupId;
 
-/// Maps any transport outcome onto the retry-safe `Unreachable` error.
-/// Every arm backs off in `OpenRaft`'s replication core; no arm invents a
-/// verdict the peer never gave.
-fn unreachable(target: u64, error: &TransportError) -> RPCError<KiviTypeConfig> {
-    let detail = format!("peer {target}: {error}");
-    let source = std::io::Error::new(std::io::ErrorKind::NotConnected, detail);
-    RPCError::Unreachable(Unreachable::new(&source))
-}
-
-fn snapshot_unreachable(target: u64, error: &TransportError) -> StreamingError<KiviTypeConfig> {
-    let detail = format!("peer {target}: {error}");
-    let source = std::io::Error::new(std::io::ErrorKind::NotConnected, detail);
-    StreamingError::Unreachable(Unreachable::new(&source))
-}
-
-/// Maps a local protocol fault (codec failure, family mismatch - our own
-/// bug or a version-skewed peer, never a remote verdict) onto the same
-/// retry-safe error.
-fn protocol_unreachable(target: u64, detail: &str) -> RPCError<KiviTypeConfig> {
-    let source = std::io::Error::new(
+/// Maps anything that is not a remote verdict onto the retry-safe
+/// `Unreachable` error: a transport outcome (unreachable, timeout) and a
+/// local protocol fault (codec failure, family mismatch - our own bug or a
+/// version-skewed peer) both back off in `OpenRaft`'s replication core.
+/// Neither ever invents a verdict the peer never gave. The snapshot
+/// family differs only in the error type it must satisfy, so both share
+/// this one source.
+fn peer_unreachable(target: u64, detail: &str) -> Unreachable<KiviTypeConfig> {
+    Unreachable::new(&std::io::Error::new(
         std::io::ErrorKind::NotConnected,
         format!("peer {target}: {detail}"),
-    );
-    RPCError::Unreachable(Unreachable::new(&source))
+    ))
 }
 
-fn protocol_snapshot_unreachable(target: u64, detail: &str) -> StreamingError<KiviTypeConfig> {
-    let source = std::io::Error::new(
-        std::io::ErrorKind::NotConnected,
-        format!("peer {target}: {detail}"),
-    );
-    StreamingError::Unreachable(Unreachable::new(&source))
+/// Retry-safe error for the unary RPC families (vote, append, transfer).
+fn unreachable(target: u64, detail: &str) -> RPCError<KiviTypeConfig> {
+    RPCError::Unreachable(peer_unreachable(target, detail))
+}
+
+/// Retry-safe error for the snapshot-transfer family.
+fn snapshot_unreachable(target: u64, detail: &str) -> StreamingError<KiviTypeConfig> {
+    StreamingError::Unreachable(peer_unreachable(target, detail))
 }
 
 /// Why a peer message could not cross the `OpenRaft` boundary. All
@@ -603,12 +597,12 @@ impl GroupRouter<KiviTypeConfig, ConsensusGroupId> for PeerRouter {
         let response = self
             .call(target, group_id, request, &option)
             .await
-            .map_err(|error| unreachable(target, &error))?;
+            .map_err(|error| unreachable(target, &error.to_string()))?;
         match response {
             PeerResponse::Append(response) => Ok(decode_append_response(&response)),
-            unexpected => Err(protocol_unreachable(
+            unexpected => Err(unreachable(
                 target,
-                &format!("peer answered append with {unexpected:?}"),
+                &format!("answered append with {unexpected:?}"),
             )),
         }
     }
@@ -624,12 +618,12 @@ impl GroupRouter<KiviTypeConfig, ConsensusGroupId> for PeerRouter {
         let response = self
             .call(target, group_id, request, &option)
             .await
-            .map_err(|error| unreachable(target, &error))?;
+            .map_err(|error| unreachable(target, &error.to_string()))?;
         match response {
             PeerResponse::Vote(response) => Ok(decode_vote_response(&response)),
-            unexpected => Err(protocol_unreachable(
+            unexpected => Err(unreachable(
                 target,
-                &format!("peer answered vote with {unexpected:?}"),
+                &format!("answered vote with {unexpected:?}"),
             )),
         }
     }
@@ -645,12 +639,12 @@ impl GroupRouter<KiviTypeConfig, ConsensusGroupId> for PeerRouter {
         let response = self
             .call(target, group_id, request, &option)
             .await
-            .map_err(|error| unreachable(target, &error))?;
+            .map_err(|error| unreachable(target, &error.to_string()))?;
         match response {
             PeerResponse::PreVote(response) => Ok(decode_vote_response(&response)),
-            unexpected => Err(protocol_unreachable(
+            unexpected => Err(unreachable(
                 target,
-                &format!("peer answered pre-vote with {unexpected:?}"),
+                &format!("answered pre-vote with {unexpected:?}"),
             )),
         }
     }
@@ -666,14 +660,14 @@ impl GroupRouter<KiviTypeConfig, ConsensusGroupId> for PeerRouter {
         let response = self
             .call(target, group_id, request, &option)
             .await
-            .map_err(|error| unreachable(target, &error))?;
+            .map_err(|error| unreachable(target, &error.to_string()))?;
         match response {
             PeerResponse::TransferLeader(response) => {
                 Ok(decode_transfer_leader_response(&response))
             }
-            unexpected => Err(protocol_unreachable(
+            unexpected => Err(unreachable(
                 target,
-                &format!("peer answered transfer-leader with {unexpected:?}"),
+                &format!("answered transfer-leader with {unexpected:?}"),
             )),
         }
     }
@@ -714,7 +708,7 @@ impl GroupRouter<KiviTypeConfig, ConsensusGroupId> for PeerRouter {
             let response = self
                 .call(target, group_id, request, &option)
                 .await
-                .map_err(|error| snapshot_unreachable(target, &error))?;
+                .map_err(|error| snapshot_unreachable(target, &error.to_string()))?;
             match response {
                 PeerResponse::Snapshot(response) => {
                     if done {
@@ -724,9 +718,9 @@ impl GroupRouter<KiviTypeConfig, ConsensusGroupId> for PeerRouter {
                     }
                 }
                 unexpected => {
-                    return Err(protocol_snapshot_unreachable(
+                    return Err(snapshot_unreachable(
                         target,
-                        &format!("peer answered snapshot with {unexpected:?}"),
+                        &format!("answered snapshot with {unexpected:?}"),
                     ));
                 }
             }

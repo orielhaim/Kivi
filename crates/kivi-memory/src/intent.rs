@@ -1,4 +1,4 @@
-//! Declarative materialization requirements (RFC §35).
+//! Declarative materialization requirements.
 //!
 //! This module is the Declarative Memory Services boundary: software
 //! describes *what* a materialization must provide and the runtime chooses

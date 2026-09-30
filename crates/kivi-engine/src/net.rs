@@ -351,8 +351,8 @@ pub(crate) fn run_net(
         // Placement is an optimisation, so a refusal must cost throughput, not
         // availability: the worker runs unbound on whatever the scheduler
         // gives it. Failing here would turn a cosmetic optimisation into a
-        // correctness-bearing dependency, which is exactly what RFC §25
-        // forbids.
+        // correctness-bearing dependency, which is exactly what the
+        // no-implicit-ownership rule forbids.
         tracing::warn!(worker = id.as_u64(), ?error, "data worker unbound");
     }
     let tablet_map = LocalTabletSet::from_tablets(tablets);
@@ -2678,7 +2678,7 @@ impl Conn {
     /// chunk lane first. The tablet borrow is long gone by the time the
     /// lane is awaited: resolution suspends only this connection task,
     /// never the reactor, and the tablet stays the sole mutation owner
-    /// throughout (§16, §17). `GetStream` completions fan out into
+    /// throughout. `GetStream` completions fan out into
     /// `ValueStream*` frames instead of one response frame.
     /// Validates an `AtLeast` token against local single-node state.
     /// Lineage failures (wrong tablet/epoch/shape) answer `StaleToken`;

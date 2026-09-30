@@ -1148,7 +1148,7 @@ async fn open_node(
     let control_seeds: Vec<SocketAddr> = config.control_seeds.clone();
     // Joiners (fresh nodes outside the voter set) start data-empty: the
     // control plane assigns their replicas through migration, so no
-    // static tablet list is required at join time (§9).
+    // static tablet list is required at join time.
     let joiner = !control_voters.contains(&config.node.as_u64())
         && !config.data_dir.join("consensus-sm").exists();
     let data_tablets: Vec<TabletId> = if joiner { Vec::new() } else { tablets };
@@ -2948,7 +2948,7 @@ fn replica_node(replica: kivi_consensus::ReplicaId) -> NodeId {
 }
 
 /// Redirects a request this node cannot serve to a desired replica from
-/// replicated control state (migration-aware routing, §32). Returns
+/// replicated control state (migration-aware routing). Returns
 /// `None` when no desired replica is known, letting the caller fall
 /// back to a retryable answer.
 async fn desired_redirect(shared: &ClusterShared, tablet: TabletId) -> Option<Response> {
@@ -3570,7 +3570,7 @@ async fn ready(State(shared): State<ClusterShared>) -> Json<serde_json::Value> {
     // usable once its peer mesh started, every configured local replica
     // loaded, and every group healthy - partial failure is reported
     // openly (counts), never hidden behind one boolean. A cluster can be
-    // ready while rebalancing: migrations never gate readiness (§44).
+    // ready while rebalancing: migrations never gate readiness.
     let total = statuses.len();
     let healthy = statuses.iter().filter(|status| status.healthy).count();
     let leaders_known = statuses
@@ -3661,7 +3661,7 @@ async fn node_info(State(shared): State<ClusterShared>) -> Json<serde_json::Valu
 }
 
 /// Per-tablet diagnostics for every local group, sorted by tablet,
-/// enriched with desired vs actual placement (§43): desired voters from
+/// enriched with desired vs actual placement: desired voters from
 /// replicated control state when present, actual voters/learners from
 /// live membership, and a placement verdict per tablet.
 async fn tablets(State(shared): State<ClusterShared>) -> Json<Vec<serde_json::Value>> {
@@ -4849,7 +4849,7 @@ async fn control_policy_update(
 
 /// Observed membership for one tablet group: actual voters, learners,
 /// leader, term, joint flag, and replication lag. Powers reconciler
-/// forwarding and operator inspection (§43).
+/// forwarding and operator inspection.
 async fn tablet_membership(
     State(shared): State<ClusterShared>,
     axum::extract::Path(id): axum::extract::Path<u64>,
@@ -5443,7 +5443,7 @@ async fn directory_cutover(
 /// Admits a node: commits `RegisterNode` (as `Joining`) then activates
 /// it. Body: `{ "node": <u64>, "peer": "<addr>", "native": "<addr>",
 /// "admin": "<addr>", "fingerprint": "<64 hex>"?, "domain": "<s>"? }`.
-/// Effective only after the replicated commit (§8: no implicit trust).
+/// Effective only after the replicated commit (no implicit trust).
 async fn control_node_add(
     State(shared): State<ClusterShared>,
     Json(body): Json<serde_json::Value>,
@@ -5591,7 +5591,7 @@ async fn control_node_drain(
 /// Removes a node after safe drain. Fails loudly when the node still
 /// desires tablets, still votes anywhere observed locally, or still
 /// votes in the control group - never silently deletes an active
-/// voter (§29). No force mode.
+/// voter. No force mode.
 async fn control_node_remove(
     State(shared): State<ClusterShared>,
     axum::extract::Path(id): axum::extract::Path<u64>,
@@ -5644,7 +5644,7 @@ async fn control_node_remove(
 
 /// Computes desired placements from current topology and creates
 /// migration plans, bounded by the reconciler policy (no unbounded
-/// snapshot storms, §25–26).
+/// snapshot storms,).
 async fn control_rebalance(
     State(shared): State<ClusterShared>,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -5670,7 +5670,7 @@ async fn control_rebalance(
     }
 }
 
-/// Rebalances tablet leadership explicitly (§53): graceful handoffs
+/// Rebalances tablet leadership explicitly: graceful handoffs
 /// away from overrepresented leaders, never continuous (no flapping).
 async fn control_leadership(
     State(shared): State<ClusterShared>,
@@ -5689,7 +5689,7 @@ async fn control_leadership(
 }
 
 /// Manual tablet move through the same persisted plan pathway as auto
-/// rebalance (no second migration pathway, §46). Body:
+/// rebalance (no second migration pathway). Body:
 /// `{ "tablet": <u64>, "from": <u64>, "to": <u64> }`.
 async fn control_migrations_create(
     State(shared): State<ClusterShared>,

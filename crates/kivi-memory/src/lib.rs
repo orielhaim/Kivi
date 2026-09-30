@@ -21,7 +21,7 @@
 //! # Size classes
 //!
 //! - Tiny (`<= TINY_INLINE_MAX`): inline bytes in the object root. No
-//!   arena, compression, or storage machinery (RFC §25 small-value fast
+//!   arena, compression, or storage machinery (small-value fast
 //!   path preserved).
 //! - Medium (`<= MEDIUM_MAX`): worker-local behavior-aware arenas with
 //!   generational handles ([`handle`], [`arena`]), compressible,
@@ -103,7 +103,7 @@ pub use tablet::{TabletEnvelope, TabletMaterializations};
 pub use telemetry::{AccessCounters, DEFAULT_OBJECT_CAPACITY, SoftwareTelemetry, TelemetryLimits};
 
 /// Tiny-value ceiling in bytes: values at or below this stay inline in
-/// the object root with no arena/compression/storage machinery (RFC §25).
+/// the object root with no arena/compression/storage machinery.
 ///
 /// 256 bytes keeps the common session/counter/pointer cases on the fast
 /// path while pushing anything with real footprint into arenas where

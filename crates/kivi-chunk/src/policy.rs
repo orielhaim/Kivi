@@ -1,7 +1,7 @@
 //! Chunking policy: deterministic fixed-size logical chunking.
 //!
-//! Chunk boundaries are a pure function of the logical byte length (RFC
-//! §27): they never depend on network frames, upload packet sizes, or
+//! Chunk boundaries are a pure function of the logical byte length: they
+//! never depend on network frames, upload packet sizes, or
 //! timing. The same value under the same [`Chunking`] always yields the
 //! same chunk sequence, which is what makes cross-writer dedup and
 //! manifest reuse sound.

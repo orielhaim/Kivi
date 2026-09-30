@@ -7,7 +7,7 @@
 //! bumped [`DirectoryVersion`]. Publication is atomic through one `Arc`, so
 //! readers never observe a half-applied replacement.
 //!
-//! Replacement ordering is enforced by construction, mirroring RFC §190:
+//! Replacement ordering is enforced by construction:
 //! a successor can activate only once the current owner no longer covers its
 //! range as active (the parent must be sealed first - activating against an
 //! overlapping active tablet is rejected), and a tablet retires only after
@@ -223,7 +223,7 @@ impl DirectorySnapshot {
     }
 
     /// Seals an active tablet: writes stop while its successor finishes
-    /// replay and activates (RFC §190).
+    /// replay and activates.
     ///
     /// # Errors
     ///

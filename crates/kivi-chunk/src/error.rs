@@ -1,7 +1,7 @@
 //! Chunk fabric failure modes.
 //!
-//! The taxonomy keeps recovery-relevant cases distinct (RFC §251 payload
-//! rule, task §43): a missing or corrupt chunk/manfiest must read as
+//! The taxonomy keeps recovery-relevant cases distinct (payload rule, task): a
+//! missing or corrupt chunk/manfiest must read as
 //! *repair me later*, never as generic `Internal`. Anything else is a
 //! local bug, a bound, or an I/O failure.
 

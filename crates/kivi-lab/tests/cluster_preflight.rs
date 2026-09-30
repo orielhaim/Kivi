@@ -10,7 +10,7 @@ use std::time::Instant;
 use kivi_lab::cluster::Cluster;
 use kivi_lab::testkit::{fill, key, put_stream};
 
-/// 64 MiB preflight timing decomposition (§62): upload time, preflight
+/// 64 MiB preflight timing decomposition: upload time, preflight
 /// quorum evidence, bulk vs Raft bytes.
 #[test]
 fn multi_tablet_large_value_preflight_decomposition() {

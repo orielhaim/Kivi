@@ -2,10 +2,10 @@
 //! before the tiny Raft root proposes, so same-tablet small writes stay
 //! responsive and other tablets stay isolated.
 //!
-//! Covers the preflight money tests: same-tablet latency (§45),
-//! cross-tablet isolation (§46), quorum-ready with a slow follower (§47),
-//! append-gate fallback with preflight disabled (§48), leader loss during
-//! preflight (§49), and the stale-state race (§50).
+//! Covers the preflight money tests: same-tablet latency,
+//! cross-tablet isolation, quorum-ready with a slow follower,
+//! append-gate fallback with preflight disabled, leader loss during
+//! preflight, and the stale-state race.
 
 use std::time::{Duration, Instant};
 
@@ -104,7 +104,7 @@ fn preflight_same_tablet_small_writes_stay_fast() {
     );
 }
 
-/// Cross-tablet isolation (§46): a 32 MiB upload on tablet A leaves
+/// Cross-tablet isolation: a 32 MiB upload on tablet A leaves
 /// tablet B latency nearly untouched - no Raft-log head-of-line crosses
 /// tablet boundaries (only shared CPU/storage/network couple them).
 #[test]
@@ -152,7 +152,7 @@ fn preflight_other_tablet_stays_isolated() {
     );
 }
 
-/// Quorum-ready with a slow follower (§47): with the A↔C bulk path down,
+/// Quorum-ready with a slow follower: with the A↔C bulk path down,
 /// A+B (quorum) still commit the root; C catches up later through the
 /// append gate.
 #[test]
@@ -188,7 +188,7 @@ fn preflight_quorum_with_slow_follower_commits() {
     assert_eq!(applied[1], applied[2]);
 }
 
-/// Preflight is only an optimization (§48): with preflight disabled, the
+/// Preflight is only an optimization: with preflight disabled, the
 /// old safe path (root arrives → gate fetches → durable → ACK) still
 /// commits correctly.
 #[test]
@@ -212,7 +212,7 @@ fn preflight_disabled_falls_back_to_append_gate() {
     );
 }
 
-/// Leader loss during preflight (§49): sidecars alone never commit - the
+/// Leader loss during preflight: sidecars alone never commit - the
 /// key stays absent or fully present, and the same identity retried on
 /// the new leader converges exactly once.
 #[test]
@@ -309,7 +309,7 @@ fn preflight_leader_loss_abandons_without_commit() {
     cluster.wait_converged_all();
 }
 
-/// Stale-state race (§50): a large write started before a small write to
+/// Stale-state race: a large write started before a small write to
 /// the same key still obeys proposal ordering - the large root proposes
 /// after its preflight, so it wins deterministically.
 #[test]

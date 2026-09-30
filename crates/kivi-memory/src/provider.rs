@@ -213,7 +213,7 @@ impl ProviderCaps {
         // Encryption is a deployment property, not a provider
         // property: no provider here offers it, so an intent requiring
         // it excludes all providers (fail closed into the
-        // correctness path, per RFC §2).
+        // correctness path).
         if encryption_required {
             return false;
         }

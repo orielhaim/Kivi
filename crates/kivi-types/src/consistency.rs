@@ -897,7 +897,7 @@ pub struct ConsistencySnapshot {
     pub covered_responders: u64,
 }
 
-/// Fencing composition of one tablet lineage (RFC §70, §194, §251).
+/// Fencing composition of one tablet lineage.
 ///
 /// Four mechanisms, one rule - a stale owner cannot authorize under the
 /// current generation:

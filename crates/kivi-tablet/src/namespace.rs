@@ -1,4 +1,4 @@
-//! Namespace descriptors: the physical layout of a keyspace (RFC §7–§9).
+//! Namespace descriptors: the physical layout of a keyspace.
 //!
 //! A [`NamespaceDescriptor`] binds a [`NamespaceId`] to one
 //! [`NamespaceLayout`]:

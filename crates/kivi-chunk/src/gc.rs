@@ -5,14 +5,14 @@
 //! becomes a deletion candidate. Deletion itself is best-effort (a failed
 //! delete costs disk, never correctness), exactly like WAL reclamation.
 //!
-//! ## Root set (§37)
+//! ## Root set
 //!
 //! The engine merges at least: live tablet roots, the current and previous
 //! retained checkpoints, manifests in required WAL history, in-flight
 //! staged uploads (pins), and checkpoints currently building. This module
 //! takes the merged set as input; assembling it is engine work.
 //!
-//! ## Why concurrent staging cannot lose (§40)
+//! ## Why concurrent staging cannot lose
 //!
 //! Two facts compose the argument:
 //!
@@ -30,7 +30,7 @@
 //! began *and* nothing reachable - live, retained, or in flight - names
 //! any record in it. Deleting it cannot strand a future commit.
 //!
-//! ## Reclamation scope (§38, §39)
+//! ## Reclamation scope
 //!
 //! Only fully-dead sealed packs are deleted. Mixed live/dead packs
 //! are kept; mark-copy compaction of cold packs is a later optimization

@@ -186,7 +186,7 @@ pub struct StageOutcome {
     pub durable: bool,
 }
 
-/// Cumulative store counters for the admin plane (§62). Owned locally,
+/// Cumulative store counters for the admin plane. Owned locally,
 /// snapshotted on request - never a hot-path lock.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ChunkStats {
@@ -218,7 +218,7 @@ pub struct ChunkStats {
     pub truncated_bytes: u64,
 }
 
-/// What recovery rebuilt, for operators and startup timing (§56).
+/// What recovery rebuilt, for operators and startup timing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ChunkRecovery {
     /// Pack files scanned.
@@ -417,9 +417,9 @@ impl ChunkStore {
     }
 
     /// Stages one chunk: appends it to the active pack unless an identical
-    /// address is already indexed (dedup hit, §35). Never syncs: call
-    /// [`sync`](Self::sync) to make staged data durable in one barrier
-    /// (§34). Cross-lane duplicates stay possible by design (§9).
+    /// address is already indexed (dedup hit). Never syncs: call
+    /// [`sync`](Self::sync) to make staged data durable in one barrier.
+    /// Cross-lane duplicates stay possible by design.
     ///
     /// # Errors
     ///
@@ -466,7 +466,7 @@ impl ChunkStore {
     }
 
     /// Stages one canonical manifest under its verified identity. Same
-    /// durability contract as [`stage_chunk`](Self::stage_chunk) (§36).
+    /// durability contract as [`stage_chunk`](Self::stage_chunk).
     ///
     /// # Errors
     ///

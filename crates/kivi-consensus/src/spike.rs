@@ -59,7 +59,6 @@ impl MemLogStore {
 #[allow(clippy::unused_async_trait_impl)]
 impl RaftLogReader<KiviTypeConfig> for MemLogStore {
     #[allow(clippy::unused_async_trait_impl)]
-    #[allow(clippy::unused_async_trait_impl)]
     async fn try_get_log_entries<RB>(
         &mut self,
         range: RB,
